@@ -250,6 +250,18 @@ fn order_by_limit_offset_and_distinct() {
         &[&["1"], &["2"]],
     );
     expect(
+        &query(&db, "SELECT id FROM users ORDER BY age DESC NULLS FIRST"),
+        &[&["3"], &["2"], &["1"]],
+    );
+    expect(
+        &query(&db, "SELECT id FROM users ORDER BY age ASC NULLS FIRST"),
+        &[&["3"], &["1"], &["2"]],
+    );
+    expect(
+        &query(&db, "SELECT id FROM users ORDER BY active ASC, age DESC"),
+        &[&["2"], &["1"], &["3"]],
+    );
+    expect(
         &query(
             &db,
             "SELECT id FROM users ORDER BY age ASC LIMIT 2 OFFSET 1",
