@@ -146,6 +146,11 @@ fn point_lookups_where_logic_and_aliases() {
     );
     expect(&query(&db, "SELECT id FROM users WHERE id = 99"), &[]);
     expect(
+        &query(&db, "SELECT id FROM users WHERE id = 1.0"),
+        &[&["1"]],
+    );
+    expect(&query(&db, "SELECT id FROM users WHERE id = 1.5"), &[]);
+    expect(
         &query(&db, "SELECT id FROM users WHERE id = 2 AND active = FALSE"),
         &[&["2"]],
     );
@@ -559,6 +564,11 @@ fn constraints_and_unsupported_features() {
         &db,
         "INSERT INTO users VALUES (1, 'Duplicate', 1, TRUE)",
         "duplicate primary key",
+    );
+    assert_error_contains(
+        &db,
+        "INSERT OR REPLACE INTO users VALUES (1, 'Replaced', 1, TRUE)",
+        "INSERT OR/IGNORE/REPLACE",
     );
     assert_error_contains(
         &db,

@@ -173,13 +173,32 @@ impl TableEngine {
         if insert.overwrite {
             return Err(Error::Unsupported("INSERT OVERWRITE".into()));
         }
+        if insert.or.is_some() || insert.ignore || insert.replace_into {
+            return Err(Error::Unsupported("INSERT OR/IGNORE/REPLACE".into()));
+        }
         if insert.on.is_some() {
             return Err(Error::Unsupported(
                 "INSERT ... ON CONFLICT/DUPLICATE KEY".into(),
             ));
         }
-        if insert.returning.is_some() {
-            return Err(Error::Unsupported("INSERT ... RETURNING".into()));
+        if insert.returning.is_some() || insert.output.is_some() {
+            return Err(Error::Unsupported("INSERT ... RETURNING/OUTPUT".into()));
+        }
+        if insert.priority.is_some() {
+            return Err(Error::Unsupported("INSERT priority modifiers".into()));
+        }
+        if insert.partitioned.is_some() || !insert.after_columns.is_empty() {
+            return Err(Error::Unsupported("INSERT ... PARTITION".into()));
+        }
+        if insert.settings.is_some() || insert.format_clause.is_some() {
+            return Err(Error::Unsupported("INSERT format/settings".into()));
+        }
+        if insert.multi_table_insert_type.is_some()
+            || !insert.multi_table_into_clauses.is_empty()
+            || !insert.multi_table_when_clauses.is_empty()
+            || insert.multi_table_else_clause.is_some()
+        {
+            return Err(Error::Unsupported("multi-table INSERT".into()));
         }
         if !insert.assignments.is_empty() {
             return Err(Error::Unsupported("INSERT ... SET".into()));
@@ -1006,7 +1025,25 @@ fn point_lookup(select: &Select, schema: &TableSchema, alias: Option<&str>) -> R
         return Ok(PointLookup::Missing);
     }
     let primary_key_column = schema.primary_key_column();
-    let primary_key = literal.coerce_to(&primary_key_column.name, primary_key_column.data_type)?;
+    let primary_key = if primary_key_column.data_type == DataType::Integer {
+        match literal {
+            // `id = 1.0` compares numerically, so accept it as a point lookup
+            // rather than failing an INT coercion that a scan would not do.
+            Value::Real(value) if value.fract() == 0.0 => {
+                let lower = -9_223_372_036_854_775_808.0_f64;
+                let upper_exclusive = 9_223_372_036_854_775_808.0_f64;
+                if value >= lower && value < upper_exclusive {
+                    Value::Integer(value as i64)
+                } else {
+                    return Ok(PointLookup::Missing);
+                }
+            }
+            Value::Real(_) => return Ok(PointLookup::Missing),
+            value => value.coerce_to(&primary_key_column.name, primary_key_column.data_type)?,
+        }
+    } else {
+        literal.coerce_to(&primary_key_column.name, primary_key_column.data_type)?
+    };
     Ok(PointLookup::Value(primary_key))
 }
 
