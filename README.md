@@ -177,8 +177,9 @@ escaping, primary-key conflicts, schema/type errors, persistence across reopen,
 and table drop/recreate. Unit tests in `src/key.rs` verify encoding round-trips
 and order preservation.
 
-Run `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` for
-formatting and lint checks.
+CI runs formatting, tests, and Clippy on Ubuntu for pushes to `main` and pull
+requests; see `.github/workflows/ci.yml`. Locally run `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` for the same checks.
 
 ## Limitations
 
