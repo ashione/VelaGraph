@@ -24,6 +24,7 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Predicates/expressions | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN`; numeric `+ - * /`, unary minus, `DATE` literals and `DATE ± INTERVAL ... DAY` |
 | Storage | RocksDB WAL-backed writes, one atomic `WriteBatch` per statement, point lookups for `pk = literal`, index prefix scans |
 | Graph kernel | property vertices/edges, labels and typed properties, outgoing/incoming adjacency indexes, label-filtered traversal, cascade delete |
+| Graph queries | standard Gremlin v0 (`V`/`E`, `out`/`in`/`both`, `has`/`hasLabel`, `values`/`id`/`label`, `limit`/`path`/`count`), 1–3 edge steps |
 
 Deliberately **not** supported: joins, subqueries, window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
 constraints, multi-statement transactions, and `SELECT` without `FROM`. See
@@ -32,7 +33,7 @@ constraints, multi-statement transactions, and `SELECT` without `FROM`. See
 ## Quick start
 
 Prerequisites: a C++ toolchain and libclang (needed by `librocksdb-sys`), plus
-Rust 1.88 or newer. On macOS with the Xcode Command Line Tools:
+Rust 1.95 or newer. On macOS with the Xcode Command Line Tools:
 
 ```bash
 export LIBCLANG_PATH="$(dirname "$(xcrun --find clang)")/../lib"
@@ -116,8 +117,8 @@ index catalog, which is also what `.schema` prints.
 ### Graph kernel
 
 `GraphEngine` is the first storage layer for the graph direction. It is additive
-and independent of the SQL engine; it does not yet include an implemented query
-language, transactions across statements, or distribution.
+and independent of the SQL engine; it includes a standard Gremlin v0 query
+subset, but not transactions across statements or distribution.
 
 ```rust
 use std::collections::BTreeMap;
@@ -172,14 +173,36 @@ for path in result.paths {
 
 A vertex is visited at most once per request, so cycles terminate; results are
 deterministic (edge id ascending) and `truncated` is set when the path limit
-stopped exploration. There is still no Gremlin parser/planner: this executor is
-the foundation a later standard Gremlin layer will drive.
+stopped exploration.
 
-The target public query language is standard Gremlin, parsed from Apache
-TinkerPop's official grammar; no project-specific dialect is planned. The
-normative v0 subset, limits, and errors are in
-[`docs/QUERY_SPEC.md`](docs/QUERY_SPEC.md), and the implementation constraints are
-in [`docs/IMPLEMENTATION_RULES.md`](docs/IMPLEMENTATION_RULES.md).
+### Gremlin v0
+
+The public graph query language is standard Gremlin text, parsed from Apache
+TinkerPop's official `Gremlin.g4` grammar via [`gremlin-rs`](https://crates.io/crates/gremlin-rs).
+No project-specific grammar or dialect is defined. `GraphEngine::gremlin`
+returns ordered rows:
+
+```rust
+use rocksdb_sql_table::{GraphEngine, GremlinRow};
+
+let graph = GraphEngine::open("./graph-data")?;
+let result = graph.gremlin("g.V().hasLabel('Person').out('KNOWS').limit(10)")?;
+for row in result.rows {
+    match row {
+        GremlinRow::Vertex(id) => println!("vertex {id}"),
+        GremlinRow::Value(value) => println!("value {}", value.render()),
+        other => println!("{other:?}"),
+    }
+}
+```
+
+The v0 subset is `V`/`E`, `out`/`in`/`both`, `has`/`hasLabel`,
+`values`/`id`/`label`, and `limit`/`path`/`count`; it allows at most 3 edge
+steps. Mutations, `outE`/`inE`/`bothE`, predicates, `repeat`, and the rest of
+Gremlin are rejected explicitly rather than downgraded. The normative subset,
+semantics, limits, and errors are in [`docs/QUERY_SPEC.md`](docs/QUERY_SPEC.md);
+implementation constraints are in
+[`docs/IMPLEMENTATION_RULES.md`](docs/IMPLEMENTATION_RULES.md).
 
 Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
 `graph/v1/p/<partition>/edge/<id>` for records and
@@ -194,7 +217,7 @@ all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
 fsync), so a process crash may lose the most recent writes. This is a
 single-process, single-partition storage kernel: ids are globally unique `u64`
 values supplied by the caller, one `GraphEngine` owns one partition, and there
-is no Gremlin parser, planner, MVCC, or Raft layer yet. Both endpoints of an edge
+is no cost-based planner, MVCC, or Raft layer yet. Both endpoints of an edge
 must currently live in the same partition; cross-partition boundary edges are a
 D1 design item. Scalar property values are a deliberate first-milestone limit,
 not the final data model.

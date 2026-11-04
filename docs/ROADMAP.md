@@ -45,6 +45,7 @@
 
 - **交付物**：基于官方 `Gremlin.g4` 的标准 Gremlin 子集（复用 `gremlin-rs` 解析器，不自写语法）；`V`/`E`、`out`/`in`/`both`、`has`/`hasLabel`、`values`/`id`/`label`、`limit`/`path`/`count`；1–3 跳遍历。
 - **完成定义**：标准 Gremlin 语料可解析；固定数据集结果确定；未支持 step 明确报错而非降级；有超时、行数和最大跳数保护；见 [`QUERY_SPEC.md`](QUERY_SPEC.md)。
+- **状态**：K2a（有界遍历）与 K2b（标准 Gremlin v0 解析/执行）已实现；未支持 step 显式报错。
 - **依赖**：K1 的邻接索引和稳定键布局。
 
 ### K3 事务与恢复

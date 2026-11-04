@@ -31,6 +31,7 @@
 mod engine;
 mod error;
 mod graph;
+mod gremlin;
 mod key;
 mod schema;
 mod storage;
@@ -40,6 +41,11 @@ mod value;
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
 pub use graph::{Edge, GraphEngine, Vertex};
+pub use gremlin::{
+    GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
+    DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,
+    MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS,
+};
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use traversal::{
     TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,
