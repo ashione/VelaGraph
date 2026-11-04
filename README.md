@@ -7,7 +7,7 @@ statements are parsed and executed by this crate.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
-ordering, pagination, `DISTINCT`, `GROUP BY`, and `COUNT`/`SUM`/`AVG`.
+ordering, pagination, `DISTINCT`, `GROUP BY`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`.
 
 ## Features
 
@@ -18,11 +18,11 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, and `COUNT`/`SUM`/`AVG`.
 | Keys | exactly one single-column primary key of type `INT` or `TEXT` |
 | Indexes | single-column and composite indexes; uniqueness; equality and range lookups on a leading column prefix |
 | DML | multi-row `INSERT ... VALUES`, `UPDATE ... SET ... [WHERE]`, `DELETE [WHERE]` |
-| Queries | projection, `WHERE`, `GROUP BY` columns, `COUNT(*)`/`COUNT(col)`, `SUM(expr)`, `AVG(expr)`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT` |
+| Queries | projection, `WHERE`, `GROUP BY` columns, `COUNT(*)`/`COUNT(col)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT` |
 | Predicates/expressions | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN`; numeric `+ - * /`, unary minus, `DATE` literals and `DATE ± INTERVAL ... DAY` |
 | Storage | RocksDB WAL-backed writes, one atomic `WriteBatch` per statement, point lookups for `pk = literal`, index prefix scans |
 
-Deliberately **not** supported: joins, subqueries, `HAVING`, `MIN`/`MAX`,
+Deliberately **not** supported: joins, subqueries, `HAVING`,
 window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
 constraints, multi-statement transactions, and `SELECT` without `FROM`. See
 [Limitations](#limitations).
@@ -118,8 +118,9 @@ index catalog, which is also what `.schema` prints.
   other mismatches are errors. `BOOLEAN` accepts only `TRUE`/`FALSE`.
 - **NULLs use SQL three-valued logic.** `NULL = NULL` is unknown, `WHERE` keeps
   only true rows, and `NOT UNKNOWN` remains unknown. `COUNT(*)` counts rows,
-  `COUNT(col)` ignores NULLs; `SUM`/`AVG` ignore NULL inputs and return `NULL`
-  when no non-NULL input remains. `SUM`/`AVG` currently return `REAL`.
+  `COUNT(col)` ignores NULLs; `SUM`/`AVG`/`MIN`/`MAX` ignore NULL inputs and
+  return `NULL` when no non-NULL input remains. `SUM`/`AVG` currently return
+  `REAL`; `MIN`/`MAX` preserve the input type.
 - **Grouped queries stream.** A `GROUP BY`/aggregate query over a full table scan
   updates per-group state as rows are decoded, without collecting all matching
   rows; only the distinct groups are materialized. Non-aggregate queries still
@@ -277,7 +278,7 @@ cargo test
 ```
 
 The suite covers CRUD, point lookups, three-valued NULL logic, ordering and
-pagination, `DISTINCT`, `COUNT`/`SUM`/`AVG`, `GROUP BY`, TPC-H Q1/Q6-shaped
+pagination, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, TPC-H Q1/Q6-shaped
 queries with `DATE` and `DECIMAL` columns, `LIKE`/`BETWEEN`/`IN`, text-key
 ordering and escaping, primary-key conflicts, schema/type errors, persistence
 across reopen,
@@ -294,7 +295,7 @@ requests; see `.github/workflows/ci.yml`. Locally run `cargo fmt --check` and
 
 This is a teaching/demo-scale engine, not a production database:
 
-- No joins, subqueries, CTEs, `HAVING`, `MIN`/`MAX`, window functions, or
+- No joins, subqueries, CTEs, `HAVING`, window functions, or
   `COUNT(DISTINCT ...)`. `GROUP BY` requires at least one aggregate projection.
 - Indexes accelerate equality/range predicates on a leading index prefix; they
   do not accelerate `OR`, `IN`, `BETWEEN`, `LIKE`, or `IS NULL` predicates.

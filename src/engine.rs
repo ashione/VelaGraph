@@ -985,6 +985,8 @@ enum ResolvedProjection {
     CountColumn { index: usize, header: String },
     Sum { expression: Expr, header: String },
     Avg { expression: Expr, header: String },
+    Min { expression: Expr, header: String },
+    Max { expression: Expr, header: String },
 }
 
 impl ResolvedProjection {
@@ -998,7 +1000,9 @@ impl ResolvedProjection {
             | ResolvedProjection::CountStar { header }
             | ResolvedProjection::CountColumn { header, .. }
             | ResolvedProjection::Sum { header, .. }
-            | ResolvedProjection::Avg { header, .. } => header.clone(),
+            | ResolvedProjection::Avg { header, .. }
+            | ResolvedProjection::Min { header, .. }
+            | ResolvedProjection::Max { header, .. } => header.clone(),
         }
     }
 }
@@ -1234,8 +1238,11 @@ fn projection_expression(
         if object_name_is(&function.name, "sum") || object_name_is(&function.name, "avg") {
             return parse_sum_avg(function, alias);
         }
+        if object_name_is(&function.name, "min") || object_name_is(&function.name, "max") {
+            return parse_min_max(function, alias);
+        }
         return Err(Error::Unsupported(format!(
-            "function `{}` (only COUNT, SUM and AVG are supported)",
+            "function `{}` (only COUNT, SUM, AVG, MIN and MAX are supported)",
             function.name
         )));
     }
@@ -1292,6 +1299,31 @@ fn parse_sum_avg(function: &Function, alias: Option<String>) -> Result<ResolvedP
         ResolvedProjection::Sum { expression, header }
     } else {
         ResolvedProjection::Avg { expression, header }
+    })
+}
+
+fn parse_min_max(function: &Function, alias: Option<String>) -> Result<ResolvedProjection> {
+    let name = if object_name_is(&function.name, "min") {
+        "MIN"
+    } else {
+        "MAX"
+    };
+    validate_aggregate_function(function, name)?;
+    let list = aggregate_argument_list(function, name)?;
+    if list.args.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "{name} requires exactly one argument"
+        )));
+    }
+    let expression = match &list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => expression.clone(),
+        other => return Err(Error::Unsupported(format!("{name} argument `{other}`"))),
+    };
+    let header = alias.unwrap_or_else(|| name.to_ascii_lowercase());
+    Ok(if name == "MIN" {
+        ResolvedProjection::Min { expression, header }
+    } else {
+        ResolvedProjection::Max { expression, header }
     })
 }
 
@@ -1460,6 +1492,8 @@ enum AggregateState {
     CountColumn(u64),
     Sum { sum: f64, count: u64 },
     Avg { sum: f64, count: u64 },
+    Min(Option<Value>),
+    Max(Option<Value>),
 }
 
 impl AggregateState {
@@ -1470,6 +1504,8 @@ impl AggregateState {
             ResolvedProjection::CountColumn { .. } => Some(Self::CountColumn(0)),
             ResolvedProjection::Sum { .. } => Some(Self::Sum { sum: 0.0, count: 0 }),
             ResolvedProjection::Avg { .. } => Some(Self::Avg { sum: 0.0, count: 0 }),
+            ResolvedProjection::Min { .. } => Some(Self::Min(None)),
+            ResolvedProjection::Max { .. } => Some(Self::Max(None)),
         }
     }
 
@@ -1493,6 +1529,36 @@ impl AggregateState {
                 *sum += number;
                 *count += 1;
             }
+            AggregateState::Min(_) | AggregateState::Max(_) => {
+                return Err(Error::Internal(format!("{name} state mismatch")));
+            }
+        }
+        Ok(())
+    }
+
+    fn add_extreme(&mut self, value: &Value, name: &str, want_max: bool) -> Result<()> {
+        if value.is_null() {
+            return Ok(());
+        }
+        let slot = match self {
+            AggregateState::Min(slot) | AggregateState::Max(slot) => slot,
+            _ => return Err(Error::Internal(format!("{name} state mismatch"))),
+        };
+        match slot {
+            None => *slot = Some(value.clone()),
+            Some(current) => {
+                let ordering = value.compare(current)?.ok_or_else(|| {
+                    Error::InvalidValue(format!("{name} cannot compare NULL values"))
+                })?;
+                let replace = if want_max {
+                    ordering == Ordering::Greater
+                } else {
+                    ordering == Ordering::Less
+                };
+                if replace {
+                    *slot = Some(value.clone());
+                }
+            }
         }
         Ok(())
     }
@@ -1515,6 +1581,9 @@ impl AggregateState {
                 } else {
                     Value::Real(*sum / *count as f64)
                 }
+            }
+            AggregateState::Min(value) | AggregateState::Max(value) => {
+                value.clone().unwrap_or(Value::Null)
             }
         }
     }
@@ -1617,6 +1686,18 @@ impl AggregateAccumulator {
                     group.states[aggregate_index].add_numeric(&value, name)?;
                     aggregate_index += 1;
                 }
+                ResolvedProjection::Min { expression, .. }
+                | ResolvedProjection::Max { expression, .. } => {
+                    let value = eval_scalar(expression, &context)?;
+                    let name = if matches!(projection, ResolvedProjection::Min { .. }) {
+                        "MIN"
+                    } else {
+                        "MAX"
+                    };
+                    let want_max = matches!(projection, ResolvedProjection::Max { .. });
+                    group.states[aggregate_index].add_extreme(&value, name, want_max)?;
+                    aggregate_index += 1;
+                }
             }
         }
         Ok(())
@@ -1682,7 +1763,9 @@ impl AggregateAccumulator {
                     ResolvedProjection::CountStar { .. }
                     | ResolvedProjection::CountColumn { .. }
                     | ResolvedProjection::Sum { .. }
-                    | ResolvedProjection::Avg { .. } => {
+                    | ResolvedProjection::Avg { .. }
+                    | ResolvedProjection::Min { .. }
+                    | ResolvedProjection::Max { .. } => {
                         row.push(group.states[aggregate_index].finish());
                         aggregate_index += 1;
                     }

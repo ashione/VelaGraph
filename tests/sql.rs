@@ -414,6 +414,48 @@ fn count_aggregates() {
         &query(&db, "SELECT SUM(age), COUNT(age) FROM users"),
         &[&["81", "2"]],
     );
+    expect(&query(&db, "SELECT MIN(age) FROM users"), &[&["36"]]);
+    expect(&query(&db, "SELECT MAX(age) FROM users"), &[&["45"]]);
+    expect(
+        &query(&db, "SELECT MIN(age), MAX(age), COUNT(age) FROM users"),
+        &[&["36", "45", "2"]],
+    );
+    expect(
+        &query(&db, "SELECT MIN(name), MAX(name) FROM users"),
+        &[&["Ada", "Linus"]],
+    );
+    expect(
+        &query(&db, "SELECT MIN(age + 1), MAX(age + 1) FROM users"),
+        &[&["37", "46"]],
+    );
+    expect(
+        &query(&db, "SELECT MIN(age), MAX(age) FROM empty_table"),
+        &[&["NULL", "NULL"]],
+    );
+    assert_header(
+        &query(
+            &db,
+            "SELECT MIN(age) AS youngest, MAX(age) AS oldest FROM users",
+        ),
+        &["youngest", "oldest"],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT active, MIN(age), MAX(age) FROM users \
+             GROUP BY active ORDER BY active",
+        ),
+        &[
+            &["false", "45", "45"],
+            &["true", "36", "36"],
+            &["NULL", "NULL", "NULL"],
+        ],
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MEDIAN(age) FROM users",
+        "only COUNT, SUM, AVG, MIN and MAX",
+    );
 }
 
 #[test]
