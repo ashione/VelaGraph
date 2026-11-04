@@ -386,6 +386,32 @@ impl Database {
         self.scan_rows(schema)
     }
 
+    /// Stream rows through a callback without materializing the whole table.
+    /// Used by grouped/aggregate queries to keep memory bounded.
+    pub fn for_each_row<F>(&self, schema: &TableSchema, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&StoredRow) -> Result<()>,
+    {
+        let prefix = row_prefix(&schema.name);
+        let primary_key_type = schema.primary_key_column().data_type;
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let primary_key = decode_primary_key(&key[prefix.len()..], primary_key_type)?;
+            let values = self.decode_row(schema, &value)?;
+            callback(&StoredRow {
+                primary_key,
+                values,
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn get_row(&self, schema: &TableSchema, primary_key: &Value) -> Result<Option<StoredRow>> {
         let key = row_key(&schema.name, primary_key)?;
         let Some(bytes) = self.db.get(key)? else {

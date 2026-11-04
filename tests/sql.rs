@@ -408,7 +408,12 @@ fn count_aggregates() {
         "SELECT COUNT(*) FROM users ORDER BY id",
         "ORDER BY is not supported",
     );
-    assert_error_contains(&db, "SELECT SUM(age) FROM users", "only COUNT is supported");
+    expect(&query(&db, "SELECT SUM(age) FROM users"), &[&["81"]]);
+    expect(&query(&db, "SELECT AVG(age) FROM users"), &[&["40.5"]]);
+    expect(
+        &query(&db, "SELECT SUM(age), COUNT(age) FROM users"),
+        &[&["81", "2"]],
+    );
 }
 
 #[test]
@@ -1017,4 +1022,129 @@ fn indexes_survive_reopen() {
         other => panic!("expected rows, got {other:?}"),
     };
     assert_eq!(rendered(&result), vec![vec!["2".to_string()]]);
+}
+
+#[test]
+fn tpch_q1_and_q6_queries() {
+    let db = TestDb::new();
+    db.execute(
+        "CREATE TABLE lineitem (\
+           l_orderkey INT PRIMARY KEY,\
+           l_partkey INT,\
+           l_suppkey INT,\
+           l_linenumber INT,\
+           l_quantity DECIMAL(15,2),\
+           l_extendedprice DECIMAL(15,2),\
+           l_discount DECIMAL(15,2),\
+           l_tax DECIMAL(15,2),\
+           l_returnflag TEXT,\
+           l_linestatus TEXT,\
+           l_shipdate DATE,\
+           l_commitdate DATE,\
+           l_receiptdate DATE,\
+           l_shipinstruct TEXT,\
+           l_shipmode TEXT,\
+           l_comment TEXT\
+         )",
+    );
+    assert_eq!(
+        db.affected(
+            "INSERT INTO lineitem VALUES \
+             (1, 10, 100, 1, 10, 100, 0.05, 0.02, 'N', 'O', DATE '1994-06-01', DATE '1994-06-01', DATE '1994-06-01', 'DELIVER IN PERSON', 'TRUCK', 'a'),\
+             (2, 11, 101, 1, 20, 200, 0.06, 0.02, 'R', 'F', DATE '1995-06-01', DATE '1995-06-01', DATE '1995-06-01', 'NONE', 'MAIL', 'b'),\
+             (3, 12, 102, 1, 30, 300, 0.07, 0.01, 'N', 'O', DATE '1998-10-01', DATE '1998-10-01', DATE '1998-10-01', 'NONE', 'SHIP', 'c'),\
+             (4, 13, 103, 1, 40, 400, 0.04, 0.02, 'R', 'F', DATE '1994-02-01', DATE '1994-02-01', DATE '1994-02-01', 'NONE', 'MAIL', 'd')"
+        ),
+        4
+    );
+
+    // TPC-H Q6: 1994 revenue for discounts in [0.05, 0.07] and quantity < 24.
+    let q6 = query(
+        &db,
+        "SELECT SUM(l_extendedprice * l_discount) AS revenue \
+         FROM lineitem \
+         WHERE l_shipdate >= DATE '1994-01-01' \
+           AND l_shipdate < DATE '1995-01-01' \
+           AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 \
+           AND l_quantity < 24",
+    );
+    assert_header(&q6, &["revenue"]);
+    expect(&q6, &[&["5"]]);
+
+    // TPC-H Q1 with GROUP BY, arithmetic aggregate arguments and ORDER BY.
+    let q1 = query(
+        &db,
+        "SELECT l_returnflag, l_linestatus, \
+                SUM(l_quantity) AS sum_qty, \
+                SUM(l_extendedprice) AS sum_base_price, \
+                SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+                SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, \
+                AVG(l_quantity) AS avg_qty, \
+                COUNT(*) AS count_order \
+         FROM lineitem \
+         WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY \
+         GROUP BY l_returnflag, l_linestatus \
+         ORDER BY l_returnflag, l_linestatus",
+    );
+    assert_header(
+        &q1,
+        &[
+            "l_returnflag",
+            "l_linestatus",
+            "sum_qty",
+            "sum_base_price",
+            "sum_disc_price",
+            "sum_charge",
+            "avg_qty",
+            "count_order",
+        ],
+    );
+    expect(
+        &q1,
+        &[
+            &["N", "O", "10", "100", "95", "96.9", "10", "1"],
+            &["R", "F", "60", "600", "572", "583.44", "30", "2"],
+        ],
+    );
+
+    // DATE columns keep ISO text ordering and can be selected directly.
+    let dates = query(&db, "SELECT l_shipdate FROM lineitem WHERE l_orderkey = 1");
+    expect(&dates, &[&["1994-06-01"]]);
+}
+
+#[test]
+fn date_arithmetic_and_invalid_dates() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE dates (id INT PRIMARY KEY, day DATE)");
+    db.execute("INSERT INTO dates VALUES (1, DATE '2000-02-28')");
+    expect(
+        &query(&db, "SELECT day FROM dates WHERE day < DATE '2000-03-01'"),
+        &[&["2000-02-28"]],
+    );
+    assert_error_contains(
+        &db,
+        "INSERT INTO dates VALUES (2, DATE '2001-02-29')",
+        "invalid date",
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM dates \
+             WHERE DATE '1998-12-01' - INTERVAL '90' DAY = DATE '1998-09-02'",
+        ),
+        &[&["1"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM dates \
+             WHERE DATE '2000-03-01' - INTERVAL '1' DAY = DATE '2000-02-29'",
+        ),
+        &[&["1"]],
+    );
+    assert_error_contains(
+        &db,
+        "INSERT INTO dates VALUES (2, DATE '2000-01-01' - INTERVAL '1' MONTH)",
+        "only DAY is supported",
+    );
 }

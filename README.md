@@ -7,24 +7,24 @@ statements are parsed and executed by this crate.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
-ordering, pagination, `DISTINCT` and `COUNT`.
+ordering, pagination, `DISTINCT`, `GROUP BY`, and `COUNT`/`SUM`/`AVG`.
 
 ## Features
 
 | Area | Supported |
 | --- | --- |
 | DDL | `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF EXISTS]`, `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`, `DROP INDEX [IF EXISTS]` |
-| Types | `INT` (`INTEGER`/`BIGINT` aliases), `REAL` (`DOUBLE`/`FLOAT`), `TEXT` (`VARCHAR`/`STRING`), `BOOLEAN` |
+| Types | `INT` (`INTEGER`/`BIGINT` aliases), `REAL` (`DOUBLE`/`FLOAT`), `TEXT` (`VARCHAR`/`STRING`), `BOOLEAN`; `DATE` (ISO-8601 text) and `DECIMAL`/`NUMERIC` (stored as `REAL`) for TPC-H compatibility |
 | Keys | exactly one single-column primary key of type `INT` or `TEXT` |
 | Indexes | single-column and composite indexes; uniqueness; equality and range lookups on a leading column prefix |
 | DML | multi-row `INSERT ... VALUES`, `UPDATE ... SET ... [WHERE]`, `DELETE [WHERE]` |
-| Queries | projection, `WHERE`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT`, `COUNT(*)`/`COUNT(col)` |
-| Predicates | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN` |
+| Queries | projection, `WHERE`, `GROUP BY` columns, `COUNT(*)`/`COUNT(col)`, `SUM(expr)`, `AVG(expr)`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT` |
+| Predicates/expressions | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN`; numeric `+ - * /`, unary minus, `DATE` literals and `DATE ± INTERVAL ... DAY` |
 | Storage | RocksDB WAL-backed writes, one atomic `WriteBatch` per statement, point lookups for `pk = literal`, index prefix scans |
 
-Deliberately **not** supported: joins, subqueries, `GROUP BY`, aggregates other
-than `COUNT`, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column constraints,
-multi-statement transactions, and `SELECT` without `FROM`. See
+Deliberately **not** supported: joins, subqueries, `HAVING`, `MIN`/`MAX`,
+window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
+constraints, multi-statement transactions, and `SELECT` without `FROM`. See
 [Limitations](#limitations).
 
 ## Quick start
@@ -118,7 +118,17 @@ index catalog, which is also what `.schema` prints.
   other mismatches are errors. `BOOLEAN` accepts only `TRUE`/`FALSE`.
 - **NULLs use SQL three-valued logic.** `NULL = NULL` is unknown, `WHERE` keeps
   only true rows, and `NOT UNKNOWN` remains unknown. `COUNT(*)` counts rows,
-  `COUNT(col)` ignores NULLs; `COUNT` works without `GROUP BY`.
+  `COUNT(col)` ignores NULLs; `SUM`/`AVG` ignore NULL inputs and return `NULL`
+  when no non-NULL input remains. `SUM`/`AVG` currently return `REAL`.
+- **Grouped queries stream.** A `GROUP BY`/aggregate query over a full table scan
+  updates per-group state as rows are decoded, without collecting all matching
+  rows; only the distinct groups are materialized. Non-aggregate queries still
+  materialize their matching rows for sorting/pagination.
+- **DATE and DECIMAL are compatibility mappings.** `DATE` columns are validated
+  ISO-8601 `TEXT` (`YYYY-MM-DD`), ordered lexicographically, and support
+  `DATE '...'` plus `DATE ± INTERVAL '<n>' DAY`. `DECIMAL`/`NUMERIC` columns are
+  stored as `REAL`; this is adequate for many TPC-H-shaped scans but is not
+  exact fixed-point arithmetic. `INTERVAL` units other than `DAY` are rejected.
 - **Primary keys are required** and imply `NOT NULL`. `INT` and `TEXT` keys are
   encoded order-preservingly, so rows are physically stored in primary-key order
   and `ORDER BY <pk>` needs no in-memory sort. Primary keys are case-sensitive.
@@ -141,6 +151,45 @@ index catalog, which is also what `.schema` prints.
   script is not a transaction: earlier statements stay committed if a later one
   fails. Mutations are serialized by an in-process mutex; concurrent processes
   should not write the same database.
+
+### TPC-H Q1/Q6 coverage
+
+The engine accepts the SQL shape used by TPC-H Q1 and Q6, including `DATE`
+literals, `DATE - INTERVAL ... DAY`, `DECIMAL` columns, grouped aggregates,
+arithmetic aggregate arguments, and `ORDER BY` on grouping columns:
+
+```sql
+-- Q1
+SELECT l_returnflag, l_linestatus,
+       SUM(l_quantity) AS sum_qty,
+       SUM(l_extendedprice) AS sum_base_price,
+       SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+       SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+       AVG(l_quantity) AS avg_qty,
+       COUNT(*) AS count_order
+FROM lineitem
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+
+-- Q6
+SELECT SUM(l_extendedprice * l_discount) AS revenue
+FROM lineitem
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01
+  AND l_quantity < 24;
+```
+
+The table definition is adapted to this engine's single-column primary-key
+requirement: TPC-H `lineitem` has a composite `(l_orderkey, l_linenumber)` key,
+so use a unique surrogate primary key (or make `l_orderkey` unique in a
+benchmark copy). The query semantics over the remaining columns are unchanged.
+A 200k-row synthetic lineitem-shaped dataset executed Q1 in about 0.55 s and Q6
+in about 0.47 s with the release CLI (Apple M1; numbers depend on hardware).
+This is functional coverage, not an official TPC-H benchmark result: there is
+no dbgen/load pipeline, composite-key support, parallelism, or columnar scan
+yet.
 
 ### Index DDL
 
@@ -221,8 +270,10 @@ cargo test
 ```
 
 The suite covers CRUD, point lookups, three-valued NULL logic, ordering and
-pagination, `DISTINCT`, `COUNT`, `LIKE`/`BETWEEN`/`IN`, text-key ordering and
-escaping, primary-key conflicts, schema/type errors, persistence across reopen,
+pagination, `DISTINCT`, `COUNT`/`SUM`/`AVG`, `GROUP BY`, TPC-H Q1/Q6-shaped
+queries with `DATE` and `DECIMAL` columns, `LIKE`/`BETWEEN`/`IN`, text-key
+ordering and escaping, primary-key conflicts, schema/type errors, persistence
+across reopen,
 table drop/recreate, index DDL, unique and composite indexes, index maintenance
 on insert/update/delete, range plans, and NULL handling in unique indexes. Unit
 tests in `src/key.rs` verify encoding round-trips and order preservation, and
@@ -236,7 +287,8 @@ requests; see `.github/workflows/ci.yml`. Locally run `cargo fmt --check` and
 
 This is a teaching/demo-scale engine, not a production database:
 
-- No joins, subqueries, CTEs, `GROUP BY`, `HAVING`, or aggregates beyond `COUNT`.
+- No joins, subqueries, CTEs, `HAVING`, `MIN`/`MAX`, window functions, or
+  `COUNT(DISTINCT ...)`. `GROUP BY` requires at least one aggregate projection.
 - Indexes accelerate equality/range predicates on a leading index prefix; they
   do not accelerate `OR`, `IN`, `BETWEEN`, `LIKE`, or `IS NULL` predicates.
   There are no covering/index-only scans and no index-based ordering: matching
@@ -249,6 +301,9 @@ This is a teaching/demo-scale engine, not a production database:
 - `UPDATE`/`INSERT` accept literal values only (`SET age = age + 1` is rejected).
 - `ORDER BY` must reference table columns, not output aliases.
 - No multi-statement or cross-process transactions; one writer process assumed.
-- All matching rows and sort results are materialized in memory.
+- Non-aggregate queries materialize all matching rows and sort results in
+  memory; grouped/aggregate full scans stream rows but materialize the groups.
+- `DECIMAL` is approximate (`REAL`), `DATE` is stored as text rather than a
+  native date, and `INTERVAL` supports only `DAY`.
 - No authentication, authorization, or SQL injection surface beyond the caller's
   own database (there is no network protocol).

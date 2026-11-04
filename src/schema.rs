@@ -54,8 +54,19 @@ impl DataType {
             | SqlDataType::Nvarchar(_)
             | SqlDataType::String(_) => Ok(DataType::Text),
             SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Boolean),
+            // DATE and DECIMAL are accepted for TPC-H compatibility. Dates are
+            // stored as ISO-8601 TEXT; DECIMAL is stored as REAL (the engine is
+            // a benchmark-oriented prototype, not an exact NUMERIC engine).
+            SqlDataType::Date | SqlDataType::Date32 => Ok(DataType::Text),
+            SqlDataType::Numeric(_)
+            | SqlDataType::Decimal(_)
+            | SqlDataType::DecimalUnsigned(_)
+            | SqlDataType::BigNumeric(_)
+            | SqlDataType::BigDecimal(_)
+            | SqlDataType::Dec(_)
+            | SqlDataType::DecUnsigned(_) => Ok(DataType::Real),
             other => Err(Error::Unsupported(format!(
-                "column type `{other}` (supported types: INT, REAL, TEXT, BOOLEAN)"
+                "column type `{other}` (supported types: INT, REAL, TEXT, BOOLEAN, DATE, DECIMAL)"
             ))),
         }
     }
