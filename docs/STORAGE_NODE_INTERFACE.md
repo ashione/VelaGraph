@@ -1,0 +1,250 @@
+# Storage node interface v0
+
+Status: proposal for P0/D1. This document defines the narrow boundary between the
+graph kernel and a replicated storage node. It is deliberately smaller than a
+database API: the node understands opaque key/value bytes and one-partition
+batches, not vertices, edges, Cypher, or query plans.
+
+K1 is the current local implementation: RocksDB, `u64` ids, partition-scoped
+keys, deterministic protobuf-compatible records, and single-`WriteBatch`
+atomicity. See [`GRAPH_FORMAT.md`](GRAPH_FORMAT.md).
+
+## Goals
+
+- Let the kernel and distributed layers evolve independently.
+- Make the atomic unit explicit: one partition-local batch.
+- Support an in-process RocksDB adapter now and a Raft-replicated shard later.
+- Make retries, fencing, snapshots, and migration first-class, not caller
+  folklore.
+- Keep the interface byte-oriented so storage format changes do not leak into
+  replication or routing code.
+
+## Non-goals for v0
+
+- Cross-partition transactions.
+- Cross-partition edge creation (see “Boundary edges”).
+- Raft implementation details, leader election, or membership.
+- Query parsing/planning, graph semantics, or secondary indexes.
+- Multi-tenant quotas and billing.
+
+## Identity and ownership
+
+```text
+ShardId      u64       physical replication unit
+PartitionId  u32       K1 key-space partition (already in every graph key)
+Epoch        u64       monotonically increasing shard ownership term
+NodeId       u64       storage/replica identity
+RequestId    [u8; 16]  client idempotency key
+```
+
+A shard owns one or more partitions (or a key range inside partitions). A node
+serves a shard only while it believes it is the leader for the current `Epoch`.
+Every write carries `(shard, epoch)`; a stale epoch is fenced, never applied.
+
+Keys are opaque bytes. The graph format's `graph/v1/p/<partition>/...` prefix is
+a kernel convention the node must not reinterpret. Range scans are half-open
+`[start, end)` byte ranges and may be bounded by a row limit and a byte limit.
+
+## Operations
+
+### Reads
+
+```text
+get(key, read_view) -> Option<value>
+scan(range, limit, byte_limit, read_view) -> stream of (key, value)
+```
+
+`None` means the key is absent; it is not an error. Reads are served from a
+`ReadView`:
+
+```text
+ReadView { shard, epoch, sequence }
+```
+
+- `sequence` is the applied state-machine sequence, not wall-clock time.
+- A leader read at the latest sequence is linearizable.
+- A snapshot read pins a sequence for the duration of a query/transaction.
+- Follower reads are allowed only when the caller sets `allow_stale`; the
+  response reports the observed sequence.
+
+### Writes
+
+```text
+batch_write(shard, epoch, request_id, operations) -> WriteResult
+```
+
+`operations` is an ordered list of `put(key, value)` and `delete(key)`. The whole
+batch is atomic or fails as a unit; there is no partial success. `WriteResult`
+contains the applied sequence and a committed/duplicate/dry-run status.
+
+`request_id` is the idempotency key. A retry with the same id and identical
+bytes returns the original result; the same id with different bytes is an
+`IdempotencyConflict`. The dedup window is bounded and documented by the node
+(proposal: at least 10 minutes or the Raft log retention window, whichever is
+shorter).
+
+A write must not mix keys owned by different shards. That is a client routing
+error, not a partially applied transaction.
+
+### Single-shard transaction
+
+```text
+begin(shard, epoch, options) -> TransactionHandle
+txn.get / txn.scan / txn.put / txn.delete
+txn.commit() / txn.abort()
+```
+
+v0 only promises a transaction whose keys are owned by one shard. It provides
+snapshot reads and atomic commit; isolation is snapshot isolation with
+first-committer-wins conflict detection, or a simpler serial commit if K3 has
+not landed MVCC yet. The transaction interface is a placeholder for K3; D4
+builds cross-shard coordination above it, never inside it.
+
+### Snapshots
+
+`read_view()` returns a pinned sequence for a bounded lease. The node must reject
+or renew expired views; a query that exceeds its lease must not silently change
+its snapshot. Snapshot creation is cheap and does not copy the graph.
+
+### Split / migration hooks
+
+```text
+admin.export_range(shard, range) -> snapshot stream + manifest
+admin.import_range(target_shard, manifest, stream) -> installed sequence
+admin.freeze(shard, epoch) -> frozen shard
+admin.install(shard, epoch, manifest) -> new owner
+admin.abort_migration(shard) -> rollback
+```
+
+Export is at a pinned sequence. Import validates the manifest, key range,
+checksums, and sequence before making the range visible. The last step is an
+epoch bump in the catalog; until then the old owner remains authoritative.
+Rollback discards imported data and leaves the source authoritative.
+
+Migration must be restartable and idempotent. A partially imported range is
+never visible.
+
+## Error model
+
+```text
+NotFound             not an error for get; scan simply ends
+InvalidArgument      malformed range, empty batch, mixed-shard batch
+NotLeader            include leader hint and current epoch when known
+Fenced               stale epoch; refresh route and retry
+Unavailable          no quorum / temporarily unreachable; retryable with backoff
+IdempotencyConflict  same request id, different bytes
+Conflict             transaction write conflict; retryable by re-reading
+ResourceExhausted    scan/row/byte limit
+Corrupt              checksum/format/version failure; do not auto-retry
+Unsupported          unknown interface/feature version
+```
+
+Retry policy is part of the contract: `Fenced`, `Unavailable`, and `Conflict`
+are retryable after refreshing route/read view; `Corrupt`,
+`IdempotencyConflict`, and `InvalidArgument` are not.
+
+## Consistency contract
+
+- A committed batch is visible to every later leader read at a sequence greater
+  than or equal to its `WriteResult.sequence`.
+- A snapshot read sees exactly the state at its pinned sequence.
+- Writes from one client are not reordered by retries because `request_id`
+  deduplicates them.
+- v0 makes no cross-shard atomicity promise. D4 adds it explicitly.
+
+## Versioning and negotiation
+
+```text
+INTERFACE_VERSION = 0
+features = bitset
+```
+
+The client sends its version and required feature bits on connect. The node
+rejects unknown required features with `Unsupported`; optional features are
+reported in the handshake. Adding an optional operation or error code is
+backward compatible; changing key/record bytes is a graph-format version
+change, not an interface change.
+
+## Rust sketch
+
+```rust
+pub trait StorageNode: Send + Sync {
+    fn read_view(&self) -> Result<ReadView>;
+    fn get(&self, key: &[u8], view: &ReadView) -> Result<Option<Vec<u8>>>;
+    fn scan(&self, range: KeyRange, limit: ScanLimit, view: &ReadView)
+        -> Result<Vec<KeyValue>>;
+    fn batch_write(&self, request: WriteRequest) -> Result<WriteResult>;
+    fn begin(&self, request: TransactionRequest) -> Result<Box<dyn Transaction>>;
+    fn admin(&self) -> &dyn StorageAdmin;
+}
+```
+
+The trait is intentionally synchronous and byte-oriented. Async/RPC adapters
+wrap it; the graph kernel sees the same operations whether the node is local
+RocksDB or a replicated shard.
+
+## Read sequence
+
+```text
+client -> route(shard, epoch) -> node
+client -> node.read_view() -> {shard, epoch, sequence}
+client -> node.get/scan(..., view)
+```
+
+If `Fenced`, the client refreshes the route and retries with the new epoch.
+
+## Write sequence
+
+```text
+client -> route(shard, epoch)
+client -> batch_write(shard, epoch, request_id, ops)
+node: validate owner/epoch -> append to replication log -> apply -> dedup[request_id]
+node -> {committed, sequence}
+```
+
+The batch is applied only after replication commit. A retry with the same
+`request_id` returns the recorded result even if the response was lost.
+
+## Boundary edges
+
+K1 requires both endpoints of an edge in one partition. Real graphs have edges
+that cross partition boundaries. v0 therefore **rejects** cross-partition edge
+creation; it does not pretend the edge exists somewhere.
+
+The D1 decision must choose one placement policy before cross-shard writes are
+enabled:
+
+1. **Source-owned edge + target boundary index**: edge record and out-adjacency
+   live with the source; target keeps a lightweight incoming reference. A
+   cross-shard batch is required and cannot be v0-atomic.
+2. **Co-locate endpoints**: route an edge only when both endpoints are in the
+   same shard; otherwise the query planner performs a distributed join. Simple,
+   but can strand high-degree vertices.
+3. **Duplicate edge on both endpoint shards**: doubles writes and needs conflict
+   resolution. Not recommended for v0.
+
+The recommendation is (1) after D4 supplies cross-shard coordination, with (2)
+as the safe default until then.
+
+## Acceptance tests for the local adapter
+
+- `get` returns `None` for a missing key and never invents an error.
+- A batch with a failed operation writes nothing.
+- Retrying the same `request_id` and bytes is idempotent; different bytes is
+  `IdempotencyConflict`.
+- A stale epoch returns `Fenced` and the old owner cannot apply writes.
+- `scan` respects start/end, row limit, and byte limit; a range with no data
+  returns an empty result.
+- A snapshot read is stable across concurrent committed writes.
+- Export/import preserves every key/value and sequence; a failed import leaves
+  the source authoritative and the target empty.
+- A mixed-shard batch is rejected before any write.
+
+## Open P0 decisions
+
+- Shard by vertex-id hash/range vs. explicit tenant partition; the K1 key
+  already carries a partition, but the mapping is not frozen.
+- Read linearizability: leader-only reads vs. lease/follower reads.
+- Raft library choice and snapshot transfer format.
+- Boundary-edge policy above.
+- Maximum batch size, scan limits, and dedup retention.
