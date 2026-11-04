@@ -34,9 +34,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  # Test and Clippy share no compiler wrapper (Clippy rebuilds every crate), so
-  # run them on separate runners. On a cold cache this halves wall-clock time
-  # from ~36 minutes to ~18; each job then saves its own dependency cache.
+  # The previous serial job took 36m36s cold (test 17m56 + Clippy 17m31).
+  # Separate runners bound wall-clock time by the slower job; the first run
+  # with the reset cache took 18m12s. Total runner minutes are roughly unchanged;
+  # the split buys faster feedback.
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -67,7 +68,6 @@ jobs:
           # key already existed.
           prefix-key: v1-rust
           cache-on-failure: false
-          cache-targets: true
 
       - name: Run tests
         run: cargo test --locked
@@ -101,7 +101,6 @@ jobs:
         with:
           prefix-key: v1-rust
           cache-on-failure: false
-          cache-targets: true
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings

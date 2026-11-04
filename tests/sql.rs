@@ -429,8 +429,18 @@ fn count_aggregates() {
         &[&["37", "46"]],
     );
     expect(
-        &query(&db, "SELECT MIN(age), MAX(age) FROM empty_table"),
+        &query(&db, "SELECT MIN(id), MAX(id) FROM empty_table"),
         &[&["NULL", "NULL"]],
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN(age) FROM empty_table",
+        "column `age` does not exist",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT SUM(nope) FROM empty_table",
+        "column `nope` does not exist",
     );
     assert_header(
         &query(
@@ -450,6 +460,58 @@ fn count_aggregates() {
             &["true", "36", "36"],
             &["NULL", "NULL", "NULL"],
         ],
+    );
+    expect(
+        &query(&db, "SELECT MIN(active), MAX(active) FROM users"),
+        &[&["false", "true"]],
+    );
+    expect(
+        &query(&db, "SELECT MIN(age + 0.5), MAX(age + 0.5) FROM users"),
+        &[&["36.5", "45.5"]],
+    );
+    expect(
+        &query(&db, "SELECT MIN(age) FROM users WHERE id = 1"),
+        &[&["36"]],
+    );
+    db.execute("CREATE INDEX idx_users_age ON users (age)");
+    expect(
+        &query(&db, "SELECT MIN(age) FROM users WHERE age > 40"),
+        &[&["45"]],
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN() FROM users",
+        "requires exactly one argument",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN(age, id) FROM users",
+        "requires exactly one argument",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN(DISTINCT age) FROM users",
+        "requires no modifiers",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN(age = 1) FROM users",
+        "arithmetic operator `=`",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN(age % 2) FROM users",
+        "arithmetic operator `%`",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT MIN(name + 1) FROM users",
+        "arithmetic on TEXT and INT",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT SUM(name) FROM users",
+        "requires a numeric argument, got TEXT",
     );
     assert_error_contains(
         &db,
@@ -1067,6 +1129,176 @@ fn indexes_survive_reopen() {
 }
 
 #[test]
+fn having_filters_groups() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount REAL)");
+    assert_eq!(
+        db.affected(
+            "INSERT INTO sales VALUES              (1, 'east', 10.0), (2, 'east', 20.0), (3, 'east', 30.0),              (4, 'west', 5.0), (5, 'north', NULL)"
+        ),
+        5
+    );
+
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(*) FROM sales GROUP BY region \
+             HAVING COUNT(*) > 1 ORDER BY region",
+        ),
+        &[&["east", "3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region FROM sales GROUP BY region \
+             HAVING COUNT(*) > 1 ORDER BY region",
+        ),
+        &[&["east"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, SUM(amount) FROM sales GROUP BY region \
+             HAVING SUM(amount) > 25 ORDER BY region",
+        ),
+        &[&["east", "60"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(*) FROM sales GROUP BY region \
+             HAVING MIN(amount) > 5 ORDER BY region",
+        ),
+        &[&["east", "3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(*) FROM sales GROUP BY region \
+             HAVING COUNT(*) BETWEEN 1 AND 2 ORDER BY region",
+        ),
+        &[&["north", "1"], &["west", "1"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(*) FROM sales GROUP BY region \
+             HAVING NOT (COUNT(*) = 1) ORDER BY region",
+        ),
+        &[&["east", "3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(*) FROM sales GROUP BY region \
+             HAVING COUNT(*) > 1 AND SUM(amount) > 50 ORDER BY region",
+        ),
+        &[&["east", "3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(*) FROM sales GROUP BY region \
+             HAVING region IN ('east', 'west') ORDER BY region",
+        ),
+        &[&["east", "3"], &["west", "1"]],
+    );
+    expect(
+        &query(&db, "SELECT COUNT(*) FROM sales HAVING COUNT(*) = 5"),
+        &[&["5"]],
+    );
+    expect(
+        &query(&db, "SELECT COUNT(*) FROM sales HAVING SUM(amount) > 50"),
+        &[&["5"]],
+    );
+    expect(
+        &query(&db, "SELECT COUNT(*) FROM sales HAVING COUNT(*) > 100"),
+        &[],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, AVG(amount) FROM sales GROUP BY region \
+             HAVING AVG(amount) > 15 ORDER BY region",
+        ),
+        &[&["east", "20"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT region, COUNT(amount) FROM sales GROUP BY region \
+             HAVING COUNT(amount) = 0 ORDER BY region",
+        ),
+        &[&["north", "0"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT COUNT(*) FROM sales GROUP BY region \
+             HAVING region = 'east'",
+        ),
+        &[&["3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT COUNT(*) FROM sales AS s GROUP BY s.region \
+             HAVING s.region = 'east'",
+        ),
+        &[&["3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT COUNT(*) FROM sales WHERE region = 'east' \
+             HAVING COUNT(*) = 3",
+        ),
+        &[&["3"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT COUNT(*) FROM sales WHERE id = 1 HAVING COUNT(*) = 1",
+        ),
+        &[&["1"]],
+    );
+    db.execute("CREATE TABLE empty_sales (id INT PRIMARY KEY, region TEXT, amount REAL)");
+    expect(
+        &query(&db, "SELECT COUNT(*) FROM empty_sales HAVING COUNT(*) = 0"),
+        &[&["0"]],
+    );
+    expect(
+        &query(&db, "SELECT COUNT(*) FROM empty_sales HAVING COUNT(*) > 0"),
+        &[],
+    );
+    db.execute("CREATE INDEX idx_sales_region ON sales (region)");
+    expect(
+        &query(
+            &db,
+            "SELECT COUNT(*) FROM sales WHERE region = 'west' \
+             GROUP BY region HAVING COUNT(*) = 1",
+        ),
+        &[&["1"]],
+    );
+
+    assert_error_contains(
+        &db,
+        "SELECT region, COUNT(*) FROM sales GROUP BY region HAVING amount > 10",
+        "must appear in GROUP BY",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(nope) > 0",
+        "column `nope` does not exist",
+    );
+    assert_error_contains(
+        &db,
+        "SELECT COUNT(*) FROM sales HAVING COUNT(*)",
+        "must be BOOLEAN",
+    );
+}
+
+#[test]
 fn tpch_q1_and_q6_queries() {
     let db = TestDb::new();
     db.execute(
@@ -1152,6 +1384,10 @@ fn tpch_q1_and_q6_queries() {
     // DATE columns keep ISO text ordering and can be selected directly.
     let dates = query(&db, "SELECT l_shipdate FROM lineitem WHERE l_orderkey = 1");
     expect(&dates, &[&["1994-06-01"]]);
+    expect(
+        &query(&db, "SELECT MIN(l_shipdate), MAX(l_shipdate) FROM lineitem"),
+        &[&["1994-02-01", "1998-10-01"]],
+    );
 }
 
 #[test]

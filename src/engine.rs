@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ColumnOption, CreateIndex, CreateTable,
     DataType as SqlDataType, DateTimeField, Delete, Distinct, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, Interval, LimitClause, ObjectName,
-    ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select, SelectItem, SetExpr, Statement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, TypedString, UnaryOperator, Update,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Insert, Interval, LimitClause,
+    ObjectName, ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select, SelectItem, SetExpr,
+    Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TypedString,
+    UnaryOperator, Update,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -500,9 +501,26 @@ impl TableEngine {
         let (schema, alias) = self.table_from_select(select)?;
         let distinct = parse_distinct(select)?;
         let projections = resolve_projection(&select.projection, &schema, alias.as_deref())?;
-        let has_aggregate = projections.iter().any(ResolvedProjection::is_aggregate);
         let group_by = parse_group_by(select, &schema, alias.as_deref())?;
         let has_group_by = !group_by.is_empty();
+        let having = match select.having.as_ref() {
+            Some(expression) => Some(resolve_having(
+                expression,
+                &schema,
+                alias.as_deref(),
+                &group_by,
+            )?),
+            None => None,
+        };
+        let has_aggregate = projections.iter().any(ResolvedProjection::is_aggregate)
+            || having
+                .as_ref()
+                .is_some_and(|having| !having.aggregates.is_empty());
+        if having.is_some() && !has_aggregate {
+            return Err(Error::Unsupported(
+                "HAVING requires an aggregate query".into(),
+            ));
+        }
         if has_group_by && !has_aggregate {
             return Err(Error::Unsupported(
                 "GROUP BY without an aggregate projection".into(),
@@ -554,7 +572,14 @@ impl TableEngine {
         let point_lookup = point_lookup(select, &schema, alias.as_deref())?;
 
         if has_aggregate {
-            let mut aggregates = AggregateAccumulator::new(&group_by, &projections);
+            let mut aggregates = AggregateAccumulator::new(
+                &group_by,
+                &projections,
+                having
+                    .as_ref()
+                    .map(|having| having.aggregates.as_slice())
+                    .unwrap_or(&[]),
+            );
             match point_lookup {
                 PointLookup::Missing => {}
                 PointLookup::Value(ref primary_key) => {
@@ -615,7 +640,8 @@ impl TableEngine {
                     }
                 }
             }
-            let mut output_rows = aggregates.finish(&group_by, &projections, &order_keys)?;
+            let mut output_rows =
+                aggregates.finish(&group_by, &projections, &order_keys, having.as_ref())?;
             if distinct {
                 let mut seen = HashSet::new();
                 output_rows.retain(|row| {
@@ -705,9 +731,6 @@ impl TableEngine {
             if !modifiers.is_empty() {
                 return Err(Error::Unsupported("GROUP BY modifiers".into()));
             }
-        }
-        if select.having.is_some() {
-            return Err(Error::Unsupported("HAVING".into()));
         }
         if !select.named_window.is_empty() || select.qualify.is_some() {
             return Err(Error::Unsupported("WINDOW/QUALIFY".into()));
@@ -1157,6 +1180,200 @@ fn parse_group_by(
     }
 }
 
+struct ResolvedHaving {
+    expression: Expr,
+    schema: TableSchema,
+    aggregates: Vec<ResolvedProjection>,
+}
+
+fn resolve_having(
+    expression: &Expr,
+    schema: &TableSchema,
+    alias: Option<&str>,
+    group_by: &[usize],
+) -> Result<ResolvedHaving> {
+    let mut aggregates = Vec::new();
+    let mut columns = group_by
+        .iter()
+        .map(|index| schema.columns[*index].clone())
+        .collect::<Vec<_>>();
+    let expression = resolve_having_expression(
+        expression,
+        schema,
+        alias,
+        group_by,
+        &mut aggregates,
+        &mut columns,
+    )?;
+    let schema = TableSchema {
+        name: "__having".to_string(),
+        columns,
+        primary_key: 0,
+    };
+    Ok(ResolvedHaving {
+        expression,
+        schema,
+        aggregates,
+    })
+}
+
+fn resolve_having_expression(
+    expression: &Expr,
+    schema: &TableSchema,
+    alias: Option<&str>,
+    group_by: &[usize],
+    aggregates: &mut Vec<ResolvedProjection>,
+    columns: &mut Vec<Column>,
+) -> Result<Expr> {
+    match strip_nested(expression) {
+        Expr::Function(function)
+            if object_name_is(&function.name, "count")
+                || object_name_is(&function.name, "sum")
+                || object_name_is(&function.name, "avg")
+                || object_name_is(&function.name, "min")
+                || object_name_is(&function.name, "max") =>
+        {
+            let projection = projection_expression(expression, None, schema, alias)?;
+            let data_type = having_aggregate_type(&projection, schema, alias)?;
+            let name = format!("__having_agg_{}", aggregates.len());
+            if columns.iter().any(|column| column.name == name) {
+                return Err(Error::Unsupported(format!(
+                    "HAVING synthetic column `{name}` conflicts with a GROUP BY column"
+                )));
+            }
+            columns.push(Column {
+                name: name.clone(),
+                data_type,
+                nullable: true,
+            });
+            aggregates.push(projection);
+            Ok(Expr::Identifier(Ident::new(name)))
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let index = resolve_column(expression, schema, alias)?;
+            if !group_by.contains(&index) {
+                return Err(Error::Unsupported(format!(
+                    "HAVING column `{}` must appear in GROUP BY",
+                    schema.columns[index].name
+                )));
+            }
+            Ok(Expr::Identifier(Ident::new(
+                schema.columns[index].name.clone(),
+            )))
+        }
+        Expr::Value(_) | Expr::TypedString(_) | Expr::Interval(_) => {
+            Ok(strip_nested(expression).clone())
+        }
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(resolve_having_expression(
+            inner, schema, alias, group_by, aggregates, columns,
+        )?))),
+        Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(resolve_having_expression(
+                expr, schema, alias, group_by, aggregates, columns,
+            )?),
+        }),
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(resolve_having_expression(
+                left, schema, alias, group_by, aggregates, columns,
+            )?),
+            op: op.clone(),
+            right: Box::new(resolve_having_expression(
+                right, schema, alias, group_by, aggregates, columns,
+            )?),
+        }),
+        Expr::IsNull(expr) => Ok(Expr::IsNull(Box::new(resolve_having_expression(
+            expr, schema, alias, group_by, aggregates, columns,
+        )?))),
+        Expr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(resolve_having_expression(
+            expr, schema, alias, group_by, aggregates, columns,
+        )?))),
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(Expr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(resolve_having_expression(
+                expr, schema, alias, group_by, aggregates, columns,
+            )?),
+            pattern: Box::new(resolve_having_expression(
+                pattern, schema, alias, group_by, aggregates, columns,
+            )?),
+            escape_char: match escape_char {
+                Some(escape) => Some(Box::new(resolve_having_expression(
+                    escape, schema, alias, group_by, aggregates, columns,
+                )?)),
+                None => None,
+            },
+        }),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(Expr::Between {
+            expr: Box::new(resolve_having_expression(
+                expr, schema, alias, group_by, aggregates, columns,
+            )?),
+            negated: *negated,
+            low: Box::new(resolve_having_expression(
+                low, schema, alias, group_by, aggregates, columns,
+            )?),
+            high: Box::new(resolve_having_expression(
+                high, schema, alias, group_by, aggregates, columns,
+            )?),
+        }),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let expr =
+                resolve_having_expression(expr, schema, alias, group_by, aggregates, columns)?;
+            let list = list
+                .iter()
+                .map(|item| {
+                    resolve_having_expression(item, schema, alias, group_by, aggregates, columns)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expr::InList {
+                expr: Box::new(expr),
+                list,
+                negated: *negated,
+            })
+        }
+        other => Err(Error::Unsupported(format!("HAVING expression `{other}`"))),
+    }
+}
+
+fn having_aggregate_type(
+    projection: &ResolvedProjection,
+    schema: &TableSchema,
+    alias: Option<&str>,
+) -> Result<DataType> {
+    Ok(match projection {
+        ResolvedProjection::CountStar { .. } | ResolvedProjection::CountColumn { .. } => {
+            DataType::Integer
+        }
+        ResolvedProjection::Sum { .. } | ResolvedProjection::Avg { .. } => DataType::Real,
+        ResolvedProjection::Min { expression, .. } | ResolvedProjection::Max { expression, .. } => {
+            match validate_aggregate_argument(expression, schema, alias, "HAVING")? {
+                ScalarType::Null | ScalarType::Text => DataType::Text,
+                ScalarType::Integer => DataType::Integer,
+                ScalarType::Real => DataType::Real,
+                ScalarType::Boolean => DataType::Boolean,
+            }
+        }
+        ResolvedProjection::Column { .. } => {
+            return Err(Error::Internal("HAVING aggregate is a column".into()))
+        }
+    })
+}
+
 fn resolve_projection(
     projection: &[SelectItem],
     schema: &TableSchema,
@@ -1236,10 +1453,10 @@ fn projection_expression(
             return parse_count(function, alias, schema, table_alias);
         }
         if object_name_is(&function.name, "sum") || object_name_is(&function.name, "avg") {
-            return parse_sum_avg(function, alias);
+            return parse_sum_avg(function, alias, schema, table_alias);
         }
         if object_name_is(&function.name, "min") || object_name_is(&function.name, "max") {
-            return parse_min_max(function, alias);
+            return parse_min_max(function, alias, schema, table_alias);
         }
         return Err(Error::Unsupported(format!(
             "function `{}` (only COUNT, SUM, AVG, MIN and MAX are supported)",
@@ -1277,7 +1494,12 @@ fn parse_count(
     }
 }
 
-fn parse_sum_avg(function: &Function, alias: Option<String>) -> Result<ResolvedProjection> {
+fn parse_sum_avg(
+    function: &Function,
+    alias: Option<String>,
+    schema: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<ResolvedProjection> {
     let name = if object_name_is(&function.name, "sum") {
         "SUM"
     } else {
@@ -1294,6 +1516,13 @@ fn parse_sum_avg(function: &Function, alias: Option<String>) -> Result<ResolvedP
         FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => expression.clone(),
         other => return Err(Error::Unsupported(format!("{name} argument `{other}`"))),
     };
+    let argument_type = validate_aggregate_argument(&expression, schema, table_alias, name)?;
+    if !argument_type.is_numeric() {
+        return Err(Error::Unsupported(format!(
+            "{name} requires a numeric argument, got {}",
+            argument_type.name()
+        )));
+    }
     let header = alias.unwrap_or_else(|| name.to_ascii_lowercase());
     Ok(if name == "SUM" {
         ResolvedProjection::Sum { expression, header }
@@ -1302,7 +1531,12 @@ fn parse_sum_avg(function: &Function, alias: Option<String>) -> Result<ResolvedP
     })
 }
 
-fn parse_min_max(function: &Function, alias: Option<String>) -> Result<ResolvedProjection> {
+fn parse_min_max(
+    function: &Function,
+    alias: Option<String>,
+    schema: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<ResolvedProjection> {
     let name = if object_name_is(&function.name, "min") {
         "MIN"
     } else {
@@ -1319,6 +1553,7 @@ fn parse_min_max(function: &Function, alias: Option<String>) -> Result<ResolvedP
         FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => expression.clone(),
         other => return Err(Error::Unsupported(format!("{name} argument `{other}`"))),
     };
+    validate_aggregate_argument(&expression, schema, table_alias, name)?;
     let header = alias.unwrap_or_else(|| name.to_ascii_lowercase());
     Ok(if name == "MIN" {
         ResolvedProjection::Min { expression, header }
@@ -1353,6 +1588,142 @@ fn aggregate_argument_list<'a>(
         return Err(Error::Unsupported(format!("{name} requires no modifiers")));
     }
     Ok(list)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarType {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Boolean,
+}
+
+impl ScalarType {
+    fn name(self) -> &'static str {
+        match self {
+            ScalarType::Null => "NULL",
+            ScalarType::Integer => "INT",
+            ScalarType::Real => "REAL",
+            ScalarType::Text => "TEXT",
+            ScalarType::Boolean => "BOOLEAN",
+        }
+    }
+
+    fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            ScalarType::Null | ScalarType::Integer | ScalarType::Real
+        )
+    }
+}
+
+fn scalar_type_of(value: &Value) -> ScalarType {
+    match value {
+        Value::Null => ScalarType::Null,
+        Value::Integer(_) => ScalarType::Integer,
+        Value::Real(_) => ScalarType::Real,
+        Value::Text(_) => ScalarType::Text,
+        Value::Boolean(_) => ScalarType::Boolean,
+    }
+}
+
+fn validate_aggregate_argument(
+    expression: &Expr,
+    schema: &TableSchema,
+    table_alias: Option<&str>,
+    name: &str,
+) -> Result<ScalarType> {
+    let inferred = match strip_nested(expression) {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let index = resolve_column(expression, schema, table_alias)?;
+            match schema.columns[index].data_type {
+                DataType::Integer => ScalarType::Integer,
+                DataType::Real => ScalarType::Real,
+                DataType::Text => ScalarType::Text,
+                DataType::Boolean => ScalarType::Boolean,
+            }
+        }
+        Expr::Value(value) => scalar_type_of(&Value::from_sql_literal(value)?),
+        Expr::TypedString(typed) => {
+            eval_typed_string(typed)?;
+            ScalarType::Text
+        }
+        Expr::Interval(interval) => {
+            eval_interval(interval)?;
+            ScalarType::Integer
+        }
+        Expr::UnaryOp { op, expr } => {
+            let operand = validate_aggregate_argument(expr, schema, table_alias, name)?;
+            match op {
+                UnaryOperator::Plus | UnaryOperator::Minus if operand.is_numeric() => operand,
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "{name} unary operator `{op}` on {}",
+                        operand.name()
+                    )))
+                }
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left = validate_aggregate_argument(left, schema, table_alias, name)?;
+            let right = validate_aggregate_argument(right, schema, table_alias, name)?;
+            if left == ScalarType::Null || right == ScalarType::Null {
+                ScalarType::Null
+            } else {
+                match op {
+                    BinaryOperator::Plus | BinaryOperator::Minus => match (left, right) {
+                        (ScalarType::Integer, ScalarType::Integer) => ScalarType::Integer,
+                        (ScalarType::Integer, ScalarType::Real)
+                        | (ScalarType::Real, ScalarType::Integer)
+                        | (ScalarType::Real, ScalarType::Real) => ScalarType::Real,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "{name} arithmetic on {} and {}",
+                                left.name(),
+                                right.name()
+                            )))
+                        }
+                    },
+                    BinaryOperator::Multiply => match (left, right) {
+                        (ScalarType::Integer, ScalarType::Integer) => ScalarType::Integer,
+                        (ScalarType::Integer, ScalarType::Real)
+                        | (ScalarType::Real, ScalarType::Integer)
+                        | (ScalarType::Real, ScalarType::Real) => ScalarType::Real,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "{name} arithmetic on {} and {}",
+                                left.name(),
+                                right.name()
+                            )))
+                        }
+                    },
+                    BinaryOperator::Divide => {
+                        if left.is_numeric() && right.is_numeric() {
+                            ScalarType::Real
+                        } else {
+                            return Err(Error::Unsupported(format!(
+                                "{name} arithmetic on {} and {}",
+                                left.name(),
+                                right.name()
+                            )));
+                        }
+                    }
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "{name} arithmetic operator `{other}`"
+                        )))
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "{name} argument expression `{other}`"
+            )))
+        }
+    };
+    Ok(inferred)
 }
 
 fn parse_order_by(
@@ -1536,20 +1907,21 @@ impl AggregateState {
         Ok(())
     }
 
-    fn add_extreme(&mut self, value: &Value, name: &str, want_max: bool) -> Result<()> {
+    fn add_extreme(&mut self, value: &Value, name: &str) -> Result<()> {
         if value.is_null() {
             return Ok(());
         }
-        let slot = match self {
-            AggregateState::Min(slot) | AggregateState::Max(slot) => slot,
+        let (slot, want_max) = match self {
+            AggregateState::Min(slot) => (slot, false),
+            AggregateState::Max(slot) => (slot, true),
             _ => return Err(Error::Internal(format!("{name} state mismatch"))),
         };
         match slot {
             None => *slot = Some(value.clone()),
             Some(current) => {
-                let ordering = value.compare(current)?.ok_or_else(|| {
-                    Error::InvalidValue(format!("{name} cannot compare NULL values"))
-                })?;
+                let Some(ordering) = value.compare(current)? else {
+                    return Ok(());
+                };
                 let replace = if want_max {
                     ordering == Ordering::Greater
                 } else {
@@ -1601,14 +1973,24 @@ struct AggregateAccumulator {
     groups: Vec<AggregateGroup>,
     lookup: HashMap<Vec<u8>, usize>,
     states_template: Vec<AggregateState>,
+    having_aggregates: Vec<ResolvedProjection>,
 }
 
 impl AggregateAccumulator {
-    fn new(group_by: &[usize], projections: &[ResolvedProjection]) -> Self {
-        let states = projections
+    fn new(
+        group_by: &[usize],
+        projections: &[ResolvedProjection],
+        having_aggregates: &[ResolvedProjection],
+    ) -> Self {
+        let mut states = projections
             .iter()
             .filter_map(AggregateState::from_projection)
             .collect::<Vec<_>>();
+        states.extend(
+            having_aggregates
+                .iter()
+                .filter_map(AggregateState::from_projection),
+        );
         let groups = if group_by.is_empty() {
             vec![AggregateGroup {
                 keys: Vec::new(),
@@ -1622,6 +2004,7 @@ impl AggregateAccumulator {
             groups,
             lookup: HashMap::new(),
             states_template: states,
+            having_aggregates: having_aggregates.to_vec(),
         }
     }
 
@@ -1657,48 +2040,14 @@ impl AggregateAccumulator {
         let group = &mut self.groups[index];
         let mut aggregate_index = 0;
         for projection in projections {
-            match projection {
-                ResolvedProjection::Column { .. } => {}
-                ResolvedProjection::CountStar { .. } => {
-                    if let AggregateState::CountStar(count) = &mut group.states[aggregate_index] {
-                        *count += 1;
-                    }
-                    aggregate_index += 1;
-                }
-                ResolvedProjection::CountColumn { index, .. } => {
-                    if !row.values[*index].is_null() {
-                        if let AggregateState::CountColumn(count) =
-                            &mut group.states[aggregate_index]
-                        {
-                            *count += 1;
-                        }
-                    }
-                    aggregate_index += 1;
-                }
-                ResolvedProjection::Sum { expression, .. }
-                | ResolvedProjection::Avg { expression, .. } => {
-                    let value = eval_scalar(expression, &context)?;
-                    let name = if matches!(projection, ResolvedProjection::Sum { .. }) {
-                        "SUM"
-                    } else {
-                        "AVG"
-                    };
-                    group.states[aggregate_index].add_numeric(&value, name)?;
-                    aggregate_index += 1;
-                }
-                ResolvedProjection::Min { expression, .. }
-                | ResolvedProjection::Max { expression, .. } => {
-                    let value = eval_scalar(expression, &context)?;
-                    let name = if matches!(projection, ResolvedProjection::Min { .. }) {
-                        "MIN"
-                    } else {
-                        "MAX"
-                    };
-                    let want_max = matches!(projection, ResolvedProjection::Max { .. });
-                    group.states[aggregate_index].add_extreme(&value, name, want_max)?;
-                    aggregate_index += 1;
-                }
+            if projection.is_aggregate() {
+                add_aggregate_state(&mut group.states[aggregate_index], projection, &context)?;
+                aggregate_index += 1;
             }
+        }
+        for projection in &self.having_aggregates {
+            add_aggregate_state(&mut group.states[aggregate_index], projection, &context)?;
+            aggregate_index += 1;
         }
         Ok(())
     }
@@ -1708,6 +2057,7 @@ impl AggregateAccumulator {
         group_by: &[usize],
         projections: &[ResolvedProjection],
         order_keys: &[SortKey],
+        having: Option<&ResolvedHaving>,
     ) -> Result<Vec<Vec<Value>>> {
         if group_by.is_empty() {
             // There is exactly one state for an ungrouped aggregate, even when
@@ -1742,8 +2092,23 @@ impl AggregateAccumulator {
             });
         }
 
+        let projection_aggregates = projections
+            .iter()
+            .filter(|projection| projection.is_aggregate())
+            .count();
         let mut output = Vec::with_capacity(self.groups.len());
         for group in self.groups {
+            if let Some(having) = having {
+                let mut values = group.keys.clone();
+                values.extend(
+                    group.states[projection_aggregates..]
+                        .iter()
+                        .map(AggregateState::finish),
+                );
+                if !row_matches(Some(&having.expression), &having.schema, None, &values)? {
+                    continue;
+                }
+            }
             let mut row = Vec::with_capacity(projections.len());
             let mut aggregate_index = 0;
             for projection in projections {
@@ -1775,6 +2140,49 @@ impl AggregateAccumulator {
         }
         Ok(output)
     }
+}
+
+fn add_aggregate_state(
+    state: &mut AggregateState,
+    projection: &ResolvedProjection,
+    context: &RowContext<'_>,
+) -> Result<()> {
+    match projection {
+        ResolvedProjection::Column { .. } => {
+            return Err(Error::Internal("column passed as aggregate".into()))
+        }
+        ResolvedProjection::CountStar { .. } => {
+            if let AggregateState::CountStar(count) = state {
+                *count += 1;
+            }
+        }
+        ResolvedProjection::CountColumn { index, .. } => {
+            if !context.values[*index].is_null() {
+                if let AggregateState::CountColumn(count) = state {
+                    *count += 1;
+                }
+            }
+        }
+        ResolvedProjection::Sum { expression, .. } | ResolvedProjection::Avg { expression, .. } => {
+            let value = eval_scalar(expression, context)?;
+            let name = if matches!(projection, ResolvedProjection::Sum { .. }) {
+                "SUM"
+            } else {
+                "AVG"
+            };
+            state.add_numeric(&value, name)?;
+        }
+        ResolvedProjection::Min { expression, .. } | ResolvedProjection::Max { expression, .. } => {
+            let value = eval_scalar(expression, context)?;
+            let name = if matches!(projection, ResolvedProjection::Min { .. }) {
+                "MIN"
+            } else {
+                "MAX"
+            };
+            state.add_extreme(&value, name)?;
+        }
+    }
+    Ok(())
 }
 
 fn group_key_bytes(keys: &[Value]) -> Vec<u8> {
@@ -2288,7 +2696,7 @@ fn eval_predicate(expression: &Expr, context: &RowContext<'_>) -> Result<Option<
             Value::Boolean(value) => Ok(Some(value)),
             Value::Null => Ok(None),
             other => Err(Error::InvalidValue(format!(
-                "WHERE expression must be BOOLEAN, got {other}"
+                "predicate expression must be BOOLEAN, got {other}"
             ))),
         },
     }

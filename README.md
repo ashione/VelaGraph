@@ -7,7 +7,8 @@ statements are parsed and executed by this crate.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
-ordering, pagination, `DISTINCT`, `GROUP BY`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`.
+ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`.
 
 ## Features
 
@@ -18,12 +19,11 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX
 | Keys | exactly one single-column primary key of type `INT` or `TEXT` |
 | Indexes | single-column and composite indexes; uniqueness; equality and range lookups on a leading column prefix |
 | DML | multi-row `INSERT ... VALUES`, `UPDATE ... SET ... [WHERE]`, `DELETE [WHERE]` |
-| Queries | projection, `WHERE`, `GROUP BY` columns, `COUNT(*)`/`COUNT(col)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT` |
+| Queries | projection, `WHERE`, `GROUP BY` columns, `HAVING` on group columns and aggregates, `COUNT(*)`/`COUNT(col)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT` |
 | Predicates/expressions | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN`; numeric `+ - * /`, unary minus, `DATE` literals and `DATE ± INTERVAL ... DAY` |
 | Storage | RocksDB WAL-backed writes, one atomic `WriteBatch` per statement, point lookups for `pk = literal`, index prefix scans |
 
-Deliberately **not** supported: joins, subqueries, `HAVING`,
-window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
+Deliberately **not** supported: joins, subqueries, window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
 constraints, multi-statement transactions, and `SELECT` without `FROM`. See
 [Limitations](#limitations).
 
@@ -124,7 +124,10 @@ index catalog, which is also what `.schema` prints.
 - **Grouped queries stream.** A `GROUP BY`/aggregate query over a full table scan
   updates per-group state as rows are decoded, without collecting all matching
   rows; only the distinct groups are materialized. Non-aggregate queries still
-  materialize their matching rows for sorting/pagination.
+  materialize their matching rows for sorting/pagination. `HAVING` is evaluated
+  after aggregation and before `DISTINCT`/pagination; it may reference `GROUP BY`
+  columns and aggregate functions, including aggregates not in the projection.
+  It does not accept projection aliases.
 - **DATE and DECIMAL are compatibility mappings.** `DATE` columns are validated
   ISO-8601 `TEXT` (`YYYY-MM-DD`), ordered lexicographically, and support
   `DATE '...'` plus `DATE ± INTERVAL '<n>' DAY`. `DECIMAL`/`NUMERIC` columns are
@@ -278,7 +281,7 @@ cargo test
 ```
 
 The suite covers CRUD, point lookups, three-valued NULL logic, ordering and
-pagination, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, TPC-H Q1/Q6-shaped
+pagination, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, TPC-H Q1/Q6-shaped
 queries with `DATE` and `DECIMAL` columns, `LIKE`/`BETWEEN`/`IN`, text-key
 ordering and escaping, primary-key conflicts, schema/type errors, persistence
 across reopen,
@@ -295,8 +298,9 @@ requests; see `.github/workflows/ci.yml`. Locally run `cargo fmt --check` and
 
 This is a teaching/demo-scale engine, not a production database:
 
-- No joins, subqueries, CTEs, `HAVING`, window functions, or
-  `COUNT(DISTINCT ...)`. `GROUP BY` requires at least one aggregate projection.
+- No joins, subqueries, CTEs, window functions, or DISTINCT aggregate
+  arguments. `GROUP BY` requires at least one aggregate projection or a HAVING
+  aggregate; `HAVING` does not accept projection aliases.
 - Indexes accelerate equality/range predicates on a leading index prefix; they
   do not accelerate `OR`, `IN`, `BETWEEN`, `LIKE`, or `IS NULL` predicates.
   There are no covering/index-only scans and no index-based ordering: matching
