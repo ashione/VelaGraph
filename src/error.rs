@@ -97,6 +97,9 @@ pub enum Error {
     #[error("invalid graph label `{0}`: labels must match [A-Za-z_][A-Za-z0-9_]* and be at most 64 bytes")]
     InvalidGraphLabel(String),
 
+    #[error("invalid graph property: {0}")]
+    InvalidGraphProperty(String),
+
     #[error("corrupt data in RocksDB: {0}")]
     CorruptData(String),
 

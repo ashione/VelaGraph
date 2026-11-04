@@ -146,12 +146,17 @@ fn main() -> rocksdb_sql_table::Result<()> {
 }
 ```
 
-Graph keys are `graph/v/<id>` and `graph/e/<id>` for records and
-`graph/out/<source>/<label>/<edge>` / `graph/in/<target>/<label>/<edge>` for
-adjacency. Edge creation and deletion update both adjacency indexes in one
-`WriteBatch`; deleting a vertex cascades to all incident edges. This is a
-single-process storage kernel: labels and properties are in-memory validated,
-but there is no Cypher parser, planner, MVCC, or Raft layer yet.
+Graph keys are `graph/v1/vertex/<id>` and `graph/v1/edge/<id>` for records and
+`graph/v1/out/<source>/<label>/<edge>` / `graph/v1/in/<target>/<label>/<edge>`
+for adjacency. The `v1` segment versions the on-disk format. Edge creation and
+deletion update both adjacency indexes in one `WriteBatch`; deleting a vertex
+cascades to all incident edges. Writes use RocksDB's default WAL behavior (no
+per-statement fsync), so a process crash may lose the most recent writes. This
+is a single-process storage kernel: labels and properties are validated, but
+there is no Cypher parser, planner, MVCC, or Raft layer yet. The v1 kernel uses
+`i64` vertex/edge ids, one graph namespace per RocksDB instance, and scalar
+property values; these are deliberate first-milestone limits, not the final
+data model.
 
 ## SQL behavior details
 

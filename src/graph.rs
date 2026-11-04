@@ -2,22 +2,22 @@
 //!
 //! This is the storage kernel for the graph direction. It deliberately keeps
 //! the first milestone small: vertices, directed labelled edges, properties,
-//! adjacency indexes, and crash-safe RocksDB writes. Query planning,
+//! adjacency indexes, and WAL-backed RocksDB writes. Query planning,
 //! transactions, and distributed placement build on this layer.
 //!
 //! Key space:
 //!
 //! ```text
-//! graph/v/<vertex-id>                                  -> JSON vertex
-//! graph/e/<edge-id>                                    -> JSON edge
-//! graph/out/<source-id>/<label>/<edge-id>              -> empty
-//! graph/in/<target-id>/<label>/<edge-id>               -> empty
+//! graph/v1/vertex/<vertex-id>                         -> JSON vertex
+//! graph/v1/edge/<edge-id>                             -> JSON edge
+//! graph/v1/out/<source-id>/<label>/<edge-id>          -> empty
+//! graph/v1/in/<target-id>/<label>/<edge-id>           -> empty
 //! ```
 //!
-//! All arrays are length-prefixed only where needed; ids are big-endian i64
-//! and labels are validated ASCII identifiers, so `/` is an unambiguous
-//! separator. Edge mutations write the edge record and both adjacency entries
-//! in one RocksDB `WriteBatch`.
+//! The `v1` segment versions the on-disk layout so a future format can coexist
+//! with existing data. Ids are big-endian i64 and labels are validated ASCII
+//! identifiers, so `/` is an unambiguous separator. Edge mutations write the
+//! edge record and both adjacency entries in one RocksDB `WriteBatch`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -29,10 +29,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::value::Value;
 
-const VERTEX_PREFIX: &[u8] = b"graph/v/";
-const EDGE_PREFIX: &[u8] = b"graph/e/";
-const OUT_PREFIX: &[u8] = b"graph/out/";
-const IN_PREFIX: &[u8] = b"graph/in/";
+const VERTEX_PREFIX: &[u8] = b"graph/v1/vertex/";
+const EDGE_PREFIX: &[u8] = b"graph/v1/edge/";
+const OUT_PREFIX: &[u8] = b"graph/v1/out/";
+const IN_PREFIX: &[u8] = b"graph/v1/in/";
 const MAX_LABEL_LEN: usize = 64;
 
 /// A property-graph vertex.
@@ -85,7 +85,9 @@ enum EdgeDirection {
 ///
 /// Mutations are serialized by an in-process lock and committed as one batch,
 /// so an edge and both of its adjacency entries become visible together. Reads
-/// observe only committed batches. Crash recovery is RocksDB's responsibility.
+/// observe only committed batches. Writes use RocksDB's default WAL behavior
+/// (no per-statement fsync); a process crash may lose the most recent writes,
+/// while a clean reopen recovers any WAL entries that reached the OS.
 pub struct GraphEngine {
     db: DB,
     write_lock: Mutex<()>,
@@ -204,7 +206,7 @@ impl GraphEngine {
     /// Insert a directed edge. Both endpoint vertices must exist and the edge
     /// id must be unused.
     pub fn create_edge(&self, edge: &Edge) -> Result<()> {
-        validate_label(&edge.label)?;
+        validate_edge(edge)?;
         let key = edge_key(edge.id);
         let _guard = self.lock();
         if self.db.get(&key)?.is_some() {
@@ -282,7 +284,15 @@ impl GraphEngine {
             if !key.starts_with(VERTEX_PREFIX) {
                 break;
             }
-            vertices.push(serde_json::from_slice(&bytes)?);
+            let vertex: Vertex = serde_json::from_slice(&bytes)?;
+            let stored_id = id_from_record_key(&key, VERTEX_PREFIX)?;
+            if vertex.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "vertex key {stored_id} contains vertex {}",
+                    vertex.id
+                )));
+            }
+            vertices.push(vertex);
         }
         vertices.sort_by_key(|vertex| vertex.id);
         Ok(vertices)
@@ -299,7 +309,15 @@ impl GraphEngine {
             if !key.starts_with(EDGE_PREFIX) {
                 break;
             }
-            edges.push(serde_json::from_slice(&bytes)?);
+            let edge: Edge = serde_json::from_slice(&bytes)?;
+            let stored_id = id_from_record_key(&key, EDGE_PREFIX)?;
+            if edge.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {stored_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            edges.push(edge);
         }
         edges.sort_by_key(|edge| edge.id);
         Ok(edges)
@@ -418,7 +436,40 @@ fn validate_vertex(vertex: &Vertex) -> Result<()> {
     for label in &vertex.labels {
         validate_label(label)?;
     }
+    validate_properties(&vertex.properties)
+}
+
+fn validate_edge(edge: &Edge) -> Result<()> {
+    validate_label(&edge.label)?;
+    validate_properties(&edge.properties)
+}
+
+fn validate_properties(properties: &BTreeMap<String, Value>) -> Result<()> {
+    for (name, value) in properties {
+        if let Value::Real(value) = value {
+            if !value.is_finite() {
+                return Err(Error::InvalidGraphProperty(format!(
+                    "property `{name}` cannot store a non-finite REAL"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+fn id_from_record_key(key: &[u8], prefix: &[u8]) -> Result<i64> {
+    let suffix = key
+        .strip_prefix(prefix)
+        .ok_or_else(|| Error::CorruptData("record key has the wrong prefix".into()))?;
+    if suffix.len() != 8 {
+        return Err(Error::CorruptData(format!(
+            "record key has {} id bytes, expected 8",
+            suffix.len()
+        )));
+    }
+    Ok(i64::from_be_bytes(suffix.try_into().map_err(|_| {
+        Error::CorruptData("record key does not end with an i64".into())
+    })?))
 }
 
 fn validate_label(label: &str) -> Result<()> {
