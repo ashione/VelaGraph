@@ -172,8 +172,8 @@ for path in result.paths {
 
 A vertex is visited at most once per request, so cycles terminate; results are
 deterministic (edge id ascending) and `truncated` is set when the path limit
-stopped exploration. There is still no Cypher parser/planner: this executor is
-the target a later parser will drive.
+stopped exploration. There is still no Gremlin parser/planner: this executor is
+the foundation a later standard Gremlin layer will drive.
 
 Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
 `graph/v1/p/<partition>/edge/<id>` for records and
@@ -188,7 +188,7 @@ all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
 fsync), so a process crash may lose the most recent writes. This is a
 single-process, single-partition storage kernel: ids are globally unique `u64`
 values supplied by the caller, one `GraphEngine` owns one partition, and there
-is no Cypher parser, planner, MVCC, or Raft layer yet. Both endpoints of an edge
+is no Gremlin parser, planner, MVCC, or Raft layer yet. Both endpoints of an edge
 must currently live in the same partition; cross-partition boundary edges are a
 D1 design item. Scalar property values are a deliberate first-milestone limit,
 not the final data model.
