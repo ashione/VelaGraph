@@ -155,6 +155,52 @@ impl TableSchema {
     }
 }
 
+/// A secondary index definition persisted in the RocksDB catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSchema {
+    pub name: String,
+    /// Indexed column names, in index order.
+    pub columns: Vec<String>,
+    pub unique: bool,
+    /// An index is only visible to readers and maintained by writers once its
+    /// initial build has completed.
+    #[serde(default = "default_true")]
+    pub ready: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl IndexSchema {
+    pub fn validate(&self, table: &TableSchema) -> Result<()> {
+        validate_identifier(&self.name)?;
+        if self.columns.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "index `{}` must include at least one column",
+                self.name
+            )));
+        }
+        for (position, name) in self.columns.iter().enumerate() {
+            table.column_index_or_error(name)?;
+            if self.columns[..position].iter().any(|other| other == name) {
+                return Err(Error::DuplicateColumn(name.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn describe(&self, table: &str) -> String {
+        format!(
+            "CREATE {}INDEX {} ON {} ({})",
+            if self.unique { "UNIQUE " } else { "" },
+            self.name,
+            table,
+            self.columns.join(", ")
+        )
+    }
+}
+
 /// Identifiers are intentionally restricted to simple ASCII names. This keeps
 /// key layout (`row/<table>/<pk>`) unambiguous and avoids quoting edge cases.
 pub fn validate_identifier(name: &str) -> Result<()> {

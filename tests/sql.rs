@@ -773,3 +773,215 @@ fn default_nullable_columns_and_primary_key_position() {
         "cannot be NULL",
     );
 }
+
+#[test]
+fn secondary_indexes_are_maintained_and_dropped() {
+    let db = TestDb::new();
+    db.setup_users();
+
+    let outcome = db
+        .execute("CREATE INDEX idx_age ON users (age)")
+        .pop()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Outcome::CreatedIndex {
+            table: "users".into(),
+            index: "idx_age".into(),
+            existed: false
+        }
+    );
+    let indexes = db.engine.list_indexes("users").unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "idx_age");
+    assert_eq!(indexes[0].columns, vec!["age".to_string()]);
+    assert!(indexes[0].ready);
+    assert!(matches!(
+        db.execute("CREATE INDEX IF NOT EXISTS idx_age ON users (age)")
+            .pop()
+            .unwrap(),
+        Outcome::CreatedIndex { existed: true, .. }
+    ));
+    assert_error_contains(
+        &db,
+        "CREATE INDEX idx_age ON users (active)",
+        "already exists",
+    );
+
+    expect(
+        &query(&db, "SELECT name FROM users WHERE age = 45"),
+        &[&["Grace"]],
+    );
+    expect(
+        &query(&db, "SELECT name FROM users u WHERE u.age = 45"),
+        &[&["Grace"]],
+    );
+    expect(
+        &query(&db, "SELECT id FROM users WHERE age >= 36 ORDER BY id"),
+        &[&["1"], &["2"]],
+    );
+
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)");
+    assert_error_contains(
+        &db,
+        "INSERT INTO users VALUES (4, 'Ada', 20, TRUE)",
+        "duplicate key for unique index",
+    );
+    assert_error_contains(
+        &db,
+        "UPDATE users SET name = 'Ada' WHERE id = 2",
+        "duplicate key for unique index",
+    );
+    expect(
+        &query(&db, "SELECT name FROM users WHERE id = 2"),
+        &[&["Grace"]],
+    );
+
+    db.execute("UPDATE users SET name = 'Grace Hopper' WHERE id = 2");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Grace Hopper'"),
+        &[&["2"]],
+    );
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Grace'"),
+        &[],
+    );
+
+    db.execute("UPDATE users SET age = 37 WHERE id = 1");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE age = 37"),
+        &[&["1"]],
+    );
+    expect(&query(&db, "SELECT id FROM users WHERE age = 36"), &[]);
+
+    db.execute("DELETE FROM users WHERE id = 3");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Linus'"),
+        &[],
+    );
+
+    assert_eq!(
+        db.execute("DROP INDEX idx_age").pop().unwrap(),
+        Outcome::DroppedIndex {
+            index: "idx_age".into(),
+            existed: true
+        }
+    );
+    assert_eq!(
+        db.execute("DROP INDEX IF EXISTS idx_age").pop().unwrap(),
+        Outcome::DroppedIndex {
+            index: "idx_age".into(),
+            existed: false
+        }
+    );
+    assert_error_contains(&db, "DROP INDEX idx_age", "does not exist");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE age = 37"),
+        &[&["1"]],
+    );
+
+    db.execute("UPDATE users SET id = 5 WHERE id = 1");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Ada'"),
+        &[&["5"]],
+    );
+    expect(&query(&db, "SELECT name FROM users WHERE id = 1"), &[]);
+
+    db.execute("DROP TABLE users");
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)");
+    assert!(db.engine.list_indexes("users").unwrap().is_empty());
+}
+
+#[test]
+fn composite_ranges_text_real_boolean_and_null_indexes() {
+    let db = TestDb::new();
+    db.execute(
+        "CREATE TABLE metrics (\
+           id INT PRIMARY KEY,\
+           category TEXT,\
+           score REAL,\
+           active BOOLEAN,\
+           note TEXT\
+         )",
+    );
+    db.execute(
+        "INSERT INTO metrics VALUES \
+         (1, 'a', 1.5, TRUE, 'alpha'),\
+         (2, 'a', 2.5, FALSE, 'beta'),\
+         (3, 'b', -1.5, TRUE, NULL),\
+         (4, 'b', 0.0, NULL, 'gamma')",
+    );
+
+    db.execute("CREATE INDEX idx_cat_score ON metrics (category, score)");
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE category = 'a' AND score >= 2.0 ORDER BY id",
+        ),
+        &[&["2"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE category = 'b' AND score < 0 ORDER BY id",
+        ),
+        &[&["3"]],
+    );
+
+    db.execute("CREATE INDEX idx_score ON metrics (score)");
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE score > -2 AND score <= 0 ORDER BY id",
+        ),
+        &[&["3"], &["4"]],
+    );
+
+    db.execute("CREATE INDEX idx_active ON metrics (active)");
+    expect(
+        &query(&db, "SELECT id FROM metrics WHERE active = FALSE"),
+        &[&["2"]],
+    );
+
+    db.execute("CREATE INDEX idx_note ON metrics (note)");
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE note >= 'beta' ORDER BY id",
+        ),
+        &[&["2"], &["4"]],
+    );
+
+    db.execute("CREATE UNIQUE INDEX idx_cat_note ON metrics (category, note)");
+    assert_eq!(
+        db.affected(
+            "INSERT INTO metrics VALUES \
+             (5, 'c', 3.0, TRUE, NULL),\
+             (6, 'c', 4.0, TRUE, NULL)"
+        ),
+        2
+    );
+    assert_error_contains(
+        &db,
+        "INSERT INTO metrics VALUES (7, 'a', 5.0, TRUE, 'alpha')",
+        "duplicate key for unique index",
+    );
+}
+
+#[test]
+fn unique_index_build_rejects_existing_duplicates() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    db.execute("INSERT INTO t VALUES (1, 'same'), (2, 'same')");
+    assert_error_contains(
+        &db,
+        "CREATE UNIQUE INDEX idx_name ON t (name)",
+        "duplicate key for unique index",
+    );
+    assert!(db.engine.list_indexes("t").unwrap().is_empty());
+    db.execute("CREATE INDEX idx_name ON t (name)");
+    expect(
+        &query(&db, "SELECT id FROM t WHERE name = 'same' ORDER BY id"),
+        &[&["1"], &["2"]],
+    );
+}
