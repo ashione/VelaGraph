@@ -116,8 +116,8 @@ index catalog, which is also what `.schema` prints.
 ### Graph kernel
 
 `GraphEngine` is the first storage layer for the graph direction. It is additive
-and independent of the SQL engine; it does not yet include a query language,
-transactions across statements, or distribution.
+and independent of the SQL engine; it does not yet include an implemented query
+language, transactions across statements, or distribution.
 
 ```rust
 use std::collections::BTreeMap;
@@ -174,6 +174,12 @@ A vertex is visited at most once per request, so cycles terminate; results are
 deterministic (edge id ascending) and `truncated` is set when the path limit
 stopped exploration. There is still no Gremlin parser/planner: this executor is
 the foundation a later standard Gremlin layer will drive.
+
+The target public query language is standard Gremlin, parsed from Apache
+TinkerPop's official grammar; no project-specific dialect is planned. The
+normative v0 subset, limits, and errors are in
+[`docs/QUERY_SPEC.md`](docs/QUERY_SPEC.md), and the implementation constraints are
+in [`docs/IMPLEMENTATION_RULES.md`](docs/IMPLEMENTATION_RULES.md).
 
 Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
 `graph/v1/p/<partition>/edge/<id>` for records and
