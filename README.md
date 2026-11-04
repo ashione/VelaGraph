@@ -146,17 +146,23 @@ fn main() -> rocksdb_sql_table::Result<()> {
 }
 ```
 
-Graph keys are `graph/v1/vertex/<id>` and `graph/v1/edge/<id>` for records and
-`graph/v1/out/<source>/<label>/<edge>` / `graph/v1/in/<target>/<label>/<edge>`
-for adjacency. The `v1` segment versions the on-disk format. Edge creation and
-deletion update both adjacency indexes in one `WriteBatch`; deleting a vertex
-cascades to all incident edges. Writes use RocksDB's default WAL behavior (no
-per-statement fsync), so a process crash may lose the most recent writes. This
-is a single-process storage kernel: labels and properties are validated, but
-there is no Cypher parser, planner, MVCC, or Raft layer yet. The v1 kernel uses
-`i64` vertex/edge ids, one graph namespace per RocksDB instance, and scalar
-property values; these are deliberate first-milestone limits, not the final
-data model.
+Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
+`graph/v1/p/<partition>/edge/<id>` for records and
+`graph/v1/p/<partition>/out/<source>/<label>/<edge>` /
+`graph/v1/p/<partition>/in/<target>/<label>/<edge>` for adjacency. The `v1`
+segment versions the on-disk format and the partition segment lets a future
+distributed layer co-locate a vertex with its adjacency. Record payloads use a
+deterministic protobuf-compatible binary format; the schema and golden vectors
+are in [`docs/GRAPH_FORMAT.md`](docs/GRAPH_FORMAT.md). Edge creation and deletion
+update both adjacency indexes in one `WriteBatch`; deleting a vertex cascades to
+all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
+fsync), so a process crash may lose the most recent writes. This is a
+single-process, single-partition storage kernel: ids are globally unique `u64`
+values supplied by the caller, one `GraphEngine` owns one partition, and there
+is no Cypher parser, planner, MVCC, or Raft layer yet. Both endpoints of an edge
+must currently live in the same partition; cross-partition boundary edges are a
+D1 design item. Scalar property values are a deliberate first-milestone limit,
+not the final data model.
 
 ## SQL behavior details
 

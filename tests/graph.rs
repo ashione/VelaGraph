@@ -8,7 +8,7 @@ fn open(path: &Path) -> GraphEngine {
     GraphEngine::open(path).expect("open graph")
 }
 
-fn vertex(id: i64, label: &str, name: &str) -> Vertex {
+fn vertex(id: u64, label: &str, name: &str) -> Vertex {
     let mut vertex = Vertex::new(id);
     vertex.labels.push(label.to_string());
     vertex
@@ -17,7 +17,7 @@ fn vertex(id: i64, label: &str, name: &str) -> Vertex {
     vertex
 }
 
-fn edge(id: i64, from: i64, to: i64, label: &str) -> Edge {
+fn edge(id: u64, from: u64, to: u64, label: &str) -> Edge {
     Edge::new(id, from, to, label)
 }
 
@@ -282,36 +282,36 @@ fn label_prefixes_do_not_bleed() {
 fn extreme_ids_round_trip() {
     let dir = TempDir::new().unwrap();
     let graph = open(dir.path());
-    for id in [i64::MIN, -1, 0, i64::MAX] {
+    for id in [0, 1, u64::MAX - 1, u64::MAX] {
         graph.create_vertex(&vertex(id, "Node", "n")).unwrap();
     }
+    graph.create_edge(&edge(0, 0, u64::MAX, "EDGE")).unwrap();
     graph
-        .create_edge(&edge(i64::MIN, i64::MIN, i64::MAX, "EDGE"))
+        .create_edge(&edge(u64::MAX, 1, u64::MAX - 1, "EDGE"))
         .unwrap();
-    graph.create_edge(&edge(i64::MAX, -1, 0, "EDGE")).unwrap();
 
-    assert!(graph.get_vertex(i64::MIN).unwrap().is_some());
-    assert!(graph.get_vertex(i64::MAX).unwrap().is_some());
+    assert!(graph.get_vertex(0).unwrap().is_some());
+    assert!(graph.get_vertex(u64::MAX).unwrap().is_some());
     assert_eq!(
         graph
-            .out_edges(i64::MIN, None)
+            .out_edges(0, None)
             .unwrap()
             .iter()
             .map(|edge| edge.id)
             .collect::<Vec<_>>(),
-        [i64::MIN]
+        [0]
     );
     assert_eq!(
         graph
-            .in_edges(i64::MAX, None)
+            .in_edges(u64::MAX, None)
             .unwrap()
             .iter()
             .map(|edge| edge.id)
             .collect::<Vec<_>>(),
-        [i64::MIN]
+        [0]
     );
-    assert!(graph.delete_edge(i64::MIN).unwrap());
-    assert!(graph.delete_vertex(i64::MIN).unwrap());
+    assert!(graph.delete_edge(0).unwrap());
+    assert!(graph.delete_vertex(0).unwrap());
 }
 
 #[test]
@@ -435,5 +435,46 @@ fn empty_graph_lists_are_empty() {
     let dir = TempDir::new().unwrap();
     let graph = open(dir.path());
     assert!(graph.vertices().unwrap().is_empty());
+    assert!(graph.edges().unwrap().is_empty());
+}
+
+#[test]
+fn partitions_are_key_isolated() {
+    let dir = TempDir::new().unwrap();
+    {
+        let graph = GraphEngine::open_partition(dir.path(), 1).unwrap();
+        assert_eq!(graph.partition(), 1);
+        graph.create_vertex(&vertex(1, "Node", "p1")).unwrap();
+    }
+    {
+        let graph = GraphEngine::open_partition(dir.path(), 2).unwrap();
+        assert_eq!(graph.partition(), 2);
+        assert!(graph.vertices().unwrap().is_empty());
+        assert!(graph.get_vertex(1).unwrap().is_none());
+        graph.create_vertex(&vertex(1, "Node", "p2")).unwrap();
+    }
+    {
+        let graph = GraphEngine::open_partition(dir.path(), 1).unwrap();
+        let node = graph.get_vertex(1).unwrap().unwrap();
+        assert_eq!(node.properties["name"], Value::Text("p1".to_string()));
+    }
+}
+
+#[test]
+fn cross_partition_edges_are_not_supported_yet() {
+    let dir = TempDir::new().unwrap();
+    {
+        let graph = GraphEngine::open_partition(dir.path(), 1).unwrap();
+        graph.create_vertex(&vertex(1, "Node", "p1")).unwrap();
+    }
+    {
+        let graph = GraphEngine::open_partition(dir.path(), 2).unwrap();
+        graph.create_vertex(&vertex(2, "Node", "p2")).unwrap();
+    }
+    let graph = GraphEngine::open_partition(dir.path(), 1).unwrap();
+    assert!(matches!(
+        graph.create_edge(&edge(10, 1, 2, "EDGE")),
+        Err(Error::EdgeEndpointNotFound(2))
+    ));
     assert!(graph.edges().unwrap().is_empty());
 }
