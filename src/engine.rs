@@ -801,12 +801,11 @@ fn flip_comparison(op: &BinaryOperator) -> &BinaryOperator {
 fn coerce_index_literal(column: &Column, value: &Value) -> Option<Value> {
     match (column.data_type, value) {
         (DataType::Integer, Value::Integer(value)) => Some(Value::Integer(*value)),
-        (DataType::Integer, Value::Real(value)) => {
-            let lower = -9_223_372_036_854_775_808.0_f64;
-            let upper_exclusive = 9_223_372_036_854_775_808.0_f64;
-            (value.fract() == 0.0 && *value >= lower && *value < upper_exclusive)
-                .then_some(Value::Integer(*value as i64))
-        }
+        // SQL compares an INT column to a REAL literal after converting the
+        // integer to f64. Above 2^53 that conversion can make multiple
+        // integers compare equal to one literal, so an exact index probe
+        // would be wrong; fall back to a scan for these predicates.
+        (DataType::Integer, Value::Real(_)) => None,
         (DataType::Real, Value::Integer(value)) => Some(Value::Real(*value as f64)),
         (DataType::Real, Value::Real(value)) => Some(Value::Real(*value)),
         (DataType::Text, Value::Text(value)) => Some(Value::Text(value.clone())),
