@@ -985,3 +985,36 @@ fn unique_index_build_rejects_existing_duplicates() {
         &[&["1"], &["2"]],
     );
 }
+
+#[test]
+fn indexes_survive_reopen() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    {
+        let engine = TableEngine::open(dir.path()).expect("open engine");
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .expect("insert");
+        engine
+            .execute("CREATE UNIQUE INDEX idx_name ON t (name)")
+            .expect("create index");
+    }
+
+    let engine = TableEngine::open(dir.path()).expect("reopen engine");
+    let indexes = engine.list_indexes("t").expect("list indexes");
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "idx_name");
+    assert!(indexes[0].ready);
+    let result = match engine
+        .execute("SELECT id FROM t WHERE name = 'b'")
+        .expect("query")
+        .pop()
+        .expect("one outcome")
+    {
+        Outcome::Rows(result) => result,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(rendered(&result), vec![vec!["2".to_string()]]);
+}
