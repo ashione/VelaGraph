@@ -1,9 +1,10 @@
 # rocksdb-sql-table
 
 A small, embeddable **table engine backed by RocksDB** with a simple SQL front
-end. It is a self-contained implementation (not a SQL layer over SQLite): table
-catalogs, secondary indexes, and rows live in RocksDB key spaces, and SQL
-statements are parsed and executed by this crate.
+end, plus an experimental single-node **property graph storage kernel**. It is a
+self-contained implementation (not a SQL layer over SQLite): catalogs, indexes,
+rows, and graph adjacency live in RocksDB key spaces, and queries are parsed and
+executed by this crate.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
@@ -22,6 +23,7 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Queries | projection, `WHERE`, `GROUP BY` columns, `HAVING` on group columns and aggregates, `COUNT(*)`/`COUNT(col)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)`, `ORDER BY ... [ASC\|DESC] [NULLS FIRST\|LAST]`, `LIMIT`/`OFFSET`, `DISTINCT` |
 | Predicates/expressions | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN`; numeric `+ - * /`, unary minus, `DATE` literals and `DATE ± INTERVAL ... DAY` |
 | Storage | RocksDB WAL-backed writes, one atomic `WriteBatch` per statement, point lookups for `pk = literal`, index prefix scans |
+| Graph kernel | property vertices/edges, labels and typed properties, outgoing/incoming adjacency indexes, label-filtered traversal, cascade delete |
 
 Deliberately **not** supported: joins, subqueries, window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
 constraints, multi-statement transactions, and `SELECT` without `FROM`. See
@@ -110,6 +112,46 @@ fn main() -> rocksdb_sql_table::Result<()> {
 one `Outcome` per statement (`Rows`, `Modified`, `Created`, `Dropped`,
 `CreatedIndex`, `DroppedIndex`). `TableEngine::list_indexes(table)` returns the
 index catalog, which is also what `.schema` prints.
+
+### Graph kernel
+
+`GraphEngine` is the first storage layer for the graph direction. It is additive
+and independent of the SQL engine; it does not yet include a query language,
+transactions across statements, or distribution.
+
+```rust
+use std::collections::BTreeMap;
+use rocksdb_sql_table::{Edge, GraphEngine, Value, Vertex};
+
+fn main() -> rocksdb_sql_table::Result<()> {
+    let graph = GraphEngine::open("./graph-data")?;
+
+    let mut ada = Vertex::new(1);
+    ada.labels.push("Person".into());
+    ada.properties.insert("name".into(), Value::Text("Ada".into()));
+    graph.create_vertex(&ada)?;
+
+    let mut grace = Vertex::new(2);
+    grace.labels.push("Person".into());
+    graph.create_vertex(&grace)?;
+
+    let mut knows = Edge::new(10, 1, 2, "KNOWS");
+    knows.properties.insert("since".into(), Value::Integer(1843));
+    graph.create_edge(&knows)?;
+
+    let outgoing = graph.out_edges(1, Some("KNOWS"))?;
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].to, 2);
+    Ok(())
+}
+```
+
+Graph keys are `graph/v/<id>` and `graph/e/<id>` for records and
+`graph/out/<source>/<label>/<edge>` / `graph/in/<target>/<label>/<edge>` for
+adjacency. Edge creation and deletion update both adjacency indexes in one
+`WriteBatch`; deleting a vertex cascades to all incident edges. This is a
+single-process storage kernel: labels and properties are in-memory validated,
+but there is no Cypher parser, planner, MVCC, or Raft layer yet.
 
 ## SQL behavior details
 
