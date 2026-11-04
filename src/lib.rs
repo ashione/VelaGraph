@@ -4,7 +4,8 @@
 //! primary-key order under a per-table prefix. It supports a deliberately small
 //! SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`,
 //! `INSERT`, `UPDATE`, `DELETE`, and single-table `SELECT` with `WHERE`,
-//! `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT` and `COUNT`.
+//! `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING` and
+//! `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` aggregates.
 //!
 //! ```no_run
 //! use rocksdb_sql_table::{Outcome, TableEngine};
