@@ -79,6 +79,27 @@ pub enum Error {
     #[error("invalid row: expected {expected} values, got {actual}")]
     InvalidRow { expected: usize, actual: usize },
 
+    #[error("vertex {0} already exists")]
+    VertexAlreadyExists(u64),
+
+    #[error("vertex {0} does not exist")]
+    VertexNotFound(u64),
+
+    #[error("edge {0} already exists")]
+    EdgeAlreadyExists(u64),
+
+    #[error("edge {0} does not exist")]
+    EdgeNotFound(u64),
+
+    #[error("edge endpoint vertex {0} does not exist")]
+    EdgeEndpointNotFound(u64),
+
+    #[error("invalid graph label `{0}`: labels must match [A-Za-z_][A-Za-z0-9_]* and be at most 64 bytes")]
+    InvalidGraphLabel(String),
+
+    #[error("invalid graph property: {0}")]
+    InvalidGraphProperty(String),
+
     #[error("corrupt data in RocksDB: {0}")]
     CorruptData(String),
 
