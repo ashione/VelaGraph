@@ -146,6 +146,35 @@ fn main() -> rocksdb_sql_table::Result<()> {
 }
 ```
 
+### Bounded traversal
+
+`GraphEngine::traverse` is the execution foundation for the query layer. It
+walks 1–3 hops over the outgoing, incoming, or both adjacency indexes, with an
+optional edge label and a result limit:
+
+```rust
+use rocksdb_sql_table::{GraphEngine, TraversalDirection, TraversalOptions};
+
+let graph = GraphEngine::open("./graph-data")?;
+let result = graph.traverse(
+    1,
+    &TraversalOptions {
+        max_hops: 3,
+        direction: TraversalDirection::Out,
+        label: Some("KNOWS".to_string()),
+        limit: 100,
+    },
+)?;
+for path in result.paths {
+    println!("{:?} via {:?}", path.vertices, path.edges);
+}
+```
+
+A vertex is visited at most once per request, so cycles terminate; results are
+deterministic (edge id ascending) and `truncated` is set when the path limit
+stopped exploration. There is still no Cypher parser/planner: this executor is
+the target a later parser will drive.
+
 Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
 `graph/v1/p/<partition>/edge/<id>` for records and
 `graph/v1/p/<partition>/out/<source>/<label>/<edge>` /
