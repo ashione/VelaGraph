@@ -185,8 +185,15 @@ The table definition is adapted to this engine's single-column primary-key
 requirement: TPC-H `lineitem` has a composite `(l_orderkey, l_linenumber)` key,
 so use a unique surrogate primary key (or make `l_orderkey` unique in a
 benchmark copy). The query semantics over the remaining columns are unchanged.
-A 200k-row synthetic lineitem-shaped dataset executed Q1 in about 0.55 s and Q6
-in about 0.47 s with the release CLI (Apple M1; numbers depend on hardware).
+The included `tpch_q1_q6` example generates a 200k-row lineitem-shaped dataset
+and times both queries without external tools:
+
+```bash
+cargo run --release --example tpch_q1_q6 -- 200000 500
+```
+
+On an Apple M1 it loaded the data in about 2.8 s, ran Q6 in about 0.39 s and Q1
+in about 0.51 s. Numbers depend on hardware and dataset shape.
 This is functional coverage, not an official TPC-H benchmark result: there is
 no dbgen/load pipeline, composite-key support, parallelism, or columnar scan
 yet.
