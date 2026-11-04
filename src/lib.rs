@@ -34,10 +34,14 @@ mod graph;
 mod key;
 mod schema;
 mod storage;
+mod traversal;
 mod value;
 
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
 pub use graph::{Edge, GraphEngine, Vertex};
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
+pub use traversal::{
+    TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,
+};
 pub use value::Value;

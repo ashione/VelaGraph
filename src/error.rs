@@ -100,6 +100,9 @@ pub enum Error {
     #[error("invalid graph property: {0}")]
     InvalidGraphProperty(String),
 
+    #[error("invalid traversal: {0}")]
+    InvalidTraversal(String),
+
     #[error("corrupt data in RocksDB: {0}")]
     CorruptData(String),
 

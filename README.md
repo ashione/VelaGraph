@@ -146,6 +146,35 @@ fn main() -> rocksdb_sql_table::Result<()> {
 }
 ```
 
+### Bounded traversal
+
+`GraphEngine::traverse` is the execution foundation for the query layer. It
+walks 1–3 hops over the outgoing, incoming, or both adjacency indexes, with an
+optional edge label and a result limit:
+
+```rust
+use rocksdb_sql_table::{GraphEngine, TraversalDirection, TraversalOptions};
+
+let graph = GraphEngine::open("./graph-data")?;
+let result = graph.traverse(
+    1,
+    &TraversalOptions {
+        max_hops: 3,
+        direction: TraversalDirection::Out,
+        label: Some("KNOWS".to_string()),
+        limit: 100,
+    },
+)?;
+for path in result.paths {
+    println!("{:?} via {:?}", path.vertices, path.edges);
+}
+```
+
+A vertex is visited at most once per request, so cycles terminate; results are
+deterministic (edge id ascending) and `truncated` is set when the path limit
+stopped exploration. There is still no Gremlin parser/planner: this executor is
+the foundation a later standard Gremlin layer will drive.
+
 Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
 `graph/v1/p/<partition>/edge/<id>` for records and
 `graph/v1/p/<partition>/out/<source>/<label>/<edge>` /
@@ -159,7 +188,7 @@ all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
 fsync), so a process crash may lose the most recent writes. This is a
 single-process, single-partition storage kernel: ids are globally unique `u64`
 values supplied by the caller, one `GraphEngine` owns one partition, and there
-is no Cypher parser, planner, MVCC, or Raft layer yet. Both endpoints of an edge
+is no Gremlin parser, planner, MVCC, or Raft layer yet. Both endpoints of an edge
 must currently live in the same partition; cross-partition boundary edges are a
 D1 design item. Scalar property values are a deliberate first-milestone limit,
 not the final data model.
