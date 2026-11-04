@@ -1,23 +1,55 @@
 use crate::error::{Error, Result};
-use crate::schema::DataType;
+use crate::schema::{Column, DataType};
 use crate::value::Value;
 
 /// Key space layout:
 ///
 /// ```text
-/// meta/table/<table>              -> JSON schema
-/// row/<table>/<encoded-pk>        -> JSON array of row values
+/// meta/table/<table>                       -> JSON table schema
+/// meta/index/<table>/<index>               -> JSON index schema
+/// row/<table>/<encoded-pk>                 -> JSON array of row values
+/// idx/<table>/<index>/<encoded-values>...  -> encoded primary key
 /// ```
 ///
-/// Table names are validated ASCII identifiers, so `/` is an unambiguous
-/// separator and row keys for one table form a single iterator prefix.
+/// Table and index names are validated ASCII identifiers, so `/` is an
+/// unambiguous separator and each table or index forms a single iterator
+/// prefix.
 pub(crate) const META_PREFIX: &[u8] = b"meta/table/";
+pub(crate) const INDEX_META_PREFIX: &[u8] = b"meta/index/";
 pub(crate) const ROW_PREFIX: &[u8] = b"row/";
+pub(crate) const INDEX_PREFIX: &[u8] = b"idx/";
 
 pub(crate) fn meta_key(table: &str) -> Vec<u8> {
     let mut key = META_PREFIX.to_vec();
     key.extend_from_slice(table.as_bytes());
     key
+}
+
+pub(crate) fn index_meta_prefix(table: &str) -> Vec<u8> {
+    let mut prefix = INDEX_META_PREFIX.to_vec();
+    prefix.extend_from_slice(table.as_bytes());
+    prefix.push(b'/');
+    prefix
+}
+
+pub(crate) fn index_meta_key(table: &str, index: &str) -> Vec<u8> {
+    let mut key = index_meta_prefix(table);
+    key.extend_from_slice(index.as_bytes());
+    key
+}
+
+pub(crate) fn index_table_prefix(table: &str) -> Vec<u8> {
+    let mut prefix = INDEX_PREFIX.to_vec();
+    prefix.extend_from_slice(table.as_bytes());
+    prefix.push(b'/');
+    prefix
+}
+
+pub(crate) fn index_prefix(table: &str, index: &str) -> Vec<u8> {
+    let mut prefix = index_table_prefix(table);
+    prefix.extend_from_slice(index.as_bytes());
+    prefix.push(b'/');
+    prefix
 }
 
 pub(crate) fn row_prefix(table: &str) -> Vec<u8> {
@@ -33,7 +65,63 @@ pub(crate) fn row_key(table: &str, primary_key: &Value) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-/// Encode a primary key so that RocksDB's byte ordering matches SQL ordering:
+pub(crate) fn key_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.last_mut() {
+        if *last == 0xFF {
+            bound.pop();
+        } else {
+            *last += 1;
+            return Some(bound);
+        }
+    }
+    None
+}
+
+/// Encode one indexed value so that lexicographic key order matches SQL value
+/// order. Each non-NULL value is prefixed with a type tag; NULL sorts first and
+/// is encoded as a single tag byte.
+pub(crate) fn encode_index_value(column: &Column, value: &Value) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(10);
+    match (column.data_type, value) {
+        (_, Value::Null) => encoded.push(0),
+        (DataType::Integer, Value::Integer(value)) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&((*value as u64) ^ (1u64 << 63)).to_be_bytes());
+        }
+        (DataType::Real, Value::Real(value)) => {
+            // SQL compares -0.0 and 0.0 as equal. Use one representation so
+            // equality lookups and unique indexes agree with that comparison.
+            let value = if *value == 0.0 { 0.0 } else { *value };
+            let bits = value.to_bits();
+            let ordered = if bits & (1u64 << 63) != 0 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            encoded.push(1);
+            encoded.extend_from_slice(&ordered.to_be_bytes());
+        }
+        (DataType::Text, Value::Text(value)) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&encode_text(value.as_bytes()));
+        }
+        (DataType::Boolean, Value::Boolean(value)) => {
+            encoded.push(1);
+            encoded.push(u8::from(*value));
+        }
+        (expected, actual) => {
+            return Err(Error::TypeMismatch {
+                column: column.name.clone(),
+                expected: expected.sql_name().to_string(),
+                actual: actual.type_name().to_string(),
+            })
+        }
+    }
+    Ok(encoded)
+}
+
+/// Decode a primary key so that RocksDB's byte ordering matches SQL ordering:
 /// signed integers get their sign bit flipped, and text is null-escaped with a
 /// terminator so that concatenation cannot create prefix collisions.
 pub(crate) fn encode_primary_key(value: &Value) -> Result<Vec<u8>> {
@@ -191,5 +279,96 @@ mod tests {
         assert!(encode_primary_key(&Value::Null).is_err());
         assert!(encode_primary_key(&Value::Boolean(true)).is_err());
         assert!(encode_primary_key(&Value::Real(1.5)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod index_key_tests {
+    use super::*;
+
+    fn column(name: &str, data_type: DataType) -> Column {
+        Column {
+            name: name.into(),
+            data_type,
+            nullable: true,
+        }
+    }
+
+    #[test]
+    fn index_values_sort_in_sql_order_and_canonicalize_zero() {
+        let int = column("i", DataType::Integer);
+        let real = column("r", DataType::Real);
+        let text = column("t", DataType::Text);
+        let boolean = column("b", DataType::Boolean);
+
+        let mut encoded = vec![
+            encode_index_value(&int, &Value::Integer(1)).unwrap(),
+            encode_index_value(&int, &Value::Integer(-1)).unwrap(),
+            encode_index_value(&int, &Value::Null).unwrap(),
+        ];
+        encoded.sort();
+        assert_eq!(
+            encoded,
+            vec![
+                encode_index_value(&int, &Value::Null).unwrap(),
+                encode_index_value(&int, &Value::Integer(-1)).unwrap(),
+                encode_index_value(&int, &Value::Integer(1)).unwrap(),
+            ]
+        );
+
+        let mut real_values = [1.5_f64, -1.5, 0.0, -0.0, 2.0];
+        real_values.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        let mut encoded: Vec<Vec<u8>> = real_values
+            .iter()
+            .map(|value| encode_index_value(&real, &Value::Real(*value)).unwrap())
+            .collect();
+        encoded.sort();
+        assert_eq!(
+            encoded,
+            vec![
+                encode_index_value(&real, &Value::Real(-1.5)).unwrap(),
+                encode_index_value(&real, &Value::Real(-0.0)).unwrap(),
+                encode_index_value(&real, &Value::Real(0.0)).unwrap(),
+                encode_index_value(&real, &Value::Real(1.5)).unwrap(),
+                encode_index_value(&real, &Value::Real(2.0)).unwrap(),
+            ]
+        );
+        assert_eq!(
+            encode_index_value(&real, &Value::Real(-0.0)).unwrap(),
+            encode_index_value(&real, &Value::Real(0.0)).unwrap()
+        );
+
+        let mut encoded = vec![
+            encode_index_value(&text, &Value::Text("b".into())).unwrap(),
+            encode_index_value(&text, &Value::Text("a".into())).unwrap(),
+        ];
+        encoded.sort();
+        assert_eq!(
+            encoded,
+            vec![
+                encode_index_value(&text, &Value::Text("a".into())).unwrap(),
+                encode_index_value(&text, &Value::Text("b".into())).unwrap(),
+            ]
+        );
+
+        let mut encoded = vec![
+            encode_index_value(&boolean, &Value::Boolean(true)).unwrap(),
+            encode_index_value(&boolean, &Value::Boolean(false)).unwrap(),
+        ];
+        encoded.sort();
+        assert_eq!(
+            encoded,
+            vec![
+                encode_index_value(&boolean, &Value::Boolean(false)).unwrap(),
+                encode_index_value(&boolean, &Value::Boolean(true)).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn key_upper_bound_handles_ff_suffixes() {
+        assert_eq!(key_upper_bound(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(key_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(key_upper_bound(b"\xff"), None);
     }
 }

@@ -408,7 +408,12 @@ fn count_aggregates() {
         "SELECT COUNT(*) FROM users ORDER BY id",
         "ORDER BY is not supported",
     );
-    assert_error_contains(&db, "SELECT SUM(age) FROM users", "only COUNT is supported");
+    expect(&query(&db, "SELECT SUM(age) FROM users"), &[&["81"]]);
+    expect(&query(&db, "SELECT AVG(age) FROM users"), &[&["40.5"]]);
+    expect(
+        &query(&db, "SELECT SUM(age), COUNT(age) FROM users"),
+        &[&["81", "2"]],
+    );
 }
 
 #[test]
@@ -771,5 +776,375 @@ fn default_nullable_columns_and_primary_key_position() {
         &db,
         "INSERT INTO t (name) VALUES ('missing id')",
         "cannot be NULL",
+    );
+}
+
+#[test]
+fn secondary_indexes_are_maintained_and_dropped() {
+    let db = TestDb::new();
+    db.setup_users();
+
+    let outcome = db
+        .execute("CREATE INDEX idx_age ON users (age)")
+        .pop()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Outcome::CreatedIndex {
+            table: "users".into(),
+            index: "idx_age".into(),
+            existed: false
+        }
+    );
+    let indexes = db.engine.list_indexes("users").unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "idx_age");
+    assert_eq!(indexes[0].columns, vec!["age".to_string()]);
+    assert!(indexes[0].ready);
+    assert!(matches!(
+        db.execute("CREATE INDEX IF NOT EXISTS idx_age ON users (age)")
+            .pop()
+            .unwrap(),
+        Outcome::CreatedIndex { existed: true, .. }
+    ));
+    assert_error_contains(
+        &db,
+        "CREATE INDEX idx_age ON users (active)",
+        "already exists",
+    );
+
+    expect(
+        &query(&db, "SELECT name FROM users WHERE age = 45"),
+        &[&["Grace"]],
+    );
+    expect(
+        &query(&db, "SELECT name FROM users u WHERE u.age = 45"),
+        &[&["Grace"]],
+    );
+    expect(
+        &query(&db, "SELECT id FROM users WHERE age >= 36 ORDER BY id"),
+        &[&["1"], &["2"]],
+    );
+
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)");
+    assert_error_contains(
+        &db,
+        "INSERT INTO users VALUES (4, 'Ada', 20, TRUE)",
+        "duplicate key for unique index",
+    );
+    assert_error_contains(
+        &db,
+        "UPDATE users SET name = 'Ada' WHERE id = 2",
+        "duplicate key for unique index",
+    );
+    expect(
+        &query(&db, "SELECT name FROM users WHERE id = 2"),
+        &[&["Grace"]],
+    );
+
+    db.execute("UPDATE users SET name = 'Grace Hopper' WHERE id = 2");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Grace Hopper'"),
+        &[&["2"]],
+    );
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Grace'"),
+        &[],
+    );
+
+    db.execute("UPDATE users SET age = 37 WHERE id = 1");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE age = 37"),
+        &[&["1"]],
+    );
+    expect(&query(&db, "SELECT id FROM users WHERE age = 36"), &[]);
+
+    db.execute("DELETE FROM users WHERE id = 3");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Linus'"),
+        &[],
+    );
+
+    assert_eq!(
+        db.execute("DROP INDEX idx_age").pop().unwrap(),
+        Outcome::DroppedIndex {
+            index: "idx_age".into(),
+            existed: true
+        }
+    );
+    assert_eq!(
+        db.execute("DROP INDEX IF EXISTS idx_age").pop().unwrap(),
+        Outcome::DroppedIndex {
+            index: "idx_age".into(),
+            existed: false
+        }
+    );
+    assert_error_contains(&db, "DROP INDEX idx_age", "does not exist");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE age = 37"),
+        &[&["1"]],
+    );
+
+    db.execute("UPDATE users SET id = 5 WHERE id = 1");
+    expect(
+        &query(&db, "SELECT id FROM users WHERE name = 'Ada'"),
+        &[&["5"]],
+    );
+    expect(&query(&db, "SELECT name FROM users WHERE id = 1"), &[]);
+
+    db.execute("DROP TABLE users");
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)");
+    assert!(db.engine.list_indexes("users").unwrap().is_empty());
+}
+
+#[test]
+fn composite_ranges_text_real_boolean_and_null_indexes() {
+    let db = TestDb::new();
+    db.execute(
+        "CREATE TABLE metrics (\
+           id INT PRIMARY KEY,\
+           category TEXT,\
+           score REAL,\
+           active BOOLEAN,\
+           note TEXT\
+         )",
+    );
+    db.execute(
+        "INSERT INTO metrics VALUES \
+         (1, 'a', 1.5, TRUE, 'alpha'),\
+         (2, 'a', 2.5, FALSE, 'beta'),\
+         (3, 'b', -1.5, TRUE, NULL),\
+         (4, 'b', 0.0, NULL, 'gamma')",
+    );
+
+    db.execute("CREATE INDEX idx_cat_score ON metrics (category, score)");
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE category = 'a' AND score >= 2.0 ORDER BY id",
+        ),
+        &[&["2"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE category = 'b' AND score < 0 ORDER BY id",
+        ),
+        &[&["3"]],
+    );
+
+    db.execute("CREATE INDEX idx_score ON metrics (score)");
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE score > -2 AND score <= 0 ORDER BY id",
+        ),
+        &[&["3"], &["4"]],
+    );
+
+    db.execute("CREATE INDEX idx_active ON metrics (active)");
+    expect(
+        &query(&db, "SELECT id FROM metrics WHERE active = FALSE"),
+        &[&["2"]],
+    );
+
+    db.execute("CREATE INDEX idx_note ON metrics (note)");
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM metrics WHERE note >= 'beta' ORDER BY id",
+        ),
+        &[&["2"], &["4"]],
+    );
+
+    db.execute("CREATE UNIQUE INDEX idx_cat_note ON metrics (category, note)");
+    assert_eq!(
+        db.affected(
+            "INSERT INTO metrics VALUES \
+             (5, 'c', 3.0, TRUE, NULL),\
+             (6, 'c', 4.0, TRUE, NULL)"
+        ),
+        2
+    );
+    assert_error_contains(
+        &db,
+        "INSERT INTO metrics VALUES (7, 'a', 5.0, TRUE, 'alpha')",
+        "duplicate key for unique index",
+    );
+}
+
+#[test]
+fn unique_index_build_rejects_existing_duplicates() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    db.execute("INSERT INTO t VALUES (1, 'same'), (2, 'same')");
+    assert_error_contains(
+        &db,
+        "CREATE UNIQUE INDEX idx_name ON t (name)",
+        "duplicate key for unique index",
+    );
+    assert!(db.engine.list_indexes("t").unwrap().is_empty());
+    db.execute("CREATE INDEX idx_name ON t (name)");
+    expect(
+        &query(&db, "SELECT id FROM t WHERE name = 'same' ORDER BY id"),
+        &[&["1"], &["2"]],
+    );
+}
+
+#[test]
+fn indexes_survive_reopen() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    {
+        let engine = TableEngine::open(dir.path()).expect("open engine");
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .expect("insert");
+        engine
+            .execute("CREATE UNIQUE INDEX idx_name ON t (name)")
+            .expect("create index");
+    }
+
+    let engine = TableEngine::open(dir.path()).expect("reopen engine");
+    let indexes = engine.list_indexes("t").expect("list indexes");
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "idx_name");
+    assert!(indexes[0].ready);
+    let result = match engine
+        .execute("SELECT id FROM t WHERE name = 'b'")
+        .expect("query")
+        .pop()
+        .expect("one outcome")
+    {
+        Outcome::Rows(result) => result,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(rendered(&result), vec![vec!["2".to_string()]]);
+}
+
+#[test]
+fn tpch_q1_and_q6_queries() {
+    let db = TestDb::new();
+    db.execute(
+        "CREATE TABLE lineitem (\
+           l_orderkey INT PRIMARY KEY,\
+           l_partkey INT,\
+           l_suppkey INT,\
+           l_linenumber INT,\
+           l_quantity DECIMAL(15,2),\
+           l_extendedprice DECIMAL(15,2),\
+           l_discount DECIMAL(15,2),\
+           l_tax DECIMAL(15,2),\
+           l_returnflag TEXT,\
+           l_linestatus TEXT,\
+           l_shipdate DATE,\
+           l_commitdate DATE,\
+           l_receiptdate DATE,\
+           l_shipinstruct TEXT,\
+           l_shipmode TEXT,\
+           l_comment TEXT\
+         )",
+    );
+    assert_eq!(
+        db.affected(
+            "INSERT INTO lineitem VALUES \
+             (1, 10, 100, 1, 10, 100, 0.05, 0.02, 'N', 'O', DATE '1994-06-01', DATE '1994-06-01', DATE '1994-06-01', 'DELIVER IN PERSON', 'TRUCK', 'a'),\
+             (2, 11, 101, 1, 20, 200, 0.06, 0.02, 'R', 'F', DATE '1995-06-01', DATE '1995-06-01', DATE '1995-06-01', 'NONE', 'MAIL', 'b'),\
+             (3, 12, 102, 1, 30, 300, 0.07, 0.01, 'N', 'O', DATE '1998-10-01', DATE '1998-10-01', DATE '1998-10-01', 'NONE', 'SHIP', 'c'),\
+             (4, 13, 103, 1, 40, 400, 0.04, 0.02, 'R', 'F', DATE '1994-02-01', DATE '1994-02-01', DATE '1994-02-01', 'NONE', 'MAIL', 'd')"
+        ),
+        4
+    );
+
+    // TPC-H Q6: 1994 revenue for discounts in [0.05, 0.07] and quantity < 24.
+    let q6 = query(
+        &db,
+        "SELECT SUM(l_extendedprice * l_discount) AS revenue \
+         FROM lineitem \
+         WHERE l_shipdate >= DATE '1994-01-01' \
+           AND l_shipdate < DATE '1995-01-01' \
+           AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 \
+           AND l_quantity < 24",
+    );
+    assert_header(&q6, &["revenue"]);
+    expect(&q6, &[&["5"]]);
+
+    // TPC-H Q1 with GROUP BY, arithmetic aggregate arguments and ORDER BY.
+    let q1 = query(
+        &db,
+        "SELECT l_returnflag, l_linestatus, \
+                SUM(l_quantity) AS sum_qty, \
+                SUM(l_extendedprice) AS sum_base_price, \
+                SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+                SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, \
+                AVG(l_quantity) AS avg_qty, \
+                COUNT(*) AS count_order \
+         FROM lineitem \
+         WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY \
+         GROUP BY l_returnflag, l_linestatus \
+         ORDER BY l_returnflag, l_linestatus",
+    );
+    assert_header(
+        &q1,
+        &[
+            "l_returnflag",
+            "l_linestatus",
+            "sum_qty",
+            "sum_base_price",
+            "sum_disc_price",
+            "sum_charge",
+            "avg_qty",
+            "count_order",
+        ],
+    );
+    expect(
+        &q1,
+        &[
+            &["N", "O", "10", "100", "95", "96.9", "10", "1"],
+            &["R", "F", "60", "600", "572", "583.44", "30", "2"],
+        ],
+    );
+
+    // DATE columns keep ISO text ordering and can be selected directly.
+    let dates = query(&db, "SELECT l_shipdate FROM lineitem WHERE l_orderkey = 1");
+    expect(&dates, &[&["1994-06-01"]]);
+}
+
+#[test]
+fn date_arithmetic_and_invalid_dates() {
+    let db = TestDb::new();
+    db.execute("CREATE TABLE dates (id INT PRIMARY KEY, day DATE)");
+    db.execute("INSERT INTO dates VALUES (1, DATE '2000-02-28')");
+    expect(
+        &query(&db, "SELECT day FROM dates WHERE day < DATE '2000-03-01'"),
+        &[&["2000-02-28"]],
+    );
+    assert_error_contains(
+        &db,
+        "INSERT INTO dates VALUES (2, DATE '2001-02-29')",
+        "invalid date",
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM dates \
+             WHERE DATE '1998-12-01' - INTERVAL '90' DAY = DATE '1998-09-02'",
+        ),
+        &[&["1"]],
+    );
+    expect(
+        &query(
+            &db,
+            "SELECT id FROM dates \
+             WHERE DATE '2000-03-01' - INTERVAL '1' DAY = DATE '2000-02-29'",
+        ),
+        &[&["1"]],
+    );
+    assert_error_contains(
+        &db,
+        "INSERT INTO dates VALUES (2, DATE '2000-01-01' - INTERVAL '1' MONTH)",
+        "only DAY is supported",
     );
 }

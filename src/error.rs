@@ -48,6 +48,15 @@ pub enum Error {
     #[error("duplicate primary key value {0}")]
     DuplicatePrimaryKey(String),
 
+    #[error("index `{0}` already exists")]
+    IndexAlreadyExists(String),
+
+    #[error("index `{0}` does not exist")]
+    IndexNotFound(String),
+
+    #[error("duplicate key for unique index `{index}`: {value}")]
+    DuplicateIndexValue { index: String, value: String },
+
     #[error("type mismatch for column `{column}`: expected {expected}, got {actual}")]
     TypeMismatch {
         column: String,

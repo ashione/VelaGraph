@@ -2,9 +2,9 @@
 //!
 //! The engine stores table definitions in a catalog key space and rows in
 //! primary-key order under a per-table prefix. It supports a deliberately small
-//! SQL subset: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, and
-//! single-table `SELECT` with `WHERE`, `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`
-//! and `COUNT`.
+//! SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`,
+//! `INSERT`, `UPDATE`, `DELETE`, and single-table `SELECT` with `WHERE`,
+//! `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT` and `COUNT`.
 //!
 //! ```no_run
 //! use rocksdb_sql_table::{Outcome, TableEngine};
@@ -31,5 +31,5 @@ mod value;
 
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
-pub use schema::{Column, DataType, TableSchema};
+pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use value::Value;

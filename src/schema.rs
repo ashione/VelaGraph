@@ -54,8 +54,19 @@ impl DataType {
             | SqlDataType::Nvarchar(_)
             | SqlDataType::String(_) => Ok(DataType::Text),
             SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Boolean),
+            // DATE and DECIMAL are accepted for TPC-H compatibility. Dates are
+            // stored as ISO-8601 TEXT; DECIMAL is stored as REAL (the engine is
+            // a benchmark-oriented prototype, not an exact NUMERIC engine).
+            SqlDataType::Date | SqlDataType::Date32 => Ok(DataType::Text),
+            SqlDataType::Numeric(_)
+            | SqlDataType::Decimal(_)
+            | SqlDataType::DecimalUnsigned(_)
+            | SqlDataType::BigNumeric(_)
+            | SqlDataType::BigDecimal(_)
+            | SqlDataType::Dec(_)
+            | SqlDataType::DecUnsigned(_) => Ok(DataType::Real),
             other => Err(Error::Unsupported(format!(
-                "column type `{other}` (supported types: INT, REAL, TEXT, BOOLEAN)"
+                "column type `{other}` (supported types: INT, REAL, TEXT, BOOLEAN, DATE, DECIMAL)"
             ))),
         }
     }
@@ -152,6 +163,52 @@ impl TableSchema {
             .collect::<Vec<_>>()
             .join(", ");
         format!("CREATE TABLE {} ({columns})", self.name)
+    }
+}
+
+/// A secondary index definition persisted in the RocksDB catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSchema {
+    pub name: String,
+    /// Indexed column names, in index order.
+    pub columns: Vec<String>,
+    pub unique: bool,
+    /// An index is only visible to readers and maintained by writers once its
+    /// initial build has completed.
+    #[serde(default = "default_true")]
+    pub ready: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl IndexSchema {
+    pub fn validate(&self, table: &TableSchema) -> Result<()> {
+        validate_identifier(&self.name)?;
+        if self.columns.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "index `{}` must include at least one column",
+                self.name
+            )));
+        }
+        for (position, name) in self.columns.iter().enumerate() {
+            table.column_index_or_error(name)?;
+            if self.columns[..position].iter().any(|other| other == name) {
+                return Err(Error::DuplicateColumn(name.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn describe(&self, table: &str) -> String {
+        format!(
+            "CREATE {}INDEX {} ON {} ({})",
+            if self.unique { "UNIQUE " } else { "" },
+            self.name,
+            table,
+            self.columns.join(", ")
+        )
     }
 }
 

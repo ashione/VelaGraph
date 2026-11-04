@@ -146,7 +146,17 @@ fn meta_command(command: &str, engine: &TableEngine) -> Result<bool> {
                 eprintln!("usage: .schema <table>");
             } else {
                 match engine.table_schema(argument) {
-                    Ok(schema) => println!("{}", schema.describe()),
+                    Ok(schema) => {
+                        println!("{}", schema.describe());
+                        match engine.list_indexes(argument) {
+                            Ok(indexes) => {
+                                for index in indexes {
+                                    println!("{}", index.describe(argument));
+                                }
+                            }
+                            Err(error) => eprintln!("error: {error}"),
+                        }
+                    }
                     Err(error) => eprintln!("error: {error}"),
                 }
             }
@@ -181,6 +191,24 @@ fn print_outcomes(outcomes: Vec<Outcome>, csv: bool) {
                     println!("table `{table}` dropped");
                 } else {
                     println!("table `{table}` did not exist");
+                }
+            }
+            Outcome::CreatedIndex {
+                table,
+                index,
+                existed,
+            } => {
+                if existed {
+                    println!("index `{index}` on `{table}` already exists");
+                } else {
+                    println!("index `{index}` on `{table}` created");
+                }
+            }
+            Outcome::DroppedIndex { index, existed } => {
+                if existed {
+                    println!("index `{index}` dropped");
+                } else {
+                    println!("index `{index}` did not exist");
                 }
             }
         }
@@ -292,12 +320,13 @@ Options:
 
 Interactive commands:
   .tables            List tables
-  .schema <table>    Show a table definition
+  .schema <table>    Show a table definition and its indexes
   .help              Show this help
   .quit              Exit
 
 Examples:
   rocksql ./data --exec \"CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL)\"
+  rocksql ./data --exec \"CREATE INDEX idx_name ON users (name)\"
   rocksql ./data --exec \"INSERT INTO users VALUES (1, 'Ada')\" --exec \"SELECT * FROM users\"
 "
     );
