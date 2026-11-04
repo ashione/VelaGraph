@@ -18,8 +18,62 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # Test and Clippy share no compiler wrapper (Clippy rebuilds every crate), so
+  # run them on separate runners. On a cold cache this halves wall-clock time
+  # from ~36 minutes to ~18; each job then saves its own dependency cache.
   test:
-    name: Test and lint
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install libclang and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          if [ -z "$libclang_path" ] || [ "$libclang_path" = "." ]; then
+            echo "libclang not found" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # v1 invalidates a 34 MB cache entry left behind before `target/` was
+          # populated; that old entry was never overwritten because its exact
+          # key already existed.
+          prefix-key: v1-rust
+          cache-on-failure: false
+          cache-targets: true
+
+      - name: Run tests
+        run: cargo test --locked
+
+  clippy:
+    name: Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -40,18 +94,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run tests
-        run: cargo test --locked
+          prefix-key: v1-rust
+          cache-on-failure: false
+          cache-targets: true
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
