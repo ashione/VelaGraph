@@ -1,10 +1,10 @@
 # Single-partition transactions and recovery (K3) v0
 
-Status: the K3 boundary is frozen. K3a (snapshot read view) and K3b
-(snapshot-isolated write transactions and conservative conflict detection) are
-implemented. K3c (crash-point recovery harness) is not implemented yet, and
-autocommit writes still use the old no-fsync behavior. This document is the
-contract the remaining implementation and its tests must satisfy.
+Status: the K3 boundary is frozen. K3a (snapshot read view), K3b
+(snapshot-isolated write transactions and conservative conflict detection), and
+K3c (process-crash recovery harness) are implemented. Autocommit writes still
+use the old no-fsync behavior. This document is the contract the implementation
+and its tests satisfy.
 
 Related contracts: [`GRAPH_FORMAT.md`](GRAPH_FORMAT.md) (keys and records),
 [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (single-shard
@@ -224,6 +224,16 @@ the harness cannot be made deterministic on all supported platforms, the PR must
 say which crash window is covered by the automated test and which is documented
 but not exercised.
 
+K3c implements this in `tests/recovery.rs`. The parent spawns the same test
+binary as a child, seeds a synced base transaction, and kills the child at two
+deterministic points: after buffering but before `commit`, and after `commit`
+returns. The test asserts that the first loses the whole buffered batch and the
+second keeps the vertex, edge, and both adjacency entries. It uses process
+`SIGKILL`/`Child::kill`, not a simulated close, and has no sleeps or ports. It
+does not inject a failure inside RocksDB's WAL write; that interior window relies
+on RocksDB's WAL atomicity and is documented rather than exercised by this
+harness.
+
 ## 7. Compatibility and migration
 
 - No graph key or payload change is introduced by K3. Snapshot/read-view and
@@ -275,9 +285,8 @@ but not exercised.
    point/adjacency reads, and stability tests. Gremlin integration is deferred.
 2. **K3b — transactions (implemented):** overlay, validation, one-batch synced
    commit, conflict detection, cascade tests.
-3. **K3c — recovery (pending):** crash-point harness and durability
-   documentation. Transaction commits already use `sync=true`; the crash
-   harness must still prove the recovery window.
+3. **K3c — recovery (implemented):** process-crash harness in
+   `tests/recovery.rs` and the durability/recovery documentation above.
 
 Each slice is a separate PR with its own green CI; K3 is not complete until all
 three acceptance sets pass.
