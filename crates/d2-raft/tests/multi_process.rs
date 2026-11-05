@@ -18,16 +18,20 @@ struct NodeProcess {
 }
 
 impl NodeProcess {
-    fn spawn(id: u64, raft: &str, control: &str) -> anyhow::Result<Self> {
-        let child = Command::new(env!("CARGO_BIN_EXE_d2-node"))
-            .args([
-                "--id",
-                &id.to_string(),
-                "--raft",
-                raft,
-                "--control",
-                control,
-            ])
+    fn spawn(id: u64, raft: &str, control: &str, bootstrap: Option<&str>) -> anyhow::Result<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_d2-node"));
+        command.args([
+            "--id",
+            &id.to_string(),
+            "--raft",
+            raft,
+            "--control",
+            control,
+        ]);
+        if let Some(members) = bootstrap {
+            command.args(["--bootstrap", members]);
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -47,10 +51,17 @@ impl Drop for NodeProcess {
     }
 }
 
-async fn free_ports() -> anyhow::Result<(u16, u16)> {
-    let raft = TcpListener::bind("127.0.0.1:0").await?;
-    let control = TcpListener::bind("127.0.0.1:0").await?;
-    Ok((raft.local_addr()?.port(), control.local_addr()?.port()))
+async fn reserve_ports(count: usize) -> anyhow::Result<Vec<u16>> {
+    let mut listeners = Vec::with_capacity(count);
+    for _ in 0..count {
+        listeners.push(TcpListener::bind("127.0.0.1:0").await?);
+    }
+    let ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().map(|addr| addr.port()))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(listeners);
+    Ok(ports)
 }
 
 async fn wait_ready(control: &str, timeout_ms: u64) -> anyhow::Result<()> {
@@ -136,22 +147,26 @@ async fn scenario() -> anyhow::Result<()> {
     let mut nodes = BTreeMap::new();
     let mut raft_addrs = BTreeMap::new();
     let mut control_addrs = BTreeMap::new();
+    let ports = reserve_ports(6).await?;
+    for (index, id) in (1_u64..=3).enumerate() {
+        raft_addrs.insert(id, format!("127.0.0.1:{}", ports[index * 2]));
+        control_addrs.insert(id, format!("127.0.0.1:{}", ports[index * 2 + 1]));
+    }
+    let bootstrap_spec = raft_addrs
+        .iter()
+        .map(|(id, addr)| format!("{id}={addr}"))
+        .collect::<Vec<_>>()
+        .join(",");
     for id in 1..=3 {
-        let (raft_port, control_port) = free_ports().await?;
-        let raft = format!("127.0.0.1:{raft_port}");
-        let control = format!("127.0.0.1:{control_port}");
-        nodes.insert(id, NodeProcess::spawn(id, &raft, &control)?);
-        raft_addrs.insert(id, raft);
-        control_addrs.insert(id, control);
+        let bootstrap = (id == 1).then_some(bootstrap_spec.as_str());
+        nodes.insert(
+            id,
+            NodeProcess::spawn(id, &raft_addrs[&id], &control_addrs[&id], bootstrap)?,
+        );
     }
     for control in control_addrs.values() {
         wait_ready(control, 10_000).await?;
     }
-
-    let members: BTreeMap<u64, String> = raft_addrs.clone();
-    send_control(&control_addrs[&1], ControlRequest::Initialize { members })
-        .await
-        .context("initialize all three nodes")?;
 
     let leader = leader_of(&control_addrs, 10_000).await?;
     for i in 0..50 {
@@ -184,7 +199,8 @@ async fn scenario() -> anyhow::Result<()> {
 
     // Restart the old leader with an empty in-memory log; the new leader must
     // bring it back through normal replication.
-    let restarted = NodeProcess::spawn(leader, &raft_addrs[&leader], &control_addrs[&leader])?;
+    let restarted =
+        NodeProcess::spawn(leader, &raft_addrs[&leader], &control_addrs[&leader], None)?;
     nodes.insert(leader, restarted);
     wait_ready(&control_addrs[&leader], 10_000).await?;
     wait_value(&control_addrs[&leader], "after", "failover", 10_000).await?;

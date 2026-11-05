@@ -223,6 +223,39 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     }
 }
 
+/// Initialize a new cluster with the given voter addresses.
+///
+/// This is the same path used by `d2-node --bootstrap` and by the control API;
+/// real deployments should call it from their startup coordinator.
+pub async fn initialize_cluster(
+    raft: &Raft,
+    members: BTreeMap<NodeId, String>,
+) -> anyhow::Result<()> {
+    let members: BTreeMap<NodeId, BasicNode> = members
+        .into_iter()
+        .map(|(id, addr)| (id, BasicNode { addr }))
+        .collect();
+    raft.initialize(members).await?;
+    Ok(())
+}
+
+/// Add one learner and return the committed log index.
+pub async fn add_learner(
+    raft: &Raft,
+    id: NodeId,
+    addr: String,
+    blocking: bool,
+) -> anyhow::Result<u64> {
+    let response = raft.add_learner(id, BasicNode { addr }, blocking).await?;
+    Ok(response.log_id.index)
+}
+
+/// Change the voter set and return the committed log index.
+pub async fn change_membership(raft: &Raft, ids: BTreeSet<NodeId>) -> anyhow::Result<u64> {
+    let response = raft.change_membership(ids, false).await?;
+    Ok(response.log_id.index)
+}
+
 /// Driver commands used by the multi-process integration test and the node CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
@@ -350,28 +383,20 @@ async fn handle_control_connection(
     let stream = reader.into_inner();
     let request: ControlRequest = serde_json::from_str(&line)?;
     let response = match request {
-        ControlRequest::Initialize { members } => {
-            let members: BTreeMap<NodeId, BasicNode> = members
-                .into_iter()
-                .map(|(id, addr)| (id, BasicNode { addr }))
-                .collect();
-            match raft.initialize(members).await {
-                Ok(()) => ControlResponse::Ack,
-                Err(error) => ControlResponse::Err(error.to_string()),
-            }
-        }
+        ControlRequest::Initialize { members } => match initialize_cluster(&raft, members).await {
+            Ok(()) => ControlResponse::Ack,
+            Err(error) => ControlResponse::Err(error.to_string()),
+        },
         ControlRequest::AddLearner { id, addr, blocking } => {
-            match raft.add_learner(id, BasicNode { addr }, blocking).await {
-                Ok(response) => ControlResponse::Index(response.log_id.index),
+            match add_learner(&raft, id, addr, blocking).await {
+                Ok(index) => ControlResponse::Index(index),
                 Err(error) => ControlResponse::Err(error.to_string()),
             }
         }
-        ControlRequest::ChangeMembership { ids } => {
-            match raft.change_membership(ids, false).await {
-                Ok(response) => ControlResponse::Index(response.log_id.index),
-                Err(error) => ControlResponse::Err(error.to_string()),
-            }
-        }
+        ControlRequest::ChangeMembership { ids } => match change_membership(&raft, ids).await {
+            Ok(index) => ControlResponse::Index(index),
+            Err(error) => ControlResponse::Err(error.to_string()),
+        },
         ControlRequest::Write { key, value } => {
             match raft.client_write(LogCommand::put(key, value)).await {
                 Ok(response) => ControlResponse::Index(response.log_id.index),
@@ -461,6 +486,24 @@ impl TcpNode {
             state_machine,
             tasks: vec![raft_task, control_task],
         })
+    }
+
+    /// Initialize a new cluster with this node and the supplied voters.
+    pub async fn bootstrap(&self, members: BTreeMap<NodeId, String>) -> anyhow::Result<()> {
+        initialize_cluster(&self.raft, members).await
+    }
+
+    pub async fn add_learner(
+        &self,
+        id: NodeId,
+        addr: String,
+        blocking: bool,
+    ) -> anyhow::Result<u64> {
+        add_learner(&self.raft, id, addr, blocking).await
+    }
+
+    pub async fn change_membership(&self, ids: BTreeSet<NodeId>) -> anyhow::Result<u64> {
+        change_membership(&self.raft, ids).await
     }
 
     pub async fn shutdown(mut self) {

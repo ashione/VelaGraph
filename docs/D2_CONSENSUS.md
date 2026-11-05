@@ -83,8 +83,9 @@ joint membership, follower reads, backup/restore.
 localhost TCP ports. It initializes all three voters, commits 50 writes, checks
 the value on every process, kills the leader, elects a new leader, writes again,
 and restarts the old leader with an empty in-memory log to verify catch-up. The
-node binaries can also be started on separate hosts; `d2-ctl` drives bootstrap,
-status, writes and reads. The TCP framing is newline-delimited JSON carrying the
+node binaries can also be started on separate hosts; `d2-node --bootstrap` uses
+the same `initialize_cluster`/`TcpNode::bootstrap` API exposed by the crate, and
+`d2-ctl` drives status, writes and reads. The TCP framing is newline-delimited JSON carrying the
 openraft request/response types.
 
 This proves cross-process consensus and serialization, not production network
