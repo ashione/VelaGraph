@@ -73,7 +73,7 @@
 
 - **交付物**：Raft 组、日志复制、快照、leader/follower 切换；副本放置策略。
 - **完成定义**：3 节点集群可写入；杀掉 leader 后 30 秒内恢复；重复/乱序消息测试通过。
-- **依赖**：D1；选型已定 openraft `=0.9.25`，见 [`D2_CONSENSUS.md`](D2_CONSENSUS.md)；原型尚未实现。
+- **依赖**：D1；选型已定 openraft `=0.9.25`，见 [`D2_CONSENSUS.md`](D2_CONSENSUS.md)；内存三节点原型已实现，RocksDB 日志与 D1 状态机仍待接。
 
 ### D3 元数据、路由与故障切换
 

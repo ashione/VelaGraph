@@ -1,7 +1,9 @@
 # D2 consensus decision: openraft v0
 
-Status: decision proposal; no D2 implementation is included yet. This document
-freezes the Raft library choice and the first prototype slice.
+Status: decision accepted; an in-memory three-node prototype is implemented in
+`crates/d2-raft`. The durable RocksDB log store, state machine, and D1 wiring
+are the next D2 slice. This document still freezes the Raft library choice and
+the prototype boundaries.
 
 Related contracts: [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (D1
 storage-node seam), [`TRANSACTIONS.md`](TRANSACTIONS.md) (K3 single-shard
