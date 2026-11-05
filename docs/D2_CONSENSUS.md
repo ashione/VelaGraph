@@ -1,9 +1,11 @@
 # D2 consensus decision: openraft v0
 
-Status: decision accepted; an in-memory three-node prototype is implemented in
-`crates/d2-raft`, including a three-OS-process TCP integration test. The durable
-RocksDB log store, state machine, and D1 wiring are the next D2 slice. This
-document still freezes the Raft library choice and the prototype boundaries.
+Status: decision accepted; a three-node prototype is implemented in
+`crates/d2-raft`, including a three-OS-process TCP integration test. The TCP node
+uses a durable RocksDB Raft log and a persisted key/value state machine; a
+three-node shutdown/reopen test is in `tests/durable.rs`. The D1 graph state
+machine, `Suite::test_all`, and D1 wiring remain the next D2 slice. This document
+still freezes the Raft library choice and the prototype boundaries.
 
 Related contracts: [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (D1
 storage-node seam), [`TRANSACTIONS.md`](TRANSACTIONS.md) (K3 single-shard
@@ -77,22 +79,46 @@ Prototype acceptance:
 Non-goals for this slice: gRPC, multi-partition placement, split/transfer,
 joint membership, follower reads, backup/restore.
 
+## Durable storage implementation
+
+The TCP node always opens two separate RocksDB directories under `--data-dir`:
+
+- `raft.db`: `raft/log/<index>` (big-endian index keys), `raft/vote`,
+  `raft/committed`, and `raft/last_purged`. Append, vote, committed-index,
+  truncate and purge writes use `sync=true`; purge and truncate use bounded
+  RocksDB range deletes.
+- `state.db`: `sm/data/<key>` values, `sm/applied`, `sm/membership`, and the
+  latest logical `sm/snapshot`. One synchronous `WriteBatch` carries every apply
+  mutation plus the applied index and membership. Snapshot install replaces the
+  data range and metadata in one batch, so a crash cannot expose a partially
+  installed snapshot.
+
+`Node::start_durable` / `Cluster::start_durable` expose the same stores for
+in-process restart tests. `tests/durable.rs` initializes three voters, writes a
+value, shuts all three nodes down, reopens the same directories without
+bootstrap, verifies the value on every node, and commits another write after the
+restart. `tests/multi_process.rs` restarts the killed leader against its original
+`--data-dir` instead of an empty log.
+
+Limitations: `state.db` still stores the D2 key/value fixture, not D1 graph
+records; `openraft::testing::Suite::test_all` has not run; and reopen tests prove
+process-restart recovery, not power-loss behavior under every RocksDB option.
+
 ## Multi-process validation
 
 `crates/d2-raft/tests/multi_process.rs` spawns three `d2-node` OS processes on
 localhost TCP ports. It initializes all three voters, commits 50 writes, checks
 the value on every process, kills the leader, elects a new leader, writes again,
-and restarts the old leader with an empty in-memory log to verify catch-up. The
-node binaries can also be started on separate hosts; `d2-node --bootstrap` uses
-the same `initialize_cluster`/`TcpNode::bootstrap` API exposed by the crate, and
-`d2-ctl` drives status, writes and reads. The TCP framing is newline-delimited JSON carrying the
-openraft request/response types.
+and restarts the old leader against its original durable directory to verify
+recovery and catch-up. The node binaries can also be started on separate hosts;
+`d2-node --bootstrap` uses the same `initialize_cluster`/`TcpNode::bootstrap` API
+exposed by the crate, and `d2-ctl` drives status, writes and reads. The TCP
+framing is newline-delimited JSON carrying the openraft request/response types.
 
-This proves cross-process consensus and serialization, not production network
-security or durability. The transport has no TLS, authentication, connection
-pooling or backpressure, and the control port is an operations/test helper.
-Multi-host deployment still needs service discovery, credentials and a durable
-log store.
+This proves cross-process consensus, serialization and process-restart recovery,
+not production network security or OS-crash durability. The transport has no
+TLS, authentication, connection pooling or backpressure, and the control port is
+an operations/test helper.
 
 ## Decisions to freeze before implementation
 
@@ -129,9 +155,11 @@ log store.
   mandatory.
 - **Medium:** `rocksdb 0.25` requires Rust 1.88 and a C++ toolchain; copy trait
   implementations, not dependency versions, from openraft examples.
-- **Medium:** the TCP smoke test proves cross-process framing and leader
-  failover, not multi-host network behavior, TLS, or OS-crash recovery. Those
-  remain D3/D6 work; storage is still in-memory.
+- **Medium:** the TCP smoke test proves cross-process framing, leader failover
+  and process-restart recovery, not multi-host network behavior, TLS, or
+  OS-crash/WAL behavior. Those remain D3/D6 work. Durable storage uses separate
+  `raft.db` and `state.db` directories, but the state machine is still the D2
+  key/value fixture rather than D1 graph records.
 
 ## Sources
 

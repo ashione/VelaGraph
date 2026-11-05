@@ -14,6 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let mut id = None;
     let mut raft_addr = None;
     let mut control_addr = None;
+    let mut data_dir = None;
     let mut bootstrap = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -21,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
             "--id" => id = Some(args.next().context("--id needs a value")?),
             "--raft" => raft_addr = Some(args.next().context("--raft needs a value")?),
             "--control" => control_addr = Some(args.next().context("--control needs a value")?),
+            "--data-dir" => data_dir = Some(args.next().context("--data-dir needs a value")?),
             "--bootstrap" => bootstrap = Some(args.next().context("--bootstrap needs a value")?),
             other => bail!("unknown argument: {other}"),
         }
@@ -28,11 +30,13 @@ async fn main() -> anyhow::Result<()> {
     let id: u64 = id.context("--id is required")?.parse()?;
     let raft_addr = raft_addr.context("--raft is required")?;
     let control_addr = control_addr.context("--control is required")?;
+    let data_dir = data_dir.context("--data-dir is required")?;
 
     let node = TcpNode::start(TcpNodeConfig {
         id,
         raft_addr,
         control_addr,
+        data_dir: data_dir.into(),
     })
     .await?;
 
