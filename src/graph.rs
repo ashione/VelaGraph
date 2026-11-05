@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, Snapshot, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -105,6 +105,17 @@ pub struct GraphEngine {
     partition: u32,
 }
 
+/// A stable, read-only view of one graph partition.
+///
+/// The view pins a RocksDB snapshot, so it continues to observe the state at
+/// [`GraphEngine::read_view`] even while newer writes commit. It exposes point
+/// and adjacency reads only; writes go through [`GraphEngine`] or a future
+/// transaction. Snapshot creation copies no graph data.
+pub struct GraphReadView<'a> {
+    snapshot: Snapshot<'a>,
+    partition: u32,
+}
+
 impl GraphEngine {
     /// Open partition `0`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -143,6 +154,14 @@ impl GraphEngine {
 
     pub fn partition(&self) -> u32 {
         self.partition
+    }
+
+    /// Pin a stable read view at the current RocksDB sequence.
+    pub fn read_view(&self) -> GraphReadView<'_> {
+        GraphReadView {
+            snapshot: self.db.snapshot(),
+            partition: self.partition,
+        }
     }
 
     /// Insert a new vertex. Returns `VertexAlreadyExists` if the id is taken.
@@ -290,6 +309,7 @@ impl GraphEngine {
         Ok(())
     }
 
+    /// Read an edge by id.
     pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
         self.get_edge_inner(id)
     }
@@ -512,6 +532,103 @@ impl GraphEngine {
         self.write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl GraphReadView<'_> {
+    /// The RocksDB sequence pinned by this view.
+    pub fn sequence(&self) -> u64 {
+        self.snapshot.sequence_number()
+    }
+
+    /// Read a vertex at this view's pinned sequence.
+    pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        let Some(bytes) = self.snapshot.get(vertex_key(self.partition, id))? else {
+            return Ok(None);
+        };
+        let vertex = codec::decode_vertex(&bytes)?;
+        if vertex.id != id {
+            return Err(Error::CorruptData(format!(
+                "vertex key {id} contains vertex {}",
+                vertex.id
+            )));
+        }
+        Ok(Some(vertex))
+    }
+
+    /// Read an edge at this view's pinned sequence.
+    pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
+        self.get_edge_inner(id)
+    }
+
+    /// Outgoing edges for a vertex in this view, ordered by edge id.
+    pub fn out_edges(&self, vertex_id: u64, label: Option<&str>) -> Result<Vec<Edge>> {
+        self.edges_by_direction(vertex_id, EdgeDirection::Out, label)
+    }
+
+    /// Incoming edges for a vertex in this view, ordered by edge id.
+    pub fn in_edges(&self, vertex_id: u64, label: Option<&str>) -> Result<Vec<Edge>> {
+        self.edges_by_direction(vertex_id, EdgeDirection::In, label)
+    }
+
+    fn edges_by_direction(
+        &self,
+        vertex_id: u64,
+        direction: EdgeDirection,
+        label: Option<&str>,
+    ) -> Result<Vec<Edge>> {
+        if let Some(label) = label {
+            validate_label(label)?;
+        }
+        if self
+            .snapshot
+            .get(vertex_key(self.partition, vertex_id))?
+            .is_none()
+        {
+            return Err(Error::VertexNotFound(vertex_id));
+        }
+
+        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
+        let mut edge_ids = Vec::new();
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            let (stored_key, _) = item?;
+            if !stored_key.starts_with(&prefix) {
+                break;
+            }
+            edge_ids.push(edge_id_from_adjacency_key(&stored_key)?);
+        }
+        edge_ids.sort_unstable();
+        edge_ids.dedup();
+
+        let mut edges = Vec::with_capacity(edge_ids.len());
+        for edge_id in edge_ids {
+            match self.get_edge_inner(edge_id)? {
+                Some(edge) => edges.push(edge),
+                None => {
+                    return Err(Error::CorruptData(format!(
+                        "adjacency entry references missing edge {edge_id}"
+                    )))
+                }
+            }
+        }
+        Ok(edges)
+    }
+
+    fn get_edge_inner(&self, id: u64) -> Result<Option<Edge>> {
+        let Some(bytes) = self.snapshot.get(edge_key(self.partition, id))? else {
+            return Ok(None);
+        };
+        let edge = codec::decode_edge(&bytes)?;
+        if edge.id != id {
+            return Err(Error::CorruptData(format!(
+                "edge key {id} contains edge {}",
+                edge.id
+            )));
+        }
+        Ok(Some(edge))
     }
 }
 

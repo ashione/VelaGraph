@@ -6,9 +6,11 @@ Read these before changing behavior:
 2. [`docs/ROADMAP.md`](docs/ROADMAP.md) — kernel and distributed scope.
 3. [`docs/GRAPH_FORMAT.md`](docs/GRAPH_FORMAT.md) — key layout and record encoding.
 4. [`docs/QUERY_SPEC.md`](docs/QUERY_SPEC.md) — normative graph query behavior.
-5. [`docs/IMPLEMENTATION_RULES.md`](docs/IMPLEMENTATION_RULES.md) — mandatory
+5. [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md) — K3 single-partition
+   transaction and recovery boundary.
+6. [`docs/IMPLEMENTATION_RULES.md`](docs/IMPLEMENTATION_RULES.md) — mandatory
    implementation constraints.
-6. [`docs/STORAGE_NODE_INTERFACE.md`](docs/STORAGE_NODE_INTERFACE.md) — D1
+7. [`docs/STORAGE_NODE_INTERFACE.md`](docs/STORAGE_NODE_INTERFACE.md) — D1
    storage-node boundary.
 
 ## Non-negotiables
