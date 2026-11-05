@@ -4,6 +4,8 @@
 //! adapter and D1 wiring land. It uses an in-memory log store and an in-memory
 //! key/value state machine; no HTTP or network ports are involved.
 //!
+#![allow(clippy::result_large_err)] // openraft trait signatures fix the error type; boxing would break the trait contract.
+
 //! The Raft log store is adapted from openraft's MIT/Apache-2.0 `memstore`
 //! example (https://github.com/databendlabs/openraft); see NOTICE.
 
