@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "antlr-rust-runtime"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff15bf0698f64d8036549d2e00c35b26eebc4e865ad69a4f9365e75ee98cda1b"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -135,6 +144,15 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "gremlin-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeabc9f2b4a7e278dde28f78f566c2fdf3ffb99cfa2a859605ba22c7c8cc1402"
+dependencies = [
+ "antlr-rust-runtime",
+]
 
 [[package]]
 name = "itertools"
@@ -344,6 +362,7 @@ dependencies = [
 name = "rocksdb-sql-table"
 version = "0.1.0"
 dependencies = [
+ "gremlin-rs",
  "rocksdb",
  "serde",
  "serde_json",

@@ -103,6 +103,27 @@ pub enum Error {
     #[error("invalid traversal: {0}")]
     InvalidTraversal(String),
 
+    #[error("invalid Gremlin: {0}")]
+    GremlinParse(String),
+
+    #[error("unsupported Gremlin step `{0}`")]
+    UnsupportedGremlinStep(String),
+
+    #[error("unsupported Gremlin argument: {0}")]
+    UnsupportedGremlinArgument(String),
+
+    #[error("unsupported Gremlin value: {0}")]
+    UnsupportedGremlinValue(String),
+
+    #[error("invalid Gremlin limit {0}: limit must be between 1 and 1000")]
+    InvalidGremlinLimit(i64),
+
+    #[error("Gremlin traversal limit exceeded: {0}")]
+    TraversalLimitExceeded(String),
+
+    #[error("invalid Gremlin traverser: {0}")]
+    InvalidGremlinTraverser(String),
+
     #[error("corrupt data in RocksDB: {0}")]
     CorruptData(String),
 

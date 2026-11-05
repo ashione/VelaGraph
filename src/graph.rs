@@ -358,6 +358,39 @@ impl GraphEngine {
         Ok(vertices)
     }
 
+    /// Scan at most `limit` vertices in id order. `truncated` is true when at
+    /// least one more vertex exists. Query execution uses this to enforce row
+    /// limits before materializing an unbounded result.
+    pub(crate) fn scan_vertices(&self, limit: usize) -> Result<(Vec<Vertex>, bool)> {
+        let prefix = vertex_prefix(self.partition);
+        let mut vertices = Vec::new();
+        let mut truncated = false;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            let (key, bytes) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if vertices.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let vertex = codec::decode_vertex(&bytes)?;
+            let stored_id = id_from_record_key(&key, &prefix)?;
+            if vertex.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "vertex key {stored_id} contains vertex {}",
+                    vertex.id
+                )));
+            }
+            vertices.push(vertex);
+        }
+        vertices.sort_by_key(|vertex| vertex.id);
+        Ok((vertices, truncated))
+    }
+
     /// All edges in this partition, ordered by id.
     pub fn edges(&self) -> Result<Vec<Edge>> {
         let prefix = edge_prefix(self.partition);
@@ -382,6 +415,37 @@ impl GraphEngine {
         }
         edges.sort_by_key(|edge| edge.id);
         Ok(edges)
+    }
+
+    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices`].
+    pub(crate) fn scan_edges(&self, limit: usize) -> Result<(Vec<Edge>, bool)> {
+        let prefix = edge_prefix(self.partition);
+        let mut edges = Vec::new();
+        let mut truncated = false;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            let (key, bytes) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if edges.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let edge = codec::decode_edge(&bytes)?;
+            let stored_id = id_from_record_key(&key, &prefix)?;
+            if edge.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {stored_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            edges.push(edge);
+        }
+        edges.sort_by_key(|edge| edge.id);
+        Ok((edges, truncated))
     }
 
     fn edges_by_direction(

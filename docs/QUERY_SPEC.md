@@ -1,7 +1,8 @@
 # Graph query specification v0
 
-Status: normative target for K2. This document constrains the public query
-surface; it is intentionally narrower than Apache TinkerPop Gremlin as a whole.
+Status: normative contract for K2; the v0 subset is implemented. This document
+constrains the public query surface; it is intentionally narrower than Apache
+TinkerPop Gremlin as a whole.
 
 Version: `0`.
 
@@ -86,6 +87,10 @@ Rules:
   properties.
 - `values(key)` emits one row per matching property value; absent properties
   emit nothing.
+- `label()` emits the first stored vertex label (labels are ordered) or the
+  edge label, as `Text`. `hasLabel` still matches any stored label.
+- `id()` emits an `Integer` row; an id above `i64::MAX` is
+  `UnsupportedGremlinValue` because v0 does not add a separate id row type.
 - A missing vertex/edge id yields no row, not an error.
 
 ## 5. Value mapping
