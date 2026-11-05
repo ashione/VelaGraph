@@ -303,3 +303,22 @@ fn recreating_a_deleted_vertex_and_edge_restores_its_adjacency() {
         [10]
     );
 }
+
+#[test]
+fn committed_transaction_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let graph = open(dir.path());
+        graph.create_vertex(&vertex(1, "Person", "Ada")).unwrap();
+        graph.create_vertex(&vertex(2, "Person", "Grace")).unwrap();
+        let mut transaction = graph.begin().unwrap();
+        transaction.create_edge(&edge(10, 1, 2, "KNOWS")).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let graph = open(dir.path());
+    assert_eq!(graph.get_vertex(1).unwrap().unwrap().id, 1);
+    assert_eq!(graph.get_edge(10).unwrap().unwrap().to, 2);
+    assert_eq!(graph.out_edges(1, Some("KNOWS")).unwrap()[0].id, 10);
+    assert_eq!(graph.in_edges(2, Some("KNOWS")).unwrap()[0].id, 10);
+}
