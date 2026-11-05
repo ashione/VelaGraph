@@ -217,10 +217,14 @@ all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
 fsync), so a process crash may lose the most recent writes. This is a
 single-process, single-partition storage kernel: ids are globally unique `u64`
 values supplied by the caller, one `GraphEngine` owns one partition, and there
-is no cost-based planner, MVCC, or Raft layer yet. Both endpoints of an edge
-must currently live in the same partition; cross-partition boundary edges are a
-D1 design item. Scalar property values are a deliberate first-milestone limit,
-not the final data model.
+is no cost-based planner, write-transaction MVCC layer, or Raft layer yet. Both
+endpoints of an edge must currently live in the same partition; cross-partition
+boundary edges are a D1 design item. Scalar property values are a deliberate
+first-milestone limit, not the final data model. The K3 single-partition
+transaction and recovery boundary is specified in
+[`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md). A snapshot-backed read view is
+implemented; write transactions, conflict detection, and crash-recovery testing
+are not yet implemented.
 
 ## SQL behavior details
 

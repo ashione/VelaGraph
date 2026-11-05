@@ -478,3 +478,41 @@ fn cross_partition_edges_are_not_supported_yet() {
     ));
     assert!(graph.edges().unwrap().is_empty());
 }
+
+#[test]
+fn read_view_is_stable_across_writes() {
+    let dir = TempDir::new().unwrap();
+    let graph = open(dir.path());
+    graph.create_vertex(&vertex(1, "Person", "Ada")).unwrap();
+    graph.create_vertex(&vertex(2, "Person", "Grace")).unwrap();
+    graph.create_edge(&edge(10, 1, 2, "KNOWS")).unwrap();
+
+    let view = graph.read_view();
+    assert_eq!(
+        view.get_vertex(1).unwrap().unwrap().properties["name"],
+        Value::Text("Ada".into())
+    );
+    assert_eq!(view.get_edge(10).unwrap().unwrap().to, 2);
+    assert_eq!(view.out_edges(1, Some("KNOWS")).unwrap()[0].id, 10);
+
+    graph
+        .update_vertex(&vertex(1, "Person", "Ada Lovelace"))
+        .unwrap();
+    graph
+        .create_vertex(&vertex(3, "Person", "Katherine"))
+        .unwrap();
+    graph.delete_edge(10).unwrap();
+
+    assert_eq!(
+        view.get_vertex(1).unwrap().unwrap().properties["name"],
+        Value::Text("Ada".into())
+    );
+    assert_eq!(
+        graph.get_vertex(1).unwrap().unwrap().properties["name"],
+        Value::Text("Ada Lovelace".into())
+    );
+    assert!(view.get_vertex(3).unwrap().is_none());
+    assert!(graph.get_vertex(3).unwrap().is_some());
+    assert_eq!(view.out_edges(1, Some("KNOWS")).unwrap().len(), 1);
+    assert!(graph.out_edges(1, Some("KNOWS")).unwrap().is_empty());
+}

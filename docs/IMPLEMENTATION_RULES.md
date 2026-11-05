@@ -42,8 +42,9 @@ same PR.
   nothing.
 - v0 rejects cross-partition edges. Do not fake them with duplicated records.
 - Do not claim multi-statement or cross-partition transactions before K3/D4.
-- Snapshot/read-view semantics are K3 work; until then, document the actual
-  read behavior.
+- Snapshot/read-view semantics are K3 work; the frozen boundary is
+  [`TRANSACTIONS.md`](TRANSACTIONS.md). Until it is implemented, document the
+  actual read behavior.
 
 ## R5 — Determinism
 
