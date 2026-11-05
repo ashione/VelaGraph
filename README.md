@@ -1,15 +1,33 @@
 # rocksdb-sql-table
 
-A small, embeddable **table engine backed by RocksDB** with a simple SQL front
-end, plus an experimental single-node **property graph storage kernel**. It is a
-self-contained implementation (not a SQL layer over SQLite): catalogs, indexes,
-rows, and graph adjacency live in RocksDB key spaces, and queries are parsed and
-executed by this crate.
+An embeddable **RocksDB storage kernel** with two front ends: a strict SQL table
+engine and a **property-graph engine**. It is a self-contained implementation
+(not a SQL layer over SQLite): catalogs, indexes, rows, graph records, and
+adjacency all live in RocksDB key spaces.
+
+The long-term target is a **distributed property-graph and table kernel**, not a
+SQL-only database. The graph path is being completed first — snapshot reads,
+single-partition write transactions, and process-crash recovery — followed by
+Raft replication (D2) and cross-shard coordination (D4). Distribution is not
+implemented yet; this README states the boundary explicitly so the current
+single-node limits are not mistaken for the final design.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
 ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`.
+
+## Direction and status
+
+| Track | Current state |
+| --- | --- |
+| Graph kernel | Property records, adjacency indexes, bounded traversal and standard Gremlin v0 are implemented. K3a snapshot read views, K3b single-partition write transactions, and K3c process-crash recovery are implemented. |
+| Distributed kernel | D1 storage-node boundary is a written proposal; D2 has chosen `openraft` 0.9.25 but the prototype is not implemented. No Raft, replication, placement, or cross-partition transaction exists yet. |
+| SQL engine | The documented SQL subset is supported; it remains autocommit per statement and does not participate in graph transactions. |
+
+The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
+the transaction/recovery contract is in [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md);
+the consensus decision is in [`docs/D2_CONSENSUS.md`](docs/D2_CONSENSUS.md).
 
 ## Features
 
@@ -24,11 +42,12 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Predicates/expressions | `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] LIKE ... [ESCAPE]`, `[NOT] BETWEEN`, `[NOT] IN`; numeric `+ - * /`, unary minus, `DATE` literals and `DATE ± INTERVAL ... DAY` |
 | Storage | RocksDB WAL-backed writes, one atomic `WriteBatch` per statement, point lookups for `pk = literal`, index prefix scans |
 | Graph kernel | property vertices/edges, labels and typed properties, outgoing/incoming adjacency indexes, label-filtered traversal, cascade delete |
+| Graph transactions | snapshot-backed read views, single-partition write transactions with conservative conflict detection, one synced `WriteBatch` per commit, process-crash recovery tests |
 | Graph queries | standard Gremlin v0 (`V`/`E`, `out`/`in`/`both`, `has`/`hasLabel`, `values`/`id`/`label`, `limit`/`path`/`count`), 1–3 edge steps |
 
 Deliberately **not** supported: joins, subqueries, window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
-constraints, multi-statement transactions, and `SELECT` without `FROM`. See
-[Limitations](#limitations).
+constraints, multi-statement SQL transactions, `SELECT` without `FROM`, and
+cross-partition graph transactions. See [Limitations](#limitations).
 
 ## Quick start
 
@@ -118,7 +137,9 @@ index catalog, which is also what `.schema` prints.
 
 `GraphEngine` is the first storage layer for the graph direction. It is additive
 and independent of the SQL engine; it includes a standard Gremlin v0 query
-subset, but not transactions across statements or distribution.
+subset, snapshot read views, and explicit single-partition write transactions.
+SQL statements still do not share a graph transaction, and distribution is not
+implemented.
 
 ```rust
 use std::collections::BTreeMap;
@@ -224,7 +245,10 @@ first-milestone limit, not the final data model. The K3 single-partition
 transaction and recovery boundary is specified in
 [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md). Snapshot-backed read views and
 single-partition write transactions with conservative conflict detection are
-implemented; crash-recovery testing and cross-partition transactions are not.
+implemented. A transaction commit uses one synced `WriteBatch`; a process-crash
+harness covers the before-commit and after-commit boundaries. Autocommit graph
+writes still use the old no-fsync behavior, and cross-partition transactions are
+not implemented.
 
 ## SQL behavior details
 
@@ -411,7 +435,7 @@ requests; see `.github/workflows/ci.yml`. Locally run `cargo fmt --check` and
 
 ## Limitations
 
-This is a teaching/demo-scale engine, not a production database:
+This is a single-node storage kernel, not yet a distributed production database:
 
 - No joins, subqueries, CTEs, window functions, or DISTINCT aggregate
   arguments. `GROUP BY` requires at least one aggregate projection or a HAVING
@@ -427,7 +451,10 @@ This is a teaching/demo-scale engine, not a production database:
   `DROP INDEX` only.
 - `UPDATE`/`INSERT` accept literal values only (`SET age = age + 1` is rejected).
 - `ORDER BY` must reference table columns, not output aliases.
-- No multi-statement or cross-process transactions; one writer process assumed.
+- SQL has no multi-statement transactions; graph transactions are single-partition
+  and single-process. Cross-partition/cross-process transactions, Raft replication,
+  placement, and failover are not implemented (D2–D4); one writer process per
+  database is assumed.
 - Non-aggregate queries materialize all matching rows and sort results in
   memory; grouped/aggregate full scans stream rows but materialize the groups.
 - `DECIMAL` is approximate (`REAL`), `DATE` is stored as text rather than a

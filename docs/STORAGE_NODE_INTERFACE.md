@@ -96,8 +96,9 @@ txn.commit() / txn.abort()
 
 v0 only promises a transaction whose keys are owned by one shard. The graph
 kernel's K3b now provides snapshot reads, conservative first-committer-wins
-conflict detection, and one-batch atomic commit. Crash-recovery testing is K3c;
-D4 builds cross-shard coordination above this interface, never inside it.
+conflict detection, one-batch atomic commit, and a process-crash recovery
+harness. D4 builds cross-shard coordination above this interface, never inside
+it.
 
 ### Snapshots
 
