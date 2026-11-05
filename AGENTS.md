@@ -12,6 +12,8 @@ Read these before changing behavior:
    implementation constraints.
 7. [`docs/STORAGE_NODE_INTERFACE.md`](docs/STORAGE_NODE_INTERFACE.md) — D1
    storage-node boundary.
+7. [`docs/D2_CONSENSUS.md`](docs/D2_CONSENSUS.md) — D2 Raft library decision and
+   prototype slice.
 
 ## Non-negotiables
 
