@@ -1,7 +1,9 @@
 # D2 consensus decision: openraft v0
 
-Status: decision proposal; no D2 implementation is included yet. This document
-freezes the Raft library choice and the first prototype slice.
+Status: decision accepted; an in-memory three-node prototype is implemented in
+`crates/d2-raft`, including a three-OS-process TCP integration test. The durable
+RocksDB log store, state machine, and D1 wiring are the next D2 slice. This
+document still freezes the Raft library choice and the prototype boundaries.
 
 Related contracts: [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (D1
 storage-node seam), [`TRANSACTIONS.md`](TRANSACTIONS.md) (K3 single-shard
@@ -53,8 +55,11 @@ Create `crates/d2-raft` with:
 - `network.rs`: in-process `RaftNetworkFactory`/`RaftNetwork` dispatching to peer
   `Raft` handles; a `DropPolicy` (allow/deny/delay per from/to) for partitions
   and message loss.
+- `tcp.rs`: TCP `RaftNetwork`/`RaftNetworkFactory`, one node per process, plus a
+  control port and `d2-node`/`d2-ctl` binaries.
 - `node.rs`: `Node::start(id, dir, peers)` / `shutdown()`.
-- `tests/cluster.rs`: three nodes, three temp dirs, no network ports.
+- `tests/cluster.rs`: three in-process nodes; `tests/multi_process.rs`: three
+  child processes over TCP, including leader kill and restart.
 
 Prototype acceptance:
 
@@ -71,6 +76,23 @@ Prototype acceptance:
 
 Non-goals for this slice: gRPC, multi-partition placement, split/transfer,
 joint membership, follower reads, backup/restore.
+
+## Multi-process validation
+
+`crates/d2-raft/tests/multi_process.rs` spawns three `d2-node` OS processes on
+localhost TCP ports. It initializes all three voters, commits 50 writes, checks
+the value on every process, kills the leader, elects a new leader, writes again,
+and restarts the old leader with an empty in-memory log to verify catch-up. The
+node binaries can also be started on separate hosts; `d2-node --bootstrap` uses
+the same `initialize_cluster`/`TcpNode::bootstrap` API exposed by the crate, and
+`d2-ctl` drives status, writes and reads. The TCP framing is newline-delimited JSON carrying the
+openraft request/response types.
+
+This proves cross-process consensus and serialization, not production network
+security or durability. The transport has no TLS, authentication, connection
+pooling or backpressure, and the control port is an operations/test helper.
+Multi-host deployment still needs service discovery, credentials and a durable
+log store.
 
 ## Decisions to freeze before implementation
 
@@ -107,8 +129,9 @@ joint membership, follower reads, backup/restore.
   mandatory.
 - **Medium:** `rocksdb 0.25` requires Rust 1.88 and a C++ toolchain; copy trait
   implementations, not dependency versions, from openraft examples.
-- **Medium:** in-process transports do not prove real network or OS-crash
-  behavior; a multi-process smoke test is a later D3/D6 item.
+- **Medium:** the TCP smoke test proves cross-process framing and leader
+  failover, not multi-host network behavior, TLS, or OS-crash recovery. Those
+  remain D3/D6 work; storage is still in-memory.
 
 ## Sources
 

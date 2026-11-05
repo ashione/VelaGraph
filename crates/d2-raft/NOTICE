@@ -1,0 +1,3 @@
+This crate's in-memory Raft log store is adapted from the openraft project's
+`memstore` example. openraft is licensed under MIT OR Apache-2.0:
+https://github.com/databendlabs/openraft
