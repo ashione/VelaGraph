@@ -10,8 +10,8 @@
 //!
 //! `GraphEngine` is a separate, additive storage kernel for property graphs:
 //! vertices, labelled directed edges, typed properties, outgoing/incoming
-//! adjacency indexes, a standard Gremlin v0 query surface, and snapshot read
-//! views. Write transactions are not implemented yet.
+//! adjacency indexes, a standard Gremlin v0 query surface, snapshot read views,
+//! and single-partition write transactions. Crash recovery is not yet verified.
 //!
 //! ```no_run
 //! use rocksdb_sql_table::{Outcome, TableEngine};
@@ -41,7 +41,7 @@ mod value;
 
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
-pub use graph::{Edge, GraphEngine, GraphReadView, Vertex};
+pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
 pub use gremlin::{
     GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
     DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,

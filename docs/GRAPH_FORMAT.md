@@ -21,7 +21,7 @@ graph/v1/p/<partition>/in/<target>/<label>/<edge>    -> empty
   an unambiguous separator, including the `A` / `AB` prefix case.
 - A vertex and its adjacency entries share a partition. A mutation's
   `WriteBatch` is atomic only inside that partition. Cross-partition
-  transactions belong to K3, not this layer.
+  transactions belong to D4, not this layer.
 - v1 requires both endpoints of an edge in the same partition. Cross-partition
   boundary edges need a D1 placement protocol and are deliberately not
   pretended here.

@@ -1,10 +1,10 @@
 # Single-partition transactions and recovery (K3) v0
 
-Status: the K3 boundary is frozen; K3a (snapshot read view) is implemented in
-this change. Transactions, conflict detection, and the crash-recovery harness
-(K3b/K3c) are not implemented yet; the engine remains autocommit-only for writes.
-This document is the contract the remaining implementation and its tests must
-satisfy.
+Status: the K3 boundary is frozen. K3a (snapshot read view) and K3b
+(snapshot-isolated write transactions and conservative conflict detection) are
+implemented. K3c (crash-point recovery harness) is not implemented yet, and
+autocommit writes still use the old no-fsync behavior. This document is the
+contract the remaining implementation and its tests must satisfy.
 
 Related contracts: [`GRAPH_FORMAT.md`](GRAPH_FORMAT.md) (keys and records),
 [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (single-shard
@@ -271,13 +271,13 @@ but not exercised.
 
 ## 10. Implementation slices
 
-1. **K3a — read views (implemented in this change):** snapshot-backed
-   `GraphReadView`, point/adjacency reads, and stability tests. Gremlin
-   integration is deferred.
-2. **K3b — transactions:** overlay, validation, one-batch commit, conflict
-   detection, cascade tests.
-3. **K3c — recovery:** sync commit, crash-point harness, reopen and durability
-   documentation.
+1. **K3a — read views (implemented):** snapshot-backed `GraphReadView`,
+   point/adjacency reads, and stability tests. Gremlin integration is deferred.
+2. **K3b — transactions (implemented):** overlay, validation, one-batch synced
+   commit, conflict detection, cascade tests.
+3. **K3c — recovery (pending):** crash-point harness and durability
+   documentation. Transaction commits already use `sync=true`; the crash
+   harness must still prove the recovery window.
 
 Each slice is a separate PR with its own green CI; K3 is not complete until all
 three acceptance sets pass.

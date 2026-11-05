@@ -124,6 +124,12 @@ pub enum Error {
     #[error("invalid Gremlin traverser: {0}")]
     InvalidGremlinTraverser(String),
 
+    #[error("transaction conflict: another write committed after the transaction snapshot")]
+    TransactionConflict,
+
+    #[error("transaction write set is too large: {0}")]
+    TransactionTooLarge(String),
+
     #[error("corrupt data in RocksDB: {0}")]
     CorruptData(String),
 

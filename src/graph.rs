@@ -23,11 +23,13 @@
 
 mod codec;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, Snapshot, WriteBatch, DB};
+use rocksdb::{
+    DBCompressionType, Direction, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -39,6 +41,8 @@ const EDGE_SUFFIX: &[u8] = b"edge/";
 const OUT_SUFFIX: &[u8] = b"out/";
 const IN_SUFFIX: &[u8] = b"in/";
 const MAX_LABEL_LEN: usize = 64;
+const MAX_TRANSACTION_OPERATIONS: usize = 10_000;
+const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 
 /// A property-graph vertex. `id` must be globally unique for a distributed
 /// deployment; the engine never generates ids.
@@ -116,6 +120,34 @@ pub struct GraphReadView<'a> {
     partition: u32,
 }
 
+/// A single-partition, snapshot-isolated write transaction.
+///
+/// Mutations are buffered until [`GraphTransaction::commit`], which validates
+/// the final state, checks that no other write committed after [`begin`], and
+/// writes one synced `WriteBatch`. Dropping the transaction aborts it. Reads
+/// see the transaction's own buffered writes over its pinned snapshot.
+///
+/// [`begin`]: GraphEngine::begin
+pub struct GraphTransaction<'a> {
+    engine: &'a GraphEngine,
+    snapshot: Snapshot<'a>,
+    read_sequence: u64,
+    vertices: BTreeMap<u64, TxVertex>,
+    edges: BTreeMap<u64, TxEdge>,
+    deleted_adjacency: BTreeSet<Vec<u8>>,
+    operations: usize,
+}
+
+struct TxVertex {
+    original: Option<Vertex>,
+    current: Option<Vertex>,
+}
+
+struct TxEdge {
+    original: Option<Edge>,
+    current: Option<Edge>,
+}
+
 impl GraphEngine {
     /// Open partition `0`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -162,6 +194,21 @@ impl GraphEngine {
             snapshot: self.db.snapshot(),
             partition: self.partition,
         }
+    }
+
+    /// Start a single-partition transaction at the current RocksDB sequence.
+    pub fn begin(&self) -> Result<GraphTransaction<'_>> {
+        let snapshot = self.db.snapshot();
+        let read_sequence = snapshot.sequence_number();
+        Ok(GraphTransaction {
+            engine: self,
+            snapshot,
+            read_sequence,
+            vertices: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            deleted_adjacency: BTreeSet::new(),
+            operations: 0,
+        })
     }
 
     /// Insert a new vertex. Returns `VertexAlreadyExists` if the id is taken.
@@ -630,6 +677,366 @@ impl GraphReadView<'_> {
         }
         Ok(Some(edge))
     }
+}
+
+impl GraphTransaction<'_> {
+    /// Read a vertex from the transaction's snapshot and own write overlay.
+    pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        self.view_vertex(id)
+    }
+
+    /// Read an edge from the transaction's snapshot and own write overlay.
+    pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
+        self.view_edge(id)
+    }
+
+    /// Buffer a new vertex.
+    pub fn create_vertex(&mut self, vertex: &Vertex) -> Result<()> {
+        validate_vertex(vertex)?;
+        self.note_operation()?;
+        if self.view_vertex(vertex.id)?.is_some() {
+            return Err(Error::VertexAlreadyExists(vertex.id));
+        }
+        self.touch_vertex(vertex.id)?.current = Some(vertex.clone());
+        Ok(())
+    }
+
+    /// Buffer a replacement for an existing vertex.
+    pub fn update_vertex(&mut self, vertex: &Vertex) -> Result<()> {
+        validate_vertex(vertex)?;
+        self.note_operation()?;
+        if self.view_vertex(vertex.id)?.is_none() {
+            return Err(Error::VertexNotFound(vertex.id));
+        }
+        self.touch_vertex(vertex.id)?.current = Some(vertex.clone());
+        Ok(())
+    }
+
+    /// Buffer a vertex deletion, including every incident edge.
+    pub fn delete_vertex(&mut self, id: u64) -> Result<bool> {
+        self.note_operation()?;
+        if self.view_vertex(id)?.is_none() {
+            return Ok(false);
+        }
+
+        let (edge_ids, adjacency_keys) = self.incident_edge_ids(id)?;
+        self.deleted_adjacency.extend(adjacency_keys);
+        for edge_id in edge_ids {
+            let entry = self.touch_edge(edge_id)?;
+            entry.current = None;
+        }
+        self.touch_vertex(id)?.current = None;
+        Ok(true)
+    }
+
+    /// Buffer a new edge. Both endpoints must exist in the transaction view.
+    pub fn create_edge(&mut self, edge: &Edge) -> Result<()> {
+        validate_edge(edge)?;
+        self.note_operation()?;
+        if self.view_edge(edge.id)?.is_some() {
+            return Err(Error::EdgeAlreadyExists(edge.id));
+        }
+        if self.view_vertex(edge.from)?.is_none() {
+            return Err(Error::EdgeEndpointNotFound(edge.from));
+        }
+        if edge.from != edge.to && self.view_vertex(edge.to)?.is_none() {
+            return Err(Error::EdgeEndpointNotFound(edge.to));
+        }
+        self.touch_edge(edge.id)?.current = Some(edge.clone());
+        Ok(())
+    }
+
+    /// Buffer an edge deletion. Returns `false` when it is already absent.
+    pub fn delete_edge(&mut self, id: u64) -> Result<bool> {
+        self.note_operation()?;
+        if self.view_edge(id)?.is_none() {
+            return Ok(false);
+        }
+        self.touch_edge(id)?.current = None;
+        Ok(true)
+    }
+
+    /// Validate and atomically commit the buffered writes.
+    ///
+    /// The commit conflicts if any write landed after this transaction's
+    /// snapshot. A read-only transaction commits as a no-op.
+    pub fn commit(self) -> Result<()> {
+        if !self.has_writes() {
+            return Ok(());
+        }
+
+        let _guard = self.engine.lock();
+        if self.engine.db.latest_sequence_number() != self.read_sequence {
+            return Err(Error::TransactionConflict);
+        }
+        self.validate_final_state()?;
+
+        let batch = self.build_batch()?;
+        if batch.size_in_bytes() > MAX_TRANSACTION_BYTES {
+            return Err(Error::TransactionTooLarge(format!(
+                "encoded write set exceeds {MAX_TRANSACTION_BYTES} bytes"
+            )));
+        }
+
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.engine.db.write_opt(batch, &options)?;
+        Ok(())
+    }
+
+    /// Discard the transaction. Dropping it has the same effect.
+    pub fn abort(self) {}
+
+    fn view_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        if let Some(entry) = self.vertices.get(&id) {
+            return Ok(entry.current.clone());
+        }
+        self.read_vertex_snapshot(id)
+    }
+
+    fn view_edge(&self, id: u64) -> Result<Option<Edge>> {
+        if let Some(entry) = self.edges.get(&id) {
+            return Ok(entry.current.clone());
+        }
+        self.read_edge_snapshot(id)
+    }
+
+    fn read_vertex_snapshot(&self, id: u64) -> Result<Option<Vertex>> {
+        let Some(bytes) = self.snapshot.get(vertex_key(self.engine.partition, id))? else {
+            return Ok(None);
+        };
+        let vertex = codec::decode_vertex(&bytes)?;
+        if vertex.id != id {
+            return Err(Error::CorruptData(format!(
+                "vertex key {id} contains vertex {}",
+                vertex.id
+            )));
+        }
+        Ok(Some(vertex))
+    }
+
+    fn read_edge_snapshot(&self, id: u64) -> Result<Option<Edge>> {
+        let Some(bytes) = self.snapshot.get(edge_key(self.engine.partition, id))? else {
+            return Ok(None);
+        };
+        let edge = codec::decode_edge(&bytes)?;
+        if edge.id != id {
+            return Err(Error::CorruptData(format!(
+                "edge key {id} contains edge {}",
+                edge.id
+            )));
+        }
+        Ok(Some(edge))
+    }
+
+    fn touch_vertex(&mut self, id: u64) -> Result<&mut TxVertex> {
+        if !self.vertices.contains_key(&id) {
+            let original = self.read_vertex_snapshot(id)?;
+            self.vertices.insert(
+                id,
+                TxVertex {
+                    current: original.clone(),
+                    original,
+                },
+            );
+        }
+        Ok(self
+            .vertices
+            .get_mut(&id)
+            .expect("vertex entry inserted above"))
+    }
+
+    fn touch_edge(&mut self, id: u64) -> Result<&mut TxEdge> {
+        if !self.edges.contains_key(&id) {
+            let original = self.read_edge_snapshot(id)?;
+            self.edges.insert(
+                id,
+                TxEdge {
+                    current: original.clone(),
+                    original,
+                },
+            );
+        }
+        Ok(self.edges.get_mut(&id).expect("edge entry inserted above"))
+    }
+
+    fn note_operation(&mut self) -> Result<()> {
+        self.operations += 1;
+        if self.operations > MAX_TRANSACTION_OPERATIONS {
+            return Err(Error::TransactionTooLarge(format!(
+                "more than {MAX_TRANSACTION_OPERATIONS} operations"
+            )));
+        }
+        Ok(())
+    }
+
+    fn incident_edge_ids(&self, vertex_id: u64) -> Result<(Vec<u64>, Vec<Vec<u8>>)> {
+        let mut snapshot_edge_ids = BTreeSet::new();
+        let mut adjacency_keys = BTreeSet::new();
+        for prefix in [
+            adjacency_prefix(self.engine.partition, EdgeDirection::Out, vertex_id, None),
+            adjacency_prefix(self.engine.partition, EdgeDirection::In, vertex_id, None),
+        ] {
+            for item in self
+                .snapshot
+                .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+            {
+                let (stored_key, _) = item?;
+                if !stored_key.starts_with(&prefix) {
+                    break;
+                }
+                snapshot_edge_ids.insert(edge_id_from_adjacency_key(&stored_key)?);
+                adjacency_keys.insert(stored_key.to_vec());
+            }
+        }
+
+        // An edge may have been deleted or moved to another endpoint in this
+        // transaction. Only the edge's current form decides whether deleting
+        // the vertex still cascades to it.
+        let mut edge_ids = BTreeSet::new();
+        for edge_id in snapshot_edge_ids {
+            if let Some(edge) = self.view_edge(edge_id)? {
+                if edge.from == vertex_id || edge.to == vertex_id {
+                    edge_ids.insert(edge_id);
+                }
+            }
+        }
+        for (id, entry) in &self.edges {
+            if let Some(edge) = &entry.current {
+                if edge.from == vertex_id || edge.to == vertex_id {
+                    edge_ids.insert(*id);
+                }
+            }
+        }
+        Ok((
+            edge_ids.into_iter().collect(),
+            adjacency_keys.into_iter().collect(),
+        ))
+    }
+
+    fn has_writes(&self) -> bool {
+        !self.deleted_adjacency.is_empty()
+            || self
+                .vertices
+                .values()
+                .any(|entry| entry.original.as_ref() != entry.current.as_ref())
+            || self
+                .edges
+                .values()
+                .any(|entry| entry.original.as_ref() != entry.current.as_ref())
+    }
+
+    fn validate_final_state(&self) -> Result<()> {
+        for (id, entry) in &self.vertices {
+            if let Some(vertex) = &entry.current {
+                validate_vertex(vertex)?;
+                if vertex.id != *id {
+                    return Err(Error::CorruptData(format!(
+                        "transaction vertex key {id} contains vertex {}",
+                        vertex.id
+                    )));
+                }
+            }
+        }
+        for (id, entry) in &self.edges {
+            let Some(edge) = &entry.current else {
+                continue;
+            };
+            validate_edge(edge)?;
+            if edge.id != *id {
+                return Err(Error::CorruptData(format!(
+                    "transaction edge key {id} contains edge {}",
+                    edge.id
+                )));
+            }
+            if self.view_vertex(edge.from)?.is_none() {
+                return Err(Error::EdgeEndpointNotFound(edge.from));
+            }
+            if edge.from != edge.to && self.view_vertex(edge.to)?.is_none() {
+                return Err(Error::EdgeEndpointNotFound(edge.to));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_batch(&self) -> Result<WriteBatch> {
+        let partition = self.engine.partition;
+        let mut batch = WriteBatch::default();
+
+        // Orphaned adjacency entries from a deleted vertex must go first so a
+        // recreated edge can put the same key back later in this batch.
+        for key in &self.deleted_adjacency {
+            batch.delete(key);
+        }
+
+        for (id, entry) in &self.vertices {
+            match (&entry.original, &entry.current) {
+                (Some(_), None) => batch.delete(vertex_key(partition, *id)),
+                (Some(original), Some(current)) if original != current => {
+                    batch.put(vertex_key(partition, *id), codec::encode_vertex(current)?);
+                }
+                (None, Some(current)) => {
+                    batch.put(vertex_key(partition, *id), codec::encode_vertex(current)?);
+                }
+                _ => {}
+            }
+        }
+
+        for entry in self.edges.values() {
+            match (&entry.original, &entry.current) {
+                (Some(original), None) => {
+                    delete_edge_batch(&mut batch, partition, original);
+                }
+                (Some(original), Some(current)) => {
+                    if original != current {
+                        delete_edge_batch(&mut batch, partition, original);
+                    }
+                    put_edge_batch(&mut batch, partition, current)?;
+                }
+                (None, Some(current)) => put_edge_batch(&mut batch, partition, current)?,
+                (None, None) => {}
+            }
+        }
+
+        Ok(batch)
+    }
+}
+
+fn put_edge_batch(batch: &mut WriteBatch, partition: u32, edge: &Edge) -> Result<()> {
+    batch.put(edge_key(partition, edge.id), codec::encode_edge(edge)?);
+    batch.put(
+        adjacency_key(
+            partition,
+            EdgeDirection::Out,
+            edge.from,
+            &edge.label,
+            edge.id,
+        ),
+        Vec::new(),
+    );
+    batch.put(
+        adjacency_key(partition, EdgeDirection::In, edge.to, &edge.label, edge.id),
+        Vec::new(),
+    );
+    Ok(())
+}
+
+fn delete_edge_batch(batch: &mut WriteBatch, partition: u32, edge: &Edge) {
+    batch.delete(edge_key(partition, edge.id));
+    batch.delete(adjacency_key(
+        partition,
+        EdgeDirection::Out,
+        edge.from,
+        &edge.label,
+        edge.id,
+    ));
+    batch.delete(adjacency_key(
+        partition,
+        EdgeDirection::In,
+        edge.to,
+        &edge.label,
+        edge.id,
+    ));
 }
 
 fn partition_prefix(partition: u32) -> Vec<u8> {
