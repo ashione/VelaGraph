@@ -22,7 +22,7 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Track | Current state |
 | --- | --- |
 | Graph kernel | Property records, adjacency indexes, bounded traversal and standard Gremlin v0 are implemented. K3a snapshot read views, K3b single-partition write transactions, and K3c process-crash recovery are implemented. |
-| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, export/import) and a `GraphRecordStore` adapter for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype, but there is no placement, cross-node routing, or cross-partition transaction yet. |
+| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype, but there is no placement, cross-node routing, or cross-partition transaction yet. |
 | SQL engine | The documented SQL subset is supported; it remains autocommit per statement and does not participate in graph transactions. |
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
