@@ -10,14 +10,15 @@
 //! the same vertices, edges, and adjacency entries as opaque D1 bytes. It does
 //! not implement transactions, routing, or replication by itself.
 //!
-//! Mutations through one store are serialized by an internal mutex, but the
-//! store still assumes one writer per shard: it reads, validates, and then
-//! submits one batch, without a conditional write. Separate stores or external
-//! writers need higher-level coordination. Request ids are derived from the
-//! observed sequence, so replaying a batch with the same view is idempotent.
-//! The high-level methods do not expose a caller-supplied request id, so
-//! exactly-once retry after an unknown commit remains a D1 caller
-//! responsibility.
+//! Mutations through one store are serialized by an internal mutex. Each
+//! mutation validates against one read view and submits its sequence as an
+//! atomic precondition, so separate stores sharing a node cannot commit stale
+//! validation. A concurrent write returns a typed storage conflict; callers
+//! must retry the entire mutation to re-read and revalidate, never just its
+//! batch. Nodes without conditional-write support reject mutations explicitly.
+//! Each invocation uses a fresh random request id. The high-level methods do
+//! not expose caller-supplied ids, so exactly-once retry after an unknown commit
+//! remains a D1 caller responsibility.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -28,7 +29,8 @@ use crate::graph::{
     validate_vertex, vertex_key, Edge, EdgeDirection, Vertex,
 };
 use crate::storage_node::{
-    KeyRange, ReadView, ScanLimit, ShardId, StorageNode, WriteOp, WriteRequest, WriteStatus,
+    KeyRange, ReadView, ScanLimit, ShardId, StorageNode, StorageNodeError, WriteOp, WriteRequest,
+    WriteStatus,
 };
 
 /// Maximum number of edges a single adjacency read may return.
@@ -386,27 +388,25 @@ impl<S: StorageNode> GraphRecordStore<S> {
                 operations.len()
             )));
         }
-        let sequence = view
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("storage sequence overflow".into()))?;
-        let result = self.node.batch_write(WriteRequest {
-            shard: self.shard,
-            epoch: view.epoch,
-            request_id: request_id(self.partition, sequence),
-            operations,
+        // Sequence-derived ids conflate independent writers from the same view,
+        // including two identical creates. Use a distinct identity per attempt.
+        let mut request_id = [0_u8; 16];
+        getrandom::fill(&mut request_id).map_err(|error| {
+            StorageNodeError::Storage(format!("request id entropy unavailable: {error}"))
         })?;
+        let result = self.node.batch_write_conditional(
+            WriteRequest {
+                shard: self.shard,
+                epoch: view.epoch,
+                request_id,
+                operations,
+            },
+            Some(view.sequence),
+        )?;
         match result.status {
             WriteStatus::Committed | WriteStatus::Duplicate => Ok(()),
         }
     }
-}
-
-fn request_id(partition: u32, sequence: u64) -> [u8; 16] {
-    let mut id = [0_u8; 16];
-    id[..4].copy_from_slice(&partition.to_be_bytes());
-    id[8..].copy_from_slice(&sequence.to_be_bytes());
-    id
 }
 
 fn prefix_range(prefix: &[u8]) -> Result<KeyRange> {

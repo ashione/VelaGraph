@@ -229,6 +229,13 @@ pub enum StorageNodeError {
         current: Epoch,
     },
 
+    /// The shard changed after the caller's read view. Re-read before retrying.
+    #[error("write conflict: expected sequence {expected}, current sequence is {current}")]
+    Conflict {
+        expected: Sequence,
+        current: Sequence,
+    },
+
     #[error("idempotency conflict for request {0:?}")]
     IdempotencyConflict(RequestId),
 
@@ -267,11 +274,34 @@ pub trait StorageNode: Send + Sync {
     fn get(&self, key: &[u8], view: &ReadView) -> Result<Option<Vec<u8>>>;
     fn scan(&self, range: KeyRange, limit: ScanLimit, view: &ReadView) -> Result<Vec<KeyValue>>;
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult>;
+
+    /// Atomically commit only if the shard still has `expected_sequence`.
+    ///
+    /// `None` preserves unconditional writes. Implementations must reject
+    /// unsupported conditions rather than silently dropping them. After epoch
+    /// validation, an identical committed request is returned as `Duplicate`
+    /// before checking the sequence; changing the condition for an existing
+    /// request id is an `IdempotencyConflict`. A conflict writes nothing.
+    fn batch_write_conditional(
+        &self,
+        request: WriteRequest,
+        expected_sequence: Option<Sequence>,
+    ) -> Result<WriteResult> {
+        if expected_sequence.is_some() {
+            return Err(StorageNodeError::Unsupported(
+                "conditional batch writes".into(),
+            ));
+        }
+        self.batch_write(request)
+    }
     fn admin(&self) -> &dyn StorageAdmin;
 }
 
 #[derive(Serialize, Deserialize)]
 struct DedupRecord {
+    // Absent in v0 records. Omitting None preserves legacy metadata bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_sequence: Option<Sequence>,
     operations: Vec<u8>,
     sequence: Sequence,
     applied_operations: usize,
@@ -546,6 +576,14 @@ impl StorageNode for LocalStorageNode {
     }
 
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult> {
+        self.batch_write_conditional(request, None)
+    }
+
+    fn batch_write_conditional(
+        &self,
+        request: WriteRequest,
+        expected_sequence: Option<Sequence>,
+    ) -> Result<WriteResult> {
         let canonical = self.validate_write(&request)?;
         let _guard = self.lock()?;
         let current_epoch = self.epoch()?;
@@ -559,7 +597,7 @@ impl StorageNode for LocalStorageNode {
         let dedup_key = Self::dedup_key(&request.request_id);
         if let Some(bytes) = self.db.get_cf(self.meta_cf(), &dedup_key)? {
             let record = Self::decode_dedup(&bytes)?;
-            if record.operations != canonical {
+            if record.operations != canonical || record.expected_sequence != expected_sequence {
                 return Err(StorageNodeError::IdempotencyConflict(request.request_id));
             }
             return Ok(WriteResult {
@@ -569,11 +607,17 @@ impl StorageNode for LocalStorageNode {
             });
         }
 
-        let sequence = self
-            .sequence()?
+        let current = self.sequence()?;
+        if let Some(expected) = expected_sequence {
+            if expected != current {
+                return Err(StorageNodeError::Conflict { expected, current });
+            }
+        }
+        let sequence = current
             .checked_add(1)
             .ok_or_else(|| StorageNodeError::ResourceExhausted("sequence overflow".into()))?;
         let dedup = DedupRecord {
+            expected_sequence,
             operations: canonical,
             sequence,
             applied_operations: request.operations.len(),

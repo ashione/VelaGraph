@@ -17,8 +17,10 @@ The first local adapter is implemented in [`src/storage_node.rs`](../src/storage
 with tests in [`tests/storage_node.rs`](../tests/storage_node.rs). It owns one
 `ShardId` and one opaque key space in RocksDB, with separate `data` and `meta`
 column families. `batch_write` updates data, the applied sequence, and the
-idempotency record in one atomic write; retries return `Duplicate`, conflicting
-bytes return `IdempotencyConflict`, and stale epochs return `Fenced`. Read views
+idempotency record in one atomic write. Optional `batch_write_conditional` compares
+the read-view sequence under that same write lock. Stale conditions return typed
+`Conflict { expected, current }` without writing data, sequence, or dedup metadata.
+Retries return `Duplicate`, conflicting operations or conditions return `IdempotencyConflict`, and stale epochs return `Fenced`. Read views
 are stable and bounded, scans enforce half-open ranges plus row/byte limits, and
 `StorageAdmin` provides export/import plus epoch advancement.
 
@@ -48,13 +50,22 @@ label, and id) and requires an empty adjacency value. A mismatch or missing edge
 is `CorruptData`; a failed cascade leaves both data and applied sequence unchanged.
 This is validation of the scanned index, not a full-graph integrity audit: absent
 adjacency entries cannot be discovered without scanning edge records.
-Mutations through one store are serialized, but the adapter assumes one
-writer per shard; separate stores need external coordination. It caps adjacency
+Mutations through one store are serialized. Each mutation validates against one
+read view and submits that view's sequence as a conditional batch, so independent
+stores sharing a conditional-capable node cannot both commit from the same
+sequence. The losing mutation returns the typed storage `Conflict` wrapped in
+`Error::StorageNode`; retry the entire graph operation to re-read and validate.
+There is no automatic retry. The conservative shard-wide check also conflicts on
+unrelated writes, including other partitions in the shard. Direct opaque-byte
+writers remain responsible for graph validity; this adapter cannot prevent them
+from writing malformed graph records after a valid mutation. It caps adjacency
 reads (and therefore a single cascade delete) at 1,000 incident edges and
 returns a storage error instead of a partial result, and leaves multi-shard
-routing and transactions to D3/D4. Request ids are derived from the observed sequence;
-exactly-once retry after an unknown commit still needs a caller-supplied id in a
-later slice. `GraphEngine` still
+routing and transactions to D3/D4. Each graph mutation invocation uses a fresh
+OS-random 128-bit request id, so identical creates from independent stores are
+not mistaken for retries. Entropy failure returns a storage error without a
+write. Exactly-once retry after an unknown commit still needs a caller-supplied
+id in a later slice; a new high-level invocation is a new attempt. `GraphEngine` still
 uses its own RocksDB handle, so the existing K1 path remains authoritative until
 the engine is wired through this adapter.
 
@@ -144,6 +155,7 @@ ReadView { shard, epoch, sequence }
 
 ```text
 batch_write(shard, epoch, request_id, operations) -> WriteResult
+batch_write_conditional(request, expected_sequence: Option<Sequence>) -> WriteResult
 ```
 
 `operations` is an ordered list of `put(key, value)` and `delete(key)`. The whole
@@ -151,10 +163,36 @@ batch is atomic or fails as a unit; there is no partial success. `WriteResult`
 contains the applied sequence and a committed/duplicate/dry-run status.
 
 `request_id` is the idempotency key. A retry with the same id and identical
-bytes returns the original result; the same id with different bytes is an
+operations and condition returns the original result; the same id with different
+operations or condition (including `Some` versus `None`) is an
 `IdempotencyConflict`. The dedup window is bounded and documented by the node
 (proposal: at least 10 minutes or the Raft log retention window, whichever is
 shorter).
+
+`expected_sequence = None` preserves the original unconditional behavior.
+`Some(sequence)` is an atomic shard-wide compare-and-write precondition, not a
+per-key version or a promise of cross-shard transactions. The caller must obtain
+it from the exact read view used for all validation reads. Adapters that do not
+support this operation return `Unsupported` for `Some`, never an unconditional
+write. The default trait method preserves existing implementations and callers.
+
+Local write ordering is:
+
+1. Validate shard, epoch, nonempty operations and size limits.
+2. Acquire the node's write lock and recheck epoch.
+3. Look up the request id. Identical operations and condition return the original
+   `Duplicate` result, even if the sequence has advanced. Different identity
+   returns `IdempotencyConflict` before the condition check.
+4. For a new request, compare the expected sequence with the current sequence.
+   A mismatch returns `Conflict { expected, current }` and consumes no request id.
+5. Check sequence overflow; atomically write data, the incremented sequence, and
+   the dedup record. Epoch revalidation, dedup, condition and overflow checks, and the
+   commit remain under the same lock.
+
+Thus a retry of a known committed conditional batch succeeds as `Duplicate`,
+while a new stale request cannot mutate any state. Fencing still takes precedence
+over deduplication. After a conflict, refresh the view and revalidate the complete
+operation, rather than changing a condition on a previously committed request.
 
 A write must not mix keys owned by different shards. That is a client routing
 error, not a partially applied transaction.
@@ -208,7 +246,7 @@ NotLeader            include leader hint and current epoch when known
 Fenced               stale epoch; refresh route and retry
 Unavailable          no quorum / temporarily unreachable; retryable with backoff
 IdempotencyConflict  same request id, different bytes
-Conflict             transaction write conflict; retryable by re-reading
+Conflict             expected/current sequence mismatch; retryable by re-reading
 ResourceExhausted    scan/row/byte limit
 Corrupt              checksum/format/version failure; do not auto-retry
 Unsupported          unknown interface/feature version
@@ -239,9 +277,29 @@ features = bitset
 
 The client sends its version and required feature bits on connect. The node
 rejects unknown required features with `Unsupported`; optional features are
-reported in the handshake. Adding an optional operation or error code is
-backward compatible; changing key/record bytes is a graph-format version
-change, not an interface change.
+reported in the handshake. The current in-process adapter has only
+`interface_version()`, not a negotiated RPC handshake or feature bitset.
+`batch_write_conditional` is an additive optional operation at interface version
+0; its default implementation returns `Unsupported` for a condition. Existing
+`WriteRequest` struct literals and unconditional `batch_write` calls are unchanged.
+The additive typed `Conflict` variant requires exhaustive error matches to be
+updated. A future transport must explicitly encode and negotiate conditional
+support, never drop the condition. D2 does not implement this synchronous trait
+method. Its independently versioned `D1V1` application commands now replicate
+these write semantics after explicit activation; legacy `TxnBatch` does not.
+See [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md) for the different persistence,
+snapshot and retained-request budget boundaries. A remote graph adapter remains
+unimplemented.
+
+Local dedup metadata gains an optional `expected_sequence` field. Missing means
+`None`, so existing records remain readable. Unconditional writes omit the field
+and retain the old representation. Conditional writes persist the condition,
+including across reopen. An older binary does not understand conditional request
+identity: do not downgrade a shard with conditional writes and replay those
+request ids through the old unconditional API. Export/import still deliberately
+omits dedup records and therefore does not preserve retry identity across
+migration. Graph keys and record bytes remain v1 and unchanged; no graph data
+migration is needed.
 
 ## Rust sketch
 
@@ -252,6 +310,8 @@ pub trait StorageNode: Send + Sync {
     fn scan(&self, range: KeyRange, limit: ScanLimit, view: &ReadView)
         -> Result<Vec<KeyValue>>;
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult>;
+    fn batch_write_conditional(&self, request: WriteRequest,
+        expected_sequence: Option<Sequence>) -> Result<WriteResult>;
     fn begin(&self, request: TransactionRequest) -> Result<Box<dyn Transaction>>;
     fn admin(&self) -> &dyn StorageAdmin;
 }
@@ -311,6 +371,15 @@ as the safe default until then.
 - Retrying the same `request_id` and bytes is idempotent; different bytes is
   `IdempotencyConflict`.
 - A stale epoch returns `Fenced` and the old owner cannot apply writes.
+- A stale/future condition returns typed `Conflict` and changes no data,
+  sequence, or dedup metadata. A refreshed uncommitted request can succeed.
+- Conditional duplicates preserve the original result after other commits and
+  reopen; changed conditions are idempotency conflicts, and stale epochs fence
+  even exact retries. Legacy dedup records remain readable.
+- Deterministic multi-store races cover identical/different same-id creation,
+  endpoint deletion versus edge creation, and label/endpoint changes versus
+  cascade deletion, in both winner orderings. Exactly one commits and the other
+  cannot partially change records or sequence.
 - `scan` respects start/end, row limit, and byte limit; a range with no data
   returns an empty result.
 - A snapshot read is stable across concurrent committed writes.
