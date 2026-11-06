@@ -240,3 +240,16 @@ an individual RocksDB call, record decode, allocation or destruction cannot be
 preempted. The execution deadline begins after parsing. The row cap bounds row
 cardinality. The separate accounted-byte budget is a logical admission limit,
 not a total heap or process RSS bound; see [QUERY_MEMORY.md](QUERY_MEMORY.md).
+
+## 11. Additive distributed global-scan entrypoint
+
+The static route resolver has a separate [global scan API](GLOBAL_SCAN.md) for
+`V()`/`E()`, optional `limit(n)`, and optional terminal `count()`. It uses this
+official parser but deliberately rejects every other step, including explicit
+IDs and adjacency. Single-partition execution above is unchanged. Ordinary
+rows carry partition IDs and sort by `(local ID, partition ID)`; count and limit
+are global. The default output cap is 100, the total candidate cap is 10,000,
+and one logical memory budget covers all partitions. A single metadata snapshot
+and one view per shard yield a per-shard snapshot vector, not a globally
+consistent snapshot. See the linked contract for fanout, snapshot admission,
+end-to-end deadline, all-or-error semantics and memory exclusions.

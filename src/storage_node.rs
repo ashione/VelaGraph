@@ -65,6 +65,19 @@ impl fmt::Debug for ReadView {
 }
 
 impl ReadView {
+    /// Number of retained key/value pairs, without cloning snapshot payloads.
+    pub fn row_count(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Raw key-plus-value bytes, excluding map/allocator overhead. This is not RSS.
+    pub fn payload_bytes(&self) -> usize {
+        self.data
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum()
+    }
+
     /// Construct an owned, bounded snapshot for an external D1 adapter.
     /// The caller must obtain metadata and entries from one atomic state view.
     pub fn from_entries(

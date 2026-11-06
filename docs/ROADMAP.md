@@ -206,5 +206,14 @@ this does not complete D3/D4/D5 or production transport security.
 fixed `(group,node)` endpoint registry to the existing resolver. Normal graph
 CRUD/Gremlin can target independent data groups; pinned sessions and exact CAS
 retries reuse the existing contract. Nine-process tests exercise metadata plus
-two data groups. No migration, cross-shard execution, automatic failover claim,
+two data groups. No migration, cross-partition edge traversal, automatic failover claim,
 TLS/authentication or production D3 completion is implied.
+
+### D5a bounded global scans (2026-11-07)
+
+The additive [global Gremlin scan](GLOBAL_SCAN.md) API merges V/E identities
+across static catalog partitions with global limit/count, stable `(ID, partition)`
+order, one snapshot per shard and one absolute deadline. It has no cross-edge
+traversal, global snapshot isolation or transactions. Full-copy snapshot and
+logical query budgets have explicit distinct bounds/exclusions. Actual metadata
+and two independent data processes exercise the functional path. D5 remains open.

@@ -102,6 +102,10 @@ impl CatalogSnapshot {
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
     }
+    /// Partition IDs in ascending order from this frozen metadata snapshot.
+    pub fn partitions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.partitions.keys().copied()
+    }
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
