@@ -12,6 +12,18 @@ import tempfile
 import time
 
 
+
+def record_client_result(log_path, record):
+    try:
+        with log_path.open('a') as log:
+            log.write(json.dumps(record) + '\n')
+    except OSError as error:
+        # Disk-full/permission errors must not hide an already received write
+        # identity or acknowledgement. This is diagnostics, not a retry journal.
+        raise RuntimeError(f'Cannot preserve client log {log_path}: {error}; no retry. '
+                           f'Response evidence: {record}') from error
+
+
 def run_client(client, config, args, timeout=20):
     log_path = Path(config).parent / 'client-results.jsonl'
     try:
@@ -27,8 +39,7 @@ def run_client(client, config, args, timeout=20):
                   if isinstance(error.stdout, bytes) else error.stdout,
                   'stderr': (error.stderr or b'').decode(errors='replace')
                   if isinstance(error.stderr, bytes) else error.stderr}
-        with log_path.open('a') as log:
-            log.write(json.dumps(record) + '\n')
+        record_client_result(log_path, record)
         raise RuntimeError(f'Client timed out; no retry. Inspect {log_path}: {record}') from error
     record = {'args': args, 'config': str(config), 'exit': result.returncode,
               'stdout': result.stdout, 'stderr': result.stderr}
@@ -36,8 +47,7 @@ def run_client(client, config, args, timeout=20):
         record['response'] = json.loads(result.stdout)
     except json.JSONDecodeError:
         pass
-    with log_path.open('a') as log:
-        log.write(json.dumps(record) + '\n')
+    record_client_result(log_path, record)
     return result
 
 

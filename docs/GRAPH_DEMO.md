@@ -42,7 +42,9 @@ finite timeouts. Failure includes bounded tails of node logs. Every completed
 client invocation is appended to `client-results.jsonl` with arguments, exit
 status, raw stdout/stderr, and parsed JSON when available. Failure messages keep
 both stdout and stderr, including structured unknown-outcome request IDs and
-stage evidence. A client timeout is recorded as unknown and is never retried;
+stage evidence. If writing the diagnostic log fails, the error still includes the
+already received response evidence; it does not claim persistence. A client
+timeout is recorded as unknown and is never retried;
 killing the client cannot cancel a server-side write already submitted.
 
 Completion, ordinary failures, SIGTERM, and Ctrl-C stop and reap only child processes

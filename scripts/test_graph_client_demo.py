@@ -70,6 +70,34 @@ class DemoSafetyTests(unittest.TestCase):
             self.assertEqual(record['stdout'], 'partial output')
             self.assertEqual(record['stderr'], 'diagnostic')
 
+    def test_log_io_failure_cannot_hide_received_identity_or_timeout(self):
+        from unittest.mock import patch
+        evidence = json.dumps({'ok': False, 'error': {'outcome': 'Unknown',
+                               'request_id': 'original-id', 'stage': 'Source'}})
+        for timeout in (False, True):
+            for operation in ('open', 'write', 'close'):
+                with self.subTest(timeout=timeout, operation=operation), \
+                        patch.object(demo.subprocess, 'run') as run, \
+                        patch.object(Path, 'open') as open_log:
+                    if operation == 'open':
+                        open_log.side_effect = OSError('disk full')
+                    elif operation == 'write':
+                        open_log.return_value.__enter__.return_value.write.side_effect = OSError('disk full')
+                    else:
+                        open_log.return_value.__exit__.side_effect = OSError('disk full')
+                    if timeout:
+                        run.side_effect = subprocess.TimeoutExpired('client', 20,
+                                                                   evidence.encode(), b'network stalled')
+                    else:
+                        run.return_value = subprocess.CompletedProcess([], 1, evidence, 'network stalled')
+                    with self.assertRaises(RuntimeError) as raised:
+                        demo.invoke('/client', '/config', 'experimental', 'edge', 'create')
+                    for detail in ('original-id', 'Unknown', 'Source', 'network stalled', 'no retry'):
+                        self.assertIn(detail, str(raised.exception))
+                    if timeout:
+                        self.assertIn('unknown-client-timeout', str(raised.exception))
+                    run.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()
