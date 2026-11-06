@@ -168,3 +168,18 @@ A change to the query layer MUST include:
 - Mutations through the query language (use the graph API).
 - Cross-partition traversals; that is D5.
 - Query planning/cost optimization; v0 is a deterministic interpreter.
+
+### Enforcement details
+
+The row cap applies to every materialized intermediate traverser set, including
+expansion after an earlier `limit`. A later `limit` or `count` does not exempt
+an oversized preceding step. A leading `limit` can bound the initial scan.
+Adjacency indexes are visited incrementally; retained expansion rows are capped
+before insertion, then returned in ascending edge-id order per input traverser.
+
+Execution checks the deadline during scans and operators and before returning
+success, including a traversal with no chained steps. Checks are cooperative:
+an individual RocksDB call, record decode, allocation or destruction cannot be
+preempted. The execution deadline begins after parsing. The row cap bounds row
+cardinality, not bytes or process RSS; v0 has no per-record property-size or
+aggregate byte budget. A separate byte-budget contract remains future work.

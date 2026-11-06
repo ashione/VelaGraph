@@ -428,7 +428,12 @@ impl GraphEngine {
     /// Scan at most `limit` vertices in id order. `truncated` is true when at
     /// least one more vertex exists. Query execution uses this to enforce row
     /// limits before materializing an unbounded result.
-    pub(crate) fn scan_vertices(&self, limit: usize) -> Result<(Vec<Vertex>, bool)> {
+    pub(crate) fn scan_vertices_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Vertex>, bool)> {
+        check()?;
         let prefix = vertex_prefix(self.partition);
         let mut vertices = Vec::new();
         let mut truncated = false;
@@ -436,6 +441,7 @@ impl GraphEngine {
             .db
             .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
         {
+            check()?;
             let (key, bytes) = item?;
             if !key.starts_with(&prefix) {
                 break;
@@ -445,6 +451,7 @@ impl GraphEngine {
                 break;
             }
             let vertex = codec::decode_vertex(&bytes)?;
+            check()?;
             let stored_id = id_from_record_key(&key, &prefix)?;
             if vertex.id != stored_id {
                 return Err(Error::CorruptData(format!(
@@ -454,7 +461,7 @@ impl GraphEngine {
             }
             vertices.push(vertex);
         }
-        vertices.sort_by_key(|vertex| vertex.id);
+        check()?;
         Ok((vertices, truncated))
     }
 
@@ -484,8 +491,13 @@ impl GraphEngine {
         Ok(edges)
     }
 
-    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices`].
-    pub(crate) fn scan_edges(&self, limit: usize) -> Result<(Vec<Edge>, bool)> {
+    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices_checked`].
+    pub(crate) fn scan_edges_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Edge>, bool)> {
+        check()?;
         let prefix = edge_prefix(self.partition);
         let mut edges = Vec::new();
         let mut truncated = false;
@@ -493,6 +505,7 @@ impl GraphEngine {
             .db
             .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
         {
+            check()?;
             let (key, bytes) = item?;
             if !key.starts_with(&prefix) {
                 break;
@@ -502,6 +515,7 @@ impl GraphEngine {
                 break;
             }
             let edge = codec::decode_edge(&bytes)?;
+            check()?;
             let stored_id = id_from_record_key(&key, &prefix)?;
             if edge.id != stored_id {
                 return Err(Error::CorruptData(format!(
@@ -511,8 +525,70 @@ impl GraphEngine {
             }
             edges.push(edge);
         }
-        edges.sort_by_key(|edge| edge.id);
+        check()?;
         Ok((edges, truncated))
+    }
+
+    /// Visit adjacency records one at a time without collecting ids or properties.
+    /// The caller bounds retained rows and restores edge-id ordering (the index
+    /// groups records by label). Checks bracket storage reads and decoding, and
+    /// run after the visitor and before successful return, including empty scans.
+    pub(crate) fn visit_adjacent_edges(
+        &self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(Edge) -> Result<()>,
+    ) -> Result<()> {
+        check()?;
+        if let Some(label) = label {
+            validate_label(label)?;
+        }
+        let vertex_exists = self
+            .db
+            .get(vertex_key(self.partition, vertex_id))?
+            .is_some();
+        check()?;
+        if !vertex_exists {
+            return Err(Error::VertexNotFound(vertex_id));
+        }
+        let direction = if incoming {
+            EdgeDirection::In
+        } else {
+            EdgeDirection::Out
+        };
+        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (stored_key, _) = item?;
+            if !stored_key.starts_with(&prefix) {
+                break;
+            }
+            let edge_id = edge_id_from_adjacency_key(&stored_key)?;
+            let bytes = self.db.get(edge_key(self.partition, edge_id))?;
+            check()?;
+            let Some(bytes) = bytes else {
+                return Err(Error::CorruptData(format!(
+                    "adjacency entry references missing edge {edge_id}"
+                )));
+            };
+            let edge = codec::decode_edge(&bytes)?;
+            check()?;
+            if edge.id != edge_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {edge_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            visit(edge)?;
+            check()?;
+        }
+        check()?;
+        Ok(())
     }
 
     fn edges_by_direction(
@@ -1165,5 +1241,144 @@ fn validate_label(label: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidGraphLabel(label.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod query_scan_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn exhausted() -> Error {
+        Error::TraversalLimitExceeded("test budget exhausted".into())
+    }
+
+    #[test]
+    fn checked_scans_recheck_empty_results_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        for vertices in [true, false] {
+            let mut checks = 0;
+            let mut check = || {
+                checks += 1;
+                if checks == 2 {
+                    Err(exhausted())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = if vertices {
+                graph.scan_vertices_checked(10, &mut check).map(|_| ())
+            } else {
+                graph.scan_edges_checked(10, &mut check).map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
+            assert_eq!(checks, 2);
+        }
+    }
+
+    #[test]
+    fn checked_scans_stop_after_record_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        graph.create_vertex(&Vertex::new(1)).unwrap();
+        graph.create_edge(&Edge::new(2, 1, 1, "LOOP")).unwrap();
+        for vertices in [true, false] {
+            let mut checks = 0;
+            let mut check = || {
+                checks += 1;
+                if checks == 3 {
+                    Err(exhausted())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = if vertices {
+                graph.scan_vertices_checked(10, &mut check).map(|_| ())
+            } else {
+                graph.scan_edges_checked(10, &mut check).map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
+            assert_eq!(checks, 3);
+        }
+    }
+
+    #[test]
+    fn adjacency_visitor_checks_budget_after_visiting_last_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        graph.create_vertex(&Vertex::new(1)).unwrap();
+        graph.create_edge(&Edge::new(2, 1, 1, "LOOP")).unwrap();
+        let visited = Cell::new(false);
+        let result = graph.visit_adjacent_edges(
+            1,
+            false,
+            None,
+            &mut || {
+                if visited.get() {
+                    Err(exhausted())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_| {
+                visited.set(true);
+                Ok(())
+            },
+        );
+        assert!(visited.get());
+        assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
+    }
+
+    #[test]
+    fn adjacency_visitor_stops_without_reading_later_corrupt_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        graph.create_vertex(&Vertex::new(1)).unwrap();
+        for id in 2..=3 {
+            graph.create_edge(&Edge::new(id, 1, 1, "LOOP")).unwrap();
+        }
+        graph.db.put(edge_key(graph.partition, 3), b"bad").unwrap();
+        let mut visited = Vec::new();
+        let result = graph.visit_adjacent_edges(1, false, None, &mut || Ok(()), &mut |edge| {
+            visited.push(edge.id);
+            Err(exhausted())
+        });
+        assert_eq!(visited, vec![2]);
+        assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
+    }
+
+    #[test]
+    fn gremlin_expansion_hits_row_cap_before_later_corrupt_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        graph.create_vertex(&Vertex::new(1)).unwrap();
+        graph.create_vertex(&Vertex::new(2)).unwrap();
+        for id in 1..=10_002 {
+            graph.create_edge(&Edge::new(id, 1, 2, "LINK")).unwrap();
+        }
+        graph
+            .db
+            .put(edge_key(graph.partition, 10_002), b"bad")
+            .unwrap();
+
+        // The explicit limit cannot hide an overflowing intermediate expansion.
+        // Eagerly loading every adjacency record would instead hit CorruptData.
+        let result = graph.gremlin("g.V(1).out().limit(1)");
+        assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
+        assert!(matches!(graph.get_edge(10_002), Err(Error::CorruptData(_))));
+    }
+
+    #[test]
+    fn gremlin_both_deduplicates_self_loops_at_exact_row_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        graph.create_vertex(&Vertex::new(1)).unwrap();
+        for id in 1..=10_000 {
+            graph.create_edge(&Edge::new(id, 1, 1, "LOOP")).unwrap();
+        }
+        let result = graph.gremlin("g.V(1).both().count()").unwrap();
+        assert_eq!(result.rows, vec![crate::gremlin::GremlinRow::Count(10_000)]);
     }
 }
