@@ -13,7 +13,7 @@ use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, WriteBatch, W
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::types::{ApplyResult, LogCommand, NodeId, TypeConfig};
+use crate::types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};
 
 const DATA_PREFIX: &[u8] = b"sm/data/";
 const DATA_PREFIX_END: &[u8] = b"sm/data0";
@@ -31,7 +31,7 @@ pub struct StoredSnapshot {
 pub struct StateMachineData {
     pub last_applied_log: Option<LogId<NodeId>>,
     pub last_membership: StoredMembership<NodeId, BasicNode>,
-    pub data: BTreeMap<String, String>,
+    pub data: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -56,10 +56,10 @@ where
     StorageIOError::write_state_machine(&error).into()
 }
 
-fn data_key(key: &str) -> Vec<u8> {
+fn data_key(key: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(DATA_PREFIX.len() + key.len());
     encoded.extend_from_slice(DATA_PREFIX);
-    encoded.extend_from_slice(key.as_bytes());
+    encoded.extend_from_slice(key);
     encoded
 }
 
@@ -100,9 +100,7 @@ impl StateMachine {
             if !key.starts_with(DATA_PREFIX) {
                 break;
             }
-            let key = String::from_utf8(key[DATA_PREFIX.len()..].to_vec())?;
-            let value = String::from_utf8(value.to_vec())?;
-            data.insert(key, value);
+            data.insert(key[DATA_PREFIX.len()..].to_vec(), value.to_vec());
         }
         drop(iter);
         let current_snapshot: Option<StoredSnapshot> = match storage.db.get(SNAPSHOT_KEY)? {
@@ -127,12 +125,36 @@ impl StateMachine {
         })
     }
 
+    /// Read a UTF-8 key/value pair from the D2 compatibility surface.
     pub async fn get(&self, key: &str) -> Option<String> {
+        self.get_raw(key.as_bytes())
+            .await
+            .and_then(|value| String::from_utf8(value).ok())
+    }
+
+    /// Read opaque D1 bytes.
+    pub async fn get_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.state.read().await.data.get(key).cloned()
     }
 
-    pub async fn scan(&self) -> BTreeMap<String, String> {
+    /// Dump the whole D1 partition as opaque bytes.
+    pub async fn scan_raw(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         self.state.read().await.data.clone()
+    }
+
+    /// UTF-8 view used by the D2 smoke tests and control port.
+    pub async fn scan(&self) -> BTreeMap<String, String> {
+        self.state
+            .read()
+            .await
+            .data
+            .iter()
+            .filter_map(|(key, value)| {
+                let key = String::from_utf8(key.clone()).ok()?;
+                let value = String::from_utf8(value.clone()).ok()?;
+                Some((key, value))
+            })
+            .collect()
     }
 
     pub async fn applied(&self) -> Option<LogId<NodeId>> {
@@ -143,8 +165,13 @@ impl StateMachine {
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachine> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let sm = self.state.read().await;
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = sm
+            .data
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         let data =
-            serde_json::to_vec(&sm.data).map_err(|e| StorageIOError::read_state_machine(&e))?;
+            serde_json::to_vec(&entries).map_err(|e| StorageIOError::read_state_machine(&e))?;
         let last_applied_log = sm.last_applied_log;
         let last_membership = sm.last_membership.clone();
         let mut current = self.current_snapshot.write().await;
@@ -206,19 +233,26 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     next.last_membership = StoredMembership::new(Some(entry.log_id), mem);
                     out.push(ApplyResult { value: None });
                 }
-                EntryPayload::Normal(cmd) => match cmd {
-                    LogCommand::Noop => out.push(ApplyResult { value: None }),
-                    LogCommand::Put(key, value) => {
-                        next.data.insert(key.clone(), value.clone());
-                        batch.put(data_key(&key), value.as_bytes());
-                        out.push(ApplyResult { value: Some(value) });
+                EntryPayload::Normal(cmd) => {
+                    match cmd {
+                        LogCommand::Noop => {}
+                        LogCommand::TxnBatch(operations) => {
+                            for operation in operations {
+                                match operation {
+                                    WriteOp::Put { key, value } => {
+                                        next.data.insert(key.clone(), value.clone());
+                                        batch.put(data_key(&key), value);
+                                    }
+                                    WriteOp::Delete { key } => {
+                                        next.data.remove(&key);
+                                        batch.delete(data_key(&key));
+                                    }
+                                }
+                            }
+                        }
                     }
-                    LogCommand::Delete(key) => {
-                        next.data.remove(&key);
-                        batch.delete(data_key(&key));
-                        out.push(ApplyResult { value: None });
-                    }
-                },
+                    out.push(ApplyResult { value: None });
+                }
             }
         }
 
@@ -245,12 +279,12 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let data = serde_json::from_slice(&bytes)
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(&bytes)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let next = StateMachineData {
             last_applied_log: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
-            data,
+            data: entries.into_iter().collect(),
         };
         let stored = StoredSnapshot {
             meta: meta.clone(),
@@ -261,7 +295,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             let mut batch = WriteBatch::default();
             batch.delete_range(DATA_PREFIX, DATA_PREFIX_END);
             for (key, value) in &next.data {
-                batch.put(data_key(key), value.as_bytes());
+                batch.put(data_key(key), value);
             }
             let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
             let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;

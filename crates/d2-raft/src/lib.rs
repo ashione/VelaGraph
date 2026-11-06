@@ -27,4 +27,4 @@ pub use tcp::{
     add_learner, change_membership, initialize_cluster, send_control, ControlRequest,
     ControlResponse, NodeStatus, TcpNode, TcpNodeConfig,
 };
-pub use types::{ApplyResult, LogCommand, NodeId, TypeConfig};
+pub use types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};

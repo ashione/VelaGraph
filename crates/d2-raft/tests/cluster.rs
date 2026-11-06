@@ -220,3 +220,28 @@ async fn a_new_learner_installs_a_snapshot() -> anyhow::Result<()> {
     assert!(installed.meta.last_log_id.map(|l| l.index).unwrap_or(0) >= applied);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opaque_d1_batch_replicates_across_nodes() -> anyhow::Result<()> {
+    let (_cluster, nodes) = start_three().await?;
+    let leader = leader_of(&nodes, 5_000).await?;
+    let key = b"graph/v1/p/0/vertex/\x00\xff";
+    let value = b"opaque-vertex";
+
+    let response = handle(&nodes, leader)
+        .raft
+        .client_write(LogCommand::put(key, value))
+        .await?;
+    for n in &nodes {
+        _cluster
+            .wait_for_applied(n, response.log_id.index, 5_000)
+            .await?;
+        assert_eq!(
+            n.state_machine.get_raw(key).await.as_deref(),
+            Some(&value[..]),
+            "node {} must expose the opaque value",
+            n.id
+        );
+    }
+    Ok(())
+}
