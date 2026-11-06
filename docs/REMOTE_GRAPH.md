@@ -109,5 +109,14 @@ validated kill/restart recovery, leader replacement, partitions, quorum loss,
 ambiguous committed graph-write recovery, snapshot install during remote graph
 traffic, or power-loss guarantees. Existing D2 and in-process graph tests retain
 their own narrower evidence; they do not substitute for those remote end-to-end
-scenarios. Cross-shard routing/transactions, durable client journals, production
-authentication, and query pushdown are also deferred.
+scenarios. Static partition-to-group routing is now available through
+[REMOTE_ROUTING.md](REMOTE_ROUTING.md). Cross-shard transactions, durable client
+journals, production authentication, and query pushdown remain deferred.
+
+## Identified groups
+
+For new multi-group deployments use `--group`, identified RPCs, and the static
+resolver described in [REMOTE_ROUTING.md](REMOTE_ROUTING.md). The CLI now binds
+group/node identity in a durable marker and refuses unmarked nonempty legacy
+directories. Do not silently upgrade/adopt old data directories. Legacy clients
+remain supported only on group-zero services.

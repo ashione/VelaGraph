@@ -2,8 +2,10 @@
 
 This is a bounded **in-process metadata slice**, not completion of D3. It adds
 persisted partition-to-shard and immutable shard-to-Raft-group placement.
-Remote leader discovery, route caching, membership changes, shard migration,
-rollback, remote RPC, security, and cross-partition queries remain unsupported.
+Route caching, membership changes, shard migration, rollback, security, and
+cross-partition queries remain unsupported. An additive static remote client is
+now documented in [REMOTE_ROUTING.md](REMOTE_ROUTING.md); the original in-process
+contract below remains unchanged.
 The existing single-shard graph adapter remains available; the bounded resolver
 below adds fixed-candidate in-process routing.
 
@@ -34,7 +36,9 @@ overwrite its bytes is outside the safe API contract.
 ## Linearizable reads and registration
 
 `snapshot` and `lookup` perform a fresh metadata leader quorum barrier using the
-concrete `ReplicatedStorageNode`, followed by its atomic bounded D1 snapshot.
+concrete adapter, followed by its atomic bounded D1 snapshot. The original
+constructor uses `ReplicatedStorageNode`; `new_remote` uses identified
+`RemoteStorageNode` and the remote server's quorum barrier.
 They never accept an arbitrary `StorageNode` implementation claiming to be
 linearizable. Follower, missing quorum, stopped node, incompatible execution
 context and expired deadline remain typed failures. An absent partition is

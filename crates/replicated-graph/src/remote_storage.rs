@@ -31,6 +31,8 @@ pub struct RemoteStorageNode {
     endpoint: SocketAddr,
     shard: ShardId,
     deadline: Duration,
+    absolute_deadline: Option<Instant>,
+    identity: Option<remote::RemoteIdentity>,
     runtime: Handle,
     admission: Arc<Semaphore>,
 }
@@ -52,9 +54,46 @@ impl RemoteStorageNode {
             endpoint,
             shard,
             deadline,
+            absolute_deadline: None,
+            identity: None,
             runtime,
             admission: Arc::new(Semaphore::new(32)),
         })
+    }
+
+    /// Explicit immutable server identity for static multi-group routing.
+    /// Unlike `new`, every RPC includes and validates both group and node ID.
+    pub fn new_identified(
+        endpoint: SocketAddr,
+        group: u64,
+        node: u64,
+        shard: ShardId,
+        deadline: Duration,
+    ) -> Result<Self> {
+        let mut adapter = Self::new(endpoint, shard, deadline)?;
+        adapter.identity = Some(remote::RemoteIdentity { group, node });
+        Ok(adapter)
+    }
+
+    pub(crate) fn scoped(&self, shard: ShardId, end: Instant, admission: Arc<Semaphore>) -> Self {
+        let mut node = self.clone();
+        node.shard = shard;
+        node.absolute_deadline = Some(end);
+        node.admission = admission;
+        node
+    }
+
+    pub(crate) fn probe_leader(&self) -> Result<()> {
+        let (endpoint, identity, shard, deadline) =
+            (self.endpoint, self.identity, self.shard, self.deadline);
+        match identity {
+            Some(identity) => self.dispatch(None, async move {
+                remote::probe_identified(endpoint, identity, shard, deadline)
+                    .await
+                    .map_err(|e| map_error(e, shard, 0, None))
+            }),
+            None => self.read_view().map(|_| ()),
+        }
     }
 
     fn dispatch<T, F>(&self, request_id: Option<RequestId>, future: F) -> Result<T>
@@ -63,9 +102,15 @@ impl RemoteStorageNode {
         F: Future<Output = Result<T>> + Send + 'static,
     {
         self.check_execution_context()?;
-        let end = Instant::now()
-            .checked_add(self.deadline)
-            .ok_or_else(|| StorageNodeError::InvalidArgument("deadline overflow".into()))?;
+        let end = match self.absolute_deadline {
+            Some(end) => end,
+            None => Instant::now()
+                .checked_add(self.deadline)
+                .ok_or_else(|| StorageNodeError::InvalidArgument("deadline overflow".into()))?,
+        };
+        if Instant::now() >= end {
+            return Err(StorageNodeError::Timeout { request_id });
+        }
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             StorageNodeError::ResourceExhausted(
                 "32 remote adapter operations already in flight".into(),
@@ -92,7 +137,7 @@ impl RemoteStorageNode {
         }
     }
 
-    fn check_view(&self, view: &ReadView) -> Result<()> {
+    pub(crate) fn check_view(&self, view: &ReadView) -> Result<()> {
         if view.shard != self.shard {
             return Err(StorageNodeError::InvalidArgument(
                 "view belongs to a different shard".into(),
@@ -100,10 +145,15 @@ impl RemoteStorageNode {
         }
         let (endpoint, shard, deadline, epoch) =
             (self.endpoint, self.shard, self.deadline, view.epoch);
+        let identity = self.identity;
         self.dispatch(None, async move {
-            let (current_shard, current, _) = remote::metadata(endpoint, shard, deadline)
-                .await
-                .map_err(|e| map_error(e, shard, epoch, None))?;
+            let (current_shard, current, _) = match identity {
+                Some(identity) => {
+                    remote::metadata_identified(endpoint, identity, shard, deadline).await
+                }
+                None => remote::metadata(endpoint, shard, deadline).await,
+            }
+            .map_err(|e| map_error(e, shard, epoch, None))?;
             if current_shard != shard {
                 return Err(StorageNodeError::Corrupt(
                     "remote metadata shard mismatch".into(),
@@ -163,10 +213,15 @@ impl StorageNode for RemoteStorageNode {
 
     fn read_view(&self) -> Result<ReadView> {
         let (endpoint, shard, deadline) = (self.endpoint, self.shard, self.deadline);
+        let identity = self.identity;
         self.dispatch(None, async move {
-            let snapshot = remote::snapshot(endpoint, shard, deadline)
-                .await
-                .map_err(|e| map_error(e, shard, 0, None))?;
+            let snapshot = match identity {
+                Some(identity) => {
+                    remote::snapshot_identified(endpoint, identity, shard, deadline).await
+                }
+                None => remote::snapshot(endpoint, shard, deadline).await,
+            }
+            .map_err(|e| map_error(e, shard, 0, None))?;
             if snapshot.shard != shard {
                 return Err(StorageNodeError::Corrupt(
                     "remote snapshot shard mismatch".into(),
@@ -269,11 +324,16 @@ impl StorageNode for RemoteStorageNode {
                 })
                 .collect(),
         };
+        let identity = self.identity;
         self.dispatch(Some(id), async move {
-            match remote::write(endpoint, request, deadline)
-                .await
-                .map_err(|e| map_error(e, shard, epoch, Some(id)))?
-            {
+            let result = match identity {
+                Some(identity) => {
+                    remote::write_identified(endpoint, identity, request, deadline).await
+                }
+                None => remote::write(endpoint, request, deadline).await,
+            }
+            .map_err(|e| map_error(e, shard, epoch, Some(id)))?;
+            match result {
                 D1Result::Write {
                     sequence,
                     status,
@@ -438,5 +498,45 @@ mod tests {
             adapter.dispatch(None, async { Ok(()) }),
             Err(StorageNodeError::Unavailable(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod routing_deadline_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_scope_never_dispatches_and_clones_share_admission() {
+        let node = RemoteStorageNode::new_identified(
+            "127.0.0.1:1".parse().unwrap(),
+            4,
+            1,
+            7,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let expired = node.scoped(
+            7,
+            Instant::now() - Duration::from_millis(1),
+            admission.clone(),
+        );
+        let id = [5; 16];
+        assert!(
+            matches!(crate::run_blocking(move || expired.dispatch(Some(id), async { panic!("must not poll") })).await.unwrap(), Err::<(), _>(StorageNodeError::Timeout { request_id: Some(actual) }) if actual == id)
+        );
+        let scoped = node.scoped(
+            7,
+            Instant::now() + Duration::from_secs(1),
+            admission.clone(),
+        );
+        let held = admission.try_acquire_owned().unwrap();
+        assert!(matches!(
+            crate::run_blocking(move || scoped.dispatch(None, async { Ok(()) }))
+                .await
+                .unwrap(),
+            Err(StorageNodeError::ResourceExhausted(_))
+        ));
+        drop(held);
     }
 }
