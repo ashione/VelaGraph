@@ -238,5 +238,7 @@ and complete D5 remain deferred. See EXPERIMENTAL_CROSS_EDGES.md.
 Experimental graph/v2 now exposes additive observed_gremlin_v3 E()/E(ids)
 filtering and projection, qualified EdgeRef results and paths, bounded canonical
 paging and source/reverse/endpoint checks. All results remain Unverified;
-edge-to-vertex traversal, repair, cross-shard transactions and completeness
-certification remain future work. Legacy observed APIs are unchanged.
+repair, cross-shard transactions and completeness certification remain future
+work. Legacy observed APIs are unchanged. The v3 functional subset now also supports
+edge adjacency and endpoint transitions with qualified paths, shared budgets,
+and explicitly unverified observations; this is not complete D5.

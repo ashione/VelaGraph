@@ -22,7 +22,9 @@ use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
 };
-const BUDGET: Duration = Duration::from_secs(20);
+// Cumulative-work regressions intentionally verify thousands of primitive reads.
+// Allow the supported maximum session deadline under slower CI hosts.
+const BUDGET: Duration = Duration::from_secs(60);
 // Keep the two process fixtures from competing for ephemeral-port startup.
 static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Process(Child);
@@ -258,7 +260,6 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             "g.E(999).in()",
             "g.E().limit(0).both()",
             "g.E().outE()",
-            "g.E().inV()",
             "g.E().id()",
             "g.E().values('missing').path()",
             "g.E().label().has('x')",
@@ -275,6 +276,222 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
                 value: rocksdb_sql_table::Value::Text("P1".into())
             }]
         );
+        // Consolidating the v3 evaluator must preserve v2 vertex-only behavior.
+        use replicated_graph::routing::experimental::ObservedRowV2 as R2;
+        for query in [
+            "g.V()",
+            "g.V(7,999,7)",
+            "g.V().limit(2).count()",
+            "g.V(7).out().path()",
+            "g.V(7).in().path()",
+            "g.V(7).both().hasLabel('P2').count()",
+            "g.V().label()",
+            "g.V(7).out().label().limit(1)",
+            "g.V().values('missing')",
+        ] {
+            let v2 = s.observed_gremlin_v2(1, query)?;
+            let v3 = s.observed_gremlin_v3(1, query)?;
+            let expected = v2
+                .rows
+                .into_iter()
+                .map(|r| match r {
+                    R2::Vertex(v) => R3::Vertex(v),
+                    R2::Path(p) => R3::Path(p),
+                    R2::Count(n) => R3::Count(n),
+                    R2::Value { source, value } => R3::Value {
+                        source: Element::Vertex(source),
+                        value,
+                    },
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(v3.rows, expected, "{query}");
+            assert_eq!(v3.snapshots, v2.snapshots);
+            assert_eq!(v3.metadata_sequence, v2.metadata_sequence);
+            assert_eq!(v3.completeness, v2.completeness);
+        }
+        assert!(matches!(
+            s.observed_gremlin_v3(1, "g.V(999).values('missing').has('x')"),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
+            ))
+        ));
+        // Edge traversers preserve qualified identity, per-input order and bag semantics.
+        for (query, expected) in [
+            ("g.V(7).outE()", vec![(1, 9), (1, 10), (1, 11), (1, 12)]),
+            ("g.V(7).inE()", vec![(2, 9), (1, 12)]),
+            (
+                "g.V(7).bothE()",
+                vec![(1, 9), (2, 9), (1, 10), (1, 11), (1, 12)],
+            ),
+            (
+                "g.V(7).bothE('K')",
+                vec![(1, 9), (2, 9), (1, 10), (1, 11), (1, 12)],
+            ),
+            ("g.V(7).outE('Missing')", vec![]),
+            ("g.V(7).inE('Missing')", vec![]),
+            ("g.V(7).bothE('Missing')", vec![]),
+            ("g.V(999).outE()", vec![]),
+            ("g.V(7).outE().has('x',1)", vec![(1, 10), (1, 11), (1, 12)]),
+            ("g.V(7).outE().limit(1).has('x',1)", vec![]),
+            ("g.V(7).outE().has('x',1).limit(1)", vec![(1, 10)]),
+            ("g.V(7,7).limit(1).outE().limit(2)", vec![(1, 9), (1, 10)]),
+        ] {
+            let result = s.observed_gremlin_v3(1, query)?;
+            assert_eq!(
+                result.rows,
+                expected
+                    .into_iter()
+                    .map(|(p, id)| R3::Edge(er(p, id)))
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+            assert_eq!(result.snapshots, s.snapshots);
+            assert_eq!(result.metadata_sequence, s.metadata_sequence);
+        }
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7,7).bothE()")?.rows,
+            [(1, 9), (2, 9), (1, 10), (1, 11), (1, 12)]
+                .into_iter()
+                .cycle()
+                .take(10)
+                .map(|(p, id)| R3::Edge(er(p, id)))
+                .collect::<Vec<_>>()
+        );
+        for (partition, query, expected) in [
+            (1, "g.E(9).inV()", vec![2]),
+            (1, "g.E(9).outV()", vec![1]),
+            (2, "g.E(9).inV()", vec![1]),
+            (2, "g.E(9).outV()", vec![2]),
+            (1, "g.E(9,9).bothV()", vec![1, 2, 1, 2]),
+            (1, "g.E(12).bothV()", vec![1, 1]),
+            (1, "g.E(999).bothV()", vec![]),
+            (1, "g.V(7).outE('K').inV()", vec![2, 2, 3, 1]),
+            (1, "g.V(7).inE('K').outV()", vec![2, 1]),
+            (1, "g.V(7).outE().inV().hasLabel('P2')", vec![2, 2]),
+            (1, "g.E(9).bothV().limit(1).hasLabel('P2')", vec![]),
+            (1, "g.E(9).bothV().hasLabel('P2').limit(1)", vec![2]),
+            (1, "g.E(9).inV().out()", vec![1]),
+        ] {
+            assert_eq!(
+                s.observed_gremlin_v3(partition, query)?.rows,
+                expected
+                    .into_iter()
+                    .map(|p| R3::Vertex(vr(p)))
+                    .collect::<Vec<_>>(),
+                "partition {partition}: {query}"
+            );
+        }
+        for (query, count) in [
+            ("g.V(7,7).outE().count()", 8),
+            ("g.V(7,7).inE().count()", 4),
+            ("g.V(7,7).bothE().count()", 10),
+            ("g.E(12).bothV().count()", 2),
+            ("g.V(7).outE().values('x').count()", 4),
+            ("g.V(999).outE().inV().count()", 0),
+        ] {
+            assert_eq!(
+                s.observed_gremlin_v3(1, query)?.rows,
+                vec![R3::Count(count)],
+                "{query}"
+            );
+        }
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).outE().limit(1).path()")?
+                .rows,
+            vec![R3::Path(vec![
+                ObservedPathElement::Vertex(vr(1)),
+                ObservedPathElement::Edge(er(1, 9))
+            ])]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(9).inV().path()")?.rows,
+            vec![R3::Path(vec![
+                ObservedPathElement::Edge(er(1, 9)),
+                ObservedPathElement::Vertex(vr(2))
+            ])]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(9).bothV().path()")?.rows,
+            vec![
+                R3::Path(vec![
+                    ObservedPathElement::Edge(er(1, 9)),
+                    ObservedPathElement::Vertex(vr(1))
+                ]),
+                R3::Path(vec![
+                    ObservedPathElement::Edge(er(1, 9)),
+                    ObservedPathElement::Vertex(vr(2))
+                ]),
+            ]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).outE().limit(1).inV().path()")?
+                .rows,
+            s.observed_gremlin_v3(1, "g.V(7).out().limit(1).path()")?
+                .rows
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(12).bothV().path()")?.rows,
+            vec![
+                R3::Path(vec![
+                    ObservedPathElement::Edge(er(1, 12)),
+                    ObservedPathElement::Vertex(vr(1))
+                ]);
+                2
+            ]
+        );
+        // Validation must not depend on whether execution happens to emit rows.
+        for query in [
+            "g.V(999).inV()",
+            "g.V(999).outV()",
+            "g.V(999).bothV()",
+            "g.E(999).outE()",
+            "g.E(999).inE()",
+            "g.E(999).bothE()",
+            "g.V(999).outE().outE()",
+            "g.E(999).inV().inV()",
+            "g.V(999).values('missing').outE()",
+            "g.V(999).values('missing').inE()",
+            "g.V(999).label().bothE()",
+            "g.E(999).values('missing').inV()",
+            "g.E(999).label().outV()",
+            "g.E(999).label().bothV()",
+            "g.V(999).outE('K','Missing')",
+            "g.V(999).inE('K','Missing')",
+            "g.V(999).bothE('K','Missing')",
+            "g.E(999).inV('K')",
+            "g.E(999).outV('K')",
+            "g.E(999).bothV('K')",
+        ] {
+            assert!(s.observed_gremlin_v3(1, query).is_err(), "{query}");
+        }
+        for step in ["outE()", "inE()", "bothE()", "inV()", "outV()", "bothV()"] {
+            for start in ["g.V(7)", "g.V(999)"] {
+                let query = format!("{start}.{step}");
+                assert!(s.observed_gremlin(1, &query).is_err(), "{query}");
+                assert!(s.observed_gremlin_v2(1, &query).is_err(), "{query}");
+            }
+        }
+        assert_eq!(
+            frozen
+                .observed_gremlin_v3(1, "g.V(7).bothE().bothV().count()")?
+                .rows,
+            vec![R3::Count(0)]
+        );
+        // Three bounded adjacency steps still share one cumulative work budget;
+        // alternating edge/endpoint stages cannot reset it or hide it with limit.
+        let repeated = std::iter::repeat_n("7", 36).collect::<Vec<_>>().join(",");
+        assert!(matches!(
+            s.observed_gremlin_v3(
+                1,
+                &format!(
+                    "g.V({repeated}).bothE().bothV().bothE().bothV().bothE().bothV().limit(1)"
+                )
+            ),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
         let r = s.observed_gremlin(1, "g.V(7).both()")?;
         assert_eq!(r.completeness, AdjacencyCompleteness::Unverified);
         assert_eq!(
@@ -370,6 +587,12 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             "g.E(99)",
             "g.E().hasLabel('Missing').limit(1)",
             "g.E().count()",
+            "g.V(7).outE()",
+            "g.V(7).bothE().count()",
+            "g.V(7).outE('Missing').count()",
+            "g.E(99).inV()",
+            "g.E(99).outV()",
+            "g.E(99).bothV().count()",
         ] {
             assert!(matches!(
                 fresh.observed_gremlin_v3(1, q),
@@ -381,6 +604,21 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
         assert_eq!(
             fresh.observed_gremlin_v3(1, "g.E().limit(1)")?.rows,
             vec![R3::Edge(er(1, 9))]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).outE().inV().count()")?
+                .rows,
+            vec![R3::Count(4)]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(99).bothV().count()")?.rows,
+            vec![R3::Count(0)]
+        );
+        assert_eq!(
+            fresh
+                .observed_gremlin_v3(2, "g.V(7).inE().outV().count()")?
+                .rows,
+            vec![R3::Count(2)]
         );
         let incoming = fresh.observed_gremlin(2, "g.V(7).in().count()")?;
         assert_eq!(incoming.rows, vec![ObservedRow::Count(2)]);
@@ -622,6 +860,20 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
                 rocksdb_sql_table::Error::TraversalLimitExceeded(_)
             ))
         ));
+        // Endpoint transitions revalidate/charge edges in the original shared
+        // byte budget. A late limit cannot erase these repeated wide payloads.
+        assert!(matches!(
+            edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).bothV().limit(1)")),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        assert_eq!(
+            edges
+                .observed_gremlin_v3(1, &format!("g.E({more_ids}).limit(1).bothV().count()"))?
+                .rows,
+            vec![R3::Count(2)]
+        );
         assert_eq!(
             edges
                 .observed_gremlin_v3(1, &format!("g.E({ids}).limit(1).values('blob').count()"))?

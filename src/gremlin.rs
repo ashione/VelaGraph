@@ -50,7 +50,8 @@ pub(crate) trait QueryReadBackend {
 /// Default per-execution logical byte budget; not an allocator or RSS limit.
 pub const MAX_GREMLIN_ACCOUNTED_BYTES: usize = 64 * 1024 * 1024;
 
-/// Maximum number of `out`/`in`/`both` steps in one query.
+/// Maximum adjacency steps in one query: `out`/`in`/`both` and, for
+/// observed queries, `outE`/`inE`/`bothE` combined.
 pub const MAX_GREMLIN_EDGE_STEPS: usize = 3;
 /// Maximum rows materialized before an explicit `limit` is reached.
 pub const MAX_GREMLIN_ROWS: usize = 10_000;
@@ -77,6 +78,12 @@ const RULE_SPAWN_V: usize = 18;
 const RULE_CHAIN: usize = 26;
 const RULE_METHOD: usize = 29;
 
+const RULE_METHOD_BOTHE: usize = 45;
+const RULE_METHOD_BOTHV: usize = 46;
+const RULE_METHOD_INE: usize = 88;
+const RULE_METHOD_INV: usize = 90;
+const RULE_METHOD_OUTE: usize = 118;
+const RULE_METHOD_OUTV: usize = 119;
 const RULE_METHOD_BOTH: usize = 44;
 const RULE_METHOD_COUNT: usize = 59;
 const RULE_METHOD_HAS: usize = 79;
@@ -122,164 +129,230 @@ pub struct GremlinQuery {
     explicit_limit: bool,
 }
 
+/// Additive steps for the experimental observed traversal API.
+/// The legacy exhaustive [`GremlinStep`] enum remains unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObservedGremlinStep {
+    Existing(GremlinStep),
+    OutE(Option<String>),
+    InE(Option<String>),
+    BothE(Option<String>),
+    InV,
+    OutV,
+    BothV,
+}
+
+/// A validated query for experimental observed execution, not v0 execution.
+/// Parsing uses the same official grammar and admission limits as [`GremlinQuery`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedGremlinQuery {
+    start: GremlinStart,
+    steps: Vec<ObservedGremlinStep>,
+    explicit_limit: bool,
+}
+
+impl ObservedGremlinQuery {
+    /// Parse the v0 subset plus edge-producing and edge-endpoint steps.
+    /// Adjacency steps share a maximum of three; endpoint steps remain bounded
+    /// by the structural admission cap. `path` and `count` must be terminal.
+    pub fn parse(input: &str) -> Result<Self> {
+        parse_validated_query(input, true)
+    }
+
+    pub fn start(&self) -> &GremlinStart {
+        &self.start
+    }
+
+    pub fn steps(&self) -> &[ObservedGremlinStep] {
+        &self.steps
+    }
+}
+
+fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQuery> {
+    if input.len() > MAX_GREMLIN_QUERY_BYTES {
+        return Err(Error::GremlinParse(format!(
+            "query text is {} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}",
+            input.len()
+        )));
+    }
+    // The byte cap alone is insufficient: short repeated arguments, chains,
+    // or nested literals can overflow the generated parser's call stack.
+    // Count raw marks, including quoted/commented ones, so malformed lexical
+    // input and lexer recovery cannot hide recursion from admission. Do not
+    // interpret tokens, escapes, identifiers, or Gremlin semantics here.
+    let marks = input
+        .bytes()
+        .filter(|byte| b"()[]{},.:;".contains(byte))
+        .count();
+    if marks > MAX_GREMLIN_STRUCTURAL_MARKS {
+        return Err(Error::GremlinComplexityLimit {
+            marks,
+            limit: MAX_GREMLIN_STRUCTURAL_MARKS,
+        });
+    }
+    if contains_unquoted_semicolon(input) {
+        return Err(Error::GremlinParse(
+            "multiple Gremlin traversals are not supported".into(),
+        ));
+    }
+    let tree = parse_query(input).map_err(|error| Error::GremlinParse(error.to_string()))?;
+    // `parse_query` can recover by stopping before invalid trailing input
+    // instead of reporting a syntax error. Verify that the returned tree
+    // covers the entire query before executing anything.
+    if normalize_gremlin_text(input) != normalize_gremlin_text(&tree.text()) {
+        return Err(Error::GremlinParse(
+            "unrecognized or trailing input after the Gremlin traversal".into(),
+        ));
+    }
+
+    // `parse_query` accepts a single `query`; require exactly one
+    // `rootTraversal` child instead of accepting expression wrappers.
+    let roots: Vec<&ParseTree> = tree
+        .children()
+        .iter()
+        .filter(|child| rule_index(child) == Some(RULE_ROOT_TRAVERSAL))
+        .collect();
+    if roots.len() != 1 {
+        return Err(Error::GremlinParse(
+            "expected exactly one Gremlin traversal".into(),
+        ));
+    }
+    let root = roots[0];
+    // Terminal traversals (`next()`, `toList()`, ...) are siblings of the
+    // root traversal in the generated grammar, not methods in its chain.
+    // Reject them rather than executing only the part before the dot.
+    for child in tree.children() {
+        if rule_index(child) == Some(RULE_ROOT_TRAVERSAL) || child.text() == "." {
+            continue;
+        }
+        return Err(Error::UnsupportedGremlinStep(child.text()));
+    }
+    if tree.children().iter().any(|child| child.text() == ".") {
+        return Err(Error::GremlinParse(
+            "trailing tokens after the Gremlin traversal".into(),
+        ));
+    }
+
+    // The parse tree puts `g` (`traversal_source`), the spawn method
+    // (`V`/`E`), and the chained traversal side by side under
+    // `root_traversal`; the spawn node is not nested in the source node.
+    root.children()
+        .iter()
+        .find(|child| rule_index(child) == Some(RULE_TRAVERSAL_SOURCE))
+        .ok_or_else(|| Error::UnsupportedGremlinStep("g".into()))?;
+    let spawn = root
+        .children()
+        .iter()
+        .find(|child| rule_index(child) == Some(RULE_SPAWN))
+        .ok_or_else(|| Error::UnsupportedGremlinStep("g".into()))?;
+    // Reject terminal traversals such as `next()`/`toList()` and any
+    // other root-level construct instead of silently running only `V()`.
+    for child in root.children() {
+        match rule_index(child) {
+            Some(RULE_TRAVERSAL_SOURCE | RULE_SPAWN | RULE_CHAIN) => {}
+            None if child.text() == "." => {}
+            _ => return Err(Error::UnsupportedGremlinStep(child.text())),
+        }
+    }
+    let source = root
+        .children()
+        .iter()
+        .find(|child| rule_index(child) == Some(RULE_TRAVERSAL_SOURCE))
+        .expect("source checked above");
+    if source
+        .children()
+        .iter()
+        .any(|child| rule_index(child).is_some())
+    {
+        return Err(Error::UnsupportedGremlinStep(source.text()));
+    }
+    let start_node = spawn
+        .children()
+        .iter()
+        .find(|child| matches!(rule_index(child), Some(RULE_SPAWN_V | RULE_SPAWN_E)))
+        .ok_or_else(|| Error::UnsupportedGremlinStep("g".into()))?;
+    let start_rule = rule_index(start_node).expect("start node is a rule");
+    let (start_name, start_args) = method_parts(start_node)?;
+    let start = match start_rule {
+        RULE_SPAWN_V => parse_start_ids("V", &start_name, &start_args, true)?,
+        RULE_SPAWN_E => parse_start_ids("E", &start_name, &start_args, false)?,
+        _ => unreachable!("rule matched above"),
+    };
+
+    let mut method_nodes = Vec::new();
+    for child in root.children() {
+        if rule_index(child) == Some(RULE_CHAIN) {
+            collect_chain(child, &mut method_nodes)?;
+        }
+    }
+    let mut steps = Vec::with_capacity(method_nodes.len());
+    for node in method_nodes {
+        steps.push(if observed {
+            parse_observed_step(node)?
+        } else {
+            ObservedGremlinStep::Existing(parse_step(node)?)
+        });
+    }
+
+    let edge_steps = steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step,
+                ObservedGremlinStep::Existing(
+                    GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Both(_)
+                ) | ObservedGremlinStep::OutE(_)
+                    | ObservedGremlinStep::InE(_)
+                    | ObservedGremlinStep::BothE(_)
+            )
+        })
+        .count();
+    if edge_steps > MAX_GREMLIN_EDGE_STEPS {
+        return Err(Error::TraversalLimitExceeded(format!(
+            "query has {edge_steps} edge steps; the limit is {MAX_GREMLIN_EDGE_STEPS}"
+        )));
+    }
+    if let Some((index, _)) = steps.iter().enumerate().find(|(index, step)| {
+        matches!(
+            step,
+            ObservedGremlinStep::Existing(GremlinStep::Path | GremlinStep::Count)
+        ) && *index + 1 != steps.len()
+    }) {
+        return Err(Error::UnsupportedGremlinArgument(format!(
+            "{} must be the last step",
+            match &steps[index] {
+                ObservedGremlinStep::Existing(GremlinStep::Path) => "path",
+                ObservedGremlinStep::Existing(GremlinStep::Count) => "count",
+                _ => unreachable!(),
+            }
+        )));
+    }
+    let explicit_limit = steps
+        .iter()
+        .any(|step| matches!(step, ObservedGremlinStep::Existing(GremlinStep::Limit(_))));
+
+    Ok(ObservedGremlinQuery {
+        start,
+        steps,
+        explicit_limit,
+    })
+}
+
 impl GremlinQuery {
     /// Parse and validate one Gremlin traversal.
     pub fn parse(input: &str) -> Result<Self> {
-        if input.len() > MAX_GREMLIN_QUERY_BYTES {
-            return Err(Error::GremlinParse(format!(
-                "query text is {} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}",
-                input.len()
-            )));
-        }
-        // The byte cap alone is insufficient: short repeated arguments, chains,
-        // or nested literals can overflow the generated parser's call stack.
-        // Count raw marks, including quoted/commented ones, so malformed lexical
-        // input and lexer recovery cannot hide recursion from admission. Do not
-        // interpret tokens, escapes, identifiers, or Gremlin semantics here.
-        let marks = input
-            .bytes()
-            .filter(|byte| b"()[]{},.:;".contains(byte))
-            .count();
-        if marks > MAX_GREMLIN_STRUCTURAL_MARKS {
-            return Err(Error::GremlinComplexityLimit {
-                marks,
-                limit: MAX_GREMLIN_STRUCTURAL_MARKS,
-            });
-        }
-        if contains_unquoted_semicolon(input) {
-            return Err(Error::GremlinParse(
-                "multiple Gremlin traversals are not supported".into(),
-            ));
-        }
-        let tree = parse_query(input).map_err(|error| Error::GremlinParse(error.to_string()))?;
-        // `parse_query` can recover by stopping before invalid trailing input
-        // instead of reporting a syntax error. Verify that the returned tree
-        // covers the entire query before executing anything.
-        if normalize_gremlin_text(input) != normalize_gremlin_text(&tree.text()) {
-            return Err(Error::GremlinParse(
-                "unrecognized or trailing input after the Gremlin traversal".into(),
-            ));
-        }
-
-        // `parse_query` accepts a single `query`; require exactly one
-        // `rootTraversal` child instead of accepting expression wrappers.
-        let roots: Vec<&ParseTree> = tree
-            .children()
-            .iter()
-            .filter(|child| rule_index(child) == Some(RULE_ROOT_TRAVERSAL))
-            .collect();
-        if roots.len() != 1 {
-            return Err(Error::GremlinParse(
-                "expected exactly one Gremlin traversal".into(),
-            ));
-        }
-        let root = roots[0];
-        // Terminal traversals (`next()`, `toList()`, ...) are siblings of the
-        // root traversal in the generated grammar, not methods in its chain.
-        // Reject them rather than executing only the part before the dot.
-        for child in tree.children() {
-            if rule_index(child) == Some(RULE_ROOT_TRAVERSAL) || child.text() == "." {
-                continue;
-            }
-            return Err(Error::UnsupportedGremlinStep(child.text()));
-        }
-        if tree.children().iter().any(|child| child.text() == ".") {
-            return Err(Error::GremlinParse(
-                "trailing tokens after the Gremlin traversal".into(),
-            ));
-        }
-
-        // The parse tree puts `g` (`traversal_source`), the spawn method
-        // (`V`/`E`), and the chained traversal side by side under
-        // `root_traversal`; the spawn node is not nested in the source node.
-        root.children()
-            .iter()
-            .find(|child| rule_index(child) == Some(RULE_TRAVERSAL_SOURCE))
-            .ok_or_else(|| Error::UnsupportedGremlinStep("g".into()))?;
-        let spawn = root
-            .children()
-            .iter()
-            .find(|child| rule_index(child) == Some(RULE_SPAWN))
-            .ok_or_else(|| Error::UnsupportedGremlinStep("g".into()))?;
-        // Reject terminal traversals such as `next()`/`toList()` and any
-        // other root-level construct instead of silently running only `V()`.
-        for child in root.children() {
-            match rule_index(child) {
-                Some(RULE_TRAVERSAL_SOURCE | RULE_SPAWN | RULE_CHAIN) => {}
-                None if child.text() == "." => {}
-                _ => return Err(Error::UnsupportedGremlinStep(child.text())),
-            }
-        }
-        let source = root
-            .children()
-            .iter()
-            .find(|child| rule_index(child) == Some(RULE_TRAVERSAL_SOURCE))
-            .expect("source checked above");
-        if source
-            .children()
-            .iter()
-            .any(|child| rule_index(child).is_some())
-        {
-            return Err(Error::UnsupportedGremlinStep(source.text()));
-        }
-        let start_node = spawn
-            .children()
-            .iter()
-            .find(|child| matches!(rule_index(child), Some(RULE_SPAWN_V | RULE_SPAWN_E)))
-            .ok_or_else(|| Error::UnsupportedGremlinStep("g".into()))?;
-        let start_rule = rule_index(start_node).expect("start node is a rule");
-        let (start_name, start_args) = method_parts(start_node)?;
-        let start = match start_rule {
-            RULE_SPAWN_V => parse_start_ids("V", &start_name, &start_args, true)?,
-            RULE_SPAWN_E => parse_start_ids("E", &start_name, &start_args, false)?,
-            _ => unreachable!("rule matched above"),
-        };
-
-        let mut method_nodes = Vec::new();
-        for child in root.children() {
-            if rule_index(child) == Some(RULE_CHAIN) {
-                collect_chain(child, &mut method_nodes)?;
-            }
-        }
-        let mut steps = Vec::with_capacity(method_nodes.len());
-        for node in method_nodes {
-            steps.push(parse_step(node)?);
-        }
-
-        let edge_steps = steps
-            .iter()
-            .filter(|step| {
-                matches!(
-                    step,
-                    GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Both(_)
-                )
-            })
-            .count();
-        if edge_steps > MAX_GREMLIN_EDGE_STEPS {
-            return Err(Error::TraversalLimitExceeded(format!(
-                "query has {edge_steps} edge steps; the limit is {MAX_GREMLIN_EDGE_STEPS}"
-            )));
-        }
-        if let Some((index, _)) = steps.iter().enumerate().find(|(index, step)| {
-            matches!(step, GremlinStep::Path | GremlinStep::Count) && *index + 1 != steps.len()
-        }) {
-            return Err(Error::UnsupportedGremlinArgument(format!(
-                "{} must be the last step",
-                match &steps[index] {
-                    GremlinStep::Path => "path",
-                    GremlinStep::Count => "count",
-                    _ => unreachable!(),
-                }
-            )));
-        }
-        let explicit_limit = steps
-            .iter()
-            .any(|step| matches!(step, GremlinStep::Limit(_)));
-
+        let parsed = parse_validated_query(input, false)?;
         Ok(Self {
-            start,
-            steps,
-            explicit_limit,
+            start: parsed.start,
+            steps: parsed
+                .steps
+                .into_iter()
+                .map(|step| match step {
+                    ObservedGremlinStep::Existing(step) => step,
+                    _ => unreachable!("legacy parser accepts only existing steps"),
+                })
+                .collect(),
+            explicit_limit: parsed.explicit_limit,
         })
     }
 
@@ -829,6 +902,39 @@ fn parse_start_ids(
     } else {
         GremlinStart::Edges(ids)
     })
+}
+
+fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {
+    let specific = node
+        .children()
+        .iter()
+        .find(|child| rule_index(child).is_some_and(|index| index >= 30))
+        .ok_or_else(|| Error::UnsupportedGremlinStep(node.text()))?;
+    let (name, args) = method_parts(specific)?;
+    match rule_index(specific).expect("specific rule has an index") {
+        RULE_METHOD_OUTE => Ok(ObservedGremlinStep::OutE(parse_optional_label(
+            &name, &args,
+        )?)),
+        RULE_METHOD_INE => Ok(ObservedGremlinStep::InE(parse_optional_label(
+            &name, &args,
+        )?)),
+        RULE_METHOD_BOTHE => Ok(ObservedGremlinStep::BothE(parse_optional_label(
+            &name, &args,
+        )?)),
+        RULE_METHOD_INV => {
+            require_no_args(&name, &args)?;
+            Ok(ObservedGremlinStep::InV)
+        }
+        RULE_METHOD_OUTV => {
+            require_no_args(&name, &args)?;
+            Ok(ObservedGremlinStep::OutV)
+        }
+        RULE_METHOD_BOTHV => {
+            require_no_args(&name, &args)?;
+            Ok(ObservedGremlinStep::BothV)
+        }
+        _ => parse_step(node).map(ObservedGremlinStep::Existing),
+    }
 }
 
 fn parse_step(node: &ParseTree) -> Result<GremlinStep> {

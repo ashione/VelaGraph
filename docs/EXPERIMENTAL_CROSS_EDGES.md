@@ -318,9 +318,10 @@ There is no completeness, failover, repair, TLS or global-snapshot claim.
 
 `observed_gremlin_v3(start_partition, text)` supports the v2 vertex subset and
 adds `E()` / `E(ids)` followed by `has`, `hasLabel`, `values(key)`, `label`,
-`limit`, `path`, and `count`. The official parser is unchanged. Edge starts
-reject `out`/`in`/`both`, `outE`/`inE`/`bothE`, endpoint steps and `id`, even on
-empty input. Only limit/count may follow a scalar projection. The older
+`limit`, `path`, and `count`. The additive official-AST adapter also supports the edge and endpoint
+steps below. Edge streams reject vertex adjacency (`out`/`in`/`both` and
+`outE`/`inE`/`bothE`); vertex streams reject endpoint steps, and `id` remains
+unsupported. Validation precedes acquisition, even on empty input. Only limit/count may follow a scalar projection. The older
 `observed_gremlin` and `observed_gremlin_v2` APIs still reject edge starts;
 their public enums and Eq/PartialEq contracts are unchanged.
 
@@ -351,3 +352,54 @@ Leading limit reads at most that many candidates per partition and keeps the
 global prefix, without checking excluded candidates. A later limit/count does
 not excuse earlier budget errors. Session construction still pins every shard,
 and all operations retain its original absolute deadline.
+
+
+### Edge adjacency and endpoints in v3
+
+The same v3 entrypoint additionally supports `outE()`, `inE()`, `bothE()`
+(with zero or one label), and `outV()`, `inV()`, `bothV()` (no arguments).
+These are official Gremlin grammar steps, accepted by the additive
+`ObservedGremlinQuery` AST adapter. `GremlinQuery::parse` and all legacy
+execution entrypoints still reject them with `UnsupportedGremlinStep`, even
+on empty input. The existing public `GremlinStep` enum is unchanged; the new
+`ObservedGremlinStep` enum wraps old steps and adds the six new forms.
+No v1 query, storage encoding or SQL behavior changes.
+
+`outE`/`inE`/`bothE` consume vertices and emit qualified edges. Each input
+expands in `(edge ID, source partition)` order. `bothE` unions directions by
+qualified edge identity, so a self-loop appears once, consistently with the
+existing observed `both` contract. This explicit experimental deduplication
+must not be mistaken for a claim of full TinkerPop traversal compatibility.
+Parallel edges, duplicate input traversers and edges with the same local ID
+in different owner partitions remain separate bag rows.
+
+`outV` emits the source vertex, `inV` emits the target vertex, and `bothV`
+emits source then target for each input edge. Endpoint rows are not sorted
+or deduplicated: a self-loop produces two equal vertex rows with `bothV`,
+matching its two endpoint positions. This differs intentionally from `bothE`'s
+qualified-edge union. Every endpoint lookup revalidates the canonical edge,
+both indexes and endpoints using the same session views. A missing or corrupt
+visible component fails the entire execution, including before a following
+filter or limit. An absent incoming index is still invisible to incoming
+adjacency; adding steps does not certify completeness.
+
+Paths append only the elements visited by each new step: for example
+`V(7).outE().inV().path()` yields `[Vertex, Edge, Vertex]`, while
+`E(9).bothV().path()` yields two `[Edge, Vertex]` paths. Existing
+`out`/`in`/`both` still append both edge and vertex. Edge/vertex filters and
+values/label projections work after either transition; provenance is the
+qualified current element. Only limit/count can follow scalars. Invalid
+stream transitions are typed `ExperimentalRouteError::Unsupported` even if
+prior steps would produce an empty stream. Unsupported grammar/arity retains
+the parser's typed error under `Query`.
+
+Global V/E start order and leading-limit acquisition are unchanged. Operators
+preserve input bag order and limits execute at their original position.
+All stages share one cumulative byte/work budget and the original snapshot
+vector and absolute deadline. Endpoint verification charges one work unit and
+the decoded edge payload per input, plus each retained row/path. The three
+adjacency-step limit counts out/in/both/outE/inE/bothE together; endpoint
+steps are bounded by the shared structural admission and row/work limits.
+No retry, view refresh, replica switch or deadline reset is introduced.
+Every successful output, including empty streams, paths and scalar counts,
+is still Unverified, never a global-completeness or global-snapshot claim.

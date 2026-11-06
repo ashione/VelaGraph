@@ -1,6 +1,8 @@
 //! Run parser stress cases in child processes: a regression must fail this test,
 //! not abort the test runner that is coordinating the rest of the suite.
-use rocksdb_sql_table::{Error, GremlinQuery, GremlinStart, MAX_GREMLIN_STRUCTURAL_MARKS};
+use rocksdb_sql_table::{
+    Error, GremlinQuery, GremlinStart, ObservedGremlinQuery, MAX_GREMLIN_STRUCTURAL_MARKS,
+};
 use std::process::Command;
 
 #[test]
@@ -31,6 +33,16 @@ fn parser_stress_isolated() {
 }
 
 fn complexity(input: &str) {
+    assert!(
+        matches!(
+            ObservedGremlinQuery::parse(input),
+            Err(Error::GremlinComplexityLimit {
+                limit: MAX_GREMLIN_STRUCTURAL_MARKS,
+                ..
+            })
+        ),
+        "expected observed complexity rejection"
+    );
     assert!(
         matches!(
             GremlinQuery::parse(input),
