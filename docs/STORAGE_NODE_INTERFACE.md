@@ -29,9 +29,9 @@ implemented, and the node has no leader/ownership identity yet (it never returns
 currently copies the data partition into each read view (bounded to 1,000,000
 rows / 64 MiB) instead of pinning a borrowed RocksDB snapshot; a production
 adapter must replace this with a real snapshot. Once that cap is exceeded,
-`read_view`/`get`/`scan` return `ResourceExhausted`; `export` streams the data
-directly so an operator can still migrate it, while `import` rejects oversized
-inputs. Batches are capped at 10,000 operations / 16 MiB. Dedup records are
+`read_view`/`get`/`scan` return `ResourceExhausted`; `export` enumerates the
+data directly so an operator can inspect or migrate it with a different adapter,
+while this adapter's `import` rejects oversized inputs. Batches are capped at 10,000 operations / 16 MiB. Dedup records are
 retained indefinitely in this prototype; bounded retention is not implemented.
 `import` is one-shot, requires a pristine target (sequence 0 and no live keys),
 and copies the source epoch; a new owner must call `set_epoch` after import
