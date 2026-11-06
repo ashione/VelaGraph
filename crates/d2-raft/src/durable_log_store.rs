@@ -6,7 +6,7 @@
 //! process restart.
 
 use std::fmt::Debug;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use openraft::{
 use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use tokio::sync::Mutex;
 
+use crate::blocking::blocking_section;
 use crate::types::{NodeId, TypeConfig};
 
 const LOG_PREFIX: &[u8] = b"raft/log/";
@@ -115,10 +116,27 @@ impl DurableLogStoreInner {
         &self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<NodeId>> {
+        let start = match range.start_bound() {
+            Bound::Included(index) => *index,
+            Bound::Excluded(index) => match index.checked_add(1) {
+                Some(next) => next,
+                None => return Ok(Vec::new()),
+            },
+            Bound::Unbounded => 0,
+        };
+        let beyond_end = |index: u64| match range.end_bound() {
+            Bound::Included(end) => index > *end,
+            Bound::Excluded(end) => index >= *end,
+            Bound::Unbounded => false,
+        };
+        if beyond_end(start) {
+            return Ok(Vec::new());
+        }
         let mut entries = Vec::new();
+        let start_key = log_key(start);
         let mut iter = self
             .db
-            .iterator(IteratorMode::From(LOG_PREFIX, Direction::Forward));
+            .iterator(IteratorMode::From(&start_key, Direction::Forward));
         for item in &mut iter {
             let (key, value) = item.map_err(read_error)?;
             let Some(index) = log_index(&key) else {
@@ -127,6 +145,9 @@ impl DurableLogStoreInner {
                 }
                 continue;
             };
+            if beyond_end(index) {
+                break;
+            }
             if !range.contains(&index) {
                 continue;
             }
@@ -144,7 +165,7 @@ impl RaftLogReader<TypeConfig> for DurableLogStore {
         range: RB,
     ) -> Result<Vec<<TypeConfig as RaftTypeConfig>::Entry>, StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        inner.read_entries(range)
+        blocking_section(|| inner.read_entries(range))
     }
 }
 
@@ -153,11 +174,13 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        let last_purged = inner.last_purged()?;
-        let last_log = inner.last_log_id()?.or(last_purged);
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id: last_log,
+        blocking_section(|| {
+            let last_purged = inner.last_purged()?;
+            let last_log = inner.last_log_id()?.or(last_purged);
+            Ok(LogState {
+                last_purged_log_id: last_purged,
+                last_log_id: last_log,
+            })
         })
     }
 
@@ -166,34 +189,38 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        let value = serde_json::to_vec(&committed).map_err(write_error)?;
-        let mut batch = WriteBatch::default();
-        batch.put(COMMITTED_KEY, value);
-        inner.write_batch(batch)
+        blocking_section(|| {
+            let value = serde_json::to_vec(&committed).map_err(write_error)?;
+            let mut batch = WriteBatch::default();
+            batch.put(COMMITTED_KEY, value);
+            inner.write_batch(batch)
+        })
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        match inner.db.get(COMMITTED_KEY).map_err(read_error)? {
+        blocking_section(|| match inner.db.get(COMMITTED_KEY).map_err(read_error)? {
             Some(value) => Ok(serde_json::from_slice(&value).map_err(read_error)?),
             None => Ok(None),
-        }
+        })
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        let value = serde_json::to_vec(vote).map_err(write_error)?;
-        let mut batch = WriteBatch::default();
-        batch.put(VOTE_KEY, value);
-        inner.write_batch(batch)
+        blocking_section(|| {
+            let value = serde_json::to_vec(vote).map_err(write_error)?;
+            let mut batch = WriteBatch::default();
+            batch.put(VOTE_KEY, value);
+            inner.write_batch(batch)
+        })
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        match inner.db.get(VOTE_KEY).map_err(read_error)? {
+        blocking_section(|| match inner.db.get(VOTE_KEY).map_err(read_error)? {
             Some(value) => Ok(Some(serde_json::from_slice(&value).map_err(read_error)?)),
             None => Ok(None),
-        }
+        })
     }
 
     async fn append<I>(
@@ -205,35 +232,94 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
         I: IntoIterator<Item = <TypeConfig as RaftTypeConfig>::Entry>,
     {
         let inner = self.inner.lock().await;
-        let mut batch = WriteBatch::default();
-        for entry in entries {
-            let key = log_key(entry.log_id.index);
-            let value = serde_json::to_vec(&entry).map_err(write_error)?;
-            batch.put(key, value);
-        }
-        inner.write_batch(batch)?;
-        callback.log_io_completed(Ok(()));
-        Ok(())
+        blocking_section(|| {
+            let mut batch = WriteBatch::default();
+            for entry in entries {
+                let key = log_key(entry.log_id.index);
+                let value = serde_json::to_vec(&entry).map_err(write_error)?;
+                batch.put(key, value);
+            }
+            inner.write_batch(batch)?;
+            callback.log_io_completed(Ok(()));
+            Ok(())
+        })
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        let mut batch = WriteBatch::default();
-        batch.delete_range(log_key(log_id.index), LOG_PREFIX_END.to_vec());
-        inner.write_batch(batch)
+        blocking_section(|| {
+            let mut batch = WriteBatch::default();
+            batch.delete_range(log_key(log_id.index), LOG_PREFIX_END.to_vec());
+            inner.write_batch(batch)
+        })
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let inner = self.inner.lock().await;
-        let end = log_key(log_id.index.saturating_add(1));
-        let value = serde_json::to_vec(&log_id).map_err(write_error)?;
-        let mut batch = WriteBatch::default();
-        batch.delete_range(LOG_PREFIX.to_vec(), end);
-        batch.put(LAST_PURGED_KEY, value);
-        inner.write_batch(batch)
+        blocking_section(|| {
+            let end = log_key(log_id.index.saturating_add(1));
+            let value = serde_json::to_vec(&log_id).map_err(write_error)?;
+            let mut batch = WriteBatch::default();
+            batch.delete_range(LOG_PREFIX.to_vec(), end);
+            batch.put(LAST_PURGED_KEY, value);
+            inner.write_batch(batch)
+        })
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_log_reads_seek_and_stop_without_decoding_unrelated_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let inner = DurableLogStoreInner {
+            db: DB::open(&options, directory.path()).unwrap(),
+        };
+        // Malformed adjacent rows make accidental out-of-range decoding observable.
+        inner.db.put(log_key(0), b"invalid").unwrap();
+        inner.db.put(log_key(4), b"invalid").unwrap();
+        for index in [1, 2, 3, u64::MAX] {
+            let entry = openraft::Entry::<TypeConfig> {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+                payload: openraft::EntryPayload::Blank,
+            };
+            inner
+                .db
+                .put(log_key(index), serde_json::to_vec(&entry).unwrap())
+                .unwrap();
+        }
+        for (bounds, expected) in [
+            ((Bound::Included(1), Bound::Included(3)), vec![1, 2, 3]),
+            ((Bound::Excluded(1), Bound::Excluded(3)), vec![2]),
+            ((Bound::Included(2), Bound::Excluded(2)), vec![]),
+            ((Bound::Included(3), Bound::Included(1)), vec![]),
+            ((Bound::Excluded(u64::MAX), Bound::Unbounded), vec![]),
+            (
+                (Bound::Included(u64::MAX), Bound::Unbounded),
+                vec![u64::MAX],
+            ),
+            ((Bound::Unbounded, Bound::Excluded(0)), vec![]),
+        ] {
+            let entries = inner.read_entries(bounds).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.log_id.index)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        inner.db.delete(log_key(0)).unwrap();
+        inner.db.delete(log_key(4)).unwrap();
+        assert_eq!(inner.read_entries(..).unwrap().len(), 4);
+        assert_eq!(inner.read_entries(..=2).unwrap().len(), 2);
     }
 }

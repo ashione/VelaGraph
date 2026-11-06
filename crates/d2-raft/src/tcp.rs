@@ -26,6 +26,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout_at, Instant};
 
+use crate::blocking::blocking_section;
 use crate::durable_log_store::DurableLogStore;
 use crate::state_machine::StateMachine;
 use crate::types::{LogCommand, NodeId, TypeConfig};
@@ -114,21 +115,30 @@ impl io::Write for FrameWriter {
     }
 }
 fn encode_frame<T: Serialize>(value: &T, deadline: Instant) -> anyhow::Result<Vec<u8>> {
-    let mut writer = FrameWriter {
-        bytes: Vec::new(),
-        deadline,
-    };
-    serde_json::to_writer(&mut writer, value)?;
-    if Instant::now() >= deadline {
-        return Err(serde_json::Error::io(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "JSON encoding deadline",
-        ))
-        .into());
-    }
-    reserve_frame(&mut writer.bytes, 1)?;
-    writer.bytes.push(b'\n');
-    Ok(writer.bytes)
+    blocking_section(|| {
+        let mut writer = FrameWriter {
+            bytes: Vec::new(),
+            deadline,
+        };
+        // Coalesce serde's tiny punctuation/numeric writes. The fixed buffer is
+        // additional scratch space, not extra permitted frame bytes. Flush
+        // through FrameWriter before accepting the final deadline or delimiter.
+        {
+            let mut buffered = std::io::BufWriter::with_capacity(8192, &mut writer);
+            serde_json::to_writer(&mut buffered, value)?;
+            std::io::Write::flush(&mut buffered).map_err(serde_json::Error::io)?;
+        }
+        if Instant::now() >= deadline {
+            return Err(serde_json::Error::io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "JSON encoding deadline",
+            ))
+            .into());
+        }
+        reserve_frame(&mut writer.bytes, 1)?;
+        writer.bytes.push(b'\n');
+        Ok(writer.bytes)
+    })
 }
 
 async fn exchange_json<Q: Serialize, R: DeserializeOwned>(
@@ -146,7 +156,7 @@ async fn exchange_json<Q: Serialize, R: DeserializeOwned>(
         stream.set_nodelay(true)?;
         stream.write_all(&payload).await?;
         let frame = read_frame(&mut BufReader::new(stream)).await?;
-        let reply = serde_json::from_slice(&frame)?;
+        let reply = blocking_section(|| serde_json::from_slice(&frame))?;
         anyhow::ensure!(
             Instant::now() < deadline,
             "RPC deadline expired during decode"
@@ -229,7 +239,7 @@ async fn handle_raft_connection(
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
     let frame = read_frame(&mut reader).await?;
-    let request: RaftRpc = serde_json::from_slice(&frame)?;
+    let request: RaftRpc = blocking_section(|| serde_json::from_slice(&frame))?;
     anyhow::ensure!(Instant::now() < deadline, "request deadline expired");
     drop(frame);
     let mut stream = reader.into_inner();
@@ -465,7 +475,7 @@ async fn handle_control_connection(
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
     let frame = read_frame(&mut reader).await?;
-    let request: ControlRequest = serde_json::from_slice(&frame)?;
+    let request: ControlRequest = blocking_section(|| serde_json::from_slice(&frame))?;
     anyhow::ensure!(Instant::now() < deadline, "control deadline expired");
     drop(frame);
     let mut stream = reader.into_inner();
@@ -689,6 +699,27 @@ mod framing_tests {
             b"\"Status\"\n"
         );
         assert_eq!(TCP_PROTOCOL_VERSION, 0);
+    }
+
+    #[test]
+    fn buffered_encoding_preserves_wire_bytes_and_deadline_error_kind() {
+        for size in [0, 1, 8191, 8192, 8193, 65536] {
+            let value = vec![255_u8; size];
+            let mut expected = serde_json::to_vec(&value).unwrap();
+            expected.push(b'\n');
+            assert_eq!(
+                encode_frame(&value, Instant::now() + Duration::from_secs(5)).unwrap(),
+                expected
+            );
+            let error = encode_frame(&value, Instant::now()).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<serde_json::Error>()
+                    .unwrap()
+                    .io_error_kind(),
+                Some(io::ErrorKind::TimedOut)
+            );
+        }
     }
 
     #[tokio::test]

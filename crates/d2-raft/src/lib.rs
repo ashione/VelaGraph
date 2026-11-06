@@ -10,6 +10,7 @@
 //! The Raft log store is adapted from openraft's MIT/Apache-2.0 `memstore`
 //! example (https://github.com/databendlabs/openraft); see NOTICE.
 
+mod blocking;
 mod d1;
 mod durable_log_store;
 mod log_store;
