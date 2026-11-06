@@ -9,6 +9,26 @@ K1 is the current local implementation: RocksDB, `u64` ids, partition-scoped
 keys, deterministic protobuf-compatible records, and single-`WriteBatch`
 atomicity. See [`GRAPH_FORMAT.md`](GRAPH_FORMAT.md).
 
+## Implementation status
+
+The first local adapter is implemented in [`src/storage_node.rs`](../src/storage_node.rs)
+with tests in [`tests/storage_node.rs`](../tests/storage_node.rs). It owns one
+`ShardId` and one opaque key space in RocksDB, with separate `data` and `meta`
+column families. `batch_write` updates data, the applied sequence, and the
+idempotency record in one atomic write; retries return `Duplicate`, conflicting
+bytes return `IdempotencyConflict`, and stale epochs return `Fenced`. Read views
+are stable and bounded, scans enforce half-open ranges plus row/byte limits, and
+`StorageAdmin` provides export/import plus epoch advancement.
+
+This is deliberately not the full interface: transactions (`begin`), shard
+routing, split/transfer, follower reads, and mixed-shard rejection are not
+implemented. The adapter currently copies the data partition into each read
+view (bounded to 1,000,000 rows / 64 MiB) instead of pinning a borrowed RocksDB
+snapshot; a production adapter must replace this with a real snapshot. Dedup
+records are retained indefinitely in this prototype; bounded retention is not
+implemented. The graph engine is not wired through this boundary yet, so the
+existing K1 path remains authoritative.
+
 ## Goals
 
 - Let the kernel and distributed layers evolve independently.

@@ -36,6 +36,7 @@ mod gremlin;
 mod key;
 mod schema;
 mod storage;
+mod storage_node;
 mod traversal;
 mod value;
 
@@ -48,6 +49,11 @@ pub use gremlin::{
     MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS,
 };
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
+pub use storage_node::{
+    Epoch, Export, KeyRange, KeyValue, LocalStorageNode, ReadView, RequestId, ScanLimit, Sequence,
+    ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult,
+    WriteStatus, INTERFACE_VERSION,
+};
 pub use traversal::{
     TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,
 };
