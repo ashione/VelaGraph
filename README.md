@@ -549,3 +549,9 @@ edge starts, filters and scalar projections with qualified edge provenance.
 Its bounded canonical pages validate observed indexes and endpoints, but every
 result remains Unverified, not a globally consistent or complete traversal.
 See [experimental edge observations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-edge-observations-v3).
+
+The observed v3 subset also supports `outE`/`inE`/`bothE` and
+`outV`/`inV`/`bothV`, with qualified mixed-element paths and bag semantics.
+`bothE` emits a self-loop once; `bothV` emits both endpoint positions, twice
+for a loop. These steps remain unsupported by legacy Gremlin APIs and do not
+make observed experimental indexes complete or globally consistent.

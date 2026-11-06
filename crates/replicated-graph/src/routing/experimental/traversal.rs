@@ -534,7 +534,13 @@ mod tests {
                 _permit: semaphore.acquire_owned().await.unwrap(),
             }),
         };
-        for q in ["g.E().count()", "g.E(1).label()", "g.V().count()"] {
+        for q in [
+            "g.E().count()",
+            "g.E(1).label()",
+            "g.V().count()",
+            "g.V().outE().inV().count()",
+            "g.E().bothV().count()",
+        ] {
             assert!(matches!(
                 session.observed_gremlin_v3(1, q),
                 Err(ExperimentalRouteError::Route(RouteError::Storage(

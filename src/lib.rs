@@ -52,9 +52,10 @@ pub use graph_records::{
     MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS,
 };
 pub use gremlin::{
-    GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
-    DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_ACCOUNTED_BYTES, MAX_GREMLIN_EDGE_STEPS,
-    MAX_GREMLIN_LIMIT, MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS, MAX_GREMLIN_STRUCTURAL_MARKS,
+    GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, ObservedGremlinQuery,
+    ObservedGremlinStep, PathElement, DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE,
+    MAX_GREMLIN_ACCOUNTED_BYTES, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,
+    MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS, MAX_GREMLIN_STRUCTURAL_MARKS,
 };
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use storage_node::{

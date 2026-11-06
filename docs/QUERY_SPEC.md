@@ -304,3 +304,21 @@ with has/hasLabel/values/label/limit/path/count and qualified edge provenance.
 Old observed APIs still reject E. See [v3 edge observations](EXPERIMENTAL_CROSS_EDGES.md#additive-edge-observations-v3)
 for ordering, strict validation, shared budgets and Unverified semantics; this
 does not broaden v1 global traversal or establish a consistent global snapshot.
+
+## Additive observed parser API
+
+`ObservedGremlinQuery::parse` uses the same official parser, start parsing,
+text/structural admission, literal validation, and terminal `path`/`count`
+checks as `GremlinQuery::parse`. It additionally recognizes standard
+`outE`/`inE`/`bothE` with zero or one validated label, and
+`inV`/`outV`/`bothV` with zero arguments. Its `ObservedGremlinStep` wraps v0
+steps as `Existing(GremlinStep)` so the legacy exhaustive enum is unchanged.
+All six adjacency operations (`out`/`in`/`both` and `outE`/`inE`/`bothE`)
+share the three-step cap. Endpoint steps are bounded by structural admission.
+
+This additive AST is for the separately typed experimental observed v3 API
+specified in [EXPERIMENTAL_CROSS_EDGES.md](EXPERIMENTAL_CROSS_EDGES.md), not
+an expansion of v0 execution. `GremlinQuery::parse` continues to reject all
+six new operations with `UnsupportedGremlinStep`; existing query surfaces
+retain that parser. Parsing does not establish element types or observed
+completeness; the experimental executor enforces its own narrower contract.
