@@ -42,7 +42,13 @@ any `StorageNode`. It reuses the K1 `graph/v1` key layout and record codec for
 vertices, edges, and outgoing/incoming adjacency entries, and applies each
 mutation as one `batch_write`. The adapter covers create/update/delete for
 vertices and edges, label-filtered adjacency reads, cascade deletion, and
-reopen. Mutations through one store are serialized, but the adapter assumes one
+reopen. Before returning adjacency results or submitting a cascade batch, it
+checks every scanned adjacency key against its edge record (direction, endpoint,
+label, and id) and requires an empty adjacency value. A mismatch or missing edge
+is `CorruptData`; a failed cascade leaves both data and applied sequence unchanged.
+This is validation of the scanned index, not a full-graph integrity audit: absent
+adjacency entries cannot be discovered without scanning edge records.
+Mutations through one store are serialized, but the adapter assumes one
 writer per shard; separate stores need external coordination. It caps adjacency
 reads (and therefore a single cascade delete) at 1,000 incident edges and
 returns a storage error instead of a partial result, and leaves multi-shard

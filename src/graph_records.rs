@@ -19,7 +19,7 @@
 //! exactly-once retry after an unknown commit remains a D1 caller
 //! responsibility.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
@@ -116,21 +116,22 @@ impl<S: StorageNode> GraphRecordStore<S> {
     }
 
     /// Delete a vertex and every incident edge and adjacency entry atomically.
+    /// Corrupt scanned adjacency entries fail before any write is submitted.
     pub fn delete_vertex(&self, id: u64) -> Result<()> {
         let _guard = self.lock();
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, id)?.is_none() {
             return Err(Error::VertexNotFound(id));
         }
-        let mut edge_ids = BTreeSet::new();
-        edge_ids.extend(self.edge_ids_in(&view, EdgeDirection::Out, id, None)?);
-        edge_ids.extend(self.edge_ids_in(&view, EdgeDirection::In, id, None)?);
-        let mut operations = Vec::with_capacity(edge_ids.len() * 3 + 1);
-        for edge_id in edge_ids {
-            let edge = self.get_edge_in(&view, edge_id)?.ok_or_else(|| {
-                Error::CorruptData(format!("adjacency points to missing edge {edge_id}"))
-            })?;
-            self.delete_edge_ops(&edge, &mut operations);
+        let mut edges = BTreeMap::new();
+        for direction in [EdgeDirection::Out, EdgeDirection::In] {
+            for edge in self.adjacency_edges_in(&view, direction, id, None)? {
+                edges.insert(edge.id, edge);
+            }
+        }
+        let mut operations = Vec::with_capacity(edges.len() * 3 + 1);
+        for edge in edges.values() {
+            self.delete_edge_ops(edge, &mut operations);
         }
         operations.push(WriteOp::delete(vertex_key(self.partition, id)));
         self.write(&view, operations)
@@ -226,6 +227,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     }
 
     /// Read outgoing edges, optionally filtered by label, ordered by edge id.
+    /// Every scanned entry is validated before applying the result limit.
     pub fn out_edges(
         &self,
         vertex_id: u64,
@@ -236,6 +238,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     }
 
     /// Read incoming edges, optionally filtered by label, ordered by edge id.
+    /// Every scanned entry is validated before applying the result limit.
     pub fn in_edges(&self, vertex_id: u64, label: Option<&str>, limit: usize) -> Result<Vec<Edge>> {
         self.edges_in_direction(vertex_id, EdgeDirection::In, label, limit)
     }
@@ -259,33 +262,8 @@ impl<S: StorageNode> GraphRecordStore<S> {
         if self.get_vertex_in(&view, vertex_id)?.is_none() {
             return Err(Error::VertexNotFound(vertex_id));
         }
-        let edge_ids = self.edge_ids_in(&view, direction, vertex_id, label)?;
-        let mut edges = Vec::with_capacity(edge_ids.len());
-        for edge_id in edge_ids {
-            let edge = self.get_edge_in(&view, edge_id)?.ok_or_else(|| {
-                Error::CorruptData(format!("adjacency points to missing edge {edge_id}"))
-            })?;
-            match direction {
-                EdgeDirection::Out if edge.from != vertex_id => {
-                    return Err(Error::CorruptData(format!(
-                        "outgoing adjacency for {vertex_id} contains edge {edge_id} from {}",
-                        edge.from
-                    )));
-                }
-                EdgeDirection::In if edge.to != vertex_id => {
-                    return Err(Error::CorruptData(format!(
-                        "incoming adjacency for {vertex_id} contains edge {edge_id} to {}",
-                        edge.to
-                    )));
-                }
-                _ => {}
-            }
-            if edges.len() >= limit {
-                break;
-            }
-            edges.push(edge);
-        }
-        edges.sort_by_key(|edge| edge.id);
+        let mut edges = self.adjacency_edges_in(&view, direction, vertex_id, label)?;
+        edges.truncate(limit);
         Ok(edges)
     }
 
@@ -317,13 +295,16 @@ impl<S: StorageNode> GraphRecordStore<S> {
         Ok(Some(edge))
     }
 
-    fn edge_ids_in(
+    // Validate every scanned entry before sorting, deduplicating, truncating,
+    // or building a mutation. Otherwise a forged key can hide behind another
+    // entry for the same edge, or point a cascade at an unrelated edge.
+    fn adjacency_edges_in(
         &self,
         view: &ReadView,
         direction: EdgeDirection,
         vertex_id: u64,
         label: Option<&str>,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<Edge>> {
         let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
         let range = prefix_range(&prefix)?;
         let values = self.node.scan(
@@ -331,13 +312,26 @@ impl<S: StorageNode> GraphRecordStore<S> {
             ScanLimit::new(MAX_ADJACENCY_EDGES, SCAN_BYTES)?,
             view,
         )?;
-        let mut ids = Vec::with_capacity(values.len());
+        let mut edges = Vec::with_capacity(values.len());
         for value in values {
-            ids.push(edge_id_from_adjacency_key(&value.key)?);
+            let edge_id = edge_id_from_adjacency_key(&value.key)?;
+            let edge = self.get_edge_in(view, edge_id)?.ok_or_else(|| {
+                Error::CorruptData(format!("adjacency points to missing edge {edge_id}"))
+            })?;
+            let endpoint = match direction {
+                EdgeDirection::Out => edge.from,
+                EdgeDirection::In => edge.to,
+            };
+            let expected = adjacency_key(self.partition, direction, endpoint, &edge.label, edge.id);
+            if value.key != expected || !value.value.is_empty() {
+                return Err(Error::CorruptData(format!(
+                    "adjacency for vertex {vertex_id} does not match edge {edge_id}"
+                )));
+            }
+            edges.push(edge);
         }
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(ids)
+        edges.sort_by_key(|edge| edge.id);
+        Ok(edges)
     }
 
     fn put_edge_ops(&self, edge: &Edge) -> Result<Vec<WriteOp>> {
