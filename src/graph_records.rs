@@ -31,6 +31,7 @@ use crate::graph::{
     id_from_record_key, validate_edge, validate_vertex, vertex_key, vertex_prefix, Edge,
     EdgeDirection, Vertex,
 };
+use crate::query_memory::{self, Accounted, AccountedVec, Budget, Reservation};
 use crate::storage_node::{
     Epoch, KeyRange, ReadView, RequestId, ScanLimit, Sequence, ShardId, StorageNode,
     StorageNodeError, WriteOp, WriteRequest, WriteStatus,
@@ -629,25 +630,117 @@ impl<S: StorageNode> GraphRecordReadView<'_, S> {
         }
         Ok(Some(record))
     }
+    fn record_accounted<T>(
+        &self,
+        key: &[u8],
+        decode: impl FnOnce(&[u8], &Budget) -> Result<Accounted<T>>,
+        id_of: impl FnOnce(&T) -> u64,
+        id: u64,
+        budget: &Budget,
+    ) -> Result<Option<Accounted<T>>> {
+        let Some(bytes) = self.store.node.get(key, &self.view)? else {
+            return Ok(None);
+        };
+        let bytes_len = query_memory::add(key.len(), bytes.len())?;
+        if bytes_len > GRAPH_QUERY_PAGE_BYTES {
+            return Err(StorageNodeError::ResourceExhausted(
+                "graph query record byte limit exceeded".into(),
+            )
+            .into());
+        }
+        // Existing get cannot preflight the adapter's return allocation. Charge
+        // on receipt, before decoding or retaining another copy in the query.
+        let _raw = budget.reserve(bytes_len)?;
+        let record = decode(&bytes, budget)?;
+        if id_of(&record) != id {
+            return Err(Error::CorruptData(
+                "graph record id does not match key".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+    fn query_page(
+        &self,
+        range: &KeyRange,
+        rows: usize,
+        cursor: Option<&crate::ScanCursor>,
+        budget: &Budget,
+    ) -> Result<QueryPage> {
+        let slots = query_memory::mul(rows, std::mem::size_of::<crate::KeyValue>())?;
+        let mut charge = budget.reserve(slots)?;
+        // Reserve both returned key/value bytes and the possible copied cursor
+        // key before dispatch. Adapter-private allocations remain out of scope.
+        let bytes = GRAPH_QUERY_PAGE_BYTES.min(budget.available() / 2);
+        if bytes == 0 {
+            return Err(Error::TraversalLimitExceeded(
+                "query accounted byte budget exceeded".into(),
+            ));
+        }
+        charge.grow(query_memory::mul(bytes, 2)?)?;
+        let page = self
+            .store
+            .node
+            .scan_page(
+                range.clone(),
+                ScanLimit::new(rows, bytes)?,
+                &self.view,
+                cursor,
+            )
+            .map_err(|error| match error {
+                StorageNodeError::ResourceExhausted(_) if bytes < GRAPH_QUERY_PAGE_BYTES => {
+                    Error::TraversalLimitExceeded(
+                        "query accounted byte budget cannot fit D1 page".into(),
+                    )
+                }
+                other => Error::from(other),
+            })?;
+        let raw = page.rows.iter().try_fold(0, |sum, row| {
+            query_memory::add(sum, query_memory::add(row.key.len(), row.value.len())?)
+        })?;
+        let cursor_bytes = page
+            .next_cursor
+            .as_ref()
+            .map_or(0, |c| c.query_resume_bytes());
+        // A conforming scan_page cannot exceed its requested bounds. Reject a
+        // broken adapter rather than accepting unaccounted returned memory.
+        if page.rows.len() > rows || raw > bytes || cursor_bytes > bytes {
+            return Err(Error::TraversalLimitExceeded(
+                "D1 page exceeded query byte reservation".into(),
+            ));
+        }
+        charge.shrink(query_memory::add(
+            slots,
+            query_memory::add(raw, cursor_bytes)?,
+        )?);
+        let next_cursor = page
+            .next_cursor
+            .map(|cursor| Accounted::new(cursor, charge.split(cursor_bytes)));
+        Ok(QueryPage {
+            rows: page.rows,
+            _charge: charge,
+            next_cursor,
+        })
+    }
     fn scan<T>(
         &self,
         prefix: Vec<u8>,
         limit: usize,
         check: &mut impl FnMut() -> Result<()>,
-        decode: impl Fn(&[u8]) -> Result<T>,
+        decode: impl Fn(&[u8], &Budget) -> Result<Accounted<T>>,
         id_of: impl Fn(&T) -> u64,
-    ) -> Result<(Vec<T>, bool)> {
+        budget: &Budget,
+    ) -> Result<(AccountedVec<Accounted<T>>, bool)> {
         let range = prefix_range(&prefix)?;
-        let mut cursor = None;
-        let mut records = Vec::new();
+        let mut cursor: Option<Accounted<crate::ScanCursor>> = None;
+        let mut records = AccountedVec::new(budget);
         loop {
             check()?;
             let remaining = limit.saturating_sub(records.len());
-            let page = self.store.node.scan_page(
-                range.clone(),
-                ScanLimit::new(remaining.clamp(1, QUERY_PAGE_ROWS), GRAPH_QUERY_PAGE_BYTES)?,
-                &self.view,
-                cursor.as_ref(),
+            let page = self.query_page(
+                &range,
+                remaining.clamp(1, QUERY_PAGE_ROWS),
+                cursor.as_deref(),
+                budget,
             )?;
             check()?;
             for row in page.rows {
@@ -655,20 +748,19 @@ impl<S: StorageNode> GraphRecordReadView<'_, S> {
                 if records.len() == limit {
                     return Ok((records, true));
                 }
-                let record = decode(&row.value)?;
+                let record = decode(&row.value, budget)?;
                 check()?;
                 if id_of(&record) != id_from_record_key(&row.key, &prefix)? {
                     return Err(Error::CorruptData(
                         "graph record id does not match key".into(),
                     ));
                 }
-                records.push(record);
+                records.push(record)?;
             }
             if page.next_cursor.is_none() {
                 check()?;
                 return Ok((records, false));
             }
-            // The continuation proves another row exists without decoding it.
             if records.len() == limit {
                 check()?;
                 return Ok((records, true));
@@ -678,37 +770,59 @@ impl<S: StorageNode> GraphRecordReadView<'_, S> {
     }
 }
 
+struct QueryPage {
+    rows: Vec<crate::KeyValue>,
+    _charge: Reservation,
+    next_cursor: Option<Accounted<crate::ScanCursor>>,
+}
+
 impl<S: StorageNode> crate::gremlin::QueryReadBackend for GraphRecordReadView<'_, S> {
-    fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        self.get_vertex(id)
+    fn get_vertex(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Vertex>>> {
+        self.record_accounted(
+            &vertex_key(self.store.partition, id),
+            codec::decode_vertex_accounted,
+            |v| v.id,
+            id,
+            budget,
+        )
     }
-    fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
-        self.get_edge(id)
+    fn get_edge(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Edge>>> {
+        self.record_accounted(
+            &edge_key(self.store.partition, id),
+            codec::decode_edge_accounted,
+            |e| e.id,
+            id,
+            budget,
+        )
     }
     fn scan_vertices_checked(
         &self,
         limit: usize,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Vertex>, bool)> {
+        budget: &Budget,
+    ) -> Result<(AccountedVec<Accounted<Vertex>>, bool)> {
         self.scan(
             vertex_prefix(self.store.partition),
             limit,
             check,
-            codec::decode_vertex,
+            codec::decode_vertex_accounted,
             |v| v.id,
+            budget,
         )
     }
     fn scan_edges_checked(
         &self,
         limit: usize,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Edge>, bool)> {
+        budget: &Budget,
+    ) -> Result<(AccountedVec<Accounted<Edge>>, bool)> {
         self.scan(
             edge_prefix(self.store.partition),
             limit,
             check,
-            codec::decode_edge,
+            codec::decode_edge_accounted,
             |e| e.id,
+            budget,
         )
     }
     fn visit_adjacent_edges(
@@ -717,13 +831,14 @@ impl<S: StorageNode> crate::gremlin::QueryReadBackend for GraphRecordReadView<'_
         incoming: bool,
         label: Option<&str>,
         check: &mut impl FnMut() -> Result<()>,
-        visit: &mut impl FnMut(Edge) -> Result<()>,
+        visit: &mut impl FnMut(Accounted<Edge>) -> Result<()>,
+        budget: &Budget,
     ) -> Result<()> {
         check()?;
         if let Some(label) = label {
             crate::graph::validate_label(label)?;
         }
-        if self.get_vertex(vertex_id)?.is_none() {
+        if crate::gremlin::QueryReadBackend::get_vertex(self, vertex_id, budget)?.is_none() {
             return Err(Error::VertexNotFound(vertex_id));
         }
         let direction = if incoming {
@@ -737,23 +852,24 @@ impl<S: StorageNode> crate::gremlin::QueryReadBackend for GraphRecordReadView<'_
             vertex_id,
             label,
         ))?;
-        let mut cursor = None;
+        let mut cursor: Option<Accounted<crate::ScanCursor>> = None;
         loop {
             check()?;
-            let page = self.store.node.scan_page(
-                range.clone(),
-                ScanLimit::new(QUERY_PAGE_ROWS, GRAPH_QUERY_PAGE_BYTES)?,
-                &self.view,
-                cursor.as_ref(),
-            )?;
+            let page = self.query_page(&range, QUERY_PAGE_ROWS, cursor.as_deref(), budget)?;
             check()?;
             for row in page.rows {
                 check()?;
                 let edge_id = edge_id_from_adjacency_key(&row.key)?;
-                let edge = self.get_edge(edge_id)?.ok_or_else(|| {
-                    Error::CorruptData("adjacency references missing edge".into())
-                })?;
+                let edge = crate::gremlin::QueryReadBackend::get_edge(self, edge_id, budget)?
+                    .ok_or_else(|| {
+                        Error::CorruptData("adjacency references missing edge".into())
+                    })?;
                 check()?;
+                // Stored payloads may be corrupt. Bound the reconstructed key
+                // before allocation; the fixed control allowance covers only
+                // valid (at most 64-byte) graph labels.
+                crate::graph::validate_label(&edge.label)
+                    .map_err(|_| Error::CorruptData("invalid edge label in adjacency".into()))?;
                 let endpoint = if incoming { edge.to } else { edge.from };
                 if endpoint != vertex_id
                     || row.key

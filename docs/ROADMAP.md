@@ -164,3 +164,11 @@
 取得固定 D1 view，分页扫描与邻接访问始终经过原 adapter。保留 view 支持同一
 sequence 的后续查询；context/epoch fencing 不绕过。此项仅为进程内单分片
 闭环，不代表 D5 跨分片遍历或生产查询服务。资源和错误契约见 `QUERY_SPEC.md`。
+
+### Query resource follow-up
+
+The common local/D1 Gremlin executor now enforces a 64 MiB query-owned logical
+byte budget, including simultaneous input/output and large-property duplicate
+traversers. Defined fees, intentional compatibility impact, and excluded storage
+view/allocator costs are in [QUERY_MEMORY.md](QUERY_MEMORY.md). This is not a
+global concurrency quota or a heap/RSS hard limit.

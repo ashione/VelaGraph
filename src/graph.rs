@@ -519,146 +519,6 @@ impl GraphEngine {
 }
 
 impl GraphReadView<'_> {
-    /// Scan at most `limit` vertices in id order. `truncated` is true when at
-    /// least one more vertex exists. Query execution uses this to enforce row
-    /// limits before materializing an unbounded result.
-    pub(crate) fn scan_vertices_checked(
-        &self,
-        limit: usize,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Vertex>, bool)> {
-        check()?;
-        let prefix = vertex_prefix(self.partition);
-        let mut vertices = Vec::new();
-        let mut truncated = false;
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            check()?;
-            let (key, bytes) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if vertices.len() >= limit {
-                truncated = true;
-                break;
-            }
-            let vertex = codec::decode_vertex(&bytes)?;
-            check()?;
-            let stored_id = id_from_record_key(&key, &prefix)?;
-            if vertex.id != stored_id {
-                return Err(Error::CorruptData(format!(
-                    "vertex key {stored_id} contains vertex {}",
-                    vertex.id
-                )));
-            }
-            vertices.push(vertex);
-        }
-        check()?;
-        Ok((vertices, truncated))
-    }
-
-    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices_checked`].
-    pub(crate) fn scan_edges_checked(
-        &self,
-        limit: usize,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Edge>, bool)> {
-        check()?;
-        let prefix = edge_prefix(self.partition);
-        let mut edges = Vec::new();
-        let mut truncated = false;
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            check()?;
-            let (key, bytes) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if edges.len() >= limit {
-                truncated = true;
-                break;
-            }
-            let edge = codec::decode_edge(&bytes)?;
-            check()?;
-            let stored_id = id_from_record_key(&key, &prefix)?;
-            if edge.id != stored_id {
-                return Err(Error::CorruptData(format!(
-                    "edge key {stored_id} contains edge {}",
-                    edge.id
-                )));
-            }
-            edges.push(edge);
-        }
-        check()?;
-        Ok((edges, truncated))
-    }
-
-    /// Visit adjacency records one at a time without collecting ids or properties.
-    /// The caller bounds retained rows and restores edge-id ordering (the index
-    /// groups records by label). Checks bracket storage reads and decoding, and
-    /// run after the visitor and before successful return, including empty scans.
-    pub(crate) fn visit_adjacent_edges(
-        &self,
-        vertex_id: u64,
-        incoming: bool,
-        label: Option<&str>,
-        check: &mut impl FnMut() -> Result<()>,
-        visit: &mut impl FnMut(Edge) -> Result<()>,
-    ) -> Result<()> {
-        check()?;
-        if let Some(label) = label {
-            validate_label(label)?;
-        }
-        let vertex_exists = self
-            .snapshot
-            .get(vertex_key(self.partition, vertex_id))?
-            .is_some();
-        check()?;
-        if !vertex_exists {
-            return Err(Error::VertexNotFound(vertex_id));
-        }
-        let direction = if incoming {
-            EdgeDirection::In
-        } else {
-            EdgeDirection::Out
-        };
-        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            check()?;
-            let (stored_key, _) = item?;
-            if !stored_key.starts_with(&prefix) {
-                break;
-            }
-            let edge_id = edge_id_from_adjacency_key(&stored_key)?;
-            let bytes = self.snapshot.get(edge_key(self.partition, edge_id))?;
-            check()?;
-            let Some(bytes) = bytes else {
-                return Err(Error::CorruptData(format!(
-                    "adjacency entry references missing edge {edge_id}"
-                )));
-            };
-            let edge = codec::decode_edge(&bytes)?;
-            check()?;
-            if edge.id != edge_id {
-                return Err(Error::CorruptData(format!(
-                    "edge key {edge_id} contains edge {}",
-                    edge.id
-                )));
-            }
-            visit(edge)?;
-            check()?;
-        }
-        check()?;
-        Ok(())
-    }
-
     /// The RocksDB sequence pinned by this view.
     pub fn sequence(&self) -> u64 {
         self.snapshot.sequence_number()
@@ -1244,11 +1104,201 @@ pub(crate) fn validate_label(label: &str) -> Result<()> {
     }
 }
 
+impl crate::gremlin::QueryReadBackend for GraphReadView<'_> {
+    fn get_vertex(
+        &self,
+        id: u64,
+        budget: &crate::query_memory::Budget,
+    ) -> Result<Option<crate::query_memory::Accounted<Vertex>>> {
+        let key = vertex_key(self.partition, id);
+        let Some(bytes) = self.snapshot.get(&key)? else {
+            return Ok(None);
+        };
+        // RocksDB returns its buffer before the caller knows its length. Charge
+        // immediately on return, before any query-owned decoding allocation.
+        let _raw = budget.reserve(crate::query_memory::add(key.len(), bytes.len())?)?;
+        let vertex = codec::decode_vertex_accounted(&bytes, budget)?;
+        if vertex.id != id {
+            return Err(Error::CorruptData("vertex id does not match key".into()));
+        }
+        Ok(Some(vertex))
+    }
+    fn get_edge(
+        &self,
+        id: u64,
+        budget: &crate::query_memory::Budget,
+    ) -> Result<Option<crate::query_memory::Accounted<Edge>>> {
+        let key = edge_key(self.partition, id);
+        let Some(bytes) = self.snapshot.get(&key)? else {
+            return Ok(None);
+        };
+        let _raw = budget.reserve(crate::query_memory::add(key.len(), bytes.len())?)?;
+        let edge = codec::decode_edge_accounted(&bytes, budget)?;
+        if edge.id != id {
+            return Err(Error::CorruptData("edge id does not match key".into()));
+        }
+        Ok(Some(edge))
+    }
+    fn scan_vertices_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+        budget: &crate::query_memory::Budget,
+    ) -> Result<(
+        crate::query_memory::AccountedVec<crate::query_memory::Accounted<Vertex>>,
+        bool,
+    )> {
+        check()?;
+        let prefix = vertex_prefix(self.partition);
+        let mut vertices = crate::query_memory::AccountedVec::new(budget);
+        let mut truncated = false;
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (key, bytes) = item?;
+            let _raw = budget.reserve(crate::query_memory::add(key.len(), bytes.len())?)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if vertices.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let vertex = codec::decode_vertex_accounted(&bytes, budget)?;
+            check()?;
+            let stored_id = id_from_record_key(&key, &prefix)?;
+            if vertex.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "vertex key {stored_id} contains vertex {}",
+                    vertex.id
+                )));
+            }
+            vertices.push(vertex)?;
+        }
+        check()?;
+        Ok((vertices, truncated))
+    }
+
+    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices_checked`].
+    fn scan_edges_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+        budget: &crate::query_memory::Budget,
+    ) -> Result<(
+        crate::query_memory::AccountedVec<crate::query_memory::Accounted<Edge>>,
+        bool,
+    )> {
+        check()?;
+        let prefix = edge_prefix(self.partition);
+        let mut edges = crate::query_memory::AccountedVec::new(budget);
+        let mut truncated = false;
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (key, bytes) = item?;
+            let _raw = budget.reserve(crate::query_memory::add(key.len(), bytes.len())?)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if edges.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let edge = codec::decode_edge_accounted(&bytes, budget)?;
+            check()?;
+            let stored_id = id_from_record_key(&key, &prefix)?;
+            if edge.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {stored_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            edges.push(edge)?;
+        }
+        check()?;
+        Ok((edges, truncated))
+    }
+
+    /// Visit adjacency records one at a time without collecting ids or properties.
+    /// The caller bounds retained rows and restores edge-id ordering (the index
+    /// groups records by label). Checks bracket storage reads and decoding, and
+    /// run after the visitor and before successful return, including empty scans.
+    fn visit_adjacent_edges(
+        &self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(crate::query_memory::Accounted<Edge>) -> Result<()>,
+        budget: &crate::query_memory::Budget,
+    ) -> Result<()> {
+        check()?;
+        if let Some(label) = label {
+            validate_label(label)?;
+        }
+        let vertex_exists = {
+            let bytes = self.snapshot.get(vertex_key(self.partition, vertex_id))?;
+            let _raw = budget.reserve(bytes.as_ref().map_or(0, |b| b.len()))?;
+            bytes.is_some()
+        };
+        check()?;
+        if !vertex_exists {
+            return Err(Error::VertexNotFound(vertex_id));
+        }
+        let direction = if incoming {
+            EdgeDirection::In
+        } else {
+            EdgeDirection::Out
+        };
+        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (stored_key, value) = item?;
+            let _adjacency_raw =
+                budget.reserve(crate::query_memory::add(stored_key.len(), value.len())?)?;
+            if !stored_key.starts_with(&prefix) {
+                break;
+            }
+            let edge_id = edge_id_from_adjacency_key(&stored_key)?;
+            let bytes = self.snapshot.get(edge_key(self.partition, edge_id))?;
+            check()?;
+            let Some(bytes) = bytes else {
+                return Err(Error::CorruptData(format!(
+                    "adjacency entry references missing edge {edge_id}"
+                )));
+            };
+            let _raw = budget.reserve(bytes.len())?;
+            let edge = codec::decode_edge_accounted(&bytes, budget)?;
+            check()?;
+            if edge.id != edge_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {edge_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            visit(edge)?;
+            check()?;
+        }
+        check()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod query_scan_tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::gremlin::{QueryReadBackend, MAX_GREMLIN_ACCOUNTED_BYTES};
+    use crate::query_memory::Budget;
 
     fn exhausted() -> Error {
         Error::TraversalLimitExceeded("test budget exhausted".into())
@@ -1271,12 +1321,16 @@ mod query_scan_tests {
             let result = if vertices {
                 graph
                     .read_view()
-                    .scan_vertices_checked(10, &mut check)
+                    .scan_vertices_checked(
+                        10,
+                        &mut check,
+                        &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES),
+                    )
                     .map(|_| ())
             } else {
                 graph
                     .read_view()
-                    .scan_edges_checked(10, &mut check)
+                    .scan_edges_checked(10, &mut check, &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES))
                     .map(|_| ())
             };
             assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
@@ -1303,12 +1357,16 @@ mod query_scan_tests {
             let result = if vertices {
                 graph
                     .read_view()
-                    .scan_vertices_checked(10, &mut check)
+                    .scan_vertices_checked(
+                        10,
+                        &mut check,
+                        &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES),
+                    )
                     .map(|_| ())
             } else {
                 graph
                     .read_view()
-                    .scan_edges_checked(10, &mut check)
+                    .scan_edges_checked(10, &mut check, &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES))
                     .map(|_| ())
             };
             assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
@@ -1338,6 +1396,7 @@ mod query_scan_tests {
                 visited.set(true);
                 Ok(())
             },
+            &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES),
         );
         assert!(visited.get());
         assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
@@ -1353,13 +1412,17 @@ mod query_scan_tests {
         }
         graph.db.put(edge_key(graph.partition, 3), b"bad").unwrap();
         let mut visited = Vec::new();
-        let result =
-            graph
-                .read_view()
-                .visit_adjacent_edges(1, false, None, &mut || Ok(()), &mut |edge| {
-                    visited.push(edge.id);
-                    Err(exhausted())
-                });
+        let result = graph.read_view().visit_adjacent_edges(
+            1,
+            false,
+            None,
+            &mut || Ok(()),
+            &mut |edge| {
+                visited.push(edge.id);
+                Err(exhausted())
+            },
+            &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES),
+        );
         assert_eq!(visited, vec![2]);
         assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
     }

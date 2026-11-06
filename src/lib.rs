@@ -35,6 +35,7 @@ mod graph;
 mod graph_records;
 mod gremlin;
 mod key;
+mod query_memory;
 mod schema;
 mod storage;
 mod storage_node;
@@ -50,8 +51,8 @@ pub use graph_records::{
 };
 pub use gremlin::{
     GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
-    DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,
-    MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS,
+    DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_ACCOUNTED_BYTES, MAX_GREMLIN_EDGE_STEPS,
+    MAX_GREMLIN_LIMIT, MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS,
 };
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use storage_node::{

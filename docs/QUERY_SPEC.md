@@ -140,10 +140,14 @@ A leading limit need not read or decode later records. This D1-only byte bound
 does not change the existing local RocksDB query contract or graph encoding.
 The 5-second cooperative execution deadline includes new-view acquisition; it
 cannot preempt a single adapter dispatch, decode, allocation or destructor.
-These are per-view, per-page, per-record and row-cardinality bounds, **not a total
-query heap or process RSS bound**. Repeated traversers can copy the same large
-vertex properties many times; output materialization can therefore exceed the
-view's byte size. Aggregate byte accounting remains future work.
+In addition, every execution shares a 64 MiB query-owned logical accounted-byte
+budget across raw buffers, decode scratch, rows, paths, ordering maps, and result
+construction. This closes repeated-large-property amplification that row and
+page bounds alone cannot constrain. The exact fees, admission points, ownership
+rules, and exclusions are specified in [QUERY_MEMORY.md](QUERY_MEMORY.md).
+This is not a heap/RSS limit. In particular, retained views, adapter-private
+allocation, allocator overhead, and parsing are excluded. Queries previously
+accepted can now fail with `TraversalLimitExceeded`; no partial success is returned.
 
 ## 5. Value mapping
 
@@ -181,7 +185,7 @@ resource limit is an error.
 | `UnsupportedGremlinArgument` | step in v0, argument form outside v0 |
 | `UnsupportedGremlinValue` | literal type outside v0 |
 | `InvalidGremlinLimit` | limit outside 1..=1000 |
-| `TraversalLimitExceeded` | more than 3 edge steps or row cap exceeded |
+| `TraversalLimitExceeded` | hop, row, accounted-byte, or deadline limit exceeded |
 | `InvalidGremlinTraverser` | a step is applied to the wrong element type |
 | `GraphNotFound` | reserved for strict lookup APIs; `V(id)`/`E(id)` remain empty |
 
@@ -194,6 +198,7 @@ to an empty result.
 - Edge steps: 3.
 - Rows per query: 10,000 before explicit `limit`.
 - Default `limit`: 100; maximum explicit `limit`: 1000.
+- Query-owned accounted bytes: 64 MiB per execution (see [accounting contract](QUERY_MEMORY.md)).
 - Query deadline: 5 seconds (implementation may make this configurable).
 
 Limits are enforced before materializing unbounded results.
@@ -233,5 +238,5 @@ Execution checks the deadline during scans and operators and before returning
 success, including a traversal with no chained steps. Checks are cooperative:
 an individual RocksDB call, record decode, allocation or destruction cannot be
 preempted. The execution deadline begins after parsing. The row cap bounds row
-cardinality, not bytes or process RSS; v0 has no per-record property-size or
-aggregate byte budget. A separate byte-budget contract remains future work.
+cardinality. The separate accounted-byte budget is a logical admission limit,
+not a total heap or process RSS bound; see [QUERY_MEMORY.md](QUERY_MEMORY.md).
