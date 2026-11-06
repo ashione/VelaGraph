@@ -82,7 +82,8 @@ which must match the original immutable placement. No bytes, CAS, request ID or
 epoch are regenerated. Retained values are not durable client journals.
 
 All [remote snapshot/frame/connection limits](REMOTE_GRAPH.md) still apply:
-2 MiB raw snapshot bytes, 100,000 rows, 16 MiB encoded frames, 16 connections per
+64 MiB / 1,000,000 rows per complete session, 2 MiB / 4,096 rows per page,
+four sessions / 128 MiB retained payload, 16 MiB encoded frames, 16 connections per
 service, and 16 outbound async RPCs per client process. Cloned resolvers share
 budgets; independently created resolvers have independent session/dispatch pools.
 These are bounded work limits, not process RSS bounds. Catalog preparation and

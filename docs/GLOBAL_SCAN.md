@@ -91,7 +91,9 @@ of an individual allocation, decode, native call or destructor.
 - Retained data snapshots together admit at most 200,000 key/value pairs and
   16 MiB raw key-plus-value bytes. Reused shard views are counted once.
 - Existing adapter per-view limits still apply. Remote acquisition is limited
-  to 2 MiB raw bytes / 100,000 rows per shard, with 16 MiB encoded frames.
+  to 64 MiB raw bytes / 1,000,000 rows per shard through fixed-session
+  downloads (2 MiB / 4,096 rows per page), with 16 MiB encoded frames.
+  These remain full local copies, not on-demand remote reads.
   Local adapters retain their own existing larger per-view bounds.
 - One 64 MiB query-owned logical accounted-byte ledger covers all partition
   scans and overlapping decoded records, page buffers, global candidate IDs,

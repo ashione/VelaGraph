@@ -3,7 +3,8 @@
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{run_blocking, RemoteStorageNode};
 use rocksdb_sql_table::{
-    Edge, Error, GraphRecordStore, GremlinRow, StorageNode, StorageNodeError, Value, Vertex,
+    Edge, Error, GraphRecordStore, GremlinRow, KeyRange, ScanLimit, StorageNode, StorageNodeError,
+    Value, Vertex,
 };
 use std::{
     collections::BTreeMap,
@@ -26,7 +27,7 @@ impl Drop for Process {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_independent_processes_graph_roundtrip() -> anyhow::Result<()> {
-    timeout(Duration::from_secs(50), scenario()).await?
+    timeout(Duration::from_secs(180), scenario()).await?
 }
 
 async fn scenario() -> anyhow::Result<()> {
@@ -196,7 +197,176 @@ async fn scenario() -> anyhow::Result<()> {
     ));
     let other = RemoteStorageNode::new(addresses[3 * leader + 2], 99, Duration::from_secs(2))?;
     assert!(run_blocking(move || other.read_view()).await?.is_err());
+    paged_snapshot_roundtrip(addresses[3 * leader + 2]).await?;
     drop(graph);
     drop(processes);
+    Ok(())
+}
+
+// This stays inside the real three-process fixture: no mock responses, automatic
+// failover, or transport-security claims. The graph contains >4 MiB of payload,
+// so a 2 MiB page budget necessarily requires at least three nonempty pages.
+async fn paged_snapshot_roundtrip(endpoint: std::net::SocketAddr) -> anyhow::Result<()> {
+    use replicated_graph::remote::{close_snapshot, open_snapshot, paged_snapshot, snapshot_page};
+    const PAGE_BYTES: usize = 2 * 1024 * 1024;
+    const PAYLOAD_BYTES: usize = 64 * 1024;
+    let budget = Duration::from_secs(20);
+    // A generous per-operation budget avoids turning debug JSON serialization
+    // of multiple MiB into an incidental timing assertion.
+    let large_graph = Arc::new(GraphRecordStore::new(
+        RemoteStorageNode::new(endpoint, 7, budget)?,
+        7,
+        0,
+    ));
+    // Build canonical graph bytes through the local public graph API, then
+    // submit small remote batches. This isolates read pagination from the
+    // prototype Raft transport's large-write/short-election timing behavior.
+    let fixture = run_blocking(move || -> anyhow::Result<_> {
+        let dir = tempfile::tempdir()?;
+        let local = GraphRecordStore::new(
+            rocksdb_sql_table::LocalStorageNode::open(dir.path(), 7)?,
+            7,
+            0,
+        );
+        for id in 100..172 {
+            let mut vertex = Vertex::new(id);
+            vertex.labels.push("large".into());
+            vertex
+                .properties
+                .insert("payload".into(), Value::Text("x".repeat(PAYLOAD_BYTES)));
+            local.create_vertex(&vertex)?;
+        }
+        Ok(local.node().admin().export()?.entries)
+    })
+    .await??;
+    for (index, row) in fixture.into_iter().enumerate() {
+        let (key, value) = (row.key, row.value);
+        let mut request_id = [0; 16];
+        request_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        request_id[8..].copy_from_slice(b"paged-fi");
+        replicated_graph::remote::write(
+            endpoint,
+            d2_raft::D1WriteRequest {
+                shard: 7,
+                epoch: 3,
+                request_id,
+                expected_sequence: None,
+                operations: vec![d2_raft::WriteOp::Put { key, value }],
+            },
+            budget,
+        )
+        .await?;
+    }
+    let before = paged_snapshot(endpoint, 7, budget).await?;
+    let descriptor = open_snapshot(endpoint, None, 7, budget).await?;
+    assert_eq!(descriptor.shard, before.shard);
+    assert_eq!(descriptor.epoch, before.epoch);
+    assert_eq!(descriptor.sequence, before.sequence);
+    assert_eq!(descriptor.rows, before.entries.len());
+    assert!(descriptor.bytes > 2 * PAGE_BYTES);
+    let first = snapshot_page(endpoint, None, descriptor.clone(), None, budget).await?;
+    assert!(first.next.is_some());
+    let first_entries = first.entries.clone();
+
+    // Mutate after opening and fetching the first page, then finish the old
+    // session. Its remaining pages must retain the same logical snapshot.
+    let g = large_graph.clone();
+    run_blocking(move || -> rocksdb_sql_table::Result<()> {
+        let mut vertex = g.get_vertex(108)?.expect("large vertex exists");
+        vertex
+            .properties
+            .insert("payload".into(), Value::Text("y".repeat(PAYLOAD_BYTES)));
+        g.update_vertex(&vertex)?;
+        g.delete_vertex(107)?;
+        let mut added = Vertex::new(173);
+        added.labels.push("large".into());
+        g.create_vertex(&added)?;
+        Ok(())
+    })
+    .await??;
+    let mut page = first;
+    let mut entries = Vec::new();
+    let mut pages = 0;
+    loop {
+        assert_eq!(page.descriptor, descriptor);
+        assert!(!page.entries.is_empty());
+        assert!(page.entries.len() <= 4096);
+        let bytes: usize = page.entries.iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert!(bytes <= PAGE_BYTES);
+        entries.extend(page.entries);
+        pages += 1;
+        assert!(pages <= descriptor.rows, "pagination must make progress");
+        let Some(cursor) = page.next else { break };
+        page = snapshot_page(endpoint, None, descriptor.clone(), Some(cursor), budget).await?;
+    }
+    assert!(pages >= 3);
+    assert_eq!(entries.len(), descriptor.rows);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>(),
+        descriptor.bytes
+    );
+    assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(entries, before.entries);
+    let replay = snapshot_page(endpoint, None, descriptor.clone(), None, budget).await?;
+    assert_eq!(replay.entries, first_entries);
+    close_snapshot(endpoint, None, descriptor.clone(), budget).await?;
+    assert!(snapshot_page(endpoint, None, descriptor, None, budget)
+        .await
+        .is_err());
+
+    let after = paged_snapshot(endpoint, 7, budget).await?;
+    assert_eq!(after.sequence, before.sequence + 3);
+    assert_eq!(after.entries.len(), before.entries.len());
+    assert_ne!(after.entries, before.entries);
+    let expected = after.entries;
+    let g = large_graph.clone();
+    run_blocking(move || -> rocksdb_sql_table::Result<()> {
+        let node = g.node();
+        let view = node.read_view()?;
+        assert!(view.payload_bytes() > 2 * PAGE_BYTES);
+        assert_eq!(
+            node.get(&expected[0].0, &view)?,
+            Some(expected[0].1.clone())
+        );
+        let rows = node.scan(
+            KeyRange::all(),
+            ScanLimit::new(100, 16 * 1024 * 1024)?,
+            &view,
+        )?;
+        let actual = rows
+            .into_iter()
+            .map(|row| (row.key, row.value))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        let mut cursor = None;
+        let mut paged = Vec::new();
+        loop {
+            let page = node.scan_page(
+                KeyRange::all(),
+                ScanLimit::new(10, 1024 * 1024)?,
+                &view,
+                cursor.as_ref(),
+            )?;
+            paged.extend(page.rows.into_iter().map(|row| (row.key, row.value)));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(paged, expected);
+        assert_eq!(
+            g.get_vertex(108)?.unwrap().properties.get("payload"),
+            Some(&Value::Text("y".repeat(PAYLOAD_BYTES)))
+        );
+        assert_eq!(
+            g.execute_gremlin("g.V().hasLabel('large').count()")?.rows,
+            vec![GremlinRow::Count(72)]
+        );
+        Ok(())
+    })
+    .await??;
     Ok(())
 }

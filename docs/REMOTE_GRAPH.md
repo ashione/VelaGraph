@@ -59,14 +59,58 @@ snapshot. This is not a new linearizable barrier: a replica may not yet know a
 new ownership epoch. A retained view is historical, and an unavailable selected
 server can prevent using it even though the bytes are copied locally.
 
-Each snapshot is limited to 100,000 records and 2 MiB raw key/value bytes. Wire
-JSON bodies are limited to 16 MiB, with a four-byte big-endian length prefix.
-JSON byte-array expansion counts toward the wire cap. A legal local D1 batch
-may not fit the remote frame and then fails explicitly. Existing D1 operation,
-raw byte, dedup, and query execution limits remain unchanged. Snapshot transfer
-is a full copy, not streaming or remote paging; this is intentionally a small
-functional prototype, not a scalability claim. Limits bound individual work,
-not total retained client snapshots or process RSS.
+`RemoteStorageNode::read_view` now downloads a fixed server session through
+bounded pages, then constructs the same **complete local `ReadView`**. It is
+not an on-demand remote view: all shard bytes are transferred before success.
+Point reads, local scan cursors and Gremlin retain their existing semantics.
+The old `snapshot` / `snapshot_identified` APIs and single `Snapshot` RPC remain
+available with their original 2 MiB / 100,000-row limits, without silent fallback.
+
+`open_snapshot` performs the barrier and captures one immutable copy. Its
+versioned descriptor binds server group/node, random startup incarnation,
+random session ID, shard, epoch, sequence, total rows and total payload bytes.
+`snapshot_page` returns at most 2 MiB raw key/value bytes and 4,096 records.
+An individual row exceeding 2 MiB is rejected at Open, even though a local D1
+write can accept larger values. A snapshot allows at most 64 MiB / 1,000,000 rows.
+Empty snapshots have one empty terminal page. Nonterminal pages must progress.
+Continuations are server-issued random tokens bound to a session and row offset;
+they are non-consuming, so replay returns the same page. They are bearer tokens
+on a trusted plaintext network, not authentication. Every page checks the local
+applied epoch, not a new quorum fence, and never refreshes snapshot contents.
+
+Each service admits four sessions and 128 MiB retained snapshot payload. Open
+reserves a slot and 64 MiB worst-case payload **before** cloning state, then
+settles to actual payload. Arc-held handler references retain the permits even
+after Close/expiry. Page response copies are separately bounded by the existing
+16-handler cap times 2 MiB, plus at most 16 MiB encoded frame per handler.
+A fixed 60-second lifetime starts at admission and is never renewed by paging;
+a 100-ms cleanup loop reclaims expired sessions. Close releases the registry
+reference. Disconnected clients or lost Open responses rely on TTL; connections
+are single-RPC and do not own the session. Shutdown drops all registry state.
+Process restart changes incarnation and cannot resume prior sessions.
+`GraphService::snapshot_stats` reports locally reserved sessions/payload, pages
+served and expired sessions; it adds no remote administrative endpoint.
+
+The complete-download helpers `paged_snapshot` / `paged_snapshot_identified`
+use one absolute deadline across Open, pages, validation and best-effort Close.
+The adapter checks that deadline while assembling its local map too. Metadata,
+continuation progress, strict key order across pages, exact row/byte totals and
+hard caps must all validate before returning a complete snapshot. Any failure
+discards the partial result. Unknown/expired/closed sessions return typed
+`SessionUnavailable` (adapter `Unavailable`); bad responses become `Corrupt`.
+No automatic reopen, retry, alternate leader, or partial success occurs. Error
+cleanup preserves the original error and never extends the operation deadline;
+cancellation uses TTL as the nonblocking fallback. Synchronous bounded clone,
+encoding and decode work is cooperative, not hard-preemptible, but checks prevent
+successful results after the deadline.
+
+Active complete-download assembly has process-wide admission of 16 operations,
+128 MiB payload and four million rows. These permits cover download assembly,
+not caller-retained returned snapshots/ReadViews. Payload plus row/object and
+frame caps are not exact heap/RSS guarantees. Wire JSON bodies remain capped at
+16 MiB, including byte-array expansion, with a four-byte big-endian length
+prefix. A legal local D1 batch may not fit the remote frame and fails explicitly.
+Existing D1 writes, dedup and query execution limits are unchanged.
 
 The server admits at most 16 concurrent connections; adapter clones share 32
 outstanding operations. Direct async clients share a 16-RPC process-wide cap.
@@ -120,3 +164,21 @@ resolver described in [REMOTE_ROUTING.md](REMOTE_ROUTING.md). The CLI now binds
 group/node identity in a durable marker and refuses unmarked nonempty legacy
 directories. Do not silently upgrade/adopt old data directories. Legacy clients
 remain supported only on group-zero services.
+
+## Paged snapshot verification
+
+The real three-process test transfers over 4.5 MiB in at least three pages,
+compares every ordered row with the original snapshot after an intervening
+mutation, checks new-snapshot changes, replay and Close, and exercises actual
+adapter point/scan reads plus standard Gremlin. Registry tests cover exact
+page/session byte limits, row-page bounds, oversized rows, concurrent payload
+and slot admission, Arc retention, Close, TTL, wrong incarnation/session and
+epoch changes. Scripted TCP peers test malformed metadata, cross-page ordering,
+row/byte/progress mismatches and an aggregate deadline across delayed pages.
+These are normal functional and bounded-protocol tests, not failover evidence.
+The service remains an unauthenticated plaintext trusted-development experiment,
+with no TLS, automatic retry, recovery, session resume or production claim.
+
+The transport directly uses the existing locked `getrandom` 0.3 dependency
+(MIT OR Apache-2.0) for incarnation/session/continuation randomness. No new
+cryptographic protocol or authentication claim is introduced.

@@ -577,3 +577,9 @@ labels in one owner-shard CAS. Null/set/remove and historical retries are explic
 `prepare_vertex_delete` explicitly rejects deletion: observed empty adjacency
 cannot prove absence of all incoming/outgoing edges or fence other shards.
 See [vertex mutations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-vertex-property-mutation).
+
+Remote adapters now acquire complete local read views through fixed snapshot
+sessions and bounded pages: up to 64 MiB / one million rows, with 2 MiB pages,
+shared admission, fixed TTL and strict full-result validation. This remains a
+trusted plaintext experiment, not lazy remote reads or failover support. The
+legacy single-Snapshot RPC is unchanged. See [paged remote snapshots](docs/REMOTE_GRAPH.md#snapshot-consistency-and-limits).
