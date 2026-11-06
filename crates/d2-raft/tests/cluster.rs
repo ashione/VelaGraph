@@ -11,12 +11,29 @@ fn node(id: u64) -> BasicNode {
     }
 }
 
+// initialize() publishes the effective membership before it is committed. A
+// leader/voter-set check alone does not make a subsequent membership change safe.
+async fn wait_for_initial_membership(n: &NodeHandle) -> anyhow::Result<()> {
+    n.raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |m| {
+                let membership_log_id = m.membership_config.log_id();
+                membership_log_id.is_some() && m.last_applied.as_ref() >= membership_log_id.as_ref()
+            },
+            "initial membership applied before adding learners",
+        )
+        .await?;
+    Ok(())
+}
+
 async fn start_three() -> anyhow::Result<(Cluster, Vec<NodeHandle>)> {
     let cluster = Cluster::new();
     let n1 = cluster.start(1).await?;
     let n2 = cluster.start(2).await?;
     let n3 = cluster.start(3).await?;
     n1.raft.initialize(BTreeMap::from([(1, node(1))])).await?;
+    wait_for_initial_membership(&n1).await?;
     n1.raft.add_learner(2, node(2), true).await?;
     n1.raft.add_learner(3, node(3), true).await?;
     n1.raft
@@ -35,9 +52,10 @@ async fn leader_of(nodes: &[NodeHandle], timeout_ms: u64) -> anyhow::Result<u64>
             for n in nodes {
                 let current = n.raft.metrics().borrow().current_leader;
                 if current == Some(n.id)
-                    && timeout(Duration::from_millis(150), n.raft.ensure_linearizable())
-                        .await
-                        .is_ok()
+                    && matches!(
+                        timeout(Duration::from_millis(150), n.raft.ensure_linearizable()).await,
+                        Ok(Ok(_))
+                    )
                 {
                     return n.id;
                 }
@@ -47,6 +65,56 @@ async fn leader_of(nodes: &[NodeHandle], timeout_ms: u64) -> anyhow::Result<u64>
     })
     .await
     .map_err(|_| anyhow::anyhow!("leader not elected within {timeout_ms}ms"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_waits_for_initial_membership_to_commit() -> anyhow::Result<()> {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let cluster = Cluster::new();
+    let mut nodes = Vec::new();
+    for id in 1..=3 {
+        nodes.push(cluster.start(id).await?);
+    }
+    // No quorum can acknowledge the initial membership until the partition heals.
+    for id in 2..=3 {
+        cluster.policy.deny(1, id).await;
+        cluster.policy.deny(id, 1).await;
+    }
+    nodes[0]
+        .raft
+        .initialize(BTreeMap::from([(1, node(1)), (2, node(2)), (3, node(3))]))
+        .await?;
+    nodes[0]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .voter_ids([1, 2, 3], "initial membership is effective")
+        .await?;
+
+    let ready = wait_for_initial_membership(&nodes[0]);
+    tokio::pin!(ready);
+    // Poll once rather than sleeping: effective membership is not sufficient.
+    assert!(poll_fn(|cx| Poll::Ready(ready.as_mut().poll(cx)))
+        .await
+        .is_pending());
+
+    cluster.policy.clear().await;
+    ready.await?;
+    let metrics = nodes[0].raft.metrics().borrow().clone();
+    assert!(metrics.membership_config.log_id().is_some());
+    assert!(metrics.last_applied.as_ref() >= metrics.membership_config.log_id().as_ref());
+
+    let learner = cluster.start(4).await?;
+    let leader = leader_of(&nodes, 5_000).await?;
+    timeout(
+        Duration::from_secs(5),
+        handle(&nodes, leader)
+            .raft
+            .add_learner(learner.id, node(learner.id), true),
+    )
+    .await??;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
