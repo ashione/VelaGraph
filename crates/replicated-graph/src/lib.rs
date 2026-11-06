@@ -5,6 +5,8 @@
 //! explicitly instead of nesting `block_on` or blocking the executor. The host
 //! runtime must remain running. There is no routing, TCP client protocol,
 //! authentication, automatic retry, or production availability guarantee.
+pub mod catalog;
+
 use std::cell::Cell;
 use std::future::Future;
 use std::sync::{mpsc, Arc};

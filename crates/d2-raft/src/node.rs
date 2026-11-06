@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,16 +10,25 @@ use tokio::time::{sleep, timeout};
 
 use crate::durable_log_store::DurableLogStore;
 use crate::log_store::LogStore;
-use crate::network::{DropPolicy, NetworkFactory, Raft, Registry};
+use crate::network::{DropPolicy, GroupId, NetworkFactory, Raft, Registry};
 use crate::state_machine::StateMachine;
 use crate::types::NodeId;
 
 pub struct Node;
 
 pub struct NodeHandle {
+    registry: Registry,
+    registration: Arc<()>,
     pub id: NodeId,
     pub raft: Raft,
     pub state_machine: Arc<StateMachine>,
+}
+
+impl NodeHandle {
+    /// Immutable in-process consensus group associated with this replica.
+    pub fn group_id(&self) -> GroupId {
+        self.registry.group_id()
+    }
 }
 
 impl Node {
@@ -27,6 +37,7 @@ impl Node {
         registry: Registry,
         policy: Arc<DropPolicy>,
     ) -> anyhow::Result<NodeHandle> {
+        let _startup = registry.reserve_startup(id).await?;
         let config = Arc::new(
             Config {
                 heartbeat_interval: 100,
@@ -45,8 +56,16 @@ impl Node {
         };
         let raft =
             openraft::Raft::new(id, config, network, log_store, state_machine.clone()).await?;
-        registry.insert(id, raft.clone()).await;
+        let registration = match registry.register(id, raft.clone()).await {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = raft.shutdown().await;
+                return Err(error);
+            }
+        };
         Ok(NodeHandle {
+            registry,
+            registration,
             id,
             raft,
             state_machine,
@@ -63,9 +82,11 @@ impl Node {
         registry: Registry,
         policy: Arc<DropPolicy>,
     ) -> anyhow::Result<NodeHandle> {
+        let _startup = registry.reserve_startup(id).await?;
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create data dir {}", dir.display()))?;
+        bind_durable_identity(dir, registry.group_id(), id)?;
         let log_store = DurableLogStore::open(dir.join("raft.db"))?;
         let state_machine = Arc::new(StateMachine::open(dir.join("state.db"))?);
         let config = Arc::new(
@@ -84,17 +105,28 @@ impl Node {
         };
         let raft =
             openraft::Raft::new(id, config, network, log_store, state_machine.clone()).await?;
-        registry.insert(id, raft.clone()).await;
+        let registration = match registry.register(id, raft.clone()).await {
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = raft.shutdown().await;
+                return Err(error);
+            }
+        };
         Ok(NodeHandle {
+            registry,
+            registration,
             id,
             raft,
             state_machine,
         })
     }
 
-    pub async fn shutdown(handle: &NodeHandle, registry: &Registry) {
-        registry.remove(handle.id).await;
+    pub async fn shutdown(handle: &NodeHandle, _registry: &Registry) {
         let _ = handle.raft.shutdown().await;
+        handle
+            .registry
+            .remove_registration(handle.id, &handle.registration)
+            .await;
     }
 }
 
@@ -108,6 +140,14 @@ impl Cluster {
         Self {
             registry: Registry::default(),
             policy: Arc::new(DropPolicy::default()),
+        }
+    }
+
+    /// Create a group-scoped cluster sharing transport and fault policy storage.
+    pub fn in_group(&self, group_id: GroupId) -> Self {
+        Self {
+            registry: self.registry.in_group(group_id),
+            policy: Arc::new(self.policy.in_group(group_id)),
         }
     }
 
@@ -189,4 +229,49 @@ impl Default for Cluster {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Versioned identity is written before creating either database. A partial or
+/// unknown identity fails closed. Legacy nonempty directories belong to group 0;
+/// they cannot silently acquire a new nonzero identity.
+fn bind_durable_identity(dir: &Path, group_id: GroupId, node_id: NodeId) -> anyhow::Result<()> {
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    #[serde(deny_unknown_fields)]
+    struct Identity {
+        version: u32,
+        group_id: GroupId,
+        node_id: NodeId,
+    }
+    let expected = Identity {
+        version: 1,
+        group_id,
+        node_id,
+    };
+    let path = dir.join("raft-group.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let actual: Identity =
+                serde_json::from_slice(&bytes).context("decode durable group identity")?;
+            anyhow::ensure!(
+                actual == expected,
+                "durable group identity mismatch: expected {expected:?}, found {actual:?}"
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read durable group identity"),
+    }
+    anyhow::ensure!(
+        group_id == 0 || std::fs::read_dir(dir)?.next().transpose()?.is_none(),
+        "nonzero group cannot adopt an unbound nonempty durable directory"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .context("create durable group identity")?;
+    file.write_all(&serde_json::to_vec(&expected)?)?;
+    file.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }

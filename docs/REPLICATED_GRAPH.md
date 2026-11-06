@@ -5,8 +5,10 @@ synchronous D1 `StorageNode` trait to an actual three-voter openraft group.
 It is an **in-process correctness prototype**, not a network graph service.
 `GraphEngine` and its K3 transaction API still use the local kernel. The same
 Gremlin parser/operators can also execute through this replicated D1 adapter.
-Routing, placement, shard migration, cross-shard transactions,
-network authentication and a production client protocol are not implemented.
+A separate [D3a static catalog](D3_STATIC_CATALOG.md) provides persisted immutable
+placement in a dedicated metadata group. Automatic routing, shard migration,
+cross-shard transactions, network authentication and a production client protocol
+are not implemented.
 
 ## Construction and execution
 

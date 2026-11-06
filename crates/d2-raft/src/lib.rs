@@ -25,7 +25,7 @@ pub use d1::{
 };
 pub use durable_log_store::DurableLogStore;
 pub use log_store::LogStore;
-pub use network::{DropPolicy, NetworkFactory, Registry};
+pub use network::{DropPolicy, GroupId, NetworkFactory, Registry};
 pub use node::{Cluster, Node, NodeHandle};
 pub use state_machine::{D1ReadLimit, D1ReadSnapshot, StateMachine, StateMachineData};
 pub use tcp::{
