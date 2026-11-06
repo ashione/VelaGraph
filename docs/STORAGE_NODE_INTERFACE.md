@@ -437,3 +437,10 @@ as the safe default until then.
 - Raft library choice and snapshot transfer format.
 - Boundary-edge policy above.
 - Maximum batch size, scan limits, and dedup retention.
+
+## Isolated v2 append-only experiment
+
+[EXPERIMENTAL_CROSS_EDGES.md](EXPERIMENTAL_CROSS_EDGES.md) documents a separate
+versioned namespace and explicitly non-atomic source/reverse append protocol.
+It does not change this document's existing v1/K3/Gremlin contract or complete
+D4/D5. Its out/in observations cannot certify missing-index completeness.

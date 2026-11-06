@@ -35,7 +35,7 @@ same PR.
   degrade to a full scan when an index covers the step.
 - New loops need a termination argument in the PR description.
 
-## R4 — Atomicity and partition boundaries
+## R4 — V1 atomicity and partition boundaries
 
 - Use one `WriteBatch` for a vertex/edge plus its adjacency updates.
 - Validate both endpoints before creating an edge; a failed create writes
@@ -131,3 +131,11 @@ git diff --check
 - [ ] Deterministic ordering tested.
 - [ ] `fmt`, `test`, `clippy`, `diff --check` pass.
 - [ ] README/roadmap/spec updated when the contract changes.
+
+## Reviewed v2 experiment exception
+
+The isolated graph/v2 append-only API in [EXPERIMENTAL_CROSS_EDGES.md](EXPERIMENTAL_CROSS_EDGES.md)
+is an explicit R2/R4/R12 scope exception: new versioned protobuf-compatible
+envelopes and golden/reopen tests, two non-atomic cross-shard batches, and
+observed-only adjacency with unverified completeness. V1 contracts are unchanged.
+No Gremlin/query-layer behavior inherits this exception.

@@ -23,8 +23,10 @@ Read these before changing behavior:
   return a partial success.
 - Keep the K1 key layout and deterministic record encoding; format changes need
   a version, migration note, and golden vectors.
-- One `WriteBatch` per vertex/edge mutation; both endpoints must exist; v0 has
-  no cross-partition edges.
+- V1: one `WriteBatch` per vertex/edge mutation; both endpoints must exist; v0 has
+  no cross-partition edges. The separately reviewed append-only v2 experiment
+  follows `docs/EXPERIMENTAL_CROSS_EDGES.md`; never apply its non-atomic semantics
+  to v1 APIs or claim its observed adjacency is complete.
 - Every traversal is bounded. Internal limits are errors, not `truncated`
   successes.
 - Preserve the SQL engine's documented behavior; do not couple SQL and graph
@@ -40,3 +42,6 @@ Read these before changing behavior:
 The current milestones are K2 (standard Gremlin subset), K3 (single-shard
 snapshot transactions), and D1 (storage-node interface). Do not implement
 cross-partition transactions, Raft, or Cypher as part of a query-layer change.
+
+The isolated v2 append-only storage experiment is a reviewed scope exception,
+not a query-layer or distributed-transaction implementation.

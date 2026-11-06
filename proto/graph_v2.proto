@@ -1,0 +1,15 @@
+syntax = "proto3";
+package graph.experimental.v2;
+
+// Canonical envelope described in docs/EXPERIMENTAL_CROSS_EDGES.md.
+// No generated code or protoc is needed. Fields are encoded in numeric order;
+// this experiment rejects unknown/noncanonical outer-envelope fields.
+message Record {
+  uint32 version = 1; // Always 2.
+  uint32 kind = 2; // 1 = vertex; 2 = source-owned edge.
+  fixed32 partition = 3; // Vertex partition or edge TARGET partition.
+  bytes record_v1 = 4; // Complete canonical graph.proto Record, version 1.
+}
+// The source partition is supplied by the edge key. The embedded edge's
+// from/to numbers are local IDs. The outer target partition qualifies `to`.
+// Index values are empty; source partition and edge ID are in the index key.

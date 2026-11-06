@@ -66,3 +66,6 @@ pub use traversal::{
     TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,
 };
 pub use value::Value;
+
+/// Isolated, explicitly non-atomic append-only cross-partition experiment.
+pub mod experimental_graph;
