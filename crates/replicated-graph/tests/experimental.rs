@@ -3,7 +3,10 @@ use replicated_graph::{
     catalog::{Catalog, Placement},
     remote::{snapshot_identified, RemoteIdentity},
     routing::{
-        experimental::{AdjacencyCompleteness, ExperimentalRouteError, Stage, StageOutcome},
+        experimental::{
+            AdjacencyCompleteness, ExperimentalRouteError, ObservedPathElement, ObservedRow, Stage,
+            StageOutcome,
+        },
         RemoteReplica, RouteResolver,
     },
     run_blocking,
@@ -140,7 +143,9 @@ async fn scenario() -> anyhow::Result<()> {
                 placement,
             )?)?;
             let session = resolver.experimental_read_session(BUDGET)?;
-            let vertex = session.prepare_vertex(p, &Vertex::new(7))?;
+            let mut v = Vertex::new(7);
+            v.labels.push(format!("P{p}"));
+            let vertex = session.prepare_vertex(p, &v)?;
             resolver.experimental_commit(&vertex, BUDGET)?;
             resolver.experimental_commit(&vertex, BUDGET)?; // exact dedup
         }
@@ -157,6 +162,16 @@ async fn scenario() -> anyhow::Result<()> {
             label: "K".into(),
             properties: BTreeMap::new(),
         };
+        let mut large = Vertex::new(99);
+        large.labels.push("Large".into());
+        large.properties.insert(
+            "blob".into(),
+            rocksdb_sql_table::Value::Text("x".repeat(700_000)),
+        );
+        let prepared_large = resolver
+            .experimental_read_session(BUDGET)?
+            .prepare_vertex(1, &large)?;
+        resolver.experimental_commit(&prepared_large, BUDGET)?;
         let old = resolver.experimental_read_session(BUDGET)?;
         for e in [
             edge(9, 1, 2),
@@ -176,7 +191,7 @@ async fn scenario() -> anyhow::Result<()> {
                 id: 9
             })?
             .is_none());
-        let session = resolver.experimental_read_session(BUDGET)?;
+        let session = resolver.experimental_read_session(Duration::from_secs(60))?;
         assert_eq!(
             session
                 .get_edge(EdgeRef {
@@ -236,6 +251,151 @@ async fn scenario() -> anyhow::Result<()> {
                 .edges
                 .len(),
             2
+        );
+        let vr = |partition| VertexRef { partition, id: 7 };
+        let v = |p| ObservedPathElement::Vertex(vr(p));
+        let e = |partition, id| ObservedPathElement::Edge(EdgeRef { partition, id });
+        let both = session.observed_gremlin(1, "g.V(7).both().path()")?;
+        assert_eq!(both.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(both.snapshots, session.snapshots);
+        assert_eq!(both.metadata_sequence, session.metadata_sequence);
+        assert_eq!(
+            both.rows,
+            vec![
+                ObservedRow::Path(vec![v(1), e(1, 9), v(2)]), // edge 9 owner 1
+                ObservedRow::Path(vec![v(1), e(2, 9), v(2)]), // edge 9 owner 2
+                ObservedRow::Path(vec![v(1), e(1, 10), v(2)]), // parallel edge 10
+                ObservedRow::Path(vec![v(1), e(1, 11), v(3)]),
+                ObservedRow::Path(vec![v(1), e(1, 12), v(1)]), // self-loop once
+            ]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin(1, "g.V(7).out('K').hasLabel('P2').count()")?
+                .rows,
+            vec![ObservedRow::Count(2)]
+        );
+        assert_eq!(
+            session.observed_gremlin(2, "g.V(7).in().path()")?.rows,
+            vec![
+                ObservedRow::Path(vec![v(2), e(1, 9), v(1)]),
+                ObservedRow::Path(vec![v(2), e(1, 10), v(1)])
+            ]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin(1, "g.V(7).out().limit(2).count()")?
+                .rows,
+            vec![ObservedRow::Count(2)]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin(1, "g.V(7).limit(1).out().count()")?
+                .rows,
+            vec![ObservedRow::Count(4)]
+        );
+        assert_eq!(
+            session.observed_gremlin(1, "g.V(999,7,7).count()")?.rows,
+            vec![ObservedRow::Count(2)]
+        );
+        assert_eq!(
+            session.observed_gremlin(1, "g.V(999).count()")?.rows,
+            vec![ObservedRow::Count(0)]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin(1, "g.V(7).out('Absent').count()")?
+                .rows,
+            vec![ObservedRow::Count(0)]
+        );
+        let multi = session.observed_gremlin(3, "g.V(7).in().out().path()")?;
+        assert_eq!(
+            multi.rows,
+            vec![
+                ObservedRow::Path(vec![v(3), e(1, 11), v(1), e(1, 9), v(2)]),
+                ObservedRow::Path(vec![v(3), e(1, 11), v(1), e(1, 10), v(2)]),
+                ObservedRow::Path(vec![v(3), e(1, 11), v(1), e(1, 11), v(3)]),
+                ObservedRow::Path(vec![v(3), e(1, 11), v(1), e(1, 12), v(1)]),
+            ]
+        );
+        assert_eq!(
+            old.observed_gremlin(1, "g.V(7).both().count()")?.rows,
+            vec![ObservedRow::Count(0)]
+        );
+        for text in [
+            "g.V()",
+            "g.E(9)",
+            "g.V(7).id()",
+            "g.V(7).has('x')",
+            "g.V(7).values('x')",
+        ] {
+            assert!(matches!(
+                session.observed_gremlin(1, text),
+                Err(ExperimentalRouteError::Unsupported(_))
+            ));
+        }
+        assert!(matches!(
+            session.observed_gremlin(1, "g.V(7).repeat(out())"),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
+            ))
+        ));
+        assert!(session
+            .observed_gremlin(1, "g.V(7).out().out().out().out()")
+            .is_err());
+        assert!(session.observed_gremlin(1, "g.V(7).limit(0)").is_err());
+        for oversized in [
+            format!("g.V({}).limit(1).out().count()", vec!["7"; 8000].join(",")),
+            format!("g.V({}7{})", "[".repeat(1000), "]".repeat(1000)),
+        ] {
+            assert!(oversized.len() < 16 * 1024);
+            assert!(matches!(
+                session.observed_gremlin(1, &oversized),
+                Err(ExperimentalRouteError::Query(
+                    rocksdb_sql_table::Error::GremlinComplexityLimit { .. }
+                ))
+            ));
+        }
+        let repeated = format!("g.V({}).both()", vec!["7"; 30].join(","));
+        assert_eq!(session.observed_gremlin(1, &repeated)?.rows.len(), 100);
+        assert_eq!(
+            session
+                .observed_gremlin(1, &(repeated.clone() + ".count()"))?
+                .rows,
+            vec![ObservedRow::Count(150)]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin(1, &(repeated + ".limit(150)"))?
+                .rows
+                .len(),
+            150
+        );
+        let repeated_large = format!(
+            "g.V({}).hasLabel('Large').count()",
+            vec!["99"; 50].join(",")
+        );
+        assert!(matches!(
+            session.observed_gremlin(1, &repeated_large),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        let leading = format!(
+            "g.V({}).limit(1).hasLabel('Large').count()",
+            vec!["99"; 50].join(",")
+        );
+        assert_eq!(
+            session.observed_gremlin(1, &leading)?.rows,
+            vec![ObservedRow::Count(1)]
+        );
+        let many = format!(
+            "g.V({}).both().both().both().count()",
+            vec!["7"; 50].join(",")
+        );
+        assert_eq!(
+            session.observed_gremlin(1, &many)?.rows,
+            vec![ObservedRow::Count(3250)]
         );
         assert!(matches!(
             session.prepare_edge(&edge(9, 1, 2)),
@@ -300,7 +460,22 @@ async fn scenario() -> anyhow::Result<()> {
                 Direction::Out
             )
             .is_err());
-        // Exact retry retains the original rejected target sequence, no implicit repair.
+        // Unknown completeness propagates even into scalar counts; visible
+        // incompleteness is an error, not a partial vector or zero count.
+        let observed = current.observed_gremlin(2, "g.V(7).in().count()")?;
+        assert_eq!(observed.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(observed.rows, vec![ObservedRow::Count(2)]);
+        assert!(matches!(
+            current.observed_gremlin(1, "g.V(7).out().count()"),
+            Err(ExperimentalRouteError::Graph(
+                ExperimentalError::Incomplete(_)
+            ))
+        ));
+        assert_eq!(
+            session.observed_gremlin(1, "g.V(7).out().count()")?.rows,
+            vec![ObservedRow::Count(4)]
+        ); // original frozen views, never refresh
+           // Exact retry retains the original rejected target sequence, no implicit repair.
         assert!(matches!(
             resolver.experimental_commit(&prepared, BUDGET),
             Err(ExperimentalRouteError::Stage {
@@ -371,7 +546,9 @@ async fn partial_registry_is_rejected_before_any_write() -> anyhow::Result<()> {
                 placement,
             )?)?;
             let session = resolver.experimental_read_session(BUDGET)?;
-            let vertex = session.prepare_vertex(p, &Vertex::new(7))?;
+            let mut v = Vertex::new(7);
+            v.labels.push(format!("P{p}"));
+            let vertex = session.prepare_vertex(p, &v)?;
             resolver.experimental_commit(&vertex, BUDGET)?;
             resolver.experimental_commit(&vertex, BUDGET)?; // exact dedup
         }

@@ -283,3 +283,9 @@ end-to-end deadline, all-or-error semantics and memory exclusions.
 versioned namespace and explicitly non-atomic source/reverse append protocol.
 It does not change this document's existing v1/K3/Gremlin contract or complete
 D4/D5. Its out/in observations cannot certify missing-index completeness.
+
+The additive v2 `observed_gremlin` entrypoint reuses this parser but has a separate
+Unverified result type. Its explicit-ID starts, out/in/both, hasLabel, path, limit
+and count subset is specified in EXPERIMENTAL_CROSS_EDGES.md. Qualified path
+vertices and edges preserve partition identity. This does not change v1 semantics
+or claim complete D5 traversal; a scalar count remains an incomplete observation.

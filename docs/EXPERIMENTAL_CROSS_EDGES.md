@@ -93,7 +93,8 @@ writes eventually succeed; open a new session to make a new observation.
 `observed_adjacency(VertexRef, Out|In)` follows only the requested index. Each
 observed entry resolves the canonical edge and verifies both sides. Order is
 `(edge ID, source partition)`; parallel edges retain multiplicity, and a
-self-loop appears once in each direction. There is no `both` API in this slice.
+self-loop appears once in each direction. This primitive has no `both` variant;
+the observed traversal below combines both directions with qualified-edge deduplication.
 A visible corrupt/incomplete entry or any required read failure aborts the whole
 call without returning a partial vector.
 
@@ -102,8 +103,8 @@ result is `ObservedAdjacency { edges, completeness: Unverified }`, including
 empty results. In particular, a source-only failed append can be invisible to
 incoming adjacency, while outgoing adjacency fails when it encounters the
 missing reverse index. This is not an exhaustive adjacency API, even in a
-successful transport call. No legacy Gremlin traversal, count, path, global
-scan or complete-result API is wired to these observations. A future complete
+successful transport call. No legacy Gremlin or complete-result API is wired to these observations.
+The separate observed traversal below preserves their uncertainty. A future complete
 query needs a visibility/coordinator protocol or bounded global integrity check;
 removing the explicit uncertainty flag would require another contract review.
 
@@ -180,3 +181,76 @@ ACK after remote commit. A local adapter wrapper separately applies a batch then
 returns Timeout to check exact retry deduplication. Each group is a single
 voter: this is functional routing/format evidence, not replication resilience,
 crash recovery, failover, network partition correctness or production security.
+
+
+## Isolated observed Gremlin traversal
+
+`ExperimentalReadSession::observed_gremlin(start_partition, text)` is an additive,
+explicitly experimental D5 functional slice. It parses standard Gremlin with the
+existing official grammar, then accepts only explicit `g.V(id, ...)` and
+`out`, `in`, `both`, `hasLabel`, `limit`, terminal `path` or terminal `count`.
+Start IDs belong to the supplied partition; later hops follow qualified endpoints.
+There is no project-specific Gremlin syntax. `V()` scans, all `E` starts, `has`,
+`values`, `id` and `label` are typed `ExperimentalRouteError::Unsupported` here.
+Parser/validation failures retain the original typed error under `Query`.
+No unsupported form falls back to v1 or a global scan.
+
+`ObservedTraversal` carries ordered rows, `completeness: Unverified`, the catalog
+sequence and all per-shard stamps. Vertex rows contain `VertexRef`. Path rows
+contain `ObservedPathElement::Vertex(VertexRef)` and `Edge(EdgeRef)`, with source
+vertex followed by edge/vertex pairs. Parallel edges therefore retain distinct
+paths even when endpoints coincide. Each input expands in `(edge ID, source
+partition)` order; `both` deduplicates only the identical qualified edge, so a
+self-loop appears once while parallel edges and same local IDs across partitions
+remain distinct. Explicit starts preserve argument order and duplicates; missing
+starts contribute no row. `hasLabel` matches any supplied vertex label.
+
+Limits act at their original step position, count counts the observed stream,
+and terminal path does not materialize properties. A leading limit short-circuits
+start acquisition once that many existing vertices were admitted. Default output
+cap is 100 unless an explicit limit occurs; count observes pre-default-cap rows.
+The existing parser enforces three edge steps and limit 1..1000.
+The shared `GremlinQuery::parse` entrypoint enforces the same 16 KiB and
+64 raw structural-mark admission as all other Gremlin calls; there is no second
+v2 parser or divergent complexity guard. The typed `GremlinComplexityLimit`
+is preserved under `ExperimentalRouteError::Query`. See QUERY_SPEC.md for its
+conservative quoted-string counting and platform verification limits.
+Every successful result, including an empty stream or scalar count, is still
+Unverified. Count is **not** an exhaustive graph cardinality. A visible missing
+reverse index aborts the query, while an entirely absent incoming index may be
+undetectable. This API must not be represented as a complete Gremlin query or
+strongly consistent graph result.
+
+One session holds one resolver permit, one frozen catalog and one pinned adapter
+view per unique shard. All parsing, primitive reads, operators and final return
+check the session's original absolute deadline; queries do not reset or extend it.
+A retained session remains frozen after later writes. There is no global snapshot,
+view refresh, replica switch, retry or per-hop deadline. Checks are cooperative,
+not preemption of parser/decoder/allocator work or one storage dispatch.
+
+Each execution additionally uses one cumulative 64 MiB logical admission budget,
+never refunded, for decoded start/filter vertices, observed edge payloads,
+ordering entries, row/path construction and final result slots/stamps. Fixed
+fees are 128 bytes per vertex/row/property/output slot, 256 per observed edge,
+64 per stamp, actual label/property text bytes, and actual path element sizes.
+A query admits at most 10,000 rows per stage and 10,000 work units across all
+stages: one per explicit start or filter lookup, adjacency invocation, and returned
+edge. These are logical units, **not** the physical read count: each adjacency
+invocation internally verifies canonical/index/endpoint records. Existing primitive
+caps remain 1,000 entries / 1 MiB index bytes and 1 MiB decoded adjacency output.
+Snapshot buffers and primitive read/decode scratch are excluded from the query
+budget and retain their separately documented bounds. One bounded primitive
+result can exist before cumulative admission, then is charged before retention
+in query rows/maps. Caller text, parser memory, allocator spare capacity, teardown
+and process RSS are not covered. There is no claim of precise live-heap accounting.
+Internal row, byte or work exhaustion errors; a later limit/count cannot hide it.
+
+Evidence: the independent metadata/two-data-process fixture exercises qualified
+identity, directional hops, both ordering, parallel edges/self-loop paths,
+filters, counts, limit placement, absent starts/labels, unsupported forms,
+byte exhaustion and bounded multi-hop expansion, frozen views, and explicit incomplete-result propagation.
+Single-voter normal-path evidence does not establish failover, repair, distributed
+snapshot isolation or production transport security.
+
+Unit regressions additionally verify exact cumulative-byte/work-unit boundaries
+and rejection of an already-expired retained session without resetting its deadline.
