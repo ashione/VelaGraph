@@ -1,4 +1,4 @@
-//! Isolated graph/v2 experiment with append-only creation and explicit edge mutations.
+//! Isolated graph/v2 experiment with append-only creation and explicit mutations.
 //! No v1 API reads these records.
 //! Batches are shard-local; composing them is explicitly NOT a transaction.
 use crate::graph::{codec, validate_edge, validate_label, validate_vertex};
@@ -114,6 +114,52 @@ impl EdgePropertyPatch {
         }
         edge.properties.extend(self.set.clone());
         validate_edge(&edge.local())?;
+        Ok(())
+    }
+}
+/// Opt-in vertex properties patch. Null is stored; removal is explicit.
+/// Identity and labels cannot be changed through this API.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VertexPropertyPatch {
+    pub set: BTreeMap<String, Value>,
+    pub remove: BTreeSet<String>,
+}
+impl VertexPropertyPatch {
+    fn apply(&self, vertex: &mut Vertex) -> Result<()> {
+        // Admit caller-owned patch before cloning its contents. These are input
+        // bounds, not a claim about allocator overhead or total process RSS.
+        if self.set.len().saturating_add(self.remove.len()) > 10_000 {
+            return Err(ExperimentalError::Invalid(
+                "vertex patch exceeds 10000 keys",
+            ));
+        }
+        let mut bytes = 0usize;
+        for (key, value) in &self.set {
+            bytes = bytes.saturating_add(key.len()).saturating_add(match value {
+                Value::Text(text) => text.len(),
+                _ => 8,
+            });
+            if bytes > 1024 * 1024 {
+                return Err(ExperimentalError::Invalid("vertex patch exceeds 1 MiB"));
+            }
+        }
+        for key in &self.remove {
+            bytes = bytes.saturating_add(key.len());
+            if bytes > 1024 * 1024 {
+                return Err(ExperimentalError::Invalid("vertex patch exceeds 1 MiB"));
+            }
+        }
+        if self.set.is_empty() && self.remove.is_empty() {
+            return Err(ExperimentalError::Invalid("empty vertex property patch"));
+        }
+        if self.set.keys().any(|key| self.remove.contains(key)) {
+            return Err(ExperimentalError::Invalid("overlapping set/remove keys"));
+        }
+        for key in &self.remove {
+            vertex.properties.remove(key);
+        }
+        vertex.properties.extend(self.set.clone());
+        validate_vertex(vertex)?;
         Ok(())
     }
 }
@@ -396,6 +442,38 @@ impl<S: StorageNode> AppendOnlyStore<S> {
             &v,
             vec![WriteOp::put(
                 record_key(self.partition, b"vertex/", vertex.id),
+                bytes,
+            )],
+        )
+    }
+    /// Prepare one canonical Put against one shard sequence. The explicit
+    /// qualified identity must match this store and the expected vertex bytes.
+    /// Retain the returned batch for exact retry; do not recreate after unknown.
+    pub fn prepare_vertex_properties(
+        &self,
+        identity: VertexRef,
+        expected: &Vertex,
+        patch: &VertexPropertyPatch,
+    ) -> Result<PreparedBatch> {
+        if identity.partition != self.partition || identity.id != expected.id {
+            return Err(ExperimentalError::Invalid("vertex identity mismatch"));
+        }
+        let mut updated = expected.clone();
+        patch.apply(&mut updated)?;
+        let v = self.view()?;
+        let current = self
+            .vertex_in(identity.id, &v)?
+            .ok_or(ExperimentalError::MissingEndpoint(identity))?;
+        // Byte equality preserves integer/real and signed-zero distinctions.
+        if codec::encode_vertex(&current)? != codec::encode_vertex(expected)? {
+            return Err(ExperimentalError::Invalid("vertex expected value mismatch"));
+        }
+        let bytes = wrap_record(1, self.partition, &codec::encode_vertex(&updated)?);
+        check_record_size(&bytes)?;
+        self.batch(
+            &v,
+            vec![WriteOp::put(
+                record_key(self.partition, b"vertex/", identity.id),
                 bytes,
             )],
         )

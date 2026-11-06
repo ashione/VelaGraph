@@ -261,3 +261,12 @@ one CAS batch. IDs are never reused. Reads validate visible residual indexes and
 charge tombstone candidates before skipping them. Recovery and GC are unsupported.
 See [deletion contract and versioned format](EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion)
 for upgrade restrictions, bounds and attempt-local retry outcomes.
+
+### Experimental v2 vertex properties
+
+Qualified vertex property patches now use an immutable owner-shard CAS with exact
+historical retries. Create APIs remain append-only and v1 stays unchanged.
+Vertex deletion explicitly returns Unsupported because observed adjacency and
+non-global snapshot vectors cannot prove complete absence or fence remote source
+writes. No cascade or unsafe isolated-vertex exception is supplied.
+See [vertex mutation contract](EXPERIMENTAL_CROSS_EDGES.md#additive-vertex-property-mutation).

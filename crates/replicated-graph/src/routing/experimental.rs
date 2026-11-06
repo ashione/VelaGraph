@@ -3,7 +3,7 @@ use super::*;
 mod traversal;
 use rocksdb_sql_table::experimental_graph::{
     AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRecord, EdgeRef,
-    ExperimentalError, PreparedBatch, VertexRef,
+    ExperimentalError, PreparedBatch, VertexPropertyPatch, VertexRef,
 };
 pub use traversal::{
     ObservedElementRef, ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3,
@@ -16,8 +16,8 @@ pub enum ExperimentalRouteError {
     Unsupported(&'static str),
     Route(RouteError),
     Graph(ExperimentalError),
-    /// The caller retains the original PreparedAppend or PreparedEdgeMutation
-    /// for exact retry. A failed stage never implies rollback of earlier or
+    /// The caller retains the original PreparedAppend, PreparedEdgeMutation or
+    /// PreparedVertexMutation for exact retry. A failed stage never implies rollback of earlier or
     /// uncertain writes.
     Stage {
         stage: Stage,
@@ -135,6 +135,22 @@ impl PreparedEdgeMutation {
     }
     pub fn reverse_request_id(&self) -> Option<RequestId> {
         self.prepared.reverse_request_id()
+    }
+}
+/// Immutable opt-in vertex property mutation with qualified identity and one
+/// shard-local conditional batch. Retain before submission for exact retry.
+#[derive(Clone, Debug)]
+pub struct PreparedVertexMutation {
+    vertex: VertexRef,
+    prepared: PreparedAppend,
+}
+impl PreparedVertexMutation {
+    pub fn vertex(&self) -> VertexRef {
+        self.vertex
+    }
+    /// Original request identity, unchanged by cloning or retries.
+    pub fn operation_id(&self) -> RequestId {
+        self.prepared.source_request_id()
     }
 }
 /// One frozen catalog and per-shard snapshot vector. Never a global snapshot.
@@ -302,6 +318,43 @@ impl ExperimentalReadSession {
             },
         })
     }
+    /// Properties only; keeps qualified identity, labels, and adjacency intact.
+    /// Uses this session's original view, never a refreshed sequence.
+    pub fn prepare_vertex_properties(
+        &self,
+        vertex: VertexRef,
+        patch: &VertexPropertyPatch,
+    ) -> ExperimentalResult<PreparedVertexMutation> {
+        let current = self
+            .get_vertex(vertex)?
+            .ok_or(ExperimentalError::MissingEndpoint(vertex))?;
+        let batch = self
+            .store(vertex.partition)?
+            .prepare_vertex_properties(vertex, &current, patch)?;
+        self.op.check(None)?;
+        Ok(PreparedVertexMutation {
+            vertex,
+            prepared: PreparedAppend {
+                metadata: self.metadata.clone(),
+                source: Participant {
+                    placement: self.placements[&vertex.partition].clone(),
+                    batch,
+                },
+                reverse: None,
+            },
+        })
+    }
+    /// Always rejected: observed adjacency cannot prove absence of incoming
+    /// canonical edges or fence concurrent writes on other shards.
+    pub fn prepare_vertex_delete(
+        &self,
+        _vertex: VertexRef,
+    ) -> ExperimentalResult<PreparedVertexMutation> {
+        self.op.check(None)?;
+        Err(ExperimentalRouteError::Unsupported(
+            "vertex deletion requires authoritative incident-edge completeness and cross-shard fencing",
+        ))
+    }
     pub fn prepare_vertex(
         &self,
         partition: u32,
@@ -438,6 +491,16 @@ impl RouteResolver {
     pub fn experimental_commit_mutation(
         &self,
         prepared: &PreparedEdgeMutation,
+        timeout: Duration,
+    ) -> ExperimentalResult<MutationAcknowledgement> {
+        self.experimental_commit(&prepared.prepared, timeout)?;
+        Ok(MutationAcknowledgement::AllBatchesAcknowledged)
+    }
+    /// Submit the exact original vertex CAS. Historical acknowledgement does
+    /// not assert that its properties are still current. Never refresh/reprepare.
+    pub fn experimental_commit_vertex_mutation(
+        &self,
+        prepared: &PreparedVertexMutation,
         timeout: Duration,
     ) -> ExperimentalResult<MutationAcknowledgement> {
         self.experimental_commit(&prepared.prepared, timeout)?;
