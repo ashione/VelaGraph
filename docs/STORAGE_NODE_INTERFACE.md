@@ -1,9 +1,11 @@
 # Storage node interface v0
 
-Status: proposal for P0/D1. This document defines the narrow boundary between the
-graph kernel and a replicated storage node. It is deliberately smaller than a
-database API: the node understands opaque key/value bytes and one-partition
-batches, not vertices, edges, Cypher, or query plans.
+Status: v0 proposal for P0/D1; a single-shard local adapter is implemented (see
+[Implementation status](#implementation-status)). This document defines the
+narrow boundary between the graph kernel and a replicated storage node. It is
+deliberately smaller than a database API: the node understands opaque
+key/value bytes and one-partition batches, not vertices, edges, Cypher, or query
+plans.
 
 K1 is the current local implementation: RocksDB, `u64` ids, partition-scoped
 keys, deterministic protobuf-compatible records, and single-`WriteBatch`
@@ -22,12 +24,19 @@ are stable and bounded, scans enforce half-open ranges plus row/byte limits, and
 
 This is deliberately not the full interface: transactions (`begin`), shard
 routing, split/transfer, follower reads, and mixed-shard rejection are not
-implemented. The adapter currently copies the data partition into each read
-view (bounded to 1,000,000 rows / 64 MiB) instead of pinning a borrowed RocksDB
-snapshot; a production adapter must replace this with a real snapshot. Dedup
-records are retained indefinitely in this prototype; bounded retention is not
-implemented. The graph engine is not wired through this boundary yet, so the
-existing K1 path remains authoritative.
+implemented, and the node has no leader/ownership identity yet (it never returns
+`NotLeader`; any caller that presents the stored epoch is accepted). The adapter
+currently copies the data partition into each read view (bounded to 1,000,000
+rows / 64 MiB) instead of pinning a borrowed RocksDB snapshot; a production
+adapter must replace this with a real snapshot. Once that cap is exceeded,
+`read_view`/`get`/`scan` return `ResourceExhausted`; `export` streams the data
+directly so an operator can still migrate it, while `import` rejects oversized
+inputs. Batches are capped at 10,000 operations / 16 MiB. Dedup records are
+retained indefinitely in this prototype; bounded retention is not implemented.
+`import` is one-shot, requires a pristine target (sequence 0 and no live keys),
+and copies the source epoch; a new owner must call `set_epoch` after import
+before accepting writes on both sides. The graph engine is not wired through
+this boundary yet, so the existing K1 path remains authoritative.
 
 ## Goals
 
@@ -124,7 +133,9 @@ it.
 
 `read_view()` returns a pinned sequence for a bounded lease. The node must reject
 or renew expired views; a query that exceeds its lease must not silently change
-its snapshot. Snapshot creation is cheap and does not copy the graph.
+its snapshot. The target behavior is cheap snapshot creation that does not copy
+the graph; the current local adapter's copied view is an explicitly documented
+prototype exception.
 
 ### Split / migration hooks
 
@@ -168,6 +179,9 @@ are retryable after refreshing route/read view; `Corrupt`,
 - A committed batch is visible to every later leader read at a sequence greater
   than or equal to its `WriteResult.sequence`.
 - A snapshot read sees exactly the state at its pinned sequence.
+- The current local adapter copies the partition at `read_view` rather than
+  pinning a RocksDB snapshot; the copy is bounded (1,000,000 rows / 64 MiB) and
+  is a prototype limitation, not the target production behavior.
 - Writes from one client are not reordered by retries because `request_id`
   deduplicates them.
 - v0 makes no cross-shard atomicity promise. D4 adds it explicitly.

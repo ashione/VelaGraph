@@ -17,6 +17,7 @@
 //! [`MAX_VIEW_ROWS`], and a production adapter must pin a real snapshot instead.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,16 +39,29 @@ const DATA_CF: &str = "data";
 const META_CF: &str = "meta";
 const META_EPOCH: &[u8] = b"epoch";
 const META_SEQUENCE: &[u8] = b"sequence";
+const META_SHARD: &[u8] = b"shard";
 const DEDUP_PREFIX: &[u8] = b"dedup/";
 const DEDUP_PREFIX_END: &[u8] = b"dedup0";
 
 /// A bounded read view of one shard at a logical sequence.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReadView {
     pub shard: ShardId,
     pub epoch: Epoch,
     pub sequence: Sequence,
     data: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl fmt::Debug for ReadView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadView")
+            .field("shard", &self.shard)
+            .field("epoch", &self.epoch)
+            .field("sequence", &self.sequence)
+            .field("rows", &self.data.len())
+            .finish()
+    }
 }
 
 /// A half-open byte range. `None` for `end` means unbounded.
@@ -180,7 +194,7 @@ pub struct WriteResult {
 
 /// A complete export of one local shard. Dedup records are not part of the
 /// export; a fresh target has no prior requests to deduplicate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Export {
     pub shard: ShardId,
     pub epoch: Epoch,
@@ -188,10 +202,22 @@ pub struct Export {
     pub entries: Vec<KeyValue>,
 }
 
+impl fmt::Debug for Export {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Export")
+            .field("shard", &self.shard)
+            .field("epoch", &self.epoch)
+            .field("sequence", &self.sequence)
+            .field("entries", &self.entries.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StorageNodeError {
-    #[error("RocksDB error: {0}")]
-    RocksDb(#[from] rocksdb::Error),
+    #[error("storage error: {0}")]
+    Storage(String),
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
@@ -214,6 +240,12 @@ pub enum StorageNodeError {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+impl From<rocksdb::Error> for StorageNodeError {
+    fn from(error: rocksdb::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StorageNodeError>;
@@ -242,6 +274,7 @@ pub trait StorageNode: Send + Sync {
 struct DedupRecord {
     operations: Vec<u8>,
     sequence: Sequence,
+    applied_operations: usize,
 }
 
 const MAX_BATCH_OPERATIONS: usize = 10_000;
@@ -270,13 +303,41 @@ impl LocalStorageNode {
             write_lock: Mutex::new(()),
         };
 
+        let has_data = node.has_data()?;
         let mut batch = WriteBatch::default();
         let mut initialized = false;
+        match node.get_meta(META_SHARD)? {
+            Some(existing) if existing != shard => {
+                return Err(StorageNodeError::Corrupt(format!(
+                    "database belongs to shard {existing}, not requested shard {shard}"
+                )));
+            }
+            Some(_) => {}
+            None if has_data => {
+                return Err(StorageNodeError::Corrupt(
+                    "non-empty database has no shard identity".into(),
+                ));
+            }
+            None => {
+                batch.put_cf(node.meta_cf(), META_SHARD, shard.to_be_bytes());
+                initialized = true;
+            }
+        }
         if node.get_meta(META_EPOCH)?.is_none() {
+            if has_data {
+                return Err(StorageNodeError::Corrupt(
+                    "non-empty database has no epoch metadata".into(),
+                ));
+            }
             batch.put_cf(node.meta_cf(), META_EPOCH, 0_u64.to_be_bytes());
             initialized = true;
         }
         if node.get_meta(META_SEQUENCE)?.is_none() {
+            if has_data {
+                return Err(StorageNodeError::Corrupt(
+                    "non-empty database has no sequence metadata".into(),
+                ));
+            }
             batch.put_cf(node.meta_cf(), META_SEQUENCE, 0_u64.to_be_bytes());
             initialized = true;
         }
@@ -302,6 +363,14 @@ impl LocalStorageNode {
         self.db
             .cf_handle(META_CF)
             .expect("meta column family opened at startup")
+    }
+
+    fn has_data(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .iterator_cf(self.data_cf(), IteratorMode::Start)
+            .next()
+            .is_some())
     }
 
     fn get_meta(&self, key: &[u8]) -> Result<Option<u64>> {
@@ -496,7 +565,7 @@ impl StorageNode for LocalStorageNode {
             return Ok(WriteResult {
                 sequence: record.sequence,
                 status: WriteStatus::Duplicate,
-                applied_operations: 0,
+                applied_operations: record.applied_operations,
             });
         }
 
@@ -507,6 +576,7 @@ impl StorageNode for LocalStorageNode {
         let dedup = DedupRecord {
             operations: canonical,
             sequence,
+            applied_operations: request.operations.len(),
         };
         let dedup_bytes = serde_json::to_vec(&dedup)
             .map_err(|error| StorageNodeError::Corrupt(error.to_string()))?;
@@ -540,19 +610,21 @@ impl StorageNode for LocalStorageNode {
 impl StorageAdmin for LocalStorageNode {
     fn export(&self) -> Result<Export> {
         let _guard = self.lock()?;
-        let view = self.load_view()?;
+        let epoch = self.epoch()?;
+        let sequence = self.sequence()?;
+        let mut entries = Vec::new();
+        for item in self.db.iterator_cf(self.data_cf(), IteratorMode::Start) {
+            let (key, value) = item?;
+            entries.push(KeyValue {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            });
+        }
         Ok(Export {
-            shard: view.shard,
-            epoch: view.epoch,
-            sequence: view.sequence,
-            entries: view
-                .data
-                .iter()
-                .map(|(key, value)| KeyValue {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
+            shard: self.shard,
+            epoch,
+            sequence,
+            entries,
         })
     }
 
@@ -563,12 +635,13 @@ impl StorageAdmin for LocalStorageNode {
                 export.shard, self.shard
             )));
         }
-        if export.sequence > 0 && export.entries.is_empty() {
+        if !export.entries.is_empty() && export.sequence == 0 {
             return Err(StorageNodeError::InvalidArgument(
-                "non-zero sequence requires at least one entry".into(),
+                "entries require a positive sequence".into(),
             ));
         }
         let mut previous: Option<&[u8]> = None;
+        let mut bytes = 0_usize;
         for entry in &export.entries {
             if previous.is_some_and(|previous| entry.key.as_slice() <= previous) {
                 return Err(StorageNodeError::InvalidArgument(
@@ -576,6 +649,12 @@ impl StorageAdmin for LocalStorageNode {
                 ));
             }
             previous = Some(&entry.key);
+            bytes = bytes.saturating_add(entry.key.len().saturating_add(entry.value.len()));
+        }
+        if export.entries.len() > MAX_VIEW_ROWS || bytes > MAX_VIEW_BYTES {
+            return Err(StorageNodeError::ResourceExhausted(
+                "import exceeds the local read-view limit".into(),
+            ));
         }
 
         let _guard = self.lock()?;
@@ -595,10 +674,9 @@ impl StorageAdmin for LocalStorageNode {
                 "import epoch must not move backwards".into(),
             ));
         }
-        let current_sequence = self.sequence()?;
-        if export.sequence < current_sequence {
+        if self.sequence()? != 0 {
             return Err(StorageNodeError::InvalidArgument(
-                "import sequence must not move backwards".into(),
+                "import target must be pristine: sequence is not zero".into(),
             ));
         }
 

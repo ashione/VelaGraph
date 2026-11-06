@@ -82,7 +82,7 @@ fn batches_are_atomic_idempotent_and_support_opaque_bytes() {
         .unwrap();
     assert_eq!(duplicate.status, WriteStatus::Duplicate);
     assert_eq!(duplicate.sequence, 1);
-    assert_eq!(duplicate.applied_operations, 0);
+    assert_eq!(duplicate.applied_operations, 2);
 
     let conflict = node.batch_write(request(
         0,
@@ -93,7 +93,9 @@ fn batches_are_atomic_idempotent_and_support_opaque_bytes() {
         conflict,
         Err(StorageNodeError::IdempotencyConflict(id)) if id == [1; 16]
     ));
-    assert_eq!(node.read_view().unwrap().sequence, 2);
+    let view = node.read_view().unwrap();
+    assert_eq!(view.sequence, 2);
+    assert_eq!(node.get(b"a", &view).unwrap(), Some(vec![0, 1, 2]));
 }
 
 #[test]
@@ -115,7 +117,7 @@ fn invalid_batches_write_nothing() {
 
     let view = node.read_view().unwrap();
     assert_eq!(view.sequence, 0);
-    assert_eq!(node.get(b"good", &view).unwrap(), None);
+    assert_eq!(node.get(b"k0", &view).unwrap(), None);
 }
 
 #[test]
@@ -158,6 +160,24 @@ fn scan_respects_range_and_limits() {
         node.scan(range, ScanLimit::new(100, 1).unwrap(), &view),
         Err(StorageNodeError::ResourceExhausted(_))
     ));
+    let two_rows = KeyRange::new(b"a".to_vec(), b"c".to_vec()).unwrap();
+    let exact_rows = node
+        .scan(two_rows.clone(), ScanLimit::new(2, 1024).unwrap(), &view)
+        .unwrap();
+    assert_eq!(exact_rows.len(), 2);
+    let exact_bytes = node
+        .scan(two_rows, ScanLimit::new(100, 4).unwrap(), &view)
+        .unwrap();
+    assert_eq!(exact_bytes.len(), 2);
+    assert_eq!(
+        node.scan(
+            KeyRange::new(b"b".to_vec(), b"b".to_vec()).unwrap(),
+            ScanLimit::default(),
+            &view
+        )
+        .unwrap(),
+        Vec::<KeyValue>::new()
+    );
     assert!(matches!(
         KeyRange::new(b"d".to_vec(), b"a".to_vec()),
         Err(StorageNodeError::InvalidArgument(_))
@@ -253,7 +273,9 @@ fn export_import_preserves_entries_epoch_and_sequence() {
     target.admin().set_epoch(2).unwrap();
     target.admin().import(export.clone()).unwrap();
     assert_eq!(target.admin().export().unwrap(), export);
-    assert_eq!(target.read_view().unwrap().sequence, 1);
+    let view = target.read_view().unwrap();
+    assert_eq!(view.epoch, 2);
+    assert_eq!(view.sequence, 1);
 
     let before = target.admin().export().unwrap();
     assert!(matches!(
@@ -287,13 +309,12 @@ fn failed_import_leaves_target_empty() {
         target.admin().import(export),
         Err(StorageNodeError::InvalidArgument(_))
     ));
+    let view = target.read_view().unwrap();
+    assert_eq!(view.epoch, 0);
+    assert_eq!(view.sequence, 0);
     assert_eq!(
         target
-            .scan(
-                KeyRange::all(),
-                ScanLimit::default(),
-                &target.read_view().unwrap()
-            )
+            .scan(KeyRange::all(), ScanLimit::default(), &view)
             .unwrap(),
         Vec::<KeyValue>::new()
     );
@@ -359,7 +380,7 @@ fn data_and_dedup_survive_reopen() {
 }
 
 #[test]
-fn import_rejects_epoch_and_sequence_rollback() {
+fn import_rejects_epoch_rollback_and_non_pristine_target() {
     let dir = tempfile::tempdir().unwrap();
     let node = node(&dir);
     node.admin().set_epoch(2).unwrap();
@@ -384,24 +405,64 @@ fn import_rejects_epoch_and_sequence_rollback() {
     node.batch_write(request(2, 2, vec![WriteOp::delete(b"temporary".to_vec())]))
         .unwrap();
     assert_eq!(node.read_view().unwrap().sequence, 2);
-    assert_eq!(
-        node.scan(
-            KeyRange::all(),
-            ScanLimit::default(),
-            &node.read_view().unwrap()
-        )
-        .unwrap(),
-        Vec::<KeyValue>::new()
-    );
 
-    let old_sequence = rocksdb_sql_table::Export {
+    let non_pristine = rocksdb_sql_table::Export {
         shard: 7,
         epoch: 2,
-        sequence: 1,
-        entries: Vec::new(),
+        sequence: 3,
+        entries: vec![KeyValue {
+            key: b"new".to_vec(),
+            value: b"value".to_vec(),
+        }],
     };
     assert!(matches!(
-        node.admin().import(old_sequence),
+        node.admin().import(non_pristine),
         Err(StorageNodeError::InvalidArgument(_))
     ));
+    assert_eq!(node.read_view().unwrap().sequence, 2);
+}
+
+#[test]
+fn empty_but_advanced_export_imports() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = node(&source_dir);
+    source
+        .batch_write(request(
+            0,
+            1,
+            vec![WriteOp::put(b"temporary".to_vec(), b"value".to_vec())],
+        ))
+        .unwrap();
+    source
+        .batch_write(request(0, 2, vec![WriteOp::delete(b"temporary".to_vec())]))
+        .unwrap();
+    let export = source.admin().export().unwrap();
+    assert_eq!(export.sequence, 2);
+    assert!(export.entries.is_empty());
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = node(&target_dir);
+    target.admin().import(export.clone()).unwrap();
+    assert_eq!(target.admin().export().unwrap(), export);
+    let view = target.read_view().unwrap();
+    assert_eq!(view.sequence, 2);
+    assert_eq!(node_get(&target, b"temporary", &view), None);
+}
+
+#[test]
+fn reopening_with_a_different_shard_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = node(&dir);
+    drop(first);
+
+    let reopened = LocalStorageNode::open(dir.path().join("node"), 8);
+    assert!(matches!(reopened, Err(StorageNodeError::Corrupt(_))));
+}
+
+fn node_get(
+    node: &LocalStorageNode,
+    key: &[u8],
+    view: &rocksdb_sql_table::ReadView,
+) -> Option<Vec<u8>> {
+    node.get(key, view).unwrap()
 }
