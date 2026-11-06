@@ -190,3 +190,12 @@ and outbound exchanges, uses shared total deadlines, and tracks shutdown of
 connections. Oversized batches can be reduced through openraft hints. Control
 remains unauthenticated and intended only for trusted isolated tests; this is
 not production transport security or D3 completion. See `D2_TCP_LIMITS.md`.
+
+### Functional remote graph prototype
+
+A separate [development-only TCP graph adapter](REMOTE_GRAPH.md) connects normal
+single-shard graph CRUD and client-side Gremlin to independently running Raft
+nodes. It uses bounded atomic snapshot copies and exact conditional D1 writes,
+not a server-side Gremlin protocol or remote D3 resolver. Crash/failover and
+network-partition validation of this new end-to-end graph path are deferred;
+this does not complete D3/D4/D5 or production transport security.

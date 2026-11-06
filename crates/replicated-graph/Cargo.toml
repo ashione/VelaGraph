@@ -6,10 +6,11 @@ description = "Bounded in-process D1 adapter connecting graph records to Raft"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+anyhow = "1"
 rocksdb-sql-table = { path = "../.." }
 d2-raft = { path = "../d2-raft" }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,4 +21,3 @@ rustix = { version = "1", features = ["net", "process"] }
 
 [dev-dependencies]
 tempfile = "3"
-anyhow = "1"

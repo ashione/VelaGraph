@@ -2,7 +2,9 @@
 
 `crates/replicated-graph` connects the existing `GraphRecordStore` through the
 synchronous D1 `StorageNode` trait to an actual three-voter openraft group.
-It is an **in-process correctness prototype**, not a network graph service.
+The original adapter described below is an **in-process correctness prototype**.
+The separate [development-only remote adapter](REMOTE_GRAPH.md) adds TCP access
+to explicitly selected replicas; it does not make this a production service.
 `GraphEngine` and its K3 transaction API still use the local kernel. The same
 Gremlin parser/operators can also execute through this replicated D1 adapter.
 A separate [D3a static catalog](D3_STATIC_CATALOG.md) provides persisted immutable
@@ -195,7 +197,17 @@ not implemented. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
 
 This closes only the bounded, in-process, single-shard replicated query path.
 K3 write-overlay transactions still belong to `GraphEngine`; cross-shard queries,
-cross-host query protocols, remote replica routing and production availability
-remain absent. A Linux-only same-host read gateway is separately documented in
+server-side remote query execution, automatic remote replica routing and
+production availability remain absent. A Linux-only same-host read gateway is
+separately documented in
 [GRAPH_UDS_GATEWAY.md](GRAPH_UDS_GATEWAY.md).
 The optional static in-process resolver is documented in D3_STATIC_CATALOG.md.
+
+## Development-only remote graph adapter
+
+An optional `RemoteStorageNode` now connects the same `GraphRecordStore` CRUD
+and standard Gremlin execution to an independently running `graph-node` process.
+See [REMOTE_GRAPH.md](REMOTE_GRAPH.md). This is a single-shard, explicitly
+selected replica API, not D3 placement routing. Gremlin runs in the client
+process against a bounded atomic snapshot fetched over TCP, not as a server-side
+query RPC. The existing in-process and same-host UDS interfaces remain unchanged.
