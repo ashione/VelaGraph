@@ -466,3 +466,226 @@ fn node_get(
 ) -> Option<Vec<u8>> {
     node.get(key, view).unwrap()
 }
+
+#[test]
+fn conditional_batches_conflict_atomically_and_can_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(&dir);
+    let initial = request(0, 1, vec![WriteOp::put(b"a", b"old")]);
+    node.batch_write(initial).unwrap();
+    let batch = request(
+        0,
+        2,
+        vec![WriteOp::delete(b"a"), WriteOp::put(b"b", b"new")],
+    );
+    let before = node.admin().export().unwrap();
+    for expected in [0, 2, u64::MAX] {
+        assert!(matches!(
+            node.batch_write_conditional(batch.clone(), Some(expected)),
+            Err(StorageNodeError::Conflict { expected: e, current: 1 }) if e == expected
+        ));
+        assert_eq!(node.admin().export().unwrap(), before);
+    }
+    // Failed conditions did not consume the request id or advance sequence.
+    let result = node.batch_write_conditional(batch, Some(1)).unwrap();
+    assert_eq!(result.status, WriteStatus::Committed);
+    assert_eq!(result.sequence, 2);
+    assert_eq!(result.applied_operations, 2);
+    let view = node.read_view().unwrap();
+    assert_eq!(node.get(b"a", &view).unwrap(), None);
+    assert_eq!(node.get(b"b", &view).unwrap(), Some(b"new".to_vec()));
+}
+
+#[test]
+fn conditional_dedup_precedes_sequence_check_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = node(&dir);
+    let batch = request(0, 1, vec![WriteOp::put(b"a", b"first")]);
+    first
+        .batch_write_conditional(batch.clone(), Some(0))
+        .unwrap();
+    first
+        .batch_write(request(0, 2, vec![WriteOp::put(b"a", b"later")]))
+        .unwrap();
+    drop(first);
+    let node = node(&dir);
+    let before = node.admin().export().unwrap();
+    let result = node
+        .batch_write_conditional(batch.clone(), Some(0))
+        .unwrap();
+    assert_eq!(result.status, WriteStatus::Duplicate);
+    assert_eq!(result.sequence, 1);
+    assert_eq!(result.applied_operations, 1);
+    assert_eq!(node.admin().export().unwrap(), before);
+    // The condition is part of request identity, including Some versus None.
+    for expected in [Some(1), Some(2), None] {
+        assert!(matches!(
+            node.batch_write_conditional(batch.clone(), expected),
+            Err(StorageNodeError::IdempotencyConflict(_))
+        ));
+        assert_eq!(node.admin().export().unwrap(), before);
+    }
+    let different = request(0, 1, vec![WriteOp::delete(b"a")]);
+    assert!(matches!(
+        node.batch_write_conditional(different, Some(0)),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    // Ownership fencing remains ahead of deduplication, even for exact retries.
+    node.admin().set_epoch(1).unwrap();
+    assert!(matches!(
+        node.batch_write_conditional(batch, Some(0)),
+        Err(StorageNodeError::Fenced {
+            epoch: 0,
+            current: 1,
+            ..
+        })
+    ));
+    assert_eq!(node.read_view().unwrap().sequence, 2);
+}
+
+#[test]
+fn unconditional_and_conditional_request_identity_are_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(&dir);
+    let batch = request(0, 1, vec![WriteOp::put(b"a", b"value")]);
+    node.batch_write(batch.clone()).unwrap();
+    assert_eq!(
+        node.batch_write_conditional(batch.clone(), None)
+            .unwrap()
+            .status,
+        WriteStatus::Duplicate
+    );
+    assert!(matches!(
+        node.batch_write_conditional(batch, Some(0)),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    assert_eq!(node.read_view().unwrap().sequence, 1);
+}
+
+#[test]
+fn legacy_dedup_metadata_without_condition_remains_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    // Fixture uses the pre-conditional on-disk JSON schema verbatim.
+    let first = node(&dir);
+    drop(first);
+    let batch = request(0, 1, vec![WriteOp::put(b"k", b"v")]);
+    let canonical = serde_json::to_vec(&batch.operations).unwrap();
+    let old_record = serde_json::to_vec(&serde_json::json!({
+        "operations": canonical,
+        "sequence": 1,
+        "applied_operations": 1,
+    }))
+    .unwrap();
+    {
+        let db = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            dir.path().join("node"),
+            ["data", "meta"],
+        )
+        .unwrap();
+        let mut key = b"dedup/".to_vec();
+        key.extend_from_slice(&[1; 16]);
+        let mut write = rocksdb::WriteBatch::default();
+        write.put_cf(db.cf_handle("data").unwrap(), b"k", b"v");
+        write.put_cf(
+            db.cf_handle("meta").unwrap(),
+            b"sequence",
+            1_u64.to_be_bytes(),
+        );
+        write.put_cf(db.cf_handle("meta").unwrap(), key, old_record);
+        db.write(write).unwrap();
+    }
+    let node = node(&dir);
+    let result = node.batch_write(batch.clone()).unwrap();
+    assert_eq!(result.status, WriteStatus::Duplicate);
+    assert_eq!(result.sequence, 1);
+    assert!(matches!(
+        node.batch_write_conditional(batch, Some(0)),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    assert_eq!(node.read_view().unwrap().sequence, 1);
+}
+
+#[test]
+fn conditional_sequence_overflow_and_invalid_requests_write_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(&dir);
+    let before = node.admin().export().unwrap();
+    assert!(matches!(
+        node.batch_write_conditional(request(0, 1, vec![]), Some(0)),
+        Err(StorageNodeError::InvalidArgument(_))
+    ));
+    let mut wrong_shard = request(0, 2, vec![WriteOp::put(b"k", b"v")]);
+    wrong_shard.shard = 8;
+    assert!(matches!(
+        node.batch_write_conditional(wrong_shard, Some(0)),
+        Err(StorageNodeError::InvalidArgument(_))
+    ));
+    assert_eq!(node.admin().export().unwrap(), before);
+    node.admin()
+        .import(rocksdb_sql_table::Export {
+            shard: 7,
+            epoch: 0,
+            sequence: u64::MAX,
+            entries: vec![],
+        })
+        .unwrap();
+    let before = node.admin().export().unwrap();
+    assert!(matches!(
+        node.batch_write_conditional(
+            request(0, 3, vec![WriteOp::put(b"k", b"v")]),
+            Some(u64::MAX)
+        ),
+        Err(StorageNodeError::ResourceExhausted(_))
+    ));
+    assert_eq!(node.admin().export().unwrap(), before);
+}
+
+#[test]
+fn simultaneous_conditional_writes_have_one_atomic_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(&dir);
+    for round in 0..16_u8 {
+        let expected = node.read_view().unwrap().sequence;
+        let gate = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let run = |id| {
+                gate.wait();
+                node.batch_write_conditional(
+                    request(0, id, vec![WriteOp::put(b"key", vec![id])]),
+                    Some(expected),
+                )
+            };
+            let first = scope.spawn(move || run(round * 2));
+            let second = scope.spawn(move || run(round * 2 + 1));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        let mut winner = None;
+        let mut conflicts = 0;
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(result) => {
+                    assert_eq!(result.status, WriteStatus::Committed);
+                    assert_eq!(result.sequence, expected + 1);
+                    assert!(winner.replace(round * 2 + index as u8).is_none());
+                }
+                Err(StorageNodeError::Conflict {
+                    expected: seen,
+                    current,
+                }) => {
+                    assert_eq!(seen, expected);
+                    assert_eq!(current, expected + 1);
+                    conflicts += 1;
+                }
+                result => panic!("unexpected conditional outcome: {result:?}"),
+            }
+        }
+        assert_eq!(conflicts, 1);
+        let view = node.read_view().unwrap();
+        assert_eq!(view.sequence, expected + 1);
+        assert_eq!(
+            node.get(b"key", &view).unwrap(),
+            Some(vec![winner.unwrap()])
+        );
+    }
+}
