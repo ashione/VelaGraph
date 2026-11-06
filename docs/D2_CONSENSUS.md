@@ -2,10 +2,13 @@
 
 Status: decision accepted; a three-node prototype is implemented in
 `crates/d2-raft`, including a three-OS-process TCP integration test. The TCP node
-uses a durable RocksDB Raft log and a persisted key/value state machine; a
-three-node shutdown/reopen test is in `tests/durable.rs`. The D1 graph state
-machine, `Suite::test_all`, and D1 wiring remain the next D2 slice. This document
-still freezes the Raft library choice and the prototype boundaries.
+uses a durable RocksDB Raft log and a persisted opaque key/value state machine
+shaped for D1 batches; a three-node shutdown/reopen test is in
+`tests/durable.rs`. `LogCommand::TxnBatch(Vec<WriteOp>)` carries arbitrary key and
+value bytes, and `openraft::testing::Suite::test_all` passes against both durable
+stores (`tests/conformance.rs`). The D1 graph `StorageNode` adapter and graph
+records remain the next D2 slice. This document still freezes the Raft library
+choice and the prototype boundaries.
 
 Related contracts: [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (D1
 storage-node seam), [`TRANSACTIONS.md`](TRANSACTIONS.md) (K3 single-shard
@@ -100,8 +103,8 @@ bootstrap, verifies the value on every node, and commits another write after the
 restart. `tests/multi_process.rs` restarts the killed leader against its original
 `--data-dir` instead of an empty log.
 
-Limitations: `state.db` still stores the D2 key/value fixture, not D1 graph
-records; `openraft::testing::Suite::test_all` has not run; and reopen tests prove
+Limitations: `state.db` stores opaque D1 byte batches but no graph-schema
+records yet; the D1 `StorageNode` adapter is not wired; and reopen tests prove
 process-restart recovery, not power-loss behavior under every RocksDB option.
 
 ## Multi-process validation
@@ -158,8 +161,8 @@ an operations/test helper.
 - **Medium:** the TCP smoke test proves cross-process framing, leader failover
   and process-restart recovery, not multi-host network behavior, TLS, or
   OS-crash/WAL behavior. Those remain D3/D6 work. Durable storage uses separate
-  `raft.db` and `state.db` directories, but the state machine is still the D2
-  key/value fixture rather than D1 graph records.
+  `raft.db` and `state.db` directories, but the state machine still holds the D2
+  byte-batch fixture rather than D1 graph records.
 
 ## Sources
 
