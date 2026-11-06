@@ -8,6 +8,7 @@
 //! The normative subset, semantics, limits, and errors live in
 //! `docs/QUERY_SPEC.md`.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use gremlin_rs::{parse_query, ParseTree};
@@ -243,22 +244,36 @@ impl GremlinQuery {
     /// Execute this query against `graph`.
     pub fn execute(&self, graph: &GraphEngine) -> Result<GremlinResult> {
         let deadline = Instant::now() + GREMLIN_DEADLINE;
+        self.execute_checked(graph, &|| {
+            if Instant::now() >= deadline {
+                Err(Error::TraversalLimitExceeded(
+                    "query deadline exceeded".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn execute_checked(
+        &self,
+        graph: &GraphEngine,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<GremlinResult> {
+        check()?;
         // A leading `limit` can be pushed into the start scan, so a large
         // graph does not fail the row cap before an explicit bound applies.
         let start_limit = match self.steps.first() {
             Some(GremlinStep::Limit(limit)) => Some(*limit),
             _ => None,
         };
-        let mut rows = self.start_rows(graph, start_limit)?;
+        let mut rows = self.start_rows(graph, start_limit, check)?;
         enforce_row_cap(rows.len())?;
 
         for step in &self.steps {
-            if Instant::now() >= deadline {
-                return Err(Error::TraversalLimitExceeded(
-                    "query deadline exceeded".into(),
-                ));
-            }
-            rows = apply_step(graph, rows, step)?;
+            check()?;
+            rows = apply_step(graph, rows, step, check)?;
+            check()?;
             enforce_row_cap(rows.len())?;
         }
 
@@ -271,16 +286,28 @@ impl GremlinQuery {
             rows.truncate(DEFAULT_GREMLIN_LIMIT);
         }
 
-        Ok(GremlinResult {
-            rows: rows.into_iter().map(Row::into_row).collect(),
-        })
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                check()?;
+                Ok(row.into_row())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        check()?;
+        Ok(GremlinResult { rows })
     }
 
-    fn start_rows(&self, graph: &GraphEngine, limit: Option<usize>) -> Result<Vec<Row>> {
+    fn start_rows(
+        &self,
+        graph: &GraphEngine,
+        limit: Option<usize>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Row>> {
         match &self.start {
             GremlinStart::Vertices(ids) if ids.is_empty() => {
                 let scan_limit = limit.unwrap_or(MAX_GREMLIN_ROWS);
-                let (vertices, truncated) = graph.scan_vertices(scan_limit)?;
+                let (vertices, truncated) =
+                    graph.scan_vertices_checked(scan_limit, &mut || check())?;
                 if truncated && limit.is_none() {
                     return Err(Error::TraversalLimitExceeded(format!(
                         "more than {MAX_GREMLIN_ROWS} vertices matched; add an explicit limit"
@@ -289,15 +316,22 @@ impl GremlinQuery {
                 Ok(vertices
                     .into_iter()
                     .map(|vertex| {
+                        check()?;
                         let id = vertex.id;
-                        Row::Element(Element::Vertex(vertex), vec![PathElement::Vertex(id)])
+                        Ok(Row::Element(
+                            Element::Vertex(vertex),
+                            vec![PathElement::Vertex(id)],
+                        ))
                     })
-                    .collect())
+                    .collect::<Result<Vec<_>>>()?)
             }
             GremlinStart::Vertices(ids) => {
-                let mut rows = Vec::with_capacity(ids.len());
+                let mut rows = Vec::with_capacity(ids.len().min(MAX_GREMLIN_ROWS));
                 for id in ids {
+                    check()?;
                     if let Some(vertex) = graph.get_vertex(*id)? {
+                        check()?;
+                        enforce_row_cap(rows.len() + 1)?;
                         rows.push(Row::Element(
                             Element::Vertex(vertex),
                             vec![PathElement::Vertex(*id)],
@@ -311,7 +345,7 @@ impl GremlinQuery {
             }
             GremlinStart::Edges(ids) if ids.is_empty() => {
                 let scan_limit = limit.unwrap_or(MAX_GREMLIN_ROWS);
-                let (edges, truncated) = graph.scan_edges(scan_limit)?;
+                let (edges, truncated) = graph.scan_edges_checked(scan_limit, &mut || check())?;
                 if truncated && limit.is_none() {
                     return Err(Error::TraversalLimitExceeded(format!(
                         "more than {MAX_GREMLIN_ROWS} edges matched; add an explicit limit"
@@ -320,15 +354,22 @@ impl GremlinQuery {
                 Ok(edges
                     .into_iter()
                     .map(|edge| {
+                        check()?;
                         let id = edge.id;
-                        Row::Element(Element::Edge(edge), vec![PathElement::Edge(id)])
+                        Ok(Row::Element(
+                            Element::Edge(edge),
+                            vec![PathElement::Edge(id)],
+                        ))
                     })
-                    .collect())
+                    .collect::<Result<Vec<_>>>()?)
             }
             GremlinStart::Edges(ids) => {
-                let mut rows = Vec::with_capacity(ids.len());
+                let mut rows = Vec::with_capacity(ids.len().min(MAX_GREMLIN_ROWS));
                 for id in ids {
+                    check()?;
                     if let Some(edge) = graph.get_edge(*id)? {
+                        check()?;
+                        enforce_row_cap(rows.len() + 1)?;
                         rows.push(Row::Element(
                             Element::Edge(edge),
                             vec![PathElement::Edge(*id)],
@@ -393,48 +434,61 @@ impl Row {
     }
 }
 
-fn apply_step(graph: &GraphEngine, rows: Vec<Row>, step: &GremlinStep) -> Result<Vec<Row>> {
+fn apply_step(
+    graph: &GraphEngine,
+    rows: Vec<Row>,
+    step: &GremlinStep,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<Row>> {
+    check()?;
     match step {
         GremlinStep::HasLabel(labels) => rows
             .into_iter()
-            .map(|row| match row {
-                Row::Element(element, path) => {
-                    let matches = match &element {
-                        Element::Vertex(vertex) => {
-                            vertex.labels.iter().any(|label| labels.contains(label))
-                        }
-                        Element::Edge(edge) => labels.contains(&edge.label),
-                    };
-                    Ok(matches.then_some(Row::Element(element, path)))
+            .map(|row| {
+                check()?;
+                match row {
+                    Row::Element(element, path) => {
+                        let matches = match &element {
+                            Element::Vertex(vertex) => {
+                                vertex.labels.iter().any(|label| labels.contains(label))
+                            }
+                            Element::Edge(edge) => labels.contains(&edge.label),
+                        };
+                        Ok(matches.then_some(Row::Element(element, path)))
+                    }
+                    _ => Err(invalid_traverser("hasLabel", "a vertex or edge")),
                 }
-                _ => Err(invalid_traverser("hasLabel", "a vertex or edge")),
             })
             .filter_map(Result::transpose)
             .collect(),
         GremlinStep::Has { key, value } => rows
             .into_iter()
-            .map(|row| match row {
-                Row::Element(element, path) => {
-                    let properties = match &element {
-                        Element::Vertex(vertex) => &vertex.properties,
-                        Element::Edge(edge) => &edge.properties,
-                    };
-                    let matches = match value {
-                        Some(expected) => properties.get(key) == Some(expected),
-                        None => properties.contains_key(key),
-                    };
-                    Ok(matches.then_some(Row::Element(element, path)))
+            .map(|row| {
+                check()?;
+                match row {
+                    Row::Element(element, path) => {
+                        let properties = match &element {
+                            Element::Vertex(vertex) => &vertex.properties,
+                            Element::Edge(edge) => &edge.properties,
+                        };
+                        let matches = match value {
+                            Some(expected) => properties.get(key) == Some(expected),
+                            None => properties.contains_key(key),
+                        };
+                        Ok(matches.then_some(Row::Element(element, path)))
+                    }
+                    _ => Err(invalid_traverser("has", "a vertex or edge")),
                 }
-                _ => Err(invalid_traverser("has", "a vertex or edge")),
             })
             .filter_map(Result::transpose)
             .collect(),
-        GremlinStep::Out(label) => expand(graph, rows, Direction::Out, label.as_deref()),
-        GremlinStep::In(label) => expand(graph, rows, Direction::In, label.as_deref()),
-        GremlinStep::Both(label) => expand(graph, rows, Direction::Both, label.as_deref()),
+        GremlinStep::Out(label) => expand(graph, rows, Direction::Out, label.as_deref(), check),
+        GremlinStep::In(label) => expand(graph, rows, Direction::In, label.as_deref(), check),
+        GremlinStep::Both(label) => expand(graph, rows, Direction::Both, label.as_deref(), check),
         GremlinStep::Values(key) => {
             let mut next = Vec::new();
             for row in rows {
+                check()?;
                 let Row::Element(element, _) = row else {
                     return Err(invalid_traverser("values", "a vertex or edge"));
                 };
@@ -450,35 +504,41 @@ fn apply_step(graph: &GraphEngine, rows: Vec<Row>, step: &GremlinStep) -> Result
         }
         GremlinStep::Id => rows
             .into_iter()
-            .map(|row| match row {
-                Row::Element(element, _) => {
-                    let id = match element {
-                        Element::Vertex(vertex) => vertex.id,
-                        Element::Edge(edge) => edge.id,
-                    };
-                    let id = i64::try_from(id).map_err(|_| {
-                        Error::UnsupportedGremlinValue(format!(
-                            "id {id} does not fit the v0 integer row type"
-                        ))
-                    })?;
-                    Ok(Row::Value(Value::Integer(id)))
+            .map(|row| {
+                check()?;
+                match row {
+                    Row::Element(element, _) => {
+                        let id = match element {
+                            Element::Vertex(vertex) => vertex.id,
+                            Element::Edge(edge) => edge.id,
+                        };
+                        let id = i64::try_from(id).map_err(|_| {
+                            Error::UnsupportedGremlinValue(format!(
+                                "id {id} does not fit the v0 integer row type"
+                            ))
+                        })?;
+                        Ok(Row::Value(Value::Integer(id)))
+                    }
+                    _ => Err(invalid_traverser("id", "a vertex or edge")),
                 }
-                _ => Err(invalid_traverser("id", "a vertex or edge")),
             })
             .collect(),
         GremlinStep::Label => rows
             .into_iter()
-            .map(|row| match row {
-                Row::Element(element, _) => {
-                    let label = match element {
-                        Element::Vertex(vertex) => {
-                            vertex.labels.first().cloned().unwrap_or_default()
-                        }
-                        Element::Edge(edge) => edge.label,
-                    };
-                    Ok(Row::Value(Value::Text(label)))
+            .map(|row| {
+                check()?;
+                match row {
+                    Row::Element(element, _) => {
+                        let label = match element {
+                            Element::Vertex(vertex) => {
+                                vertex.labels.first().cloned().unwrap_or_default()
+                            }
+                            Element::Edge(edge) => edge.label,
+                        };
+                        Ok(Row::Value(Value::Text(label)))
+                    }
+                    _ => Err(invalid_traverser("label", "a vertex or edge")),
                 }
-                _ => Err(invalid_traverser("label", "a vertex or edge")),
             })
             .collect(),
         GremlinStep::Limit(limit) => {
@@ -488,9 +548,12 @@ fn apply_step(graph: &GraphEngine, rows: Vec<Row>, step: &GremlinStep) -> Result
         }
         GremlinStep::Path => rows
             .into_iter()
-            .map(|row| match row {
-                Row::Element(_, path) => Ok(Row::Path(path)),
-                _ => Err(invalid_traverser("path", "a vertex or edge")),
+            .map(|row| {
+                check()?;
+                match row {
+                    Row::Element(_, path) => Ok(Row::Path(path)),
+                    _ => Err(invalid_traverser("path", "a vertex or edge")),
+                }
             })
             .collect(),
         GremlinStep::Count => Ok(vec![Row::Count(rows.len() as u64)]),
@@ -509,47 +572,55 @@ fn expand(
     rows: Vec<Row>,
     direction: Direction,
     label: Option<&str>,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<Vec<Row>> {
     let mut next = Vec::new();
     for row in rows {
+        check()?;
         let Row::Element(Element::Vertex(vertex), path) = row else {
             return Err(invalid_traverser(
                 "out/in/both",
                 "a vertex (not an edge or value)",
             ));
         };
-        let mut edges = match direction {
-            Direction::Out => graph.out_edges(vertex.id, label)?,
-            Direction::In => graph.in_edges(vertex.id, label)?,
-            Direction::Both => {
-                let mut edges = graph.out_edges(vertex.id, label)?;
-                edges.extend(graph.in_edges(vertex.id, label)?);
-                edges
+        // Adjacency keys are label-first, not edge-id-first. Keep only bounded
+        // output rows, ordered by edge id, rather than materializing all edges.
+        // The map also collapses a self-loop seen in both directions.
+        let mut adjacent = BTreeMap::new();
+        let mut visit = |edge: Edge| -> Result<()> {
+            check()?;
+            if adjacent.contains_key(&edge.id) {
+                return Ok(());
             }
-        };
-        edges.sort_by_key(|edge| edge.id);
-        edges.dedup_by_key(|edge| edge.id);
-        for edge in edges {
             let target_id = match direction {
                 Direction::Out => edge.to,
                 Direction::In => edge.from,
-                Direction::Both => {
-                    if edge.from == vertex.id {
-                        edge.to
-                    } else {
-                        edge.from
-                    }
-                }
+                Direction::Both if edge.from == vertex.id => edge.to,
+                Direction::Both => edge.from,
             };
             let Some(target) = graph.get_vertex(target_id)? else {
-                continue;
+                return Ok(());
             };
+            check()?;
+            enforce_row_cap(next.len() + adjacent.len() + 1)?;
             let mut next_path = path.clone();
             next_path.push(PathElement::Edge(edge.id));
             next_path.push(PathElement::Vertex(target_id));
-            next.push(Row::Element(Element::Vertex(target), next_path));
+            adjacent.insert(edge.id, Row::Element(Element::Vertex(target), next_path));
+            Ok(())
+        };
+        if matches!(direction, Direction::Out | Direction::Both) {
+            graph.visit_adjacent_edges(vertex.id, false, label, &mut || check(), &mut visit)?;
+        }
+        if matches!(direction, Direction::In | Direction::Both) {
+            graph.visit_adjacent_edges(vertex.id, true, label, &mut || check(), &mut visit)?;
+        }
+        for (_, row) in adjacent {
+            check()?;
+            next.push(row);
         }
     }
+    check()?;
     Ok(next)
 }
 
@@ -952,5 +1023,90 @@ impl GraphEngine {
     /// Parse and execute one standard Gremlin v0 traversal.
     pub fn gremlin(&self, query: &str) -> Result<GremlinResult> {
         GremlinQuery::parse(query)?.execute(self)
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn deadline_failure_at_every_checkpoint_never_returns_partial_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        let mut vertex = Vertex::new(1);
+        vertex.labels.push("person".into());
+        vertex
+            .properties
+            .insert("name".into(), Value::Text("A".into()));
+        graph.create_vertex(&vertex).unwrap();
+        graph.create_edge(&Edge::new(1, 1, 1, "LOOP")).unwrap();
+        for text in [
+            "g.V()",
+            "g.E()",
+            "g.V(1).both().path()",
+            "g.V(1).out().count()",
+            "g.V(1).hasLabel('person').has('name').values('name')",
+            "g.E(1).id()",
+            "g.V(1).label()",
+            "g.V(1).limit(1)",
+        ] {
+            let query = GremlinQuery::parse(text).unwrap();
+            let calls = Cell::new(0);
+            query
+                .execute_checked(&graph, &|| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            // Fail every checkpoint, including final-step and final result checks.
+            // No sleep or dependence on thread scheduling / wall-clock timing.
+            for fail_at in 1..=calls.get() {
+                let current = Cell::new(0);
+                let result = query.execute_checked(&graph, &|| {
+                    current.set(current.get() + 1);
+                    if current.get() == fail_at {
+                        Err(Error::TraversalLimitExceeded("injected deadline".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(
+                    matches!(result, Err(Error::TraversalLimitExceeded(_))),
+                    "{text}, checkpoint {fail_at}"
+                );
+                assert_eq!(
+                    current.get(),
+                    fail_at,
+                    "execution continued after cancellation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_id_start_checks_cap_before_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        graph.create_vertex(&Vertex::new(1)).unwrap();
+        let query = GremlinQuery {
+            start: GremlinStart::Vertices(vec![1; MAX_GREMLIN_ROWS + 1]),
+            steps: vec![],
+            explicit_limit: false,
+        };
+        assert!(matches!(
+            query.execute(&graph),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        let bounded = GremlinQuery {
+            steps: vec![GremlinStep::Limit(1)],
+            explicit_limit: true,
+            ..query
+        };
+        assert_eq!(
+            bounded.execute(&graph).unwrap().rows,
+            vec![GremlinRow::Vertex(1)]
+        );
     }
 }

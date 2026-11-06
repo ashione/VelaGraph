@@ -277,3 +277,70 @@ fn queries_see_reopened_data() {
         vec![GremlinRow::Value(Value::Text("Persisted".into()))]
     );
 }
+
+#[test]
+fn high_fanout_is_bounded_before_later_limit_or_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = GraphEngine::open(dir.path()).unwrap();
+    graph.create_vertex(&Vertex::new(1)).unwrap();
+    graph.create_vertex(&Vertex::new(2)).unwrap();
+    // Parallel edges deliberately make a large fanout without a large start scan.
+    for id in 0..10_000 {
+        graph
+            .create_edge(&Edge::new(id, 1, 2, if id % 2 == 0 { "Z" } else { "A" }))
+            .unwrap();
+    }
+    assert_eq!(
+        graph.gremlin("g.V(1).out().count()").unwrap().rows,
+        vec![GremlinRow::Count(10_000)]
+    );
+    assert_eq!(
+        graph.gremlin("g.V(2).in().count()").unwrap().rows,
+        vec![GremlinRow::Count(10_000)]
+    );
+    for query in ["g.V(1,1).out().count()", "g.V(1).out().in().limit(1)"] {
+        assert!(
+            matches!(graph.gremlin(query), Err(Error::TraversalLimitExceeded(_))),
+            "{query}"
+        );
+    }
+    graph.create_edge(&Edge::new(10_000, 1, 2, "A")).unwrap();
+    for query in [
+        "g.V(1).out()",
+        "g.V(2).in().count()",
+        "g.V(1).both().limit(1)",
+    ] {
+        assert!(
+            matches!(graph.gremlin(query), Err(Error::TraversalLimitExceeded(_))),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn adjacency_order_and_self_loop_dedup_survive_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = GraphEngine::open(dir.path()).unwrap();
+    for id in 1..=3 {
+        graph.create_vertex(&Vertex::new(id)).unwrap();
+    }
+    for edge in [
+        Edge::new(30, 1, 2, "A"),
+        Edge::new(10, 1, 1, "Z"),
+        Edge::new(20, 3, 1, "B"),
+    ] {
+        graph.create_edge(&edge).unwrap();
+    }
+    assert_eq!(
+        graph.gremlin("g.V(1).both().limit(3)").unwrap().rows,
+        vec![
+            GremlinRow::Vertex(1),
+            GremlinRow::Vertex(3),
+            GremlinRow::Vertex(2)
+        ]
+    );
+    assert_eq!(
+        graph.gremlin("g.V(1).both().count()").unwrap().rows,
+        vec![GremlinRow::Count(3)]
+    );
+}
