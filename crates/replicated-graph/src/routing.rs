@@ -32,6 +32,36 @@ pub const MAX_OPERATIONS: usize = 32;
 pub const MAX_REGISTERED_REPLICAS: usize = MAX_SHARDS * MAX_REPLICAS;
 pub const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Global-scan fanout and aggregate retained-snapshot admission bounds.
+pub const MAX_SCAN_PARTITIONS: usize = 32;
+pub const MAX_SCAN_SHARDS: usize = 8;
+pub const MAX_SCAN_VIEW_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SCAN_VIEW_ROWS: usize = 200_000;
+
+/// All partitions in one frozen catalog, or an explicit nonduplicated selection.
+#[derive(Clone, Debug)]
+pub enum ScanScope {
+    All,
+    Selected(Vec<u32>),
+}
+
+/// One component of a per-shard snapshot vector, not a global timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardReadStamp {
+    pub group: u64,
+    pub shard: u64,
+    pub epoch: u64,
+    pub sequence: u64,
+}
+
+/// A global ordered scan over independently acquired immutable shard views.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalScanResult {
+    pub metadata_sequence: u64,
+    pub snapshots: Vec<ShardReadStamp>,
+    pub result: rocksdb_sql_table::GlobalScanOutput,
+}
+
 #[derive(Debug)]
 pub enum RouteError {
     Storage(StorageNodeError),
@@ -303,6 +333,153 @@ impl RouteResolver {
         })
     }
 
+    /// Execute V()/E(), optional limit(n), and optional terminal count() globally.
+    /// The catalog is read once, each unique shard is pinned once, and all data
+    /// acquisition/reads share one absolute deadline (at most five seconds).
+    /// Rows sort by (ID, partition); any required shard failure aborts the query.
+    /// Snapshots form a vector, not a globally consistent snapshot. The existing
+    /// single-partition Gremlin API and its broader subset are unchanged.
+    pub fn execute_global_scan(
+        &self,
+        scope: ScanScope,
+        query: &str,
+        timeout: Duration,
+    ) -> Result<GlobalScanResult> {
+        self.execute_global_scan_observed(scope, query, timeout, |_| Ok(()))
+    }
+
+    // Acquisition checkpoints also permit deterministic race/deadline tests.
+    // No callback is exposed through the public API.
+    fn execute_global_scan_observed(
+        &self,
+        scope: ScanScope,
+        query: &str,
+        timeout: Duration,
+        mut observer: impl FnMut(Option<u64>) -> Result<()>,
+    ) -> Result<GlobalScanResult> {
+        let plan = rocksdb_sql_table::GlobalScanPlan::parse(query)?;
+        if timeout.is_zero() || timeout > MAX_OPERATION_TIMEOUT {
+            return Err(RouteError::InvalidArgument(
+                "timeout must be positive and at most 60 seconds",
+            ));
+        }
+        let op = self.start(timeout.min(rocksdb_sql_table::GREMLIN_DEADLINE))?;
+        let catalog = select_read(&self.metadata.replicas, &op, None, |id| {
+            self.catalogs[&id]
+                .scoped(op.end, self.dispatches.clone())
+                .snapshot()
+                .map_err(Into::into)
+        })?;
+        observer(None)?;
+        op.check(None)?;
+        let partitions = match scope {
+            ScanScope::All => {
+                if catalog.partition_count() > MAX_SCAN_PARTITIONS {
+                    return Err(scan_capacity());
+                }
+                catalog.partitions().collect::<Vec<_>>()
+            }
+            ScanScope::Selected(mut selected) => {
+                if selected.len() > MAX_SCAN_PARTITIONS {
+                    return Err(scan_capacity());
+                }
+                selected.sort_unstable();
+                if selected.windows(2).any(|p| p[0] == p[1]) {
+                    return Err(RouteError::InvalidArgument("duplicate scan partition"));
+                }
+                selected
+            }
+        };
+        // Resolve the entire selection before data I/O, never refresh metadata.
+        let mut placements = BTreeMap::new();
+        for partition in &partitions {
+            op.check(None)?;
+            let placement = catalog
+                .placement(*partition)
+                .ok_or(RouteError::MissingPartition(*partition))?;
+            for id in &placement.replicas {
+                if !self.replicas.contains_key(&(placement.group, *id)) {
+                    return Err(RouteError::MissingReplica {
+                        group: placement.group,
+                        node: *id,
+                    });
+                }
+            }
+            placements.insert(placement.shard, placement.clone());
+            if placements.len() > MAX_SCAN_SHARDS {
+                return Err(scan_capacity());
+            }
+        }
+        let mut pinned = BTreeMap::new();
+        let mut snapshots = Vec::with_capacity(placements.len());
+        let (mut bytes, mut rows) = (0usize, 0usize);
+        for placement in placements.values() {
+            let (adapter, view) = select_read(&placement.replicas, &op, None, |id| {
+                let adapter = self.adapter(placement, id, &op);
+                let view = adapter.read_view()?;
+                if view.epoch != placement.epoch {
+                    return Err(StorageNodeError::Fenced {
+                        shard: placement.shard,
+                        epoch: placement.epoch,
+                        current: view.epoch,
+                    }
+                    .into());
+                }
+                Ok((adapter, view))
+            })?;
+            // Acquisition allocation is adapter-owned; charge before retaining
+            // the new view alongside the already admitted snapshots. No RSS claim.
+            admit_snapshot(
+                &mut bytes,
+                &mut rows,
+                view.payload_bytes(),
+                view.row_count(),
+            )?;
+            snapshots.push(ShardReadStamp {
+                group: placement.group,
+                shard: placement.shard,
+                epoch: view.epoch,
+                sequence: view.sequence,
+            });
+            pinned.insert(
+                placement.shard,
+                PinnedNode {
+                    adapter,
+                    view,
+                    op: op.clone(),
+                },
+            );
+            observer(Some(placement.shard))?;
+            op.check(None)?;
+        }
+        let stores = partitions
+            .iter()
+            .map(|partition| {
+                let shard = catalog
+                    .placement(*partition)
+                    .expect("validated partition")
+                    .shard;
+                (
+                    *partition,
+                    GraphRecordStore::new(pinned[&shard].clone(), shard, *partition),
+                )
+            })
+            .collect::<Vec<_>>();
+        // PinnedNode::read_view clones the same Arc-backed view, never a new
+        // data snapshot, even when several partitions share one shard.
+        let views = stores
+            .iter()
+            .map(|(partition, store)| Ok((*partition, store.read_view()?)))
+            .collect::<rocksdb_sql_table::Result<Vec<_>>>()?;
+        let result = plan.execute(&views, &|| op.check(None).map_err(Into::into))?;
+        op.check(None)?;
+        Ok(GlobalScanResult {
+            metadata_sequence: catalog.sequence(),
+            snapshots,
+            result,
+        })
+    }
+
     /// Explicit exact retry only. Fresh metadata must match the immutable
     /// prepared placement. Conflict, epoch, timeout and unavailable are terminal;
     /// only `NotLeader` may select another fixed candidate within this call.
@@ -332,6 +509,29 @@ impl RouteResolver {
             (result, false)
         })
     }
+}
+
+fn scan_capacity() -> RouteError {
+    StorageNodeError::ResourceExhausted(
+        "global scan fanout or aggregate snapshot limit exceeded".into(),
+    )
+    .into()
+}
+
+fn admit_snapshot(
+    bytes: &mut usize,
+    rows: &mut usize,
+    incoming_bytes: usize,
+    incoming_rows: usize,
+) -> Result<()> {
+    let total_bytes = bytes.saturating_add(incoming_bytes);
+    let total_rows = rows.saturating_add(incoming_rows);
+    if total_bytes > MAX_SCAN_VIEW_BYTES || total_rows > MAX_SCAN_VIEW_ROWS {
+        return Err(scan_capacity());
+    }
+    *bytes = total_bytes;
+    *rows = total_rows;
+    Ok(())
 }
 
 // At most one attempt per fixed replica, so even cyclic/self/foreign hints
@@ -555,6 +755,30 @@ impl RoutedReadView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_admission_is_aggregate_and_overflow_safe() {
+        let (mut bytes, mut rows) = (0, 0);
+        admit_snapshot(
+            &mut bytes,
+            &mut rows,
+            MAX_SCAN_VIEW_BYTES / 2,
+            MAX_SCAN_VIEW_ROWS / 2,
+        )
+        .unwrap();
+        admit_snapshot(
+            &mut bytes,
+            &mut rows,
+            MAX_SCAN_VIEW_BYTES / 2,
+            MAX_SCAN_VIEW_ROWS / 2,
+        )
+        .unwrap();
+        assert_eq!((bytes, rows), (MAX_SCAN_VIEW_BYTES, MAX_SCAN_VIEW_ROWS));
+        assert!(admit_snapshot(&mut bytes, &mut rows, 1, 0).is_err());
+        assert!(admit_snapshot(&mut bytes, &mut rows, 0, 1).is_err());
+        assert!(admit_snapshot(&mut bytes, &mut rows, usize::MAX, usize::MAX).is_err());
+        assert_eq!((bytes, rows), (MAX_SCAN_VIEW_BYTES, MAX_SCAN_VIEW_ROWS));
+    }
 
     fn operation(end: Instant) -> Operation {
         Operation {
@@ -785,5 +1009,330 @@ mod remote_configuration_tests {
             &[replica(4, 1, 8011), replica(5, 2, 8011)]
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod global_scan_tests {
+    use super::*;
+    use d2_raft::{Cluster, D1Command, LogCommand};
+    use openraft::BasicNode;
+    use rocksdb_sql_table::GlobalScanOutput;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn place(group: u64) -> Placement {
+        Placement {
+            group,
+            shard: group,
+            epoch: 1,
+            replicas: vec![1],
+        }
+    }
+
+    async fn start(root: &Cluster, group: u64) -> NodeHandle {
+        let node = root.in_group(group).start(1).await.unwrap();
+        node.raft
+            .initialize(BTreeMap::from([(1, BasicNode::default())]))
+            .await
+            .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if node.raft.ensure_linearizable().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        node.raft
+            .client_write(LogCommand::D1V1(D1Command::Activate {
+                shard: group,
+                epoch: 1,
+            }))
+            .await
+            .unwrap();
+        node
+    }
+
+    fn register(catalog: &Catalog, partition: u32, placement: Placement) {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&partition.to_be_bytes());
+        let prepared = catalog
+            .prepare_registration(id, partition, placement)
+            .unwrap();
+        catalog.commit_registration(&prepared).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_and_shared_shard_views_stay_pinned_during_concurrent_changes() {
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let data = start(&root, 20).await;
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let adapter = ReplicatedStorageNode::new(&data, 20, TEST_TIMEOUT).unwrap();
+        let resolver = RouteResolver::new(
+            place(10),
+            std::slice::from_ref(&meta),
+            std::slice::from_ref(&data),
+        )
+        .unwrap();
+        crate::run_blocking(move || {
+            register(&catalog, 1, place(20));
+            register(&catalog, 2, place(20));
+            for partition in 1..=3 {
+                GraphRecordStore::new(adapter.clone(), 20, partition)
+                    .create_vertex(&Vertex::new(1))
+                    .unwrap();
+            }
+            let mut catalog_callbacks = 0;
+            let mut shard_callbacks = 0;
+            let before = resolver
+                .execute_global_scan_observed(
+                    ScanScope::All,
+                    "g.V().count()",
+                    TEST_TIMEOUT,
+                    |shard| {
+                        match shard {
+                            None => {
+                                catalog_callbacks += 1;
+                                register(&catalog, 3, place(20));
+                            }
+                            Some(20) => {
+                                shard_callbacks += 1;
+                                GraphRecordStore::new(adapter.clone(), 20, 2)
+                                    .create_vertex(&Vertex::new(2))
+                                    .unwrap();
+                            }
+                            Some(other) => panic!("unexpected shard {other}"),
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(catalog_callbacks, 1);
+            assert_eq!(shard_callbacks, 1);
+            assert_eq!(before.snapshots.len(), 1);
+            assert_eq!(before.result, GlobalScanOutput::Count(2));
+            let after = resolver
+                .execute_global_scan(ScanScope::All, "g.V().count()", TEST_TIMEOUT)
+                .unwrap();
+            assert_eq!(after.result, GlobalScanOutput::Count(4));
+            assert_eq!(after.snapshots.len(), 1);
+            assert!(after.metadata_sequence > before.metadata_sequence);
+            assert!(after.snapshots[0].sequence > before.snapshots[0].sequence);
+            assert_eq!(resolver.operations.available_permits(), MAX_OPERATIONS);
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        root.in_group(20).shutdown(&data).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn total_deadline_includes_observer_and_releases_operation_permit() {
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let resolver = RouteResolver::new(place(10), std::slice::from_ref(&meta), &[]).unwrap();
+        crate::run_blocking(move || {
+            let mut called = false;
+            let result = resolver.execute_global_scan_observed(
+                ScanScope::All,
+                "g.V().count()",
+                Duration::from_secs(1),
+                |shard| {
+                    assert_eq!(shard, None);
+                    called = true;
+                    std::thread::sleep(Duration::from_millis(1100));
+                    Ok(())
+                },
+            );
+            assert!(
+                called,
+                "catalog acquisition must finish before injected delay"
+            );
+            assert!(matches!(
+                result,
+                Err(RouteError::Storage(StorageNodeError::Timeout {
+                    request_id: None
+                }))
+            ));
+            assert_eq!(resolver.operations.available_permits(), MAX_OPERATIONS);
+            assert_eq!(
+                resolver
+                    .execute_global_scan(ScanScope::All, "g.V().count()", TEST_TIMEOUT)
+                    .unwrap()
+                    .result,
+                GlobalScanOutput::Count(0)
+            );
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_fanout_and_duplicate_selection_fail_without_data_reads() {
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        // The data handle is registered but deliberately never initialized or activated.
+        let data = root.in_group(20).start(1).await.unwrap();
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let resolver = RouteResolver::new(
+            place(10),
+            std::slice::from_ref(&meta),
+            std::slice::from_ref(&data),
+        )
+        .unwrap();
+        crate::run_blocking(move || {
+            for partition in 1..=33 {
+                register(&catalog, partition, place(20));
+            }
+            let mut pinned = 0;
+            let result = resolver.execute_global_scan_observed(
+                ScanScope::All,
+                "g.V()",
+                TEST_TIMEOUT,
+                |shard| {
+                    pinned += usize::from(shard.is_some());
+                    Ok(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(RouteError::Storage(StorageNodeError::ResourceExhausted(_)))
+            ));
+            assert_eq!(pinned, 0);
+            assert!(matches!(
+                resolver.execute_global_scan(
+                    ScanScope::Selected((1..=33).collect()),
+                    "g.V()",
+                    TEST_TIMEOUT
+                ),
+                Err(RouteError::Storage(StorageNodeError::ResourceExhausted(_)))
+            ));
+            assert!(matches!(
+                resolver.execute_global_scan(
+                    ScanScope::Selected(vec![1, 1]),
+                    "g.V()",
+                    TEST_TIMEOUT
+                ),
+                Err(RouteError::InvalidArgument(_))
+            ));
+            assert_eq!(resolver.operations.available_permits(), MAX_OPERATIONS);
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        root.in_group(20).shutdown(&data).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ninth_shard_fails_before_any_data_snapshot() {
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let mut data = Vec::new();
+        for group in 20..29 {
+            data.push(start(&root, group).await);
+        }
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let resolver = RouteResolver::new(place(10), std::slice::from_ref(&meta), &data).unwrap();
+        crate::run_blocking(move || {
+            for partition in 1..=9 {
+                register(&catalog, partition, place(u64::from(partition) + 19));
+            }
+            let eight = resolver
+                .execute_global_scan(
+                    ScanScope::Selected((1..=8).collect()),
+                    "g.V().count()",
+                    TEST_TIMEOUT,
+                )
+                .unwrap();
+            assert_eq!(eight.result, GlobalScanOutput::Count(0));
+            assert_eq!(eight.snapshots.len(), 8);
+            let mut pinned = 0;
+            let result = resolver.execute_global_scan_observed(
+                ScanScope::All,
+                "g.V()",
+                TEST_TIMEOUT,
+                |shard| {
+                    pinned += usize::from(shard.is_some());
+                    Ok(())
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(RouteError::Storage(StorageNodeError::ResourceExhausted(_)))
+            ));
+            assert_eq!(pinned, 0);
+            assert_eq!(resolver.operations.available_permits(), MAX_OPERATIONS);
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        for (group, node) in (20..29).zip(data.iter()) {
+            root.in_group(group).shutdown(node).await;
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aggregate_retained_snapshot_cap_rejects_two_individually_valid_views() {
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let a = start(&root, 20).await;
+        let b = start(&root, 30).await;
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let adapters = [
+            ReplicatedStorageNode::new(&a, 20, TEST_TIMEOUT).unwrap(),
+            ReplicatedStorageNode::new(&b, 30, TEST_TIMEOUT).unwrap(),
+        ];
+        let data = [a, b];
+        let resolver = RouteResolver::new(place(10), std::slice::from_ref(&meta), &data).unwrap();
+        crate::run_blocking(move || {
+            for (partition, shard, node) in [(1, 20, &adapters[0]), (2, 30, &adapters[1])] {
+                register(&catalog, partition, place(shard));
+                node.batch_write(WriteRequest {
+                    shard,
+                    epoch: 1,
+                    request_id: [9; 16],
+                    operations: vec![rocksdb_sql_table::WriteOp::Put {
+                        key: b"opaque-outside-graph".to_vec(),
+                        value: vec![7; 9 * 1024 * 1024],
+                    }],
+                })
+                .unwrap();
+                let single = resolver
+                    .execute_global_scan(
+                        ScanScope::Selected(vec![partition]),
+                        "g.V().count()",
+                        TEST_TIMEOUT,
+                    )
+                    .unwrap();
+                assert_eq!(single.result, GlobalScanOutput::Count(0));
+                assert_eq!(single.snapshots.len(), 1);
+            }
+            let result =
+                resolver.execute_global_scan(ScanScope::All, "g.V().count()", TEST_TIMEOUT);
+            assert!(matches!(
+                result,
+                Err(RouteError::Storage(StorageNodeError::ResourceExhausted(_)))
+            ));
+            assert_eq!(resolver.operations.available_permits(), MAX_OPERATIONS);
+            assert_eq!(
+                resolver
+                    .execute_global_scan(
+                        ScanScope::Selected(vec![1]),
+                        "g.V().count()",
+                        TEST_TIMEOUT
+                    )
+                    .unwrap()
+                    .result,
+                GlobalScanOutput::Count(0)
+            );
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        root.in_group(20).shutdown(&data[0]).await;
+        root.in_group(30).shutdown(&data[1]).await;
     }
 }

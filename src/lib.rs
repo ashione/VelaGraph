@@ -31,6 +31,7 @@
 
 mod engine;
 mod error;
+mod global_scan;
 mod graph;
 mod graph_records;
 mod gremlin;
@@ -44,6 +45,7 @@ mod value;
 
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
+pub use global_scan::{GlobalScanOutput, GlobalScanPlan, QualifiedGremlinRow};
 pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
 pub use graph_records::{
     GraphRecordReadView, GraphRecordStore, PreparedGraphMutation, GRAPH_QUERY_PAGE_BYTES,
