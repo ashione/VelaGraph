@@ -147,3 +147,14 @@ experiment exception: preparation verifies a complete observed edge; one
 conditional source-shard canonical Put changes properties only. It adds no
 format, identity/label/endpoint mutation, target write, or distributed transaction.
 V2 creation remains append-only and old exact retries retain historical dedup.
+
+### Reviewed experimental edge deletion extension
+
+The opt-in v2 edge mutation API additionally supports permanent tombstone deletion.
+It is an explicit R2/R4/R12 scope exception, not a change to v1 single-batch,
+failed-create, cascade, K3 or query contracts. Cross-shard source tombstone/out
+removal and target in removal are staged, not atomic; same-shard deletion uses
+one CAS batch. IDs are never reused. Reads validate visible residual indexes and
+charge tombstone candidates before skipping them. Recovery and GC are unsupported.
+See [deletion contract and versioned format](EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion)
+for upgrade restrictions, bounds and attempt-local retry outcomes.

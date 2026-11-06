@@ -220,17 +220,26 @@ impl ExperimentalReadSession {
                     }
                     let scan_limit = ScanLimit::new(remaining, 1024 * 1024 + 64)?;
                     if edge_start {
-                        let page = store.edge_page(after, scan_limit)?;
-                        work.charge(page.raw_bytes + page.edges.len() * 128)?;
-                        for candidate in page.edges {
+                        let page = store.edge_record_page(after, scan_limit)?;
+                        work.charge(page.raw_bytes + page.records.len() * 128)?;
+                        for candidate in page.records {
                             self.op.check(None)?;
                             work.visit()?;
-                            work.edge(&candidate)?;
+                            work.edge(candidate.edge())?;
                             let r = candidate.identity();
-                            let edge = self.get_edge(r)?.ok_or(ExperimentalError::Incomplete(r))?;
-                            work.edge(&edge)?;
-                            if edge != candidate {
+                            let record = self
+                                .verified_edge_record(r)?
+                                .ok_or(ExperimentalError::Incomplete(r))?;
+                            work.edge(record.edge())?;
+                            if record != candidate {
                                 return Err(ExperimentalError::Incomplete(r).into());
+                            }
+                            // Deleted candidates still consume raw bytes, work and
+                            // their page cursor. Only verified live edges count
+                            // towards a leading limit, so tombstone pages cannot
+                            // truncate the requested live prefix.
+                            if matches!(record, EdgeRecord::Deleted(_)) {
+                                continue;
                             }
                             push_element(
                                 &mut rows,

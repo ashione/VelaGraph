@@ -560,5 +560,13 @@ The opt-in v2 coordinator also supports properties-only edge updates via
 `prepare_edge_properties` and `experimental_commit_mutation`. One immutable
 source-shard CAS preserves identity, label, endpoints and indexes; exact retries
 never overwrite newer properties. Null and explicit removal are distinct.
-No deletion, automatic recovery or distributed transaction is implied.
+No automatic recovery or distributed transaction is implied.
 See [edge property mutations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-edge-property-mutation).
+
+The opt-in `prepare_edge_delete` / `experimental_commit_mutation` pair deletes
+complete v2 edges using permanent versioned tombstones, never reusable EdgeRefs.
+Cross-shard deletion remains staged and can be incomplete; same-shard writes
+combine into one CAS batch. Observed queries verify residual indexes and charge
+tombstones against scan budgets. Upgrade all readers before first deletion;
+downgrade, automatic repair, tombstone GC and vertex deletion are unsupported.
+See [edge deletion](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion).

@@ -1,4 +1,4 @@
-//! Isolated graph/v2 experiment with append-only creation and property patches.
+//! Isolated graph/v2 experiment with append-only creation and explicit edge mutations.
 //! No v1 API reads these records.
 //! Batches are shard-local; composing them is explicitly NOT a transaction.
 use crate::graph::{codec, validate_edge, validate_label, validate_vertex};
@@ -19,6 +19,8 @@ pub enum ExperimentalError {
     Invalid(&'static str),
     #[error("experimental entity already exists")]
     AlreadyExists,
+    #[error("experimental live edge not found: {0:?}")]
+    NotFound(EdgeRef),
     #[error("corrupt experimental graph data: {0}")]
     Corrupt(&'static str),
     #[error("experimental endpoint missing: {0:?}")]
@@ -60,6 +62,37 @@ impl CrossEdge {
             properties: self.properties.clone(),
         }
     }
+}
+/// Permanent source-owned deletion marker. Properties are deliberately absent.
+/// The operation ID identifies the original source request, not a recovery log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeTombstone {
+    pub edge: CrossEdge,
+    pub operation_id: RequestId,
+}
+/// A canonical edge record, including permanent ID reservations.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EdgeRecord {
+    Live(CrossEdge),
+    Deleted(EdgeTombstone),
+}
+impl EdgeRecord {
+    pub fn edge(&self) -> &CrossEdge {
+        match self {
+            Self::Live(e) => e,
+            Self::Deleted(t) => &t.edge,
+        }
+    }
+    pub fn identity(&self) -> EdgeRef {
+        self.edge().identity()
+    }
+}
+/// A bounded page retaining tombstones for caller verification and budgeting.
+#[derive(Debug)]
+pub struct EdgeRecordPage {
+    pub records: Vec<EdgeRecord>,
+    pub next_after: Option<u64>,
+    pub raw_bytes: usize,
 }
 /// A properties-only patch. Null is a stored value; removal is explicit.
 /// Empty patches and names appearing in both sets are rejected.
@@ -140,8 +173,8 @@ impl PreparedBatch {
     }
 }
 /// Isolated participant primitives. Creates remain append-only. The additive
-/// properties preparation changes only canonical edge properties; no delete,
-/// v1 migration, label/endpoint update, or unqualified cross-edge API exists.
+/// properties and deletion primitives require the routing coordinator for full
+/// endpoint validation. No v1 migration or label/endpoint update exists.
 pub struct AppendOnlyStore<S> {
     node: S,
     shard: u64,
@@ -256,7 +289,26 @@ impl<S: StorageNode> AppendOnlyStore<S> {
     }
     /// Reads source-owned canonical edges from one bounded page. Stable
     /// pagination requires a pinned node. No all-or-error scan fallback is used.
+    /// This legacy live-only API errors on tombstones. Use edge_record_page to
+    /// retain and verify deleted candidates without hiding incomplete deletion.
     pub fn edge_page(&self, after: Option<u64>, limit: ScanLimit) -> Result<EdgePage> {
+        let page = self.edge_record_page(after, limit)?;
+        let edges = page
+            .records
+            .into_iter()
+            .map(|r| match r {
+                EdgeRecord::Live(e) => Ok(e),
+                EdgeRecord::Deleted(t) => Err(ExperimentalError::Incomplete(t.edge.identity())),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(EdgePage {
+            edges,
+            next_after: page.next_after,
+            raw_bytes: page.raw_bytes,
+        })
+    }
+    /// Includes deletion markers, never silently filters partially deleted edges.
+    pub fn edge_record_page(&self, after: Option<u64>, limit: ScanLimit) -> Result<EdgeRecordPage> {
         if limit.max_rows == 0
             || limit.max_bytes == 0
             || limit.max_rows > 128
@@ -299,24 +351,7 @@ impl<S: StorageNode> AppendOnlyStore<S> {
             if last.is_some_and(|previous| id <= previous) {
                 return Err(ExperimentalError::Corrupt("edge page order"));
             }
-            let (to_partition, bytes) = unwrap_record(&row.value, 2)?;
-            let local = codec::decode_edge(bytes)?;
-            if local.id != id {
-                return Err(ExperimentalError::Corrupt("edge key identity"));
-            }
-            edges.push(CrossEdge {
-                id,
-                from: VertexRef {
-                    partition: self.partition,
-                    id: local.from,
-                },
-                to: VertexRef {
-                    partition: to_partition,
-                    id: local.to,
-                },
-                label: local.label,
-                properties: local.properties,
-            });
+            edges.push(decode_edge_record(&row.value, self.partition, id)?);
             last = Some(id);
             last_key = row.key;
         }
@@ -327,8 +362,8 @@ impl<S: StorageNode> AppendOnlyStore<S> {
         {
             return Err(ExperimentalError::Corrupt("edge page continuation"));
         }
-        Ok(EdgePage {
-            edges,
+        Ok(EdgeRecordPage {
+            records: edges,
             next_after: page.next_cursor.and(last),
             raw_bytes,
         })
@@ -417,34 +452,98 @@ impl<S: StorageNode> AppendOnlyStore<S> {
         self.edge_in(id, &v)
     }
     fn edge_in(&self, id: u64, v: &ReadView) -> Result<Option<CrossEdge>> {
+        Ok(match self.edge_record_in(id, v)? {
+            Some(EdgeRecord::Live(e)) => Some(e),
+            Some(EdgeRecord::Deleted(_)) | None => None,
+        })
+    }
+    /// Checks only source state. The routing session also checks target state.
+    pub fn get_edge_record(&self, id: u64) -> Result<Option<EdgeRecord>> {
+        self.edge_record_in(id, &self.view()?)
+    }
+    fn edge_record_in(&self, id: u64, v: &ReadView) -> Result<Option<EdgeRecord>> {
         let Some(bytes) = self
             .node
             .get(&record_key(self.partition, b"edge/", id), v)?
         else {
             return Ok(None);
         };
-        let (to_partition, rest) = unwrap_record(&bytes, 2)?;
-        let local = codec::decode_edge(rest)?;
-        let edge = CrossEdge {
-            id: local.id,
-            from: VertexRef {
-                partition: self.partition,
-                id: local.from,
-            },
-            to: VertexRef {
-                partition: to_partition,
-                id: local.to,
-            },
-            label: local.label,
-            properties: local.properties,
+        let record = decode_edge_record(&bytes, self.partition, id)?;
+        let edge = record.edge();
+        let index = self.node.get(&index_key(edge, Direction::Out), v)?;
+        let valid = match &record {
+            EdgeRecord::Live(_) => {
+                index == Some(Vec::new()) && self.vertex_in(edge.from.id, v)?.is_some()
+            }
+            EdgeRecord::Deleted(_) => index.is_none(),
         };
-        if edge.id != id
-            || self.node.get(&index_key(&edge, Direction::Out), v)? != Some(Vec::new())
-            || self.vertex_in(edge.from.id, v)?.is_none()
+        if !valid {
+            return Err(ExperimentalError::Incomplete(edge.identity()));
+        }
+        Ok(Some(record))
+    }
+    /// Prepare permanent canonical tombstone and source index deletion in one CAS.
+    /// The caller must verify target completeness before submitting either batch.
+    pub fn prepare_source_delete(&self, expected: &CrossEdge) -> Result<PreparedBatch> {
+        if expected.from.partition != self.partition {
+            return Err(ExperimentalError::Invalid("source owner mismatch"));
+        }
+        let v = self.view()?;
+        let current = self
+            .edge_in(expected.id, &v)?
+            .ok_or(ExperimentalError::NotFound(expected.identity()))?;
+        if current.to != expected.to
+            || codec::encode_edge(&current.local())? != codec::encode_edge(&expected.local())?
+        {
+            return Err(ExperimentalError::Incomplete(expected.identity()));
+        }
+        let mut batch = self.batch(&v, Vec::new())?;
+        let mut edge = current;
+        edge.properties.clear();
+        let bytes = encode_tombstone(&EdgeTombstone {
+            edge,
+            operation_id: batch.request_id(),
+        })?;
+        batch.request.operations = vec![
+            WriteOp::put(record_key(self.partition, b"edge/", expected.id), bytes),
+            WriteOp::Delete {
+                key: index_key(expected, Direction::Out),
+            },
+        ];
+        Ok(batch)
+    }
+    /// Prepare the target participant against its original sequence.
+    pub fn prepare_reverse_delete(&self, edge: &CrossEdge) -> Result<PreparedBatch> {
+        if edge.to.partition != self.partition {
+            return Err(ExperimentalError::Invalid("target partition mismatch"));
+        }
+        let v = self.view()?;
+        if self.node.get(&index_key(edge, Direction::In), &v)? != Some(Vec::new())
+            || self.vertex_in(edge.to.id, &v)?.is_none()
         {
             return Err(ExperimentalError::Incomplete(edge.identity()));
         }
-        Ok(Some(edge))
+        self.batch(
+            &v,
+            vec![WriteOp::Delete {
+                key: index_key(edge, Direction::In),
+            }],
+        )
+    }
+    /// A tombstone is absent only when its reverse index is absent too.
+    pub fn verify_deleted_reverse(&self, tombstone: &EdgeTombstone) -> Result<()> {
+        let edge = &tombstone.edge;
+        if edge.to.partition != self.partition {
+            return Err(ExperimentalError::Invalid("target partition mismatch"));
+        }
+        if self
+            .node
+            .get(&index_key(edge, Direction::In), &self.view()?)?
+            .is_some()
+        {
+            return Err(ExperimentalError::Incomplete(edge.identity()));
+        }
+        Ok(())
     }
     /// Prepare one canonical Put against a single source view. The expected
     /// edge must match its exact canonical source encoding. The full routing API
@@ -613,4 +712,66 @@ fn check_record_size(bytes: &[u8]) -> Result<()> {
         return Err(StorageNodeError::ResourceExhausted("v2 record exceeds 1 MiB".into()).into());
     }
     Ok(())
+}
+
+// The v3 deletion envelope retains the v2 namespace and canonical edge key.
+// Field 4 is a canonical property-free v1 Edge; field 5 is the source request ID.
+fn encode_tombstone(t: &EdgeTombstone) -> Result<Vec<u8>> {
+    if !t.edge.properties.is_empty() {
+        return Err(ExperimentalError::Corrupt("tombstone properties"));
+    }
+    let mut bytes = wrap_record(
+        3,
+        t.edge.to.partition,
+        &codec::encode_edge(&t.edge.local())?,
+    );
+    bytes[1] = 3;
+    bytes.extend([42, 16]);
+    bytes.extend(t.operation_id);
+    check_record_size(&bytes)?;
+    Ok(bytes)
+}
+fn decode_edge_record(bytes: &[u8], partition: u32, id: u64) -> Result<EdgeRecord> {
+    check_record_size(bytes)?;
+    let deleted = bytes.starts_with(&[8, 3, 16, 3, 29]);
+    let mut envelope;
+    let (to_partition, rest) = if deleted {
+        if bytes.len() < 29 || bytes[bytes.len() - 18..bytes.len() - 16] != [42, 16] {
+            return Err(ExperimentalError::Corrupt("tombstone operation ID"));
+        }
+        envelope = bytes[..bytes.len() - 18].to_vec();
+        envelope[1] = 2;
+        unwrap_record(&envelope, 3)?
+    } else {
+        unwrap_record(bytes, 2)?
+    };
+    let local = codec::decode_edge(rest)?;
+    if local.id != id {
+        return Err(ExperimentalError::Corrupt("edge key identity"));
+    }
+    let edge = CrossEdge {
+        id,
+        from: VertexRef {
+            partition,
+            id: local.from,
+        },
+        to: VertexRef {
+            partition: to_partition,
+            id: local.to,
+        },
+        label: local.label,
+        properties: local.properties,
+    };
+    if deleted {
+        let tombstone = EdgeTombstone {
+            edge,
+            operation_id: bytes[bytes.len() - 16..].try_into().unwrap(),
+        };
+        if encode_tombstone(&tombstone)? != bytes {
+            return Err(ExperimentalError::Corrupt("noncanonical tombstone"));
+        }
+        Ok(EdgeRecord::Deleted(tombstone))
+    } else {
+        Ok(EdgeRecord::Live(edge))
+    }
 }

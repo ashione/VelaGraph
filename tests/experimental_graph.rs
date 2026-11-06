@@ -1161,3 +1161,505 @@ fn edge_property_prepared_bytes_are_immutable_and_epoch_fencing_precedes_dedup()
     assert_eq!(before.entries, after.entries);
     assert_eq!(before.sequence, after.sequence);
 }
+
+#[test]
+fn deleted_edges_reopen_reserve_identity_and_ignore_historical_retries() {
+    use rocksdb_sql_table::experimental_graph::EdgeRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let (create, update, deletion, expected);
+    {
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        let b = AppendOnlyStore::new(n.clone(), 7, 2);
+        vertex(&a, &n, 1);
+        vertex(&b, &n, 2);
+        let e = edge(1, 2);
+        create = a
+            .prepare_source(&e)
+            .unwrap()
+            .combine(b.prepare_reverse(&e).unwrap())
+            .unwrap();
+        create.submit(&n).unwrap();
+        update = a
+            .prepare_source_properties(&e, &property_patch(Value::Integer(42)))
+            .unwrap();
+        update.submit(&n).unwrap();
+        expected = a.get_edge(7).unwrap().unwrap();
+        deletion = a
+            .prepare_source_delete(&expected)
+            .unwrap()
+            .combine(b.prepare_reverse_delete(&expected).unwrap())
+            .unwrap();
+        let before = n.read_view().unwrap().sequence;
+        deletion.submit(&n).unwrap();
+        for retry in [&create, &update, &deletion] {
+            retry.submit(&n).unwrap();
+        }
+        assert_eq!(n.read_view().unwrap().sequence, before + 1);
+        assert!(a.get_edge(7).unwrap().is_none());
+        assert!(a.observed_index(1, Direction::Out).unwrap().is_empty());
+        assert!(b.observed_index(2, Direction::In).unwrap().is_empty());
+        match a.get_edge_record(7).unwrap().unwrap() {
+            EdgeRecord::Deleted(tombstone) => {
+                assert_eq!(tombstone.edge.identity(), expected.identity());
+                assert_eq!(tombstone.edge.to, expected.to);
+                assert_eq!(tombstone.edge.label, expected.label);
+                assert!(tombstone.edge.properties.is_empty());
+                assert_eq!(tombstone.operation_id, deletion.request_id());
+            }
+            other => panic!("expected permanent tombstone, got {other:?}"),
+        }
+        assert!(matches!(a.prepare_source_delete(&expected),
+            Err(ExperimentalError::NotFound(id)) if id == expected.identity()));
+    }
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let b = AppendOnlyStore::new(n.clone(), 7, 2);
+    let before = n.read_view().unwrap().sequence;
+    for retry in [&create, &update, &deletion] {
+        retry.submit(&n).unwrap();
+    }
+    assert_eq!(n.read_view().unwrap().sequence, before);
+    assert!(a.get_edge(7).unwrap().is_none());
+    assert!(b.observed_index(2, Direction::In).unwrap().is_empty());
+    let mut reused = expected.clone();
+    reused.label = "Different".into();
+    assert!(matches!(
+        a.prepare_source(&reused),
+        Err(ExperimentalError::AlreadyExists)
+    ));
+}
+
+#[test]
+fn deletion_cas_races_updates_and_rejects_residual_out_index() {
+    for update_wins in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        vertex(&a, &n, 1);
+        vertex(&a, &n, 2);
+        let e = edge(1, 1);
+        a.prepare_source(&e)
+            .unwrap()
+            .combine(a.prepare_reverse(&e).unwrap())
+            .unwrap()
+            .submit(&n)
+            .unwrap();
+        let deletion = a
+            .prepare_source_delete(&e)
+            .unwrap()
+            .combine(a.prepare_reverse_delete(&e).unwrap())
+            .unwrap();
+        let update = a
+            .prepare_source_properties(&e, &property_patch(Value::Integer(1)))
+            .unwrap();
+        let (winner, loser) = if update_wins {
+            (&update, &deletion)
+        } else {
+            (&deletion, &update)
+        };
+        winner.submit(&n).unwrap();
+        let before = n.read_view().unwrap().sequence;
+        assert!(matches!(
+            loser.submit(&n),
+            Err(ExperimentalError::Storage(
+                StorageNodeError::Conflict { .. }
+            ))
+        ));
+        assert_eq!(n.read_view().unwrap().sequence, before);
+        if update_wins {
+            assert_eq!(
+                a.get_edge(7).unwrap().unwrap().properties["x"],
+                Value::Integer(1)
+            );
+        } else {
+            assert!(a.get_edge(7).unwrap().is_none());
+            raw(
+                &n,
+                vec![WriteOp::Put {
+                    key: index(7, b"K"),
+                    value: vec![],
+                }],
+            );
+            assert!(
+                matches!(a.get_edge(7), Err(ExperimentalError::Incomplete(id)) if id == e.identity())
+            );
+            assert!(
+                matches!(a.get_edge_record(7), Err(ExperimentalError::Incomplete(id)) if id == e.identity())
+            );
+        }
+    }
+}
+
+#[test]
+fn record_pages_include_tombstones_and_charge_their_raw_bytes() {
+    use rocksdb_sql_table::experimental_graph::EdgeRecord;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        vertex(&a, &n, 1);
+        vertex(&a, &n, 2);
+        for id in 0..5 {
+            let mut e = edge(1, 1);
+            e.id = id;
+            a.prepare_source(&e)
+                .unwrap()
+                .combine(a.prepare_reverse(&e).unwrap())
+                .unwrap()
+                .submit(&n)
+                .unwrap();
+            if id < 4 {
+                a.prepare_source_delete(&e)
+                    .unwrap()
+                    .combine(a.prepare_reverse_delete(&e).unwrap())
+                    .unwrap()
+                    .submit(&n)
+                    .unwrap();
+            }
+        }
+    }
+    let a = AppendOnlyStore::new(LocalStorageNode::open(dir.path(), 7).unwrap(), 7, 1);
+    let mut after = None;
+    let mut records = vec![];
+    loop {
+        let page = a
+            .edge_record_page(after, ScanLimit::new(2, 1024).unwrap())
+            .unwrap();
+        assert!(page.records.len() <= 2);
+        assert!(page.raw_bytes > 0 && page.raw_bytes <= 1024);
+        records.extend(page.records);
+        after = page.next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(records.len(), 5);
+    for (id, record) in records.into_iter().enumerate() {
+        match record {
+            EdgeRecord::Deleted(t) => {
+                assert!(id < 4);
+                assert_eq!(t.edge.id, id as u64);
+            }
+            EdgeRecord::Live(e) => {
+                assert_eq!(id, 4);
+                assert_eq!(e.id, 4);
+            }
+        }
+    }
+    assert!(a
+        .edge_record_page(None, ScanLimit::new(1, 1).unwrap())
+        .is_err());
+}
+
+#[test]
+fn tombstone_envelope_matches_golden_and_rejects_invalid_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    vertex(&a, &n, 1);
+    vertex(&a, &n, 2);
+    let e = edge(1, 1);
+    a.prepare_source(&e)
+        .unwrap()
+        .combine(a.prepare_reverse(&e).unwrap())
+        .unwrap()
+        .submit(&n)
+        .unwrap();
+    let deletion = a
+        .prepare_source_delete(&e)
+        .unwrap()
+        .combine(a.prepare_reverse_delete(&e).unwrap())
+        .unwrap();
+    deletion.submit(&n).unwrap();
+    let key = hex("67726170682f76322f702f000000012f656467652f0000000000000007");
+    let mut golden = hex("080310031d01000000220f080110021a0908071001180222014b2a10");
+    golden.extend(deletion.request_id());
+    assert_eq!(
+        n.get(&key, &n.read_view().unwrap()).unwrap(),
+        Some(golden.clone())
+    );
+    // Old live-only page callers must fail, never silently omit tombstones.
+    let paged = AppendOnlyStore::new(
+        EdgePaged {
+            node: n.clone(),
+            fault: 0,
+        },
+        7,
+        1,
+    );
+    assert!(matches!(
+        paged.edge_page(None, ScanLimit::new(10, 1024).unwrap()),
+        Err(ExperimentalError::Incomplete(_))
+    ));
+    for fault in 0..6 {
+        let mut bytes = golden.clone();
+        match fault {
+            0 => {
+                bytes.pop();
+            } // truncated operation ID
+            1 => bytes[1] = 2, // old version with deletion kind
+            2 => bytes[3] = 2, // deletion version with live kind
+            3 => {
+                let i = bytes.len() - 17;
+                bytes[i] = 15;
+            } // wrong ID length
+            4 => {
+                bytes.extend([42, 0]);
+            } // extra field
+            5 => bytes[18] = 8, // canonical payload ID disagrees with key
+            _ => unreachable!(),
+        }
+        n.batch_write(WriteRequest {
+            shard: 7,
+            epoch: 0,
+            request_id: [150 + fault as u8; 16],
+            operations: vec![WriteOp::Put {
+                key: key.clone(),
+                value: bytes,
+            }],
+        })
+        .unwrap();
+        assert!(
+            a.get_edge_record(7).is_err(),
+            "accepted malformed tombstone {fault}"
+        );
+        assert!(
+            paged
+                .edge_record_page(None, ScanLimit::new(10, 1024).unwrap())
+                .is_err(),
+            "page accepted malformed tombstone {fault}"
+        );
+    }
+}
+
+#[test]
+fn delete_source_and_reverse_lost_ack_retry_exactly_and_conflict_on_change() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source = node(source_dir.path());
+    let target = node(target_dir.path());
+    let a = AppendOnlyStore::new(source.clone(), 7, 1);
+    let b = AppendOnlyStore::new(target.clone(), 7, 2);
+    vertex(&a, &source, 1);
+    vertex(&b, &target, 2);
+    let e = edge(1, 2);
+    a.prepare_source(&e).unwrap().submit(&source).unwrap();
+    b.prepare_reverse(&e).unwrap().submit(&target).unwrap();
+    let deletion = a.prepare_source_delete(&e).unwrap();
+    let reverse = b.prepare_reverse_delete(&e).unwrap();
+    let competing = a.prepare_source_delete(&e).unwrap();
+    assert_ne!(competing.request_id(), deletion.request_id());
+    for (prepared, n, operation_count) in [(&deletion, &source, 2), (&reverse, &target, 1)] {
+        let transport = CommitThenTimeout {
+            node: n.clone(),
+            calls: std::sync::Mutex::new(vec![]),
+        };
+        assert!(matches!(prepared.submit(&transport),
+            Err(ExperimentalError::Storage(StorageNodeError::Timeout { request_id: Some(id) })) if id == prepared.request_id()));
+        let committed = n.admin().export().unwrap();
+        prepared.submit(&transport).unwrap();
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+        assert_eq!(calls[0].0.operations.len(), operation_count);
+        let (request, sequence) = calls[0].clone();
+        assert!(matches!(
+            n.batch_write_conditional(request.clone(), sequence.map(|s| s + 1)),
+            Err(StorageNodeError::IdempotencyConflict(_))
+        ));
+        let mut changed = request;
+        changed.operations = vec![WriteOp::put(b"changed".to_vec(), vec![])];
+        assert!(matches!(
+            n.batch_write_conditional(changed, sequence),
+            Err(StorageNodeError::IdempotencyConflict(_))
+        ));
+        let after = n.admin().export().unwrap();
+        assert_eq!(committed.entries, after.entries);
+        assert_eq!(committed.sequence, after.sequence);
+    }
+    let before = source.admin().export().unwrap();
+    assert!(matches!(
+        competing.submit(&source),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::Conflict { .. }
+        ))
+    ));
+    assert_eq!(before.entries, source.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, source.read_view().unwrap().sequence);
+    assert!(a.get_edge(7).unwrap().is_none());
+    assert!(b.observed_index(2, Direction::In).unwrap().is_empty());
+}
+
+#[test]
+fn independent_delete_preserves_other_source_same_id_and_unsubmitted_old_cas() {
+    let d = tempfile::tempdir().unwrap();
+    let n = node(d.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let b = AppendOnlyStore::new(n.clone(), 7, 2);
+    let c = AppendOnlyStore::new(n.clone(), 7, 3);
+    vertex(&a, &n, 1);
+    vertex(&b, &n, 2);
+    vertex(&c, &n, 1);
+    let ea = edge(1, 2);
+    let ec = edge(3, 2);
+    a.prepare_source(&ea)
+        .unwrap()
+        .combine(b.prepare_reverse(&ea).unwrap())
+        .unwrap()
+        .submit(&n)
+        .unwrap();
+    c.prepare_source(&ec)
+        .unwrap()
+        .combine(b.prepare_reverse(&ec).unwrap())
+        .unwrap()
+        .submit(&n)
+        .unwrap();
+    let pending = a
+        .prepare_source_properties(&ea, &property_patch(Value::Integer(9)))
+        .unwrap();
+    let deleted = a
+        .prepare_source_delete(&ea)
+        .unwrap()
+        .combine(b.prepare_reverse_delete(&ea).unwrap())
+        .unwrap();
+    deleted.submit(&n).unwrap();
+    assert!(pending.submit(&n).is_err());
+    assert!(a.get_edge(7).unwrap().is_none());
+    assert_eq!(c.get_edge(7).unwrap(), Some(ec.clone()));
+    b.verify_reverse(&ec).unwrap();
+    let incoming = b.observed_index(2, Direction::In).unwrap();
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].edge, ec.identity());
+    match a.get_edge_record(7).unwrap().unwrap() {
+        rocksdb_sql_table::experimental_graph::EdgeRecord::Deleted(t) => {
+            b.verify_deleted_reverse(&t).unwrap()
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn independent_delete_commit_then_timeout_retry_is_historical() {
+    let d = tempfile::tempdir().unwrap();
+    let n = node(d.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let b = AppendOnlyStore::new(n.clone(), 7, 2);
+    vertex(&a, &n, 1);
+    vertex(&b, &n, 2);
+    let e = edge(1, 2);
+    let create = a
+        .prepare_source(&e)
+        .unwrap()
+        .combine(b.prepare_reverse(&e).unwrap())
+        .unwrap();
+    create.submit(&n).unwrap();
+    let deletion = a
+        .prepare_source_delete(&e)
+        .unwrap()
+        .combine(b.prepare_reverse_delete(&e).unwrap())
+        .unwrap();
+    let transport = CommitThenTimeout {
+        node: n.clone(),
+        calls: std::sync::Mutex::new(vec![]),
+    };
+    assert!(
+        matches!(deletion.submit(&transport),Err(ExperimentalError::Storage(StorageNodeError::Timeout{request_id:Some(id)})) if id==deletion.request_id())
+    );
+    assert!(a.get_edge(7).unwrap().is_none());
+    assert!(b.observed_index(2, Direction::In).unwrap().is_empty());
+    vertex(&a, &n, 100);
+    let before = n.admin().export().unwrap();
+    deletion.submit(&transport).unwrap();
+    create.submit(&n).unwrap();
+    let after = n.admin().export().unwrap();
+    assert_eq!(before.entries, after.entries);
+    assert_eq!(before.sequence, after.sequence);
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[test]
+fn simultaneous_update_delete_cas_has_one_winner_and_consistent_indexes() {
+    use rocksdb_sql_table::experimental_graph::EdgeRecord;
+    use std::sync::Barrier;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let b = AppendOnlyStore::new(n.clone(), 7, 2);
+    vertex(&a, &n, 1);
+    vertex(&b, &n, 2);
+    // Repeat with distinct canonical identities, without requiring the scheduler
+    // to choose a particular winner or relying on sleeps for synchronization.
+    for id in 100..116 {
+        let mut e = edge(1, 2);
+        e.id = id;
+        a.prepare_source(&e)
+            .unwrap()
+            .combine(b.prepare_reverse(&e).unwrap())
+            .unwrap()
+            .submit(&n)
+            .unwrap();
+        let update = a
+            .prepare_source_properties(&e, &property_patch(Value::Integer(42)))
+            .unwrap();
+        let deletion = a
+            .prepare_source_delete(&e)
+            .unwrap()
+            .combine(b.prepare_reverse_delete(&e).unwrap())
+            .unwrap();
+        assert_eq!(update.sequence(), deletion.sequence());
+        let before = n.read_view().unwrap().sequence;
+        let barrier = Barrier::new(3);
+        let (updated, deleted) = std::thread::scope(|scope| {
+            let update_thread = scope.spawn(|| {
+                barrier.wait();
+                update.submit(&n)
+            });
+            let delete_thread = scope.spawn(|| {
+                barrier.wait();
+                deletion.submit(&n)
+            });
+            barrier.wait();
+            (update_thread.join().unwrap(), delete_thread.join().unwrap())
+        });
+        assert_eq!(n.read_view().unwrap().sequence, before + 1);
+        let update_won = match (updated, deleted) {
+            (Ok(()), Err(ExperimentalError::Storage(StorageNodeError::Conflict { .. }))) => true,
+            (Err(ExperimentalError::Storage(StorageNodeError::Conflict { .. })), Ok(())) => false,
+            other => panic!("expected exactly one CAS winner and one conflict: {other:?}"),
+        };
+        let outgoing = a.observed_index(1, Direction::Out).unwrap();
+        let incoming = b.observed_index(2, Direction::In).unwrap();
+        let out_count = outgoing
+            .iter()
+            .filter(|row| row.edge == e.identity())
+            .count();
+        let in_count = incoming
+            .iter()
+            .filter(|row| row.edge == e.identity())
+            .count();
+        if update_won {
+            let mut expected = e.clone();
+            expected.properties.insert("x".into(), Value::Integer(42));
+            assert_eq!(a.get_edge(id).unwrap(), Some(expected.clone()));
+            assert!(
+                matches!(a.get_edge_record(id).unwrap(), Some(EdgeRecord::Live(actual)) if actual == expected)
+            );
+            b.verify_reverse(&expected).unwrap();
+            assert_eq!((out_count, in_count), (1, 1));
+        } else {
+            assert!(a.get_edge(id).unwrap().is_none());
+            match a.get_edge_record(id).unwrap().unwrap() {
+                EdgeRecord::Deleted(tombstone) => {
+                    assert_eq!(tombstone.operation_id, deletion.request_id());
+                    b.verify_deleted_reverse(&tombstone).unwrap();
+                }
+                other => panic!("delete winner must leave a tombstone: {other:?}"),
+            }
+            assert_eq!((out_count, in_count), (0, 0));
+        }
+    }
+}

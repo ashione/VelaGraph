@@ -2,8 +2,8 @@
 use super::*;
 mod traversal;
 use rocksdb_sql_table::experimental_graph::{
-    AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError,
-    PreparedBatch, VertexRef,
+    AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRecord, EdgeRef,
+    ExperimentalError, PreparedBatch, VertexRef,
 };
 pub use traversal::{
     ObservedElementRef, ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3,
@@ -103,18 +103,20 @@ impl PreparedAppend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EdgeMutationKind {
     Properties,
+    Delete,
 }
 /// Historical acknowledgement of the original request, not proof that the
-/// current properties still equal this mutation's result.
+/// current graph state still equals this mutation's result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationAcknowledgement {
     AllBatchesAcknowledged,
 }
-/// Immutable exact retry of a properties-only source batch. Retain before
+/// Immutable exact retry of source and optional reverse mutation batches. Retain before
 /// submission; never reprepare automatically after an unknown outcome.
 #[derive(Clone, Debug)]
 pub struct PreparedEdgeMutation {
     edge: EdgeRef,
+    kind: EdgeMutationKind,
     prepared: PreparedAppend,
 }
 impl PreparedEdgeMutation {
@@ -122,14 +124,17 @@ impl PreparedEdgeMutation {
         self.edge
     }
     pub fn kind(&self) -> EdgeMutationKind {
-        EdgeMutationKind::Properties
+        self.kind
     }
-    /// The single participant request ID is also the operation ID.
+    /// The source participant request ID is also the operation ID.
     pub fn operation_id(&self) -> RequestId {
         self.prepared.source_request_id()
     }
     pub fn source_request_id(&self) -> RequestId {
         self.operation_id()
+    }
+    pub fn reverse_request_id(&self) -> Option<RequestId> {
+        self.prepared.reverse_request_id()
     }
 }
 /// One frozen catalog and per-shard snapshot vector. Never a global snapshot.
@@ -162,9 +167,20 @@ impl ExperimentalReadSession {
     /// Checks the canonical record and both observed indexes/endpoints. Absence
     /// of the canonical record means absent in the source's pinned snapshot.
     pub fn get_edge(&self, edge: EdgeRef) -> ExperimentalResult<Option<CrossEdge>> {
-        let value = self.store(edge.partition)?.get_edge(edge.id)?;
-        if let Some(e) = &value {
-            self.store(e.to.partition)?.verify_reverse(e)?;
+        let value = match self.verified_edge_record(edge)? {
+            Some(EdgeRecord::Live(e)) => Some(e),
+            Some(EdgeRecord::Deleted(_)) | None => None,
+        };
+        Ok(value)
+    }
+    fn verified_edge_record(&self, edge: EdgeRef) -> ExperimentalResult<Option<EdgeRecord>> {
+        let value = self.store(edge.partition)?.get_edge_record(edge.id)?;
+        match &value {
+            Some(EdgeRecord::Live(e)) => self.store(e.to.partition)?.verify_reverse(e)?,
+            Some(EdgeRecord::Deleted(t)) => {
+                self.store(t.edge.to.partition)?.verify_deleted_reverse(t)?
+            }
+            None => {}
         }
         self.op.check(None)?;
         Ok(value)
@@ -238,6 +254,7 @@ impl ExperimentalReadSession {
         self.op.check(None)?;
         Ok(PreparedEdgeMutation {
             edge,
+            kind: EdgeMutationKind::Properties,
             prepared: PreparedAppend {
                 metadata: self.metadata.clone(),
                 source: Participant {
@@ -245,6 +262,43 @@ impl ExperimentalReadSession {
                     batch,
                 },
                 reverse: None,
+            },
+        })
+    }
+    /// Delete a complete observed live edge. Permanently reserves its identity.
+    /// Two shards are staged, never atomic; retain this exact prepared value.
+    pub fn prepare_edge_delete(&self, edge: EdgeRef) -> ExperimentalResult<PreparedEdgeMutation> {
+        let current = self
+            .get_edge(edge)?
+            .ok_or(ExperimentalError::NotFound(edge))?;
+        let source = self
+            .store(edge.partition)?
+            .prepare_source_delete(&current)?;
+        let reverse = self
+            .store(current.to.partition)?
+            .prepare_reverse_delete(&current)?;
+        let (source, reverse) = if source.shard() == reverse.shard() {
+            (source.combine(reverse)?, None)
+        } else {
+            (
+                source,
+                Some(Participant {
+                    placement: self.placements[&current.to.partition].clone(),
+                    batch: reverse,
+                }),
+            )
+        };
+        self.op.check(None)?;
+        Ok(PreparedEdgeMutation {
+            edge,
+            kind: EdgeMutationKind::Delete,
+            prepared: PreparedAppend {
+                metadata: self.metadata.clone(),
+                source: Participant {
+                    placement: self.placements[&edge.partition].clone(),
+                    batch: source,
+                },
+                reverse,
             },
         })
     }
@@ -378,8 +432,8 @@ impl RouteResolver {
             op,
         })
     }
-    /// Submit the original immutable source mutation. Unknown results are
-    /// returned unchanged with the source request ID; no refresh/reprepare.
+    /// Submit the original immutable mutation, source then optional reverse.
+    /// Unknown results retain their stage and request ID; no refresh/reprepare.
     /// Exact retry acknowledges history and never reapplies over newer values.
     pub fn experimental_commit_mutation(
         &self,

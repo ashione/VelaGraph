@@ -250,3 +250,14 @@ endpoints, then prepares one source-shard conditional Put. Identity/label/endpoi
 remain fixed. Immutable exact retry preserves historical dedup after newer writes;
 Null/removal are explicit. This does not implement deletion, repair, distributed
 transactions or production transport security. V1 contracts remain unchanged.
+
+### Reviewed experimental edge deletion extension
+
+The opt-in v2 edge mutation API additionally supports permanent tombstone deletion.
+It is an explicit R2/R4/R12 scope exception, not a change to v1 single-batch,
+failed-create, cascade, K3 or query contracts. Cross-shard source tombstone/out
+removal and target in removal are staged, not atomic; same-shard deletion uses
+one CAS batch. IDs are never reused. Reads validate visible residual indexes and
+charge tombstone candidates before skipping them. Recovery and GC are unsupported.
+See [deletion contract and versioned format](EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion)
+for upgrade restrictions, bounds and attempt-local retry outcomes.
