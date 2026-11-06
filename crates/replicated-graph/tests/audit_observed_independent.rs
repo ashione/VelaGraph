@@ -198,8 +198,16 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             vec![ObservedRow::Count(0)]
         );
         assert!(s.observed_gremlin(99, "g.V(999).count()").is_err());
+        assert_eq!(
+            s.observed_gremlin(99, "g.V().count()")?.rows,
+            vec![ObservedRow::Count(3)]
+        );
+        assert_eq!(
+            s.observed_gremlin(99, "g.V().has('missing').count()")?.rows,
+            vec![ObservedRow::Count(0)]
+        );
         for q in [
-            "g.V()",
+            "g.V().label()",
             "g.E(7)",
             "g.V(7).values('x')",
             "g.V(7).path().out()",

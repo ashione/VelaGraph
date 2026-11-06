@@ -187,13 +187,17 @@ crash recovery, failover, network partition correctness or production security.
 
 `ExperimentalReadSession::observed_gremlin(start_partition, text)` is an additive,
 explicitly experimental D5 functional slice. It parses standard Gremlin with the
-existing official grammar, then accepts only explicit `g.V(id, ...)` and
-`out`, `in`, `both`, `hasLabel`, `limit`, terminal `path` or terminal `count`.
-Start IDs belong to the supplied partition; later hops follow qualified endpoints.
-There is no project-specific Gremlin syntax. `V()` scans, all `E` starts, `has`,
-`values`, `id` and `label` are typed `ExperimentalRouteError::Unsupported` here.
+existing official grammar, then accepts `g.V()` or explicit `g.V(id, ...)` and
+`out`, `in`, `both`, `hasLabel`, `has(key)`, `has(key,value)`, `limit`, terminal
+`path` or terminal `count`. Explicit start IDs belong to the supplied partition;
+later hops follow qualified endpoints. Empty `V()` scans every partition in the
+frozen catalog and ignores `start_partition`, even if that argument is unregistered.
+An empty catalog yields an empty stream (or observed count zero). Global start
+order is `(local ID, partition ID)`, matching the separate v1 global scan API.
+There is no project-specific Gremlin syntax. All `E` starts, `values`, `id` and
+`label` remain typed `ExperimentalRouteError::Unsupported` here.
 Parser/validation failures retain the original typed error under `Query`.
-No unsupported form falls back to v1 or a global scan.
+No unsupported form falls back to v1 or another query API.
 
 `ObservedTraversal` carries ordered rows, `completeness: Unverified`, the catalog
 sequence and all per-shard stamps. Vertex rows contain `VertexRef`. Path rows
@@ -204,10 +208,21 @@ partition)` order; `both` deduplicates only the identical qualified edge, so a
 self-loop appears once while parallel edges and same local IDs across partitions
 remain distinct. Explicit starts preserve argument order and duplicates; missing
 starts contribute no row. `hasLabel` matches any supplied vertex label.
+`has(key)` requires a present property, including a present Null; equality uses
+the same strict typed comparison as v0, without numeric/text coercion. A missing
+key does not match Null. Filters reload properties from the original pinned view
+and preserve input order, including duplicates and qualified traversal paths.
 
 Limits act at their original step position, count counts the observed stream,
 and terminal path does not materialize properties. A leading limit short-circuits
-start acquisition once that many existing vertices were admitted. Default output
+explicit start acquisition once that many existing vertices were admitted. For
+global starts, a leading limit acquires at most N vertices per partition and
+retains the globally smallest N candidates. All shards were already pinned by
+session creation; a leading limit does not bypass unavailable shards. Acquisition
+uses pages of at most 128 rows and 1 MiB + 64 raw key/value bytes. V2 records
+remain bounded to 1 MiB. Pagination never falls back to an all-or-error scan.
+Only an immediately leading limit can bound start acquisition; a later limit,
+filter or count cannot hide an earlier resource error. Default output
 cap is 100 unless an explicit limit occurs; count observes pre-default-cap rows.
 The existing parser enforces three edge steps and limit 1..1000.
 The shared `GremlinQuery::parse` entrypoint enforces the same 16 KiB and
@@ -229,25 +244,30 @@ view refresh, replica switch, retry or per-hop deadline. Checks are cooperative,
 not preemption of parser/decoder/allocator work or one storage dispatch.
 
 Each execution additionally uses one cumulative 64 MiB logical admission budget,
-never refunded, for decoded start/filter vertices, observed edge payloads,
+never refunded, for encoded global-start pages, decoded start/filter vertices, observed edge payloads,
 ordering entries, row/path construction and final result slots/stamps. Fixed
 fees are 128 bytes per vertex/row/property/output slot, 256 per observed edge,
-64 per stamp, actual label/property text bytes, and actual path element sizes.
+64 per stamp, 128 per global page row, actual encoded global-page bytes, actual
+label/property text bytes, and actual path element sizes.
 A query admits at most 10,000 rows per stage and 10,000 work units across all
-stages: one per explicit start or filter lookup, adjacency invocation, and returned
-edge. These are logical units, **not** the physical read count: each adjacency
+stages: one per explicit start, decoded global-start candidate or filter lookup,
+adjacency invocation, and returned edge. Global candidates from all partitions
+share this 10,000-work-unit cap; leading-limit candidates discarded during global
+merge still consume work/bytes. Thus a leading limit is not a guarantee that a
+query fits the work budget (for example, 32 partitions each supplying 1,000
+candidates exceed it). These are logical units, **not** the physical read count: each adjacency
 invocation internally verifies canonical/index/endpoint records. Existing primitive
 caps remain 1,000 entries / 1 MiB index bytes and 1 MiB decoded adjacency output.
 Snapshot buffers and primitive read/decode scratch are excluded from the query
 budget and retain their separately documented bounds. One bounded primitive
-result can exist before cumulative admission, then is charged before retention
+result or decoded start page can exist before cumulative admission, then is charged before retention
 in query rows/maps. Caller text, parser memory, allocator spare capacity, teardown
 and process RSS are not covered. There is no claim of precise live-heap accounting.
 Internal row, byte or work exhaustion errors; a later limit/count cannot hide it.
 
 Evidence: the independent metadata/two-data-process fixture exercises qualified
 identity, directional hops, both ordering, parallel edges/self-loop paths,
-filters, counts, limit placement, absent starts/labels, unsupported forms,
+global starts and strict property filters, counts, limit placement, absent starts/labels, unsupported forms,
 byte exhaustion and bounded multi-hop expansion, frozen views, and explicit incomplete-result propagation.
 Single-voter normal-path evidence does not establish failover, repair, distributed
 snapshot isolation or production transport security.

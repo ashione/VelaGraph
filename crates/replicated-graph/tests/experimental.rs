@@ -13,7 +13,7 @@ use replicated_graph::{
 };
 use rocksdb_sql_table::{
     experimental_graph::{CrossEdge, Direction, EdgeRef, ExperimentalError, VertexRef},
-    Vertex,
+    Value, Vertex,
 };
 use std::{
     collections::BTreeMap,
@@ -136,7 +136,7 @@ async fn scenario() -> anyhow::Result<()> {
     let ap = a.placement.clone();
     let bp = b.placement.clone();
     let (resolver, unknown_source, unknown_reverse) = run_blocking(move || -> anyhow::Result<_> {
-        for (p, placement) in [(1, ap.clone()), (2, bp), (3, ap)] {
+        for (p, placement) in [(1, ap.clone()), (2, bp), (3, ap.clone())] {
             catalog.commit_registration(&catalog.prepare_registration(
                 [p as u8; 16],
                 p,
@@ -145,6 +145,19 @@ async fn scenario() -> anyhow::Result<()> {
             let session = resolver.experimental_read_session(BUDGET)?;
             let mut v = Vertex::new(7);
             v.labels.push(format!("P{p}"));
+            v.properties.insert(
+                "typed".into(),
+                match p {
+                    1 => Value::Integer(1),
+                    2 => Value::Real(1.0),
+                    _ => Value::Text("1".into()),
+                },
+            );
+            if p != 3 {
+                v.properties.insert("nullable".into(), Value::Null);
+            }
+            v.properties
+                .insert("enabled".into(), Value::Boolean(p == 2));
             let vertex = session.prepare_vertex(p, &v)?;
             resolver.experimental_commit(&vertex, BUDGET)?;
             resolver.experimental_commit(&vertex, BUDGET)?; // exact dedup
@@ -255,6 +268,87 @@ async fn scenario() -> anyhow::Result<()> {
         let vr = |partition| VertexRef { partition, id: 7 };
         let v = |p| ObservedPathElement::Vertex(vr(p));
         let e = |partition, id| ObservedPathElement::Edge(EdgeRef { partition, id });
+        // Global starts ignore even an unregistered start partition, include
+        // partitions sharing a shard, and sort by (local ID, partition).
+        let global = session.observed_gremlin(999, "g.V()")?;
+        let global_rows = vec![
+            ObservedRow::Vertex(vr(1)),
+            ObservedRow::Vertex(vr(2)),
+            ObservedRow::Vertex(vr(3)),
+            ObservedRow::Vertex(VertexRef {
+                partition: 1,
+                id: 99,
+            }),
+        ];
+        assert_eq!(global.rows, global_rows);
+        assert_eq!(global.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(global.snapshots, session.snapshots);
+        assert_eq!(global.metadata_sequence, session.metadata_sequence);
+        assert_eq!(session.snapshots.len(), 2); // three partitions, two shards
+        assert_eq!(
+            session.observed_gremlin(2, "g.V().limit(2)")?.rows,
+            global_rows[..2]
+        );
+        assert_eq!(
+            session.observed_gremlin(1, "g.V(99,7,99)")?.rows,
+            vec![
+                global_rows[3].clone(),
+                global_rows[0].clone(),
+                global_rows[3].clone()
+            ]
+        );
+        assert_eq!(
+            session.observed_gremlin(2, "g.V(7,7)")?.rows,
+            vec![ObservedRow::Vertex(vr(2)); 2]
+        );
+        for (query, expected) in [
+            ("g.V().count()", 4),
+            ("g.V().has('typed').count()", 3),
+            ("g.V().has('typed',1).count()", 1),
+            ("g.V().has('typed',1.0).count()", 1),
+            ("g.V().has('typed','1').count()", 1),
+            ("g.V().has('typed',true).count()", 0),
+            ("g.V().has('nullable').count()", 2),
+            ("g.V().has('nullable',null).count()", 2),
+            ("g.V().has('missing').count()", 0),
+            ("g.V().has('missing',null).count()", 0),
+            ("g.V().has('enabled',true).count()", 1),
+            ("g.V().has('enabled',false).count()", 2),
+            ("g.V().limit(1).has('enabled',true).count()", 0),
+            ("g.V().has('enabled',true).limit(1).count()", 1),
+            ("g.V().hasLabel('P2').limit(1).count()", 1),
+            ("g.V().limit(1).hasLabel('P2').count()", 0),
+            ("g.V(7).out().has('typed',1.0).count()", 2),
+            ("g.V(7).out().has('typed',1).count()", 1),
+            ("g.V(7).out().has('nullable').count()", 3),
+            ("g.V(7).out().has('nullable',null).count()", 3),
+            ("g.V(7).out().has('missing',null).count()", 0),
+        ] {
+            let result = session.observed_gremlin(1, query)?;
+            assert_eq!(result.rows, vec![ObservedRow::Count(expected)], "{query}");
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+            assert_eq!(result.snapshots, session.snapshots);
+            assert_eq!(result.metadata_sequence, session.metadata_sequence);
+        }
+        assert_eq!(
+            session
+                .observed_gremlin(999, "g.V().has('typed').path()")?
+                .rows,
+            vec![
+                ObservedRow::Path(vec![v(1)]),
+                ObservedRow::Path(vec![v(2)]),
+                ObservedRow::Path(vec![v(3)])
+            ]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin(999, "g.V().has('typed',1).out().has('typed',1.0).path()")?
+                .rows,
+            vec![
+                ObservedRow::Path(vec![v(1), e(1, 9), v(2)]),
+                ObservedRow::Path(vec![v(1), e(1, 10), v(2)]),
+            ]
+        );
         let both = session.observed_gremlin(1, "g.V(7).both().path()")?;
         assert_eq!(both.completeness, AdjacencyCompleteness::Unverified);
         assert_eq!(both.snapshots, session.snapshots);
@@ -323,10 +417,9 @@ async fn scenario() -> anyhow::Result<()> {
             vec![ObservedRow::Count(0)]
         );
         for text in [
-            "g.V()",
             "g.E(9)",
             "g.V(7).id()",
-            "g.V(7).has('x')",
+            "g.V(7).label()",
             "g.V(7).values('x')",
         ] {
             assert!(matches!(
@@ -381,6 +474,19 @@ async fn scenario() -> anyhow::Result<()> {
                 rocksdb_sql_table::Error::TraversalLimitExceeded(_)
             ))
         ));
+        // Filters and terminal output caps cannot refund preceding acquisition.
+        for suffix in [".has('missing').count()", ".has('blob').limit(1)"] {
+            let query = format!("g.V({}){suffix}", vec!["99"; 50].join(","));
+            assert!(
+                matches!(
+                    session.observed_gremlin(1, &query),
+                    Err(ExperimentalRouteError::Query(
+                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                    ))
+                ),
+                "{query}"
+            );
+        }
         let leading = format!(
             "g.V({}).limit(1).hasLabel('Large').count()",
             vec!["99"; 50].join(",")
@@ -427,8 +533,51 @@ async fn scenario() -> anyhow::Result<()> {
             }) => assert_eq!(Some(request_id), prepared.reverse_request_id()),
             other => panic!("expected honest incomplete outcome: {other:?}"),
         }
+        // Catalog and data acquisition stay frozen independently: this new
+        // same-shard partition and its low-ID vertex must not leak into session.
+        catalog.commit_registration(&catalog.prepare_registration([4; 16], 4, ap)?)?;
+        let fresh = resolver.experimental_read_session(BUDGET)?;
+        let new_partition_vertex = fresh.prepare_vertex(4, &Vertex::new(2))?;
+        resolver.experimental_commit(&new_partition_vertex, BUDGET)?;
+        drop(fresh);
         // Source remains; no claim of abort. Index-only incoming cannot detect it.
         let current = resolver.experimental_read_session(BUDGET)?;
+        let pinned_global = session.observed_gremlin(4, "g.V()")?;
+        assert_eq!(pinned_global.rows, global_rows);
+        assert_eq!(pinned_global.snapshots, session.snapshots);
+        assert_eq!(pinned_global.metadata_sequence, session.metadata_sequence);
+        assert_eq!(
+            pinned_global.completeness,
+            AdjacencyCompleteness::Unverified
+        );
+        let fresh_global = current.observed_gremlin(999, "g.V()")?;
+        assert_eq!(
+            fresh_global.rows,
+            vec![
+                ObservedRow::Vertex(VertexRef {
+                    partition: 4,
+                    id: 2
+                }),
+                ObservedRow::Vertex(vr(1)),
+                ObservedRow::Vertex(vr(2)),
+                ObservedRow::Vertex(vr(3)),
+                ObservedRow::Vertex(VertexRef {
+                    partition: 2,
+                    id: 8
+                }),
+                ObservedRow::Vertex(VertexRef {
+                    partition: 1,
+                    id: 99
+                }),
+            ]
+        );
+        assert_eq!(fresh_global.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(fresh_global.snapshots, current.snapshots);
+        assert_eq!(fresh_global.metadata_sequence, current.metadata_sequence);
+        assert_ne!(fresh_global.metadata_sequence, session.metadata_sequence);
+        assert_ne!(fresh_global.snapshots, session.snapshots);
+        assert_eq!(current.snapshots.len(), 2);
+
         assert!(matches!(
             current.get_edge(EdgeRef {
                 partition: 1,

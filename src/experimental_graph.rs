@@ -121,6 +121,15 @@ pub struct AppendOnlyStore<S> {
     shard: u64,
     partition: u32,
 }
+/// A bounded page of v2 vertices in local ID order.
+/// `raw_bytes` accounts for the encoded page alongside the decoded vertices.
+/// Pass `next_after` back to continue; None means the range was exhausted.
+#[derive(Debug)]
+pub struct VertexPage {
+    pub vertices: Vec<Vertex>,
+    pub next_after: Option<u64>,
+    pub raw_bytes: usize,
+}
 impl<S: StorageNode> AppendOnlyStore<S> {
     pub fn new(node: S, shard: u64, partition: u32) -> Self {
         Self {
@@ -153,6 +162,63 @@ impl<S: StorageNode> AppendOnlyStore<S> {
     pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
         let v = self.view()?;
         self.vertex_in(id, &v)
+    }
+    /// Reads a bounded ordered page, without an all-or-error scan fallback.
+    /// Each call uses this node's read view. Callers requiring stable pages must
+    /// use a pinned node, as ExperimentalReadSession does; a plain live node
+    /// does not promise a snapshot across calls.
+    pub fn vertex_page(&self, after: Option<u64>, limit: ScanLimit) -> Result<VertexPage> {
+        if limit.max_rows > 128 || limit.max_bytes > 1024 * 1024 + 64 {
+            return Err(ExperimentalError::Invalid(
+                "vertex page exceeds 128 rows or 1 MiB + 64 bytes",
+            ));
+        }
+        let view = self.view()?;
+        let mut prefix = record_key(self.partition, b"vertex/", 0);
+        prefix.truncate(prefix.len() - 8);
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() += 1;
+        let start = after.map_or_else(
+            || prefix.clone(),
+            |id| {
+                let mut key = record_key(self.partition, b"vertex/", id);
+                // Exclusive canonical key, without skipping malformed suffixes.
+                key.push(0);
+                key
+            },
+        );
+        let page = self
+            .node
+            .scan_page(KeyRange::new(start, end)?, limit, &view, None)?;
+        let mut vertices = Vec::new();
+        let mut raw_bytes = 0usize;
+        let mut last = after;
+        for row in page.rows {
+            self.node.check_execution_context()?;
+            raw_bytes = raw_bytes.saturating_add(row.key.len() + row.value.len());
+            if !row.key.starts_with(&prefix) || row.key.len() != prefix.len() + 8 {
+                return Err(ExperimentalError::Corrupt("vertex key encoding"));
+            }
+            let id = u64::from_be_bytes(row.key[prefix.len()..].try_into().unwrap());
+            if last.is_some_and(|previous| id <= previous) {
+                return Err(ExperimentalError::Corrupt("vertex page order"));
+            }
+            let (partition, bytes) = unwrap_record(&row.value, 1)?;
+            let vertex = codec::decode_vertex(bytes)?;
+            if partition != self.partition || vertex.id != id {
+                return Err(ExperimentalError::Corrupt("vertex key identity"));
+            }
+            last = Some(id);
+            vertices.push(vertex);
+        }
+        if page.next_cursor.is_some() && vertices.is_empty() {
+            return Err(ExperimentalError::Corrupt("empty continuing vertex page"));
+        }
+        Ok(VertexPage {
+            vertices,
+            next_after: page.next_cursor.and(last),
+            raw_bytes,
+        })
     }
     fn vertex_in(&self, id: u64, v: &ReadView) -> Result<Option<Vertex>> {
         self.node

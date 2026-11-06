@@ -528,8 +528,8 @@ A separate [append-only graph/v2 experiment](docs/EXPERIMENTAL_CROSS_EDGES.md)
 supports qualified vertices and source-owned edges across shards, with explicit
 non-atomic staged writes and unknown/incomplete outcomes. Its out/in API returns
 index observations with **unverified completeness**, not complete Gremlin results.
-Its separate observed Gremlin API supports explicit vertex starts, directional
-hops, labels, qualified paths, limits and counts while retaining that uncertainty.
+Its separate observed Gremlin API supports global/explicit vertex starts, directional
+hops, label/property filters, qualified paths, limits and counts while retaining that uncertainty.
 V1 data and atomicity stay unchanged; v1 entities do not participate. No automatic
 repair, migration, failover guarantee or production deployment is implied.
 
