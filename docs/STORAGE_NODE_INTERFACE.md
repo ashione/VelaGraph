@@ -272,6 +272,43 @@ are retryable after refreshing route/read view; `Corrupt`,
   deduplicates them.
 - v0 makes no cross-shard atomicity promise. D4 adds it explicitly.
 
+## Explicit bounded pagination
+
+`ReadView::scan_page(range, limit, cursor)` and optional
+`StorageNode::scan_page(range, limit, view, cursor)` are additive APIs. Existing
+`scan` remains all-or-error: exceeding its row or byte limit is still
+`ResourceExhausted`, not a partial result. Pagination is explicit and does not
+relax query-level total budgets or permit a query to report partial success.
+
+- Each page returns at most `max_rows` and at most `max_bytes` of key + value
+  bytes, in ascending byte-key order over `[start, end)`. Limits must be nonzero.
+- `ScanPage.rows` contains the page and `next_cursor` is `None` only when the
+  range is exhausted. An exact row/byte boundary at the end has no continuation.
+- A continuation is exclusive of the last returned key. It is opaque, cloneable,
+  in-process only, and bound to the exact snapshot allocation, metadata, and
+  range. A clone of that view works; a new view at even the same sequence does
+  not. Replaying a cursor deterministically repeats the page; limits may change.
+- Every nonterminal page contains a row and advances its cursor. If the first
+  remaining row does not fit the byte budget, the call fails with
+  `ResourceExhausted`. It never returns an empty nonterminal page. If a later
+  row cannot fit, preceding rows form a page and the next call must fit that
+  row or fail. No row is skipped or silently truncated.
+- The algorithm seeks after the cursor and inspects at most one extra row to
+  determine exhaustion, without cloning that lookahead row. Allocation is
+  bounded by the page limits and the already bounded snapshot. Cursors share
+  ownership of that snapshot and retain it until dropped; they are not a remote
+  cursor format or a lease/production snapshot implementation.
+- Local and replicated adapters perform their existing view shard/epoch checks
+  on every page. The replicated adapter also enforces its blocking execution
+  context. A retained snapshot may continue through an explicitly selected new
+  replica in the same shard/epoch after failover; it never refreshes its contents.
+  New view acquisition still requires the leader read barrier. This retains the
+  same snapshot-read fencing limitations as existing `get`/`scan` (checks use
+  contacted replica metadata, not a new consensus barrier on each page).
+- Other adapters/decorators default to `Unsupported` until they explicitly
+  implement/forward pagination and preserve those checks. Direct `ReadView`
+  methods only read immutable data; they do not perform adapter fencing.
+
 ## Versioning and negotiation
 
 ```text

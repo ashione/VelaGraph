@@ -94,6 +94,65 @@ impl ReadView {
         self.data.get(key).cloned()
     }
 
+    /// Return one explicitly bounded page of this immutable snapshot.
+    ///
+    /// Continue with the returned cursor and the same range and view (or its
+    /// clone). A different view, even at the same sequence, is rejected. Limits
+    /// may change between pages. Adapter ownership/fencing checks are separate.
+    /// A nonterminal page always contains at least one row; a first row larger
+    /// than the byte budget is an error, never an empty continuation.
+    pub fn scan_page(
+        &self,
+        range: KeyRange,
+        limit: ScanLimit,
+        cursor: Option<&ScanCursor>,
+    ) -> Result<ScanPage> {
+        range.validate()?;
+        ScanLimit::new(limit.max_rows, limit.max_bytes)?;
+        let (mut start, end) = range.bounds();
+        if let Some(cursor) = cursor {
+            if !Arc::ptr_eq(&self.data, &cursor.view.data)
+                || (self.shard, self.epoch, self.sequence)
+                    != (cursor.view.shard, cursor.view.epoch, cursor.view.sequence)
+                || range != cursor.range
+            {
+                return Err(StorageNodeError::InvalidArgument(
+                    "scan cursor belongs to a different view or range".into(),
+                ));
+            }
+            start = Bound::Excluded(cursor.after.as_slice());
+        }
+        let mut rows: Vec<KeyValue> = Vec::new();
+        let mut bytes = 0usize;
+        for (key, value) in self.data.range::<[u8], _>((start, end)) {
+            let entry_bytes = key.len().saturating_add(value.len());
+            if rows.len() >= limit.max_rows || entry_bytes > limit.max_bytes.saturating_sub(bytes) {
+                let Some(last) = rows.last() else {
+                    return Err(StorageNodeError::ResourceExhausted(
+                        "scan page cannot fit one row".into(),
+                    ));
+                };
+                return Ok(ScanPage {
+                    next_cursor: Some(ScanCursor {
+                        view: self.clone(),
+                        range,
+                        after: last.key.clone(),
+                    }),
+                    rows,
+                });
+            }
+            bytes += entry_bytes;
+            rows.push(KeyValue {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+        Ok(ScanPage {
+            rows,
+            next_cursor: None,
+        })
+    }
+
     /// Scan this immutable snapshot without returning partial results on limits.
     pub fn scan(&self, range: KeyRange, limit: ScanLimit) -> Result<Vec<KeyValue>> {
         range.validate()?;
@@ -114,6 +173,33 @@ impl ReadView {
         }
         Ok(out)
     }
+}
+
+/// An opaque, in-process continuation tied to one immutable view and range.
+/// Retains the view by shared ownership without copying its entries. It is not
+/// a serializable remote cursor. Replaying it repeats the same page.
+#[derive(Clone)]
+pub struct ScanCursor {
+    view: ReadView,
+    range: KeyRange,
+    after: Vec<u8>,
+}
+
+impl fmt::Debug for ScanCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScanCursor")
+            .field("view", &self.view)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Explicit partial scan result. `None` means the range has been exhausted;
+/// `Some` always advances past the last returned key, exclusively.
+#[derive(Clone, Debug)]
+pub struct ScanPage {
+    pub rows: Vec<KeyValue>,
+    pub next_cursor: Option<ScanCursor>,
 }
 
 /// A half-open byte range. `None` for `end` means unbounded.
@@ -343,6 +429,19 @@ pub trait StorageNode: Send + Sync {
     fn read_view(&self) -> Result<ReadView>;
     fn get(&self, key: &[u8], view: &ReadView) -> Result<Option<Vec<u8>>>;
     fn scan(&self, range: KeyRange, limit: ScanLimit, view: &ReadView) -> Result<Vec<KeyValue>>;
+    /// Optional bounded pagination. Implementations must perform the same view
+    /// checks as `scan` on every page. The default fails closed for adapters and
+    /// decorators that have not explicitly implemented pagination.
+    fn scan_page(
+        &self,
+        _range: KeyRange,
+        _limit: ScanLimit,
+        _view: &ReadView,
+        _cursor: Option<&ScanCursor>,
+    ) -> Result<ScanPage> {
+        Err(StorageNodeError::Unsupported("paged scans".into()))
+    }
+
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult>;
 
     /// Atomically commit only if the shard still has `expected_sequence`.
@@ -643,6 +742,17 @@ impl StorageNode for LocalStorageNode {
             });
         }
         Ok(out)
+    }
+
+    fn scan_page(
+        &self,
+        range: KeyRange,
+        limit: ScanLimit,
+        view: &ReadView,
+        cursor: Option<&ScanCursor>,
+    ) -> Result<ScanPage> {
+        self.check_view(view)?;
+        view.scan_page(range, limit, cursor)
     }
 
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult> {

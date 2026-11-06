@@ -159,3 +159,13 @@ Existing convenience graph CRUD signatures and local behavior are unchanged.
 All scans and preparation loops retain existing graph limits. Snapshot copy
 loops stop on row/byte bounds; waits have deadlines. Existing D2 logical
 snapshots and apply-map clones remain prototype costs, not scalability evidence.
+
+## Explicit paged snapshot reads
+
+The adapter supports D1 `scan_page` with an opaque exclusive cursor tied to the
+original immutable view and range. Each page checks execution context, shard,
+and the contacted replica's epoch, just like `scan`; it never reacquires a
+snapshot or silently changes sequences after failover. The new API does not
+change the existing all-or-error `scan` contract or query-level budgets. See
+[the D1 pagination contract](STORAGE_NODE_INTERFACE.md#explicit-bounded-pagination)
+for row/byte limits, oversized-row errors, cursor lifetime, and compatibility.

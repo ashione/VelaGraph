@@ -567,3 +567,98 @@ async fn retained_views_bounded_scans_and_replicated_epoch_fencing() -> anyhow::
     })
     .await?
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paged_snapshot_survives_failover_without_switching_view() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(45), async {
+        use rocksdb_sql_table::{WriteOp, WriteRequest};
+        let cluster = Cluster::new();
+        let dirs = (0..3)
+            .map(|_| tempfile::tempdir())
+            .collect::<Result<Vec<_>, _>>()?;
+        let nodes = start(&cluster, &dirs).await?;
+        let current = bootstrap(&nodes).await?;
+        let adapter = ReplicatedStorageNode::new(&nodes[current], 7, Duration::from_secs(2))?;
+        let a = adapter.clone();
+        let view = run_blocking(move || {
+            a.batch_write(WriteRequest {
+                shard: 7,
+                epoch: 3,
+                request_id: [91; 16],
+                operations: vec![
+                    WriteOp::put(b"a", b"1"),
+                    WriteOp::put(b"b", b"2"),
+                    WriteOp::put(b"c", b"3"),
+                ],
+            })?;
+            a.read_view()
+        })
+        .await??;
+        let limit = ScanLimit::new(1, 2)?;
+        // Every adapter page must reject synchronous execution on a Tokio worker.
+        assert!(matches!(
+            adapter.scan_page(KeyRange::all(), limit, &view, None),
+            Err(StorageNodeError::Unsupported(_))
+        ));
+        let a = adapter.clone();
+        let v = view.clone();
+        let first = run_blocking(move || a.scan_page(KeyRange::all(), limit, &v, None)).await??;
+        assert_eq!(first.rows[0].key, b"a");
+        converge(&cluster, &nodes, current).await?;
+        cluster.shutdown(&nodes[current]).await;
+        let next = leader(&nodes, Some(nodes[current].id)).await?;
+        let adapter = ReplicatedStorageNode::new(&nodes[next], 7, Duration::from_secs(2))?;
+        let a = adapter.clone();
+        let fresh = run_blocking(move || {
+            a.batch_write(WriteRequest {
+                shard: 7,
+                epoch: 3,
+                request_id: [92; 16],
+                operations: vec![WriteOp::delete(b"b"), WriteOp::put(b"d", b"4")],
+            })?;
+            a.read_view()
+        })
+        .await??;
+        let cursor = first.next_cursor.unwrap();
+        let a = adapter.clone();
+        let c = cursor.clone();
+        // A freshly acquired view cannot silently replace the original snapshot.
+        assert!(matches!(
+            run_blocking(move || a.scan_page(KeyRange::all(), limit, &fresh, Some(&c))).await?,
+            Err(StorageNodeError::InvalidArgument(_))
+        ));
+        let a = adapter.clone();
+        let v = view.clone();
+        let second =
+            run_blocking(move || a.scan_page(KeyRange::all(), limit, &v, Some(&cursor))).await??;
+        assert_eq!(second.rows[0].key, b"b");
+        let a = adapter.clone();
+        let v = view.clone();
+        let cursor = second.next_cursor.unwrap();
+        let last =
+            run_blocking(move || a.scan_page(KeyRange::all(), limit, &v, Some(&cursor))).await??;
+        assert_eq!(last.rows[0].key, b"c");
+        assert!(last.next_cursor.is_none());
+        let response = nodes[next]
+            .raft
+            .client_write(LogCommand::D1V1(D1Command::SetEpoch {
+                shard: 7,
+                expected_epoch: 3,
+                new_epoch: 4,
+            }))
+            .await?;
+        assert!(response.data.d1.unwrap().is_ok());
+        let a = adapter.clone();
+        assert!(matches!(
+            run_blocking(move || a.scan_page(KeyRange::all(), limit, &view, None)).await?,
+            Err(StorageNodeError::Fenced { current: 4, .. })
+        ));
+        for (i, node) in nodes.iter().enumerate() {
+            if i != current {
+                cluster.shutdown(node).await;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
