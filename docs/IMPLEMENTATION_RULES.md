@@ -138,4 +138,6 @@ The isolated graph/v2 append-only API in [EXPERIMENTAL_CROSS_EDGES.md](EXPERIMEN
 is an explicit R2/R4/R12 scope exception: new versioned protobuf-compatible
 envelopes and golden/reopen tests, two non-atomic cross-shard batches, and
 observed-only adjacency with unverified completeness. V1 contracts are unchanged.
-No Gremlin/query-layer behavior inherits this exception.
+The separate observed Gremlin entrypoint is an additive R12/D5 experimental
+scope exception, with qualified paths and explicitly Unverified results. No v1
+Gremlin/query-layer behavior inherits this exception.

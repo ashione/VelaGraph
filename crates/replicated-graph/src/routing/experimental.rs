@@ -1,11 +1,15 @@
 //! Isolated v2 append-only graph experiment. Not a distributed transaction.
 use super::*;
+mod traversal;
 use rocksdb_sql_table::experimental_graph::{
     AppendOnlyStore, CrossEdge, Direction, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
 };
+pub use traversal::{ObservedPathElement, ObservedRow, ObservedTraversal};
 
 #[derive(Debug)]
 pub enum ExperimentalRouteError {
+    Query(rocksdb_sql_table::Error),
+    Unsupported(&'static str),
     Route(RouteError),
     Graph(ExperimentalError),
     /// The caller retains the original PreparedAppend for exact retry. A failed

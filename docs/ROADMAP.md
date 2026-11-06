@@ -225,3 +225,10 @@ and two independent data processes exercise the functional path. D5 remains open
 versioned namespace and explicitly non-atomic source/reverse append protocol.
 It does not change this document's existing v1/K3/Gremlin contract or complete
 D4/D5. Its out/in observations cannot certify missing-index completeness.
+
+
+D5 experimental functional slice: isolated v2 observed Gremlin now supports
+explicit V IDs with qualified out/in/both, label filtering, vertex/edge paths,
+limits and observed counts. Results always expose Unverified completeness and a
+per-shard snapshot vector. Full adjacency visibility, global consistency, repair
+and complete D5 remain deferred. See EXPERIMENTAL_CROSS_EDGES.md.

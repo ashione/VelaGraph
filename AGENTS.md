@@ -44,4 +44,5 @@ snapshot transactions), and D1 (storage-node interface). Do not implement
 cross-partition transactions, Raft, or Cypher as part of a query-layer change.
 
 The isolated v2 append-only storage experiment is a reviewed scope exception,
-not a query-layer or distributed-transaction implementation.
+extended only by the separately typed observed Gremlin subset in the same
+contract, not complete D5 or a distributed-transaction implementation.
