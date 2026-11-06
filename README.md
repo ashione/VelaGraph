@@ -530,3 +530,12 @@ non-atomic staged writes and unknown/incomplete outcomes. Its out/in API returns
 index observations with **unverified completeness**, not complete Gremlin results.
 V1 data and atomicity stay unchanged; v1 entities do not participate. No automatic
 repair, migration, failover guarantee or production deployment is implied.
+
+### Gremlin parser resource admission
+
+All Gremlin text entrypoints now reject more than 64 raw structural marks
+(`()[]{},.:;`) with typed `GremlinComplexityLimit` before invoking the official
+recursive parser. The existing 16 KiB cap alone did not prevent stack overflow
+from short repeated lists/chains. Marks inside strings/comments also count: this
+intentionally conservative compatibility restriction avoids a second lexer and
+malformed-string bypasses. See [query limits](docs/QUERY_SPEC.md#8-resource-limits).

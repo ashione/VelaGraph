@@ -546,10 +546,12 @@ fn assert_query_byte_limit(result: Result<GremlinResult>, query: &str) {
 
 #[test]
 fn aggregate_budget_parallel_edges_and_repeated_ids_reject_on_all_entry_points() {
+    // Stay below parser admission while retaining >64 MiB amplification:
+    // fifty repeated 2 MiB vertices still exercise the execution byte budget.
     let mut target = Vertex::new(2);
     target
         .properties
-        .insert("big".into(), Value::Text("x".repeat(1024 * 1024)));
+        .insert("big".into(), Value::Text("x".repeat(2 * 1024 * 1024)));
     let vertices = vec![Vertex::new(1), target];
     let edges = (0..100)
         .map(|id| Edge::new(id, 1, 2, "TO"))
@@ -564,7 +566,7 @@ fn aggregate_budget_parallel_edges_and_repeated_ids_reject_on_all_entry_points()
     }
     let store = GraphRecordStore::new(Node::new(&vertices, &edges), 7, 0);
     let retained = store.read_view().unwrap();
-    let repeated = format!("g.V({}).count()", vec!["2"; 100].join(","));
+    let repeated = format!("g.V({}).count()", vec!["2"; 50].join(","));
     for text in [
         "g.V(1).out()",
         "g.V(1).out().limit(1)",
@@ -576,7 +578,7 @@ fn aggregate_budget_parallel_edges_and_repeated_ids_reject_on_all_entry_points()
         assert_query_byte_limit(query.execute_records(&store), text);
         assert_query_byte_limit(query.execute_record_view(&retained), text);
     }
-    let text = format!("g.V({}).limit(1).id()", vec!["2"; 100].join(","));
+    let text = format!("g.V({}).limit(1).id()", vec!["2"; 50].join(","));
     let query = GremlinQuery::parse(&text).unwrap();
     let expected = GremlinResult {
         rows: vec![GremlinRow::Value(Value::Integer(2))],

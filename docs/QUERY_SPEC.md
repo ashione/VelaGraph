@@ -32,6 +32,19 @@ tests in the same change.
 - `;`-separated lists, mutations (`addV`, `addE`, `property`, `drop`), lambdas,
   bytecode, and server scripts are rejected.
 - Query text MUST be valid UTF-8 and at most 16 KiB.
+- Before invoking the recursive official parser, input MUST contain at most
+  64 raw structural marks from `()[]{},.:;`. Marks inside quoted strings and
+  comments count too. This conservative resource admission does not tokenize,
+  validate, normalize, or rewrite Gremlin; the official grammar still decides
+  syntax. Above the limit, return `GremlinComplexityLimit` before parsing.
+  Counting raw marks avoids hiding recursion behind malformed quotes, escapes,
+  comments, or lexer recovery. It covers argument lists, chains, and nesting,
+  including unsupported constructs, at every `GremlinQuery::parse` entrypoint.
+- Compatibility change: previously accepted long lists/chains or punctuation-heavy
+  string values can now fail admission even below 16 KiB. For example `g.V(...)`
+  accepts up to 62 simple IDs with no other steps; duplicate IDs still count and
+  retain their order. Long ordinary Unicode/alphanumeric string values remain
+  governed by the byte limit. This is not a per-step or token count.
 - String literals use Gremlin quoting rules (single or double quotes); the
   parser decides validity.
 
@@ -181,6 +194,7 @@ resource limit is an error.
 | Error | Meaning |
 |---|---|
 | `GremlinParse` | invalid Gremlin text or multiple queries |
+| `GremlinComplexityLimit` | raw structural-mark budget exceeded before parsing |
 | `UnsupportedGremlinStep` | valid Gremlin, step outside v0 |
 | `UnsupportedGremlinArgument` | step in v0, argument form outside v0 |
 | `UnsupportedGremlinValue` | literal type outside v0 |
@@ -195,6 +209,11 @@ to an empty result.
 ## 8. Resource limits
 
 - Query text: 16 KiB.
+- Parser admission: 64 raw structural marks (`()[]{},.:;`), including quoted
+  and commented text. This bound is tested in isolated subprocesses on a 2 MiB
+  worker-thread stack, including parser, validation and parse-tree destruction.
+  It is not a guarantee for arbitrarily small caller stacks or a parsing deadline.
+  Revalidate it when upgrading the pinned parser/runtime or supported platforms.
 - Edge steps: 3.
 - Rows per query: 10,000 before explicit `limit`.
 - Default `limit`: 100; maximum explicit `limit`: 1000.

@@ -60,6 +60,10 @@ pub const DEFAULT_GREMLIN_LIMIT: usize = 100;
 pub const MAX_GREMLIN_LIMIT: usize = 1_000;
 /// Maximum accepted query text.
 pub const MAX_GREMLIN_QUERY_BYTES: usize = 16 * 1024;
+/// Maximum raw structural marks (`()[]{},.:;`) before invoking the recursive
+/// official parser. Marks inside strings and comments also count, deliberately.
+/// This is a conservative resource limit, not a lexer or grammar validation.
+pub const MAX_GREMLIN_STRUCTURAL_MARKS: usize = 64;
 /// Wall-clock deadline for one query.
 pub const GREMLIN_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -126,6 +130,21 @@ impl GremlinQuery {
                 "query text is {} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}",
                 input.len()
             )));
+        }
+        // The byte cap alone is insufficient: short repeated arguments, chains,
+        // or nested literals can overflow the generated parser's call stack.
+        // Count raw marks, including quoted/commented ones, so malformed lexical
+        // input and lexer recovery cannot hide recursion from admission. Do not
+        // interpret tokens, escapes, identifiers, or Gremlin semantics here.
+        let marks = input
+            .bytes()
+            .filter(|byte| b"()[]{},.:;".contains(byte))
+            .count();
+        if marks > MAX_GREMLIN_STRUCTURAL_MARKS {
+            return Err(Error::GremlinComplexityLimit {
+                marks,
+                limit: MAX_GREMLIN_STRUCTURAL_MARKS,
+            });
         }
         if contains_unquoted_semicolon(input) {
             return Err(Error::GremlinParse(
