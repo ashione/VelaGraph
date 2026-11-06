@@ -84,6 +84,8 @@
 - **完成定义**：节点下线后路由自动收敛；新节点加入可迁移分片；元数据有版本和回滚。
 - **依赖**：D2 的副本状态机。
 
+- **D3a 静态 catalog 切片**：独立预配置 metadata D1 group 上的持久化、版本化 partition→shard→group/epoch/replicas catalog；leader barrier 读取、条件注册、精确重试与不可变绑定。进程内 `(group,node)` 隔离；无 quorum 失败关闭。详见 [`D3_STATIC_CATALOG.md`](D3_STATIC_CATALOG.md)。不支持自动路由收敛、成员变更或迁移，不代表 D3 完成；catalog epoch 不构成跨独立 group 的 fence。
+
 ### D4 分布式事务
 
 - **交付物**：跨分片 2PC 或快照事务；事务协调者；超时/恢复/悬挂事务处理。
