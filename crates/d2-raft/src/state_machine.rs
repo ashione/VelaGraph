@@ -13,8 +13,11 @@ use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, WriteBatch, W
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::d1::D1State;
 use crate::types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};
+use crate::{D1Command, D1Error, D1Result, D1WriteStatus};
 
+const D1_KEY: &[u8] = b"sm/d1";
 const DATA_PREFIX: &[u8] = b"sm/data/";
 const DATA_PREFIX_END: &[u8] = b"sm/data0";
 const APPLIED_KEY: &[u8] = b"sm/applied";
@@ -32,6 +35,42 @@ pub struct StateMachineData {
     pub last_applied_log: Option<LogId<NodeId>>,
     pub last_membership: StoredMembership<NodeId, BasicNode>,
     pub data: BTreeMap<Vec<u8>, Vec<u8>>,
+    #[serde(default)]
+    pub(crate) d1: Option<D1State>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV1 {
+    version: u32,
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    d1: D1State,
+}
+
+struct DecodedSnapshot {
+    data: BTreeMap<Vec<u8>, Vec<u8>>,
+    d1: Option<D1State>,
+}
+
+// Legacy snapshots are arrays; D1 snapshots are a mandatory versioned object.
+fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<DecodedSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let (entries, d1) = if value.is_array() {
+        (
+            serde_json::from_value::<Vec<(Vec<u8>, Vec<u8>)>>(value)?,
+            None,
+        )
+    } else {
+        let snapshot: SnapshotV1 = serde_json::from_value(value)?;
+        anyhow::ensure!(snapshot.version == 1, "unsupported snapshot version");
+        snapshot.d1.validate()?;
+        (snapshot.entries, Some(snapshot.d1))
+    };
+    let mut data = BTreeMap::new();
+    for (key, value) in entries {
+        anyhow::ensure!(data.insert(key, value).is_none(), "duplicate snapshot key");
+    }
+    Ok(DecodedSnapshot { data, d1 })
 }
 
 #[derive(Debug)]
@@ -83,10 +122,22 @@ impl StateMachine {
         let db = DB::open(&options, path.as_ref())?;
         let storage = Arc::new(StateMachineStorage { db });
 
-        let last_applied_log = match storage.db.get(APPLIED_KEY)? {
+        let d1: Option<D1State> = storage
+            .db
+            .get(D1_KEY)?
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()?;
+        if let Some(d1) = &d1 {
+            d1.validate()?;
+        }
+        let last_applied_log: Option<LogId<NodeId>> = match storage.db.get(APPLIED_KEY)? {
             Some(value) => serde_json::from_slice(&value)?,
             None => None,
         };
+        anyhow::ensure!(
+            d1.is_none() || last_applied_log.is_some(),
+            "D1 state is missing its applied marker"
+        );
         let last_membership = match storage.db.get(MEMBERSHIP_KEY)? {
             Some(value) => serde_json::from_slice(&value)?,
             None => StoredMembership::default(),
@@ -118,11 +169,23 @@ impl StateMachine {
                 last_applied_log,
                 last_membership,
                 data,
+                d1,
             }),
             snapshot_idx: AtomicU64::new(snapshot_idx),
             current_snapshot: RwLock::new(current_snapshot),
             storage: Some(storage),
         })
+    }
+
+    /// Local diagnostic metadata, not a linearizable distributed read.
+    /// Call `raft.ensure_linearizable()` before sampling on a leader.
+    pub async fn d1_metadata(&self) -> Option<(u64, u64, u64)> {
+        self.state
+            .read()
+            .await
+            .d1
+            .as_ref()
+            .map(|d1| (d1.shard, d1.epoch, d1.sequence))
     }
 
     /// Read a UTF-8 key/value pair from the D2 compatibility surface.
@@ -170,8 +233,15 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachine> {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let data =
-            serde_json::to_vec(&entries).map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let data = match &sm.d1 {
+            Some(d1) => serde_json::to_vec(&SnapshotV1 {
+                version: 1,
+                entries,
+                d1: d1.clone(),
+            }),
+            None => serde_json::to_vec(&entries),
+        }
+        .map_err(|e| StorageIOError::read_state_machine(&e))?;
         let last_applied_log = sm.last_applied_log;
         let last_membership = sm.last_membership.clone();
         let mut current = self.current_snapshot.write().await;
@@ -228,30 +298,36 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
         for entry in entries {
             next.last_applied_log = Some(entry.log_id);
             match entry.payload {
-                EntryPayload::Blank => out.push(ApplyResult { value: None }),
+                EntryPayload::Blank => out.push(ApplyResult {
+                    value: None,
+                    d1: None,
+                }),
                 EntryPayload::Membership(mem) => {
                     next.last_membership = StoredMembership::new(Some(entry.log_id), mem);
-                    out.push(ApplyResult { value: None });
+                    out.push(ApplyResult {
+                        value: None,
+                        d1: None,
+                    });
                 }
                 EntryPayload::Normal(cmd) => {
+                    let mut result = ApplyResult {
+                        value: None,
+                        d1: None,
+                    };
                     match cmd {
                         LogCommand::Noop => {}
                         LogCommand::TxnBatch(operations) => {
-                            for operation in operations {
-                                match operation {
-                                    WriteOp::Put { key, value } => {
-                                        next.data.insert(key.clone(), value.clone());
-                                        batch.put(data_key(&key), value);
-                                    }
-                                    WriteOp::Delete { key } => {
-                                        next.data.remove(&key);
-                                        batch.delete(data_key(&key));
-                                    }
-                                }
+                            if next.d1.is_some() {
+                                result.d1 = Some(Err(D1Error::LegacyWriteDisabled));
+                            } else {
+                                apply_operations(&mut next, &mut batch, operations);
                             }
                         }
+                        LogCommand::D1V1(command) => {
+                            result.d1 = Some(apply_d1(&mut next, &mut batch, command));
+                        }
                     }
-                    out.push(ApplyResult { value: None });
+                    out.push(result);
                 }
             }
         }
@@ -259,6 +335,11 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
         if let Some(storage) = &self.storage {
             let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
             let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
+            if let Some(d1) = &next.d1 {
+                batch.put(D1_KEY, serde_json::to_vec(d1).map_err(write_error)?);
+            } else {
+                batch.delete(D1_KEY);
+            }
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
             storage.write_sync(batch)?;
@@ -279,17 +360,62 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(&bytes)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let DecodedSnapshot { data, d1 } = decode_snapshot(&bytes).map_err(|e| {
+            StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(e.to_string()),
+            )
+        })?;
+        if d1.is_some() && meta.last_log_id.is_none() {
+            return Err(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other("D1 snapshot is missing its applied marker"),
+            )
+            .into());
+        }
+        // Serialize persistence and publication with apply and snapshot build.
+        let mut sm = self.state.write().await;
+        if sm.last_applied_log.is_some_and(|current| {
+            meta.last_log_id.is_none_or(|incoming| {
+                incoming.index < current.index
+                    || (incoming.index == current.index && incoming != current)
+            })
+        }) {
+            return Err(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other("snapshot would regress applied state"),
+            )
+            .into());
+        }
+        if sm.d1.is_some() && d1.is_none() {
+            return Err(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other("cannot downgrade D1 snapshot to legacy"),
+            )
+            .into());
+        }
+        if let (Some(current), Some(incoming)) = (&sm.d1, &d1) {
+            if current.shard != incoming.shard {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other("snapshot shard mismatch"),
+                )
+                .into());
+            }
+        }
         let next = StateMachineData {
             last_applied_log: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
-            data: entries.into_iter().collect(),
+            data,
+            d1,
         };
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: bytes,
         };
+        // Acquire both locks before the durable write: there is no cancellation
+        // point between a successful disk commit and publishing the new state.
+        let mut current = self.current_snapshot.write().await;
 
         if let Some(storage) = &self.storage {
             let mut batch = WriteBatch::default();
@@ -300,16 +426,18 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
             let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
             let snapshot = serde_json::to_vec(&stored).map_err(write_error)?;
+            if let Some(d1) = &next.d1 {
+                batch.put(D1_KEY, serde_json::to_vec(d1).map_err(write_error)?);
+            } else {
+                batch.delete(D1_KEY);
+            }
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
             batch.put(SNAPSHOT_KEY, snapshot);
             storage.write_sync(batch)?;
         }
 
-        let mut sm = self.state.write().await;
         *sm = next;
-        drop(sm);
-        let mut current = self.current_snapshot.write().await;
         *current = Some(stored);
         Ok(())
     }
@@ -328,5 +456,72 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
+    }
+}
+
+fn apply_operations(next: &mut StateMachineData, batch: &mut WriteBatch, operations: Vec<WriteOp>) {
+    for operation in operations {
+        match operation {
+            WriteOp::Put { key, value } => {
+                next.data.insert(key.clone(), value.clone());
+                batch.put(data_key(&key), value);
+            }
+            WriteOp::Delete { key } => {
+                next.data.remove(&key);
+                batch.delete(data_key(&key));
+            }
+        }
+    }
+}
+
+fn apply_d1(
+    next: &mut StateMachineData,
+    batch: &mut WriteBatch,
+    command: D1Command,
+) -> Result<D1Result, D1Error> {
+    match command {
+        D1Command::Activate { shard, epoch } => {
+            if let Some(d1) = &next.d1 {
+                d1.check_shard(shard)?;
+                d1.check_epoch(epoch)?;
+            } else {
+                if !next.data.is_empty() {
+                    return Err(D1Error::LegacyDataPresent);
+                }
+                next.d1 = Some(D1State::new(shard, epoch));
+            }
+            Ok(D1Result::Activated { shard, epoch })
+        }
+        D1Command::SetEpoch {
+            shard,
+            expected_epoch,
+            new_epoch,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            if new_epoch < expected_epoch {
+                return Err(D1Error::InvalidEpoch);
+            }
+            // An exact administrative retry after losing the reply is harmless.
+            if d1.epoch != new_epoch {
+                d1.check_epoch(expected_epoch)?;
+            }
+            d1.epoch = new_epoch;
+            Ok(D1Result::Epoch { epoch: new_epoch })
+        }
+        D1Command::Write(request) => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            let result = d1.write(&request)?;
+            if matches!(
+                result,
+                D1Result::Write {
+                    status: D1WriteStatus::Committed,
+                    ..
+                }
+            ) {
+                apply_operations(next, batch, request.operations);
+            }
+            Ok(result)
+        }
     }
 }

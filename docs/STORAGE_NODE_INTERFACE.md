@@ -284,8 +284,12 @@ reported in the handshake. The current in-process adapter has only
 `WriteRequest` struct literals and unconditional `batch_write` calls are unchanged.
 The additive typed `Conflict` variant requires exhaustive error matches to be
 updated. A future transport must explicitly encode and negotiate conditional
-support, never drop the condition. D2's separate byte-batch state machine does
-not yet implement this method or inherit these guarantees.
+support, never drop the condition. D2 does not implement this synchronous trait
+method. Its independently versioned `D1V1` application commands now replicate
+these write semantics after explicit activation; legacy `TxnBatch` does not.
+See [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md) for the different persistence,
+snapshot and retained-request budget boundaries. A remote graph adapter remains
+unimplemented.
 
 Local dedup metadata gains an optional `expected_sequence` field. Missing means
 `None`, so existing records remain readable. Unconditional writes omit the field
