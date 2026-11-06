@@ -500,4 +500,6 @@ through a Unix domain socket in a trusted owner-only directory. Peer UID checks,
 fixed snapshots and deadlines, bounded frames and worker admission apply. See
 [the gateway contract](docs/GRAPH_UDS_GATEWAY.md). This is a same-host process
 boundary, not cross-host routing or a production network service. Existing D2
-TCP/control listeners are unchanged and remain outside this boundary.
+TCP/control listeners remain outside this trust boundary. Their separate
+[resource limits](docs/D2_TCP_LIMITS.md) do not add authentication or make
+them production-secure.

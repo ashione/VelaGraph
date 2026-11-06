@@ -182,3 +182,11 @@ global concurrency quota or a heap/RSS hard limit.
 ### Same-host graph UDS gateway
 
 Linux 上新增只读 UDS gateway，以受信任目录、socket 权限和 peer UID 限制同主机进程访问。每连接固定一个 resolver snapshot 和 deadline，只支持 open/read/close；帧、响应、并发和慢客户端等待有界。它不是跨主机 replica transport、生产网络服务、写协议或 D3 完成。契约见 `GRAPH_UDS_GATEWAY.md`。
+
+### D2 TCP resource safety
+
+Legacy newline-JSON v0 now bounds frame allocation/encoding, concurrent handlers
+and outbound exchanges, uses shared total deadlines, and tracks shutdown of
+connections. Oversized batches can be reduced through openraft hints. Control
+remains unauthenticated and intended only for trusted isolated tests; this is
+not production transport security or D3 completion. See `D2_TCP_LIMITS.md`.

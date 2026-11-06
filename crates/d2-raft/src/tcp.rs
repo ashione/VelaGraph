@@ -10,18 +10,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
+use openraft::error::{
+    InstallSnapshotError, PayloadTooLarge, RPCError, RaftError, RemoteError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Config};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{timeout_at, Instant};
 
 use crate::durable_log_store::DurableLogStore;
 use crate::state_machine::StateMachine;
@@ -30,7 +33,129 @@ use crate::types::{LogCommand, NodeId, TypeConfig};
 pub type Raft = openraft::Raft<TypeConfig>;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+/// Legacy newline JSON protocol, unchanged on the wire (no negotiation).
+pub const TCP_PROTOCOL_VERSION: u16 = 0;
 const MAX_LINE: usize = 64 * 1024 * 1024;
+const CONNECTIONS_PER_LISTENER: usize = 4;
+static OUTBOUND: Semaphore = Semaphore::const_new(16);
+
+// The frame includes the newline. Check before extending, never read_line into
+// an unbounded String. BufReader itself uses only its fixed-size read buffer.
+async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete JSON frame",
+            ));
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let count = newline.map_or(available.len(), |n| n + 1);
+        if count > MAX_LINE - frame.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JSON frame exceeds limit",
+            ));
+        }
+        reserve_frame(&mut frame, count)?;
+        frame.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return Ok(frame);
+        }
+        if frame.len() == MAX_LINE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JSON frame missing delimiter within limit",
+            ));
+        }
+    }
+}
+
+// Grow geometrically for small JSON tokens, but never request capacity beyond
+// the frame cap (including the delimiter). Allocator bookkeeping is excluded.
+fn reserve_frame(bytes: &mut Vec<u8>, additional: usize) -> io::Result<()> {
+    let needed = bytes.len() + additional;
+    if needed > bytes.capacity() {
+        let capacity = needed.max(bytes.capacity().saturating_mul(2)).min(MAX_LINE);
+        bytes
+            .try_reserve_exact(capacity - bytes.len())
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+struct FrameWriter {
+    bytes: Vec<u8>,
+    deadline: Instant,
+}
+impl io::Write for FrameWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "JSON encoding deadline",
+            ));
+        }
+        if bytes.len() > MAX_LINE - 1 - self.bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JSON encoding exceeds limit",
+            ));
+        }
+        reserve_frame(&mut self.bytes, bytes.len())?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+fn encode_frame<T: Serialize>(value: &T, deadline: Instant) -> anyhow::Result<Vec<u8>> {
+    let mut writer = FrameWriter {
+        bytes: Vec::new(),
+        deadline,
+    };
+    serde_json::to_writer(&mut writer, value)?;
+    if Instant::now() >= deadline {
+        return Err(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "JSON encoding deadline",
+        ))
+        .into());
+    }
+    reserve_frame(&mut writer.bytes, 1)?;
+    writer.bytes.push(b'\n');
+    Ok(writer.bytes)
+}
+
+async fn exchange_json<Q: Serialize, R: DeserializeOwned>(
+    addr: &str,
+    request: &Q,
+    budget: Duration,
+) -> anyhow::Result<R> {
+    let deadline = Instant::now() + budget.min(RPC_TIMEOUT);
+    let _permit = OUTBOUND
+        .try_acquire()
+        .map_err(|_| anyhow::anyhow!("outbound RPC capacity exhausted"))?;
+    let result = timeout_at(deadline, async {
+        let payload = encode_frame(request, deadline)?;
+        let mut stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        stream.write_all(&payload).await?;
+        let frame = read_frame(&mut BufReader::new(stream)).await?;
+        let reply = serde_json::from_slice(&frame)?;
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "RPC deadline expired during decode"
+        );
+        Ok::<R, anyhow::Error>(reply)
+    })
+    .await;
+    result.map_err(|_| anyhow::anyhow!("{addr}: RPC deadline expired"))?
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 enum RaftRpc {
@@ -55,66 +180,59 @@ fn io_unreachable(addr: &str, message: impl Into<String>) -> Unreachable {
     ))
 }
 
-async fn exchange(addr: &str, request: &RaftRpc) -> Result<RaftReply, String> {
-    let mut stream = timeout(RPC_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| format!("connect to {addr} timed out"))?
-        .map_err(|e| format!("connect to {addr}: {e}"))?;
-    let _ = stream.set_nodelay(true);
-    let mut payload = serde_json::to_vec(request).map_err(|e| format!("encode request: {e}"))?;
-    payload.push(b'\n');
-    timeout(RPC_TIMEOUT, stream.write_all(&payload))
-        .await
-        .map_err(|_| format!("write to {addr} timed out"))?
-        .map_err(|e| format!("write to {addr}: {e}"))?;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    timeout(RPC_TIMEOUT, reader.read_line(&mut line))
-        .await
-        .map_err(|_| format!("read from {addr} timed out"))?
-        .map_err(|e| format!("read from {addr}: {e}"))?;
-    if line.is_empty() {
-        return Err(format!("{addr} closed the connection without a reply"));
-    }
-    if line.len() > MAX_LINE {
-        return Err(format!("{addr} response exceeds {MAX_LINE} bytes"));
-    }
-    serde_json::from_str(&line).map_err(|e| format!("decode response from {addr}: {e}"))
+async fn exchange(addr: &str, request: &RaftRpc, option: RPCOption) -> anyhow::Result<RaftReply> {
+    exchange_json(addr, request, option.hard_ttl()).await
 }
 
-async fn serve_raft(listener: TcpListener, raft: Raft) {
+// Own every connection task. Shutdown stops admission, cancels active handlers,
+// and joins them before the listener task finishes.
+async fn serve(
+    listener: TcpListener,
+    raft: Raft,
+    state: Option<Arc<StateMachine>>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                tracing::warn!(%error, "raft listener accept failed");
-                continue;
+        tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            _ = connections.join_next(), if !connections.is_empty() => {},
+            accepted = listener.accept(), if connections.len() < CONNECTIONS_PER_LISTENER => {
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    Err(error) => { tracing::warn!(%error, "listener accept failed"); break; }
+                };
+                let raft = raft.clone();
+                let state = state.clone();
+                let deadline = Instant::now() + RPC_TIMEOUT;
+                connections.spawn(async move {
+                    let work = async {
+                        match state {
+                            Some(state) => handle_control_connection(stream, raft, state, deadline).await,
+                            None => handle_raft_connection(stream, raft, deadline).await,
+                        }
+                    };
+                    // Do not log attacker-controlled JSON or payloads.
+                    let _ = timeout_at(deadline, work).await;
+                });
             }
-        };
-        let raft = raft.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_raft_connection(stream, raft).await {
-                tracing::warn!(%error, "raft connection failed");
-            }
-        });
+        }
     }
+    connections.shutdown().await;
 }
 
-async fn handle_raft_connection(stream: TcpStream, raft: Raft) -> anyhow::Result<()> {
-    let mut line = String::new();
+async fn handle_raft_connection(
+    stream: TcpStream,
+    raft: Raft,
+    deadline: Instant,
+) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
-    let read = timeout(RPC_TIMEOUT, reader.read_line(&mut line)).await;
-    match read {
-        Ok(Ok(0)) => return Ok(()),
-        Ok(Ok(_)) if line.len() > MAX_LINE => anyhow::bail!("request too large"),
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => anyhow::bail!("request timed out"),
-    }
-
+    let frame = read_frame(&mut reader).await?;
+    let request: RaftRpc = serde_json::from_slice(&frame)?;
+    anyhow::ensure!(Instant::now() < deadline, "request deadline expired");
+    drop(frame);
     let mut stream = reader.into_inner();
-    let request: RaftRpc = serde_json::from_str(&line)?;
     let reply = match request {
         RaftRpc::Vote(request) => RaftReply::Vote(raft.vote(request).await),
         RaftRpc::AppendEntries(request) => {
@@ -124,9 +242,8 @@ async fn handle_raft_connection(stream: TcpStream, raft: Raft) -> anyhow::Result
             RaftReply::InstallSnapshot(raft.install_snapshot(request).await)
         }
     };
-    let mut payload = serde_json::to_vec(&reply)?;
-    payload.push(b'\n');
-    timeout(RPC_TIMEOUT, stream.write_all(&payload)).await??;
+    let payload = encode_frame(&reply, deadline)?;
+    stream.write_all(&payload).await?;
     Ok(())
 }
 
@@ -172,11 +289,26 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let reply = exchange(&self.addr, &RaftRpc::AppendEntries(rpc))
+        let can_split = rpc.entries.len() > 1;
+        let entries_hint = (rpc.entries.len() / 2).max(1) as u64;
+        let reply = exchange(&self.addr, &RaftRpc::AppendEntries(rpc), option)
             .await
-            .map_err(|error| RPCError::Unreachable(io_unreachable(&self.addr, error)))?;
+            .map_err(|error| {
+                // Openraft must split an oversized aggregate batch instead of
+                // retrying the identical batch forever as an unreachable peer.
+                // Encoding budget exhaustion also shrinks multi-entry batches;
+                // network timeouts never do. A single entry cannot be split.
+                if error.downcast_ref::<serde_json::Error>().is_some_and(|e| {
+                    e.io_error_kind() == Some(io::ErrorKind::InvalidData)
+                        || (can_split && e.io_error_kind() == Some(io::ErrorKind::TimedOut))
+                }) {
+                    RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint(entries_hint))
+                } else {
+                    RPCError::Unreachable(io_unreachable(&self.addr, error.to_string()))
+                }
+            })?;
         match reply {
             RaftReply::AppendEntries(result) => remote(self.target, result),
             _ => Err(RPCError::Unreachable(io_unreachable(
@@ -189,14 +321,16 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let reply = exchange(&self.addr, &RaftRpc::InstallSnapshot(rpc))
+        let reply = exchange(&self.addr, &RaftRpc::InstallSnapshot(rpc), option)
             .await
-            .map_err(|error| RPCError::Unreachable(io_unreachable(&self.addr, error)))?;
+            .map_err(|error| {
+                RPCError::Unreachable(io_unreachable(&self.addr, error.to_string()))
+            })?;
         match reply {
             RaftReply::InstallSnapshot(result) => remote_snapshot(self.target, result),
             _ => Err(RPCError::Unreachable(io_unreachable(
@@ -209,11 +343,13 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let reply = exchange(&self.addr, &RaftRpc::Vote(rpc))
+        let reply = exchange(&self.addr, &RaftRpc::Vote(rpc), option)
             .await
-            .map_err(|error| RPCError::Unreachable(io_unreachable(&self.addr, error)))?;
+            .map_err(|error| {
+                RPCError::Unreachable(io_unreachable(&self.addr, error.to_string()))
+            })?;
         match reply {
             RaftReply::Vote(result) => remote(self.target, result),
             _ => Err(RPCError::Unreachable(io_unreachable(
@@ -312,77 +448,27 @@ impl ControlResponse {
     }
 }
 
-async fn exchange_control(addr: &str, request: &ControlRequest) -> Result<ControlResponse, String> {
-    let mut stream = timeout(RPC_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| format!("connect to {addr} timed out"))?
-        .map_err(|e| format!("connect to {addr}: {e}"))?;
-    let _ = stream.set_nodelay(true);
-    let mut payload =
-        serde_json::to_vec(request).map_err(|e| format!("encode control request: {e}"))?;
-    payload.push(b'\n');
-    timeout(RPC_TIMEOUT, stream.write_all(&payload))
-        .await
-        .map_err(|_| format!("write control to {addr} timed out"))?
-        .map_err(|e| format!("write control to {addr}: {e}"))?;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    timeout(RPC_TIMEOUT, reader.read_line(&mut line))
-        .await
-        .map_err(|_| format!("read control from {addr} timed out"))?
-        .map_err(|e| format!("read control from {addr}: {e}"))?;
-    if line.is_empty() {
-        return Err(format!("{addr} closed the control connection"));
-    }
-    serde_json::from_str(&line).map_err(|e| format!("decode control from {addr}: {e}"))
+async fn exchange_control(addr: &str, request: &ControlRequest) -> anyhow::Result<ControlResponse> {
+    exchange_json(addr, request, RPC_TIMEOUT).await
 }
 
 /// Send one control command and return the decoded response.
 pub async fn send_control(addr: &str, request: ControlRequest) -> anyhow::Result<ControlResponse> {
-    exchange_control(addr, &request)
-        .await
-        .map_err(anyhow::Error::msg)?
-        .into_result()
-}
-
-async fn serve_control(listener: TcpListener, raft: Raft, state_machine: Arc<StateMachine>) {
-    loop {
-        let (mut stream, _peer) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                tracing::warn!(%error, "control listener accept failed");
-                continue;
-            }
-        };
-        let raft = raft.clone();
-        let state_machine = state_machine.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_control_connection(&mut stream, raft, state_machine).await {
-                tracing::warn!(%error, "control connection failed");
-            }
-        });
-    }
+    exchange_control(addr, &request).await?.into_result()
 }
 
 async fn handle_control_connection(
-    stream: &mut TcpStream,
+    stream: TcpStream,
     raft: Raft,
     state_machine: Arc<StateMachine>,
+    deadline: Instant,
 ) -> anyhow::Result<()> {
-    let mut line = String::new();
     let mut reader = BufReader::new(stream);
-    let read = timeout(RPC_TIMEOUT, reader.read_line(&mut line)).await;
-    match read {
-        Ok(Ok(0)) => return Ok(()),
-        Ok(Ok(_)) if line.len() > MAX_LINE => anyhow::bail!("control request too large"),
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => anyhow::bail!("control request timed out"),
-    }
-
-    let stream = reader.into_inner();
-    let request: ControlRequest = serde_json::from_str(&line)?;
+    let frame = read_frame(&mut reader).await?;
+    let request: ControlRequest = serde_json::from_slice(&frame)?;
+    anyhow::ensure!(Instant::now() < deadline, "control deadline expired");
+    drop(frame);
+    let mut stream = reader.into_inner();
     let response = match request {
         ControlRequest::Initialize { members } => match initialize_cluster(&raft, members).await {
             Ok(()) => ControlResponse::Ack,
@@ -399,6 +485,17 @@ async fn handle_control_connection(
             Err(error) => ControlResponse::Err(error.to_string()),
         },
         ControlRequest::Write { key, value } => {
+            // Each UTF-8 byte becomes at most four JSON bytes ("255,").
+            // Keep 1 KiB for the fixed command/log/vote envelope. Raw public
+            // Raft handles remain caller-managed and can submit larger entries.
+            if key.len().saturating_add(value.len()) > (MAX_LINE - 1024) / 4 {
+                let response =
+                    ControlResponse::Err("control write exceeds replication payload budget".into());
+                stream
+                    .write_all(&encode_frame(&response, deadline)?)
+                    .await?;
+                return Ok(());
+            }
             match raft.client_write(LogCommand::put(key, value)).await {
                 Ok(response) => match response.data.d1 {
                     Some(Err(error)) => {
@@ -429,9 +526,8 @@ async fn handle_control_connection(
             })
         }
     };
-    let mut payload = serde_json::to_vec(&response)?;
-    payload.push(b'\n');
-    timeout(RPC_TIMEOUT, stream.write_all(&payload)).await??;
+    let payload = encode_frame(&response, deadline)?;
+    stream.write_all(&payload).await?;
     Ok(())
 }
 
@@ -457,6 +553,7 @@ pub struct TcpNode {
     pub raft: Raft,
     pub state_machine: Arc<StateMachine>,
     tasks: Vec<JoinHandle<()>>,
+    stop: watch::Sender<bool>,
 }
 
 impl TcpNode {
@@ -487,11 +584,13 @@ impl TcpNode {
         )
         .await?;
 
-        let raft_task = tokio::spawn(serve_raft(raft_listener, raft.clone()));
-        let control_task = tokio::spawn(serve_control(
+        let (stop, receiver) = watch::channel(false);
+        let raft_task = tokio::spawn(serve(raft_listener, raft.clone(), None, receiver.clone()));
+        let control_task = tokio::spawn(serve(
             control_listener,
             raft.clone(),
-            state_machine.clone(),
+            Some(state_machine.clone()),
+            receiver,
         ));
         Ok(Self {
             id: config.id,
@@ -500,6 +599,7 @@ impl TcpNode {
             raft,
             state_machine,
             tasks: vec![raft_task, control_task],
+            stop,
         })
     }
 
@@ -522,9 +622,95 @@ impl TcpNode {
     }
 
     pub async fn shutdown(mut self) {
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
-        let _ = self.raft.shutdown().await;
+        // Once polled, cleanup owns the node even if the caller cancels its
+        // wait. Otherwise cancellation between joining listeners and stopping
+        // Raft would leave a live core retaining the durable stores.
+        let cleanup = tokio::spawn(async move {
+            let _ = self.stop.send(true);
+            for task in self.tasks.drain(..) {
+                let _ = task.await;
+            }
+            let _ = self.raft.shutdown().await;
+        });
+        let _ = cleanup.await;
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn oversize_without_newline_fails_before_consuming_extra_bytes() {
+        let bytes = vec![b'x'; MAX_LINE + 32];
+        let mut reader = BufReader::with_capacity(8192, bytes.as_slice());
+        let error = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, vec![b'x'; 32]);
+    }
+
+    #[tokio::test]
+    async fn exact_frame_boundary_and_multiple_frames() {
+        let mut bytes = vec![b' '; MAX_LINE];
+        bytes[MAX_LINE - 1] = b'\n';
+        bytes.extend_from_slice(b"\"Status\"\n");
+        let mut reader = BufReader::new(bytes.as_slice());
+        assert_eq!(read_frame(&mut reader).await.unwrap().len(), MAX_LINE);
+        assert_eq!(read_frame(&mut reader).await.unwrap(), b"\"Status\"\n");
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let mut reader = BufReader::new(&b"\"Status\""[..]);
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn encoding_is_bounded_for_requests_and_responses_including_escapes() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let value = "x".repeat(MAX_LINE - 3);
+        let encoded = encode_frame(&value, deadline).unwrap();
+        assert_eq!(encoded.len(), MAX_LINE);
+        assert!(encoded.capacity() <= MAX_LINE);
+        let oversized = "x".repeat(MAX_LINE - 2);
+        assert!(encode_frame(&oversized, deadline).is_err());
+        // JSON escaping, not the input string length, determines the limit.
+        let response = ControlResponse::Value(Some("\0".repeat(MAX_LINE / 6)));
+        assert!(encode_frame(&response, deadline).is_err());
+        assert!(encode_frame(&ControlRequest::Status, Instant::now()).is_err());
+        assert_eq!(
+            encode_frame(&ControlRequest::Status, deadline).unwrap(),
+            b"\"Status\"\n"
+        );
+        assert_eq!(TCP_PROTOCOL_VERSION, 0);
+    }
+
+    #[tokio::test]
+    async fn slow_frame_uses_one_deadline_not_one_timeout_per_chunk() {
+        let (mut sender, receiver) = duplex(64);
+        let task = tokio::spawn(async move {
+            for _ in 0..20 {
+                if sender.write_all(b" ").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let start = Instant::now();
+        assert!(timeout_at(
+            start + Duration::from_millis(50),
+            read_frame(&mut BufReader::new(receiver))
+        )
+        .await
+        .is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        task.abort();
+        let _ = task.await;
     }
 }

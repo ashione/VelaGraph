@@ -126,3 +126,10 @@ exported for a service's own startup path.
 
 This transport is a validation fixture. It has no authentication or TLS; do not
 expose the ports on an untrusted network.
+
+### TCP trust boundary
+
+TCP remains unauthenticated plaintext, including membership and write controls.
+Use only in a trusted isolated test environment. See the [version-0 framing,
+admission, deadline, shutdown and uncertain-outcome contract](../../docs/D2_TCP_LIMITS.md).
+Resource limits do not make these endpoints production-secure.

@@ -130,8 +130,10 @@ framing is newline-delimited JSON carrying the openraft request/response types.
 
 This proves cross-process consensus, serialization and process-restart recovery,
 not production network security or OS-crash durability. The transport has no
-TLS, authentication, connection pooling or backpressure, and the control port is
-an operations/test helper.
+TLS, authentication, or connection pooling, and the control port is an
+operations/test helper. Bounded framing, admission, total deadlines and tracked
+shutdown are specified in [D2 TCP limits](D2_TCP_LIMITS.md); these are resource
+safeguards, not production authentication or authorization.
 
 ## Decisions to freeze before implementation
 
