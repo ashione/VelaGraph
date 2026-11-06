@@ -22,6 +22,7 @@ pub const MAX_IN_FLIGHT: usize = 16;
 const VERSION: u32 = 1;
 /// Largest accepted client or server operation budget.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
+pub mod distributed;
 mod paged;
 pub mod query;
 pub use paged::{
@@ -101,6 +102,14 @@ enum Operation {
         descriptor: SnapshotDescriptor,
     },
     Query(query::QueryRequest),
+    OpenQuery {
+        shard: u64,
+        timeout_millis: u64,
+    },
+    QueryFragment(distributed::FragmentRequest),
+    CloseQuery {
+        descriptor: distributed::Descriptor,
+    },
     Write(D1WriteRequest),
 }
 #[derive(Serialize, Deserialize)]
@@ -118,6 +127,9 @@ enum Reply {
     SnapshotPage(SnapshotPage),
     CloseSnapshot,
     Query(query::QueryResponse),
+    OpenQuery(distributed::Descriptor),
+    QueryFragment(Result<distributed::FragmentOutput, query::QueryFailure>),
+    CloseQuery,
     Write(D1Result),
 }
 
@@ -164,6 +176,7 @@ impl GraphService {
         let state = node.state_machine.clone();
         let sessions = Arc::new(paged::Sessions::new()?);
         let worker_sessions = sessions.clone();
+        let query_sessions = Arc::new(distributed::Sessions::new()?);
         let (stop, mut stopped) = watch::channel(false);
         let admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let task = tokio::spawn(async move {
@@ -174,7 +187,7 @@ impl GraphService {
                 while handlers.try_join_next().is_some() {}
                 let accepted = tokio::select! {
                     _ = stopped.changed() => break,
-                    _ = cleanup.tick() => { sessions.expire(); continue; },
+                    _ = cleanup.tick() => { sessions.expire(); query_sessions.expire(); continue; },
                     _ = handlers.join_next(), if !handlers.is_empty() => continue,
                     result = listener.accept() => result,
                 };
@@ -185,6 +198,7 @@ impl GraphService {
                 let raft = raft.clone();
                 let state = state.clone();
                 let sessions = sessions.clone();
+                let query_sessions = query_sessions.clone();
                 let end = Instant::now() + deadline;
                 handlers.spawn(async move {
                     let _permit = permit;
@@ -201,6 +215,11 @@ impl GraphService {
                         Operation::Query(query) if (1..=5000).contains(&query.timeout_millis) => {
                             end.min(Instant::now() + Duration::from_millis(query.timeout_millis))
                         }
+                        Operation::OpenQuery { timeout_millis, .. }
+                            if (1..=5000).contains(timeout_millis) =>
+                        {
+                            end.min(Instant::now() + Duration::from_millis(*timeout_millis))
+                        }
                         _ => end,
                     };
                     // Dropping the waiting future at the deadline does not undo
@@ -210,7 +229,15 @@ impl GraphService {
                     }
                     let result = match tokio::time::timeout_at(
                         end,
-                        execute(raft, state, identity, shard, request, sessions, end),
+                        execute(
+                            raft,
+                            state,
+                            identity,
+                            shard,
+                            request,
+                            (sessions, query_sessions),
+                            end,
+                        ),
                     )
                     .await
                     {
@@ -264,9 +291,10 @@ async fn execute(
     identity: RemoteIdentity,
     shard: u64,
     request: Request,
-    sessions: Arc<paged::Sessions>,
+    sessions: (Arc<paged::Sessions>, Arc<distributed::Sessions>),
     end: Instant,
 ) -> Result<Reply, RemoteError> {
+    let (sessions, query_sessions) = sessions;
     if request.version != VERSION {
         return Err(RemoteError::Protocol);
     }
@@ -277,6 +305,31 @@ async fn execute(
         return Err(RemoteError::InvalidArgument);
     }
     match request.operation {
+        Operation::OpenQuery {
+            shard: requested,
+            timeout_millis,
+        } => {
+            if requested != shard || !(1..=5000).contains(&timeout_millis) {
+                return Err(RemoteError::InvalidArgument);
+            }
+            let end = end.min(Instant::now() + Duration::from_millis(timeout_millis));
+            raft.ensure_linearizable()
+                .await
+                .map_err(|_| RemoteError::Unavailable)?;
+            query_sessions
+                .open(&state, identity, shard, end)
+                .await
+                .map(Reply::OpenQuery)
+        }
+        Operation::QueryFragment(request) => {
+            query_sessions
+                .fragment(&state, identity, shard, request, end)
+                .await
+        }
+        Operation::CloseQuery { descriptor } => {
+            query_sessions.close(identity, shard, &descriptor)?;
+            Ok(Reply::CloseQuery)
+        }
         Operation::Query(request) => {
             query::execute_query(raft, state, identity, shard, request, end).await
         }
@@ -592,7 +645,13 @@ async fn rpc(
     id: Option<[u8; 16]>,
 ) -> Result<Reply, RemoteError> {
     let end = checked_deadline(duration, id)?;
-    let response_limit = if matches!(&operation, Operation::Query(_)) {
+    let response_limit = if matches!(
+        &operation,
+        Operation::Query(_)
+            | Operation::OpenQuery { .. }
+            | Operation::QueryFragment(_)
+            | Operation::CloseQuery { .. }
+    ) {
         query::MAX_QUERY_RESPONSE_BYTES + 1024
     } else {
         MAX_FRAME_BYTES
