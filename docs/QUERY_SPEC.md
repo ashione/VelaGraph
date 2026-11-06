@@ -244,9 +244,13 @@ not a total heap or process RSS bound; see [QUERY_MEMORY.md](QUERY_MEMORY.md).
 ## 11. Additive distributed global-scan entrypoint
 
 The static route resolver has a separate [global scan API](GLOBAL_SCAN.md) for
-`V()`/`E()`, optional `limit(n)`, and optional terminal `count()`. It uses this
-official parser but deliberately rejects every other step, including explicit
-IDs and adjacency. Single-partition execution above is unchanged. Ordinary
+`V()`/`E()` followed by order-preserving `hasLabel`, `has`, `values`, `label`
+and `limit` steps, with optional terminal `count()`. It uses this official
+parser and the same element operators, but rejects explicit IDs, `id`, paths
+and adjacency. Limits execute in their original positions; only an immediately
+leading limit can bound candidate acquisition. Missing properties, strict
+equality and invalid scalar traversers follow the single-partition rules.
+Single-partition execution above is unchanged. Ordinary
 rows carry partition IDs and sort by `(local ID, partition ID)`; count and limit
 are global. The default output cap is 100, the total candidate cap is 10,000,
 and one logical memory budget covers all partitions. A single metadata snapshot

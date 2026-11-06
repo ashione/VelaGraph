@@ -123,3 +123,17 @@ A separate deterministic ledger smoke run recorded peak admitted bytes:
 1 MiB workload reached 66,088,521 admitted bytes before rejecting its next
 reservation. All ledgers returned to zero. Run with:
 `cargo test --lib accounted_high_water_smoke -- --ignored --nocapture`.
+
+## Global filter/projection execution
+
+The global scan executor uses this same ledger across all partitions. It retains
+qualified candidate IDs, then reloads records only from pinned views for element
+operators. Reload raw buffers and decoded payloads overlap accumulated projected
+results and remain charged. `values`/`label` move payloads through the ordinary
+operator implementation. Final output construction keeps all payload reservation
+holders, their vector slots, input slots and destination slots charged until the
+result is complete. Filters release discarded records; retained element IDs
+release record fees before the next operator reload. A late filter or limit
+does not exempt the global initial candidate cap. Snapshot-vector storage remains
+outside the logical query ledger under the separate GLOBAL_SCAN.md admission
+contract; this is not a global atomic snapshot or process RSS bound.

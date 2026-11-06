@@ -212,7 +212,8 @@ TLS/authentication or production D3 completion is implied.
 ### D5a bounded global scans (2026-11-07)
 
 The additive [global Gremlin scan](GLOBAL_SCAN.md) API merges V/E identities
-across static catalog partitions with global limit/count, stable `(ID, partition)`
+across static catalog partitions with ordered has/hasLabel filters, values/label
+projections, global limit/count, stable `(ID, partition)`
 order, one snapshot per shard and one absolute deadline. It has no cross-edge
 traversal, global snapshot isolation or transactions. Full-copy snapshot and
 logical query budgets have explicit distinct bounds/exclusions. Actual metadata

@@ -8,16 +8,28 @@ D5 scan slice, not cross-partition edge traversal or distributed transactions.
 ## Query and identity contract
 
 Input is standard Gremlin, parsed by the existing official-grammar parser before
-any I/O. The complete supported shapes are `g.V()`, `g.E()`, optionally followed
-by exactly one `limit(n)` and/or terminal `count()`. Limits retain the existing
-1..=1000 range. Explicit IDs, filters, projections, adjacency steps (`out`, `in`,
-`both`), paths, repeated limits, and all other unsupported steps fail explicitly.
-No text is rewritten and no independently truncated query results are joined.
+any I/O. Traversals start with `g.V()` or `g.E()`, followed by any sequence of
+`hasLabel(label, ...)`, `has(key)`, `has(key, value)`, `values(key)`, `label()`
+and `limit(n)`, optionally ending with `count()`. Limits retain the existing
+1..=1000 range and repeated limits execute in their original positions.
+Explicit IDs, `id()`, adjacency steps (`out`, `in`, `both`), paths, and all other
+unsupported steps fail explicitly. No text is rewritten and no independently
+truncated query results are joined.
+
+Filters retain input order and use the single-partition operator semantics:
+`has` uses strict typed equality, present Null is distinct from a missing key,
+and `hasLabel` matches any stored label. `values` emits nothing for a missing
+property; `label` emits the first stored vertex label (or empty Text for an
+unlabelled vertex) or the edge label. Projections retain their origin partition
+and do not sort by projected values. Element-only steps applied to a nonempty
+scalar stream return `InvalidGremlinTraverser`, as in single-partition execution;
+empty streams remain empty. Count is terminal.
 
 `ScanScope::All` freezes the catalog's registered partition set.
 `ScanScope::Selected(Vec<u32>)` freezes that explicitly selected set; duplicate
 or unknown partitions are errors. An empty selection is allowed. Every ordinary
-result is a `QualifiedGremlinRow { partition, row }` with a Vertex or Edge row.
+result is a `QualifiedGremlinRow { partition, row }` with a Vertex, Edge or
+projected Value row.
 Local IDs can collide across partitions; collisions remain distinct rows.
 Order is ascending `(local ID, partition ID)`, independent of registration,
 selection, replica or snapshot acquisition order. `GlobalScanOutput::Count(n)`
@@ -30,10 +42,23 @@ ordinary output is capped at 100, after checking the entire candidate set's
 More than 10,000 candidates is `TraversalLimitExceeded`, not partial success.
 Two partitions with 6,000 candidates each therefore fail without a leading
 limit, even though each fits by itself. The executor scans each partition's
-bounded initial candidates using the same ledger and retains global top N for
-a leading limit. This is correct because the subset has no filters/expansions.
-A leading limit need not decode later graph records, but never skips acquiring
-any required shard snapshot.
+bounded initial candidates using the same ledger, then sorts global identities before applying the operators left to
+right. Only an immediately leading limit permits per-partition top N acquisition
+and global top N retention. A later filter, projection, count or limit never
+waives the 10,000-start-candidate check, even if it would discard every row.
+
+For example, `g.V().has('x').limit(2)` finds the first two matching elements,
+whereas `g.V().limit(2).has('x')` tests only the first two global elements and can
+return fewer than two. Likewise `g.V().values('x').limit(2)` skips missing
+properties before choosing two output values. A leading limit need not decode
+later graph records, but never skips acquiring any required shard snapshot.
+
+Candidate acquisition retains identities rather than all record payloads.
+Element operators reload from the same retained partition view and reuse the
+ordinary operator implementation; this is not a fresh read or replica failover.
+All reloads, raw/decoded overlap, projected payloads, intermediate slots and
+final output reservation holders use the same query budget. The extra point
+reads are bounded by candidate count and the parsed query's 16 KiB size limit.
 
 ## Consistency, failures and deadline
 
@@ -70,7 +95,8 @@ of an individual allocation, decode, native call or destructor.
   Local adapters retain their own existing larger per-view bounds.
 - One 64 MiB query-owned logical accounted-byte ledger covers all partition
   scans and overlapping decoded records, page buffers, global candidate IDs,
-  and output rows. The normal [query memory exclusions](QUERY_MEMORY.md) apply.
+  projected values, intermediate and output rows. The normal
+  [query memory exclusions](QUERY_MEMORY.md) apply.
   Global candidate and final-output vector slots are reserved before allocation.
 - A fixed 4096-byte query control fee covers execution controls, not the
   separately fanout-bounded router maps, graph-store wrappers or snapshot vector.
@@ -91,7 +117,8 @@ separate future work.
 
 `global_scan` integration tests launch actual independent metadata and two data
 `graph-node` processes. They exercise overlapping vertex/edge IDs, ordering,
-global limit/count/default cap, >10k aggregate rows, same-shard partition reuse,
+global limit/count/default cap, filters/projections and limit position, strict
+types, late matching properties, >10k aggregate rows, same-shard partition reuse,
 unknown partitions and unavailable data without partial success. Kernel tests
 exercise the official parsed subset, byte ledger, empty results, row boundaries
 and deadline rejection. Deterministic acquisition-checkpoint tests interleave

@@ -645,6 +645,42 @@ fn apply_step(
     Ok(output)
 }
 
+/// Apply a non-expanding element step to a qualified global row, reloading only
+/// from its pinned partition view. Use the ordinary operator implementation so
+/// strict values, labels and invalid traversers cannot drift between executors.
+pub(crate) fn apply_global_element_step(
+    graph: &impl QueryReadBackend,
+    row: Accounted<GremlinRow>,
+    step: &GremlinStep,
+    check: &dyn Fn() -> Result<()>,
+    budget: &Budget,
+) -> Result<Option<Accounted<GremlinRow>>> {
+    check()?;
+    let row = match row.value {
+        GremlinRow::Vertex(id) => match graph.get_vertex(id, budget)? {
+            Some(vertex) => vertex_row(vertex, budget)?,
+            None => return Ok(None),
+        },
+        GremlinRow::Edge(id) => match graph.get_edge(id, budget)? {
+            Some(edge) => edge_row(edge)?,
+            None => return Ok(None),
+        },
+        GremlinRow::Value(value) => Accounted::new(Row::Value(value), row.charge),
+        _ => unreachable!("global planner excludes paths and intermediate count"),
+    };
+    let mut input = AccountedVec::new(budget);
+    input.push(row)?;
+    let output = apply_step(graph, input, step, check, budget)?;
+    check()?;
+    Ok(output.into_iter().next().map(|row| {
+        let mut row = row.map(Row::into_row);
+        if matches!(row.value, GremlinRow::Vertex(_) | GremlinRow::Edge(_)) {
+            row.charge.shrink(0);
+        }
+        row
+    }))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Direction {
     Out,
