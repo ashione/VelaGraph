@@ -27,8 +27,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
 use crate::graph::{
-    adjacency_key, adjacency_prefix, codec, edge_id_from_adjacency_key, edge_key, validate_edge,
-    validate_vertex, vertex_key, Edge, EdgeDirection, Vertex,
+    adjacency_key, adjacency_prefix, codec, edge_id_from_adjacency_key, edge_key, edge_prefix,
+    id_from_record_key, validate_edge, validate_vertex, vertex_key, vertex_prefix, Edge,
+    EdgeDirection, Vertex,
 };
 use crate::storage_node::{
     Epoch, KeyRange, ReadView, RequestId, ScanLimit, Sequence, ShardId, StorageNode,
@@ -116,6 +117,25 @@ impl<S: StorageNode> GraphRecordStore<S> {
             .write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Pin one storage-node view. Replicated nodes acquire a leader read barrier.
+    /// All subsequent query reads retain this sequence and use the node's checks.
+    pub fn read_view(&self) -> Result<GraphRecordReadView<'_, S>> {
+        self.node.check_execution_context()?;
+        let view = self.node.read_view()?;
+        if view.shard != self.shard {
+            return Err(StorageNodeError::InvalidArgument(
+                "view belongs to a different shard".into(),
+            )
+            .into());
+        }
+        Ok(GraphRecordReadView { store: self, view })
+    }
+
+    /// Parse and execute standard Gremlin against one newly pinned D1 view.
+    pub fn execute_gremlin(&self, query: &str) -> Result<crate::GremlinResult> {
+        crate::GremlinQuery::parse(query)?.execute_records(self)
     }
 
     pub fn node(&self) -> &S {
@@ -538,6 +558,224 @@ fn prefix_range(prefix: &[u8]) -> Result<KeyRange> {
                 end.pop();
             }
             None => return Ok(KeyRange::all()),
+        }
+    }
+}
+
+/// One immutable D1 graph sequence, retaining its originating store and adapter.
+/// Reads still perform context and epoch checks; no raw-view shortcut is exposed.
+/// Retaining this value does not guarantee that a new leader read is available.
+pub struct GraphRecordReadView<'a, S: StorageNode> {
+    store: &'a GraphRecordStore<S>,
+    view: ReadView,
+}
+
+/// Byte budget for a D1 query page or individual graph record (key plus value).
+pub const GRAPH_QUERY_PAGE_BYTES: usize = 16 * 1024 * 1024;
+const QUERY_PAGE_ROWS: usize = 256;
+
+impl<S: StorageNode> GraphRecordReadView<'_, S> {
+    /// Sequence pinned when the view was acquired.
+    pub fn sequence(&self) -> Sequence {
+        self.view.sequence
+    }
+    /// Ownership epoch pinned when the view was acquired.
+    pub fn epoch(&self) -> Epoch {
+        self.view.epoch
+    }
+    /// Parse and execute a query on this retained sequence.
+    pub fn execute_gremlin(&self, query: &str) -> Result<crate::GremlinResult> {
+        crate::GremlinQuery::parse(query)?.execute_record_view(self)
+    }
+    /// Read a vertex through the originating adapter.
+    pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        self.record(
+            &vertex_key(self.store.partition, id),
+            codec::decode_vertex,
+            |v| v.id,
+            id,
+        )
+    }
+    /// Read an edge through the originating adapter.
+    pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
+        self.record(
+            &edge_key(self.store.partition, id),
+            codec::decode_edge,
+            |e| e.id,
+            id,
+        )
+    }
+    fn record<T>(
+        &self,
+        key: &[u8],
+        decode: impl FnOnce(&[u8]) -> Result<T>,
+        id_of: impl FnOnce(&T) -> u64,
+        id: u64,
+    ) -> Result<Option<T>> {
+        let Some(bytes) = self.store.node.get(key, &self.view)? else {
+            return Ok(None);
+        };
+        if key.len().saturating_add(bytes.len()) > GRAPH_QUERY_PAGE_BYTES {
+            return Err(StorageNodeError::ResourceExhausted(
+                "graph query record byte limit exceeded".into(),
+            )
+            .into());
+        }
+        let record = decode(&bytes)?;
+        if id_of(&record) != id {
+            return Err(Error::CorruptData(
+                "graph record id does not match key".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+    fn scan<T>(
+        &self,
+        prefix: Vec<u8>,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+        decode: impl Fn(&[u8]) -> Result<T>,
+        id_of: impl Fn(&T) -> u64,
+    ) -> Result<(Vec<T>, bool)> {
+        let range = prefix_range(&prefix)?;
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            check()?;
+            let remaining = limit.saturating_sub(records.len());
+            let page = self.store.node.scan_page(
+                range.clone(),
+                ScanLimit::new(remaining.clamp(1, QUERY_PAGE_ROWS), GRAPH_QUERY_PAGE_BYTES)?,
+                &self.view,
+                cursor.as_ref(),
+            )?;
+            check()?;
+            for row in page.rows {
+                check()?;
+                if records.len() == limit {
+                    return Ok((records, true));
+                }
+                let record = decode(&row.value)?;
+                check()?;
+                if id_of(&record) != id_from_record_key(&row.key, &prefix)? {
+                    return Err(Error::CorruptData(
+                        "graph record id does not match key".into(),
+                    ));
+                }
+                records.push(record);
+            }
+            if page.next_cursor.is_none() {
+                check()?;
+                return Ok((records, false));
+            }
+            // The continuation proves another row exists without decoding it.
+            if records.len() == limit {
+                check()?;
+                return Ok((records, true));
+            }
+            cursor = page.next_cursor;
+        }
+    }
+}
+
+impl<S: StorageNode> crate::gremlin::QueryReadBackend for GraphRecordReadView<'_, S> {
+    fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        self.get_vertex(id)
+    }
+    fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
+        self.get_edge(id)
+    }
+    fn scan_vertices_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Vertex>, bool)> {
+        self.scan(
+            vertex_prefix(self.store.partition),
+            limit,
+            check,
+            codec::decode_vertex,
+            |v| v.id,
+        )
+    }
+    fn scan_edges_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Edge>, bool)> {
+        self.scan(
+            edge_prefix(self.store.partition),
+            limit,
+            check,
+            codec::decode_edge,
+            |e| e.id,
+        )
+    }
+    fn visit_adjacent_edges(
+        &self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(Edge) -> Result<()>,
+    ) -> Result<()> {
+        check()?;
+        if let Some(label) = label {
+            crate::graph::validate_label(label)?;
+        }
+        if self.get_vertex(vertex_id)?.is_none() {
+            return Err(Error::VertexNotFound(vertex_id));
+        }
+        let direction = if incoming {
+            EdgeDirection::In
+        } else {
+            EdgeDirection::Out
+        };
+        let range = prefix_range(&adjacency_prefix(
+            self.store.partition,
+            direction,
+            vertex_id,
+            label,
+        ))?;
+        let mut cursor = None;
+        loop {
+            check()?;
+            let page = self.store.node.scan_page(
+                range.clone(),
+                ScanLimit::new(QUERY_PAGE_ROWS, GRAPH_QUERY_PAGE_BYTES)?,
+                &self.view,
+                cursor.as_ref(),
+            )?;
+            check()?;
+            for row in page.rows {
+                check()?;
+                let edge_id = edge_id_from_adjacency_key(&row.key)?;
+                let edge = self.get_edge(edge_id)?.ok_or_else(|| {
+                    Error::CorruptData("adjacency references missing edge".into())
+                })?;
+                check()?;
+                let endpoint = if incoming { edge.to } else { edge.from };
+                if endpoint != vertex_id
+                    || row.key
+                        != adjacency_key(
+                            self.store.partition,
+                            direction,
+                            endpoint,
+                            &edge.label,
+                            edge.id,
+                        )
+                    || !row.value.is_empty()
+                {
+                    return Err(Error::CorruptData("adjacency does not match edge".into()));
+                }
+                visit(edge)?;
+                check()?;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                check()?;
+                return Ok(());
+            }
         }
     }
 }

@@ -3,8 +3,9 @@
 `crates/replicated-graph` connects the existing `GraphRecordStore` through the
 synchronous D1 `StorageNode` trait to an actual three-voter openraft group.
 It is an **in-process correctness prototype**, not a network graph service.
-`GraphEngine`, its Gremlin/traversal execution and K3 transaction API still use
-the local kernel. Routing, placement, shard migration, cross-shard transactions,
+`GraphEngine` and its K3 transaction API still use the local kernel. The same
+Gremlin parser/operators can also execute through this replicated D1 adapter.
+Routing, placement, shard migration, cross-shard transactions,
 network authentication and a production client protocol are not implemented.
 
 ## Construction and execution
@@ -169,3 +170,26 @@ snapshot or silently changes sequences after failover. The new API does not
 change the existing all-or-error `scan` contract or query-level budgets. See
 [the D1 pagination contract](STORAGE_NODE_INTERFACE.md#explicit-bounded-pagination)
 for row/byte limits, oversized-row errors, cursor lifetime, and compatibility.
+
+## Single-shard Gremlin over the adapter
+
+`GraphRecordStore::execute_gremlin("g.V().out().count()")` now executes the same
+standard Gremlin v0 parser and operators as `GraphEngine`. Run it inside
+`run_blocking`, like graph CRUD. It pins one leader-barrier D1 view and routes all
+paged scans and point reads through `ReplicatedStorageNode`; no view access skips
+context or epoch checks. `GraphRecordStore::read_view` exposes a retained
+`GraphRecordReadView`; its `execute_gremlin` repeats queries at that same sequence.
+New leader/quorum reads can fail while a previously acquired view remains usable
+until epoch fencing. Neither path automatically routes to a new leader.
+
+The query row cap is 10,000, not the CRUD adjacency convenience cap of 1,000.
+Pages are at most 256 rows / 16 MiB, and individual records share the 16 MiB bound.
+Oversized records, unsupported pagination, stale epochs, incompatible runtime
+contexts, read-barrier failures and query limits return errors, never truncated
+success. These caps do not bound total query heap or process RSS: repeated
+traversers can duplicate large property payloads. Aggregate byte accounting is
+not implemented. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
+
+This closes only the bounded, in-process, single-shard replicated query path.
+K3 write-overlay transactions still belong to `GraphEngine`; cross-shard queries,
+client/server query protocols, routing and production availability remain absent.

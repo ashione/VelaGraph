@@ -462,3 +462,14 @@ This is a single-node storage kernel, not yet a distributed production database:
   native date, and `INTERVAL` supports only `DAY`.
 - No authentication, authorization, or SQL injection surface beyond the caller's
   own database (there is no network protocol).
+
+### Single-shard replicated Gremlin prototype
+
+The optional `replicated-graph` adapter also supports standard Gremlin v0 through
+`GraphRecordStore::execute_gremlin`. Each execution pins one leader-barrier D1
+view; scans and adjacency use bounded pages through the adapter. Use
+`replicated_graph::run_blocking` from async code. Retained `GraphRecordReadView`
+queries preserve their original sequence, while context and epoch checks remain
+active. This is an in-process, single-shard path, not a distributed query service.
+See [the query contract](docs/QUERY_SPEC.md) and
+[replicated graph limitations](docs/REPLICATED_GRAPH.md).

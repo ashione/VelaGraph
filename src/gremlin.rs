@@ -329,6 +329,27 @@ impl GremlinQuery {
         self.execute_on_read(&view, check)
     }
 
+    /// Execute against one newly acquired D1 graph view. Its acquisition, including
+    /// a replicated leader barrier, is included in the cooperative deadline.
+    pub fn execute_records<S: crate::StorageNode>(
+        &self,
+        graph: &crate::GraphRecordStore<S>,
+    ) -> Result<GremlinResult> {
+        let deadline = Instant::now() + GREMLIN_DEADLINE;
+        let view = graph.read_view()?;
+        self.execute_on_read(&view, &|| check_deadline(deadline))
+    }
+
+    /// Execute against a retained D1 view without acquiring another read barrier.
+    /// The originating adapter still enforces execution context and epoch fencing.
+    pub fn execute_record_view<S: crate::StorageNode>(
+        &self,
+        view: &crate::GraphRecordReadView<'_, S>,
+    ) -> Result<GremlinResult> {
+        let deadline = Instant::now() + GREMLIN_DEADLINE;
+        self.execute_on_read(view, &|| check_deadline(deadline))
+    }
+
     // The backend represents one stable read view for the entire execution.
     fn execute_on_read(
         &self,
@@ -1316,3 +1337,17 @@ mod snapshot_tests {
         }
     }
 }
+
+fn check_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(Error::TraversalLimitExceeded(
+            "query deadline exceeded".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "graph_record_query_tests.rs"]
+mod record_query_tests;

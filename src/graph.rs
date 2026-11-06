@@ -1123,13 +1123,13 @@ fn partition_prefix(partition: u32) -> Vec<u8> {
     key
 }
 
-fn vertex_prefix(partition: u32) -> Vec<u8> {
+pub(crate) fn vertex_prefix(partition: u32) -> Vec<u8> {
     let mut key = partition_prefix(partition);
     key.extend_from_slice(VERTEX_SUFFIX);
     key
 }
 
-fn edge_prefix(partition: u32) -> Vec<u8> {
+pub(crate) fn edge_prefix(partition: u32) -> Vec<u8> {
     let mut key = partition_prefix(partition);
     key.extend_from_slice(EDGE_SUFFIX);
     key
@@ -1217,7 +1217,7 @@ fn validate_properties(properties: &BTreeMap<String, Value>) -> Result<()> {
     Ok(())
 }
 
-fn id_from_record_key(key: &[u8], prefix: &[u8]) -> Result<u64> {
+pub(crate) fn id_from_record_key(key: &[u8], prefix: &[u8]) -> Result<u64> {
     let suffix = key
         .strip_prefix(prefix)
         .ok_or_else(|| Error::CorruptData("record key has the wrong prefix".into()))?;

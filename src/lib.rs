@@ -45,7 +45,8 @@ pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
 pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
 pub use graph_records::{
-    GraphRecordStore, PreparedGraphMutation, MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS,
+    GraphRecordReadView, GraphRecordStore, PreparedGraphMutation, GRAPH_QUERY_PAGE_BYTES,
+    MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS,
 };
 pub use gremlin::{
     GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
