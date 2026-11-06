@@ -530,6 +530,8 @@ non-atomic staged writes and unknown/incomplete outcomes. Its out/in API returns
 index observations with **unverified completeness**, not complete Gremlin results.
 Its separate observed Gremlin API supports global/explicit vertex starts, directional
 hops, label/property filters, qualified paths, limits and counts while retaining that uncertainty.
+The additive `observed_gremlin_v2` result API also supports qualified `values(key)`
+and `label()` projections without weakening the original observed types' `Eq` API.
 V1 data and atomicity stay unchanged; v1 entities do not participate. No automatic
 repair, migration, failover guarantee or production deployment is implied.
 

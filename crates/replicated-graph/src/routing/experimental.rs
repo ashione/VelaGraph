@@ -4,7 +4,9 @@ mod traversal;
 use rocksdb_sql_table::experimental_graph::{
     AppendOnlyStore, CrossEdge, Direction, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
 };
-pub use traversal::{ObservedPathElement, ObservedRow, ObservedTraversal};
+pub use traversal::{
+    ObservedPathElement, ObservedRow, ObservedRowV2, ObservedTraversal, ObservedTraversalV2,
+};
 
 #[derive(Debug)]
 pub enum ExperimentalRouteError {

@@ -261,3 +261,206 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
     .await??;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Result<()> {
+    use replicated_graph::routing::experimental::{ObservedRowV2, ObservedTraversal};
+    use rocksdb_sql_table::Value;
+    // Compile-time regression: downstream users may still require Eq.
+    fn requires_eq<T: Eq>() {}
+    requires_eq::<ObservedRow>();
+    requires_eq::<ObservedTraversal>();
+    let _lock = PROCESS_TEST_LOCK.lock().await;
+    let m = Group::start(10, 10).await?;
+    let a = Group::start(20, 20).await?;
+    let b = Group::start(30, 30).await?;
+    let catalog = Catalog::new_remote(m.replicas[0].endpoint, 1, m.placement.clone(), BUDGET)?;
+    let resolver = RouteResolver::new_remote(
+        m.placement.clone(),
+        &m.replicas,
+        &[a.replicas.clone(), b.replicas.clone()].concat(),
+    )?;
+    run_blocking(move || -> anyhow::Result<()> {
+        let vr = |partition, id| VertexRef { partition, id };
+        for (p, placement) in [
+            (1, a.placement.clone()),
+            (2, b.placement.clone()),
+            (3, a.placement.clone()),
+        ] {
+            catalog.commit_registration(&catalog.prepare_registration(
+                [p as u8; 16],
+                p,
+                placement,
+            )?)?;
+            let mut v = Vertex::new(7);
+            if p != 3 {
+                v.labels = vec!["Z".into(), "A".into()];
+            }
+            if p == 1 {
+                v.properties.insert("x".into(), Value::Null);
+            }
+            if p == 2 {
+                v.properties.insert("x".into(), Value::Real(-0.0));
+            }
+            v.properties.insert("bool".into(), Value::Boolean(true));
+            v.properties.insert("int".into(), Value::Integer(i64::MAX));
+            v.properties
+                .insert("text".into(), Value::Text("同值".into()));
+            let prepared = resolver
+                .experimental_read_session(BUDGET)?
+                .prepare_vertex(p, &v)?;
+            resolver.experimental_commit(&prepared, BUDGET)?;
+        }
+        for (id, to) in [(1, 2), (2, 2), (3, 3)] {
+            let prepared =
+                resolver
+                    .experimental_read_session(BUDGET)?
+                    .prepare_edge(&CrossEdge {
+                        id,
+                        from: vr(1, 7),
+                        to: vr(to, 7),
+                        label: "K".into(),
+                        properties: BTreeMap::new(),
+                    })?;
+            resolver.experimental_commit(&prepared, BUDGET)?;
+        }
+        let s = resolver.experimental_read_session(BUDGET)?;
+        let value = |source, value| ObservedRowV2::Value { source, value };
+        let r = s.observed_gremlin_v2(999, "g.V().values('x')")?;
+        assert_eq!(
+            r.rows,
+            vec![
+                value(vr(1, 7), Value::Null),
+                value(vr(2, 7), Value::Real(0.0))
+            ]
+        );
+        let ObservedRowV2::Value {
+            value: Value::Real(z),
+            ..
+        } = r.rows[1]
+        else {
+            panic!("REAL retained")
+        };
+        assert_eq!(z.to_bits(), (-0.0f64).to_bits());
+        assert_eq!(r.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(r.metadata_sequence, s.metadata_sequence);
+        assert_eq!(r.snapshots, s.snapshots);
+        assert_eq!(r.snapshots.len(), 2);
+        assert_eq!(
+            s.observed_gremlin_v2(1, "g.V().label()")?.rows,
+            vec![
+                value(vr(1, 7), Value::Text("Z".into())),
+                value(vr(2, 7), Value::Text("Z".into())),
+                value(vr(3, 7), Value::Text(String::new())),
+            ]
+        );
+        assert_eq!(
+            s.observed_gremlin_v2(1, "g.V(7).out().values('x')")?.rows,
+            vec![
+                value(vr(2, 7), Value::Real(-0.0)),
+                value(vr(2, 7), Value::Real(-0.0))
+            ]
+        );
+        assert_eq!(
+            s.observed_gremlin_v2(1, "g.V(7,7).out().values('x').count()")?
+                .rows,
+            vec![ObservedRowV2::Count(4)]
+        );
+        for (query, n) in [
+            ("g.V().values('x').count()", 2),
+            ("g.V().values('x').limit(1).count()", 1),
+            ("g.V().limit(3).values('x').count()", 2),
+            ("g.V().values('missing').count()", 0),
+            ("g.V().label().count()", 3),
+            ("g.V(999).values('x').count()", 0),
+        ] {
+            assert_eq!(
+                s.observed_gremlin_v2(1, query)?.rows,
+                vec![ObservedRowV2::Count(n)],
+                "{query}"
+            );
+        }
+        for key in ["bool", "int", "text"] {
+            let query = format!("g.V().values('{key}')");
+            let projected = s.observed_gremlin_v2(1, &query)?;
+            assert_eq!(projected.rows.len(), 3);
+            for (index, row) in projected.rows.iter().enumerate() {
+                let expected = match key {
+                    "bool" => Value::Boolean(true),
+                    "int" => Value::Integer(i64::MAX),
+                    _ => Value::Text("同值".into()),
+                };
+                assert_eq!(*row, value(vr(index as u32 + 1, 7), expected));
+            }
+        }
+        for query in [
+            "g.V().values('x').limit(0).count()",
+            "g.V().values('x').out()",
+            "g.V(999).label().has('x')",
+            "g.V().values('missing').values('x')",
+            "g.V().limit(0).label().path()",
+            "g.V().label().label()",
+            "g.V().values()",
+            "g.V().values('x','bool')",
+            "g.V().id()",
+            "g.E().label()",
+            "g.V().count().limit(1)",
+        ] {
+            assert!(s.observed_gremlin_v2(1, query).is_err(), "{query}");
+        }
+        assert!(matches!(
+            s.observed_gremlin(1, "g.V().label()"),
+            Err(ExperimentalRouteError::Unsupported(_))
+        ));
+        for real in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut v = Vertex::new(100);
+            v.properties.insert("x".into(), Value::Real(real));
+            assert!(s.prepare_vertex(1, &v).is_err());
+        }
+        // A later append must not refresh either the frozen scan or projections.
+        let mut later = Vertex::new(1);
+        later
+            .properties
+            .insert("x".into(), Value::Text("later".into()));
+        let prepared = s.prepare_vertex(2, &later)?;
+        resolver.experimental_commit(&prepared, BUDGET)?;
+        assert_eq!(s.observed_gremlin_v2(1, "g.V().values('x')")?.rows, r.rows);
+        let fresh = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(
+            fresh
+                .observed_gremlin_v2(1, "g.V().limit(1).values('missing').count()")?
+                .rows,
+            vec![ObservedRowV2::Count(0)]
+        );
+        assert_eq!(
+            fresh
+                .observed_gremlin_v2(1, "g.V().values('x').limit(1)")?
+                .rows,
+            vec![value(vr(2, 1), Value::Text("later".into()))]
+        );
+        let mut wide = Vertex::new(90);
+        wide.properties
+            .insert("blob".into(), Value::Text("x".repeat(800_000)));
+        let prepared = fresh.prepare_vertex(1, &wide)?;
+        resolver.experimental_commit(&prepared, BUDGET)?;
+        let wide_session = resolver.experimental_read_session(BUDGET)?;
+        let ids = std::iter::repeat_n("90", 32).collect::<Vec<_>>().join(",");
+        // Start acquisition fits; projection rereads and retained scalar payloads
+        // cross the shared logical byte cap before a late limit can hide work.
+        assert_eq!(
+            wide_session
+                .observed_gremlin_v2(1, &format!("g.V({ids}).count()"))?
+                .rows,
+            vec![ObservedRowV2::Count(32)]
+        );
+        assert!(matches!(
+            wide_session.observed_gremlin_v2(1, &format!("g.V({ids}).values('blob').limit(1)")),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        Ok(())
+    })
+    .await??;
+    Ok(())
+}

@@ -229,6 +229,8 @@ D4/D5. Its out/in observations cannot certify missing-index completeness.
 
 D5 experimental functional slice: isolated v2 observed Gremlin now supports
 global/explicit V starts with qualified out/in/both, label/property filtering, vertex/edge paths,
-limits and observed counts. Results always expose Unverified completeness and a
+limits and observed counts. An additive result-v2 entrypoint adds values/label
+projections with qualified provenance and preserved bag multiplicity, keeping
+the original Eq API intact. Results always expose Unverified completeness and a
 per-shard snapshot vector. Full adjacency visibility, global consistency, repair
 and complete D5 remain deferred. See EXPERIMENTAL_CROSS_EDGES.md.

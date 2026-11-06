@@ -1132,6 +1132,25 @@ mod global_scan_tests {
             assert_eq!(all.snapshots, before.snapshots);
             assert_eq!(all.metadata_sequence, before.metadata_sequence);
             assert_eq!(all.snapshots.len(), 1);
+            let labels = before.observed_gremlin_v2(999, "g.V().label()").unwrap();
+            assert_eq!(labels.rows.len(), 100);
+            assert_eq!(labels.snapshots, all.snapshots);
+            assert_eq!(
+                before
+                    .observed_gremlin_v2(999, "g.V().label().limit(400)")
+                    .unwrap()
+                    .rows
+                    .len(),
+                400
+            );
+            assert_eq!(
+                before
+                    .observed_gremlin_v2(999, "g.V().label().count()")
+                    .unwrap()
+                    .rows,
+                vec![super::experimental::ObservedRowV2::Count(400)]
+            );
+
             assert_eq!(
                 before.observed_gremlin(999, "g.V()").unwrap().rows,
                 expected[..100]
@@ -1174,6 +1193,14 @@ mod global_scan_tests {
                     rocksdb_sql_table::Error::TraversalLimitExceeded(_)
                 ))
             ));
+            for query in ["g.V().values('missing').count()", "g.V().label().limit(1)"] {
+                assert!(matches!(
+                    within.observed_gremlin_v2(999, query),
+                    Err(ExperimentalRouteError::Query(
+                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                    ))
+                ));
+            }
             drop(within);
             for partition in [1, 2] {
                 adapter
