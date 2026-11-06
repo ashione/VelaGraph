@@ -52,9 +52,10 @@ async fn leader_of(nodes: &[NodeHandle], timeout_ms: u64) -> anyhow::Result<u64>
             for n in nodes {
                 let current = n.raft.metrics().borrow().current_leader;
                 if current == Some(n.id)
-                    && timeout(Duration::from_millis(150), n.raft.ensure_linearizable())
-                        .await
-                        .is_ok()
+                    && matches!(
+                        timeout(Duration::from_millis(150), n.raft.ensure_linearizable()).await,
+                        Ok(Ok(_))
+                    )
                 {
                     return n.id;
                 }
@@ -106,10 +107,13 @@ async fn startup_waits_for_initial_membership_to_commit() -> anyhow::Result<()> 
 
     let learner = cluster.start(4).await?;
     let leader = leader_of(&nodes, 5_000).await?;
-    handle(&nodes, leader)
-        .raft
-        .add_learner(learner.id, node(learner.id), true)
-        .await?;
+    timeout(
+        Duration::from_secs(5),
+        handle(&nodes, leader)
+            .raft
+            .add_learner(learner.id, node(learner.id), true),
+    )
+    .await??;
     Ok(())
 }
 
