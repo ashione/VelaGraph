@@ -38,6 +38,30 @@ and copies the source epoch; a new owner must call `set_epoch` after import
 before accepting writes on both sides. The graph engine is not wired through
 this boundary yet, so the existing K1 path remains authoritative.
 
+### Local performance snapshot
+
+`examples/storage_node_bench.rs` is a reproducible local benchmark:
+
+```text
+cargo run --release --example storage_node_bench --locked
+```
+
+It writes 100,000 opaque keys with 100-byte values in 100-operation,
+`sync=true` batches, then measures a stable read view, point gets, a full scan,
+and reopen. Read operations report the fastest of five trials. On 2026-11-06, three runs on an Apple M2 Pro (macOS 14.7.8) produced:
+
+| Operation | Observed |
+| --- | ---: |
+| batch_write | 393k–404k ops/s (0.25 ms per 100-op batch) |
+| read_view (100k rows copied) | ~34.4 ms |
+| get | 875k–996k ops/s (~1.0–1.1 µs/op) |
+| scan (100k rows) | 6.7M–8.4M rows/s (~12–15 ms) |
+| reopen | 113–130 ms |
+
+These are single-machine, local-APFS numbers, not a production or replicated
+capacity claim. The read view copies the partition, so its cost grows with the
+shard size; `sync=true` is included in the write result.
+
 ## Goals
 
 - Let the kernel and distributed layers evolve independently.
