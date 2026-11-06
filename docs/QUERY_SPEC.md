@@ -289,3 +289,12 @@ Unverified result type. Its global/explicit-ID V starts, out/in/both, hasLabel,
 has(key)/has(key,value), path, limit and count subset is specified in EXPERIMENTAL_CROSS_EDGES.md. Qualified path
 vertices and edges preserve partition identity. This does not change v1 semantics
 or claim complete D5 traversal; a scalar count remains an incomplete observation.
+
+The additive `observed_gremlin_v2` result API also supports `values(key)` and
+`label()` on vertices, followed only by limit/count. It retains qualified source
+provenance on scalar rows and ordered bag multiplicity. Missing properties drop
+rows; present Null remains; label is the first stored label or empty Text.
+`ObservedRowV2`/`ObservedTraversalV2` use Value's PartialEq (NaN is not self-equal,
+signed zeros compare equal); original observed Eq types/API remain unchanged.
+Shared budgets, deadline, snapshots and Unverified status are specified in
+EXPERIMENTAL_CROSS_EDGES.md; these are not complete D5 results.

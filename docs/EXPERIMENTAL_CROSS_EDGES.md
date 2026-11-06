@@ -274,3 +274,42 @@ snapshot isolation or production transport security.
 
 Unit regressions additionally verify exact cumulative-byte/work-unit boundaries
 and rejection of an already-expired retained session without resetting its deadline.
+
+### Additive projection result API (version 2)
+
+`observed_gremlin_v2(start_partition, text)` adds `values(key)` and `label()`
+to the observed subset above. It returns `ObservedTraversalV2` with
+`ObservedRowV2::{Vertex, Path, Count, Value { source, value }}`. `source` is the
+qualified `VertexRef` supplying the scalar, including after a cross-shard hop.
+This is a result-API version, not another storage encoding. The original
+`observed_gremlin`, `ObservedTraversal` and `ObservedRow` are unchanged: their
+`Eq` contracts and exhaustive enum variants remain available, and their entrypoint
+still explicitly rejects scalar projections. Opt into the new method/types to
+consume projections; no data migration is needed.
+
+Values retain the existing strict `Value` types. Missing properties contribute
+no row; a present `Null` contributes a Null row and counts as one. `label()`
+returns the first **stored** vertex label (labels are ordered), or empty Text for
+an unlabeled vertex, exactly as v1. Neither projection sorts or deduplicates;
+parallel edges and repeated starts preserve duplicate scalar rows, even with
+identical source/value. Different partitions retain distinct qualified sources.
+Only `limit` and terminal `count` may follow a scalar projection. An invalid
+following step fails with `Query(UnsupportedGremlinArgument)` even on empty
+input. The official parser's arity, type and terminal-step rules still apply.
+`E` starts and `id()` remain unsupported.
+
+The new types derive `PartialEq`, deliberately not `Eq`: the public `Value`
+contains `f64`, so caller-constructed NaN is not self-equal and signed zeros
+compare equal. The graph's existing write validation and record decoder reject
+NaN and infinities. Finite floats (including the sign bit of zero), integers,
+booleans, text and Null are passed through without coercion or normalization.
+No equality behavior in SQL, graph Value or the original observed API changes.
+
+Projection happens in step order before later limits/counts, and all lookup,
+value-payload and row charges share the same cumulative 10,000-work-unit,
+64-MiB logical byte budget as start acquisition, filters and hops. A later limit
+cannot erase earlier work. Default 100-row presentation applies only when no
+explicit limit and no terminal count; internal caps still return errors. All
+reads use the original session adapters/snapshot vector and absolute deadline.
+Results, including projected counts and empty results, remain `Unverified`.
+There is no completeness, failover, repair, TLS or global-snapshot claim.

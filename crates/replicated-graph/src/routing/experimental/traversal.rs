@@ -23,6 +23,31 @@ pub struct ObservedTraversal {
     pub metadata_sequence: u64,
     pub snapshots: Vec<ShardReadStamp>,
 }
+/// Version 2 observation rows add scalar projections without weakening the
+/// original `ObservedRow: Eq` contract. Value equality is `Value::PartialEq`:
+/// signed zeros compare equal; caller-constructed NaN is not self-equal.
+/// Stored graph values reject NaN and infinity at write and decode boundaries.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObservedRowV2 {
+    Vertex(VertexRef),
+    Path(Vec<ObservedPathElement>),
+    Count(u64),
+    /// The qualified vertex that supplied this value. Repeated traversers remain
+    /// repeated rows even when their source and value are identical.
+    Value {
+        source: VertexRef,
+        value: Value,
+    },
+}
+/// Additive projection-capable result. This is still an unverified observation,
+/// not a globally consistent or complete result. No storage format is changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservedTraversalV2 {
+    pub rows: Vec<ObservedRowV2>,
+    pub completeness: AdjacencyCompleteness,
+    pub metadata_sequence: u64,
+    pub snapshots: Vec<ShardReadStamp>,
+}
 /// Cumulative logical work admission; charges are never refunded during a query.
 /// Snapshot storage, parser allocations and bounded primitive-read scratch are
 /// excluded. This is deliberately not a heap/RSS bound.
@@ -67,6 +92,7 @@ fn limit(message: &str) -> ExperimentalRouteError {
 struct Row {
     vertex: VertexRef,
     path: Vec<ObservedPathElement>,
+    value: Option<Value>,
 }
 fn push(rows: &mut Vec<Row>, row: Row, work: &mut Work) -> ExperimentalResult<()> {
     if rows.len() >= 10_000 {
@@ -86,13 +112,65 @@ impl ExperimentalReadSession {
         start_partition: u32,
         text: &str,
     ) -> ExperimentalResult<ObservedTraversal> {
+        let result = self.execute_observed(start_partition, text, false)?;
+        let output = ObservedTraversal {
+            rows: result
+                .rows
+                .into_iter()
+                .map(|row| match row {
+                    ObservedRowV2::Vertex(v) => ObservedRow::Vertex(v),
+                    ObservedRowV2::Path(p) => ObservedRow::Path(p),
+                    ObservedRowV2::Count(n) => ObservedRow::Count(n),
+                    ObservedRowV2::Value { .. } => {
+                        unreachable!("legacy entrypoint rejects projections")
+                    }
+                })
+                .collect(),
+            completeness: result.completeness,
+            metadata_sequence: result.metadata_sequence,
+            snapshots: result.snapshots,
+        };
+        self.op.check(None)?;
+        Ok(output)
+    }
+
+    /// Projection-capable version of `observed_gremlin`, sharing the same frozen
+    /// session and budgets. `values(key)` drops missing properties but retains
+    /// explicit Null; `label()` returns the first stored label or empty text.
+    /// Only limit/count may follow a scalar projection, including on empty input.
+    pub fn observed_gremlin_v2(
+        &self,
+        start_partition: u32,
+        text: &str,
+    ) -> ExperimentalResult<ObservedTraversalV2> {
+        self.execute_observed(start_partition, text, true)
+    }
+
+    fn execute_observed(
+        &self,
+        start_partition: u32,
+        text: &str,
+        projections: bool,
+    ) -> ExperimentalResult<ObservedTraversalV2> {
         self.op.check(None)?;
         let query = GremlinQuery::parse(text).map_err(ExperimentalRouteError::Query)?;
         self.op.check(None)?;
         let GremlinStart::Vertices(ids) = query.start() else {
             return Err(ExperimentalRouteError::Unsupported("v2 requires a V start"));
         };
+        let mut scalar = false;
         for step in query.steps() {
+            if scalar && !matches!(step, GremlinStep::Limit(_) | GremlinStep::Count) {
+                return Err(ExperimentalRouteError::Query(
+                    rocksdb_sql_table::Error::UnsupportedGremlinArgument(
+                        "only limit/count may follow a v2 scalar projection".into(),
+                    ),
+                ));
+            }
+            if projections && matches!(step, GremlinStep::Values(_) | GremlinStep::Label) {
+                scalar = true;
+                continue;
+            }
             if !matches!(
                 step,
                 GremlinStep::Out(_)
@@ -135,6 +213,7 @@ impl ExperimentalReadSession {
                     Row {
                         vertex: r,
                         path: vec![ObservedPathElement::Vertex(r)],
+                        value: None,
                     },
                     &mut work,
                 )?;
@@ -173,6 +252,7 @@ impl ExperimentalReadSession {
                             Row {
                                 vertex: r,
                                 path: vec![ObservedPathElement::Vertex(r)],
+                                value: None,
                             },
                             &mut work,
                         )?;
@@ -267,12 +347,41 @@ impl ExperimentalReadSession {
                                 Row {
                                     vertex: target,
                                     path,
+                                    value: None,
                                 },
                                 &mut work,
                             )?;
                         }
                     }
                     rows = next;
+                }
+                GremlinStep::Values(_) | GremlinStep::Label => {
+                    let mut projected = Vec::new();
+                    for mut row in rows {
+                        self.op.check(None)?;
+                        work.visit()?;
+                        let mut vertex = self
+                            .get_vertex(row.vertex)?
+                            .ok_or(ExperimentalError::MissingEndpoint(row.vertex))?;
+                        work.vertex(&vertex)?;
+                        let value = match step {
+                            GremlinStep::Values(key) => vertex.properties.remove(key),
+                            GremlinStep::Label => Some(Value::Text(
+                                vertex.labels.into_iter().next().unwrap_or_default(),
+                            )),
+                            _ => unreachable!("projection step"),
+                        };
+                        if let Some(value) = value {
+                            work.charge(match &value {
+                                Value::Text(s) => s.len(),
+                                _ => 8,
+                            })?;
+                            row.value = Some(value);
+                            row.path.clear();
+                            push(&mut projected, row, &mut work)?;
+                        }
+                    }
+                    rows = projected;
                 }
                 GremlinStep::Path | GremlinStep::Count => {}
                 _ => unreachable!("validated supported subset"),
@@ -290,20 +399,25 @@ impl ExperimentalReadSession {
         }
         work.charge(rows.len() * 128 + self.snapshots.len() * 64)?;
         let output = if count {
-            vec![ObservedRow::Count(rows.len() as u64)]
+            vec![ObservedRowV2::Count(rows.len() as u64)]
         } else {
             rows.into_iter()
                 .map(|r| {
-                    if path {
-                        ObservedRow::Path(r.path)
+                    if let Some(value) = r.value {
+                        ObservedRowV2::Value {
+                            source: r.vertex,
+                            value,
+                        }
+                    } else if path {
+                        ObservedRowV2::Path(r.path)
                     } else {
-                        ObservedRow::Vertex(r.vertex)
+                        ObservedRowV2::Vertex(r.vertex)
                     }
                 })
                 .collect()
         };
         self.op.check(None)?;
-        Ok(ObservedTraversal {
+        Ok(ObservedTraversalV2 {
             rows: output,
             completeness: AdjacencyCompleteness::Unverified,
             metadata_sequence: self.metadata_sequence,
@@ -315,6 +429,20 @@ impl ExperimentalReadSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn projection_equality_follows_value_without_claiming_eq() {
+        let source = VertexRef {
+            partition: 1,
+            id: 7,
+        };
+        let row = |x| ObservedRowV2::Value {
+            source,
+            value: Value::Real(x),
+        };
+        assert_eq!(row(-0.0), row(0.0));
+        let nan = row(f64::NAN);
+        assert_ne!(nan, nan.clone());
+    }
     #[test]
     fn cumulative_budget_is_shared_and_never_refunded() {
         let mut work = Work {
@@ -396,6 +524,12 @@ mod tests {
                 _permit: semaphore.acquire_owned().await.unwrap(),
             }),
         };
+        assert!(matches!(
+            session.observed_gremlin_v2(1, "g.V().values('x').count()"),
+            Err(ExperimentalRouteError::Route(RouteError::Storage(
+                StorageNodeError::Timeout { .. }
+            )))
+        ));
         assert!(matches!(
             session.observed_gremlin(1, "g.V(7).count()"),
             Err(ExperimentalRouteError::Route(RouteError::Storage(
