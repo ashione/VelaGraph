@@ -15,9 +15,9 @@ use d2_raft::{
     StateMachine, TypeConfig,
 };
 use rocksdb_sql_table::{
-    Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanLimit, Sequence, ShardId,
-    StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult, WriteStatus,
-    MAX_VIEW_BYTES, MAX_VIEW_ROWS,
+    Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
+    Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
+    WriteResult, WriteStatus, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
 };
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -200,6 +200,17 @@ impl StorageNode for ReplicatedStorageNode {
     fn scan(&self, range: KeyRange, limit: ScanLimit, view: &ReadView) -> Result<Vec<KeyValue>> {
         self.check_view(view)?;
         view.scan(range, limit)
+    }
+
+    fn scan_page(
+        &self,
+        range: KeyRange,
+        limit: ScanLimit,
+        view: &ReadView,
+        cursor: Option<&ScanCursor>,
+    ) -> Result<ScanPage> {
+        self.check_view(view)?;
+        view.scan_page(range, limit, cursor)
     }
 
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult> {

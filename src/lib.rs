@@ -54,9 +54,9 @@ pub use gremlin::{
 };
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use storage_node::{
-    Epoch, Export, KeyRange, KeyValue, LocalStorageNode, ReadView, RequestId, ScanLimit, Sequence,
-    ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult,
-    WriteStatus, INTERFACE_VERSION, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
+    Epoch, Export, KeyRange, KeyValue, LocalStorageNode, ReadView, RequestId, ScanCursor,
+    ScanLimit, ScanPage, Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp,
+    WriteRequest, WriteResult, WriteStatus, INTERFACE_VERSION, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
 };
 pub use traversal::{
     TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,
