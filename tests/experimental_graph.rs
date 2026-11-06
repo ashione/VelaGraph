@@ -607,3 +607,105 @@ fn audit_combined_same_shard_source_reverse_fail_atomically_on_stale_view() {
     assert!(a.observed_index(1, Direction::Out).unwrap().is_empty());
     assert!(b.observed_index(2, Direction::In).unwrap().is_empty());
 }
+
+#[test]
+fn vertex_pages_are_bounded_ordered_isolated_and_reopenable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let n = node(dir.path());
+        let store = AppendOnlyStore::new(n.clone(), 7, 1);
+        for id in [u64::MAX, 300, 0, 1, 128, 129] {
+            vertex(&store, &n, id);
+        }
+        vertex(&AppendOnlyStore::new(n.clone(), 7, 2), &n, 8);
+        // This decorator intentionally lacks paged scans. No fallback to scan.
+        assert!(matches!(
+            store.vertex_page(None, ScanLimit::new(1, 1024).unwrap()),
+            Err(ExperimentalError::Storage(StorageNodeError::Unsupported(_)))
+        ));
+    }
+    let store = AppendOnlyStore::new(LocalStorageNode::open(dir.path(), 7).unwrap(), 7, 1);
+    let mut after = None;
+    let mut ids = vec![];
+    loop {
+        let page = store
+            .vertex_page(after, ScanLimit::new(2, 1024).unwrap())
+            .unwrap();
+        assert!(page.vertices.len() <= 2);
+        assert!(page.raw_bytes <= 1024);
+        ids.extend(page.vertices.into_iter().map(|v| v.id));
+        after = page.next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(ids, vec![0, 1, 128, 129, 300, u64::MAX]);
+    assert!(store
+        .vertex_page(Some(u64::MAX), ScanLimit::new(1, 1024).unwrap())
+        .unwrap()
+        .vertices
+        .is_empty());
+    assert!(matches!(
+        store.vertex_page(None, ScanLimit::new(1, 1).unwrap()),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::ResourceExhausted(_)
+        ))
+    ));
+    assert!(matches!(
+        store.vertex_page(None, ScanLimit::new(129, 1024).unwrap()),
+        Err(ExperimentalError::Invalid(_))
+    ));
+    assert!(matches!(
+        store.vertex_page(None, ScanLimit::new(1, 1024 * 1024 + 65).unwrap()),
+        Err(ExperimentalError::Invalid(_))
+    ));
+}
+
+#[test]
+fn vertex_pages_reject_corrupt_keys_envelopes_and_identity_without_partial_success() {
+    let prefix = hex("67726170682f76322f702f000000012f7665727465782f");
+    for case in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let n = node(dir.path());
+            let store = AppendOnlyStore::new(n.clone(), 7, 1);
+            vertex(&store, &n, 1);
+            let mut key = prefix.clone();
+            key.extend(2u64.to_be_bytes());
+            let mut value = n
+                .get(
+                    &[prefix.clone(), 1u64.to_be_bytes().to_vec()].concat(),
+                    &n.read_view().unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            match case {
+                0 => key.push(0),
+                1 => value[5] = 2, // wrong partition
+                2 => value[0] = 0, // corrupt envelope
+                4 => {
+                    // malformed suffix of the preceding page's exact last key
+                    key = prefix.clone();
+                    key.extend(1u64.to_be_bytes());
+                    key.push(0);
+                }
+                _ => {} // record id 1 under key id 2
+            }
+            raw(&n, vec![WriteOp::Put { key, value }]);
+        }
+        let store = AppendOnlyStore::new(LocalStorageNode::open(dir.path(), 7).unwrap(), 7, 1);
+        let first = store
+            .vertex_page(None, ScanLimit::new(1, 1024).unwrap())
+            .unwrap();
+        assert_eq!(first.vertices[0].id, 1);
+        assert_eq!(first.next_after, Some(1));
+        assert!(matches!(
+            store.vertex_page(first.next_after, ScanLimit::new(128, 1024).unwrap()),
+            Err(ExperimentalError::Corrupt(_))
+        ));
+        assert!(matches!(
+            store.vertex_page(None, ScanLimit::new(128, 1024).unwrap()),
+            Err(ExperimentalError::Corrupt(_))
+        ));
+    }
+}

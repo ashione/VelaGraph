@@ -79,7 +79,8 @@ fn push(rows: &mut Vec<Row>, row: Row, work: &mut Work) -> ExperimentalResult<()
 impl ExperimentalReadSession {
     /// Executes against this session's original catalog, shard views and deadline.
     /// Local start IDs belong to `start_partition`; subsequent hops are qualified.
-    /// Missing explicit starts produce no row. No implicit/global start scan.
+    /// Missing explicit starts produce no row. Empty V() scans every frozen
+    /// catalog partition in (local ID, partition ID) order, ignoring start_partition.
     pub fn observed_gremlin(
         &self,
         start_partition: u32,
@@ -89,13 +90,8 @@ impl ExperimentalReadSession {
         let query = GremlinQuery::parse(text).map_err(ExperimentalRouteError::Query)?;
         self.op.check(None)?;
         let GremlinStart::Vertices(ids) = query.start() else {
-            return Err(ExperimentalRouteError::Unsupported(
-                "v2 requires explicit V(ids...)",
-            ));
+            return Err(ExperimentalRouteError::Unsupported("v2 requires a V start"));
         };
-        if ids.is_empty() {
-            return Err(ExperimentalRouteError::Unsupported("v2 V() scan"));
-        }
         for step in query.steps() {
             if !matches!(
                 step,
@@ -103,6 +99,7 @@ impl ExperimentalReadSession {
                     | GremlinStep::In(_)
                     | GremlinStep::Both(_)
                     | GremlinStep::HasLabel(_)
+                    | GremlinStep::Has { .. }
                     | GremlinStep::Path
                     | GremlinStep::Limit(_)
                     | GremlinStep::Count
@@ -112,8 +109,10 @@ impl ExperimentalReadSession {
                 ));
             }
         }
-        // Resolve even when all explicit starts are absent.
-        self.store(start_partition)?;
+        // Explicit IDs retain partition validation even when all are absent.
+        if !ids.is_empty() {
+            self.store(start_partition)?;
+        }
         let mut work = Work {
             bytes: 4096,
             visits: 0,
@@ -141,11 +140,61 @@ impl ExperimentalReadSession {
                 )?;
             }
         }
+        if ids.is_empty() {
+            let leading = match query.steps().first() {
+                Some(GremlinStep::Limit(n)) => Some(*n),
+                _ => None,
+            };
+            for partition in self.placements.keys() {
+                let store = self.store(*partition)?;
+                let mut after = None;
+                let mut acquired = 0usize;
+                loop {
+                    self.op.check(None)?;
+                    let remaining = leading.map_or(128, |n| n.saturating_sub(acquired).min(128));
+                    if remaining == 0 {
+                        break;
+                    }
+                    // One bounded decoded page may overlap already admitted rows.
+                    // Raw page and decoded payload are charged cumulatively before retention.
+                    let page =
+                        store.vertex_page(after, ScanLimit::new(remaining, 1024 * 1024 + 64)?)?;
+                    work.charge(page.raw_bytes + page.vertices.len() * 128)?;
+                    for vertex in page.vertices {
+                        self.op.check(None)?;
+                        work.visit()?;
+                        work.vertex(&vertex)?;
+                        let r = VertexRef {
+                            partition: *partition,
+                            id: vertex.id,
+                        };
+                        push(
+                            &mut rows,
+                            Row {
+                                vertex: r,
+                                path: vec![ObservedPathElement::Vertex(r)],
+                            },
+                            &mut work,
+                        )?;
+                        acquired += 1;
+                    }
+                    if let Some(n) = leading {
+                        rows.sort_unstable_by_key(|row| (row.vertex.id, row.vertex.partition));
+                        rows.truncate(n);
+                    }
+                    after = page.next_after;
+                    if after.is_none() {
+                        break;
+                    }
+                }
+            }
+            rows.sort_unstable_by_key(|row| (row.vertex.id, row.vertex.partition));
+        }
         for step in query.steps() {
             self.op.check(None)?;
             match step {
                 GremlinStep::Limit(n) => rows.truncate(*n),
-                GremlinStep::HasLabel(labels) => {
+                GremlinStep::HasLabel(_) | GremlinStep::Has { .. } => {
                     let mut filtered = Vec::new();
                     for row in rows {
                         self.op.check(None)?;
@@ -154,7 +203,17 @@ impl ExperimentalReadSession {
                             .get_vertex(row.vertex)?
                             .ok_or(ExperimentalError::MissingEndpoint(row.vertex))?;
                         work.vertex(&v)?;
-                        if v.labels.iter().any(|l| labels.contains(l)) {
+                        let matches = match step {
+                            GremlinStep::HasLabel(labels) => {
+                                v.labels.iter().any(|l| labels.contains(l))
+                            }
+                            GremlinStep::Has { key, value } => match value {
+                                Some(value) => v.properties.get(key) == Some(value),
+                                None => v.properties.contains_key(key),
+                            },
+                            _ => unreachable!("filter step"),
+                        };
+                        if matches {
                             push(&mut filtered, row, &mut work)?;
                         }
                     }
@@ -275,6 +334,48 @@ mod tests {
         };
         work.visit().unwrap();
         assert!(work.visit().is_err());
+    }
+    #[tokio::test]
+    async fn empty_global_catalog_is_an_unverified_empty_observation() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let session = ExperimentalReadSession {
+            metadata: Placement {
+                shard: 1,
+                group: 1,
+                epoch: 1,
+                replicas: vec![1],
+            },
+            metadata_sequence: 42,
+            snapshots: vec![],
+            placements: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            op: Arc::new(Operation {
+                end: Instant::now() + Duration::from_secs(60),
+                _permit: semaphore.acquire_owned().await.unwrap(),
+            }),
+        };
+        let output = session
+            .observed_gremlin(999, "g.V().has('missing').count()")
+            .unwrap();
+        assert_eq!(output.rows, vec![ObservedRow::Count(0)]);
+        assert_eq!(output.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(output.metadata_sequence, 42);
+        assert!(output.snapshots.is_empty());
+        assert!(session
+            .observed_gremlin(999, "g.V().path()")
+            .unwrap()
+            .rows
+            .is_empty());
+        assert!(matches!(
+            session.observed_gremlin(999, "g.V(1)"),
+            Err(ExperimentalRouteError::Route(RouteError::MissingPartition(
+                999
+            )))
+        ));
+        assert!(matches!(
+            session.observed_gremlin(999, "g.V().values('x')"),
+            Err(ExperimentalRouteError::Unsupported(_))
+        ));
     }
     #[tokio::test]
     async fn expired_session_does_not_restart_deadline_even_for_empty_count() {

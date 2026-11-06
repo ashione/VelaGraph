@@ -1065,6 +1065,177 @@ mod global_scan_tests {
         catalog.commit_registration(&prepared).unwrap();
     }
 
+    // Minimal canonical vertex fixture using GRAPH_FORMAT and
+    // EXPERIMENTAL_CROSS_EDGES envelopes. Raw test-only batches avoid 10,002
+    // Raft commits; production writes still use validated append preparation.
+    fn bare_v2_vertex(partition: u32, id: u64) -> rocksdb_sql_table::WriteOp {
+        let mut key = b"graph/v2/p/".to_vec();
+        key.extend(partition.to_be_bytes());
+        key.extend(b"/vertex/");
+        key.extend(id.to_be_bytes());
+        let mut payload = vec![8]; // Vertex.id, protobuf uint64
+        let mut remaining = id;
+        while remaining >= 128 {
+            payload.push((remaining as u8 & 127) | 128);
+            remaining >>= 7;
+        }
+        payload.push(remaining as u8);
+        let mut record = vec![8, 1, 16, 1, 26, payload.len() as u8];
+        record.extend(payload);
+        let mut value = vec![8, 2, 16, 1, 29];
+        value.extend(partition.to_le_bytes());
+        value.extend([34, record.len() as u8]);
+        value.extend(record);
+        rocksdb_sql_table::WriteOp::Put { key, value }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_global_vertex_pages_share_acquisition_and_filter_budgets() {
+        use super::experimental::{AdjacencyCompleteness, ExperimentalRouteError, ObservedRow};
+        use rocksdb_sql_table::experimental_graph::VertexRef;
+
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let data = start(&root, 20).await;
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let adapter = ReplicatedStorageNode::new(&data, 20, TEST_TIMEOUT).unwrap();
+        let resolver = RouteResolver::new(
+            place(10),
+            std::slice::from_ref(&meta),
+            std::slice::from_ref(&data),
+        )
+        .unwrap();
+        crate::run_blocking(move || {
+            for partition in [1, 2] {
+                register(&catalog, partition, place(20));
+                adapter
+                    .batch_write(WriteRequest {
+                        shard: 20,
+                        epoch: 1,
+                        request_id: [partition as u8; 16],
+                        operations: (1..=200).map(|id| bare_v2_vertex(partition, id)).collect(),
+                    })
+                    .unwrap();
+            }
+            let before = resolver
+                .experimental_read_session(Duration::from_secs(60))
+                .unwrap();
+            let expected: Vec<_> = (1..=200)
+                .flat_map(|id| {
+                    [1, 2].map(|partition| ObservedRow::Vertex(VertexRef { partition, id }))
+                })
+                .collect();
+            // Two pages per partition, equal local IDs, one shared data view.
+            let all = before.observed_gremlin(999, "g.V().limit(400)").unwrap();
+            assert_eq!(all.rows, expected);
+            assert_eq!(all.completeness, AdjacencyCompleteness::Unverified);
+            assert_eq!(all.snapshots, before.snapshots);
+            assert_eq!(all.metadata_sequence, before.metadata_sequence);
+            assert_eq!(all.snapshots.len(), 1);
+            assert_eq!(
+                before.observed_gremlin(999, "g.V()").unwrap().rows,
+                expected[..100]
+            );
+            assert_eq!(
+                before
+                    .observed_gremlin(999, "g.V().limit(300)")
+                    .unwrap()
+                    .rows,
+                expected[..300]
+            );
+            assert_eq!(
+                before.observed_gremlin(999, "g.V().count()").unwrap().rows,
+                vec![ObservedRow::Count(400)]
+            );
+            for partition in [1, 2] {
+                adapter
+                    .batch_write(WriteRequest {
+                        shard: 20,
+                        epoch: 1,
+                        request_id: [partition as u8 + 2; 16],
+                        operations: (201..=4000)
+                            .map(|id| bare_v2_vertex(partition, id))
+                            .collect(),
+                    })
+                    .unwrap();
+            }
+            // Acquisition fits, but reading properties adds visits to the same
+            // cumulative work budget even when the filter discards every row.
+            let within = resolver
+                .experimental_read_session(Duration::from_secs(60))
+                .unwrap();
+            assert_eq!(
+                within.observed_gremlin(999, "g.V().count()").unwrap().rows,
+                vec![ObservedRow::Count(8000)]
+            );
+            assert!(matches!(
+                within.observed_gremlin(999, "g.V().has('missing').count()"),
+                Err(ExperimentalRouteError::Query(
+                    rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                ))
+            ));
+            drop(within);
+            for partition in [1, 2] {
+                adapter
+                    .batch_write(WriteRequest {
+                        shard: 20,
+                        epoch: 1,
+                        request_id: [partition as u8 + 4; 16],
+                        operations: (4001..=5001)
+                            .map(|id| bare_v2_vertex(partition, id))
+                            .collect(),
+                    })
+                    .unwrap();
+            }
+            // Each partition is below 10k; their combined acquisition is not.
+            let current = resolver
+                .experimental_read_session(Duration::from_secs(60))
+                .unwrap();
+            for query in [
+                "g.V()",
+                "g.V().count()",
+                "g.V().has('missing')",
+                "g.V().has('missing').limit(1)",
+                "g.V().has('missing').count()",
+                "g.V().hasLabel('Missing').limit(1).count()",
+            ] {
+                let result = current.observed_gremlin(999, query);
+                assert!(
+                    matches!(
+                        result,
+                        Err(ExperimentalRouteError::Query(
+                            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        ))
+                    ),
+                    "{query}: {result:?}"
+                );
+            }
+            for (query, count) in [
+                ("g.V().limit(1000).count()", 1000),
+                ("g.V().limit(1000).has('missing').count()", 0),
+            ] {
+                let result = current.observed_gremlin(999, query).unwrap();
+                assert_eq!(result.rows, vec![ObservedRow::Count(count)], "{query}");
+                assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+                assert_eq!(result.snapshots, current.snapshots);
+                assert_eq!(result.metadata_sequence, current.metadata_sequence);
+            }
+            assert!(current
+                .observed_gremlin(999, "g.V().limit(1000).has('missing')")
+                .unwrap()
+                .rows
+                .is_empty());
+            assert_eq!(
+                before.observed_gremlin(999, "g.V().count()").unwrap().rows,
+                vec![ObservedRow::Count(400)]
+            );
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        root.in_group(20).shutdown(&data).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn global_filters_reload_properties_only_from_pinned_views() {
         use rocksdb_sql_table::{GremlinRow, QualifiedGremlinRow, Value};
