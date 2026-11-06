@@ -52,6 +52,12 @@ All data and logs are retained for inspection, including on successful runs.
 Review the printed directory and remove it yourself when no longer needed.
 Each new run starts from new data rather than resuming these directories.
 
+Plan for several hundred MiB of retained RocksDB files per run (about 447 MiB
+in one development run; this is not a fixed storage bound). Repeated demos can
+fill a small `/tmp` filesystem. To choose a larger filesystem, set `TMPDIR` to an
+existing directory with enough free space; the demo still creates a unique child
+directory and never reuses existing data. Cargo tests inherit this setting too.
+
 ## Tests
 
 ```sh
