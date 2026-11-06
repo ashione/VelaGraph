@@ -35,8 +35,28 @@ while this adapter's `import` rejects oversized inputs. Batches are capped at 10
 retained indefinitely in this prototype; bounded retention is not implemented.
 `import` is one-shot, requires a pristine target (sequence 0 and no live keys),
 and copies the source epoch; a new owner must call `set_epoch` after import
-before accepting writes on both sides. The graph engine is not wired through
-this boundary yet, so the existing K1 path remains authoritative.
+before accepting writes on both sides.
+
+[`src/graph_records.rs`](../src/graph_records.rs) adds a graph-record adapter over
+any `StorageNode`. It reuses the K1 `graph/v1` key layout and record codec for
+vertices, edges, and outgoing/incoming adjacency entries, and applies each
+mutation as one `batch_write`. The adapter covers create/update/delete for
+vertices and edges, label-filtered adjacency reads, cascade deletion, and
+reopen. Before returning adjacency results or submitting a cascade batch, it
+checks every scanned adjacency key against its edge record (direction, endpoint,
+label, and id) and requires an empty adjacency value. A mismatch or missing edge
+is `CorruptData`; a failed cascade leaves both data and applied sequence unchanged.
+This is validation of the scanned index, not a full-graph integrity audit: absent
+adjacency entries cannot be discovered without scanning edge records.
+Mutations through one store are serialized, but the adapter assumes one
+writer per shard; separate stores need external coordination. It caps adjacency
+reads (and therefore a single cascade delete) at 1,000 incident edges and
+returns a storage error instead of a partial result, and leaves multi-shard
+routing and transactions to D3/D4. Request ids are derived from the observed sequence;
+exactly-once retry after an unknown commit still needs a caller-supplied id in a
+later slice. `GraphEngine` still
+uses its own RocksDB handle, so the existing K1 path remains authoritative until
+the engine is wired through this adapter.
 
 ### Local performance snapshot
 

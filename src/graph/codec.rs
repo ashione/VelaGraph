@@ -51,7 +51,7 @@ const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LABELS: usize = 4096;
 const MAX_PROPERTIES: usize = 65_536;
 
-pub(super) fn encode_vertex(vertex: &Vertex) -> Result<Vec<u8>> {
+pub(crate) fn encode_vertex(vertex: &Vertex) -> Result<Vec<u8>> {
     if vertex.labels.len() > MAX_LABELS {
         return Err(Error::InvalidGraphProperty(format!(
             "vertex has {} labels, limit is {MAX_LABELS}",
@@ -67,7 +67,7 @@ pub(super) fn encode_vertex(vertex: &Vertex) -> Result<Vec<u8>> {
     encode_record(KIND_VERTEX, payload)
 }
 
-pub(super) fn encode_edge(edge: &Edge) -> Result<Vec<u8>> {
+pub(crate) fn encode_edge(edge: &Edge) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     put_uint(&mut payload, 1, edge.id);
     put_uint(&mut payload, 2, edge.from);
@@ -77,12 +77,12 @@ pub(super) fn encode_edge(edge: &Edge) -> Result<Vec<u8>> {
     encode_record(KIND_EDGE, payload)
 }
 
-pub(super) fn decode_vertex(bytes: &[u8]) -> Result<Vertex> {
+pub(crate) fn decode_vertex(bytes: &[u8]) -> Result<Vertex> {
     let payload = decode_record(bytes, KIND_VERTEX)?;
     decode_vertex_payload(&payload)
 }
 
-pub(super) fn decode_edge(bytes: &[u8]) -> Result<Edge> {
+pub(crate) fn decode_edge(bytes: &[u8]) -> Result<Edge> {
     let payload = decode_record(bytes, KIND_EDGE)?;
     decode_edge_payload(&payload)
 }
