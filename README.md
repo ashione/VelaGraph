@@ -543,3 +543,9 @@ recursive parser. The existing 16 KiB cap alone did not prevent stack overflow
 from short repeated lists/chains. Marks inside strings/comments also count: this
 intentionally conservative compatibility restriction avoids a second lexer and
 malformed-string bypasses. See [query limits](docs/QUERY_SPEC.md#8-resource-limits).
+
+The isolated graph/v2 experiment additionally offers `observed_gremlin_v3`
+edge starts, filters and scalar projections with qualified edge provenance.
+Its bounded canonical pages validate observed indexes and endpoints, but every
+result remains Unverified, not a globally consistent or complete traversal.
+See [experimental edge observations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-edge-observations-v3).

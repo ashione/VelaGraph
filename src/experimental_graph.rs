@@ -130,6 +130,14 @@ pub struct VertexPage {
     pub next_after: Option<u64>,
     pub raw_bytes: usize,
 }
+/// A bounded canonical edge page in local ID order. Index and endpoint
+/// completeness is not certified here; callers must verify each candidate.
+#[derive(Debug)]
+pub struct EdgePage {
+    pub edges: Vec<CrossEdge>,
+    pub next_after: Option<u64>,
+    pub raw_bytes: usize,
+}
 impl<S: StorageNode> AppendOnlyStore<S> {
     pub fn new(node: S, shard: u64, partition: u32) -> Self {
         Self {
@@ -216,6 +224,85 @@ impl<S: StorageNode> AppendOnlyStore<S> {
         }
         Ok(VertexPage {
             vertices,
+            next_after: page.next_cursor.and(last),
+            raw_bytes,
+        })
+    }
+    /// Reads source-owned canonical edges from one bounded page. Stable
+    /// pagination requires a pinned node. No all-or-error scan fallback is used.
+    pub fn edge_page(&self, after: Option<u64>, limit: ScanLimit) -> Result<EdgePage> {
+        if limit.max_rows == 0
+            || limit.max_bytes == 0
+            || limit.max_rows > 128
+            || limit.max_bytes > 1024 * 1024 + 64
+        {
+            return Err(ExperimentalError::Invalid("edge page limit"));
+        }
+        let view = self.view()?;
+        let mut prefix = record_key(self.partition, b"edge/", 0);
+        prefix.truncate(prefix.len() - 8);
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() += 1;
+        let start = after.map_or_else(
+            || prefix.clone(),
+            |id| {
+                let mut key = record_key(self.partition, b"edge/", id);
+                key.push(0);
+                key
+            },
+        );
+        let range = KeyRange::new(start, end)?;
+        let page = self.node.scan_page(range.clone(), limit, &view, None)?;
+        if page.rows.len() > limit.max_rows {
+            return Err(ExperimentalError::Corrupt("edge page row limit"));
+        }
+        let mut edges = Vec::new();
+        let mut raw_bytes = 0usize;
+        let mut last = after;
+        let mut last_key = Vec::new();
+        for row in page.rows {
+            self.node.check_execution_context()?;
+            raw_bytes = raw_bytes.saturating_add(row.key.len() + row.value.len());
+            if raw_bytes > limit.max_bytes {
+                return Err(ExperimentalError::Corrupt("edge page byte limit"));
+            }
+            if !row.key.starts_with(&prefix) || row.key.len() != prefix.len() + 8 {
+                return Err(ExperimentalError::Corrupt("edge key encoding"));
+            }
+            let id = u64::from_be_bytes(row.key[prefix.len()..].try_into().unwrap());
+            if last.is_some_and(|previous| id <= previous) {
+                return Err(ExperimentalError::Corrupt("edge page order"));
+            }
+            let (to_partition, bytes) = unwrap_record(&row.value, 2)?;
+            let local = codec::decode_edge(bytes)?;
+            if local.id != id {
+                return Err(ExperimentalError::Corrupt("edge key identity"));
+            }
+            edges.push(CrossEdge {
+                id,
+                from: VertexRef {
+                    partition: self.partition,
+                    id: local.from,
+                },
+                to: VertexRef {
+                    partition: to_partition,
+                    id: local.to,
+                },
+                label: local.label,
+                properties: local.properties,
+            });
+            last = Some(id);
+            last_key = row.key;
+        }
+        if page
+            .next_cursor
+            .as_ref()
+            .is_some_and(|c| edges.is_empty() || !c.matches_page(&view, &range, &last_key))
+        {
+            return Err(ExperimentalError::Corrupt("edge page continuation"));
+        }
+        Ok(EdgePage {
+            edges,
             next_after: page.next_cursor.and(last),
             raw_bytes,
         })

@@ -313,3 +313,41 @@ explicit limit and no terminal count; internal caps still return errors. All
 reads use the original session adapters/snapshot vector and absolute deadline.
 Results, including projected counts and empty results, remain `Unverified`.
 There is no completeness, failover, repair, TLS or global-snapshot claim.
+
+## Additive edge observations (v3)
+
+`observed_gremlin_v3(start_partition, text)` supports the v2 vertex subset and
+adds `E()` / `E(ids)` followed by `has`, `hasLabel`, `values(key)`, `label`,
+`limit`, `path`, and `count`. The official parser is unchanged. Edge starts
+reject `out`/`in`/`both`, `outE`/`inE`/`bothE`, endpoint steps and `id`, even on
+empty input. Only limit/count may follow a scalar projection. The older
+`observed_gremlin` and `observed_gremlin_v2` APIs still reject edge starts;
+their public enums and Eq/PartialEq contracts are unchanged.
+
+Explicit edge IDs belong to start_partition, retain argument order and
+repetitions, and omit missing IDs. E() ignores start_partition and merges all
+frozen catalog partitions in (local edge ID, source-owner partition) order.
+`ObservedRowV3::Edge` holds an EdgeRef, scalar provenance uses
+`ObservedElementRef::{Vertex, Edge}`, and an edge-start path has one qualified
+Edge path element. Edge label is the canonical edge's label. Property matching
+is strict; values drops missing properties and retains explicit Null.
+
+Every acquired edge candidate is checked against canonical record, outgoing
+and incoming indexes, and both endpoints on the original session snapshots.
+An inconsistent candidate fails the entire query with typed Incomplete; a
+filter cannot hide it. This is still **Unverified**, including empty/scalar/
+count results: a missing canonical record with a residual reverse index cannot
+be found by the canonical scan. The snapshot vector is not a global snapshot,
+and this feature is not a completeness audit, transaction, repair, retry, or
+replica-switch mechanism.
+
+Pages are at most 128 records / 1 MiB + 64 bytes, checked for limits, key and
+record identity, strict order, and continuation view/range/last-key binding.
+Scans require a pinned node for stability; unsupported pagination has no scan
+fallback. Each query has one cumulative 10,000-work-unit / stage-row cap and
+64 MiB logical byte budget, with a default output cap of 100. These are not
+RSS limits; bounded primitive scratch and snapshot storage are excluded.
+Leading limit reads at most that many candidates per partition and keeps the
+global prefix, without checking excluded candidates. A later limit/count does
+not excuse earlier budget errors. Session construction still pins every shard,
+and all operations retain its original absolute deadline.

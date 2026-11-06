@@ -1,5 +1,7 @@
 //! Bounded, explicitly incomplete observations using the existing Gremlin parser.
 use super::*;
+mod edges;
+pub use edges::{ObservedElementRef, ObservedRowV3, ObservedTraversalV3};
 use rocksdb_sql_table::{GremlinQuery, GremlinStart, GremlinStep, Value};
 
 /// The value is an observation, never a certified complete traversal result.
@@ -482,6 +484,14 @@ mod tests {
                 _permit: semaphore.acquire_owned().await.unwrap(),
             }),
         };
+        let edge_output = session
+            .observed_gremlin_v3(999, "g.E().has('missing').count()")
+            .unwrap();
+        assert_eq!(edge_output.rows, vec![ObservedRowV3::Count(0)]);
+        assert_eq!(edge_output.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(edge_output.metadata_sequence, 42);
+        assert!(session.observed_gremlin_v3(999, "g.E().out()").is_err());
+        assert!(session.observed_gremlin_v3(999, "g.E(1)").is_err());
         let output = session
             .observed_gremlin(999, "g.V().has('missing').count()")
             .unwrap();
@@ -524,6 +534,14 @@ mod tests {
                 _permit: semaphore.acquire_owned().await.unwrap(),
             }),
         };
+        for q in ["g.E().count()", "g.E(1).label()", "g.V().count()"] {
+            assert!(matches!(
+                session.observed_gremlin_v3(1, q),
+                Err(ExperimentalRouteError::Route(RouteError::Storage(
+                    StorageNodeError::Timeout { .. }
+                )))
+            ));
+        }
         assert!(matches!(
             session.observed_gremlin_v2(1, "g.V().values('x').count()"),
             Err(ExperimentalRouteError::Route(RouteError::Storage(
