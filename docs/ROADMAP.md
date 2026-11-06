@@ -178,3 +178,7 @@ global concurrency quota or a heap/RSS hard limit.
 ### D3a bounded route resolver
 
 固定进程内 `(group,node)` registry 上，新增 fresh metadata quorum lookup、有限候选/leader hint、共享绝对 deadline 与 admission 的路由。读 session 固定原 adapter/view，prepared 写重试保持原 request ID/epoch/sequence；未知结果不内部重试，Conflict/Fenced 终止。此项不含网络客户端、缓存、成员变更或迁移，D3 仍未完成。契约见 `D3_STATIC_CATALOG.md`。
+
+### Same-host graph UDS gateway
+
+Linux 上新增只读 UDS gateway，以受信任目录、socket 权限和 peer UID 限制同主机进程访问。每连接固定一个 resolver snapshot 和 deadline，只支持 open/read/close；帧、响应、并发和慢客户端等待有界。它不是跨主机 replica transport、生产网络服务、写协议或 D3 完成。契约见 `GRAPH_UDS_GATEWAY.md`。
