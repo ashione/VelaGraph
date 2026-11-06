@@ -207,7 +207,8 @@ fn route_error(e: RouteError) -> RemoteError {
             rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
             | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
             | rocksdb_sql_table::Error::UnsupportedGremlinValue(_) => RemoteError::Unsupported {},
-            rocksdb_sql_table::Error::TraversalLimitExceeded(_) => {
+            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            | rocksdb_sql_table::Error::GremlinComplexityLimit { .. } => {
                 RemoteError::ResourceExhausted {}
             }
             _ => RemoteError::Graph {},
@@ -792,6 +793,19 @@ mod tests {
                 RemoteError::NotLeader { leader }
             );
         }
+    }
+
+    #[test]
+    fn parser_complexity_is_a_remote_resource_error() {
+        assert_eq!(
+            route_error(RouteError::Graph(
+                rocksdb_sql_table::Error::GremlinComplexityLimit {
+                    marks: 65,
+                    limit: 64,
+                }
+            )),
+            RemoteError::ResourceExhausted {}
+        );
     }
 
     #[test]

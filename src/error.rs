@@ -106,6 +106,10 @@ pub enum Error {
     #[error("invalid Gremlin: {0}")]
     GremlinParse(String),
 
+    /// Raw structural-mark admission failed before the recursive parser ran.
+    #[error("Gremlin parse complexity limit exceeded: {marks} structural marks; limit is {limit}")]
+    GremlinComplexityLimit { marks: usize, limit: usize },
+
     #[error("unsupported Gremlin step `{0}`")]
     UnsupportedGremlinStep(String),
 
