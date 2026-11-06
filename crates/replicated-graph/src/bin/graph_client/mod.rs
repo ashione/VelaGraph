@@ -1,6 +1,10 @@
 use anyhow::{bail, ensure, Context, Result};
 use replicated_graph::{
     catalog::{Catalog, Placement},
+    remote::{
+        self,
+        query::{QueryMode, QueryRequest},
+    },
     routing::{experimental::*, RemoteReplica, RouteResolver, ScanScope, ShardReadStamp},
     run_blocking,
 };
@@ -13,7 +17,7 @@ use serde_json::{json, Value as Json};
 use std::{collections::BTreeMap, io::Read, net::SocketAddr, path::Path, time::Duration};
 
 const MAX_INPUT: u64 = 1024 * 1024;
-const HELP: &str = "graph-client --config FILE --allow-insecure-development COMMAND\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
+const HELP: &str = "graph-client --config FILE --allow-insecure-development COMMAND\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nv1 server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +191,14 @@ enum Command {
     Lookup(u32),
     Register(u32, Placement),
     Query(u32, String),
+    ServerQuery {
+        group: u64,
+        node: u64,
+        shard: u64,
+        partition: u32,
+        mode: QueryMode,
+        text: String,
+    },
     Global(String),
     Observed(u32, String),
     Vertex(u32, Vertex),
@@ -236,6 +248,18 @@ fn parse_command(words: &[String], mut opts: BTreeMap<String, String>) -> Result
             number(&take(&mut opts, "--partition")?)?,
             take(&mut opts, "--query")?,
         ),
+        [namespace @ ("v1" | "experimental"), "server-query"] => Command::ServerQuery {
+            group: number(&take(&mut opts, "--group")?)?,
+            node: number(&take(&mut opts, "--node")?)?,
+            shard: number(&take(&mut opts, "--shard")?)?,
+            partition: number(&take(&mut opts, "--partition")?)?,
+            mode: if *namespace == "v1" {
+                QueryMode::V1
+            } else {
+                QueryMode::V2Observed
+            },
+            text: take(&mut opts, "--query")?,
+        },
         ["v1", "global-query"] => Command::Global(take(&mut opts, "--query")?),
         ["experimental", "observed-query"] => Command::Observed(
             number(&take(&mut opts, "--start-partition")?)?,
@@ -294,6 +318,39 @@ pub async fn run(args: Vec<String>) -> Result<Json> {
     let config: Config = read_json(&take(&mut opts, "--config")?)?;
     let command = parse_command(&words, opts)?;
     let client = config.client()?;
+    if let Command::ServerQuery {
+        group,
+        node,
+        shard,
+        partition,
+        mode,
+        text,
+    } = command
+    {
+        let endpoint = client
+            .config
+            .data_nodes
+            .iter()
+            .find(|r| r.group == group && r.node == node)
+            .context("explicit query replica is not in data_nodes")?
+            .endpoint;
+        let output = remote::query::query(
+            endpoint,
+            Some(remote::RemoteIdentity { group, node }),
+            QueryRequest {
+                shard,
+                partition,
+                mode,
+                text,
+                timeout_millis: client.config.timeout_ms.min(5000),
+            },
+            client.timeout,
+        )
+        .await??;
+        return Ok(
+            json!({"version":1,"ok":true,"execution":"server","scope":"single_partition","output":output}),
+        );
+    }
     run_blocking(move || execute(client, command)).await?
 }
 
@@ -392,6 +449,7 @@ fn append_failure(
 
 fn execute(client: Client, command: Command) -> Result<Json> {
     match command {
+        Command::ServerQuery { .. } => bail!("server query requires asynchronous dispatch"),
         Command::Check => {
             Ok(json!({"version":1,"ok":true,"namespace":"configuration","network_contacted":false}))
         }
@@ -491,7 +549,7 @@ pub fn error_json(error: &anyhow::Error) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn config() -> Json {
+    pub(super) fn config() -> Json {
         json!({"version":1,"timeout_ms":100,"metadata":{"group":1,"shard":101,"epoch":1,"replicas":[1]},"metadata_node":1,"metadata_nodes":[{"group":1,"node":1,"endpoint":"127.0.0.1:10101"}],"data_nodes":[{"group":2,"node":1,"endpoint":"127.0.0.1:10102"}]})
     }
     #[tokio::test]
@@ -749,5 +807,62 @@ mod additional_tests {
             r#"{"version":1,"id":1,"labels":[],"properties":{"x":{"Integer":1},"x":{"Integer":2}}}"#
         )
         .is_err());
+    }
+    #[tokio::test]
+    async fn server_query_is_explicit_and_unknown_replica_fails_offline() {
+        for namespace in ["v1", "experimental"] {
+            let options = BTreeMap::from([
+                ("--group".into(), "2".into()),
+                ("--node".into(), "1".into()),
+                ("--shard".into(), "7".into()),
+                ("--partition".into(), "10".into()),
+                ("--query".into(), "g.V().count()".into()),
+            ]);
+            let words = vec![namespace.into(), "server-query".into()];
+            let parsed = parse_command(&words, options.clone()).unwrap();
+            assert!(matches!(
+                parsed,
+                Command::ServerQuery {
+                    group: 2,
+                    node: 1,
+                    shard: 7,
+                    partition: 10,
+                    ..
+                }
+            ));
+            for field in ["--group", "--node", "--shard", "--partition", "--query"] {
+                let mut missing = options.clone();
+                missing.remove(field);
+                assert!(parse_command(&words, missing).is_err());
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("client.json");
+        std::fs::write(&file, serde_json::to_vec(&super::tests::config()).unwrap()).unwrap();
+        let args = [
+            "--config",
+            file.to_str().unwrap(),
+            "--allow-insecure-development",
+            "v1",
+            "server-query",
+            "--group",
+            "999",
+            "--node",
+            "1",
+            "--shard",
+            "7",
+            "--partition",
+            "10",
+            "--query",
+            "g.V().count()",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let error = run(args).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "explicit query replica is not in data_nodes"
+        );
     }
 }

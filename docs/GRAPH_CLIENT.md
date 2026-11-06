@@ -157,3 +157,12 @@ operation; it is never an exact retry of the original. Do not use only the ID to
 forge a prepared operation or claim safe recovery. If killed or disconnected
 before output is received, a write may have committed even without a saved ID.
 A future durable recovery/session design is separate work.
+
+## Explicit server-side query commands
+
+The additive `v1 server-query` and `experimental server-query` commands select
+one configured data replica with `--group`, `--node`, `--shard`, `--partition`
+and `--query`. They do not consult the catalog, retry or download the shard.
+See [REMOTE_QUERY.md](REMOTE_QUERY.md) for the explicit scope, typed output,
+limits, examples and Unverified v2 semantics. Existing query commands keep their
+client-side execution and JSON shape.

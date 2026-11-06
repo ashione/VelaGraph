@@ -23,6 +23,7 @@ const VERSION: u32 = 1;
 /// Largest accepted client or server operation budget.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
 mod paged;
+pub mod query;
 pub use paged::{
     close_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified, snapshot_page,
     SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES, MAX_PAGE_ROWS,
@@ -99,6 +100,7 @@ enum Operation {
     CloseSnapshot {
         descriptor: SnapshotDescriptor,
     },
+    Query(query::QueryRequest),
     Write(D1WriteRequest),
 }
 #[derive(Serialize, Deserialize)]
@@ -115,6 +117,7 @@ enum Reply {
     OpenSnapshot(SnapshotDescriptor),
     SnapshotPage(SnapshotPage),
     CloseSnapshot,
+    Query(query::QueryResponse),
     Write(D1Result),
 }
 
@@ -192,6 +195,14 @@ impl GraphService {
                             Ok(Ok(request)) => request,
                             _ => return,
                         };
+                    // A query's shorter budget also governs response encoding and
+                    // sending; it cannot regain the longer connection deadline.
+                    let end = match &request.operation {
+                        Operation::Query(query) if (1..=5000).contains(&query.timeout_millis) => {
+                            end.min(Instant::now() + Duration::from_millis(query.timeout_millis))
+                        }
+                        _ => end,
+                    };
                     // Dropping the waiting future at the deadline does not undo
                     // a command already submitted to Raft.
                     if Instant::now() >= end {
@@ -266,6 +277,9 @@ async fn execute(
         return Err(RemoteError::InvalidArgument);
     }
     match request.operation {
+        Operation::Query(request) => {
+            query::execute_query(raft, state, identity, shard, request, end).await
+        }
         Operation::OpenSnapshot { shard: requested } => {
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
@@ -578,6 +592,11 @@ async fn rpc(
     id: Option<[u8; 16]>,
 ) -> Result<Reply, RemoteError> {
     let end = checked_deadline(duration, id)?;
+    let response_limit = if matches!(&operation, Operation::Query(_)) {
+        query::MAX_QUERY_RESPONSE_BYTES + 1024
+    } else {
+        MAX_FRAME_BYTES
+    };
     let _permit = CLIENT_ADMISSION
         .try_acquire()
         .map_err(|_| RemoteError::ResourceExhausted)?;
@@ -595,7 +614,7 @@ async fn rpc(
             end,
         )
         .await?;
-        let response: Response = read_frame(&mut stream, end).await?;
+        let response: Response = read_frame_limited(&mut stream, end, response_limit).await?;
         if response.version != VERSION {
             return Err(RemoteError::Protocol);
         }
@@ -661,11 +680,18 @@ async fn read_frame<T: DeserializeOwned>(
     stream: &mut TcpStream,
     end: Instant,
 ) -> Result<T, RemoteError> {
+    read_frame_limited(stream, end, MAX_FRAME_BYTES).await
+}
+async fn read_frame_limited<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    end: Instant,
+    limit: usize,
+) -> Result<T, RemoteError> {
     let size = stream
         .read_u32()
         .await
         .map_err(|_| RemoteError::Unavailable)? as usize;
-    if size == 0 || size > MAX_FRAME_BYTES {
+    if size == 0 || size > limit {
         return Err(RemoteError::ResourceExhausted);
     }
     let mut bytes = vec![0; size];
