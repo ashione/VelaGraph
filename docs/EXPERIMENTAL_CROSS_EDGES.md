@@ -537,3 +537,58 @@ verified reads. All observed successes, including zero counts, remain Unverified
 Fault recovery, failover, coordinated snapshots, durable client retry storage,
 TLS/auth hardening and production deployment remain future work. Tests are normal
 functional and bounded-fault evidence, not claims of a distributed transaction.
+
+## Additive vertex property mutation
+
+`ExperimentalReadSession::prepare_vertex_properties(VertexRef, &VertexPropertyPatch)`
+prepares one owner-shard conditional canonical Put. It is a separate opt-in API;
+`prepare_vertex` still rejects existing records and remains append-only creation.
+The qualified partition/ID is retained by `PreparedVertexMutation::vertex()`.
+Labels, identity, edge records and both adjacency indexes remain unchanged. A
+missing vertex returns `Graph(MissingEndpoint(vertex))`; a missing partition keeps
+the routing error. `set` stores typed values including Null; `remove` deletes only
+named properties, with absent names a no-op. An empty patch or overlapping
+set/remove names is invalid, and non-finite reals remain rejected. Before cloning
+patch contents, admission limits the combined set/remove entries to 10,000 and
+key/value payload to 1 MiB (text bytes or eight bytes per other scalar). The final
+canonical record still has the existing 1 MiB encoded cap. These are admission
+bounds, not total heap/RSS limits. A no-op nonempty patch still commits a CAS.
+
+The participant `AppendOnlyStore::prepare_vertex_properties` also takes the
+qualified identity and exact expected vertex. It rejects store/ID mismatches and
+compares canonical bytes, preserving signed-zero and integer/real distinctions.
+The coordinator uses its original frozen owner view and sequence, never a new
+read during preparation. This does not certify adjacency completeness or provide
+a global snapshot. Existing frozen observations keep their old properties;
+new sessions observe committed properties. Every observed query stays Unverified.
+No Gremlin mutation syntax or v1 behavior changes.
+
+Retain the immutable prepared value before calling
+`RouteResolver::experimental_commit_vertex_mutation(&prepared, timeout)`.
+`operation_id()` identifies the exact original conditional request. The existing
+single-source Stage errors preserve attempt-local Rejected/Unknown semantics;
+Unknown may have committed. Exact retries reuse the original placement, epoch,
+sequence, bytes and request ID without re-preparation. A historical
+`MutationAcknowledgement::AllBatchesAcknowledged` does not assert the mutation is
+still current. Old successful create/update retries cannot overwrite newer
+properties. Competing writes on the owner shard conservatively conflict; even
+unrelated writes may invalidate preparation. There is no reverse stage, durable
+client journal, automatic recovery or cross-shard transaction.
+
+### Vertex deletion is explicitly unsupported
+
+`prepare_vertex_delete(VertexRef)` always returns `Unsupported` (subject to the
+session's existing deadline check), even for an apparently isolated vertex or a
+single-shard placement. It performs no writes. Empty observed adjacency cannot
+prove absence of canonical incoming edges: source-first cross-shard creation may
+not yet have installed the target index. A frozen multi-shard snapshot vector
+also cannot atomically fence concurrent source writes. There is no supported
+complete incident-edge authority or cross-shard fencing protocol, so this release
+provides no vertex deletion or cascading fallback. It does not scan shards and
+mistake a bounded or non-global observation for a deletion proof. Edge tombstone
+deletion remains supported separately. Vertex deletion needs a future explicit
+integrity/coordination design.
+
+Storage keys, live record envelopes and property encoding are unchanged; no data
+migration or new format version is needed for vertex properties. Existing edge
+tombstone upgrade/downgrade restrictions still apply independently.

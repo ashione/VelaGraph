@@ -1663,3 +1663,463 @@ fn simultaneous_update_delete_cas_has_one_winner_and_consistent_indexes() {
         }
     }
 }
+
+fn vertex_property_patch(
+    value: Value,
+) -> rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
+    rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
+        set: BTreeMap::from([("x".into(), value)]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn vertex_properties_preserve_identity_labels_types_snapshots_and_reopen_retries() {
+    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    let dir = tempfile::tempdir().unwrap();
+    let identity = VertexRef {
+        partition: 1,
+        id: 1,
+    };
+    let key = hex("67726170682f76322f702f000000012f7665727465782f0000000000000001");
+    let create;
+    let update;
+    let final_vertex;
+    {
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        let b = AppendOnlyStore::new(n.clone(), 7, 2);
+        let mut original = Vertex::new(1);
+        original.labels = vec!["Person".into(), "Member".into()];
+        original
+            .properties
+            .insert("remove".into(), Value::Boolean(true));
+        create = a.prepare_vertex(&original).unwrap();
+        create.submit(&n).unwrap();
+        vertex(&b, &n, 2);
+        let e = edge(1, 2);
+        a.prepare_source(&e)
+            .unwrap()
+            .combine(b.prepare_reverse(&e).unwrap())
+            .unwrap()
+            .submit(&n)
+            .unwrap();
+        let frozen = n.read_view().unwrap();
+        let frozen_bytes = n.get(&key, &frozen).unwrap();
+        let before = n.admin().export().unwrap();
+        let patch = VertexPropertyPatch {
+            set: BTreeMap::from([
+                ("null".into(), Value::Null),
+                ("int".into(), Value::Integer(i64::MAX)),
+                ("min".into(), Value::Integer(i64::MIN)),
+                ("real".into(), Value::Real(-0.0)),
+                ("text".into(), Value::Text("精确".into())),
+                ("bool".into(), Value::Boolean(false)),
+            ]),
+            remove: ["remove".into(), "absent".into()].into(),
+        };
+        update = a
+            .prepare_vertex_properties(identity, &original, &patch)
+            .unwrap();
+        assert_eq!(before.entries, n.admin().export().unwrap().entries);
+        update.submit(&n).unwrap();
+        let after = n.admin().export().unwrap();
+        assert_eq!(after.sequence, before.sequence + 1);
+        assert_eq!(before.entries.len(), after.entries.len());
+        assert_eq!(
+            before
+                .entries
+                .iter()
+                .zip(&after.entries)
+                .filter(|(a, b)| a != b)
+                .count(),
+            1
+        );
+        let updated = a.get_vertex(1).unwrap().unwrap();
+        assert_eq!(updated.id, original.id);
+        assert_eq!(updated.labels, original.labels);
+        assert_eq!(updated.properties, patch.set);
+        assert!(
+            matches!(updated.properties["real"], Value::Real(v) if v.to_bits() == (-0.0f64).to_bits())
+        );
+        assert_eq!(n.get(&key, &frozen).unwrap(), frozen_bytes);
+        assert_ne!(n.get(&key, &n.read_view().unwrap()).unwrap(), frozen_bytes);
+        assert_eq!(a.get_edge(7).unwrap(), Some(e.clone()));
+        b.verify_reverse(&e).unwrap();
+        assert_eq!(a.observed_index(1, Direction::Out).unwrap().len(), 1);
+        a.prepare_vertex_properties(
+            identity,
+            &updated,
+            &vertex_property_patch(Value::Integer(2)),
+        )
+        .unwrap()
+        .submit(&n)
+        .unwrap();
+        final_vertex = a.get_vertex(1).unwrap().unwrap();
+        create.submit(&n).unwrap();
+        update.submit(&n).unwrap();
+        assert_eq!(a.get_vertex(1).unwrap(), Some(final_vertex.clone()));
+        assert_eq!(n.read_view().unwrap().sequence, after.sequence + 1);
+    }
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let before = n.admin().export().unwrap();
+    create.submit(&n).unwrap();
+    update.submit(&n).unwrap();
+    assert_eq!(a.get_vertex(1).unwrap(), Some(final_vertex));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn vertex_property_validation_rejects_wrong_identity_stale_bytes_and_invalid_patches() {
+    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let identity = VertexRef {
+        partition: 1,
+        id: 1,
+    };
+    let mut expected = Vertex::new(1);
+    expected.labels.push("Person".into());
+    expected.properties.insert("x".into(), Value::Real(-0.0));
+    a.prepare_vertex(&expected).unwrap().submit(&n).unwrap();
+    let before = n.admin().export().unwrap();
+    let patch = vertex_property_patch(Value::Null);
+    for wrong in [
+        VertexRef {
+            partition: 2,
+            id: 1,
+        },
+        VertexRef {
+            partition: 1,
+            id: 2,
+        },
+    ] {
+        assert!(matches!(
+            a.prepare_vertex_properties(wrong, &expected, &patch),
+            Err(ExperimentalError::Invalid(_))
+        ));
+    }
+    let missing = VertexRef {
+        partition: 1,
+        id: 42,
+    };
+    assert!(
+        matches!(a.prepare_vertex_properties(missing, &Vertex::new(42), &patch), Err(ExperimentalError::MissingEndpoint(v)) if v == missing)
+    );
+    for changed in 0..3 {
+        let mut stale = expected.clone();
+        match changed {
+            0 => {
+                stale.properties.insert("x".into(), Value::Real(0.0));
+            }
+            1 => stale.labels.push("Other".into()),
+            _ => {
+                stale.properties.insert("x".into(), Value::Integer(0));
+            }
+        }
+        assert!(matches!(
+            a.prepare_vertex_properties(identity, &stale, &patch),
+            Err(ExperimentalError::Invalid(_))
+        ));
+    }
+    for patch in [
+        VertexPropertyPatch::default(),
+        VertexPropertyPatch {
+            remove: ["x".into()].into(),
+            ..vertex_property_patch(Value::Null)
+        },
+    ] {
+        assert!(matches!(
+            a.prepare_vertex_properties(identity, &expected, &patch),
+            Err(ExperimentalError::Invalid(_))
+        ));
+    }
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            a.prepare_vertex_properties(
+                identity,
+                &expected,
+                &vertex_property_patch(Value::Real(value))
+            ),
+            Err(ExperimentalError::Graph(_))
+        ));
+    }
+    assert!(matches!(
+        a.prepare_vertex_properties(
+            identity,
+            &expected,
+            &vertex_property_patch(Value::Text("x".repeat(1024 * 1024 - 1)))
+        ),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::ResourceExhausted(_)
+        ))
+    ));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn vertex_property_cas_races_and_unrelated_writes_do_not_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let identity = VertexRef {
+        partition: 1,
+        id: 1,
+    };
+    let expected = Vertex::new(1);
+    a.prepare_vertex(&expected).unwrap().submit(&n).unwrap();
+    let one = a
+        .prepare_vertex_properties(
+            identity,
+            &expected,
+            &vertex_property_patch(Value::Integer(1)),
+        )
+        .unwrap();
+    let two = a
+        .prepare_vertex_properties(
+            identity,
+            &expected,
+            &vertex_property_patch(Value::Integer(2)),
+        )
+        .unwrap();
+    one.submit(&n).unwrap();
+    let before = n.admin().export().unwrap();
+    assert!(matches!(
+        two.submit(&n),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::Conflict { .. }
+        ))
+    ));
+    assert!(matches!(
+        a.prepare_vertex_properties(identity, &expected, &vertex_property_patch(Value::Null)),
+        Err(ExperimentalError::Invalid(_))
+    ));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, n.read_view().unwrap().sequence);
+    let current = a.get_vertex(1).unwrap().unwrap();
+    let stale = a
+        .prepare_vertex_properties(identity, &current, &vertex_property_patch(Value::Null))
+        .unwrap();
+    vertex(&a, &n, 42);
+    let before = n.admin().export().unwrap();
+    assert!(matches!(
+        stale.submit(&n),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::Conflict { .. }
+        ))
+    ));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn vertex_property_prepared_bytes_are_immutable_and_epoch_fencing_precedes_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let identity = VertexRef {
+        partition: 1,
+        id: 1,
+    };
+    let mut expected = Vertex::new(1);
+    a.prepare_vertex(&expected).unwrap().submit(&n).unwrap();
+    let mut patch = vertex_property_patch(Value::Integer(7));
+    let prepared = a
+        .prepare_vertex_properties(identity, &expected, &patch)
+        .unwrap();
+    expected.labels.push("Changed".into());
+    patch.set.insert("x".into(), Value::Integer(8));
+    prepared.submit(&n).unwrap();
+    let current = a.get_vertex(1).unwrap().unwrap();
+    assert!(current.labels.is_empty());
+    assert_eq!(current.properties["x"], Value::Integer(7));
+    n.admin().set_epoch(1).unwrap();
+    let before = n.admin().export().unwrap();
+    assert!(matches!(
+        prepared.submit(&n),
+        Err(ExperimentalError::Storage(StorageNodeError::Fenced { .. }))
+    ));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn vertex_property_lost_ack_dedups_and_changed_requests_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let expected = Vertex::new(1);
+    a.prepare_vertex(&expected).unwrap().submit(&n).unwrap();
+    let prepared = a
+        .prepare_vertex_properties(
+            VertexRef {
+                partition: 1,
+                id: 1,
+            },
+            &expected,
+            &vertex_property_patch(Value::Null),
+        )
+        .unwrap();
+    let transport = CommitThenTimeout {
+        node: n.clone(),
+        calls: std::sync::Mutex::new(vec![]),
+    };
+    assert!(matches!(
+        prepared.submit(&transport),
+        Err(ExperimentalError::Storage(StorageNodeError::Timeout { .. }))
+    ));
+    let committed = n.admin().export().unwrap();
+    prepared.submit(&transport).unwrap();
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(calls[0].0.operations.len(), 1);
+    let (request, condition) = calls[0].clone();
+    assert!(matches!(
+        n.batch_write_conditional(request.clone(), condition.map(|n| n + 1)),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    let mut changed = request;
+    changed.operations = vec![WriteOp::put(b"changed".to_vec(), vec![])];
+    assert!(matches!(
+        n.batch_write_conditional(changed, condition),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    assert_eq!(committed.entries, n.admin().export().unwrap().entries);
+    assert_eq!(committed.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn vertex_property_patch_admission_bounds_count_set_remove_and_payload_bytes() {
+    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let identity = VertexRef {
+        partition: 1,
+        id: 1,
+    };
+    let expected = Vertex::new(1);
+    a.prepare_vertex(&expected).unwrap().submit(&n).unwrap();
+    let before = n.admin().export().unwrap();
+    // Removing absent keys is allowed, but still charged to the input budget.
+    let mut patch = VertexPropertyPatch {
+        remove: (0..10_000).map(|i| format!("key{i}")).collect(),
+        ..Default::default()
+    };
+    a.prepare_vertex_properties(identity, &expected, &patch)
+        .unwrap();
+    patch.set.insert("x".into(), Value::Null);
+    assert!(matches!(
+        a.prepare_vertex_properties(identity, &expected, &patch),
+        Err(ExperimentalError::Invalid(_))
+    ));
+    patch.remove.remove("key0");
+    a.prepare_vertex_properties(identity, &expected, &patch)
+        .unwrap();
+
+    let mut patch = VertexPropertyPatch {
+        remove: ["r".repeat(1024 * 1024)].into(),
+        ..Default::default()
+    };
+    a.prepare_vertex_properties(identity, &expected, &patch)
+        .unwrap();
+    patch.remove.insert("a".into());
+    assert!(matches!(
+        a.prepare_vertex_properties(identity, &expected, &patch),
+        Err(ExperimentalError::Invalid(_))
+    ));
+    for value in [
+        Value::Null,
+        Value::Integer(0),
+        Value::Real(0.0),
+        Value::Boolean(false),
+    ] {
+        let mut patch = VertexPropertyPatch {
+            set: BTreeMap::from([("x".into(), value)]),
+            remove: ["r".repeat(1024 * 1024 - 9)].into(),
+        };
+        a.prepare_vertex_properties(identity, &expected, &patch)
+            .unwrap();
+        patch.remove.insert("a".into());
+        assert!(matches!(
+            a.prepare_vertex_properties(identity, &expected, &patch),
+            Err(ExperimentalError::Invalid(_))
+        ));
+    }
+    let patch = VertexPropertyPatch {
+        set: BTreeMap::from([("x".into(), Value::Text("精确".into()))]),
+        remove: ["r".repeat(1024 * 1024 - 7)].into(),
+    };
+    a.prepare_vertex_properties(identity, &expected, &patch)
+        .unwrap();
+    let mut oversized = patch;
+    oversized.remove.insert("a".into());
+    assert!(matches!(
+        a.prepare_vertex_properties(identity, &expected, &oversized),
+        Err(ExperimentalError::Invalid(_))
+    ));
+    assert!(matches!(
+        a.prepare_vertex_properties(
+            identity,
+            &expected,
+            &vertex_property_patch(Value::Text("x".repeat(1024 * 1024)))
+        ),
+        Err(ExperimentalError::Invalid(_))
+    ));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    assert_eq!(before.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn vertex_property_nonempty_noop_commits_advance_sequence_and_fence_sibling_batches() {
+    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    for patch in [
+        vertex_property_patch(Value::Integer(7)),
+        VertexPropertyPatch {
+            remove: ["absent".into()].into(),
+            ..Default::default()
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        let identity = VertexRef {
+            partition: 1,
+            id: 1,
+        };
+        let mut expected = Vertex::new(1);
+        expected.properties.insert("x".into(), Value::Integer(7));
+        a.prepare_vertex(&expected).unwrap().submit(&n).unwrap();
+        let noop = a
+            .prepare_vertex_properties(identity, &expected, &patch)
+            .unwrap();
+        let sibling = a
+            .prepare_vertex_properties(
+                identity,
+                &expected,
+                &vertex_property_patch(Value::Integer(8)),
+            )
+            .unwrap();
+        let before = n.admin().export().unwrap();
+        noop.submit(&n).unwrap();
+        let committed = n.admin().export().unwrap();
+        assert_eq!(committed.entries, before.entries);
+        assert_eq!(committed.sequence, before.sequence + 1);
+        assert_eq!(a.get_vertex(1).unwrap(), Some(expected));
+        assert!(matches!(
+            sibling.submit(&n),
+            Err(ExperimentalError::Storage(
+                StorageNodeError::Conflict { .. }
+            ))
+        ));
+        // An exact retry remains idempotent even though the original no-op
+        // consumed a sequence and invalidated other preparations.
+        noop.submit(&n).unwrap();
+        assert_eq!(n.admin().export().unwrap().entries, committed.entries);
+        assert_eq!(n.read_view().unwrap().sequence, committed.sequence);
+    }
+}

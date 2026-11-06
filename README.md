@@ -570,3 +570,10 @@ combine into one CAS batch. Observed queries verify residual indexes and charge
 tombstones against scan budgets. Upgrade all readers before first deletion;
 downgrade, automatic repair, tombstone GC and vertex deletion are unsupported.
 See [edge deletion](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion).
+
+Opt-in v2 vertex properties are available through `prepare_vertex_properties`
+and `experimental_commit_vertex_mutation`, retaining qualified identity and
+labels in one owner-shard CAS. Null/set/remove and historical retries are explicit.
+`prepare_vertex_delete` explicitly rejects deletion: observed empty adjacency
+cannot prove absence of all incoming/outgoing edges or fence other shards.
+See [vertex mutations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-vertex-property-mutation).

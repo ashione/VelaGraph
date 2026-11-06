@@ -158,3 +158,9 @@ one CAS batch. IDs are never reused. Reads validate visible residual indexes and
 charge tombstone candidates before skipping them. Recovery and GC are unsupported.
 See [deletion contract and versioned format](EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion)
 for upgrade restrictions, bounds and attempt-local retry outcomes.
+
+The opt-in vertex properties API is covered by the v2 experiment exception:
+one conditional canonical Put preserves qualified identity, labels and adjacency,
+with bounded patch admission and exact historical retry. Vertex deletion is
+explicitly Unsupported; absence of observed indexes is never a deletion proof.
+No v1, Gremlin syntax, live record format or distributed transaction change.

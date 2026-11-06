@@ -6,7 +6,7 @@ use replicated_graph::{
         experimental::{
             AdjacencyCompleteness, EdgeMutationKind, ExperimentalReadSession,
             ExperimentalRouteError, MutationAcknowledgement, ObservedPathElement, ObservedRow,
-            Stage, StageOutcome,
+            ObservedRowV2, Stage, StageOutcome,
         },
         RemoteReplica, RouteError, RouteResolver,
     },
@@ -14,7 +14,8 @@ use replicated_graph::{
 };
 use rocksdb_sql_table::{
     experimental_graph::{
-        CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError, VertexRef,
+        CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError, VertexPropertyPatch,
+        VertexRef,
     },
     StorageNode, StorageNodeError, Value, Vertex, WriteOp, WriteRequest,
 };
@@ -1190,5 +1191,173 @@ async fn edge_deletion_scenario() -> anyhow::Result<()> {
         Ok(())
     })
     .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_v2_vertex_properties_in_real_processes() -> anyhow::Result<()> {
+    let _fixture = PROCESS_TEST_LOCK.lock().await;
+    timeout(Duration::from_secs(120), vertex_property_scenario()).await?
+}
+
+async fn vertex_property_scenario() -> anyhow::Result<()> {
+    let metadata = Group::start(410, 510).await?;
+    let a = Group::start(420, 520).await?;
+    let b = Group::start(430, 530).await?;
+    let catalog = Catalog::new_remote(
+        metadata.replicas[0].endpoint,
+        1,
+        metadata.placement.clone(),
+        BUDGET,
+    )?;
+    let resolver = RouteResolver::new_remote(
+        metadata.placement.clone(),
+        &metadata.replicas,
+        &[a.replicas.clone(), b.replicas.clone()].concat(),
+    )?;
+    let ap = a.placement.clone();
+    let bp = b.placement.clone();
+    run_blocking(move || -> anyhow::Result<()> {
+        let vr = |partition| VertexRef { partition, id: 7 };
+        let mut creates = Vec::new();
+        for (partition, placement) in [(1, ap.clone()), (2, bp), (3, ap)] {
+            catalog.commit_registration(&catalog.prepare_registration([partition as u8; 16], partition, placement)?)?;
+            let mut vertex = Vertex::new(7);
+            vertex.labels.push(format!("P{partition}"));
+            vertex.properties = BTreeMap::from([
+                ("typed".into(), Value::Integer(1)),
+                ("nullable".into(), Value::Text("before".into())),
+                ("removed".into(), Value::Null),
+                ("zero".into(), Value::Real(0.0)),
+                ("untouched".into(), Value::Integer(partition as i64)),
+            ]);
+            let create = resolver.experimental_read_session(BUDGET)?.prepare_vertex(partition, &vertex)?;
+            resolver.experimental_commit(&create, BUDGET)?;
+            creates.push(create);
+        }
+        // Each same-numbered vertex is qualified, including two partitions on
+        // the same shard. Mutating one must not replace either of the others.
+        for partition in 1..=3 {
+            let frozen = resolver.experimental_read_session(BUDGET)?;
+            let before: Vec<_> = (1..=3).map(|p| frozen.get_vertex(vr(p)).unwrap().unwrap()).collect();
+            let patch = VertexPropertyPatch {
+                set: BTreeMap::from([
+                    ("typed".into(), Value::Real(1.0)),
+                    ("nullable".into(), Value::Null),
+                    ("zero".into(), Value::Real(-0.0)),
+                    ("enabled".into(), Value::Boolean(true)),
+                    ("large".into(), Value::Integer(i64::MAX)),
+                ]),
+                remove: BTreeSet::from(["removed".into(), "absent".into()]),
+            };
+            let update = frozen.prepare_vertex_properties(vr(partition), &patch)?;
+            assert_eq!(update.vertex(), vr(partition));
+            assert_eq!(resolver.experimental_commit_vertex_mutation(&update, BUDGET)?, MutationAcknowledgement::AllBatchesAcknowledged);
+            let fresh = resolver.experimental_read_session(BUDGET)?;
+            let mut expected = before[(partition - 1) as usize].clone();
+            expected.properties.extend(patch.set);
+            expected.properties.remove("removed");
+            for p in 1..=3 {
+                let actual = fresh.get_vertex(vr(p))?.unwrap();
+                assert_eq!(actual, if p == partition { expected.clone() } else { before[(p - 1) as usize].clone() });
+                assert_eq!(frozen.get_vertex(vr(p))?.unwrap(), before[(p - 1) as usize]);
+            }
+            assert!(matches!(fresh.get_vertex(vr(partition))?.unwrap().properties["zero"], Value::Real(value) if value.to_bits() == (-0.0f64).to_bits()));
+            for (session, typed, null_count, removed_count) in [
+                (&frozen, Value::Integer(1), 0, 1),
+                (&fresh, Value::Real(1.0), 1, 0),
+            ] {
+                assert_eq!(session.observed_gremlin_v2(partition, "g.V(7).values('typed')")?.rows,
+                    vec![ObservedRowV2::Value { source: vr(partition), value: typed }]);
+                for (query, count) in [
+                    ("g.V(7).has('nullable',null).count()", null_count),
+                    ("g.V(7).has('removed').count()", removed_count),
+                    ("g.V(7).has('absent',null).count()", 0),
+                ] {
+                    let result = session.observed_gremlin(partition, query)?;
+                    assert_eq!(result.rows, vec![ObservedRow::Count(count)]);
+                    assert_eq!(result.snapshots, session.snapshots);
+                    assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+                }
+            }
+            let stale = frozen.prepare_vertex_properties(vr(partition), &VertexPropertyPatch {
+                set: BTreeMap::from([("stale".into(), Value::Boolean(true))]), remove: BTreeSet::new(),
+            })?;
+            assert_ne!(stale.operation_id(), update.operation_id());
+            assert!(matches!(resolver.experimental_commit_vertex_mutation(&stale, BUDGET),
+                Err(ExperimentalRouteError::Stage { stage: Stage::Source, outcome: StageOutcome::Rejected,
+                    request_id, source_acknowledged_this_attempt: false,
+                    error: RouteError::Storage(StorageNodeError::Conflict { .. }) }) if request_id == stale.operation_id()));
+            let later = fresh.prepare_vertex_properties(vr(partition), &VertexPropertyPatch {
+                set: BTreeMap::from([("typed".into(), Value::Text("later".into()))]),
+                remove: BTreeSet::from(["nullable".into()]),
+            })?;
+            resolver.experimental_commit_vertex_mutation(&later, BUDGET)?;
+            resolver.experimental_commit(&creates[(partition - 1) as usize], BUDGET)?;
+            assert_eq!(resolver.experimental_commit_vertex_mutation(&update, BUDGET)?, MutationAcknowledgement::AllBatchesAcknowledged);
+            expected.properties.insert("typed".into(), Value::Text("later".into()));
+            expected.properties.remove("nullable");
+            assert_eq!(resolver.experimental_read_session(BUDGET)?.get_vertex(vr(partition))?.unwrap(), expected);
+        }
+        // Two real concurrent submissions, not sequential simulation. Both CAS
+        // requests share a snapshot; exactly one can change this shard sequence.
+        let session = resolver.experimental_read_session(BUDGET)?;
+        let contenders: Vec<_> = ["left", "right"].into_iter().map(|value|
+            session.prepare_vertex_properties(vr(1), &VertexPropertyPatch {
+                set: BTreeMap::from([("winner".into(), Value::Text(value.into()))]), remove: BTreeSet::new(),
+            }).unwrap()).collect();
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = contenders.iter().map(|prepared| {
+                let resolver = &resolver;
+                let barrier = &barrier;
+                scope.spawn(move || { barrier.wait(); resolver.experimental_commit_vertex_mutation(prepared, BUDGET) })
+            }).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = outcomes.iter().position(|result| result.is_ok()).unwrap();
+        let loser = 1 - winner;
+        assert!(matches!(&outcomes[loser], Err(ExperimentalRouteError::Stage {
+            stage: Stage::Source, outcome: StageOutcome::Rejected, request_id,
+            source_acknowledged_this_attempt: false,
+            error: RouteError::Storage(StorageNodeError::Conflict { .. }),
+        }) if *request_id == contenders[loser].operation_id()));
+        let session = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(session.get_vertex(vr(1))?.unwrap().properties["winner"], Value::Text(["left", "right"][winner].into()));
+        // Invalid budgets and oversized caller patches fail before a write.
+        assert!(matches!(resolver.experimental_commit_vertex_mutation(&contenders[winner], Duration::ZERO),
+            Err(ExperimentalRouteError::Route(RouteError::InvalidArgument(_)))));
+        let oversized = VertexPropertyPatch {
+            set: BTreeMap::from([("oversized".into(), Value::Text("x".repeat(1024 * 1024)))]),
+            remove: BTreeSet::new(),
+        };
+        assert!(matches!(session.prepare_vertex_properties(vr(1), &oversized),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Invalid(_)))));
+        let missing = VertexRef { partition: 1, id: 999 };
+        assert!(matches!(session.prepare_vertex_properties(missing, &VertexPropertyPatch::default()),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::MissingEndpoint(vertex))) if vertex == missing));
+        for vertex in [vr(1), vr(2), vr(3), missing] {
+            assert!(matches!(session.prepare_vertex_delete(vertex), Err(ExperimentalRouteError::Unsupported(_))));
+        }
+        assert_eq!(session.snapshots, resolver.experimental_read_session(BUDGET)?.snapshots);
+        // A canonical source-only edge is invisible to the target's incoming
+        // index. Empty observed adjacency must not authorize target deletion.
+        let edge = CrossEdge { id: 400, from: vr(1), to: vr(2), label: "Partial".into(), properties: BTreeMap::new() };
+        let append = session.prepare_edge(&edge)?;
+        let invalidate = session.prepare_vertex(2, &Vertex::new(8))?;
+        resolver.experimental_commit(&invalidate, BUDGET)?;
+        assert!(matches!(resolver.experimental_commit(&append, BUDGET), Err(ExperimentalRouteError::Stage {
+            stage: Stage::Reverse, outcome: StageOutcome::Incomplete, source_acknowledged_this_attempt: true, ..
+        })));
+        let partial = resolver.experimental_read_session(BUDGET)?;
+        assert!(partial.observed_adjacency(vr(2), Direction::In)?.edges.is_empty());
+        assert!(matches!(partial.get_edge(edge.identity()), Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(_)))));
+        assert!(matches!(partial.prepare_vertex_delete(vr(2)), Err(ExperimentalRouteError::Unsupported(_))));
+        let after = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(partial.snapshots, after.snapshots);
+        assert!(after.get_vertex(vr(2))?.is_some());
+        Ok(())
+    }).await??;
     Ok(())
 }
