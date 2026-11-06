@@ -1,13 +1,66 @@
 # Storage node interface v0
 
-Status: proposal for P0/D1. This document defines the narrow boundary between the
-graph kernel and a replicated storage node. It is deliberately smaller than a
-database API: the node understands opaque key/value bytes and one-partition
-batches, not vertices, edges, Cypher, or query plans.
+Status: v0 proposal for P0/D1; a single-shard local adapter is implemented (see
+[Implementation status](#implementation-status)). This document defines the
+narrow boundary between the graph kernel and a replicated storage node. It is
+deliberately smaller than a database API: the node understands opaque
+key/value bytes and one-partition batches, not vertices, edges, Cypher, or query
+plans.
 
 K1 is the current local implementation: RocksDB, `u64` ids, partition-scoped
 keys, deterministic protobuf-compatible records, and single-`WriteBatch`
 atomicity. See [`GRAPH_FORMAT.md`](GRAPH_FORMAT.md).
+
+## Implementation status
+
+The first local adapter is implemented in [`src/storage_node.rs`](../src/storage_node.rs)
+with tests in [`tests/storage_node.rs`](../tests/storage_node.rs). It owns one
+`ShardId` and one opaque key space in RocksDB, with separate `data` and `meta`
+column families. `batch_write` updates data, the applied sequence, and the
+idempotency record in one atomic write; retries return `Duplicate`, conflicting
+bytes return `IdempotencyConflict`, and stale epochs return `Fenced`. Read views
+are stable and bounded, scans enforce half-open ranges plus row/byte limits, and
+`StorageAdmin` provides export/import plus epoch advancement.
+
+This is deliberately not the full interface: transactions (`begin`), shard
+routing, split/transfer, follower reads, and mixed-shard rejection are not
+implemented, and the node has no leader/ownership identity yet (it never returns
+`NotLeader`; any caller that presents the stored epoch is accepted). The adapter
+currently copies the data partition into each read view (bounded to 1,000,000
+rows / 64 MiB) instead of pinning a borrowed RocksDB snapshot; a production
+adapter must replace this with a real snapshot. Once that cap is exceeded,
+`read_view`/`get`/`scan` return `ResourceExhausted`; `export` enumerates the
+data directly so an operator can inspect or migrate it with a different adapter,
+while this adapter's `import` rejects oversized inputs. Batches are capped at 10,000 operations / 16 MiB. Dedup records are
+retained indefinitely in this prototype; bounded retention is not implemented.
+`import` is one-shot, requires a pristine target (sequence 0 and no live keys),
+and copies the source epoch; a new owner must call `set_epoch` after import
+before accepting writes on both sides. The graph engine is not wired through
+this boundary yet, so the existing K1 path remains authoritative.
+
+### Local performance snapshot
+
+`examples/storage_node_bench.rs` is a reproducible local benchmark:
+
+```text
+cargo run --release --example storage_node_bench --locked
+```
+
+It writes 100,000 opaque keys with 100-byte values in 100-operation,
+`sync=true` batches, then measures a stable read view, point gets, a full scan,
+and reopen. Read operations report the fastest of five trials. On 2026-11-06, three runs on an Apple M2 Pro (macOS 14.7.8) produced:
+
+| Operation | Observed |
+| --- | ---: |
+| batch_write | 393k–404k ops/s (0.25 ms per 100-op batch) |
+| read_view (100k rows copied) | ~34.4 ms |
+| get | 875k–996k ops/s (~1.0–1.1 µs/op) |
+| scan (100k rows) | 6.7M–8.4M rows/s (~12–15 ms) |
+| reopen | 113–130 ms |
+
+These are single-machine, local-APFS numbers, not a production or replicated
+capacity claim. The read view copies the partition, so its cost grows with the
+shard size; `sync=true` is included in the write result.
 
 ## Goals
 
@@ -104,7 +157,9 @@ it.
 
 `read_view()` returns a pinned sequence for a bounded lease. The node must reject
 or renew expired views; a query that exceeds its lease must not silently change
-its snapshot. Snapshot creation is cheap and does not copy the graph.
+its snapshot. The target behavior is cheap snapshot creation that does not copy
+the graph; the current local adapter's copied view is an explicitly documented
+prototype exception.
 
 ### Split / migration hooks
 
@@ -148,6 +203,9 @@ are retryable after refreshing route/read view; `Corrupt`,
 - A committed batch is visible to every later leader read at a sequence greater
   than or equal to its `WriteResult.sequence`.
 - A snapshot read sees exactly the state at its pinned sequence.
+- The current local adapter copies the partition at `read_view` rather than
+  pinning a RocksDB snapshot; the copy is bounded (1,000,000 rows / 64 MiB) and
+  is a prototype limitation, not the target production behavior.
 - Writes from one client are not reordered by retries because `request_id`
   deduplicates them.
 - v0 makes no cross-shard atomicity promise. D4 adds it explicitly.

@@ -6,9 +6,11 @@ uses a durable RocksDB Raft log and a persisted opaque key/value state machine
 shaped for D1 batches; a three-node shutdown/reopen test is in
 `tests/durable.rs`. `LogCommand::TxnBatch(Vec<WriteOp>)` carries arbitrary key and
 value bytes, and `openraft::testing::Suite::test_all` passes against both durable
-stores (`tests/conformance.rs`). The D1 graph `StorageNode` adapter and graph
-records remain the next D2 slice. This document still freezes the Raft library
-choice and the prototype boundaries.
+stores (`tests/conformance.rs`). The graph-facing D1 adapter and graph records
+remain the next D2 slice. This document still freezes the Raft library
+choice and the prototype boundaries. A single-shard local D1 byte adapter now
+exists in `src/storage_node.rs`; wiring the graph engine through it and adding
+graph-schema records remain the next slice.
 
 Related contracts: [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (D1
 storage-node seam), [`TRANSACTIONS.md`](TRANSACTIONS.md) (K3 single-shard
@@ -104,8 +106,9 @@ restart. `tests/multi_process.rs` restarts the killed leader against its origina
 `--data-dir` instead of an empty log.
 
 Limitations: `state.db` stores opaque D1 byte batches but no graph-schema
-records yet; the D1 `StorageNode` adapter is not wired; and reopen tests prove
-process-restart recovery, not power-loss behavior under every RocksDB option.
+records yet; the local D1 `StorageNode` adapter exists but the graph engine is
+not wired through it; and reopen tests prove process-restart recovery, not
+power-loss behavior under every RocksDB option.
 
 ## Multi-process validation
 
