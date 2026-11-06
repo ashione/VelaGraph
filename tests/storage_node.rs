@@ -233,9 +233,10 @@ fn epoch_fences_old_writers_and_old_views() {
 fn export_import_preserves_entries_epoch_and_sequence() {
     let source_dir = tempfile::tempdir().unwrap();
     let source = node(&source_dir);
+    source.admin().set_epoch(2).unwrap();
     source
         .batch_write(request(
-            0,
+            2,
             1,
             vec![
                 WriteOp::put(b"a".to_vec(), b"1".to_vec()),
@@ -249,6 +250,7 @@ fn export_import_preserves_entries_epoch_and_sequence() {
 
     let target_dir = tempfile::tempdir().unwrap();
     let target = node(&target_dir);
+    target.admin().set_epoch(2).unwrap();
     target.admin().import(export.clone()).unwrap();
     assert_eq!(target.admin().export().unwrap(), export);
     assert_eq!(target.read_view().unwrap().sequence, 1);
