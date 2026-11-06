@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::log_store::LogStore;
+use crate::durable_log_store::DurableLogStore;
 use crate::state_machine::StateMachine;
 use crate::types::{LogCommand, NodeId, TypeConfig};
 
@@ -429,12 +430,19 @@ async fn handle_control_connection(
     Ok(())
 }
 
+fn create_data_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| anyhow::anyhow!("create data dir {}: {error}", path.display()))
+}
+
 /// Configuration for one node process.
 #[derive(Debug, Clone)]
 pub struct TcpNodeConfig {
     pub id: NodeId,
     pub raft_addr: String,
     pub control_addr: String,
+    /// Directory for the durable `raft.db` and `state.db` RocksDB stores.
+    pub data_dir: PathBuf,
 }
 
 pub struct TcpNode {
@@ -462,12 +470,14 @@ impl TcpNode {
             }
             .validate()?,
         );
-        let state_machine = Arc::new(StateMachine::default());
+        create_data_dir(&config.data_dir)?;
+        let log_store = DurableLogStore::open(config.data_dir.join("raft.db"))?;
+        let state_machine = Arc::new(StateMachine::open(config.data_dir.join("state.db"))?);
         let raft = Raft::new(
             config.id,
             raft_config,
             TcpNetworkFactory,
-            LogStore::default(),
+            log_store,
             state_machine.clone(),
         )
         .await?;

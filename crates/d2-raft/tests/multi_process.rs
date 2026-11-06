@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use tempfile::TempDir;
+
 use anyhow::{bail, Context};
 use d2_raft::{send_control, ControlRequest, ControlResponse, NodeStatus};
 use tokio::net::TcpListener;
@@ -18,7 +20,13 @@ struct NodeProcess {
 }
 
 impl NodeProcess {
-    fn spawn(id: u64, raft: &str, control: &str, bootstrap: Option<&str>) -> anyhow::Result<Self> {
+    fn spawn(
+        id: u64,
+        raft: &str,
+        control: &str,
+        data_dir: &str,
+        bootstrap: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_d2-node"));
         command.args([
             "--id",
@@ -27,6 +35,8 @@ impl NodeProcess {
             raft,
             "--control",
             control,
+            "--data-dir",
+            data_dir,
         ]);
         if let Some(members) = bootstrap {
             command.args(["--bootstrap", members]);
@@ -147,10 +157,12 @@ async fn scenario() -> anyhow::Result<()> {
     let mut nodes = BTreeMap::new();
     let mut raft_addrs = BTreeMap::new();
     let mut control_addrs = BTreeMap::new();
+    let mut data_dirs: BTreeMap<u64, TempDir> = BTreeMap::new();
     let ports = reserve_ports(6).await?;
     for (index, id) in (1_u64..=3).enumerate() {
         raft_addrs.insert(id, format!("127.0.0.1:{}", ports[index * 2]));
         control_addrs.insert(id, format!("127.0.0.1:{}", ports[index * 2 + 1]));
+        data_dirs.insert(id, tempfile::tempdir()?);
     }
     let bootstrap_spec = raft_addrs
         .iter()
@@ -159,9 +171,16 @@ async fn scenario() -> anyhow::Result<()> {
         .join(",");
     for id in 1..=3 {
         let bootstrap = (id == 1).then_some(bootstrap_spec.as_str());
+        let data_dir = data_dirs[&id].path().to_string_lossy().into_owned();
         nodes.insert(
             id,
-            NodeProcess::spawn(id, &raft_addrs[&id], &control_addrs[&id], bootstrap)?,
+            NodeProcess::spawn(
+                id,
+                &raft_addrs[&id],
+                &control_addrs[&id],
+                &data_dir,
+                bootstrap,
+            )?,
         );
     }
     for control in control_addrs.values() {
@@ -197,10 +216,16 @@ async fn scenario() -> anyhow::Result<()> {
         wait_value(control, "after", "failover", 10_000).await?;
     }
 
-    // Restart the old leader with an empty in-memory log; the new leader must
-    // bring it back through normal replication.
-    let restarted =
-        NodeProcess::spawn(leader, &raft_addrs[&leader], &control_addrs[&leader], None)?;
+    // Restart the old leader against the same durable directories; it must
+    // recover its log/state and then catch up through normal replication.
+    let data_dir = data_dirs[&leader].path().to_string_lossy().into_owned();
+    let restarted = NodeProcess::spawn(
+        leader,
+        &raft_addrs[&leader],
+        &control_addrs[&leader],
+        &data_dir,
+        None,
+    )?;
     nodes.insert(leader, restarted);
     wait_ready(&control_addrs[&leader], 10_000).await?;
     wait_value(&control_addrs[&leader], "after", "failover", 10_000).await?;

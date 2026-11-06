@@ -1,9 +1,13 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+use anyhow::Context;
 
 use openraft::Config;
 use tokio::time::{sleep, timeout};
 
+use crate::durable_log_store::DurableLogStore;
 use crate::log_store::LogStore;
 use crate::network::{DropPolicy, NetworkFactory, Raft, Registry};
 use crate::state_machine::StateMachine;
@@ -49,6 +53,45 @@ impl Node {
         })
     }
 
+    /// Start a node whose Raft log and state machine are persisted under `dir`.
+    ///
+    /// `raft.db` and `state.db` are separate RocksDB directories so log purge
+    /// and graph snapshots never touch each other's keys.
+    pub async fn start_durable(
+        id: NodeId,
+        dir: impl AsRef<Path>,
+        registry: Registry,
+        policy: Arc<DropPolicy>,
+    ) -> anyhow::Result<NodeHandle> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create data dir {}", dir.display()))?;
+        let log_store = DurableLogStore::open(dir.join("raft.db"))?;
+        let state_machine = Arc::new(StateMachine::open(dir.join("state.db"))?);
+        let config = Arc::new(
+            Config {
+                heartbeat_interval: 100,
+                election_timeout_min: 300,
+                election_timeout_max: 600,
+                ..Default::default()
+            }
+            .validate()?,
+        );
+        let network = NetworkFactory {
+            registry: registry.clone(),
+            policy: policy.clone(),
+            from: id,
+        };
+        let raft =
+            openraft::Raft::new(id, config, network, log_store, state_machine.clone()).await?;
+        registry.insert(id, raft.clone()).await;
+        Ok(NodeHandle {
+            id,
+            raft,
+            state_machine,
+        })
+    }
+
     pub async fn shutdown(handle: &NodeHandle, registry: &Registry) {
         registry.remove(handle.id).await;
         let _ = handle.raft.shutdown().await;
@@ -70,6 +113,14 @@ impl Cluster {
 
     pub async fn start(&self, id: NodeId) -> anyhow::Result<NodeHandle> {
         Node::start(id, self.registry.clone(), self.policy.clone()).await
+    }
+
+    pub async fn start_durable(
+        &self,
+        id: NodeId,
+        dir: impl AsRef<Path>,
+    ) -> anyhow::Result<NodeHandle> {
+        Node::start_durable(id, dir, self.registry.clone(), self.policy.clone()).await
     }
 
     pub async fn shutdown(&self, handle: &NodeHandle) {
