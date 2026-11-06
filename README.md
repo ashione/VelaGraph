@@ -23,7 +23,7 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Track | Current state |
 | --- | --- |
 | Graph kernel | Property records, adjacency indexes, bounded traversal and standard Gremlin v0 are implemented. K3a snapshot read views, K3b single-partition write transactions, and K3c process-crash recovery are implemented. |
-| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; `crates/replicated-graph` now connects `GraphRecordStore` to actual Raft through a bounded in-process D1 adapter, leader read barriers and retained prepared mutations for exact retries ([contract](docs/REPLICATED_GRAPH.md)). It is not a remote service: a bounded [D3a static catalog](docs/D3_STATIC_CATALOG.md) now persists immutable placement in a dedicated metadata group, with quorum reads and conditional registration. Its optional fixed-candidate in-process resolver pins read sessions and exact retry identities; remote routing, migration, transport security, and cross-partition transactions remain unsupported. |
+| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; `crates/replicated-graph` now connects `GraphRecordStore` to actual Raft through a bounded in-process D1 adapter, leader read barriers and retained prepared mutations for exact retries ([contract](docs/REPLICATED_GRAPH.md)). A separate [development-only TCP adapter](docs/REMOTE_GRAPH.md) now adds explicitly selected remote replicas and client-side Gremlin; a bounded [D3a static catalog](docs/D3_STATIC_CATALOG.md) now persists immutable placement in a dedicated metadata group, with quorum reads and conditional registration. Its optional fixed-candidate in-process resolver pins read sessions and exact retry identities; remote routing, migration, transport security, and cross-partition transactions remain unsupported. |
 | SQL engine | The documented SQL subset is supported; it remains autocommit per statement and does not participate in graph transactions. |
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
@@ -503,3 +503,11 @@ boundary, not cross-host routing or a production network service. Existing D2
 TCP/control listeners remain outside this trust boundary. Their separate
 [resource limits](docs/D2_TCP_LIMITS.md) do not add authentication or make
 them production-secure.
+
+### Development-only cross-process graph access
+
+The optional [`graph-node` and `RemoteStorageNode`](docs/REMOTE_GRAPH.md) connect
+existing graph CRUD and client-side standard Gremlin to independent TCP Raft
+processes. Explicitly enable plaintext development mode and use only a trusted
+isolated network. This functional slice is single-shard, bounded, and does not
+perform automatic retries or claim validated remote graph failover recovery.
