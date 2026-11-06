@@ -44,7 +44,9 @@ mod value;
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
 pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
-pub use graph_records::{GraphRecordStore, MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS};
+pub use graph_records::{
+    GraphRecordStore, PreparedGraphMutation, MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS,
+};
 pub use gremlin::{
     GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
     DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,
@@ -54,7 +56,7 @@ pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use storage_node::{
     Epoch, Export, KeyRange, KeyValue, LocalStorageNode, ReadView, RequestId, ScanLimit, Sequence,
     ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult,
-    WriteStatus, INTERFACE_VERSION,
+    WriteStatus, INTERFACE_VERSION, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
 };
 pub use traversal::{
     TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,

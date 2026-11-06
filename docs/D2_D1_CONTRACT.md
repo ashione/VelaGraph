@@ -2,7 +2,9 @@
 
 This is a single-shard **application-state-machine slice**, not a distributed
 graph database or an implementation of the synchronous `StorageNode` trait.
-`GraphRecordStore` and `GraphEngine` are not wired through Raft. The independent
+The separate [replicated graph adapter](REPLICATED_GRAPH.md) now wires
+`GraphRecordStore` through these commands in-process; `GraphEngine` is not wired
+through Raft. The independent
 `d2-raft` crate has no dependency on the local D1 crate; opaque graph/v1 bytes
 are unchanged. Transport security, routing, placement, bounded remote reads,
 client deadlines/retry policy and cross-shard transactions remain separate work.
@@ -77,7 +79,8 @@ apply call have the same results and final state as individual calls. This API i
 not a general-purpose way for callers to replay arbitrary out-of-order log entries.
 `d1_metadata`, `get_raw` and `scan_raw` are local diagnostic views, not distributed
 read guarantees. A caller using the leader must first ensure linearizability;
-a complete read-view adapter remains future work.
+the separate adapter uses the bounded atomic `d1_read_snapshot` capture after
+the barrier, not separate metadata/data reads.
 
 ## Bounds and explicit prototype limitations
 

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/d2-raft"]
-default-members = [".", "crates/d2-raft"]
+members = ["crates/d2-raft", "crates/replicated-graph"]
+default-members = [".", "crates/d2-raft", "crates/replicated-graph"]
 resolver = "2"
 
 [package]
