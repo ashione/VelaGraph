@@ -51,6 +51,16 @@ Deliberately **not** supported: joins, subqueries, window functions, `ALTER TABL
 constraints, multi-statement SQL transactions, `SELECT` without `FROM`, and
 cross-partition graph transactions. See [Limitations](#limitations).
 
+## Remote graph command-line client
+
+A development-only [`graph-client`](docs/GRAPH_CLIENT.md) now exposes catalog
+registration/lookup, v1 partition/global Gremlin and explicitly experimental v2
+creation/observed queries without writing Rust. The [three-process loopback
+demo](docs/GRAPH_DEMO.md) builds two same-ID vertices in different shards, creates
+a cross-shard edge and verifies a qualified path. Results retain snapshot vectors
+and experimental `Unverified` completeness; this is not a distributed transaction,
+production-secure service or durable client retry mechanism.
+
 ## Quick start
 
 Prerequisites: a C++ toolchain and libclang (needed by `librocksdb-sys`), plus
