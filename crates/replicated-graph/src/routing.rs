@@ -1066,6 +1066,69 @@ mod global_scan_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_filters_reload_properties_only_from_pinned_views() {
+        use rocksdb_sql_table::{GremlinRow, QualifiedGremlinRow, Value};
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let data = start(&root, 20).await;
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let adapter = ReplicatedStorageNode::new(&data, 20, TEST_TIMEOUT).unwrap();
+        let resolver = RouteResolver::new(
+            place(10),
+            std::slice::from_ref(&meta),
+            std::slice::from_ref(&data),
+        )
+        .unwrap();
+        crate::run_blocking(move || {
+            register(&catalog, 1, place(20));
+            let store = GraphRecordStore::new(adapter, 20, 1);
+            let mut vertex = Vertex::new(1);
+            vertex
+                .properties
+                .insert("x".into(), Value::Text("old".into()));
+            store.create_vertex(&vertex).unwrap();
+            let before = resolver
+                .execute_global_scan_observed(
+                    ScanScope::All,
+                    "g.V().has('x','old').values('x')",
+                    TEST_TIMEOUT,
+                    |shard| {
+                        if shard == Some(20) {
+                            vertex
+                                .properties
+                                .insert("x".into(), Value::Text("new".into()));
+                            store.update_vertex(&vertex).unwrap();
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                before.result,
+                GlobalScanOutput::Rows(vec![QualifiedGremlinRow {
+                    partition: 1,
+                    row: GremlinRow::Value(Value::Text("old".into()))
+                }])
+            );
+            let after = resolver
+                .execute_global_scan(ScanScope::All, "g.V().values('x')", TEST_TIMEOUT)
+                .unwrap();
+            assert_eq!(
+                after.result,
+                GlobalScanOutput::Rows(vec![QualifiedGremlinRow {
+                    partition: 1,
+                    row: GremlinRow::Value(Value::Text("new".into()))
+                }])
+            );
+            assert!(after.snapshots[0].sequence > before.snapshots[0].sequence);
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        root.in_group(20).shutdown(&data).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catalog_and_shared_shard_views_stay_pinned_during_concurrent_changes() {
         let root = Cluster::new();
         let meta = start(&root, 10).await;

@@ -284,7 +284,8 @@ async fn scenario() -> anyhow::Result<()> {
         for query in [
             "g.V(1)",
             "g.V().out()",
-            "g.V().hasLabel('person')",
+            "g.V().id()",
+            "g.V().path()",
             "g.V().madeUpStep()",
         ] {
             assert!(
@@ -294,6 +295,62 @@ async fn scenario() -> anyhow::Result<()> {
                 "{query}"
             );
         }
+        // The same local ID has different properties in each partition.
+        for (query, expected) in [
+            (
+                "g.V().hasLabel('person').has('partition',2)",
+                rows(&[(2, 1), (2, 2)], false),
+            ),
+            ("g.V().limit(2).has('partition',2)", rows(&[(2, 1)], false)),
+            (
+                "g.V().has('partition',2).limit(2)",
+                rows(&[(2, 1), (2, 2)], false),
+            ),
+            ("g.V().has('partition','2')", rows(&[], false)),
+            ("g.V().has('missing').limit(1)", rows(&[], false)),
+            (
+                "g.E().hasLabel('knows').limit(2)",
+                rows(&[(1, 7), (2, 7)], true),
+            ),
+        ] {
+            assert_eq!(
+                resolver
+                    .execute_global_scan(ScanScope::Selected(vec![3, 2, 1]), query, BUDGET)?
+                    .result,
+                expected,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            resolver
+                .execute_global_scan(ScanScope::All, "g.V().values('partition').limit(2)", BUDGET)?
+                .result,
+            GlobalScanOutput::Rows(vec![
+                QualifiedGremlinRow {
+                    partition: 1,
+                    row: GremlinRow::Value(Value::Integer(1))
+                },
+                QualifiedGremlinRow {
+                    partition: 2,
+                    row: GremlinRow::Value(Value::Integer(2))
+                },
+            ])
+        );
+        assert_eq!(
+            resolver
+                .execute_global_scan(ScanScope::All, "g.E().label().limit(1)", BUDGET)?
+                .result,
+            GlobalScanOutput::Rows(vec![QualifiedGremlinRow {
+                partition: 1,
+                row: GremlinRow::Value(Value::Text("knows".into()))
+            }])
+        );
+        assert_eq!(
+            resolver
+                .execute_global_scan(ScanScope::All, "g.V().values('missing').count()", BUDGET)?
+                .result,
+            GlobalScanOutput::Count(0)
+        );
         // 120 candidates demonstrate that the implicit 100 is global, not 100
         // per shard. Existing IDs 1 and 2 are replaced with bare v1 vertices.
         for (node, shard, partitions) in [(&a_node, 120, vec![1, 3]), (&b_node, 130, vec![2])] {
@@ -325,6 +382,48 @@ async fn scenario() -> anyhow::Result<()> {
                 .result,
             GlobalScanOutput::Count(120)
         );
+        for partition in [1, 2] {
+            for id in 121..=240 {
+                let mut vertex = Vertex::new(id);
+                vertex.labels.push("late".into());
+                vertex
+                    .properties
+                    .insert("x".into(), Value::Integer(id as i64));
+                let view = resolver.read_view(partition, BUDGET)?;
+                resolver.commit_prepared(&view.prepare_create_vertex(&vertex)?, BUDGET)?;
+            }
+        }
+        let projected = resolver.execute_global_scan(
+            ScanScope::All,
+            "g.V().hasLabel('late').values('x')",
+            BUDGET,
+        )?;
+        let GlobalScanOutput::Rows(projected) = projected.result else {
+            panic!("rows")
+        };
+        assert_eq!(projected.len(), 100);
+        assert_eq!(
+            projected[0],
+            QualifiedGremlinRow {
+                partition: 1,
+                row: GremlinRow::Value(Value::Integer(121))
+            }
+        );
+        assert_eq!(
+            resolver
+                .execute_global_scan(ScanScope::All, "g.V().has('x').count()", BUDGET)?
+                .result,
+            GlobalScanOutput::Count(240)
+        );
+        assert_eq!(
+            resolver
+                .execute_global_scan(ScanScope::All, "g.V().values('x').limit(1)", BUDGET)?
+                .result,
+            GlobalScanOutput::Rows(vec![QualifiedGremlinRow {
+                partition: 1,
+                row: GremlinRow::Value(Value::Integer(121))
+            }])
+        );
         // Each partition remains below 10k, but their merged candidates exceed it.
         for (node, shard, partition) in [(&a_node, 120, 1), (&b_node, 130, 2)] {
             node.batch_write(WriteRequest {
@@ -346,7 +445,12 @@ async fn scenario() -> anyhow::Result<()> {
                 .result,
             GlobalScanOutput::Count(10_000)
         );
-        for query in ["g.V()", "g.V().count()"] {
+        for query in [
+            "g.V()",
+            "g.V().count()",
+            "g.V().has('missing').limit(1)",
+            "g.V().values('missing').count()",
+        ] {
             assert!(
                 matches!(
                     resolver.execute_global_scan(ScanScope::All, query, BUDGET),

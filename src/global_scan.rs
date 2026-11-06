@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use crate::gremlin::QueryReadBackend;
-use crate::query_memory::{self, Budget};
+use crate::query_memory::{self, Accounted, AccountedVec, Budget};
 use crate::{
     Error, GraphRecordReadView, GremlinQuery, GremlinRow, GremlinStart, GremlinStep, Result,
     StorageNode, DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_ACCOUNTED_BYTES,
@@ -26,12 +26,13 @@ pub enum GlobalScanOutput {
     Count(u64),
 }
 
-/// Validated global subset: V()/E(), optional limit(n), optional terminal count().
+/// Validated global scans with order-preserving filters, projections and limits.
 #[derive(Debug, Clone)]
 pub struct GlobalScanPlan {
     vertices: bool,
     limit: Option<usize>,
-    count: bool,
+    steps: Vec<GremlinStep>,
+    explicit_limit: bool,
 }
 
 impl GlobalScanPlan {
@@ -44,17 +45,32 @@ impl GlobalScanPlan {
             GremlinStart::Edges(ids) if ids.is_empty() => false,
             _ => return Err(unsupported()),
         };
-        let (limit, count) = match parsed.steps() {
-            [] => (None, false),
-            [GremlinStep::Limit(n)] => (Some(*n), false),
-            [GremlinStep::Count] => (None, true),
-            [GremlinStep::Limit(n), GremlinStep::Count] => (Some(*n), true),
-            _ => return Err(unsupported()),
+        for step in parsed.steps() {
+            if !matches!(
+                step,
+                GremlinStep::HasLabel(_)
+                    | GremlinStep::Has { .. }
+                    | GremlinStep::Values(_)
+                    | GremlinStep::Label
+                    | GremlinStep::Limit(_)
+                    | GremlinStep::Count
+            ) {
+                return Err(unsupported());
+            }
+        }
+        // Only an immediately leading limit can bound candidate acquisition.
+        let limit = match parsed.steps().first() {
+            Some(GremlinStep::Limit(n)) => Some(*n),
+            _ => None,
         };
         Ok(Self {
             vertices,
             limit,
-            count,
+            explicit_limit: parsed
+                .steps()
+                .iter()
+                .any(|s| matches!(s, GremlinStep::Limit(_))),
+            steps: parsed.steps().to_vec(),
         })
     }
 
@@ -149,35 +165,76 @@ impl GlobalScanPlan {
         }
         ids.sort_unstable();
         check()?;
-        if self.count {
-            return Ok(GlobalScanOutput::Count(ids.len() as u64));
-        }
-        ids.truncate(self.limit.unwrap_or(DEFAULT_GREMLIN_LIMIT));
-        // Input slots remain charged while final output is constructed.
-        let _output_slots = budget.reserve(query_memory::mul(
-            ids.len(),
-            std::mem::size_of::<QualifiedGremlinRow>(),
-        )?)?;
-        let mut rows = Vec::with_capacity(ids.len());
+        let mut rows = AccountedVec::new(budget);
         for (id, partition) in ids {
             check()?;
-            rows.push(QualifiedGremlinRow {
+            rows.push((
                 partition,
-                row: if self.vertices {
-                    GremlinRow::Vertex(id)
-                } else {
-                    GremlinRow::Edge(id)
-                },
+                Accounted::new(
+                    if self.vertices {
+                        GremlinRow::Vertex(id)
+                    } else {
+                        GremlinRow::Edge(id)
+                    },
+                    budget.reserve(0)?,
+                ),
+            ))?;
+        }
+        for step in &self.steps {
+            check()?;
+            match step {
+                GremlinStep::Limit(n) => rows.truncate(*n),
+                GremlinStep::Count => {
+                    check()?;
+                    return Ok(GlobalScanOutput::Count(rows.len() as u64));
+                }
+                _ => {
+                    let mut output = AccountedVec::new(budget);
+                    for (partition, row) in rows {
+                        check()?;
+                        let view = &views
+                            .iter()
+                            .find(|(p, _)| *p == partition)
+                            .expect("qualified candidate has a pinned view")
+                            .1;
+                        if let Some(row) = crate::gremlin::apply_global_element_step(
+                            view, row, step, &check, budget,
+                        )? {
+                            output.push((partition, row))?;
+                        }
+                    }
+                    rows = output;
+                }
+            }
+        }
+        if !self.explicit_limit {
+            rows.truncate(DEFAULT_GREMLIN_LIMIT);
+        }
+        // Keep input slots and every payload charged until the final output is
+        // complete, including payloads moved out of the accounted iterator.
+        let _output_slots = budget.reserve(query_memory::mul(
+            rows.len(),
+            std::mem::size_of::<QualifiedGremlinRow>(),
+        )?)?;
+        let mut payload_charges = AccountedVec::new(budget);
+        let mut output = Vec::with_capacity(rows.len());
+        for (partition, row) in rows {
+            check()?;
+            payload_charges.push(row.charge)?;
+            output.push(QualifiedGremlinRow {
+                partition,
+                row: row.value,
             });
         }
         check()?;
-        Ok(GlobalScanOutput::Rows(rows))
+        Ok(GlobalScanOutput::Rows(output))
     }
 }
 
 fn unsupported() -> Error {
     Error::UnsupportedGremlinStep(
-        "global scan supports only V()/E(), optional limit(n), and terminal count()".into(),
+        "global scan supports V()/E(), hasLabel/has, values/label, limit, and terminal count()"
+            .into(),
     )
 }
 fn row_cap() -> Error {
@@ -198,13 +255,7 @@ mod tests {
         ] {
             GlobalScanPlan::parse(text).unwrap();
         }
-        for text in [
-            "g.V(1)",
-            "g.E(1)",
-            "g.V().out()",
-            "g.V().id()",
-            "g.V().limit(2).limit(1)",
-        ] {
+        for text in ["g.V(1)", "g.E(1)", "g.V().out()", "g.V().id()"] {
             assert!(matches!(
                 GlobalScanPlan::parse(text),
                 Err(Error::UnsupportedGremlinStep(_))
@@ -270,6 +321,226 @@ mod tests {
             7,
             partition,
         )
+    }
+    fn rich_store(partition: u32, count: u64) -> crate::GraphRecordStore<Node> {
+        let entries = (1..=count)
+            .map(|id| {
+                let mut vertex = crate::Vertex::new(id);
+                vertex.labels = vec!["first".into(), "person".into()];
+                if id % 2 == 0 {
+                    vertex
+                        .properties
+                        .insert("x".into(), crate::Value::Integer(partition.into()));
+                    vertex.properties.insert("null".into(), crate::Value::Null);
+                    vertex
+                        .properties
+                        .insert("text".into(), crate::Value::Text("1".into()));
+                    vertex
+                        .properties
+                        .insert("flag".into(), crate::Value::Boolean(true));
+                }
+                (
+                    crate::graph::vertex_key(partition, id),
+                    crate::graph::codec::encode_vertex(&vertex).unwrap(),
+                )
+            })
+            .collect();
+        crate::GraphRecordStore::new(
+            Node(crate::ReadView::from_entries(7, 1, 1, entries).unwrap()),
+            7,
+            partition,
+        )
+    }
+    #[test]
+    fn filters_projections_preserve_origin_order_and_step_position() {
+        let a = rich_store(1, 240);
+        let b = rich_store(2, 240);
+        let views = [(2, b.read_view().unwrap()), (1, a.read_view().unwrap())];
+        let run = |q| {
+            GlobalScanPlan::parse(q)
+                .unwrap()
+                .execute(&views, &|| Ok(()))
+                .unwrap()
+        };
+        assert_eq!(
+            run("g.V().limit(2).has('x').count()"),
+            GlobalScanOutput::Count(0)
+        );
+        assert_eq!(
+            run("g.V().has('x').limit(2).count()"),
+            GlobalScanOutput::Count(2)
+        );
+        assert_eq!(
+            run("g.V().hasLabel('person').has('x').count()"),
+            GlobalScanOutput::Count(240)
+        );
+        assert_eq!(
+            run("g.V().values('x').count()"),
+            GlobalScanOutput::Count(240)
+        );
+        assert_eq!(
+            run("g.V().has('x',1).count()"),
+            GlobalScanOutput::Count(120)
+        );
+        assert_eq!(
+            run("g.V().has('x','1').count()"),
+            GlobalScanOutput::Count(0)
+        );
+        assert_eq!(
+            run("g.V().has('x',1.0).count()"),
+            GlobalScanOutput::Count(0)
+        );
+        assert_eq!(
+            run("g.V().has('null').count()"),
+            GlobalScanOutput::Count(240)
+        );
+        assert_eq!(
+            run("g.V().values('missing').has('x').count()"),
+            GlobalScanOutput::Count(0)
+        );
+        assert_eq!(
+            run("g.V().has('null',null).has('flag',true).has('text','1').count()"),
+            GlobalScanOutput::Count(240)
+        );
+        assert_eq!(
+            run("g.V().values('missing').count()"),
+            GlobalScanOutput::Count(0)
+        );
+        assert_eq!(
+            run("g.V().values('x').limit(2).limit(1)"),
+            GlobalScanOutput::Rows(vec![QualifiedGremlinRow {
+                partition: 1,
+                row: GremlinRow::Value(crate::Value::Integer(1))
+            }])
+        );
+        assert_eq!(
+            run("g.V().limit(1).label()"),
+            GlobalScanOutput::Rows(vec![QualifiedGremlinRow {
+                partition: 1,
+                row: GremlinRow::Value(crate::Value::Text("first".into()))
+            }])
+        );
+        let GlobalScanOutput::Rows(rows) = run("g.V().has('x').values('x')") else {
+            panic!("rows")
+        };
+        assert_eq!(rows.len(), 100);
+        assert!(matches!(
+            GlobalScanPlan::parse("g.V().label().has('x')")
+                .unwrap()
+                .execute(&views, &|| Ok(())),
+            Err(Error::InvalidGremlinTraverser(_))
+        ));
+    }
+    #[test]
+    fn late_filters_and_limits_do_not_waive_candidate_cap() {
+        let a = rich_store(1, 6000);
+        let b = rich_store(2, 6000);
+        let views = [(1, a.read_view().unwrap()), (2, b.read_view().unwrap())];
+        for q in [
+            "g.V().has('missing').limit(1)",
+            "g.V().values('missing').count()",
+            "g.V().hasLabel('absent').count()",
+        ] {
+            assert!(
+                matches!(
+                    GlobalScanPlan::parse(q)
+                        .unwrap()
+                        .execute(&views, &|| Ok(())),
+                    Err(Error::TraversalLimitExceeded(_))
+                ),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            GlobalScanPlan::parse("g.V().limit(1).has('missing').count()")
+                .unwrap()
+                .execute(&views, &|| Ok(()))
+                .unwrap(),
+            GlobalScanOutput::Count(0)
+        );
+    }
+    #[test]
+    fn projection_budget_and_deadline_release_all_charges() {
+        let a = rich_store(1, 200);
+        let b = rich_store(2, 200);
+        let views = [(1, a.read_view().unwrap()), (2, b.read_view().unwrap())];
+        let plan = GlobalScanPlan::parse("g.V().has('text').values('text').limit(200)").unwrap();
+        let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
+        plan.execute_budget(&views, &|| Ok(()), &budget).unwrap();
+        assert_eq!(budget.used(), 0);
+        let exact = Budget::new(budget.peak());
+        plan.execute_budget(&views, &|| Ok(()), &exact).unwrap();
+        assert_eq!(exact.used(), 0);
+        // Page sizes adapt to remaining budget; peak-minus-one need not fail.
+        let short = Budget::new(query_memory::CONTROL_BYTES);
+        assert!(matches!(
+            plan.execute_budget(&views, &|| Ok(()), &short),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(short.used(), 0);
+        let checks = std::cell::Cell::new(0);
+        assert!(plan
+            .execute_budget(
+                &views,
+                &|| {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 1500 {
+                        Err(row_cap())
+                    } else {
+                        Ok(())
+                    }
+                },
+                &budget
+            )
+            .is_err());
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn projected_payloads_share_one_budget_across_partitions() {
+        let make = |partition| {
+            let entries = (1..=20)
+                .map(|id| {
+                    let mut vertex = crate::Vertex::new(id);
+                    vertex
+                        .properties
+                        .insert("x".into(), crate::Value::Text("x".repeat(16 * 1024)));
+                    (
+                        crate::graph::vertex_key(partition, id),
+                        crate::graph::codec::encode_vertex(&vertex).unwrap(),
+                    )
+                })
+                .collect();
+            crate::GraphRecordStore::new(
+                Node(crate::ReadView::from_entries(7, 1, 1, entries).unwrap()),
+                7,
+                partition,
+            )
+        };
+        let a = make(1);
+        let b = make(2);
+        let plan = GlobalScanPlan::parse("g.V().values('x')").unwrap();
+        let budget = Budget::new(750 * 1024);
+        for (partition, store) in [(1, &a), (2, &b)] {
+            plan.execute_budget(
+                &[(partition, store.read_view().unwrap())],
+                &|| Ok(()),
+                &budget,
+            )
+            .unwrap();
+            assert_eq!(budget.used(), 0);
+        }
+        let both = [(1, a.read_view().unwrap()), (2, b.read_view().unwrap())];
+        // Acquisition and plain ID output fit; accumulating values across both
+        // partitions must fail, even though each partition fits by itself.
+        GlobalScanPlan::parse("g.V()")
+            .unwrap()
+            .execute_budget(&both, &|| Ok(()), &budget)
+            .unwrap();
+        assert!(matches!(
+            plan.execute_budget(&both, &|| Ok(()), &budget),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(budget.used(), 0);
     }
     #[test]
     fn global_order_limit_count_and_partition_identity() {
