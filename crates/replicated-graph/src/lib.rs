@@ -4,9 +4,12 @@
 //! operations from async code; direct synchronous calls on Tokio workers fail
 //! explicitly instead of nesting `block_on` or blocking the executor. The host
 //! runtime must remain running. The optional [`routing`] module adds bounded
-//! static in-process routing. No TCP graph protocol, authentication, or production
-//! availability guarantee is provided.
+//! static in-process routing. On Linux, `gateway` adds a same-host read-only UDS
+//! interface with OS peer identity checks. No TCP graph protocol, cross-host
+//! authentication, or production availability guarantee is provided.
 pub mod catalog;
+#[cfg(target_os = "linux")]
+pub mod gateway;
 pub mod routing;
 
 use std::cell::Cell;

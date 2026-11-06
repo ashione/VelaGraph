@@ -489,5 +489,15 @@ a fresh metadata quorum read. Read sessions pin one adapter/view and deadline;
 prepared writes retain their original identity across explicit retries. All
 clones share admission limits across groups. See
 [the static routing contract](docs/D3_STATIC_CATALOG.md#bounded-in-process-route-resolver).
-No remote graph protocol, membership changes, migration or cross-group fencing
-is implemented.
+The Linux-only same-host read gateway below is separate from this in-process
+resolver. Cross-host graph protocols, membership changes, migration and
+cross-group fencing remain unimplemented.
+
+### Same-host read-only graph gateway
+
+On Linux, `replicated_graph::gateway` exposes bounded open/query/close sessions
+through a Unix domain socket in a trusted owner-only directory. Peer UID checks,
+fixed snapshots and deadlines, bounded frames and worker admission apply. See
+[the gateway contract](docs/GRAPH_UDS_GATEWAY.md). This is a same-host process
+boundary, not cross-host routing or a production network service. Existing D2
+TCP/control listeners are unchanged and remain outside this boundary.

@@ -195,6 +195,7 @@ not implemented. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
 
 This closes only the bounded, in-process, single-shard replicated query path.
 K3 write-overlay transactions still belong to `GraphEngine`; cross-shard queries,
-client/server query protocols, remote routing and production availability remain
-absent.
+cross-host query protocols, remote replica routing and production availability
+remain absent. A Linux-only same-host read gateway is separately documented in
+[GRAPH_UDS_GATEWAY.md](GRAPH_UDS_GATEWAY.md).
 The optional static in-process resolver is documented in D3_STATIC_CATALOG.md.
