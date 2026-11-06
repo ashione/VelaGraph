@@ -11,10 +11,11 @@ use tokio::sync::Semaphore;
 pub(crate) enum Adapter {
     Local(ReplicatedStorageNode),
     Remote(RemoteStorageNode),
+    Frozen(crate::remote::query::FrozenNode),
 }
 macro_rules! dispatch {
     ($self:ident, $method:ident ($($arg:expr),*)) => {
-        match $self { Self::Local(node) => node.$method($($arg),*), Self::Remote(node) => node.$method($($arg),*) }
+        match $self { Self::Local(node) => node.$method($($arg),*), Self::Remote(node) => node.$method($($arg),*), Self::Frozen(node) => node.$method($($arg),*) }
     }
 }
 impl Adapter {
@@ -22,6 +23,7 @@ impl Adapter {
         match self {
             Self::Local(node) => Self::Local(node.scoped(shard, end, admission)),
             Self::Remote(node) => Self::Remote(node.scoped(shard, end, admission)),
+            Self::Frozen(node) => Self::Frozen(node.clone()),
         }
     }
     pub(crate) fn probe_leader(&self) -> Result<()> {

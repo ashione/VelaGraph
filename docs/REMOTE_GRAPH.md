@@ -182,3 +182,9 @@ with no TLS, automatic retry, recovery, session resume or production claim.
 The transport directly uses the existing locked `getrandom` 0.3 dependency
 (MIT OR Apache-2.0) for incarnation/session/continuation randomness. No new
 cryptographic protocol or authentication claim is introduced.
+
+## Additive server query pushdown
+
+[REMOTE_QUERY.md](REMOTE_QUERY.md) documents the explicit single-partition Query
+operation and CLI commands. Existing snapshot download APIs remain unchanged.
+This does not add cross-shard global consistency, retry, TLS or authentication.

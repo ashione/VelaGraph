@@ -578,3 +578,92 @@ impl RouteResolver {
         Ok(AppendAcknowledgement::AllBatchesAcknowledged)
     }
 }
+
+/// Reuses the observed interpreter without a catalog lookup or another snapshot.
+/// This private session has exactly one partition; references outside it fail.
+pub(crate) fn execute_frozen_query(
+    node: crate::remote::query::FrozenNode,
+    identity: crate::remote::RemoteIdentity,
+    partition: u32,
+    text: &str,
+) -> std::result::Result<Vec<crate::remote::query::QueryRow>, crate::remote::query::QueryFailure> {
+    use crate::remote::query::{
+        graph_error, storage_error, QualifiedElement, QueryFailure, QueryRow,
+    };
+    let placement = Placement {
+        group: identity.group,
+        shard: node.view.shard,
+        epoch: node.view.epoch,
+        replicas: vec![identity.node],
+    };
+    let op = Arc::new(Operation {
+        end: node.end,
+        _permit: Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .map_err(|_| QueryFailure::ResourceExhausted)?,
+    });
+    let stamp = ShardReadStamp {
+        group: identity.group,
+        shard: node.view.shard,
+        epoch: node.view.epoch,
+        sequence: node.view.sequence,
+    };
+    let pinned = PinnedNode {
+        view: node.view.clone(),
+        adapter: Adapter::Frozen(node),
+        op: op.clone(),
+    };
+    let session = ExperimentalReadSession {
+        metadata: placement.clone(),
+        metadata_sequence: 0,
+        snapshots: vec![stamp],
+        placements: BTreeMap::from([(partition, placement.clone())]),
+        nodes: BTreeMap::from([(placement.shard, pinned)]),
+        op,
+    };
+    let result = session
+        .observed_gremlin_v3(partition, text)
+        .map_err(|error| match error {
+            ExperimentalRouteError::Query(e) => graph_error(e),
+            ExperimentalRouteError::Unsupported(_) => QueryFailure::Unsupported,
+            ExperimentalRouteError::Route(RouteError::MissingPartition(_)) => {
+                QueryFailure::UnsupportedScope
+            }
+            ExperimentalRouteError::Route(RouteError::Storage(e)) => storage_error(e),
+            ExperimentalRouteError::Route(RouteError::Graph(e)) => graph_error(e),
+            ExperimentalRouteError::Graph(ExperimentalError::Graph(e)) => graph_error(e),
+            ExperimentalRouteError::Graph(ExperimentalError::Storage(e)) => storage_error(e),
+            _ => QueryFailure::IncompleteOrCorrupt,
+        })?;
+    let element = |e| match e {
+        ObservedElementRef::Vertex(v) => QualifiedElement::Vertex {
+            partition: v.partition,
+            id: v.id,
+        },
+        ObservedElementRef::Edge(e) => QualifiedElement::Edge {
+            partition: e.partition,
+            id: e.id,
+        },
+    };
+    Ok(result
+        .rows
+        .into_iter()
+        .map(|row| match row {
+            ObservedRowV3::Vertex(v) => QueryRow::Element(element(ObservedElementRef::Vertex(v))),
+            ObservedRowV3::Edge(e) => QueryRow::Element(element(ObservedElementRef::Edge(e))),
+            ObservedRowV3::Path(path) => QueryRow::Path(
+                path.into_iter()
+                    .map(|e| match e {
+                        ObservedPathElement::Vertex(v) => element(ObservedElementRef::Vertex(v)),
+                        ObservedPathElement::Edge(e) => element(ObservedElementRef::Edge(e)),
+                    })
+                    .collect(),
+            ),
+            ObservedRowV3::Count(n) => QueryRow::Count(n),
+            ObservedRowV3::Value { source, value } => QueryRow::Value {
+                source: Some(element(source)),
+                value,
+            },
+        })
+        .collect())
+}
