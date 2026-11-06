@@ -534,3 +534,350 @@ fn acquisition_time_is_in_query_deadline() {
     ));
     assert_eq!(store.node().calls.load(Ordering::SeqCst), 0);
 }
+
+fn assert_query_byte_limit(result: Result<GremlinResult>, query: &str) {
+    match result {
+        Err(Error::TraversalLimitExceeded(message)) => {
+            assert!(message.contains("byte"), "{query}: {message}");
+        }
+        other => panic!("expected accounted-byte rejection for {query}, got {other:?}"),
+    }
+}
+
+#[test]
+fn aggregate_budget_parallel_edges_and_repeated_ids_reject_on_all_entry_points() {
+    let mut target = Vertex::new(2);
+    target
+        .properties
+        .insert("big".into(), Value::Text("x".repeat(1024 * 1024)));
+    let vertices = vec![Vertex::new(1), target];
+    let edges = (0..100)
+        .map(|id| Edge::new(id, 1, 2, "TO"))
+        .collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    let local = GraphEngine::open(dir.path()).unwrap();
+    for vertex in &vertices {
+        local.create_vertex(vertex).unwrap();
+    }
+    for edge in &edges {
+        local.create_edge(edge).unwrap();
+    }
+    let store = GraphRecordStore::new(Node::new(&vertices, &edges), 7, 0);
+    let retained = store.read_view().unwrap();
+    let repeated = format!("g.V({}).count()", vec!["2"; 100].join(","));
+    for text in [
+        "g.V(1).out()",
+        "g.V(1).out().limit(1)",
+        "g.V(1).out().count()",
+        &repeated,
+    ] {
+        let query = GremlinQuery::parse(text).unwrap();
+        assert_query_byte_limit(query.execute(&local), text);
+        assert_query_byte_limit(query.execute_records(&store), text);
+        assert_query_byte_limit(query.execute_record_view(&retained), text);
+    }
+    let text = format!("g.V({}).limit(1).id()", vec!["2"; 100].join(","));
+    let query = GremlinQuery::parse(&text).unwrap();
+    let expected = GremlinResult {
+        rows: vec![GremlinRow::Value(Value::Integer(2))],
+    };
+    assert_eq!(query.execute(&local).unwrap(), expected);
+    assert_eq!(query.execute_records(&store).unwrap(), expected);
+    assert_eq!(query.execute_record_view(&retained).unwrap(), expected);
+}
+
+#[test]
+fn aggregate_budget_multi_page_decoded_properties_exceed_small_encoded_store() {
+    // Small integer encodings hide substantial decoded BTreeMap entry costs.
+    // 1100 records require multiple pages even at the 256-row maximum.
+    let vertices = (0..1100)
+        .map(|id| {
+            let mut vertex = Vertex::new(id);
+            vertex.labels.push("wide".into());
+            for property in 0..1000 {
+                vertex
+                    .properties
+                    .insert(format!("p{property:04}"), Value::Integer(property));
+            }
+            vertex
+        })
+        .collect::<Vec<_>>();
+    let encoded_bytes: usize = vertices
+        .iter()
+        .map(|v| vertex_key(0, v.id).len() + codec::encode_vertex(v).unwrap().len())
+        .sum();
+    assert!(encoded_bytes < 32 * 1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let local = GraphEngine::open(dir.path()).unwrap();
+    for vertex in &vertices {
+        local.create_vertex(vertex).unwrap();
+    }
+    let store = GraphRecordStore::new(Node::new(&vertices, &[]), 7, 0);
+    let retained = store.read_view().unwrap();
+    for text in ["g.V()", "g.V().count()", "g.V().hasLabel('wide').limit(1)"] {
+        let query = GremlinQuery::parse(text).unwrap();
+        assert_query_byte_limit(query.execute(&local), text);
+        assert_query_byte_limit(query.execute_records(&store), text);
+        assert_query_byte_limit(query.execute_record_view(&retained), text);
+    }
+    let query = GremlinQuery::parse("g.V().limit(1).values('p0000')").unwrap();
+    let expected = GremlinResult {
+        rows: vec![GremlinRow::Value(Value::Integer(0))],
+    };
+    assert_eq!(query.execute(&local).unwrap(), expected);
+    assert_eq!(query.execute_records(&store).unwrap(), expected);
+    assert_eq!(query.execute_record_view(&retained).unwrap(), expected);
+}
+
+fn check_exact_point_budget(
+    backend: &impl crate::gremlin::QueryReadBackend,
+    text: &str,
+    expected: &GremlinResult,
+) {
+    use crate::query_memory::Budget;
+    let query = GremlinQuery::parse(text).unwrap();
+    let measured = Budget::new(16 * 1024 * 1024);
+    assert_eq!(
+        &query
+            .execute_on_read_budget(backend, &|| Ok(()), &measured)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(measured.used(), 0);
+    let exact = Budget::new(measured.peak());
+    assert_eq!(
+        &query
+            .execute_on_read_budget(backend, &|| Ok(()), &exact)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(exact.used(), 0);
+    assert_eq!(exact.peak(), measured.peak());
+    let insufficient = Budget::new(measured.peak() - 1);
+    assert_query_byte_limit(
+        query.execute_on_read_budget(backend, &|| Ok(()), &insufficient),
+        text,
+    );
+    assert_eq!(
+        insufficient.used(),
+        0,
+        "failed query leaked reservations: {text}"
+    );
+    assert_eq!(
+        GremlinQuery::parse("g.V(1).id()")
+            .unwrap()
+            .execute_on_read_budget(backend, &|| Ok(()), &insufficient)
+            .unwrap()
+            .rows,
+        vec![GremlinRow::Value(Value::Integer(1))]
+    );
+    assert_eq!(insufficient.used(), 0);
+}
+
+#[test]
+fn aggregate_budget_exact_point_boundaries_projections_and_edge_scratch() {
+    let (mut vertices, mut edges) = fixture();
+    vertices[1]
+        .properties
+        .insert("big".into(), Value::Text("v".repeat(64 * 1024)));
+    edges[0]
+        .properties
+        .insert("big".into(), Value::Text("e".repeat(256 * 1024)));
+    let dir = tempfile::tempdir().unwrap();
+    let local = GraphEngine::open(dir.path()).unwrap();
+    for vertex in &vertices {
+        local.create_vertex(vertex).unwrap();
+    }
+    for edge in &edges {
+        local.create_edge(edge).unwrap();
+    }
+    let store = GraphRecordStore::new(Node::new(&vertices, &edges), 7, 0);
+    let retained = store.read_view().unwrap();
+    for text in [
+        "g.V(2)",
+        "g.V(2).values('big')",
+        "g.V(2).label()",
+        "g.V(2).path()",
+        "g.E(100)",
+        "g.E(100).values('big')",
+        "g.E(100).label()",
+        "g.E(100).path()",
+    ] {
+        let query = GremlinQuery::parse(text).unwrap();
+        let expected = query.execute(&local).unwrap();
+        assert_eq!(query.execute_records(&store).unwrap(), expected, "{text}");
+        assert_eq!(
+            query.execute_record_view(&retained).unwrap(),
+            expected,
+            "{text}"
+        );
+        check_exact_point_budget(&local.read_view(), text, &expected);
+        check_exact_point_budget(&retained, text, &expected);
+    }
+    // Traversal decodes and drops a large edge even when returning only IDs or paths.
+    for (text, rows) in [
+        (
+            "g.V(1).out('KNOWS').id()",
+            vec![GremlinRow::Value(Value::Integer(2))],
+        ),
+        (
+            "g.V(1).out('KNOWS').label()",
+            vec![GremlinRow::Value(Value::Text("person".into()))],
+        ),
+        (
+            "g.V(1).out('KNOWS').path()",
+            vec![GremlinRow::Path(vec![
+                PathElement::Vertex(1),
+                PathElement::Edge(100),
+                PathElement::Vertex(2),
+            ])],
+        ),
+    ] {
+        let query = GremlinQuery::parse(text).unwrap();
+        assert_eq!(query.execute(&local).unwrap().rows, rows);
+        assert_eq!(query.execute_records(&store).unwrap().rows, rows);
+        assert_eq!(query.execute_record_view(&retained).unwrap().rows, rows);
+    }
+    fn check_edge_scratch(backend: &impl crate::gremlin::QueryReadBackend) {
+        let budget = crate::query_memory::Budget::new(128 * 1024);
+        assert_query_byte_limit(
+            GremlinQuery::parse("g.V(1).out('KNOWS').id()")
+                .unwrap()
+                .execute_on_read_budget(backend, &|| Ok(()), &budget),
+            "large edge scratch",
+        );
+        assert_eq!(budget.used(), 0);
+        assert_eq!(
+            GremlinQuery::parse("g.V(1).values('name')")
+                .unwrap()
+                .execute_on_read_budget(backend, &|| Ok(()), &budget)
+                .unwrap()
+                .rows,
+            vec![GremlinRow::Value(Value::Text("Alice".into()))],
+        );
+        assert_eq!(budget.used(), 0);
+    }
+    check_edge_scratch(&local.read_view());
+    check_edge_scratch(&retained);
+}
+
+// Regression tests from the independent accounting audit.
+#[test]
+fn audit_corrupt_d1_label_rejected_before_key_reconstruction() {
+    use crate::query_memory::Budget;
+    let mut edge = Edge::new(7, 1, 2, "ok");
+    edge.label = "x".repeat(1024 * 1024);
+    let mut entries = std::collections::BTreeMap::new();
+    for id in [1, 2] {
+        entries.insert(
+            vertex_key(0, id),
+            codec::encode_vertex(&Vertex::new(id)).unwrap(),
+        );
+    }
+    entries.insert(edge_key(0, 7), codec::encode_edge(&edge).unwrap());
+    entries.insert(adjacency_key(0, EdgeDirection::Out, 1, "ok", 7), Vec::new());
+    let node = Node::new(&[], &[]);
+    *node.live.lock().unwrap() = ReadView::from_entries(7, 1, 1, entries).unwrap();
+    let store = GraphRecordStore::new(node, 7, 0);
+    let view = store.read_view().unwrap();
+    let budget = Budget::new(3 * 1024 * 1024);
+    let error = GremlinQuery::parse("g.V(1).out()")
+        .unwrap()
+        .execute_on_read_budget(&view, &|| Ok(()), &budget)
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::CorruptData(ref message) if message.contains("label")),
+        "{error:?}"
+    );
+    assert!(
+        budget.peak() >= 2 * 1024 * 1024,
+        "large raw and decoded label must overlap"
+    );
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn audit_local_lookahead_is_charged_for_vertices_and_edges() {
+    use crate::query_memory::Budget;
+    let dir = tempfile::tempdir().unwrap();
+    let graph = GraphEngine::open(dir.path()).unwrap();
+    graph.create_vertex(&Vertex::new(1)).unwrap();
+    let mut big = Vertex::new(2);
+    big.properties
+        .insert("p".into(), Value::Text("x".repeat(100_000)));
+    graph.create_vertex(&big).unwrap();
+    graph.create_edge(&Edge::new(1, 1, 1, "ok")).unwrap();
+    let mut edge = Edge::new(2, 1, 1, "ok");
+    edge.properties = big.properties.clone();
+    graph.create_edge(&edge).unwrap();
+    for text in ["g.V().limit(1)", "g.E().limit(1)"] {
+        let budget = Budget::new(8192);
+        let result = GremlinQuery::parse(text).unwrap().execute_on_read_budget(
+            &graph.read_view(),
+            &|| Ok(()),
+            &budget,
+        );
+        assert!(
+            matches!(result, Err(Error::TraversalLimitExceeded(_))),
+            "{text}: {result:?}"
+        );
+        assert_eq!(budget.used(), 0, "{text}");
+    }
+}
+
+fn audit_cancel_every_checkpoint(backend: &impl crate::gremlin::QueryReadBackend) {
+    use crate::query_memory::Budget;
+    use std::cell::Cell;
+    let query = GremlinQuery::parse("g.V(1,2).both().path()").unwrap();
+    let calls = Cell::new(0);
+    let budget = Budget::new(16 * 1024 * 1024);
+    query
+        .execute_on_read_budget(
+            backend,
+            &|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            &budget,
+        )
+        .unwrap();
+    let checkpoints = calls.get();
+    assert!(checkpoints > 20);
+    assert_eq!(budget.used(), 0);
+    for cutoff in 1..=checkpoints {
+        calls.set(0);
+        let result = query.execute_on_read_budget(
+            backend,
+            &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == cutoff {
+                    Err(Error::TraversalLimitExceeded("audit cancellation".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            &budget,
+        );
+        assert!(
+            matches!(result, Err(Error::TraversalLimitExceeded(ref m)) if m == "audit cancellation"),
+            "checkpoint {cutoff}: {result:?}"
+        );
+        assert_eq!(budget.used(), 0, "checkpoint {cutoff}");
+    }
+}
+
+#[test]
+fn audit_cancellation_releases_all_local_and_d1_overlap() {
+    let (vertices, edges) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let local = GraphEngine::open(dir.path()).unwrap();
+    for vertex in &vertices {
+        local.create_vertex(vertex).unwrap();
+    }
+    for edge in &edges {
+        local.create_edge(edge).unwrap();
+    }
+    let store = GraphRecordStore::new(Node::new(&vertices, &edges), 7, 0);
+    audit_cancel_every_checkpoint(&local.read_view());
+    audit_cancel_every_checkpoint(&store.read_view().unwrap());
+}

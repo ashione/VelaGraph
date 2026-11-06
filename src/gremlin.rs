@@ -14,71 +14,41 @@ use std::time::{Duration, Instant};
 use gremlin_rs::{parse_query, ParseTree};
 
 use crate::error::{Error, Result};
-use crate::graph::{Edge, GraphEngine, GraphReadView, Vertex};
+use crate::graph::{Edge, GraphEngine, Vertex};
+use crate::query_memory::{self, Accounted, AccountedVec, Budget};
 use crate::value::Value;
 
 /// Query-only reads from one stable sequence. Implementations must never mix
 /// live reads into a view, silently truncate an internal cap, or collect an
 /// unbounded adjacency list. This is not a distributed storage-node contract.
 pub(crate) trait QueryReadBackend {
-    fn get_vertex(&self, id: u64) -> Result<Option<Vertex>>;
-    fn get_edge(&self, id: u64) -> Result<Option<Edge>>;
+    fn get_vertex(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Vertex>>>;
+    fn get_edge(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Edge>>>;
     fn scan_vertices_checked(
         &self,
         limit: usize,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Vertex>, bool)>;
+        budget: &Budget,
+    ) -> Result<(AccountedVec<Accounted<Vertex>>, bool)>;
     fn scan_edges_checked(
         &self,
         limit: usize,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Edge>, bool)>;
+        budget: &Budget,
+    ) -> Result<(AccountedVec<Accounted<Edge>>, bool)>;
     fn visit_adjacent_edges(
         &self,
         vertex_id: u64,
         incoming: bool,
         label: Option<&str>,
         check: &mut impl FnMut() -> Result<()>,
-        visit: &mut impl FnMut(Edge) -> Result<()>,
+        visit: &mut impl FnMut(Accounted<Edge>) -> Result<()>,
+        budget: &Budget,
     ) -> Result<()>;
 }
 
-impl QueryReadBackend for GraphReadView<'_> {
-    fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        GraphReadView::get_vertex(self, id)
-    }
-
-    fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
-        GraphReadView::get_edge(self, id)
-    }
-
-    fn scan_vertices_checked(
-        &self,
-        limit: usize,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Vertex>, bool)> {
-        GraphReadView::scan_vertices_checked(self, limit, check)
-    }
-
-    fn scan_edges_checked(
-        &self,
-        limit: usize,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Edge>, bool)> {
-        GraphReadView::scan_edges_checked(self, limit, check)
-    }
-
-    fn visit_adjacent_edges(
-        &self,
-        vertex_id: u64,
-        incoming: bool,
-        label: Option<&str>,
-        check: &mut impl FnMut() -> Result<()>,
-        visit: &mut impl FnMut(Edge) -> Result<()>,
-    ) -> Result<()> {
-        GraphReadView::visit_adjacent_edges(self, vertex_id, incoming, label, check, visit)
-    }
-}
+/// Default per-execution logical byte budget; not an allocator or RSS limit.
+pub const MAX_GREMLIN_ACCOUNTED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum number of `out`/`in`/`both` steps in one query.
 pub const MAX_GREMLIN_EDGE_STEPS: usize = 3;
@@ -356,6 +326,16 @@ impl GremlinQuery {
         graph: &impl QueryReadBackend,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<GremlinResult> {
+        self.execute_on_read_budget(graph, check, &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES))
+    }
+
+    pub(crate) fn execute_on_read_budget(
+        &self,
+        graph: &impl QueryReadBackend,
+        check: &dyn Fn() -> Result<()>,
+        budget: &Budget,
+    ) -> Result<GremlinResult> {
+        let _control = budget.reserve(query_memory::CONTROL_BYTES)?;
         check()?;
         // A leading `limit` can be pushed into the start scan, so a large
         // graph does not fail the row cap before an explicit bound applies.
@@ -363,12 +343,12 @@ impl GremlinQuery {
             Some(GremlinStep::Limit(limit)) => Some(*limit),
             _ => None,
         };
-        let mut rows = self.start_rows(graph, start_limit, check)?;
+        let mut rows = self.start_rows(graph, start_limit, check, budget)?;
         enforce_row_cap(rows.len())?;
 
         for step in &self.steps {
             check()?;
-            rows = apply_step(graph, rows, step, check)?;
+            rows = apply_step(graph, rows, step, check, budget)?;
             check()?;
             enforce_row_cap(rows.len())?;
         }
@@ -376,20 +356,28 @@ impl GremlinQuery {
         // The default cap is a result cap, not a traversal cutoff; `count`
         // already observed the pre-cap rows it is supposed to count.
         if !self.explicit_limit
-            && !rows.iter().any(|row| matches!(row, Row::Count(_)))
+            && !rows.iter().any(|row| matches!(row.value, Row::Count(_)))
             && rows.len() > DEFAULT_GREMLIN_LIMIT
         {
             rows.truncate(DEFAULT_GREMLIN_LIMIT);
         }
 
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                check()?;
-                Ok(row.into_row())
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // The input iterator keeps its container charge while the output Vec
+        // grows; payload reservations move with the rows, never cloning values.
+        let mut output = AccountedVec::new(budget);
+        let mut charges = AccountedVec::new(budget);
+        for row in rows {
+            check()?;
+            let Accounted { value, mut charge } = row;
+            let value = value.into_row();
+            let bytes = result_payload_bytes(&value)?;
+            charge.shrink(bytes);
+            output.push(value)?;
+            charges.push(charge)?;
+        }
         check()?;
+        let (rows, _slots) = output.into_parts();
+        // Successful return transfers payload ownership out of the query budget.
         Ok(GremlinResult { rows })
     }
 
@@ -398,86 +386,70 @@ impl GremlinQuery {
         graph: &impl QueryReadBackend,
         limit: Option<usize>,
         check: &dyn Fn() -> Result<()>,
-    ) -> Result<Vec<Row>> {
+        budget: &Budget,
+    ) -> Result<AccountedVec<Accounted<Row>>> {
+        let mut rows = AccountedVec::new(budget);
         match &self.start {
             GremlinStart::Vertices(ids) if ids.is_empty() => {
-                let scan_limit = limit.unwrap_or(MAX_GREMLIN_ROWS);
-                let (vertices, truncated) =
-                    graph.scan_vertices_checked(scan_limit, &mut || check())?;
+                let (vertices, truncated) = graph.scan_vertices_checked(
+                    limit.unwrap_or(MAX_GREMLIN_ROWS),
+                    &mut || check(),
+                    budget,
+                )?;
                 if truncated && limit.is_none() {
-                    return Err(Error::TraversalLimitExceeded(format!(
-                        "more than {MAX_GREMLIN_ROWS} vertices matched; add an explicit limit"
-                    )));
+                    return Err(Error::TraversalLimitExceeded(
+                        "vertex row cap exceeded; add an explicit limit".into(),
+                    ));
                 }
-                Ok(vertices
-                    .into_iter()
-                    .map(|vertex| {
-                        check()?;
-                        let id = vertex.id;
-                        Ok(Row::Element(
-                            Element::Vertex(vertex),
-                            vec![PathElement::Vertex(id)],
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?)
+                for vertex in vertices {
+                    check()?;
+                    rows.push(vertex_row(vertex, budget)?)?;
+                }
             }
             GremlinStart::Vertices(ids) => {
-                let mut rows = Vec::with_capacity(ids.len().min(MAX_GREMLIN_ROWS));
                 for id in ids {
                     check()?;
-                    if let Some(vertex) = graph.get_vertex(*id)? {
+                    if let Some(vertex) = graph.get_vertex(*id, budget)? {
                         check()?;
                         enforce_row_cap(rows.len() + 1)?;
-                        rows.push(Row::Element(
-                            Element::Vertex(vertex),
-                            vec![PathElement::Vertex(*id)],
-                        ));
+                        rows.push(vertex_row(vertex, budget)?)?;
                     }
                     if limit.is_some_and(|limit| rows.len() >= limit) {
                         break;
                     }
                 }
-                Ok(rows)
             }
             GremlinStart::Edges(ids) if ids.is_empty() => {
-                let scan_limit = limit.unwrap_or(MAX_GREMLIN_ROWS);
-                let (edges, truncated) = graph.scan_edges_checked(scan_limit, &mut || check())?;
+                let (edges, truncated) = graph.scan_edges_checked(
+                    limit.unwrap_or(MAX_GREMLIN_ROWS),
+                    &mut || check(),
+                    budget,
+                )?;
                 if truncated && limit.is_none() {
-                    return Err(Error::TraversalLimitExceeded(format!(
-                        "more than {MAX_GREMLIN_ROWS} edges matched; add an explicit limit"
-                    )));
+                    return Err(Error::TraversalLimitExceeded(
+                        "edge row cap exceeded; add an explicit limit".into(),
+                    ));
                 }
-                Ok(edges
-                    .into_iter()
-                    .map(|edge| {
-                        check()?;
-                        let id = edge.id;
-                        Ok(Row::Element(
-                            Element::Edge(edge),
-                            vec![PathElement::Edge(id)],
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?)
+                for edge in edges {
+                    check()?;
+                    rows.push(edge_row(edge)?)?;
+                }
             }
             GremlinStart::Edges(ids) => {
-                let mut rows = Vec::with_capacity(ids.len().min(MAX_GREMLIN_ROWS));
                 for id in ids {
                     check()?;
-                    if let Some(edge) = graph.get_edge(*id)? {
+                    if let Some(edge) = graph.get_edge(*id, budget)? {
                         check()?;
                         enforce_row_cap(rows.len() + 1)?;
-                        rows.push(Row::Element(
-                            Element::Edge(edge),
-                            vec![PathElement::Edge(*id)],
-                        ));
+                        rows.push(edge_row(edge)?)?;
                     }
                     if limit.is_some_and(|limit| rows.len() >= limit) {
                         break;
                     }
                 }
-                Ok(rows)
             }
         }
+        Ok(rows)
     }
 }
 
@@ -530,130 +502,147 @@ impl Row {
     }
 }
 
+fn vertex_row(mut vertex: Accounted<Vertex>, _budget: &Budget) -> Result<Accounted<Row>> {
+    vertex.charge.grow(query_memory::PATH_ITEM)?;
+    let id = vertex.id;
+    Ok(vertex.map(|v| Row::Element(Element::Vertex(v), vec![PathElement::Vertex(id)])))
+}
+fn edge_row(mut edge: Accounted<Edge>) -> Result<Accounted<Row>> {
+    edge.charge.grow(query_memory::PATH_ITEM)?;
+    let id = edge.id;
+    Ok(edge.map(|e| Row::Element(Element::Edge(e), vec![PathElement::Edge(id)])))
+}
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Text(s) => s.len(),
+        _ => 0,
+    }
+}
+fn result_payload_bytes(row: &GremlinRow) -> Result<usize> {
+    match row {
+        GremlinRow::Value(v) => Ok(value_bytes(v)),
+        GremlinRow::Path(p) => query_memory::mul(p.len(), query_memory::PATH_ITEM),
+        _ => Ok(0),
+    }
+}
 fn apply_step(
     graph: &impl QueryReadBackend,
-    rows: Vec<Row>,
+    rows: AccountedVec<Accounted<Row>>,
     step: &GremlinStep,
     check: &dyn Fn() -> Result<()>,
-) -> Result<Vec<Row>> {
+    budget: &Budget,
+) -> Result<AccountedVec<Accounted<Row>>> {
     check()?;
     match step {
-        GremlinStep::HasLabel(labels) => rows
-            .into_iter()
-            .map(|row| {
-                check()?;
-                match row {
-                    Row::Element(element, path) => {
-                        let matches = match &element {
-                            Element::Vertex(vertex) => {
-                                vertex.labels.iter().any(|label| labels.contains(label))
-                            }
-                            Element::Edge(edge) => labels.contains(&edge.label),
-                        };
-                        Ok(matches.then_some(Row::Element(element, path)))
-                    }
-                    _ => Err(invalid_traverser("hasLabel", "a vertex or edge")),
-                }
-            })
-            .filter_map(Result::transpose)
-            .collect(),
-        GremlinStep::Has { key, value } => rows
-            .into_iter()
-            .map(|row| {
-                check()?;
-                match row {
-                    Row::Element(element, path) => {
-                        let properties = match &element {
-                            Element::Vertex(vertex) => &vertex.properties,
-                            Element::Edge(edge) => &edge.properties,
-                        };
-                        let matches = match value {
-                            Some(expected) => properties.get(key) == Some(expected),
-                            None => properties.contains_key(key),
-                        };
-                        Ok(matches.then_some(Row::Element(element, path)))
-                    }
-                    _ => Err(invalid_traverser("has", "a vertex or edge")),
-                }
-            })
-            .filter_map(Result::transpose)
-            .collect(),
-        GremlinStep::Out(label) => expand(graph, rows, Direction::Out, label.as_deref(), check),
-        GremlinStep::In(label) => expand(graph, rows, Direction::In, label.as_deref(), check),
-        GremlinStep::Both(label) => expand(graph, rows, Direction::Both, label.as_deref(), check),
-        GremlinStep::Values(key) => {
-            let mut next = Vec::new();
-            for row in rows {
-                check()?;
-                let Row::Element(element, _) = row else {
-                    return Err(invalid_traverser("values", "a vertex or edge"));
-                };
-                let properties = match &element {
-                    Element::Vertex(vertex) => &vertex.properties,
-                    Element::Edge(edge) => &edge.properties,
-                };
-                if let Some(value) = properties.get(key) {
-                    next.push(Row::Value(value.clone()));
-                }
-            }
-            Ok(next)
+        GremlinStep::Out(label) => {
+            return expand(graph, rows, Direction::Out, label.as_deref(), check, budget)
         }
-        GremlinStep::Id => rows
-            .into_iter()
-            .map(|row| {
-                check()?;
-                match row {
-                    Row::Element(element, _) => {
-                        let id = match element {
-                            Element::Vertex(vertex) => vertex.id,
-                            Element::Edge(edge) => edge.id,
-                        };
-                        let id = i64::try_from(id).map_err(|_| {
-                            Error::UnsupportedGremlinValue(format!(
-                                "id {id} does not fit the v0 integer row type"
-                            ))
-                        })?;
-                        Ok(Row::Value(Value::Integer(id)))
-                    }
-                    _ => Err(invalid_traverser("id", "a vertex or edge")),
-                }
-            })
-            .collect(),
-        GremlinStep::Label => rows
-            .into_iter()
-            .map(|row| {
-                check()?;
-                match row {
-                    Row::Element(element, _) => {
-                        let label = match element {
-                            Element::Vertex(vertex) => {
-                                vertex.labels.first().cloned().unwrap_or_default()
-                            }
-                            Element::Edge(edge) => edge.label,
-                        };
-                        Ok(Row::Value(Value::Text(label)))
-                    }
-                    _ => Err(invalid_traverser("label", "a vertex or edge")),
-                }
-            })
-            .collect(),
+        GremlinStep::In(label) => {
+            return expand(graph, rows, Direction::In, label.as_deref(), check, budget)
+        }
+        GremlinStep::Both(label) => {
+            return expand(
+                graph,
+                rows,
+                Direction::Both,
+                label.as_deref(),
+                check,
+                budget,
+            )
+        }
         GremlinStep::Limit(limit) => {
             let mut rows = rows;
             rows.truncate(*limit);
-            Ok(rows)
+            return Ok(rows);
         }
-        GremlinStep::Path => rows
-            .into_iter()
-            .map(|row| {
-                check()?;
-                match row {
-                    Row::Element(_, path) => Ok(Row::Path(path)),
-                    _ => Err(invalid_traverser("path", "a vertex or edge")),
-                }
-            })
-            .collect(),
-        GremlinStep::Count => Ok(vec![Row::Count(rows.len() as u64)]),
+        GremlinStep::Count => {
+            let count = rows.len() as u64;
+            drop(rows);
+            let mut output = AccountedVec::new(budget);
+            output.push(Accounted::new(Row::Count(count), budget.reserve(0)?))?;
+            return Ok(output);
+        }
+        _ => {}
     }
+    let mut output = AccountedVec::new(budget);
+    for row in rows {
+        check()?;
+        let Accounted {
+            value: row,
+            mut charge,
+        } = row;
+        let Row::Element(element, path) = row else {
+            return Err(invalid_traverser(
+                "has/values/id/label/path",
+                "a vertex or edge",
+            ));
+        };
+        let next = match step {
+            GremlinStep::HasLabel(labels) => {
+                let matches = match &element {
+                    Element::Vertex(v) => v.labels.iter().any(|l| labels.contains(l)),
+                    Element::Edge(e) => labels.contains(&e.label),
+                };
+                matches.then_some(Row::Element(element, path))
+            }
+            GremlinStep::Has { key, value } => {
+                let properties = match &element {
+                    Element::Vertex(v) => &v.properties,
+                    Element::Edge(e) => &e.properties,
+                };
+                let matches = match value {
+                    Some(v) => properties.get(key) == Some(v),
+                    None => properties.contains_key(key),
+                };
+                matches.then_some(Row::Element(element, path))
+            }
+            GremlinStep::Values(key) => {
+                // Move the value out; never temporarily duplicate a large Text.
+                let mut properties = match element {
+                    Element::Vertex(v) => v.properties,
+                    Element::Edge(e) => e.properties,
+                };
+                let value = properties.remove(key);
+                drop(properties);
+                drop(path);
+                charge.shrink(value.as_ref().map_or(0, value_bytes));
+                value.map(Row::Value)
+            }
+            GremlinStep::Id => {
+                let id = match element {
+                    Element::Vertex(v) => v.id,
+                    Element::Edge(e) => e.id,
+                };
+                let id = i64::try_from(id).map_err(|_| {
+                    Error::UnsupportedGremlinValue(format!(
+                        "id {id} does not fit the v0 integer row type"
+                    ))
+                })?;
+                drop(path);
+                charge.shrink(0);
+                Some(Row::Value(Value::Integer(id)))
+            }
+            GremlinStep::Label => {
+                let label = match element {
+                    Element::Vertex(v) => v.labels.into_iter().next().unwrap_or_default(),
+                    Element::Edge(e) => e.label,
+                };
+                drop(path);
+                charge.shrink(label.len());
+                Some(Row::Value(Value::Text(label)))
+            }
+            GremlinStep::Path => {
+                drop(element);
+                charge.shrink(query_memory::mul(path.len(), query_memory::PATH_ITEM)?);
+                Some(Row::Path(path))
+            }
+            _ => unreachable!("handled above"),
+        };
+        if let Some(value) = next {
+            output.push(Accounted::new(value, charge))?;
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -665,25 +654,25 @@ enum Direction {
 
 fn expand(
     graph: &impl QueryReadBackend,
-    rows: Vec<Row>,
+    rows: AccountedVec<Accounted<Row>>,
     direction: Direction,
     label: Option<&str>,
     check: &dyn Fn() -> Result<()>,
-) -> Result<Vec<Row>> {
-    let mut next = Vec::new();
-    for row in rows {
+    budget: &Budget,
+) -> Result<AccountedVec<Accounted<Row>>> {
+    let mut next = AccountedVec::new(budget);
+    for source in rows {
         check()?;
-        let Row::Element(Element::Vertex(vertex), path) = row else {
+        let Row::Element(Element::Vertex(vertex), path) = &source.value else {
             return Err(invalid_traverser(
                 "out/in/both",
                 "a vertex (not an edge or value)",
             ));
         };
-        // Adjacency keys are label-first, not edge-id-first. Keep only bounded
-        // output rows, ordered by edge id, rather than materializing all edges.
-        // The map also collapses a self-loop seen in both directions.
+        // Input, current source, adjacent map and next rows all keep their own
+        // reservations alive throughout this overlap.
         let mut adjacent = BTreeMap::new();
-        let mut visit = |edge: Edge| -> Result<()> {
+        let mut visit = |edge: Accounted<Edge>| -> Result<()> {
             check()?;
             if adjacent.contains_key(&edge.id) {
                 return Ok(());
@@ -694,26 +683,49 @@ fn expand(
                 Direction::Both if edge.from == vertex.id => edge.to,
                 Direction::Both => edge.from,
             };
-            let Some(target) = graph.get_vertex(target_id)? else {
+            let Some(mut target) = graph.get_vertex(target_id, budget)? else {
                 return Ok(());
             };
             check()?;
             enforce_row_cap(next.len() + adjacent.len() + 1)?;
-            let mut next_path = path.clone();
+            let len = query_memory::add(path.len(), 2)?;
+            target
+                .charge
+                .grow(query_memory::mul(len, query_memory::PATH_ITEM)?)?;
+            let map_slot = budget.reserve(query_memory::MAP_ENTRY)?;
+            let mut next_path = Vec::with_capacity(len);
+            next_path.extend_from_slice(path);
             next_path.push(PathElement::Edge(edge.id));
             next_path.push(PathElement::Vertex(target_id));
-            adjacent.insert(edge.id, Row::Element(Element::Vertex(target), next_path));
+            let row = target.map(|v| Row::Element(Element::Vertex(v), next_path));
+            adjacent.insert(edge.id, (row, map_slot));
             Ok(())
         };
         if matches!(direction, Direction::Out | Direction::Both) {
-            graph.visit_adjacent_edges(vertex.id, false, label, &mut || check(), &mut visit)?;
+            graph.visit_adjacent_edges(
+                vertex.id,
+                false,
+                label,
+                &mut || check(),
+                &mut visit,
+                budget,
+            )?;
         }
         if matches!(direction, Direction::In | Direction::Both) {
-            graph.visit_adjacent_edges(vertex.id, true, label, &mut || check(), &mut visit)?;
+            graph.visit_adjacent_edges(
+                vertex.id,
+                true,
+                label,
+                &mut || check(),
+                &mut visit,
+                budget,
+            )?;
         }
-        for (_, row) in adjacent {
+        // BTreeMap's allocator node packing is excluded; the defined per-entry
+        // charge moves out and is released only after the output slot is reserved.
+        for (_, (row, _map_slot)) in adjacent {
             check()?;
-            next.push(row);
+            next.push(row)?;
         }
     }
     check()?;
@@ -1351,3 +1363,109 @@ fn check_deadline(deadline: Instant) -> Result<()> {
 #[cfg(test)]
 #[path = "graph_record_query_tests.rs"]
 mod record_query_tests;
+
+#[cfg(test)]
+mod memory_overlap_tests {
+    use super::*;
+
+    #[test]
+    fn individually_fitting_input_and_output_sets_cannot_bypass_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        for id in [1, 2] {
+            let mut vertex = Vertex::new(id);
+            vertex
+                .properties
+                .insert("p".into(), Value::Text("x".repeat(4096)));
+            graph.create_vertex(&vertex).unwrap();
+        }
+        graph.create_edge(&Edge::new(1, 1, 2, "E")).unwrap();
+        let view = graph.read_view();
+        let mut individually = 0;
+        for text in ["g.V(1,1)", "g.V(2,2)"] {
+            let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
+            GremlinQuery::parse(text)
+                .unwrap()
+                .execute_on_read_budget(&view, &|| Ok(()), &budget)
+                .unwrap();
+            individually = individually.max(budget.peak());
+            assert_eq!(budget.used(), 0);
+        }
+        let query = GremlinQuery::parse("g.V(1,1).out() ").unwrap();
+        let tight = Budget::new(individually);
+        assert!(matches!(
+            query.execute_on_read_budget(&view, &|| Ok(()), &tight),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(tight.used(), 0);
+        let roomy = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
+        assert_eq!(
+            query
+                .execute_on_read_budget(&view, &|| Ok(()), &roomy)
+                .unwrap()
+                .rows,
+            vec![GremlinRow::Vertex(2), GremlinRow::Vertex(2)]
+        );
+        assert!(roomy.peak() > individually);
+        assert_eq!(roomy.used(), 0);
+    }
+    #[test]
+    #[ignore = "manual accounting high-water smoke benchmark"]
+    fn accounted_high_water_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        for id in 0..10_000 {
+            let mut vertex = Vertex::new(id);
+            vertex.labels.push("V".into());
+            vertex
+                .properties
+                .insert("n".into(), Value::Integer(id as i64));
+            graph.create_vertex(&vertex).unwrap();
+        }
+        for id in 0..8 {
+            graph.create_edge(&Edge::new(id, 0, 0, "E")).unwrap();
+        }
+        let mut short = Vertex::new(10_000);
+        for id in 0..1000 {
+            short.properties.insert(format!("p{id}"), Value::Null);
+        }
+        graph.create_vertex(&short).unwrap();
+        let mut big = Vertex::new(10_001);
+        big.properties
+            .insert("big".into(), Value::Text("x".repeat(1024 * 1024)));
+        graph.create_vertex(&big).unwrap();
+        for id in 100..200 {
+            graph.create_edge(&Edge::new(id, 1, 10_001, "BIG")).unwrap();
+        }
+        for text in [
+            "g.V().limit(100).values('n')",
+            "g.V().limit(1000).values('n')",
+            "g.V(0).out().out().out().path()",
+            "g.V(10000).count()",
+            "g.V(1).out().count()",
+        ] {
+            let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
+            let result = GremlinQuery::parse(text).unwrap().execute_on_read_budget(
+                &graph.read_view(),
+                &|| Ok(()),
+                &budget,
+            );
+            println!(
+                "{text}: peak_accounted_bytes={} rejected={}",
+                budget.peak(),
+                result.is_err()
+            );
+            assert_eq!(budget.used(), 0);
+        }
+        // Remove the extra benchmark records so the scan is exactly at row cap.
+        graph.delete_vertex(10_000).unwrap();
+        graph.delete_vertex(10_001).unwrap();
+        let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
+        GremlinQuery::parse("g.V().count()")
+            .unwrap()
+            .execute_on_read_budget(&graph.read_view(), &|| Ok(()), &budget)
+            .unwrap();
+        println!("g.V().count(): peak_accounted_bytes={}", budget.peak());
+        assert_eq!(budget.used(), 0);
+    }
+}

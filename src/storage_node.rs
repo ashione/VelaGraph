@@ -185,6 +185,14 @@ pub struct ScanCursor {
     after: Vec<u8>,
 }
 
+impl ScanCursor {
+    // Query accounting excludes the shared view. Range and cursor headers are
+    // included in the fixed query control charge; this is the copied resume key.
+    pub(crate) fn query_resume_bytes(&self) -> usize {
+        self.after.len()
+    }
+}
+
 impl fmt::Debug for ScanCursor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

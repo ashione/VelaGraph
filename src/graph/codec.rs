@@ -42,6 +42,7 @@ use std::collections::BTreeMap;
 
 use super::{Edge, Vertex};
 use crate::error::{Error, Result};
+use crate::query_memory::{Accounted, Budget, Reservation, RECORD_BASE};
 use crate::value::Value;
 
 const RECORD_VERSION: u32 = 1;
@@ -79,12 +80,51 @@ pub(crate) fn encode_edge(edge: &Edge) -> Result<Vec<u8>> {
 
 pub(crate) fn decode_vertex(bytes: &[u8]) -> Result<Vertex> {
     let payload = decode_record(bytes, KIND_VERTEX)?;
-    decode_vertex_payload(&payload)
+    decode_vertex_payload(payload, &mut None)
 }
 
 pub(crate) fn decode_edge(bytes: &[u8]) -> Result<Edge> {
     let payload = decode_record(bytes, KIND_EDGE)?;
-    decode_edge_payload(&payload)
+    decode_edge_payload(payload, &mut None)
+}
+
+/// Decode into query-owned memory, reserving before each owned allocation.
+pub(crate) fn decode_vertex_accounted(bytes: &[u8], budget: &Budget) -> Result<Accounted<Vertex>> {
+    let mut reservation = budget.reserve(RECORD_BASE)?;
+    let payload = decode_record(bytes, KIND_VERTEX)?;
+    let vertex = decode_vertex_payload(payload, &mut Some(&mut reservation))?;
+    Ok(Accounted::new(vertex, reservation))
+}
+
+pub(crate) fn decode_edge_accounted(bytes: &[u8], budget: &Budget) -> Result<Accounted<Edge>> {
+    let mut reservation = budget.reserve(RECORD_BASE)?;
+    let payload = decode_record(bytes, KIND_EDGE)?;
+    let edge = decode_edge_payload(payload, &mut Some(&mut reservation))?;
+    Ok(Accounted::new(edge, reservation))
+}
+
+// Charge every encountered owned field before allocation. Repeated singular
+// fields retain protobuf's last-field semantics, but their charges are retained
+// conservatively until the record is dropped, even when an earlier value is
+// overwritten. This also covers property fields encountered in arbitrary order.
+fn charge(reservation: &mut Option<&mut Reservation>, bytes: usize) -> Result<()> {
+    if let Some(reservation) = reservation {
+        reservation.grow(bytes)?;
+    }
+    Ok(())
+}
+
+fn owned_string(
+    reader: &mut Reader<'_>,
+    reservation: &mut Option<&mut Reservation>,
+    slot: usize,
+) -> Result<String> {
+    let text = reader.string()?;
+    let bytes = slot
+        .checked_add(text.len())
+        .ok_or_else(|| Error::TraversalLimitExceeded("query memory accounting overflow".into()))?;
+    charge(reservation, bytes)?;
+    Ok(text.to_owned())
 }
 
 fn encode_record(kind: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -101,7 +141,7 @@ fn encode_record(kind: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_record(bytes: &[u8], expected_kind: u32) -> Result<Vec<u8>> {
+fn decode_record(bytes: &[u8], expected_kind: u32) -> Result<&[u8]> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(Error::CorruptData(format!(
             "graph record is {} bytes, limit is {MAX_RECORD_BYTES}",
@@ -117,7 +157,7 @@ fn decode_record(bytes: &[u8], expected_kind: u32) -> Result<Vec<u8>> {
         match (field, wire) {
             (1, 0) => version = Some(reader.varint()?),
             (2, 0) => kind = Some(reader.varint()?),
-            (3, 2) => payload = Some(reader.bytes()?.to_vec()),
+            (3, 2) => payload = Some(reader.bytes()?),
             _ => reader.skip(wire)?,
         }
     }
@@ -169,7 +209,10 @@ fn encode_value(value: &Value) -> Vec<u8> {
     out
 }
 
-fn decode_vertex_payload(payload: &[u8]) -> Result<Vertex> {
+fn decode_vertex_payload(
+    payload: &[u8],
+    reservation: &mut Option<&mut Reservation>,
+) -> Result<Vertex> {
     let mut reader = Reader::new(payload);
     let mut id = None;
     let mut labels = Vec::new();
@@ -184,9 +227,9 @@ fn decode_vertex_payload(payload: &[u8]) -> Result<Vertex> {
                         "vertex has more than {MAX_LABELS} labels"
                     )));
                 }
-                labels.push(reader.string()?.to_string());
+                labels.push(owned_string(&mut reader, reservation, 32)?);
             }
-            (3, 2) => decode_property(&mut reader, &mut properties)?,
+            (3, 2) => decode_property(&mut reader, &mut properties, reservation)?,
             _ => reader.skip(wire)?,
         }
     }
@@ -197,7 +240,7 @@ fn decode_vertex_payload(payload: &[u8]) -> Result<Vertex> {
     })
 }
 
-fn decode_edge_payload(payload: &[u8]) -> Result<Edge> {
+fn decode_edge_payload(payload: &[u8], reservation: &mut Option<&mut Reservation>) -> Result<Edge> {
     let mut reader = Reader::new(payload);
     let mut id = None;
     let mut from = None;
@@ -210,8 +253,8 @@ fn decode_edge_payload(payload: &[u8]) -> Result<Edge> {
             (1, 0) => id = Some(reader.varint()?),
             (2, 0) => from = Some(reader.varint()?),
             (3, 0) => to = Some(reader.varint()?),
-            (4, 2) => label = Some(reader.string()?.to_string()),
-            (5, 2) => decode_property(&mut reader, &mut properties)?,
+            (4, 2) => label = Some(owned_string(&mut reader, reservation, 0)?),
+            (5, 2) => decode_property(&mut reader, &mut properties, reservation)?,
             _ => reader.skip(wire)?,
         }
     }
@@ -227,6 +270,7 @@ fn decode_edge_payload(payload: &[u8]) -> Result<Edge> {
 fn decode_property(
     reader: &mut Reader<'_>,
     properties: &mut BTreeMap<String, Value>,
+    reservation: &mut Option<&mut Reservation>,
 ) -> Result<()> {
     if properties.len() >= MAX_PROPERTIES {
         return Err(Error::CorruptData(format!(
@@ -234,26 +278,35 @@ fn decode_property(
         )));
     }
     let message = reader.bytes()?;
+    charge(reservation, 64)?;
     let mut nested = Reader::new(message);
     let mut name = None;
     let mut value = None;
     while !nested.is_empty() {
         let (field, wire) = nested.key()?;
         match (field, wire) {
-            (1, 2) => name = Some(nested.string()?.to_string()),
-            (2, 2) => value = Some(decode_value(nested.bytes()?)?),
+            (1, 2) => name = Some(owned_string(&mut nested, reservation, 0)?),
+            (2, 2) => value = Some(decode_value(nested.bytes()?, reservation)?),
             _ => nested.skip(wire)?,
         }
     }
     let name = name.ok_or_else(|| Error::CorruptData("property has no name".into()))?;
     let value = value.ok_or_else(|| Error::CorruptData("property has no value".into()))?;
-    if properties.insert(name.clone(), value).is_some() {
-        return Err(Error::CorruptData(format!("duplicate property `{name}`")));
+    match properties.entry(name) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(value);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            return Err(Error::CorruptData(format!(
+                "duplicate property `{}`",
+                entry.key()
+            )));
+        }
     }
     Ok(())
 }
 
-fn decode_value(bytes: &[u8]) -> Result<Value> {
+fn decode_value(bytes: &[u8], reservation: &mut Option<&mut Reservation>) -> Result<Value> {
     let mut reader = Reader::new(bytes);
     let mut value = None;
     while !reader.is_empty() {
@@ -274,7 +327,7 @@ fn decode_value(bytes: &[u8]) -> Result<Value> {
                 }
                 value = Some(Value::Real(real));
             }
-            (4, 2) => value = Some(Value::Text(reader.string()?.to_string())),
+            (4, 2) => value = Some(Value::Text(owned_string(&mut reader, reservation, 0)?)),
             (5, 0) => value = Some(Value::Boolean(reader.varint()? != 0)),
             _ => reader.skip(wire)?,
         }
@@ -526,6 +579,155 @@ mod tests {
             hex(&encode_edge(&edge).unwrap()),
             "080110021a1208071001180222014b2a070a017812022801"
         );
+    }
+
+    #[test]
+    fn accounted_vertex_exact_boundary_and_release() {
+        let record = vertex();
+        let bytes = encode_vertex(&record).unwrap();
+        // Record + label slot and UTF-8 + property slot, name, and text.
+        let expected = 128 + 32 + 6 + 64 + 4 + 3;
+        let budget = Budget::new(expected);
+        let decoded = decode_vertex_accounted(&bytes, &budget).unwrap();
+        assert_eq!(decoded.value, record);
+        assert_eq!(budget.used(), expected);
+        drop(decoded);
+        assert_eq!(budget.used(), 0);
+        let tight = Budget::new(expected - 1);
+        assert!(matches!(
+            decode_vertex_accounted(&bytes, &tight),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(tight.used(), 0);
+    }
+
+    #[test]
+    fn accounted_edge_exact_boundary_and_release() {
+        let mut edge = Edge::new(7, 1, 2, "KNOWS");
+        edge.properties.insert("p".into(), Value::Text("é".into()));
+        let bytes = encode_edge(&edge).unwrap();
+        let expected = 128 + 5 + 64 + 1 + 2;
+        let budget = Budget::new(expected);
+        let decoded = decode_edge_accounted(&bytes, &budget).unwrap();
+        assert_eq!(decoded.value, edge);
+        assert_eq!(budget.used(), expected);
+        drop(decoded);
+        assert_eq!(budget.used(), 0);
+        let tight = Budget::new(expected - 1);
+        assert!(matches!(
+            decode_edge_accounted(&bytes, &tight),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(tight.used(), 0);
+    }
+
+    #[test]
+    fn accounted_many_short_properties_charge_slots() {
+        let mut record = Vertex::new(1);
+        for i in 0..1000 {
+            record.properties.insert(format!("{i:04}"), Value::Null);
+        }
+        let bytes = encode_vertex(&record).unwrap();
+        let expected = 128 + 1000 * (64 + 4);
+        let budget = Budget::new(expected);
+        let decoded = decode_vertex_accounted(&bytes, &budget).unwrap();
+        assert_eq!(budget.used(), expected);
+        drop(decoded);
+        let tight = Budget::new(expected - 1);
+        assert!(matches!(
+            decode_vertex_accounted(&bytes, &tight),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(tight.used(), 0);
+    }
+
+    #[test]
+    fn accounted_fields_charge_before_later_corruption() {
+        let mut payload = Vec::new();
+        put_uint(&mut payload, 1, 1);
+        put_bytes(&mut payload, 2, b"label");
+        payload.push(0); // Invalid field key, after the allocating field.
+        let bytes = encode_record(KIND_VERTEX, payload).unwrap();
+        let tight = Budget::new(128 + 32 + 4);
+        assert!(matches!(
+            decode_vertex_accounted(&bytes, &tight),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(tight.peak(), 128);
+        assert_eq!(tight.used(), 0);
+        let roomy = Budget::new(1024);
+        assert!(matches!(
+            decode_vertex_accounted(&bytes, &roomy),
+            Err(Error::CorruptData(_))
+        ));
+        assert_eq!(roomy.used(), 0);
+        assert_eq!(roomy.peak(), 128 + 32 + 5);
+        // Even the base charge is acquired before inspecting malformed bytes.
+        let tiny = Budget::new(127);
+        assert!(matches!(
+            decode_vertex_accounted(&[], &tiny),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        assert_eq!(tiny.used(), 0);
+    }
+
+    #[test]
+    fn accounted_arbitrary_property_order_and_overwritten_fields() {
+        let mut property = Vec::new();
+        put_bytes(
+            &mut property,
+            2,
+            &encode_value(&Value::Text("first".into())),
+        );
+        put_bytes(&mut property, 1, b"old");
+        put_bytes(&mut property, 2, &encode_value(&Value::Text("last".into())));
+        put_bytes(&mut property, 1, b"new");
+        let mut payload = Vec::new();
+        put_uint(&mut payload, 1, 1);
+        put_bytes(&mut payload, 3, &property);
+        let bytes = encode_record(KIND_VERTEX, payload).unwrap();
+        let budget = Budget::new(128 + 64 + 5 + 3 + 4 + 3);
+        let decoded = decode_vertex_accounted(&bytes, &budget).unwrap();
+        assert_eq!(decoded.properties["new"], Value::Text("last".into()));
+        assert_eq!(decoded.value, decode_vertex(&bytes).unwrap());
+        assert_eq!(budget.available(), 0);
+        drop(decoded);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn accounted_duplicate_properties_release_all_charges() {
+        let mut property = Vec::new();
+        put_bytes(&mut property, 1, b"same");
+        put_bytes(
+            &mut property,
+            2,
+            &encode_value(&Value::Text("value".into())),
+        );
+        let mut payload = Vec::new();
+        put_uint(&mut payload, 1, 1);
+        put_bytes(&mut payload, 3, &property);
+        put_bytes(&mut payload, 3, &property);
+        let bytes = encode_record(KIND_VERTEX, payload).unwrap();
+        let budget = Budget::new(128 + 2 * (64 + 4 + 5));
+        assert!(
+            matches!(decode_vertex_accounted(&bytes, &budget), Err(Error::CorruptData(message)) if message == "duplicate property `same`")
+        );
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.peak(), 128 + 2 * (64 + 4 + 5));
+    }
+
+    #[test]
+    fn record_payload_borrows_last_field() {
+        let mut bytes = encode_vertex(&vertex()).unwrap();
+        let payload = [8, 2]; // Vertex id 2.
+        put_bytes(&mut bytes, 3, &payload);
+        let borrowed = decode_record(&bytes, KIND_VERTEX).unwrap();
+        assert_eq!(
+            borrowed.as_ptr(),
+            bytes[bytes.len() - payload.len()..].as_ptr()
+        );
+        assert_eq!(decode_vertex(&bytes).unwrap(), Vertex::new(2));
     }
 
     fn hex(bytes: &[u8]) -> String {

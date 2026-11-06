@@ -473,3 +473,11 @@ queries preserve their original sequence, while context and epoch checks remain
 active. This is an in-process, single-shard path, not a distributed query service.
 See [the query contract](docs/QUERY_SPEC.md) and
 [replicated graph limitations](docs/REPLICATED_GRAPH.md).
+
+### Query-owned memory admission
+
+Local and D1 Gremlin executions now share a per-execution 64 MiB logical byte
+budget for decoded records, intermediate rows/paths, query pages and result
+construction. Large-property queries can fail even below the row cap. This is
+not a process RSS or allocator limit; retained D1 snapshots and adapter-private
+allocations are separate. See [the accounting contract](docs/QUERY_MEMORY.md).
