@@ -15,16 +15,17 @@ not report or imply a metadata sequence. Restart/reconfigure the service to
 change its routes; this prototype is not online migration or automatic discovery.
 
 The client sends `DistributedRequest { start_partition, text, timeout_millis }`.
-The first slice accepts explicit `g.V(id, ...)` starts, at most one `out()` or
-`out(label)`, order-preserving `hasLabel`, `has`, `limit`, terminal `path` or
+The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` or
+`out(label)` steps, order-preserving `hasLabel`, `has`, `limit`, terminal `path` or
 `count`, and `values(key)` followed only by `limit`/`count`. Unsupported start and
 step forms fail explicitly through the official parser. No global V/E scan,
-second hop, incoming traversal, mutation, alternate query dialect or textual
+incoming traversal, mutation, alternate query dialect or textual
 query rewriting is provided by this slice.
 
 Examples:
 
 - `g.V(1).out('knows').path()`
+- `g.V(1).out('knows').out('returns').out('knows').path()`
 - `g.V(1).out('knows').has('active',true).limit(2).count()`
 - `g.V(1).out('knows').values('name')`
 
@@ -106,8 +107,11 @@ Input order and bag multiplicity are preserved. Expansion is ordered per input
 by edge ID and source partition. An edge's qualified partition is its source
 partition, including when the traversal has moved to its target partition.
 Parallel edges and duplicate input IDs are not globally deduplicated. Paths
-retain qualified vertex and edge identities, so equal local IDs in different
-partitions remain distinct.
+retain qualified vertex and edge identities at every hop, so equal local IDs in
+different partitions remain distinct. Cycles and revisiting a shard are allowed:
+each hop uses the original retained session, never a newly acquired snapshot.
+The official parser rejects more than three outgoing hops before any session is
+opened, even for a missing start or a preceding `limit(1)`.
 
 Limits execute in their original positions. In particular,
 `out().limit(2).has('active',true)` tests only the first two expanded rows,
@@ -172,26 +176,30 @@ an authenticated or encrypted public query service.
 ## Verification scope
 
 `tests/distributed_query.rs` hosts the coordinator in the test process and runs
-two actual independent data `graph-node` processes, each with a single voter.
-A third metadata process is used only to configure the legacy interpreter oracle;
+two actual independent data `graph-node` processes, each with a single voter. A
+third metadata process is used only to configure the legacy interpreter oracle;
 it is not used by the new coordinator. Public storage APIs generate the fixture
-records. Ten representative queries are compared with the existing
-`experimental_read_session().observed_gremlin_v3` interpreter. Its legacy
-snapshot downloads deliberately use direct endpoints outside the audited new
-query path. It checks qualified cross-partition
-paths with overlapping local IDs, duplicate inputs and parallel edges, limit
-position, filtered/projected rows, counts above the default output cap, empty
-starts, unsupported subsets, incomplete reverse state and unavailable
-shards. A proxy checkpoint interleaves a target write after snapshot acquisition:
-the running query retains the old value and the next query sees the update.
-An additional partition mapped to the same shard verifies one session per shard.
-TCP audit proxies reject snapshot-download operations and measure data response
-bytes in the presence of more than 3 MiB of unrelated vertex payload.
+records. Representative one-, two- and three-hop queries are compared with the
+existing `experimental_read_session().observed_gremlin_v3` interpreter. Its
+legacy snapshot downloads deliberately use direct endpoints outside the audited
+new query path. It checks qualified cross-partition paths with overlapping
+vertex/edge IDs, cycles that revisit both shards, duplicate inputs and parallel
+edges, inter-hop limit position, filtered/projected rows, counts above the
+default output cap, empty starts, unsupported subsets, incomplete reverse state
+and unavailable shards. A proxy checkpoint interleaves a target write after
+snapshot acquisition: the running three-hop query retains the old value when
+revisiting the target shard and the next query sees the update. Second-hop
+incomplete reverse state aborts even when a later label/limit would discard it.
+A branching multi-hop query exhausts one cumulative budget even if its
+single-hop prefix fits. An additional partition mapped to the same shard
+verifies one session per shard. TCP audit proxies reject snapshot-download
+operations and measure data response bytes in the presence of more than 3 MiB of
+unrelated vertex payload.
 
 These tests are functional distributed-query evidence, not evidence of replica
 failover, global snapshot isolation, adjacency completeness, durable query
-recovery, transport security or cross-shard transactions. Broader Gremlin and
-multi-hop execution remain separate work.
+recovery, transport security or cross-shard transactions. Broader Gremlin, more
+than three hops and query optimization remain separate work.
 
 Additional regression coverage checks cumulative resource exhaustion even before
 a later limit/count, repeated session release, the command-line query client,

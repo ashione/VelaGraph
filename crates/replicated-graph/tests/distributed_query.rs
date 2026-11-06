@@ -205,10 +205,10 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
     let b = Shared(Arc::new(LocalStorageNode::open(b_dir.path(), 130)?));
     let source = AppendOnlyStore::new(a.clone(), 120, 0);
     let target = AppendOnlyStore::new(b.clone(), 130, 1);
-    for id in [1, 7, 9] {
+    for id in [1, 7, 8, 9] {
         source.prepare_vertex(&Vertex::new(id))?.submit(&a)?;
     }
-    for id in [1, 2, 3] {
+    for id in [1, 2, 3, 8] {
         let mut v = Vertex::new(id);
         v.labels.push("person".into());
         v.properties
@@ -239,6 +239,51 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
         source.prepare_source(&edge)?.submit(&a)?;
         target.prepare_reverse(&edge)?.submit(&b)?;
     }
+    // Return to the original shard on hop two, including overlapping edge IDs.
+    // Hop three revisits the same shard/session and preserves parallel-edge bags.
+    for (id, from) in [(20, 1), (30, 3)] {
+        let edge = CrossEdge {
+            id,
+            from: VertexRef {
+                partition: 1,
+                id: from,
+            },
+            to: VertexRef {
+                partition: 0,
+                id: 1,
+            },
+            label: "returns".into(),
+            properties: BTreeMap::new(),
+        };
+        target.prepare_source(&edge)?.submit(&b)?;
+        source.prepare_reverse(&edge)?.submit(&a)?;
+    }
+    let first = CrossEdge {
+        id: 800,
+        from: VertexRef {
+            partition: 0,
+            id: 8,
+        },
+        to: VertexRef {
+            partition: 1,
+            id: 8,
+        },
+        label: "knows".into(),
+        properties: BTreeMap::new(),
+    };
+    source.prepare_source(&first)?.submit(&a)?;
+    target.prepare_reverse(&first)?.submit(&b)?;
+    let incomplete_second = CrossEdge {
+        id: 801,
+        from: first.to,
+        to: VertexRef {
+            partition: 0,
+            id: 1,
+        },
+        label: "returns".into(),
+        properties: BTreeMap::new(),
+    };
+    target.prepare_source(&incomplete_second)?.submit(&b)?;
     // Deliberately incomplete append; a query of this start must fail closed.
     let broken = CrossEdge {
         id: 900,
@@ -413,6 +458,26 @@ fn legacy_oracle(
         "g.V(7).out('knows')",
         "g.V(999).out('knows').count()",
         "g.V(1,9).limit(1).out('knows').count()",
+        "g.V(1).out('knows').out('returns').path()",
+        "g.V(1,1).out().out().out().path()",
+        "g.V(1).out().limit(1).out().count()",
+        "g.V(1).out().out().limit(1).count()",
+        "g.V(1).out().has('active',true).out().out().values('name')",
+        "g.V(1).out().out().out().has('active',true).count()",
+        "g.V(1).out().out('missing').out().count()",
+        "g.V(999).out().out().out().path()",
+        "g.V(1,1).limit(1).out().out().out().path()",
+        "g.V(1).out().limit(2).out().out().path()",
+        "g.V(1).out().out().limit(2).out().path()",
+        "g.V(1).out().out().out().limit(2).path()",
+        "g.V(1).out().out().out().limit(2).has('active',true).count()",
+        "g.V(1).out().out().out().has('active',true).limit(2).count()",
+        "g.V(1).out().out().out().values('missing').count()",
+        "g.V(1).out().out().out().values('name').limit(3)",
+        "g.V(1).out().hasLabel('missing').out().out().path()",
+        "g.V(1,999,1).out().out().out().count()",
+        "g.V(1).out().has('missing').out().out().count()",
+        "g.V(1).out().out().out().hasLabel('person').path()",
     ] {
         let observed = session.observed_gremlin_v3(0, text)?;
         let rows = observed
@@ -545,6 +610,54 @@ async fn scenario() -> anyhow::Result<()> {
             "legacy interpreter differential: {text}"
         );
     }
+    let two_hop_paths = [(20, 1, 20), (30, 3, 30), (40, 1, 20)]
+        .into_iter()
+        .map(|(first, via, second)| {
+            QueryRow::Path(vec![
+                vertex(0, 1),
+                QualifiedElement::Edge {
+                    partition: 0,
+                    id: first,
+                },
+                vertex(1, via),
+                QualifiedElement::Edge {
+                    partition: 1,
+                    id: second,
+                },
+                vertex(0, 1),
+            ])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows(endpoint, "g.V(1).out().out().path()").await?,
+        two_hop_paths
+    );
+    let opened_a = ap.opened.load(Ordering::SeqCst);
+    let opened_b = bp.opened.load(Ordering::SeqCst);
+    assert_eq!(
+        rows(endpoint, "g.V(1).out().out().out().count()").await?,
+        vec![QueryRow::Count(12)]
+    );
+    assert_eq!(ap.opened.load(Ordering::SeqCst) - opened_a, 1);
+    assert_eq!(bp.opened.load(Ordering::SeqCst) - opened_b, 1);
+    let opened = ap.opened.load(Ordering::SeqCst) + bp.opened.load(Ordering::SeqCst);
+    assert_eq!(
+        distributed::query(
+            endpoint,
+            DistributedRequest {
+                start_partition: 0,
+                text: "g.V(999).out().out().out().out().count()".into(),
+                timeout_millis: 5000,
+            },
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::ResourceExhausted)
+    );
+    assert_eq!(
+        ap.opened.load(Ordering::SeqCst) + bp.opened.load(Ordering::SeqCst),
+        opened
+    );
     let mut twice = expected.clone();
     twice.extend(expected);
     assert_eq!(rows(endpoint, "g.V(1,1).out('knows').path()").await?, twice);
@@ -604,7 +717,6 @@ async fn scenario() -> anyhow::Result<()> {
     );
     for text in [
         "g.V().count()",
-        "g.V(1).out().out().count()",
         "g.E(1).count()",
         "g.V(999).values('name').out()",
     ] {
@@ -626,11 +738,55 @@ async fn scenario() -> anyhow::Result<()> {
             "{text}: {result:?}"
         );
     }
+    // Internal work is cumulative across all hops, even when a later limit
+    // or count would make the final result tiny. One hop of this bag fits.
+    let repeated = std::iter::repeat_n("1", 50).collect::<Vec<_>>().join(",");
+    assert_eq!(
+        rows(endpoint, &format!("g.V({repeated}).out().count()")).await?,
+        vec![QueryRow::Count(200)]
+    );
+    for suffix in ["limit(1)", "count()"] {
+        let result = distributed::query(
+            endpoint,
+            DistributedRequest {
+                start_partition: 0,
+                text: format!("g.V({repeated}).out().out().out().{suffix}"),
+                timeout_millis: 5000,
+            },
+            BUDGET,
+        )
+        .await?;
+        assert_eq!(result, Err(QueryFailure::ResourceExhausted));
+    }
+    // A corrupt observation first encountered on the second hop must fail,
+    // including if it would be label-filtered or discarded by a later limit.
+    for text in [
+        "g.V(8).out().out().count()",
+        "g.V(8).out().out('different-label').limit(1).count()",
+    ] {
+        assert_eq!(
+            distributed::query(
+                endpoint,
+                DistributedRequest {
+                    start_partition: 0,
+                    text: text.into(),
+                    timeout_millis: 5000,
+                },
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::IncompleteOrCorrupt)
+        );
+    }
+    assert_eq!(
+        rows(endpoint, "g.V(8).out().hasLabel('missing').out().count()").await?,
+        vec![QueryRow::Count(0)]
+    );
     // Both snapshots have been acquired when the first fragment is dispatched.
     // Change target data while that fragment is paused; the running query must
     // read its original target session, and a subsequent query must see the write.
     ap.gate.pause.store(true, Ordering::SeqCst);
-    let pinned = tokio::spawn(rows(endpoint, "g.V(1).out('knows').values('name')"));
+    let pinned = tokio::spawn(rows(endpoint, "g.V(1).out().out().out().values('name')"));
     timeout(Duration::from_secs(3), ap.gate.entered.notified()).await?;
     let changed = run_blocking(|| -> anyhow::Result<Export> {
         let dir = tempfile::tempdir()?;
@@ -674,7 +830,7 @@ async fn scenario() -> anyhow::Result<()> {
             value: Value::Text("person-1".into())
         }
     );
-    let fresh = rows(endpoint, "g.V(1).out('knows').values('name')").await?;
+    let fresh = rows(endpoint, "g.V(1).out().out().out().values('name')").await?;
     assert_eq!(
         fresh[0],
         QueryRow::Value {
