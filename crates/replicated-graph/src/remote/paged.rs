@@ -63,8 +63,8 @@ pub struct SnapshotStats {
 struct Session {
     descriptor: SnapshotDescriptor,
     entries: Vec<(Vec<u8>, Vec<u8>)>,
-    // At most ceil(rows / MAX_PAGE_ROWS) + ceil(bytes / MAX_PAGE_BYTES)
-    // page boundaries (plus one), since each nonterminal page fills a cap.
+    // Bounded by snapshot rows (plus the empty-snapshot boundary). Each
+    // nonterminal page either meets the row cap or cannot fit its next row.
     starts: Vec<usize>,
     tokens: Vec<[u8; 16]>,
     expires: Instant,
