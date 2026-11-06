@@ -1,0 +1,16 @@
+[package]
+name = "replicated-graph"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded in-process D1 adapter connecting graph records to Raft"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rocksdb-sql-table = { path = "../.." }
+d2-raft = { path = "../d2-raft" }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+anyhow = "1"

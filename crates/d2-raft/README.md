@@ -4,8 +4,10 @@ An openraft prototype for D2. It proves the consensus seam with a durable
 RocksDB log and an applied opaque key/value state machine shaped for D1 batches.
 The TCP node also runs across real OS processes. A versioned D1 application command now carries shard/epoch fencing, conditional
 sequence and retry identity through Raft, snapshots and reopen. The D1 graph
-`StorageNode` adapter is still a separate slice; the in-process `Cluster::start` path remains an
-in-memory test fixture.
+`StorageNode` adapter is implemented separately in `crates/replicated-graph`;
+see [its in-process contract](../../docs/REPLICATED_GRAPH.md). The in-process
+`Cluster::start` path remains an in-memory test fixture, while `start_durable`
+persists replicas in RocksDB.
 
 See [`D2_D1_CONTRACT.md`](../../docs/D2_D1_CONTRACT.md) for activation, versioned
 persistence, upgrade limits, and the deliberately bounded no-eviction retry budget.

@@ -8,9 +8,10 @@ adjacency all live in RocksDB key spaces.
 The long-term target is a **distributed property-graph and table kernel**, not a
 SQL-only database. The graph path is being completed first — snapshot reads,
 single-partition write transactions, and process-crash recovery — followed by
-Raft replication (D2) and cross-shard coordination (D4). Distribution is not
-implemented yet; this README states the boundary explicitly so the current
-single-node limits are not mistaken for the final design.
+Raft replication (D2) and cross-shard coordination (D4). An in-process
+three-node graph-record replication prototype now exists; the full GraphEngine,
+remote routing and cross-shard system are not implemented. This README states
+those boundaries so prototype behavior is not mistaken for the final design.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
@@ -22,7 +23,7 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Track | Current state |
 | --- | --- |
 | Graph kernel | Property records, adjacency indexes, bounded traversal and standard Gremlin v0 are implemented. K3a snapshot read views, K3b single-partition write transactions, and K3c process-crash recovery are implemented. |
-| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; it is not yet a remote `StorageNode`/graph adapter, and there is no placement, cross-node routing, or cross-partition transaction. |
+| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; `crates/replicated-graph` now connects `GraphRecordStore` to actual Raft through a bounded in-process D1 adapter, leader read barriers and retained prepared mutations for exact retries ([contract](docs/REPLICATED_GRAPH.md)). It is not a remote service: there is no placement, automatic routing, transport security, or cross-partition transaction. |
 | SQL engine | The documented SQL subset is supported; it remains autocommit per statement and does not participate in graph transactions. |
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);

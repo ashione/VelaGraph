@@ -102,6 +102,19 @@ fn data_key(key: &[u8]) -> Vec<u8> {
     encoded
 }
 
+/// Atomic local D1 snapshot, not itself a distributed consistency guarantee.
+#[derive(Debug)]
+pub struct D1ReadSnapshot {
+    pub shard: u64,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub entries: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+/// Requested snapshot bounds were exceeded; no partial data is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D1ReadLimit;
+
 #[derive(Debug, Default)]
 pub struct StateMachine {
     pub state: RwLock<StateMachineData>,
@@ -175,6 +188,33 @@ impl StateMachine {
             current_snapshot: RwLock::new(current_snapshot),
             storage: Some(storage),
         })
+    }
+
+    /// Capture D1 metadata and bytes under one lock, checking bounds before cloning.
+    /// This is a local snapshot; callers must first complete a Raft read barrier.
+    pub async fn d1_read_snapshot(
+        &self,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Option<D1ReadSnapshot>, D1ReadLimit> {
+        let state = self.state.read().await;
+        let Some(d1) = &state.d1 else { return Ok(None) };
+        if state.data.len() > max_rows {
+            return Err(D1ReadLimit);
+        }
+        let mut bytes = 0usize;
+        for (key, value) in &state.data {
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+            if bytes > max_bytes {
+                return Err(D1ReadLimit);
+            }
+        }
+        Ok(Some(D1ReadSnapshot {
+            shard: d1.shard,
+            epoch: d1.epoch,
+            sequence: d1.sequence,
+            entries: state.data.clone(),
+        }))
     }
 
     /// Local diagnostic metadata, not a linearizable distributed read.

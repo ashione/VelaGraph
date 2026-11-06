@@ -64,6 +64,58 @@ impl fmt::Debug for ReadView {
     }
 }
 
+impl ReadView {
+    /// Construct an owned, bounded snapshot for an external D1 adapter.
+    /// The caller must obtain metadata and entries from one atomic state view.
+    pub fn from_entries(
+        shard: ShardId,
+        epoch: Epoch,
+        sequence: Sequence,
+        entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<Self> {
+        let bytes = entries.iter().fold(0usize, |n, (k, v)| {
+            n.saturating_add(k.len()).saturating_add(v.len())
+        });
+        if entries.len() > MAX_VIEW_ROWS || bytes > MAX_VIEW_BYTES {
+            return Err(StorageNodeError::ResourceExhausted(
+                "read view limit exceeded".into(),
+            ));
+        }
+        Ok(Self {
+            shard,
+            epoch,
+            sequence,
+            data: Arc::new(entries),
+        })
+    }
+
+    /// Read this immutable snapshot. Adapter ownership/fencing checks are separate.
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.data.get(key).cloned()
+    }
+
+    /// Scan this immutable snapshot without returning partial results on limits.
+    pub fn scan(&self, range: KeyRange, limit: ScanLimit) -> Result<Vec<KeyValue>> {
+        range.validate()?;
+        ScanLimit::new(limit.max_rows, limit.max_bytes)?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for (key, value) in self.data.range::<[u8], _>(range.bounds()) {
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+            if out.len() >= limit.max_rows || bytes > limit.max_bytes {
+                return Err(StorageNodeError::ResourceExhausted(
+                    "scan limit reached".into(),
+                ));
+            }
+            out.push(KeyValue {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// A half-open byte range. `None` for `end` means unbounded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyRange {
@@ -216,6 +268,17 @@ impl fmt::Debug for Export {
 
 #[derive(Debug, Error)]
 pub enum StorageNodeError {
+    /// The contacted replica cannot serve a leader operation. No automatic routing.
+    #[error("not leader; leader hint: {leader:?}")]
+    NotLeader { leader: Option<u64> },
+
+    /// A timed-out write may still commit. Retry its exact original identity.
+    #[error("operation timed out; write outcome may be unknown, request: {request_id:?}")]
+    Timeout { request_id: Option<RequestId> },
+
+    #[error("replica unavailable: {0}")]
+    Unavailable(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 
@@ -266,6 +329,13 @@ pub trait StorageAdmin {
 
 /// The D1 byte-oriented boundary.
 pub trait StorageNode: Send + Sync {
+    /// Fail before a caller acquires a blocking graph mutex on an incompatible
+    /// executor thread. This hook must not perform IO or wait for a lock.
+    /// Decorator implementations must forward it to the wrapped node.
+    fn check_execution_context(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn interface_version(&self) -> u32 {
         INTERFACE_VERSION
     }
@@ -309,8 +379,8 @@ struct DedupRecord {
 
 const MAX_BATCH_OPERATIONS: usize = 10_000;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
-const MAX_VIEW_ROWS: usize = 1_000_000;
-const MAX_VIEW_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_VIEW_ROWS: usize = 1_000_000;
+pub const MAX_VIEW_BYTES: usize = 64 * 1024 * 1024;
 
 /// A single-shard local RocksDB implementation of [`StorageNode`].
 pub struct LocalStorageNode {

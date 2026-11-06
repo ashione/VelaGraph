@@ -27,7 +27,7 @@ pub use durable_log_store::DurableLogStore;
 pub use log_store::LogStore;
 pub use network::{DropPolicy, NetworkFactory, Registry};
 pub use node::{Cluster, Node, NodeHandle};
-pub use state_machine::{StateMachine, StateMachineData};
+pub use state_machine::{D1ReadLimit, D1ReadSnapshot, StateMachine, StateMachineData};
 pub use tcp::{
     add_learner, change_membership, initialize_cluster, send_control, ControlRequest,
     ControlResponse, NodeStatus, TcpNode, TcpNodeConfig,

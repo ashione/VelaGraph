@@ -13,12 +13,14 @@
 //! Mutations through one store are serialized by an internal mutex. Each
 //! mutation validates against one read view and submits its sequence as an
 //! atomic precondition, so separate stores sharing a node cannot commit stale
-//! validation. A concurrent write returns a typed storage conflict; callers
-//! must retry the entire mutation to re-read and revalidate, never just its
-//! batch. Nodes without conditional-write support reject mutations explicitly.
-//! Each invocation uses a fresh random request id. The high-level methods do
-//! not expose caller-supplied ids, so exactly-once retry after an unknown commit
-//! remains a D1 caller responsibility.
+//! validation. A definite storage conflict requires preparing a new mutation
+//! to re-read and revalidate. For an uncertain commit outcome, retain a
+//! [`PreparedGraphMutation`] and retry it unchanged, including on another store
+//! for the same logical shard and partition. The storage node determines dedup
+//! retention and epoch fencing; this adapter never refreshes either the epoch
+//! or sequence condition. Nodes without conditional writes reject mutations.
+//! Convenience CRUD calls prepare a fresh identity per invocation and therefore
+//! cannot recover an uncertain outcome by simply repeating the CRUD call.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -29,8 +31,8 @@ use crate::graph::{
     validate_vertex, vertex_key, Edge, EdgeDirection, Vertex,
 };
 use crate::storage_node::{
-    KeyRange, ReadView, ScanLimit, ShardId, StorageNode, StorageNodeError, WriteOp, WriteRequest,
-    WriteStatus,
+    Epoch, KeyRange, ReadView, RequestId, ScanLimit, Sequence, ShardId, StorageNode,
+    StorageNodeError, WriteOp, WriteRequest, WriteStatus,
 };
 
 /// Maximum number of edges a single adjacency read may return.
@@ -40,12 +42,54 @@ pub const MAX_GRAPH_BATCH_OPERATIONS: usize = 10_000;
 
 const SCAN_BYTES: usize = 64 * 1024 * 1024;
 
+/// An immutable, validated graph mutation with a stable retry identity.
+///
+/// Preparation does not write data. Keep this value until the outcome is known;
+/// cloning it preserves its identity. Commit retries submit the exact original
+/// bytes, epoch and sequence condition without re-reading or revalidating.
+/// It may be submitted to another store for the same logical shard/partition,
+/// such as after a leader change. It is not a durable retry journal and does not
+/// bypass epoch fencing or the underlying node's deduplication retention limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedGraphMutation {
+    request: WriteRequest,
+    expected_sequence: Sequence,
+    partition: u32,
+}
+
+impl PreparedGraphMutation {
+    /// Logical shard to which this mutation is bound.
+    pub fn shard(&self) -> ShardId {
+        self.request.shard
+    }
+
+    /// Graph partition to which this mutation is bound.
+    pub fn partition(&self) -> u32 {
+        self.partition
+    }
+
+    /// Original ownership epoch; retries never refresh it.
+    pub fn epoch(&self) -> Epoch {
+        self.request.epoch
+    }
+
+    /// Stable idempotency identity shared by every retry of this value.
+    pub fn request_id(&self) -> RequestId {
+        self.request.request_id
+    }
+
+    /// Original validation sequence; retries never refresh it.
+    pub fn expected_sequence(&self) -> Sequence {
+        self.expected_sequence
+    }
+}
+
 /// A graph-record view over one D1 shard.
 ///
 /// The store writes the same `graph/v1/p/<partition>/...` keys as
 /// `GraphEngine`, so the two representations stay byte-compatible. It is
-/// constructed over any [`StorageNode`], including the local adapter and a
-/// future replicated state machine.
+/// constructed over any [`StorageNode`], including the local adapter and the
+/// external in-process Raft adapter.
 pub struct GraphRecordStore<S: StorageNode> {
     node: S,
     shard: ShardId,
@@ -64,10 +108,14 @@ impl<S: StorageNode> GraphRecordStore<S> {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, ()> {
-        self.write_lock
+    fn lock(&self) -> Result<MutexGuard<'_, ()>> {
+        // Reject incompatible executor threads before they could wait on a
+        // mutation already using the blocking store lock.
+        self.node.check_execution_context()?;
+        Ok(self
+            .write_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     pub fn node(&self) -> &S {
@@ -89,14 +137,21 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Insert a vertex. The id must not exist.
     pub fn create_vertex(&self, vertex: &Vertex) -> Result<()> {
-        let _guard = self.lock();
+        let _guard = self.lock()?;
+        let prepared = self.prepare_create_vertex(vertex)?;
+        self.commit_prepared_unlocked(&prepared)
+    }
+
+    /// Validate and prepare this mutation without writing it.
+    /// Retain the returned value for retry after an uncertain commit outcome.
+    pub fn prepare_create_vertex(&self, vertex: &Vertex) -> Result<PreparedGraphMutation> {
         validate_vertex(vertex)?;
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, vertex.id)?.is_some() {
             return Err(Error::VertexAlreadyExists(vertex.id));
         }
         let encoded = codec::encode_vertex(vertex)?;
-        self.write(
+        self.prepare_write(
             &view,
             vec![WriteOp::put(vertex_key(self.partition, vertex.id), encoded)],
         )
@@ -104,14 +159,21 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Replace an existing vertex. The id must exist.
     pub fn update_vertex(&self, vertex: &Vertex) -> Result<()> {
-        let _guard = self.lock();
+        let _guard = self.lock()?;
+        let prepared = self.prepare_update_vertex(vertex)?;
+        self.commit_prepared_unlocked(&prepared)
+    }
+
+    /// Validate and prepare this mutation without writing it.
+    /// Retain the returned value for retry after an uncertain commit outcome.
+    pub fn prepare_update_vertex(&self, vertex: &Vertex) -> Result<PreparedGraphMutation> {
         validate_vertex(vertex)?;
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, vertex.id)?.is_none() {
             return Err(Error::VertexNotFound(vertex.id));
         }
         let encoded = codec::encode_vertex(vertex)?;
-        self.write(
+        self.prepare_write(
             &view,
             vec![WriteOp::put(vertex_key(self.partition, vertex.id), encoded)],
         )
@@ -120,7 +182,14 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Delete a vertex and every incident edge and adjacency entry atomically.
     /// Corrupt scanned adjacency entries fail before any write is submitted.
     pub fn delete_vertex(&self, id: u64) -> Result<()> {
-        let _guard = self.lock();
+        let _guard = self.lock()?;
+        let prepared = self.prepare_delete_vertex(id)?;
+        self.commit_prepared_unlocked(&prepared)
+    }
+
+    /// Validate and prepare this mutation without writing it.
+    /// Retain the returned value for retry after an uncertain commit outcome.
+    pub fn prepare_delete_vertex(&self, id: u64) -> Result<PreparedGraphMutation> {
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, id)?.is_none() {
             return Err(Error::VertexNotFound(id));
@@ -136,7 +205,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
             self.delete_edge_ops(edge, &mut operations);
         }
         operations.push(WriteOp::delete(vertex_key(self.partition, id)));
-        self.write(&view, operations)
+        self.prepare_write(&view, operations)
     }
 
     pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
@@ -146,7 +215,14 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Insert an edge and both adjacency entries atomically.
     pub fn create_edge(&self, edge: &Edge) -> Result<()> {
-        let _guard = self.lock();
+        let _guard = self.lock()?;
+        let prepared = self.prepare_create_edge(edge)?;
+        self.commit_prepared_unlocked(&prepared)
+    }
+
+    /// Validate and prepare this mutation without writing it.
+    /// Retain the returned value for retry after an uncertain commit outcome.
+    pub fn prepare_create_edge(&self, edge: &Edge) -> Result<PreparedGraphMutation> {
         validate_edge(edge)?;
         let view = self.node.read_view()?;
         if self.get_edge_in(&view, edge.id)?.is_some() {
@@ -157,12 +233,19 @@ impl<S: StorageNode> GraphRecordStore<S> {
                 return Err(Error::EdgeEndpointNotFound(endpoint));
             }
         }
-        self.write(&view, self.put_edge_ops(edge)?)
+        self.prepare_write(&view, self.put_edge_ops(edge)?)
     }
 
     /// Replace an existing edge and its adjacency entries atomically.
     pub fn update_edge(&self, edge: &Edge) -> Result<()> {
-        let _guard = self.lock();
+        let _guard = self.lock()?;
+        let prepared = self.prepare_update_edge(edge)?;
+        self.commit_prepared_unlocked(&prepared)
+    }
+
+    /// Validate and prepare this mutation without writing it.
+    /// Retain the returned value for retry after an uncertain commit outcome.
+    pub fn prepare_update_edge(&self, edge: &Edge) -> Result<PreparedGraphMutation> {
         validate_edge(edge)?;
         let view = self.node.read_view()?;
         let previous = self
@@ -213,19 +296,26 @@ impl<S: StorageNode> GraphRecordStore<S> {
             operations.push(WriteOp::delete(old_in));
         }
         operations.push(WriteOp::put(new_in, Vec::new()));
-        self.write(&view, operations)
+        self.prepare_write(&view, operations)
     }
 
     /// Delete an edge and both adjacency entries atomically.
     pub fn delete_edge(&self, id: u64) -> Result<()> {
-        let _guard = self.lock();
+        let _guard = self.lock()?;
+        let prepared = self.prepare_delete_edge(id)?;
+        self.commit_prepared_unlocked(&prepared)
+    }
+
+    /// Validate and prepare this mutation without writing it.
+    /// Retain the returned value for retry after an uncertain commit outcome.
+    pub fn prepare_delete_edge(&self, id: u64) -> Result<PreparedGraphMutation> {
         let view = self.node.read_view()?;
         let edge = self
             .get_edge_in(&view, id)?
             .ok_or(Error::EdgeNotFound(id))?;
         let mut operations = Vec::new();
         self.delete_edge_ops(&edge, &mut operations);
-        self.write(&view, operations)
+        self.prepare_write(&view, operations)
     }
 
     /// Read outgoing edges, optionally filtered by label, ordered by edge id.
@@ -381,7 +471,11 @@ impl<S: StorageNode> GraphRecordStore<S> {
         )));
     }
 
-    fn write(&self, view: &ReadView, operations: Vec<WriteOp>) -> Result<()> {
+    fn prepare_write(
+        &self,
+        view: &ReadView,
+        operations: Vec<WriteOp>,
+    ) -> Result<PreparedGraphMutation> {
         if operations.len() > MAX_GRAPH_BATCH_OPERATIONS {
             return Err(Error::TransactionTooLarge(format!(
                 "graph mutation has {} operations, limit is {MAX_GRAPH_BATCH_OPERATIONS}",
@@ -394,15 +488,38 @@ impl<S: StorageNode> GraphRecordStore<S> {
         getrandom::fill(&mut request_id).map_err(|error| {
             StorageNodeError::Storage(format!("request id entropy unavailable: {error}"))
         })?;
-        let result = self.node.batch_write_conditional(
-            WriteRequest {
+        Ok(PreparedGraphMutation {
+            request: WriteRequest {
                 shard: self.shard,
                 epoch: view.epoch,
                 request_id,
                 operations,
             },
-            Some(view.sequence),
-        )?;
+            expected_sequence: view.sequence,
+            partition: self.partition,
+        })
+    }
+
+    /// Commit or retry an unchanged prepared mutation for this shard/partition.
+    ///
+    /// No validation reads are repeated and no retry is automatic. A definite
+    /// conflict requires a newly prepared mutation; an uncertain outcome must
+    /// be retried with this same value. Epoch fencing remains authoritative.
+    pub fn commit_prepared(&self, prepared: &PreparedGraphMutation) -> Result<()> {
+        let _guard = self.lock()?;
+        self.commit_prepared_unlocked(prepared)
+    }
+
+    fn commit_prepared_unlocked(&self, prepared: &PreparedGraphMutation) -> Result<()> {
+        if prepared.shard() != self.shard || prepared.partition != self.partition {
+            return Err(StorageNodeError::InvalidArgument(
+                "prepared graph mutation targets a different shard or partition".into(),
+            )
+            .into());
+        }
+        let result = self
+            .node
+            .batch_write_conditional(prepared.request.clone(), Some(prepared.expected_sequence))?;
         match result.status {
             WriteStatus::Committed | WriteStatus::Duplicate => Ok(()),
         }

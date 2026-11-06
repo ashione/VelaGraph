@@ -16,6 +16,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Static RocksDB is linked into many test binaries. Debug info exhausted the
+  # hosted runner disk before tests started; keep assertions, omit symbols.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
 
 jobs:
   fmt:
@@ -63,10 +68,8 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          # v1 invalidates a 34 MB cache entry left behind before `target/` was
-          # populated; that old entry was never overwritten because its exact
-          # key already existed.
-          prefix-key: v1-rust
+          # Do not restore old, much larger debug-info build artifacts.
+          prefix-key: v2-no-debug-rust
           cache-on-failure: false
 
       - name: Run tests
@@ -99,7 +102,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-no-debug-rust
           cache-on-failure: false
 
       - name: Run Clippy

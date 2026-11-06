@@ -64,8 +64,12 @@ returns a storage error instead of a partial result, and leaves multi-shard
 routing and transactions to D3/D4. Each graph mutation invocation uses a fresh
 OS-random 128-bit request id, so identical creates from independent stores are
 not mistaken for retries. Entropy failure returns a storage error without a
-write. Exactly-once retry after an unknown commit still needs a caller-supplied
-id in a later slice; a new high-level invocation is a new attempt. `GraphEngine` still
+write. Explicit `prepare_*` methods return an immutable `PreparedGraphMutation`;
+retain and resubmit it through `commit_prepared` after an unknown outcome, including
+through another leader adapter for the same shard/partition. This preserves the
+original identity, bytes, epoch and condition without new reads. It is not a durable
+client journal. A new convenience CRUD invocation is a new attempt. See the
+[in-process Raft adapter contract](REPLICATED_GRAPH.md). `GraphEngine` still
 uses its own RocksDB handle, so the existing K1 path remains authoritative until
 the engine is wired through this adapter.
 
@@ -288,8 +292,9 @@ support, never drop the condition. D2 does not implement this synchronous trait
 method. Its independently versioned `D1V1` application commands now replicate
 these write semantics after explicit activation; legacy `TxnBatch` does not.
 See [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md) for the different persistence,
-snapshot and retained-request budget boundaries. A remote graph adapter remains
-unimplemented.
+snapshot and retained-request budget boundaries. The separate
+[`replicated-graph` adapter](REPLICATED_GRAPH.md) implements this trait in-process;
+a remote graph service remains unimplemented.
 
 Local dedup metadata gains an optional `expected_sequence` field. Missing means
 `None`, so existing records remain readable. Unconditional writes omit the field

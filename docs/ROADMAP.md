@@ -68,7 +68,7 @@
 - **交付物**：`get`/`scan`/`batch_write`/`snapshot`/`transaction` 的窄接口；按点 ID 或范围分片；分片切分与迁移的最小协议。
 - **完成定义**：单机实现通过接口测试；分片路由可解释；迁移过程可回滚，不丢数据。
 - **依赖**：与内核线在 P0 共同冻结接口 v0。
-- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，但尚未实现此同步 StorageNode trait 或图适配接线。`GraphEngine` 接线、`begin` 事务接口、分片路由与拆分/迁移仍未实现。
+- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine` 接线、`begin` 事务接口、分片路由与拆分/迁移仍未实现。
 
 ### D2 复制与共识
 
@@ -76,7 +76,7 @@
 - **完成定义**：3 节点集群可写入；杀掉 leader 后 30 秒内恢复；重复/乱序消息测试通过。
 - **依赖**：D1；选型已定 openraft `=0.9.25`，见 [`D2_CONSENSUS.md`](D2_CONSENSUS.md)；三节点原型、多进程 TCP 验证已实现；节点使用 RocksDB `raft.db` 持久化日志与 `state.db` 不透明字节批次状态机，重启可恢复；`Suite::test_all` 已通过；D1 本地字节 `StorageNode` 适配已实现，图引擎接线仍待做。
 
-- **应用语义切片**：版本化 `D1V1` 命令已复制 shard/epoch、request_id、expected sequence 与原子 data/sequence/dedup/applied marker；snapshot/restart 保留重试身份。详见 [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md)。尚非 `StorageNode`/图引擎接线；无淘汰去重预算耗尽后明确拒绝新写，不能视为生产容量方案。
+- **应用语义切片**：版本化 `D1V1` 命令已复制 shard/epoch、request_id、expected sequence 与原子 data/sequence/dedup/applied marker；snapshot/restart 保留重试身份。详见 [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md)。已有进程内 `StorageNode`/GraphRecordStore 接线，但未连接 GraphEngine、远程客户端或自动路由；无淘汰去重预算耗尽后明确拒绝新写，不能视为生产容量方案。
 
 ### D3 元数据、路由与故障切换
 
