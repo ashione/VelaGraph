@@ -8,7 +8,7 @@ use rocksdb_sql_table::{
     RequestId, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult,
 };
 
-use crate::ReplicatedStorageNode;
+use crate::{adapter::Adapter, RemoteStorageNode, ReplicatedStorageNode};
 
 const KEY: &[u8] = b"catalog/v1/state";
 const MAGIC: &[u8; 4] = b"CAT1";
@@ -161,7 +161,7 @@ impl PreparedRegistration {
 /// `run_blocking` for operations, just like `ReplicatedStorageNode`.
 #[derive(Clone)]
 pub struct Catalog {
-    node: ReplicatedStorageNode,
+    node: Adapter,
     metadata: Placement,
 }
 impl Catalog {
@@ -171,7 +171,33 @@ impl Catalog {
             return Err(CatalogError::MetadataMismatch);
         }
         Ok(Self {
-            node: ReplicatedStorageNode::new(node, metadata.shard, deadline)?,
+            node: Adapter::Local(ReplicatedStorageNode::new(node, metadata.shard, deadline)?),
+            metadata,
+        })
+    }
+
+    /// One statically identified remote metadata replica. Every RPC validates
+    /// group and node identity; snapshots use the remote leader quorum barrier.
+    /// Construct on a runtime and call operations through `run_blocking`.
+    pub fn new_remote(
+        endpoint: std::net::SocketAddr,
+        node_id: u64,
+        metadata: Placement,
+        deadline: Duration,
+    ) -> Result<Self> {
+        metadata.validate()?;
+        if !metadata.replicas.contains(&node_id) {
+            return Err(CatalogError::MetadataMismatch);
+        }
+        let node = RemoteStorageNode::new_identified(
+            endpoint,
+            metadata.group,
+            node_id,
+            metadata.shard,
+            deadline,
+        )?;
+        Ok(Self {
+            node: Adapter::Remote(node),
             metadata,
         })
     }

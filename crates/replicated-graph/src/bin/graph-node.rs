@@ -14,6 +14,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut id = None;
+    let mut group = 0u64;
     let mut raft_addr = None;
     let mut control_addr = None;
     let mut data_dir = None;
@@ -29,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
             "--graph" => graph_addr = Some(args.next().context("--graph needs a value")?),
             "--shard" => shard = Some(args.next().context("--shard needs a value")?),
             "--epoch" => epoch = Some(args.next().context("--epoch needs a value")?),
+            "--group" => group = args.next().context("--group needs a value")?.parse()?,
             "--id" => id = Some(args.next().context("--id needs a value")?),
             "--raft" => raft_addr = Some(args.next().context("--raft needs a value")?),
             "--control" => control_addr = Some(args.next().context("--control needs a value")?),
@@ -49,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
     let raft_addr = raft_addr.context("--raft is required")?;
     let control_addr = control_addr.context("--control is required")?;
     let data_dir = data_dir.context("--data-dir is required")?;
+
+    bind_graph_identity(std::path::Path::new(&data_dir), group, id)?;
 
     let node = TcpNode::start(TcpNodeConfig {
         id,
@@ -91,7 +95,9 @@ async fn main() -> anyhow::Result<()> {
         }
     })
     .await??;
-    let service = GraphService::start(&node, graph_addr, shard, Duration::from_secs(3)).await?;
+    let service =
+        GraphService::start_identified(&node, graph_addr, group, shard, Duration::from_secs(3))
+            .await?;
     eprintln!("WARNING: plaintext unauthenticated development service; trusted network only");
     println!("graph={}", service.local_addr());
     println!(
@@ -116,4 +122,76 @@ fn parse_members(spec: &str) -> anyhow::Result<BTreeMap<u64, String>> {
         members.insert(id.parse()?, addr.to_owned());
     }
     Ok(members)
+}
+
+/// Graph endpoint identity only: the Raft TCP protocol remains unauthenticated.
+/// Persist before opening the databases; partial files fail closed on reopen.
+fn bind_graph_identity(dir: &std::path::Path, group: u64, node: u64) -> anyhow::Result<()> {
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Identity {
+        version: u32,
+        group: u64,
+        node: u64,
+    }
+    std::fs::create_dir_all(dir)?;
+    let expected = Identity {
+        version: 1,
+        group,
+        node,
+    };
+    let path = dir.join("graph-service-identity.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let actual: Identity =
+                serde_json::from_slice(&bytes).context("decode graph service identity")?;
+            anyhow::ensure!(
+                actual == expected,
+                "stored graph service identity differs from startup configuration"
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read graph service identity"),
+    }
+    // Unmarked legacy data cannot establish its original node identity. Refuse
+    // adoption even for group zero rather than accidentally rebinding a node.
+    anyhow::ensure!(
+        std::fs::read_dir(dir)?.next().transpose()?.is_none(),
+        "cannot bind graph identity to an unmarked nonempty data directory"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&serde_json::to_vec(&expected)?)?;
+    file.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_graph_identity_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        bind_graph_identity(dir.path(), 10, 1).unwrap();
+        bind_graph_identity(dir.path(), 10, 1).unwrap();
+        assert!(bind_graph_identity(dir.path(), 11, 1).is_err());
+        assert!(bind_graph_identity(dir.path(), 10, 2).is_err());
+        assert!(bind_graph_identity(dir.path(), 0, 1).is_err());
+        std::fs::write(dir.path().join("graph-service-identity.json"), b"{").unwrap();
+        assert!(bind_graph_identity(dir.path(), 10, 1).is_err());
+    }
+
+    #[test]
+    fn unmarked_existing_data_is_never_rebound() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("legacy-data"), b"data").unwrap();
+        assert!(bind_graph_identity(dir.path(), 10, 1).is_err());
+        assert!(bind_graph_identity(dir.path(), 0, 1).is_err());
+        assert!(!dir.path().join("graph-service-identity.json").exists());
+    }
 }

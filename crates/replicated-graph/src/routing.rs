@@ -1,4 +1,4 @@
-//! Bounded in-process routing for immutable catalog placement.
+//! Bounded local or static remote routing for immutable catalog placement.
 //!
 //! Every resolver operation reads metadata afresh. Hints only reorder a fixed
 //! candidate set; unavailable read-only probes may advance to another candidate.
@@ -22,8 +22,9 @@ use rocksdb_sql_table::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    adapter::Adapter,
     catalog::{Catalog, CatalogError, Placement, MAX_REPLICAS, MAX_SHARDS},
-    ReplicatedStorageNode,
+    RemoteStorageNode, ReplicatedStorageNode,
 };
 
 /// Shared limits across all clones, groups, candidates, and retained sessions.
@@ -97,14 +98,23 @@ impl Operation {
     }
 }
 
-/// Static concrete in-process handles, not a remote endpoint registry. Construct
-/// on the hosting runtime. All calls must use `run_blocking` or a plain thread.
+/// One configured graph-service endpoint. The server checks both IDs on every
+/// operation. This is mismatch detection, not authentication or a directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteReplica {
+    pub group: u64,
+    pub node: u64,
+    pub endpoint: std::net::SocketAddr,
+}
+
+/// Static concrete local handles or identified remote endpoints. Construct on
+/// the hosting runtime. All calls must use `run_blocking` or a plain thread.
 /// Separate resolver instances have separate budgets; reuse clones for one client.
 #[derive(Clone)]
 pub struct RouteResolver {
     metadata: Placement,
     catalogs: Arc<BTreeMap<u64, Catalog>>,
-    replicas: Arc<BTreeMap<(u64, u64), ReplicatedStorageNode>>,
+    replicas: Arc<BTreeMap<(u64, u64), Adapter>>,
     operations: Arc<Semaphore>,
     dispatches: Arc<Semaphore>,
 }
@@ -134,7 +144,69 @@ impl RouteResolver {
             }
             let adapter = ReplicatedStorageNode::new(node, 0, MAX_OPERATION_TIMEOUT)?;
             if replicas
-                .insert((node.group_id(), node.id), adapter)
+                .insert((node.group_id(), node.id), Adapter::Local(adapter))
+                .is_some()
+            {
+                return Err(RouteError::InvalidArgument("duplicate data replica"));
+            }
+        }
+        Ok(Self {
+            metadata,
+            catalogs: Arc::new(catalogs),
+            replicas: Arc::new(replicas),
+            operations: Arc::new(Semaphore::new(MAX_OPERATIONS)),
+            dispatches: Arc::new(Semaphore::new(MAX_OPERATIONS)),
+        })
+    }
+
+    /// Build a static remote resolver. Addresses are configured by the caller,
+    /// never learned from leader hints. Duplicate keys and reused addresses fail
+    /// closed. Every selected placement must have all its replicas registered.
+    pub fn new_remote(
+        metadata: Placement,
+        metadata_nodes: &[RemoteReplica],
+        data_nodes: &[RemoteReplica],
+    ) -> Result<Self> {
+        metadata.validate()?;
+        if metadata_nodes.len() != metadata.replicas.len()
+            || data_nodes.len() > MAX_REGISTERED_REPLICAS
+        {
+            return Err(RouteError::InvalidArgument("fixed replica registry size"));
+        }
+        let mut catalogs = BTreeMap::new();
+        let mut addresses = BTreeSet::new();
+        for node in metadata_nodes {
+            if node.group != metadata.group || !addresses.insert(node.endpoint) {
+                return Err(RouteError::InvalidArgument(
+                    "metadata identity or duplicate address",
+                ));
+            }
+            let catalog = Catalog::new_remote(
+                node.endpoint,
+                node.node,
+                metadata.clone(),
+                MAX_OPERATION_TIMEOUT,
+            )?;
+            if catalogs.insert(node.node, catalog).is_some() {
+                return Err(RouteError::InvalidArgument("duplicate metadata replica"));
+            }
+        }
+        let mut replicas = BTreeMap::new();
+        for node in data_nodes {
+            if node.group == metadata.group || !addresses.insert(node.endpoint) {
+                return Err(RouteError::InvalidArgument(
+                    "reserved group or duplicate address",
+                ));
+            }
+            let adapter = RemoteStorageNode::new_identified(
+                node.endpoint,
+                node.group,
+                node.node,
+                0,
+                MAX_OPERATION_TIMEOUT,
+            )?;
+            if replicas
+                .insert((node.group, node.node), Adapter::Remote(adapter))
                 .is_some()
             {
                 return Err(RouteError::InvalidArgument("duplicate data replica"));
@@ -200,7 +272,7 @@ impl RouteResolver {
         Ok((placement, found.sequence()))
     }
 
-    fn adapter(&self, p: &Placement, id: u64, op: &Operation) -> ReplicatedStorageNode {
+    fn adapter(&self, p: &Placement, id: u64, op: &Operation) -> Adapter {
         self.replicas[&(p.group, id)].scoped(p.shard, op.end, self.dispatches.clone())
     }
 
@@ -346,13 +418,13 @@ impl RoutedPreparedMutation {
 
 #[derive(Clone)]
 struct PinnedNode {
-    adapter: ReplicatedStorageNode,
+    adapter: Adapter,
     view: ReadView,
     op: Arc<Operation>,
 }
 impl StorageNode for PinnedNode {
     fn admin(&self) -> &dyn rocksdb_sql_table::StorageAdmin {
-        &self.adapter
+        self.adapter.admin()
     }
     fn check_execution_context(&self) -> std::result::Result<(), StorageNodeError> {
         self.adapter.check_execution_context()?;
@@ -635,7 +707,9 @@ mod tests {
                 .try_acquire_many_owned(MAX_OPERATIONS as u32)
                 .unwrap();
             for raw in resolver.replicas.values() {
-                let node = raw.scoped(7, op.end, pool.clone());
+                let Adapter::Local(node) = raw.scoped(7, op.end, pool.clone()) else {
+                    panic!("expected local adapter")
+                };
                 assert_eq!(node.absolute_deadline, Some(op.end));
                 assert!(Arc::ptr_eq(&node.admission, &pool));
                 assert!(matches!(
@@ -645,7 +719,9 @@ mod tests {
             }
             drop(held);
             for raw in resolver.replicas.values() {
-                let node = raw.scoped(7, op.end, pool.clone());
+                let Adapter::Local(node) = raw.scoped(7, op.end, pool.clone()) else {
+                    panic!("expected local adapter")
+                };
                 node.dispatch(None, async { Ok(()) }).unwrap();
             }
         })
@@ -654,5 +730,60 @@ mod tests {
         cluster.in_group(10).shutdown(&meta).await;
         cluster.in_group(20).shutdown(&data[0]).await;
         cluster.in_group(30).shutdown(&data[1]).await;
+    }
+}
+
+#[cfg(test)]
+mod remote_configuration_tests {
+    use super::*;
+    fn replica(group: u64, node: u64, port: u16) -> RemoteReplica {
+        RemoteReplica {
+            group,
+            node,
+            endpoint: ([127, 0, 0, 1], port).into(),
+        }
+    }
+    #[tokio::test]
+    async fn registry_is_complete_bounded_and_group_scoped() {
+        let metadata = Placement {
+            shard: 90,
+            group: 9,
+            epoch: 1,
+            replicas: vec![1, 2],
+        };
+        let nodes = [replica(9, 1, 8001), replica(9, 2, 8002)];
+        assert!(RouteResolver::new_remote(
+            metadata.clone(),
+            &nodes,
+            &[replica(4, 1, 8011), replica(5, 1, 8021)]
+        )
+        .is_ok());
+        assert!(RouteResolver::new_remote(metadata.clone(), &nodes[..1], &[]).is_err());
+        assert!(
+            RouteResolver::new_remote(metadata.clone(), &[nodes[0], replica(9, 3, 8003)], &[])
+                .is_err()
+        );
+        assert!(
+            RouteResolver::new_remote(metadata.clone(), &[nodes[0], replica(8, 2, 8003)], &[])
+                .is_err()
+        );
+        assert!(
+            RouteResolver::new_remote(metadata.clone(), &nodes, &[replica(9, 3, 8011)]).is_err()
+        );
+        assert!(
+            RouteResolver::new_remote(metadata.clone(), &nodes, &[replica(4, 1, 8001)]).is_err()
+        );
+        assert!(RouteResolver::new_remote(
+            metadata.clone(),
+            &nodes,
+            &[replica(4, 1, 8011), replica(4, 1, 8021)]
+        )
+        .is_err());
+        assert!(RouteResolver::new_remote(
+            metadata,
+            &nodes,
+            &[replica(4, 1, 8011), replica(5, 2, 8011)]
+        )
+        .is_err());
     }
 }

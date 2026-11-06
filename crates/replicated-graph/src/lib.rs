@@ -4,10 +4,11 @@
 //! operations from async code; direct synchronous calls on Tokio workers fail
 //! explicitly instead of nesting `block_on` or blocking the executor. The host
 //! runtime must remain running. The optional [`routing`] module adds bounded
-//! static in-process routing. On Linux, `gateway` adds a same-host read-only UDS
+//! static local and remote routing. On Linux, `gateway` adds a same-host read-only UDS
 //! interface with OS peer identity checks. The optional `remote` service and
 //! `RemoteStorageNode` add plaintext TCP for trusted development networks.
 //! No cross-host authentication or production availability guarantee is provided.
+mod adapter;
 pub mod catalog;
 pub mod remote;
 pub mod remote_storage;

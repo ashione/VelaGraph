@@ -43,6 +43,14 @@ pub enum RemoteError {
     Protocol,
 }
 
+/// Expected graph endpoint identity, not authenticated Raft transport identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteIdentity {
+    pub group: u64,
+    pub node: u64,
+}
+
 /// Atomic state-machine copy taken after a leader read barrier.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,11 +64,14 @@ pub struct RemoteSnapshot {
 #[serde(deny_unknown_fields)]
 struct Request {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<RemoteIdentity>,
     operation: Operation,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    Probe { shard: u64 },
     Snapshot { shard: u64 },
     Metadata { shard: u64 },
     Write(D1WriteRequest),
@@ -73,6 +84,7 @@ struct Response {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    Probe,
     Snapshot(RemoteSnapshot),
     Metadata(u64, u64, u64),
     Write(D1Result),
@@ -93,6 +105,22 @@ impl GraphService {
         shard: u64,
         deadline: Duration,
     ) -> Result<Self, RemoteError> {
+        Self::start_identified(node, bind, 0, shard, deadline).await
+    }
+
+    /// Bind graph RPC identity. Nonzero groups require identified requests.
+    /// Separate Raft groups must still use independently configured TCP peers.
+    pub async fn start_identified(
+        node: &d2_raft::tcp::TcpNode,
+        bind: SocketAddr,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        let identity = RemoteIdentity {
+            group,
+            node: node.id,
+        };
         checked_deadline(deadline, None)?;
         let listener = TcpListener::bind(bind)
             .await
@@ -134,13 +162,15 @@ impl GraphService {
                     if Instant::now() >= end {
                         return;
                     }
-                    let result =
-                        match tokio::time::timeout_at(end, execute(raft, state, shard, request))
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => return,
-                        };
+                    let result = match tokio::time::timeout_at(
+                        end,
+                        execute(raft, state, identity, shard, request),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => return,
+                    };
                     let response = Response {
                         version: VERSION,
                         result,
@@ -179,13 +209,42 @@ impl Drop for GraphService {
 async fn execute(
     raft: openraft::Raft<TypeConfig>,
     state: Arc<StateMachine>,
+    identity: RemoteIdentity,
     shard: u64,
     request: Request,
 ) -> Result<Reply, RemoteError> {
     if request.version != VERSION {
         return Err(RemoteError::Protocol);
     }
+    if request
+        .identity
+        .map_or(identity.group != 0, |expected| expected != identity)
+    {
+        return Err(RemoteError::InvalidArgument);
+    }
     match request.operation {
+        Operation::Probe { shard: requested } => {
+            if requested != shard {
+                return Err(RemoteError::InvalidArgument);
+            }
+            raft.ensure_linearizable().await.map_err(|e| {
+                if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
+                    RemoteError::NotLeader {
+                        leader: hint.leader_id,
+                    }
+                } else {
+                    RemoteError::Unavailable
+                }
+            })?;
+            let (actual, _, _) = state
+                .d1_metadata()
+                .await
+                .ok_or(RemoteError::Application(D1Error::NotActivated))?;
+            if actual != shard {
+                return Err(RemoteError::InvalidArgument);
+            }
+            Ok(Reply::Probe)
+        }
         Operation::Metadata { shard: requested } => {
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
@@ -282,7 +341,34 @@ pub async fn snapshot(
     shard: u64,
     deadline: Duration,
 ) -> Result<RemoteSnapshot, RemoteError> {
-    match rpc(endpoint, Operation::Snapshot { shard }, deadline, None).await? {
+    snapshot_with_identity(endpoint, None, shard, deadline).await
+}
+
+/// Identified variant of [`snapshot`]; validates the configured group and node.
+pub async fn snapshot_identified(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    shard: u64,
+    deadline: Duration,
+) -> Result<RemoteSnapshot, RemoteError> {
+    snapshot_with_identity(endpoint, Some(identity), shard, deadline).await
+}
+
+async fn snapshot_with_identity(
+    endpoint: SocketAddr,
+    identity: Option<RemoteIdentity>,
+    shard: u64,
+    deadline: Duration,
+) -> Result<RemoteSnapshot, RemoteError> {
+    match rpc(
+        endpoint,
+        identity,
+        Operation::Snapshot { shard },
+        deadline,
+        None,
+    )
+    .await?
+    {
         Reply::Snapshot(view) => {
             let bytes = view.entries.iter().fold(0usize, |n, (k, v)| {
                 n.saturating_add(k.len()).saturating_add(v.len())
@@ -308,7 +394,34 @@ pub async fn metadata(
     shard: u64,
     deadline: Duration,
 ) -> Result<(u64, u64, u64), RemoteError> {
-    match rpc(endpoint, Operation::Metadata { shard }, deadline, None).await? {
+    metadata_with_identity(endpoint, None, shard, deadline).await
+}
+
+/// Identified variant of [`metadata`]; validates the configured group and node.
+pub async fn metadata_identified(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    shard: u64,
+    deadline: Duration,
+) -> Result<(u64, u64, u64), RemoteError> {
+    metadata_with_identity(endpoint, Some(identity), shard, deadline).await
+}
+
+async fn metadata_with_identity(
+    endpoint: SocketAddr,
+    identity: Option<RemoteIdentity>,
+    shard: u64,
+    deadline: Duration,
+) -> Result<(u64, u64, u64), RemoteError> {
+    match rpc(
+        endpoint,
+        identity,
+        Operation::Metadata { shard },
+        deadline,
+        None,
+    )
+    .await?
+    {
         Reply::Metadata(actual, epoch, sequence) if actual == shard && epoch > 0 => {
             Ok((actual, epoch, sequence))
         }
@@ -322,13 +435,61 @@ pub async fn write(
     request: D1WriteRequest,
     deadline: Duration,
 ) -> Result<D1Result, RemoteError> {
+    write_with_identity(endpoint, None, request, deadline).await
+}
+
+/// Identified variant of [`write`]; validates the configured group and node.
+pub async fn write_identified(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    request: D1WriteRequest,
+    deadline: Duration,
+) -> Result<D1Result, RemoteError> {
+    write_with_identity(endpoint, Some(identity), request, deadline).await
+}
+
+async fn write_with_identity(
+    endpoint: SocketAddr,
+    identity: Option<RemoteIdentity>,
+    request: D1WriteRequest,
+    deadline: Duration,
+) -> Result<D1Result, RemoteError> {
     validate_write(&request)?;
     let id = request.request_id;
-    match rpc(endpoint, Operation::Write(request), deadline, Some(id)).await? {
+    match rpc(
+        endpoint,
+        identity,
+        Operation::Write(request),
+        deadline,
+        Some(id),
+    )
+    .await?
+    {
         Reply::Write(result @ D1Result::Write { .. }) => Ok(result),
         _ => Err(RemoteError::Protocol),
     }
 }
+/// Perform a leader/quorum barrier without copying shard contents.
+pub async fn probe_identified(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    shard: u64,
+    deadline: Duration,
+) -> Result<(), RemoteError> {
+    match rpc(
+        endpoint,
+        Some(identity),
+        Operation::Probe { shard },
+        deadline,
+        None,
+    )
+    .await?
+    {
+        Reply::Probe => Ok(()),
+        _ => Err(RemoteError::Protocol),
+    }
+}
+
 fn checked_deadline(duration: Duration, id: Option<[u8; 16]>) -> Result<Instant, RemoteError> {
     if duration > MAX_DEADLINE {
         return Err(RemoteError::InvalidArgument);
@@ -342,6 +503,7 @@ fn checked_deadline(duration: Duration, id: Option<[u8; 16]>) -> Result<Instant,
 }
 async fn rpc(
     endpoint: SocketAddr,
+    identity: Option<RemoteIdentity>,
     operation: Operation,
     duration: Duration,
     id: Option<[u8; 16]>,
@@ -358,6 +520,7 @@ async fn rpc(
             &mut stream,
             &Request {
                 version: VERSION,
+                identity,
                 operation,
             },
             end,
@@ -474,6 +637,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_operation_checks_group_and_node_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
+            id: 1,
+            raft_addr: "127.0.0.1:0".into(),
+            control_addr: "127.0.0.1:0".into(),
+            data_dir: dir.path().into(),
+        })
+        .await
+        .unwrap();
+        let service = GraphService::start_identified(
+            &node,
+            "127.0.0.1:0".parse().unwrap(),
+            10,
+            7,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let endpoint = service.local_addr();
+        let identity = RemoteIdentity { group: 10, node: 1 };
+        let request = D1WriteRequest {
+            shard: 7,
+            epoch: 1,
+            request_id: [4; 16],
+            expected_sequence: Some(0),
+            operations: vec![d2_raft::WriteOp::Put {
+                key: vec![1],
+                value: vec![2],
+            }],
+        };
+        // Even an uninitialized Raft node must reject identity before attempting
+        // a read barrier, metadata lookup, or mutation.
+        for wrong in [
+            None,
+            Some(RemoteIdentity { group: 11, node: 1 }),
+            Some(RemoteIdentity { group: 10, node: 2 }),
+        ] {
+            for operation in [
+                Operation::Snapshot { shard: 7 },
+                Operation::Metadata { shard: 7 },
+                Operation::Probe { shard: 7 },
+                Operation::Write(request.clone()),
+            ] {
+                assert!(matches!(
+                    rpc(endpoint, wrong, operation, Duration::from_secs(2), None).await,
+                    Err(RemoteError::InvalidArgument)
+                ));
+            }
+        }
+        assert!(node.state_machine.d1_metadata().await.is_none());
+        assert!(matches!(
+            metadata_identified(endpoint, identity, 7, Duration::from_secs(2)).await,
+            Err(RemoteError::Application(D1Error::NotActivated))
+        ));
+        service.shutdown().await;
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn probe_is_bounded_and_does_not_transfer_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
+            id: 1,
+            raft_addr: "127.0.0.1:0".into(),
+            control_addr: "127.0.0.1:0".into(),
+            data_dir: dir.path().into(),
+        })
+        .await
+        .unwrap();
+        node.bootstrap(std::collections::BTreeMap::from([(
+            1,
+            node.raft_addr.clone(),
+        )]))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if node.raft.ensure_linearizable().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        node.raft
+            .client_write(LogCommand::D1V1(D1Command::Activate { shard: 7, epoch: 1 }))
+            .await
+            .unwrap();
+        node.raft
+            .client_write(LogCommand::D1V1(D1Command::Write(D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [5; 16],
+                expected_sequence: Some(0),
+                operations: vec![d2_raft::WriteOp::Put {
+                    key: vec![1],
+                    value: vec![2; MAX_SNAPSHOT_BYTES + 1],
+                }],
+            })))
+            .await
+            .unwrap();
+        let service = GraphService::start_identified(
+            &node,
+            "127.0.0.1:0".parse().unwrap(),
+            10,
+            7,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let identity = RemoteIdentity { group: 10, node: 1 };
+        assert!(
+            probe_identified(service.local_addr(), identity, 7, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            snapshot_identified(service.local_addr(), identity, 7, Duration::from_secs(5)).await,
+            Err(RemoteError::ResourceExhausted)
+        ));
+        service.shutdown().await;
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn oversized_frame_rejected_before_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -555,6 +845,7 @@ mod tests {
                 &mut stream,
                 &Request {
                     version,
+                    identity: None,
                     operation: Operation::Snapshot { shard },
                 },
                 Instant::now() + Duration::from_secs(5),
