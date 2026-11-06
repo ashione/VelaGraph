@@ -2,9 +2,10 @@
 
 This is a bounded **in-process metadata slice**, not completion of D3. It adds
 persisted partition-to-shard and immutable shard-to-Raft-group placement.
-Automatic leader discovery, route caching, membership changes, shard migration,
+Remote leader discovery, route caching, membership changes, shard migration,
 rollback, remote RPC, security, and cross-partition queries remain unsupported.
-The existing single-shard graph adapter is unchanged.
+The existing single-shard graph adapter remains available; the bounded resolver
+below adds fixed-candidate in-process routing.
 
 ## Bootstrap and identity
 
@@ -129,7 +130,8 @@ before decode loops/allocation. All serialization and validation loops are
 bounded by these limits. Every operation uses one D1 read or one conditional
 write with the adapter deadline and shared 32-operation admission bound.
 Preparation CPU work is bounded by catalog limits, but the deadline covers the
-D1 call, not an arbitrary blocking closure. No retry/discovery loop exists.
+D1 call, not an arbitrary blocking closure. The catalog alone has no retry/discovery loop; the optional bounded resolver
+below supplies a separate shared deadline and admission scope.
 
 D1 retains at most 4,096 successful requests and 64 MiB accounted dedup bytes,
 with no eviction. Whole-record updates amplify retained bytes, so the catalog
@@ -148,3 +150,91 @@ adversarial tests cover competing bootstrap identities, metadata epoch fencing,
 and deletion of the catalog row without silently resetting its history. Separate group-isolation tests cover overlapping node IDs and durable
 identity rejection. Fault injection is in-process; graceful reopen is not
 power-loss evidence, and these tests do not establish production network safety.
+
+## Bounded in-process route resolver
+
+`replicated_graph::routing::RouteResolver` is an additive, static client. It
+accepts the complete fixed metadata replica set and a bounded registry of
+concrete data `NodeHandle`s on their hosting runtime. Registry keys include both
+`(group_id, node_id)`; at most 31,744 data handles are accepted, with duplicate
+keys and metadata-group data handles rejected. All replicas named by a selected
+placement must be registered. The registry never changes from a leader hint,
+and no hint supplies a remote address. Bootstrap and correct membership remain
+the host's responsibility, not something the resolver proves.
+
+Every `read_view(partition, timeout)` and `commit_prepared(prepared, timeout)`
+performs a **fresh linearizable metadata snapshot**, even for repeated routes
+or unknown partitions. No stale catalog or last-known-route fallback exists.
+The catalog still has only immutable placement: no route cache, lease, watch,
+reconfiguration, migration or cross-group fencing is added.
+
+Candidate selection is deterministic: start at the lowest configured ID and
+visit each fixed candidate at most once. A `NotLeader` hint can prioritize only
+an unvisited member of that placement. Self, repeated, cyclic, unknown and
+foreign-group hints cannot expand the set. Metadata reads, data view acquisition
+and read-only pre-write leader probes may advance on `Unavailable`. A timeout
+ends the operation. Before a write, a leader quorum probe does not read graph
+records, change the validation sequence or prepare a new mutation. Once a write
+is dispatched, only definite `NotLeader` can advance to another candidate;
+`Timeout`, `Unavailable`, `Conflict`, `Fenced`, idempotency and capacity errors
+are terminal. There is no internal retry of an ambiguous write outcome.
+
+One absolute monotonic deadline covers metadata reads, all candidates, the data
+barrier/probe and write dispatch. A positive timeout of at most 60 seconds is
+required. Runtime queueing consumes that same budget; a queued task first polled
+after expiry does not start the operation. Waits and successful return paths
+check the deadline. Bounded synchronous decode, cloning, parser/query work and
+destructors are cooperative, not preemptible: a call can return its timeout
+later than the deadline, but cannot return a late successful routed result.
+The ordinary adapter's per-operation duration API remains available separately.
+
+Resolver clones share a 32-operation admission pool across **all groups and
+replicas**, and a second shared cap of 32 in-flight adapter dispatches. A read
+session retains its operation slot until every clone is dropped, including after
+its deadline expires. An expired session must be dropped, not retained as a way
+to reclaim its slot. Cancelled/timed-out dispatch tasks retain their dispatch
+permit until they actually exit. Repeated adapter selection cannot create new
+pools. Independently constructed resolvers have independent pools; these limits
+are not a process-wide quota or RSS bound. Reuse one resolver's clones for a
+single client budget.
+
+### Pinned read sessions and exact graph retries
+
+`RoutedReadView` exposes the catalog snapshot's `metadata_sequence`, data
+sequence/epoch and immutable placement. Its point reads, `scan_page`, Gremlin and
+all six graph `prepare_*` methods reuse exactly the original concrete adapter and
+D1 view. They do not rediscover a leader, refresh metadata or obtain another data
+snapshot. A changed sequence is visible only to a new session. Session clones
+keep the same deadline; they do not renew it. Paged cursors remain bound to the
+original view/range. Context and locally observed epoch checks still apply on
+the original adapter, including after leadership changes. This retains the
+existing limitation that an isolated old replica may not yet know a newer epoch;
+metadata epochs are not instantaneous revocation of historical reads.
+
+Preparation returns an opaque `RoutedPreparedMutation` carrying the full metadata
+configuration, immutable data placement and original `PreparedGraphMutation`.
+The latter retains exact bytes, request ID, epoch and expected sequence. It does
+not hold the read session's admission slot or deadline. Drop the session when
+finished, retain the preparation, and explicitly call `commit_prepared` with a
+new bounded operation budget. Fresh metadata must match both metadata identity
+and the original data placement. A matching newer catalog revision due to an
+unrelated registration does not invalidate the exact retry. The authoritative
+replicated D1 write still validates epoch and condition atomically.
+
+After a timeout or lost response, retry **that same value**. Successful duplicate
+retry keeps the original sequence and writes nothing again. Never call a fresh
+`prepare_*` to recover an unknown outcome. A definitive `Conflict` requires an
+explicit fresh session and preparation; the resolver never does it automatically.
+These values are in-memory, not a durable retry journal. Resolver sessions cannot
+commit arbitrary CRUD directly or expose a dynamically rerouting StorageNode.
+No graph, catalog, D1 or Raft wire/storage encoding changes are introduced.
+
+Verification adds bounded-selector/admission/deadline unit tests and real
+three-voter metadata plus two data groups with overlapping numeric replica and
+vertex IDs. Cases cover metadata quorum loss, unknown partitions, stopped first
+candidates, leadership changes, retained pages/queries, all prepared CRUD, stale
+epoch/conflict and an apply-lock timeout followed by an exact duplicate retry.
+Independent adversarial cases also cover admission until the last session clone
+is dropped, expired sessions retaining their slots, and metadata/data waits
+sharing one deadline. These are in-process fault tests, not production network
+or migration evidence.

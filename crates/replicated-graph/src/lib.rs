@@ -3,14 +3,16 @@
 //! Construct on the runtime hosting the node. Use [`run_blocking`] for graph
 //! operations from async code; direct synchronous calls on Tokio workers fail
 //! explicitly instead of nesting `block_on` or blocking the executor. The host
-//! runtime must remain running. There is no routing, TCP client protocol,
-//! authentication, automatic retry, or production availability guarantee.
+//! runtime must remain running. The optional [`routing`] module adds bounded
+//! static in-process routing. No TCP graph protocol, authentication, or production
+//! availability guarantee is provided.
 pub mod catalog;
+pub mod routing;
 
 use std::cell::Cell;
 use std::future::Future;
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use d2_raft::{
     D1Command, D1Error, D1Result, D1WriteRequest, D1WriteStatus, LogCommand, NodeHandle,
@@ -61,6 +63,7 @@ pub struct ReplicatedStorageNode {
     runtime: Handle,
     shard: ShardId,
     deadline: Duration,
+    absolute_deadline: Option<Instant>,
     admission: Arc<Semaphore>,
 }
 
@@ -82,8 +85,19 @@ impl ReplicatedStorageNode {
             runtime,
             shard,
             deadline,
+            absolute_deadline: None,
             admission: Arc::new(Semaphore::new(32)),
         })
+    }
+
+    // Resolver-created clones share one dispatch pool across all groups and
+    // keep the original absolute deadline, including runtime queueing time.
+    fn scoped(&self, shard: ShardId, end: Instant, admission: Arc<Semaphore>) -> Self {
+        let mut node = self.clone();
+        node.shard = shard;
+        node.absolute_deadline = Some(end);
+        node.admission = admission;
+        node
     }
 
     fn dispatch<T, F>(&self, request_id: Option<RequestId>, future: F) -> Result<T>
@@ -92,20 +106,32 @@ impl ReplicatedStorageNode {
         F: Future<Output = Result<T>> + Send + 'static,
     {
         self.check_execution_context()?;
+        let end = match self.absolute_deadline {
+            Some(end) => end,
+            None => Instant::now()
+                .checked_add(self.deadline)
+                .ok_or_else(|| StorageNodeError::InvalidArgument("deadline overflow".into()))?,
+        };
+        if Instant::now() >= end {
+            return Err(StorageNodeError::Timeout { request_id });
+        }
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             StorageNodeError::ResourceExhausted("32 adapter operations already in flight".into())
         })?;
         let (sender, receiver) = mpsc::sync_channel(1);
-        let deadline = self.deadline;
         let task = self.runtime.spawn(async move {
             let _permit = permit;
-            let result = tokio::time::timeout(deadline, future)
-                .await
-                .unwrap_or(Err(StorageNodeError::Timeout { request_id }));
+            let result = poll_before_deadline(end, request_id, future).await;
             let _ = sender.send(result);
         });
-        match receiver.recv_timeout(deadline) {
-            Ok(result) => result,
+        match receiver.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok(result) => {
+                if Instant::now() >= end {
+                    Err(StorageNodeError::Timeout { request_id })
+                } else {
+                    result
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 task.abort();
                 Err(StorageNodeError::Timeout { request_id })
@@ -114,6 +140,13 @@ impl ReplicatedStorageNode {
                 Err(StorageNodeError::Unavailable("node runtime stopped".into()))
             }
         }
+    }
+
+    // Read-only selection before write dispatch. This is not preparation: it
+    // never reads or replaces the original condition, epoch, bytes, or ID.
+    fn probe_leader(&self) -> Result<()> {
+        let raft = self.raft.clone();
+        self.dispatch(None, async move { leader_barrier(&raft).await })
     }
 
     fn check_view(&self, view: &ReadView) -> Result<()> {
@@ -147,6 +180,37 @@ impl ReplicatedStorageNode {
     }
 }
 
+// A queued task must not first poll a write after its absolute deadline.
+async fn poll_before_deadline<T>(
+    end: Instant,
+    request_id: Option<RequestId>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    if Instant::now() >= end {
+        return Err(StorageNodeError::Timeout { request_id });
+    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(end), future)
+        .await
+        .unwrap_or(Err(StorageNodeError::Timeout { request_id }))
+}
+
+async fn leader_barrier(raft: &openraft::Raft<TypeConfig>) -> Result<()> {
+    raft.ensure_linearizable()
+        .await
+        .map_err(|e| {
+            if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
+                StorageNodeError::NotLeader {
+                    leader: hint.leader_id,
+                }
+            } else if e.fatal().is_some() {
+                StorageNodeError::Unavailable("Raft stopped".into())
+            } else {
+                StorageNodeError::Unavailable("Raft read quorum unavailable".into())
+            }
+        })
+        .map(|_| ())
+}
+
 impl StorageNode for ReplicatedStorageNode {
     fn check_execution_context(&self) -> Result<()> {
         if Handle::try_current().is_ok() && !BLOCKING_SCOPE.with(Cell::get) {
@@ -162,17 +226,7 @@ impl StorageNode for ReplicatedStorageNode {
         let state = self.state.clone();
         let shard = self.shard;
         self.dispatch(None, async move {
-            raft.ensure_linearizable().await.map_err(|e| {
-                if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
-                    StorageNodeError::NotLeader {
-                        leader: hint.leader_id,
-                    }
-                } else if e.fatal().is_some() {
-                    StorageNodeError::Unavailable("Raft stopped".into())
-                } else {
-                    StorageNodeError::Unavailable("Raft read quorum unavailable".into())
-                }
-            })?;
+            leader_barrier(&raft).await?;
             let snapshot = state
                 .d1_read_snapshot(MAX_VIEW_ROWS, MAX_VIEW_BYTES)
                 .await
@@ -355,6 +409,20 @@ impl StorageAdmin for ReplicatedStorageNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_queued_work_is_not_polled() {
+        let mut polled = false;
+        let future = async {
+            polled = true;
+            Ok(())
+        };
+        let result = poll_before_deadline(Instant::now(), Some([8; 16]), future).await;
+        assert!(!polled);
+        assert!(
+            matches!(result, Err(StorageNodeError::Timeout { request_id: Some(id) }) if id == [8; 16])
+        );
+    }
 
     #[test]
     fn application_rejections_remain_typed() {

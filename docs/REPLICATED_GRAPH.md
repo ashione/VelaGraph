@@ -6,7 +6,8 @@ It is an **in-process correctness prototype**, not a network graph service.
 `GraphEngine` and its K3 transaction API still use the local kernel. The same
 Gremlin parser/operators can also execute through this replicated D1 adapter.
 A separate [D3a static catalog](D3_STATIC_CATALOG.md) provides persisted immutable
-placement in a dedicated metadata group. Automatic routing, shard migration,
+placement in a dedicated metadata group. The optional bounded in-process resolver
+is described there. Shard migration,
 cross-shard transactions, network authentication and a production client protocol
 are not implemented.
 
@@ -194,4 +195,6 @@ not implemented. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
 
 This closes only the bounded, in-process, single-shard replicated query path.
 K3 write-overlay transactions still belong to `GraphEngine`; cross-shard queries,
-client/server query protocols, routing and production availability remain absent.
+client/server query protocols, remote routing and production availability remain
+absent.
+The optional static in-process resolver is documented in D3_STATIC_CATALOG.md.

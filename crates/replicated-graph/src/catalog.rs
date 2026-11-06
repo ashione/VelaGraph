@@ -28,7 +28,7 @@ pub struct Placement {
     pub replicas: Vec<u64>,
 }
 impl Placement {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.replicas.is_empty()
             || self.replicas.len() > MAX_REPLICAS
             || self.replicas.windows(2).any(|w| w[0] >= w[1])
@@ -174,6 +174,17 @@ impl Catalog {
             node: ReplicatedStorageNode::new(node, metadata.shard, deadline)?,
             metadata,
         })
+    }
+
+    pub(crate) fn scoped(
+        &self,
+        end: std::time::Instant,
+        admission: std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            node: self.node.scoped(self.metadata.shard, end, admission),
+            metadata: self.metadata.clone(),
+        }
     }
 
     /// Exactly one D1 leader-barrier read, with its bounded operation deadline.
