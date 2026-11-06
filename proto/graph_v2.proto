@@ -13,3 +13,13 @@ message Record {
 // The source partition is supplied by the edge key. The embedded edge's
 // from/to numbers are local IDs. The outer target partition qualifies `to`.
 // Index values are empty; source partition and edge ID are in the index key.
+
+// Additive tombstone encoding, still stored at graph/v2/.../edge/<id>.
+// Old readers reject version 3; downgrade after deletion is unsupported.
+message EdgeTombstone {
+  uint32 version = 1; // Always 3 (record version, not Gremlin result API).
+  uint32 kind = 2; // Always 3.
+  fixed32 partition = 3; // Target partition.
+  bytes record_v1 = 4; // Canonical Edge with empty properties, retaining identity/label/endpoints.
+  bytes operation_id = 5; // Exactly 16 bytes, original source batch request ID.
+}

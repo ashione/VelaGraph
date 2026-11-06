@@ -28,8 +28,7 @@ qualified edge reference, not a second copy of the edge payload.
 `ExperimentalReadSession::prepare_edge` is the full endpoint-checking operation:
 it prepares both participants before any submission. Vertex and edge creation
 reject existing keys; conditional shard-sequence checks fence concurrent writers.
-The additive properties-only update API below is opt-in; there is no v2 delete
-API. V1 APIs cannot see, modify or delete v2 keys,
+The additive properties update and edge deletion APIs below are opt-in. V1 APIs cannot see, modify or delete v2 keys,
 so a v1 cascade cannot break v2 endpoints. Direct opaque D1/admin operations
 remain trusted escape hatches, as for v1. No integrity guarantee covers raw key
 modification. V1 and v2 prepared values are different types and cannot be passed
@@ -116,8 +115,8 @@ old properties. Changed bytes or condition with the same request ID conflict.
 No durable client journal, automatic recovery, rollback, repair or ID reuse is
 added. Endpoint immutability under supported v2 APIs makes a source-only CAS
 sufficient for this properties slice; raw D1/admin edits remain outside the
-integrity guarantee, including target edits after preparation. Future endpoint
-mutation/deletion requires a separately reviewed protocol.
+integrity guarantee, including target edits after preparation. Endpoint mutation and vertex deletion remain unsupported. Edge deletion follows
+the separately reviewed tombstone protocol below.
 
 Existing sessions and all observed traversal APIs retain their frozen views;
 a fresh session observes new source properties. Snapshot vectors remain non-global,
@@ -400,8 +399,10 @@ Scans require a pinned node for stability; unsupported pagination has no scan
 fallback. Each query has one cumulative 10,000-work-unit / stage-row cap and
 64 MiB logical byte budget, with a default output cap of 100. These are not
 RSS limits; bounded primitive scratch and snapshot storage are excluded.
-Leading limit reads at most that many candidates per partition and keeps the
-global prefix, without checking excluded candidates. A later limit/count does
+Leading limit reads until that many live candidates per partition and keeps the
+global prefix, without checking later excluded candidates. Tombstones are verified
+and charged while searching for that prefix, so a leading limit does not cap
+physical candidate work or suppress resource exhaustion. A later limit/count does
 not excuse earlier budget errors. Session construction still pins every shard,
 and all operations retain its original absolute deadline.
 
@@ -455,3 +456,84 @@ steps are bounded by the shared structural admission and row/work limits.
 No retry, view refresh, replica switch or deadline reset is introduced.
 Every successful output, including empty streams, paths and scalar counts,
 is still Unverified, never a global-completeness or global-snapshot claim.
+
+## Additive permanent edge deletion
+
+`ExperimentalReadSession::prepare_edge_delete(EdgeRef)` accepts only a complete
+observed live edge. It verifies both endpoints and both indexes in the frozen
+session before preparing any writes. A missing or fully deleted edge returns
+`Graph(NotFound(edge))`; a partially deleted edge returns `Graph(Incomplete(edge))`.
+A fresh delete is not an acknowledgement of an older request. Retain the original
+`PreparedEdgeMutation`, with `kind() == Delete`, `operation_id()` (source request
+ID), and `source_request_id()` / optional `reverse_request_id()`.
+
+Source CAS writes a permanent tombstone at the original canonical key and deletes
+the outgoing index in one batch. The target CAS deletes the incoming index.
+Both batches retain original sequences, epochs, placements, bytes and request IDs.
+Same-shard participants combine into one conditional batch. Different shards
+submit source then target, with the existing attempt-local Rejected / Incomplete /
+Unknown contract and no rollback. `AllBatchesAcknowledged` acknowledges historical
+requests, not atomic visibility or a globally consistent deleted state. Unrelated
+writes can conservatively invalidate either CAS. A target conflict after source
+acknowledgement may remain permanently incomplete; no automatic re-preparation,
+recovery, journal, compensation, or repair is supplied. Unknown may have committed.
+
+The canonical key is never removed or reused. Creation rejects its existence,
+including tombstones. Exact retries of an old successful create, property update,
+or delete acknowledge dedup history without resurrecting or changing later data.
+A competing update/delete or delete/delete from one source sequence is fenced by
+CAS; fresh property updates cannot modify tombstones. This release does not delete
+vertices, change label/endpoints, garbage-collect tombstones, or reclaim EdgeRefs.
+Raw admin/D1 edits remain outside supported graph integrity guarantees.
+
+### Tombstone format and upgrade
+
+Live v2 keys and bytes are unchanged. A tombstone uses the original graph/v2
+canonical edge key with an explicitly new record envelope: version=3, kind=3,
+fixed32 target partition field 3, bytes field 4 containing a canonical v1 Edge
+with empty properties and original ID/from/to/label, and bytes field 5 containing
+exactly 16 bytes of original source request ID. Fields are in numeric order;
+unknown, duplicated, noncanonical or oversized encodings are rejected. The 1 MiB
+record cap remains. This is a storage record version, independent of the observed
+Gremlin v3 result API. The marker identifies the deletion, not a durable coordinator
+journal. `proto/graph_v2.proto` specifies both envelopes; golden/reopen tests pin
+mixed live and deleted storage. The source partition remains supplied by the key.
+
+Golden tombstone for edge 7, source partition 1 / ID 1, target partition 1 / ID 2,
+label K and request ID sixteen `01` bytes:
+`080310031d01000000220f080110021a0908071001180222014b2a1001010101010101010101010101010101`.
+The integration golden uses the actual prepared request ID and pins every other byte.
+
+Migration is opt-in: upgraded readers accept existing live v2 records alongside
+new tombstones. All readers of a database that uses deletion must be upgraded
+before invoking deletion. Older readers explicitly fail on the new version;
+downgrade after the first deletion is unsupported. There is no automatic conversion
+of v1 or recovery/GC migration.
+
+### Reads, residual indexes and bounded scans
+
+Session `get_edge` returns None for a tombstone only after verifying both its
+source out index and target in index are absent in the pinned views. Either
+residual index yields Incomplete. Missing canonical data still means absent in
+the source snapshot, not proof about uncertain writes. Incoming adjacency that
+encounters a residual reverse index fails; an outgoing adjacency with no index
+cannot discover that residual and remains explicitly Unverified. No read path
+silently skips visible residuals. Frozen old sessions may still see a live edge;
+a non-global snapshot vector may mix stages and return Incomplete.
+
+`AppendOnlyStore::get_edge_record` validates only the source participant;
+`verify_deleted_reverse` supplies the target check. Its low-level `get_edge`
+returns None after source validation only and must not be mistaken for a complete
+delete observation. The legacy live-only `edge_page` errors on a tombstone;
+`edge_record_page` retains all live/deleted candidates and is used by global E().
+Global E verifies each candidate before skipping a deleted one. Tombstones consume
+raw page bytes, decoded admission, one work unit, deadline checks and continuation
+positions. A leading limit counts live candidates, so full tombstone pages neither
+end the scan early nor erase its shared 10,000-work / 64 MiB caps. Later filters,
+count or limit cannot hide a partial deletion or an exhausted internal budget.
+Explicit E(id), projections, paths, endpoint and adjacency steps inherit the same
+verified reads. All observed successes, including zero counts, remain Unverified.
+
+Fault recovery, failover, coordinated snapshots, durable client retry storage,
+TLS/auth hardening and production deployment remain future work. Tests are normal
+functional and bounded-fault evidence, not claims of a distributed transaction.

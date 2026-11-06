@@ -1012,3 +1012,183 @@ async fn property_mutation_scenario() -> anyhow::Result<()> {
     .await??;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_v2_edge_deletions_in_real_processes() -> anyhow::Result<()> {
+    let _fixture = PROCESS_TEST_LOCK.lock().await;
+    timeout(Duration::from_secs(180), edge_deletion_scenario()).await?
+}
+
+async fn edge_deletion_scenario() -> anyhow::Result<()> {
+    let metadata = Group::start(410, 510).await?;
+    let a = Group::start(420, 520).await?;
+    let mut b = Group::start(430, 530).await?;
+    let catalog = Catalog::new_remote(
+        metadata.replicas[0].endpoint,
+        1,
+        metadata.placement.clone(),
+        BUDGET,
+    )?;
+    let resolver = RouteResolver::new_remote(
+        metadata.placement.clone(),
+        &metadata.replicas,
+        &[a.replicas.clone(), b.replicas.clone()].concat(),
+    )?;
+    let ap = a.placement.clone();
+    let bp = b.placement.clone();
+    let (resolver, unknown_source, unknown_reverse) = run_blocking(move || -> anyhow::Result<_> {
+        for (partition, placement) in [(1, ap.clone()), (2, bp), (3, ap)] {
+            catalog.commit_registration(&catalog.prepare_registration([partition as u8; 16], partition, placement)?)?;
+            let prepared = resolver.experimental_read_session(BUDGET)?.prepare_vertex(partition, &Vertex::new(7))?;
+            resolver.experimental_commit(&prepared, BUDGET)?;
+        }
+        let edge = |id, target| CrossEdge {
+            id, from: VertexRef { partition: 1, id: 7 },
+            to: VertexRef { partition: target, id: 7 }, label: "Delete".into(),
+            properties: BTreeMap::from([("payload".into(), Value::Text("discard me".into()))]),
+        };
+        // Cross-shard parallel edges, same-shard partitions, and a self-loop.
+        let edges = [edge(1, 2), edge(2, 2), edge(3, 3), edge(4, 1)];
+        let mut creates = vec![];
+        for e in &edges {
+            let create = resolver.experimental_read_session(BUDGET)?.prepare_edge(e)?;
+            resolver.experimental_commit(&create, BUDGET)?;
+            creates.push(create);
+        }
+        let frozen = resolver.experimental_read_session(BUDGET)?;
+        for (i, e) in edges.iter().enumerate() {
+            let before_update = resolver.experimental_read_session(BUDGET)?;
+            let patch = EdgePropertyPatch { set: BTreeMap::from([("x".into(), Value::Integer(1))]), remove: BTreeSet::new() };
+            let old_update = before_update.prepare_edge_properties(e.identity(), &patch)?;
+            resolver.experimental_commit_mutation(&old_update, BUDGET)?;
+            let before_delete = resolver.experimental_read_session(BUDGET)?;
+            let deletion = before_delete.prepare_edge_delete(e.identity())?;
+            let race = before_delete.prepare_edge_properties(e.identity(), &patch)?;
+            assert_eq!(deletion.kind(), EdgeMutationKind::Delete);
+            assert_eq!(deletion.edge(), e.identity());
+            assert_eq!(deletion.operation_id(), deletion.source_request_id());
+            assert_eq!(deletion.reverse_request_id().is_some(), e.to.partition == 2);
+            assert_eq!(resolver.experimental_commit_mutation(&deletion, BUDGET)?, MutationAcknowledgement::AllBatchesAcknowledged);
+            let deleted = resolver.experimental_read_session(BUDGET)?;
+            assert!(deleted.get_edge(e.identity())?.is_none());
+            assert!(before_delete.get_edge(e.identity())?.is_some());
+            assert_eq!(frozen.get_edge(e.identity())?, Some(e.clone()));
+            for (endpoint, direction) in [(e.from, Direction::Out), (e.to, Direction::In)] {
+                assert!(deleted.observed_adjacency(endpoint, direction)?.edges.iter().all(|other| other.identity() != e.identity()));
+                assert!(deleted.get_vertex(endpoint)?.is_some());
+            }
+            assert!(matches!(deleted.prepare_edge_delete(e.identity()),
+                Err(ExperimentalRouteError::Graph(ExperimentalError::NotFound(id))) if id == e.identity()));
+            assert!(matches!(deleted.prepare_edge(e), Err(ExperimentalRouteError::Graph(ExperimentalError::AlreadyExists))));
+            assert!(matches!(resolver.experimental_commit_mutation(&race, BUDGET),
+                Err(ExperimentalRouteError::Stage { stage: Stage::Source, outcome: StageOutcome::Rejected,
+                    source_acknowledged_this_attempt: false, .. })));
+            resolver.experimental_commit(&creates[i], BUDGET)?;
+            resolver.experimental_commit_mutation(&old_update, BUDGET)?;
+            resolver.experimental_commit_mutation(&deletion, BUDGET)?;
+            let fresh = resolver.experimental_read_session(BUDGET)?;
+            assert_eq!(deleted.snapshots, fresh.snapshots);
+            assert!(fresh.get_edge(e.identity())?.is_none());
+            assert_eq!(fresh.observed_gremlin_v3(999, "g.E().count()")?.rows,
+                vec![replicated_graph::routing::experimental::ObservedRowV3::Count((edges.len() - i - 1) as u64)]);
+            if i + 1 < edges.len() {
+                assert_eq!(fresh.observed_gremlin_v3(999, "g.E().limit(1)")?.rows,
+                    vec![replicated_graph::routing::experimental::ObservedRowV3::Edge(edges[i + 1].identity())]);
+            }
+        }
+        let missing = EdgeRef { partition: 1, id: 999 };
+        assert!(matches!(resolver.experimental_read_session(BUDGET)?.prepare_edge_delete(missing),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::NotFound(id))) if id == missing));
+        // More than a page of tombstones must not consume the live leading limit.
+        for id in 10..140 {
+            let e = edge(id, 1);
+            let create = resolver.experimental_read_session(BUDGET)?.prepare_edge(&e)?;
+            resolver.experimental_commit(&create, BUDGET)?;
+            let deletion = resolver.experimental_read_session(BUDGET)?.prepare_edge_delete(e.identity())?;
+            resolver.experimental_commit_mutation(&deletion, BUDGET)?;
+        }
+        let survivor = edge(200, 2);
+        resolver.experimental_commit(&resolver.experimental_read_session(BUDGET)?.prepare_edge(&survivor)?, BUDGET)?;
+        let session = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(session.observed_gremlin_v3(999, "g.E().limit(1)")?.rows, vec![replicated_graph::routing::experimental::ObservedRowV3::Edge(survivor.identity())]);
+        assert_eq!(session.observed_gremlin_v3(999, "g.E().count()")?.rows, vec![replicated_graph::routing::experimental::ObservedRowV3::Count(1)]);
+        // Updating only the reverse shard makes deletion source-acknowledged
+        // but incomplete. A fresh session must not hide the remaining index.
+        let deletion = session.prepare_edge_delete(survivor.identity())?;
+        let target_write = session.prepare_vertex(2, &Vertex::new(8))?;
+        resolver.experimental_commit(&target_write, BUDGET)?;
+        for _ in 0..2 {
+            match resolver.experimental_commit_mutation(&deletion, BUDGET) {
+                Err(ExperimentalRouteError::Stage { stage: Stage::Reverse, outcome: StageOutcome::Incomplete,
+                    source_acknowledged_this_attempt: true, request_id, .. }) => {
+                    assert_eq!(Some(request_id), deletion.reverse_request_id());
+                }
+                other => panic!("expected partially committed deletion: {other:?}"),
+            }
+        }
+        let partial = resolver.experimental_read_session(BUDGET)?;
+        assert!(matches!(partial.get_edge(survivor.identity()),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(id))) if id == survivor.identity()));
+        assert!(matches!(partial.observed_gremlin_v3(999, "g.E().count()"),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(id))) if id == survivor.identity()));
+        for query in [
+            "g.E(200)", "g.E(200).path()", "g.E(200).count()",
+            "g.E(200).has('missing').count()", "g.E(200).limit(1)",
+            "g.E().has('missing').count()", "g.E().limit(1)",
+            "g.V(7).inE().count()",
+        ] {
+            let partition = if query.starts_with("g.V") { 2 } else { 1 };
+            assert!(matches!(partial.observed_gremlin_v3(partition, query),
+                Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(id))) if id == survivor.identity()),
+                "partial deletion silently accepted {query}");
+        }
+        assert!(partial.observed_adjacency(survivor.to, Direction::In).is_err());
+        assert!(matches!(partial.prepare_edge_delete(survivor.identity()),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(id))) if id == survivor.identity()));
+        assert_eq!(partial.snapshots, resolver.experimental_read_session(BUDGET)?.snapshots);
+        // Prepare both transport-uncertain stages before stopping a participant.
+        let reverse_edge = edge(201, 2);
+        let mut source_edge = edge(202, 1);
+        source_edge.from.partition = 2;
+        for e in [&reverse_edge, &source_edge] {
+            resolver.experimental_commit(&resolver.experimental_read_session(BUDGET)?.prepare_edge(e)?, BUDGET)?;
+        }
+        let session = resolver.experimental_read_session(BUDGET)?;
+        let unknown_source = session.prepare_edge_delete(source_edge.identity())?;
+        let unknown_reverse = session.prepare_edge_delete(reverse_edge.identity())?;
+        Ok((resolver, unknown_source, unknown_reverse))
+    }).await??;
+    b.process.0.kill()?;
+    b.process.0.wait()?;
+    run_blocking(move || -> anyhow::Result<()> {
+        for (mutation, expected_stage, acknowledged) in [
+            (&unknown_reverse, Stage::Reverse, true),
+            (&unknown_source, Stage::Source, false),
+        ] {
+            match resolver.experimental_commit_mutation(mutation, BUDGET) {
+                Err(ExperimentalRouteError::Stage {
+                    stage,
+                    outcome: StageOutcome::Unknown,
+                    source_acknowledged_this_attempt,
+                    request_id,
+                    ..
+                }) => {
+                    assert_eq!(stage, expected_stage);
+                    assert_eq!(source_acknowledged_this_attempt, acknowledged);
+                    assert_eq!(
+                        request_id,
+                        if acknowledged {
+                            mutation.reverse_request_id().unwrap()
+                        } else {
+                            mutation.source_request_id()
+                        }
+                    );
+                }
+                other => panic!("expected honest transport uncertainty: {other:?}"),
+            }
+        }
+        Ok(())
+    })
+    .await??;
+    Ok(())
+}
