@@ -32,6 +32,7 @@
 mod engine;
 mod error;
 mod graph;
+mod graph_records;
 mod gremlin;
 mod key;
 mod schema;
@@ -43,6 +44,7 @@ mod value;
 pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
 pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
+pub use graph_records::{GraphRecordStore, MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS};
 pub use gremlin::{
     GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, PathElement,
     DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,

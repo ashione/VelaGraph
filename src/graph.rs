@@ -21,7 +21,7 @@
 //! mutations write the edge record and both adjacency entries in one RocksDB
 //! `WriteBatch`.
 
-mod codec;
+pub(crate) mod codec;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -86,7 +86,7 @@ impl Edge {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum EdgeDirection {
+pub(crate) enum EdgeDirection {
     Out,
     In,
 }
@@ -1059,11 +1059,11 @@ fn edge_prefix(partition: u32) -> Vec<u8> {
     key
 }
 
-fn vertex_key(partition: u32, id: u64) -> Vec<u8> {
+pub(crate) fn vertex_key(partition: u32, id: u64) -> Vec<u8> {
     key_with_id(&vertex_prefix(partition), id)
 }
 
-fn edge_key(partition: u32, id: u64) -> Vec<u8> {
+pub(crate) fn edge_key(partition: u32, id: u64) -> Vec<u8> {
     key_with_id(&edge_prefix(partition), id)
 }
 
@@ -1074,7 +1074,7 @@ fn key_with_id(prefix: &[u8], id: u64) -> Vec<u8> {
     key
 }
 
-fn adjacency_prefix(
+pub(crate) fn adjacency_prefix(
     partition: u32,
     direction: EdgeDirection,
     vertex_id: u64,
@@ -1095,7 +1095,7 @@ fn adjacency_prefix(
     key
 }
 
-fn adjacency_key(
+pub(crate) fn adjacency_key(
     partition: u32,
     direction: EdgeDirection,
     vertex_id: u64,
@@ -1107,7 +1107,7 @@ fn adjacency_key(
     key
 }
 
-fn edge_id_from_adjacency_key(key: &[u8]) -> Result<u64> {
+pub(crate) fn edge_id_from_adjacency_key(key: &[u8]) -> Result<u64> {
     let bytes = key
         .get(key.len().saturating_sub(8)..)
         .ok_or_else(|| Error::CorruptData("adjacency key is too short".into()))?;
@@ -1116,14 +1116,14 @@ fn edge_id_from_adjacency_key(key: &[u8]) -> Result<u64> {
     })?))
 }
 
-fn validate_vertex(vertex: &Vertex) -> Result<()> {
+pub(crate) fn validate_vertex(vertex: &Vertex) -> Result<()> {
     for label in &vertex.labels {
         validate_label(label)?;
     }
     validate_properties(&vertex.properties)
 }
 
-fn validate_edge(edge: &Edge) -> Result<()> {
+pub(crate) fn validate_edge(edge: &Edge) -> Result<()> {
     validate_label(&edge.label)?;
     validate_properties(&edge.properties)
 }
@@ -1156,7 +1156,7 @@ fn id_from_record_key(key: &[u8], prefix: &[u8]) -> Result<u64> {
     })?))
 }
 
-fn validate_label(label: &str) -> Result<()> {
+pub(crate) fn validate_label(label: &str) -> Result<()> {
     let valid_length = !label.is_empty() && label.len() <= MAX_LABEL_LEN;
     let valid_bytes = label.bytes().enumerate().all(|(index, byte)| {
         byte.is_ascii_alphabetic() || byte == b'_' || (index > 0 && byte.is_ascii_digit())

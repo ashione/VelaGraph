@@ -138,6 +138,9 @@ pub enum Error {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("storage node error: {0}")]
+    StorageNode(#[from] crate::storage_node::StorageNodeError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
