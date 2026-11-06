@@ -1,11 +1,12 @@
-//! Isolated append-only graph/v2 experiment. No v1 API reads these records.
+//! Isolated graph/v2 experiment with append-only creation and property patches.
+//! No v1 API reads these records.
 //! Batches are shard-local; composing them is explicitly NOT a transaction.
 use crate::graph::{codec, validate_edge, validate_label, validate_vertex};
 use crate::{
     Edge, KeyRange, ReadView, RequestId, ScanLimit, StorageNode, StorageNodeError, Value, Vertex,
     WriteOp, WriteRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type Result<T> = std::result::Result<T, ExperimentalError>;
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +59,29 @@ impl CrossEdge {
             label: self.label.clone(),
             properties: self.properties.clone(),
         }
+    }
+}
+/// A properties-only patch. Null is a stored value; removal is explicit.
+/// Empty patches and names appearing in both sets are rejected.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EdgePropertyPatch {
+    pub set: BTreeMap<String, Value>,
+    pub remove: BTreeSet<String>,
+}
+impl EdgePropertyPatch {
+    fn apply(&self, edge: &mut CrossEdge) -> Result<()> {
+        if self.set.is_empty() && self.remove.is_empty() {
+            return Err(ExperimentalError::Invalid("empty edge property patch"));
+        }
+        if self.set.keys().any(|key| self.remove.contains(key)) {
+            return Err(ExperimentalError::Invalid("overlapping set/remove keys"));
+        }
+        for key in &self.remove {
+            edge.properties.remove(key);
+        }
+        edge.properties.extend(self.set.clone());
+        validate_edge(&edge.local())?;
+        Ok(())
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +139,9 @@ impl PreparedBatch {
         Ok(self)
     }
 }
-/// No update, delete, v1 migration, or unqualified cross-edge API is provided.
+/// Isolated participant primitives. Creates remain append-only. The additive
+/// properties preparation changes only canonical edge properties; no delete,
+/// v1 migration, label/endpoint update, or unqualified cross-edge API exists.
 pub struct AppendOnlyStore<S> {
     node: S,
     shard: u64,
@@ -388,9 +414,12 @@ impl<S: StorageNode> AppendOnlyStore<S> {
     }
     pub fn get_edge(&self, id: u64) -> Result<Option<CrossEdge>> {
         let v = self.view()?;
+        self.edge_in(id, &v)
+    }
+    fn edge_in(&self, id: u64, v: &ReadView) -> Result<Option<CrossEdge>> {
         let Some(bytes) = self
             .node
-            .get(&record_key(self.partition, b"edge/", id), &v)?
+            .get(&record_key(self.partition, b"edge/", id), v)?
         else {
             return Ok(None);
         };
@@ -410,12 +439,51 @@ impl<S: StorageNode> AppendOnlyStore<S> {
             properties: local.properties,
         };
         if edge.id != id
-            || self.node.get(&index_key(&edge, Direction::Out), &v)? != Some(Vec::new())
-            || self.vertex_in(edge.from.id, &v)?.is_none()
+            || self.node.get(&index_key(&edge, Direction::Out), v)? != Some(Vec::new())
+            || self.vertex_in(edge.from.id, v)?.is_none()
         {
             return Err(ExperimentalError::Incomplete(edge.identity()));
         }
         Ok(Some(edge))
+    }
+    /// Prepare one canonical Put against a single source view. The expected
+    /// edge must match its exact canonical source encoding. The full routing API
+    /// additionally verifies the reverse index and target endpoint in its
+    /// frozen session before invoking this participant primitive.
+    pub fn prepare_source_properties(
+        &self,
+        expected: &CrossEdge,
+        patch: &EdgePropertyPatch,
+    ) -> Result<PreparedBatch> {
+        if expected.from.partition != self.partition {
+            return Err(ExperimentalError::Invalid("source owner mismatch"));
+        }
+        let mut updated = expected.clone();
+        patch.apply(&mut updated)?;
+        let v = self.view()?;
+        let current = self
+            .edge_in(expected.id, &v)?
+            .ok_or(ExperimentalError::Incomplete(expected.identity()))?;
+        // Compare bytes rather than f64 PartialEq: signed zeros must not hide
+        // a changed source record. NaN is already rejected by validation.
+        if current.to != expected.to
+            || codec::encode_edge(&current.local())? != codec::encode_edge(&expected.local())?
+        {
+            return Err(ExperimentalError::Incomplete(expected.identity()));
+        }
+        let bytes = wrap_record(
+            2,
+            updated.to.partition,
+            &codec::encode_edge(&updated.local())?,
+        );
+        check_record_size(&bytes)?;
+        self.batch(
+            &v,
+            vec![WriteOp::put(
+                record_key(self.partition, b"edge/", updated.id),
+                bytes,
+            )],
+        )
     }
     pub fn verify_reverse(&self, edge: &CrossEdge) -> Result<()> {
         if edge.to.partition != self.partition {

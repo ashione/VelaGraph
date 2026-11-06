@@ -1,4 +1,4 @@
-# Isolated append-only graph/v2 experiment
+# Isolated graph/v2 experiment
 
 Status: functional experiment, **not D4 transactions or complete D5 traversal**.
 The existing graph/v1 format, single-partition CRUD, K3 transactions and Gremlin
@@ -16,7 +16,7 @@ the opaque StorageNode protocol and existing graph adapters are unchanged.
 No production deployment, automatic repair, migration, TLS/authentication,
 complete cross-shard Gremlin, or distributed snapshot guarantee is added.
 
-## Identity and append-only mode
+## Identity and append-only creation
 
 `VertexRef { partition: u32, id: u64 }` qualifies endpoints. `EdgeRef` has the
 same fields, with partition always the source vertex's partition. Edge IDs are
@@ -28,7 +28,8 @@ qualified edge reference, not a second copy of the edge payload.
 `ExperimentalReadSession::prepare_edge` is the full endpoint-checking operation:
 it prepares both participants before any submission. Vertex and edge creation
 reject existing keys; conditional shard-sequence checks fence concurrent writers.
-There are no v2 update/delete APIs. V1 APIs cannot see, modify or delete v2 keys,
+The additive properties-only update API below is opt-in; there is no v2 delete
+API. V1 APIs cannot see, modify or delete v2 keys,
 so a v1 cascade cannot break v2 endpoints. Direct opaque D1/admin operations
 remain trusted escape hatches, as for v1. No integrity guarantee covers raw key
 modification. V1 and v2 prepared values are different types and cannot be passed
@@ -74,6 +75,57 @@ all I/O phases *within* one call share its absolute deadline. Holding a prepared
 value does not extend a read session. Commit uses the prepared frozen placements,
 not newly registered catalog entries. Epoch fencing is still checked by storage.
 There is no placement migration or ownership change support.
+
+## Additive edge property mutation
+
+`ExperimentalReadSession::prepare_edge_properties(EdgeRef, &EdgePropertyPatch)`
+returns a separate immutable `PreparedEdgeMutation`. Its patch has a sorted
+`set` map and `remove` set. An empty patch or any overlapping key is Invalid.
+Setting Null stores a present Null; removing an absent property is permitted.
+Nonempty patches that leave the same values still submit a conditional write.
+Property names and values use the existing graph validation/codec: finite reals
+(including signed zero), exact i64 integers, text, booleans and Null. The final
+encoded record must fit the existing 1 MiB cap. No new format or migration is
+introduced. Identity, label, endpoints and both adjacency indexes are immutable.
+
+Preparation first verifies the canonical record, source out index, target in
+index and both endpoints in the original frozen session. A missing canonical
+edge or incomplete visible edge is rejected with `Graph(Incomplete(edge))`.
+It prepares exactly one conditional source-shard Put; there is no target write.
+The low-level `AppendOnlyStore::prepare_source_properties` is only a participant
+primitive: it verifies the exact expected canonical source encoding and the
+source index/endpoint, not the remote reverse index/endpoint. Applications should use the session API.
+The existing low-level append preparation and `PreparedAppend` contract remain
+unchanged; create still rejects any existing canonical key.
+
+`RouteResolver::experimental_commit_mutation(&prepared, timeout)` submits that
+original source batch. The distinct `MutationAcknowledgement::AllBatchesAcknowledged`
+means historical acknowledgement of this request, not proof that its values
+remain current. `edge()`, `kind()` and `operation_id()` identify the mutation;
+the operation ID is the single participant's `source_request_id()`.
+The prepared object retains original bytes, sequence, epoch and placement.
+A shard-sequence CAS fences races, including unrelated writes to that source
+shard; conflicts are conservative and do not trigger automatic re-preparation.
+The original append error Stage/Rejected/Unknown contract applies unchanged.
+There is no reverse stage for a property mutation. Unknown may have committed:
+retain and explicitly retry the same prepared object, never recompute it.
+
+Dedup checks precede sequence CAS (but not epoch fencing). Retrying an old create
+or mutation after a newer property update acknowledges history without restoring
+old properties. Changed bytes or condition with the same request ID conflict.
+No durable client journal, automatic recovery, rollback, repair or ID reuse is
+added. Endpoint immutability under supported v2 APIs makes a source-only CAS
+sufficient for this properties slice; raw D1/admin edits remain outside the
+integrity guarantee, including target edits after preparation. Future endpoint
+mutation/deletion requires a separately reviewed protocol.
+
+Existing sessions and all observed traversal APIs retain their frozen views;
+a fresh session observes new source properties. Snapshot vectors remain non-global,
+and all successful observed results remain Unverified. This is an additive Rust
+coordination API, not new Gremlin mutation syntax or a complete transaction API.
+Tests cover exact values, Null/removal, bad/oversize patches, source invalidation,
+CAS races, reopen, lost acknowledgements, changed retry identities and historical
+retry after newer writes, plus normal-path independent process routing.
 
 ## Read contract: observed is not complete
 

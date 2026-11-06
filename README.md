@@ -555,3 +555,10 @@ The observed v3 subset also supports `outE`/`inE`/`bothE` and
 `bothE` emits a self-loop once; `bothV` emits both endpoint positions, twice
 for a loop. These steps remain unsupported by legacy Gremlin APIs and do not
 make observed experimental indexes complete or globally consistent.
+
+The opt-in v2 coordinator also supports properties-only edge updates via
+`prepare_edge_properties` and `experimental_commit_mutation`. One immutable
+source-shard CAS preserves identity, label, endpoints and indexes; exact retries
+never overwrite newer properties. Null and explicit removal are distinct.
+No deletion, automatic recovery or distributed transaction is implied.
+See [edge property mutations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-edge-property-mutation).

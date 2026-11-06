@@ -242,3 +242,11 @@ repair, cross-shard transactions and completeness certification remain future
 work. Legacy observed APIs are unchanged. The v3 functional subset now also supports
 edge adjacency and endpoint transitions with qualified paths, shared budgets,
 and explicitly unverified observations; this is not complete D5.
+
+### Experimental v2 edge properties
+
+The additive properties-only coordinator validates both observed indexes and
+endpoints, then prepares one source-shard conditional Put. Identity/label/endpoints
+remain fixed. Immutable exact retry preserves historical dedup after newer writes;
+Null/removal are explicit. This does not implement deletion, repair, distributed
+transactions or production transport security. V1 contracts remain unchanged.
