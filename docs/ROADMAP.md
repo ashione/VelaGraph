@@ -157,3 +157,10 @@
 3. 在 P0 产出接口 v0、基准脚本和验收清单，再进入编码。
 
 当前 PR #3 已合并，作为单机 SQL 原型保留；它不作为分布式图数据库的最终架构，但其 RocksDB 存储、键编码、索引和测试经验可直接复用到内核线。
+
+### 单分片 replicated Gremlin 增量
+
+`GraphRecordStore` 已复用标准 Gremlin v0 解析与算子，以一次 leader barrier
+取得固定 D1 view，分页扫描与邻接访问始终经过原 adapter。保留 view 支持同一
+sequence 的后续查询；context/epoch fencing 不绕过。此项仅为进程内单分片
+闭环，不代表 D5 跨分片遍历或生产查询服务。资源和错误契约见 `QUERY_SPEC.md`。

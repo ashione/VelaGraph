@@ -103,9 +103,43 @@ snapshot, never as a mixture. Reusing a parsed query acquires a new snapshot
 on each execution. Parsing precedes snapshot acquisition and the execution
 deadline includes snapshot acquisition; parsing itself is outside that deadline.
 
-This is a local single-partition guarantee, not a Raft read, distributed
-snapshot, or transaction with a query-visible write overlay. The internal
-backend does not change the storage-node scan contract.
+This local path is not a Raft read or a transaction with a query-visible write
+overlay. The same parser and operators also support the D1 path below.
+
+### Single-shard D1 and replicated queries
+
+`GraphRecordStore::execute_gremlin` and `GremlinQuery::execute_records` acquire
+exactly one `GraphRecordReadView` after parsing. Every start scan, point lookup,
+adjacency entry, edge and target vertex uses that view through the originating
+storage adapter. With `ReplicatedStorageNode`, acquisition requires one leader
+linearizability barrier. The query then reads the immutable D1 sequence, without
+another barrier per point or page. This is a single-shard, in-process prototype,
+not cross-shard snapshot isolation, routing, or a production query service.
+
+A retained `GraphRecordReadView` supports `execute_gremlin`, or
+`GremlinQuery::execute_record_view`, without refreshing the sequence. Already
+acquired views can remain readable after loss of quorum or leadership; new reads
+can fail with typed storage errors. Every actual point/page read still performs
+adapter context and epoch fencing. A retained view cannot bypass a changed epoch
+or enable synchronous calls from a Tokio worker. Use `replicated_graph::run_blocking`
+for this adapter, including retained-view queries.
+
+D1 queries require `scan_page`; unsupported pagination fails explicitly, without
+falling back to live reads or an all-or-error scan. Start pages contain at most
+256 rows; a leading `limit` reduces the last page's row bound. Adjacency is visited
+in pages and retains only the query's bounded output; it is not constrained by
+the separate 1,000-edge CRUD adjacency convenience API. Cross-label ordering,
+parallel-edge multiplicity, self-loop deduplication and errors use the same query
+operators as the local engine.
+
+D1 views retain their existing 1,000,000-row / 64 MiB total acquisition bounds.
+Query pages and individual graph records have an additional 16 MiB key-plus-value
+budget (`GRAPH_QUERY_PAGE_BYTES`). A record exceeding that budget fails with
+`StorageNode(ResourceExhausted)` for point reads or scans, never partial success.
+A leading limit need not read or decode later records. This D1-only byte bound
+does not change the existing local RocksDB query contract or graph encoding.
+The 5-second cooperative execution deadline includes new-view acquisition; it
+cannot preempt a single adapter dispatch, decode, allocation or destructor.
 
 ## 5. Value mapping
 
