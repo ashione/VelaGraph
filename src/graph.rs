@@ -425,46 +425,6 @@ impl GraphEngine {
         Ok(vertices)
     }
 
-    /// Scan at most `limit` vertices in id order. `truncated` is true when at
-    /// least one more vertex exists. Query execution uses this to enforce row
-    /// limits before materializing an unbounded result.
-    pub(crate) fn scan_vertices_checked(
-        &self,
-        limit: usize,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Vertex>, bool)> {
-        check()?;
-        let prefix = vertex_prefix(self.partition);
-        let mut vertices = Vec::new();
-        let mut truncated = false;
-        for item in self
-            .db
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            check()?;
-            let (key, bytes) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if vertices.len() >= limit {
-                truncated = true;
-                break;
-            }
-            let vertex = codec::decode_vertex(&bytes)?;
-            check()?;
-            let stored_id = id_from_record_key(&key, &prefix)?;
-            if vertex.id != stored_id {
-                return Err(Error::CorruptData(format!(
-                    "vertex key {stored_id} contains vertex {}",
-                    vertex.id
-                )));
-            }
-            vertices.push(vertex);
-        }
-        check()?;
-        Ok((vertices, truncated))
-    }
-
     /// All edges in this partition, ordered by id.
     pub fn edges(&self) -> Result<Vec<Edge>> {
         let prefix = edge_prefix(self.partition);
@@ -489,106 +449,6 @@ impl GraphEngine {
         }
         edges.sort_by_key(|edge| edge.id);
         Ok(edges)
-    }
-
-    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices_checked`].
-    pub(crate) fn scan_edges_checked(
-        &self,
-        limit: usize,
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<(Vec<Edge>, bool)> {
-        check()?;
-        let prefix = edge_prefix(self.partition);
-        let mut edges = Vec::new();
-        let mut truncated = false;
-        for item in self
-            .db
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            check()?;
-            let (key, bytes) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if edges.len() >= limit {
-                truncated = true;
-                break;
-            }
-            let edge = codec::decode_edge(&bytes)?;
-            check()?;
-            let stored_id = id_from_record_key(&key, &prefix)?;
-            if edge.id != stored_id {
-                return Err(Error::CorruptData(format!(
-                    "edge key {stored_id} contains edge {}",
-                    edge.id
-                )));
-            }
-            edges.push(edge);
-        }
-        check()?;
-        Ok((edges, truncated))
-    }
-
-    /// Visit adjacency records one at a time without collecting ids or properties.
-    /// The caller bounds retained rows and restores edge-id ordering (the index
-    /// groups records by label). Checks bracket storage reads and decoding, and
-    /// run after the visitor and before successful return, including empty scans.
-    pub(crate) fn visit_adjacent_edges(
-        &self,
-        vertex_id: u64,
-        incoming: bool,
-        label: Option<&str>,
-        check: &mut impl FnMut() -> Result<()>,
-        visit: &mut impl FnMut(Edge) -> Result<()>,
-    ) -> Result<()> {
-        check()?;
-        if let Some(label) = label {
-            validate_label(label)?;
-        }
-        let vertex_exists = self
-            .db
-            .get(vertex_key(self.partition, vertex_id))?
-            .is_some();
-        check()?;
-        if !vertex_exists {
-            return Err(Error::VertexNotFound(vertex_id));
-        }
-        let direction = if incoming {
-            EdgeDirection::In
-        } else {
-            EdgeDirection::Out
-        };
-        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
-        for item in self
-            .db
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            check()?;
-            let (stored_key, _) = item?;
-            if !stored_key.starts_with(&prefix) {
-                break;
-            }
-            let edge_id = edge_id_from_adjacency_key(&stored_key)?;
-            let bytes = self.db.get(edge_key(self.partition, edge_id))?;
-            check()?;
-            let Some(bytes) = bytes else {
-                return Err(Error::CorruptData(format!(
-                    "adjacency entry references missing edge {edge_id}"
-                )));
-            };
-            let edge = codec::decode_edge(&bytes)?;
-            check()?;
-            if edge.id != edge_id {
-                return Err(Error::CorruptData(format!(
-                    "edge key {edge_id} contains edge {}",
-                    edge.id
-                )));
-            }
-            visit(edge)?;
-            check()?;
-        }
-        check()?;
-        Ok(())
     }
 
     fn edges_by_direction(
@@ -659,6 +519,146 @@ impl GraphEngine {
 }
 
 impl GraphReadView<'_> {
+    /// Scan at most `limit` vertices in id order. `truncated` is true when at
+    /// least one more vertex exists. Query execution uses this to enforce row
+    /// limits before materializing an unbounded result.
+    pub(crate) fn scan_vertices_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Vertex>, bool)> {
+        check()?;
+        let prefix = vertex_prefix(self.partition);
+        let mut vertices = Vec::new();
+        let mut truncated = false;
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (key, bytes) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if vertices.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let vertex = codec::decode_vertex(&bytes)?;
+            check()?;
+            let stored_id = id_from_record_key(&key, &prefix)?;
+            if vertex.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "vertex key {stored_id} contains vertex {}",
+                    vertex.id
+                )));
+            }
+            vertices.push(vertex);
+        }
+        check()?;
+        Ok((vertices, truncated))
+    }
+
+    /// Scan at most `limit` edges in id order. See [`Self::scan_vertices_checked`].
+    pub(crate) fn scan_edges_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Edge>, bool)> {
+        check()?;
+        let prefix = edge_prefix(self.partition);
+        let mut edges = Vec::new();
+        let mut truncated = false;
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (key, bytes) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if edges.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let edge = codec::decode_edge(&bytes)?;
+            check()?;
+            let stored_id = id_from_record_key(&key, &prefix)?;
+            if edge.id != stored_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {stored_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            edges.push(edge);
+        }
+        check()?;
+        Ok((edges, truncated))
+    }
+
+    /// Visit adjacency records one at a time without collecting ids or properties.
+    /// The caller bounds retained rows and restores edge-id ordering (the index
+    /// groups records by label). Checks bracket storage reads and decoding, and
+    /// run after the visitor and before successful return, including empty scans.
+    pub(crate) fn visit_adjacent_edges(
+        &self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(Edge) -> Result<()>,
+    ) -> Result<()> {
+        check()?;
+        if let Some(label) = label {
+            validate_label(label)?;
+        }
+        let vertex_exists = self
+            .snapshot
+            .get(vertex_key(self.partition, vertex_id))?
+            .is_some();
+        check()?;
+        if !vertex_exists {
+            return Err(Error::VertexNotFound(vertex_id));
+        }
+        let direction = if incoming {
+            EdgeDirection::In
+        } else {
+            EdgeDirection::Out
+        };
+        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            check()?;
+            let (stored_key, _) = item?;
+            if !stored_key.starts_with(&prefix) {
+                break;
+            }
+            let edge_id = edge_id_from_adjacency_key(&stored_key)?;
+            let bytes = self.snapshot.get(edge_key(self.partition, edge_id))?;
+            check()?;
+            let Some(bytes) = bytes else {
+                return Err(Error::CorruptData(format!(
+                    "adjacency entry references missing edge {edge_id}"
+                )));
+            };
+            let edge = codec::decode_edge(&bytes)?;
+            check()?;
+            if edge.id != edge_id {
+                return Err(Error::CorruptData(format!(
+                    "edge key {edge_id} contains edge {}",
+                    edge.id
+                )));
+            }
+            visit(edge)?;
+            check()?;
+        }
+        check()?;
+        Ok(())
+    }
+
     /// The RocksDB sequence pinned by this view.
     pub fn sequence(&self) -> u64 {
         self.snapshot.sequence_number()
@@ -1269,9 +1269,15 @@ mod query_scan_tests {
                 }
             };
             let result = if vertices {
-                graph.scan_vertices_checked(10, &mut check).map(|_| ())
+                graph
+                    .read_view()
+                    .scan_vertices_checked(10, &mut check)
+                    .map(|_| ())
             } else {
-                graph.scan_edges_checked(10, &mut check).map(|_| ())
+                graph
+                    .read_view()
+                    .scan_edges_checked(10, &mut check)
+                    .map(|_| ())
             };
             assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
             assert_eq!(checks, 2);
@@ -1295,9 +1301,15 @@ mod query_scan_tests {
                 }
             };
             let result = if vertices {
-                graph.scan_vertices_checked(10, &mut check).map(|_| ())
+                graph
+                    .read_view()
+                    .scan_vertices_checked(10, &mut check)
+                    .map(|_| ())
             } else {
-                graph.scan_edges_checked(10, &mut check).map(|_| ())
+                graph
+                    .read_view()
+                    .scan_edges_checked(10, &mut check)
+                    .map(|_| ())
             };
             assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
             assert_eq!(checks, 3);
@@ -1311,7 +1323,7 @@ mod query_scan_tests {
         graph.create_vertex(&Vertex::new(1)).unwrap();
         graph.create_edge(&Edge::new(2, 1, 1, "LOOP")).unwrap();
         let visited = Cell::new(false);
-        let result = graph.visit_adjacent_edges(
+        let result = graph.read_view().visit_adjacent_edges(
             1,
             false,
             None,
@@ -1341,10 +1353,13 @@ mod query_scan_tests {
         }
         graph.db.put(edge_key(graph.partition, 3), b"bad").unwrap();
         let mut visited = Vec::new();
-        let result = graph.visit_adjacent_edges(1, false, None, &mut || Ok(()), &mut |edge| {
-            visited.push(edge.id);
-            Err(exhausted())
-        });
+        let result =
+            graph
+                .read_view()
+                .visit_adjacent_edges(1, false, None, &mut || Ok(()), &mut |edge| {
+                    visited.push(edge.id);
+                    Err(exhausted())
+                });
         assert_eq!(visited, vec![2]);
         assert!(matches!(result, Err(Error::TraversalLimitExceeded(_))));
     }
