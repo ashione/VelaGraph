@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use openraft::storage::RaftStateMachine;
@@ -14,11 +14,51 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::blocking::blocking_section;
-use crate::d1::D1State;
+use crate::d1::{D1State, DedupRecord, MAX_DEDUP_REQUESTS};
 use crate::types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};
 use crate::{D1Command, D1Error, D1Result, D1WriteStatus};
 
 const D1_KEY: &[u8] = b"sm/d1";
+const DEDUP_PREFIX: &[u8] = b"sm/dedup/";
+const DEDUP_PREFIX_END: &[u8] = b"sm/dedup0";
+
+// Disk-only v2. Logical snapshots retain their complete v1 D1 state. Old
+// binaries reject this header rather than silently losing retry identities.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1MetadataV2 {
+    version: u32,
+    shard: u64,
+    epoch: u64,
+    sequence: u64,
+}
+
+impl D1MetadataV2 {
+    fn of(state: &D1State) -> Self {
+        Self {
+            version: 2,
+            shard: state.shard,
+            epoch: state.epoch,
+            sequence: state.sequence,
+        }
+    }
+}
+
+fn dedup_key(sequence: u64) -> Vec<u8> {
+    let mut key = DEDUP_PREFIX.to_vec();
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+fn put_dedup(batch: &mut WriteBatch, records: &[DedupRecord]) -> Result<(), StorageError<NodeId>> {
+    for record in records {
+        batch.put(
+            dedup_key(record.sequence),
+            serde_json::to_vec(record).map_err(write_error)?,
+        );
+    }
+    Ok(())
+}
 const DATA_PREFIX: &[u8] = b"sm/data/";
 const DATA_PREFIX_END: &[u8] = b"sm/data0";
 const APPLIED_KEY: &[u8] = b"sm/applied";
@@ -77,10 +117,17 @@ fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<DecodedSnapshot> {
 #[derive(Debug)]
 struct StateMachineStorage {
     db: DB,
+    legacy_d1: AtomicBool,
+    #[cfg(test)]
+    fail_next_write: AtomicBool,
 }
 
 impl StateMachineStorage {
     fn write_sync(&self, batch: WriteBatch) -> Result<(), StorageError<NodeId>> {
+        #[cfg(test)]
+        if self.fail_next_write.swap(false, Ordering::Relaxed) {
+            return Err(write_error(std::io::Error::other("injected sync failure")));
+        }
         let mut options = WriteOptions::default();
         options.set_sync(true);
         self.db
@@ -143,13 +190,65 @@ impl StateMachine {
         options.create_if_missing(true);
         options.set_compression_type(DBCompressionType::None);
         let db = DB::open(&options, path.as_ref())?;
-        let storage = Arc::new(StateMachineStorage { db });
+        let storage = Arc::new(StateMachineStorage {
+            db,
+            legacy_d1: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_write: AtomicBool::new(false),
+        });
 
-        let d1: Option<D1State> = storage
+        let mut d1 = None;
+        if let Some(bytes) = storage.db.get(D1_KEY)? {
+            // Inspect only the discriminator; deserialize directly from bytes so
+            // large legacy requests do not also become a serde_json::Value tree.
+            #[derive(Deserialize)]
+            struct Version {
+                version: u32,
+            }
+            match serde_json::from_slice::<Version>(&bytes)?.version {
+                1 => {
+                    d1 = Some(serde_json::from_slice::<D1State>(&bytes)?);
+                    storage.legacy_d1.store(true, Ordering::Relaxed);
+                }
+                2 => {
+                    let meta: D1MetadataV2 = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        meta.sequence <= MAX_DEDUP_REQUESTS as u64,
+                        "D1 dedup capacity exceeded"
+                    );
+                    let mut state = D1State::new(meta.shard, meta.epoch);
+                    state.sequence = meta.sequence;
+                    d1 = Some(state);
+                }
+                _ => anyhow::bail!("unsupported D1 disk version"),
+            }
+        }
+        for item in storage
             .db
-            .get(D1_KEY)?
-            .map(|bytes| serde_json::from_slice(&bytes))
-            .transpose()?;
+            .iterator(IteratorMode::From(DEDUP_PREFIX, Direction::Forward))
+        {
+            let (key, value) = item?;
+            if !key.starts_with(DEDUP_PREFIX) {
+                break;
+            }
+            anyhow::ensure!(
+                !storage.legacy_d1.load(Ordering::Relaxed),
+                "legacy D1 state has unexpected incremental retry records"
+            );
+            let state = d1
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("orphan D1 retry record"))?;
+            anyhow::ensure!(
+                state.dedup.len() < MAX_DEDUP_REQUESTS,
+                "D1 dedup capacity exceeded"
+            );
+            let record: DedupRecord = serde_json::from_slice(&value)?;
+            anyhow::ensure!(
+                key.as_ref() == dedup_key(record.sequence),
+                "D1 retry key/sequence mismatch"
+            );
+            state.dedup.push(record);
+        }
         if let Some(d1) = &d1 {
             d1.validate()?;
         }
@@ -344,7 +443,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     {
         let mut sm = self.state.write().await;
         blocking_section(|| {
-            let mut next = sm.clone();
+            let mut next = ApplyDelta::new(&sm);
             let mut out = Vec::new();
             let mut batch = WriteBatch::default();
 
@@ -373,11 +472,11 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                                 if next.d1.is_some() {
                                     result.d1 = Some(Err(D1Error::LegacyWriteDisabled));
                                 } else {
-                                    apply_operations(&mut next, &mut batch, operations);
+                                    apply_operations(&sm, &mut next, &mut batch, operations);
                                 }
                             }
                             LogCommand::D1V1(command) => {
-                                result.d1 = Some(apply_d1(&mut next, &mut batch, command));
+                                result.d1 = Some(apply_d1(&sm, &mut next, &mut batch, command));
                             }
                         }
                         out.push(result);
@@ -389,13 +488,23 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
                 let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
                 if let Some(d1) = &next.d1 {
-                    batch.put(D1_KEY, serde_json::to_vec(d1).map_err(write_error)?);
+                    batch.put(
+                        D1_KEY,
+                        serde_json::to_vec(&D1MetadataV2::of(d1)).map_err(write_error)?,
+                    );
+                    if storage.legacy_d1.load(Ordering::Relaxed) {
+                        if let Some(previous) = &sm.d1 {
+                            put_dedup(&mut batch, &previous.dedup)?;
+                        }
+                    }
+                    put_dedup(&mut batch, &d1.dedup)?;
                 } else {
                     batch.delete(D1_KEY);
                 }
                 batch.put(APPLIED_KEY, applied);
                 batch.put(MEMBERSHIP_KEY, membership);
                 storage.write_sync(batch)?;
+                storage.legacy_d1.store(false, Ordering::Relaxed);
             }
             #[cfg(test)]
             if let Some(gate) = self.apply_publish_gate.lock().unwrap().take() {
@@ -404,7 +513,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .expect("test must release apply publication gate");
             }
-            *sm = next;
+            next.publish(&mut sm);
             Ok(out)
         })
     }
@@ -487,8 +596,13 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
             let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
             let snapshot = serde_json::to_vec(&stored).map_err(write_error)?;
+            batch.delete_range(DEDUP_PREFIX, DEDUP_PREFIX_END);
             if let Some(d1) = &next.d1 {
-                batch.put(D1_KEY, serde_json::to_vec(d1).map_err(write_error)?);
+                batch.put(
+                    D1_KEY,
+                    serde_json::to_vec(&D1MetadataV2::of(d1)).map_err(write_error)?,
+                );
+                put_dedup(&mut batch, &d1.dedup)?;
             } else {
                 batch.delete(D1_KEY);
             }
@@ -496,6 +610,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             batch.put(MEMBERSHIP_KEY, membership);
             batch.put(SNAPSHOT_KEY, snapshot);
             storage.write_sync(batch)?;
+            storage.legacy_d1.store(false, Ordering::Relaxed);
         }
 
         *sm = next;
@@ -520,23 +635,83 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     }
 }
 
-fn apply_operations(next: &mut StateMachineData, batch: &mut WriteBatch, operations: Vec<WriteOp>) {
-    for operation in operations {
-        match operation {
-            WriteOp::Put { key, value } => {
-                next.data.insert(key.clone(), value.clone());
-                batch.put(data_key(&key), value);
-            }
-            WriteOp::Delete { key } => {
-                next.data.remove(&key);
-                batch.delete(data_key(&key));
+/// An apply-call overlay. Only changed keys and newly accepted retry identities
+/// are owned here; the published state remains untouched until sync succeeds.
+struct ApplyDelta {
+    last_applied_log: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
+    d1: Option<D1State>,
+    data: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    data_len: usize,
+}
+
+impl ApplyDelta {
+    fn new(state: &StateMachineData) -> Self {
+        Self {
+            last_applied_log: state.last_applied_log,
+            last_membership: state.last_membership.clone(),
+            d1: state.d1.as_ref().map(D1State::stage),
+            data: BTreeMap::new(),
+            data_len: state.data.len(),
+        }
+    }
+
+    fn publish(self, state: &mut StateMachineData) {
+        for (key, value) in self.data {
+            match value {
+                Some(value) => {
+                    state.data.insert(key, value);
+                }
+                None => {
+                    state.data.remove(&key);
+                }
             }
         }
+        if let Some(mut next) = self.d1 {
+            if let Some(previous) = state.d1.as_mut() {
+                previous.epoch = next.epoch;
+                previous.sequence = next.sequence;
+                previous.dedup.append(&mut next.dedup);
+            } else {
+                state.d1 = Some(next);
+            }
+        }
+        state.last_applied_log = self.last_applied_log;
+        state.last_membership = self.last_membership;
+    }
+}
+
+fn apply_operations(
+    base: &StateMachineData,
+    next: &mut ApplyDelta,
+    batch: &mut WriteBatch,
+    operations: Vec<WriteOp>,
+) {
+    for operation in operations {
+        let (key, value) = match operation {
+            WriteOp::Put { key, value } => (key, Some(value)),
+            WriteOp::Delete { key } => (key, None),
+        };
+        let existed = next
+            .data
+            .get(&key)
+            .map_or_else(|| base.data.contains_key(&key), Option::is_some);
+        match (&value, existed) {
+            (Some(_), false) => next.data_len += 1,
+            (None, true) => next.data_len -= 1,
+            _ => {}
+        }
+        match &value {
+            Some(value) => batch.put(data_key(&key), value),
+            None => batch.delete(data_key(&key)),
+        }
+        next.data.insert(key, value);
     }
 }
 
 fn apply_d1(
-    next: &mut StateMachineData,
+    base: &StateMachineData,
+    next: &mut ApplyDelta,
     batch: &mut WriteBatch,
     command: D1Command,
 ) -> Result<D1Result, D1Error> {
@@ -546,7 +721,7 @@ fn apply_d1(
                 d1.check_shard(shard)?;
                 d1.check_epoch(epoch)?;
             } else {
-                if !next.data.is_empty() {
+                if next.data_len != 0 {
                     return Err(D1Error::LegacyDataPresent);
                 }
                 next.d1 = Some(D1State::new(shard, epoch));
@@ -572,7 +747,7 @@ fn apply_d1(
         }
         D1Command::Write(request) => {
             let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
-            let result = d1.write(&request)?;
+            let result = d1.write_with_history(&request, base.d1.as_ref())?;
             if matches!(
                 result,
                 D1Result::Write {
@@ -580,7 +755,7 @@ fn apply_d1(
                     ..
                 }
             ) {
-                apply_operations(next, batch, request.operations);
+                apply_operations(base, next, batch, request.operations);
             }
             Ok(result)
         }
@@ -671,6 +846,364 @@ mod apply_publication_tests {
         let reopened = StateMachine::open(dir.path())?;
         assert_eq!(reopened.applied().await, Some(entry(2, "").log_id));
         assert_eq!(reopened.get("key").await.as_deref(), Some("new"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod incremental_apply_tests {
+    use super::*;
+    use crate::D1WriteRequest;
+    use openraft::CommittedLeaderId;
+
+    fn entry(index: u64, command: D1Command) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(LogCommand::D1V1(command)),
+        }
+    }
+
+    fn write(id: u8, expected: u64) -> D1Command {
+        D1Command::Write(D1WriteRequest {
+            shard: 7,
+            epoch: 3,
+            request_id: [id; 16],
+            expected_sequence: Some(expected),
+            operations: vec![
+                WriteOp::put(b"key", [id]),
+                WriteOp::put(b"gone", [id]),
+                WriteOp::delete(b"gone"),
+            ],
+        })
+    }
+
+    fn activate() -> Entry<TypeConfig> {
+        entry(1, D1Command::Activate { shard: 7, epoch: 3 })
+    }
+
+    // Construct the exact old layout, including graph bytes and the applied
+    // marker, without calling any new persistence helpers.
+    async fn legacy_fixture(path: &Path) -> anyhow::Result<()> {
+        let mut memory = Arc::new(StateMachine::default());
+        memory.apply([activate(), entry(2, write(1, 0))]).await?;
+        let state = memory.state.read().await;
+        let db = DB::open_default(path)?;
+        let mut batch = WriteBatch::default();
+        batch.put(D1_KEY, serde_json::to_vec(state.d1.as_ref().unwrap())?);
+        batch.put(APPLIED_KEY, serde_json::to_vec(&state.last_applied_log)?);
+        batch.put(MEMBERSHIP_KEY, serde_json::to_vec(&state.last_membership)?);
+        for (key, value) in &state.data {
+            batch.put(data_key(key), value);
+        }
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        db.write_opt(batch, &options)?;
+        Ok(())
+    }
+
+    fn disk_records(sm: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .db
+            .iterator(IteratorMode::From(DEDUP_PREFIX, Direction::Forward))
+            .map(Result::unwrap)
+            .take_while(|(k, _)| k.starts_with(DEDUP_PREFIX))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn migration_is_lazy_atomic_and_keeps_historical_retries() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        legacy_fixture(dir.path()).await?;
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        let old = sm.storage.as_ref().unwrap().db.get(D1_KEY)?.unwrap();
+        assert!(serde_json::from_slice::<D1State>(&old).is_ok());
+        assert!(disk_records(&sm).is_empty());
+        let before = sm.state.read().await.clone();
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm.apply([entry(3, write(2, 1))]).await.is_err());
+        {
+            let after = sm.state.read().await;
+            assert_eq!(after.data, before.data);
+            assert_eq!(after.d1, before.d1);
+            assert_eq!(after.last_applied_log, before.last_applied_log);
+            assert_eq!(after.last_membership, before.last_membership);
+        }
+        assert_eq!(sm.storage.as_ref().unwrap().db.get(D1_KEY)?.unwrap(), old);
+        assert!(disk_records(&sm).is_empty());
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        let result = sm
+            .apply([
+                entry(3, write(1, 0)),
+                entry(4, write(2, 1)),
+                entry(5, write(2, 1)),
+            ])
+            .await?;
+        assert!(matches!(
+            result[0].d1,
+            Some(Ok(D1Result::Write {
+                sequence: 1,
+                status: D1WriteStatus::Duplicate,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            result[1].d1,
+            Some(Ok(D1Result::Write {
+                sequence: 2,
+                status: D1WriteStatus::Committed,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            result[2].d1,
+            Some(Ok(D1Result::Write {
+                sequence: 2,
+                status: D1WriteStatus::Duplicate,
+                ..
+            }))
+        ));
+        assert_eq!(disk_records(&sm).len(), 2);
+        let header = sm.storage.as_ref().unwrap().db.get(D1_KEY)?.unwrap();
+        assert_eq!(header, br#"{"version":2,"shard":7,"epoch":3,"sequence":2}"#);
+        // This is precisely the old binary's D1 decoder: reject rather than
+        // treating separated records as empty or accepting the newer version.
+        assert!(serde_json::from_slice::<D1State>(&header).is_err());
+        assert_eq!(dedup_key(1), b"sm/dedup/\0\0\0\0\0\0\0\x01");
+        assert_eq!(
+            disk_records(&sm)[0].1,
+            serde_json::to_vec(&serde_json::from_slice::<D1State>(&old)?.dedup[0])?
+        );
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        assert_eq!(sm.d1_metadata().await, Some((7, 3, 2)));
+        assert_eq!(sm.applied().await.unwrap().index, 5);
+        assert_eq!(sm.get_raw(b"key").await, Some(vec![2]));
+        assert_eq!(sm.get_raw(b"gone").await, None);
+        assert!(matches!(
+            sm.apply([entry(6, write(1, 0))]).await?[0].d1,
+            Some(Ok(D1Result::Write {
+                sequence: 1,
+                status: D1WriteStatus::Duplicate,
+                ..
+            }))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_apply_does_not_clone_untouched_values_or_rewrite_history(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        sm.apply([activate(), entry(2, write(1, 0))]).await?;
+        let value_pointer = sm.state.read().await.data[b"key".as_slice()].as_ptr();
+        let records = disk_records(&sm);
+        let mut request = match write(2, 1) {
+            D1Command::Write(r) => r,
+            _ => unreachable!(),
+        };
+        request.operations = vec![WriteOp::put(b"another", vec![42; 1024])];
+        let disk_sequence = sm.storage.as_ref().unwrap().db.latest_sequence_number();
+        sm.apply([entry(3, D1Command::Write(request))]).await?;
+        // Exactly one data key, one new retry record, and three metadata keys.
+        // Rewriting any retained record would increase this RocksDB sequence.
+        assert_eq!(
+            sm.storage.as_ref().unwrap().db.latest_sequence_number() - disk_sequence,
+            5
+        );
+        assert_eq!(
+            sm.state.read().await.data[b"key".as_slice()].as_ptr(),
+            value_pointer
+        );
+        assert_eq!(disk_records(&sm)[0], records[0]);
+        let storage = sm.storage.as_ref().unwrap();
+        let header = storage.db.get(D1_KEY)?.unwrap();
+        assert!(header.len() < 100);
+        // A rejected command advances only the applied marker; all historical
+        // retry identity bytes stay the same across a failed CAS and a noop.
+        let before = disk_records(&sm);
+        sm.apply([entry(4, write(3, 0))]).await?;
+        assert_eq!(disk_records(&sm), before);
+        assert_eq!(sm.d1_metadata().await, Some((7, 3, 2)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_replaces_incremental_retry_range_and_reopens() -> anyhow::Result<()> {
+        let mut source = Arc::new(StateMachine::default());
+        source.apply([activate(), entry(10, write(1, 0))]).await?;
+        let snapshot = source.build_snapshot().await?;
+        let decoded: SnapshotV1 = serde_json::from_slice(snapshot.snapshot.get_ref())?;
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.d1.dedup.len(), 1);
+        let dir = tempfile::tempdir()?;
+        let mut target = Arc::new(StateMachine::open(dir.path())?);
+        target
+            .apply([activate(), entry(2, write(2, 0)), entry(3, write(3, 1))])
+            .await?;
+        assert_eq!(disk_records(&target).len(), 2);
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await?;
+        assert_eq!(disk_records(&target).len(), 1);
+        drop(target);
+        let mut target = Arc::new(StateMachine::open(dir.path())?);
+        assert_eq!(target.d1_metadata().await, Some((7, 3, 1)));
+        assert!(matches!(
+            target.apply([entry(11, write(1, 0))]).await?[0].d1,
+            Some(Ok(D1Result::Write {
+                status: D1WriteStatus::Duplicate,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            target.apply([entry(12, write(2, 1))]).await?[0].d1,
+            Some(Ok(D1Result::Write {
+                status: D1WriteStatus::Committed,
+                sequence: 2,
+                ..
+            }))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_mismatched_or_orphan_retry_records_fail_closed() -> anyhow::Result<()> {
+        for corruption in 0..4 {
+            let dir = tempfile::tempdir()?;
+            let mut sm = Arc::new(StateMachine::open(dir.path())?);
+            sm.apply([activate(), entry(2, write(1, 0))]).await?;
+            let db = &sm.storage.as_ref().unwrap().db;
+            match corruption {
+                0 => db.delete(dedup_key(1))?,
+                1 => {
+                    let record = db.get(dedup_key(1))?.unwrap();
+                    db.put(dedup_key(2), record)?;
+                }
+                2 => db.delete(D1_KEY)?,
+                _ => {
+                    let legacy = serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap())?;
+                    db.put(D1_KEY, legacy)?;
+                }
+            }
+            drop(sm);
+            assert!(
+                StateMachine::open(dir.path()).is_err(),
+                "corruption {corruption}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_overlay_activation_observes_ordered_deletes() -> anyhow::Result<()> {
+        let mut sm = Arc::new(StateMachine::default());
+        let mut put = activate();
+        put.payload = EntryPayload::Normal(LogCommand::put("key", "old"));
+        sm.apply([put]).await?;
+        let rejected = sm
+            .apply([entry(2, D1Command::Activate { shard: 7, epoch: 3 })])
+            .await?;
+        assert!(matches!(
+            rejected[0].d1,
+            Some(Err(D1Error::LegacyDataPresent))
+        ));
+        let mut remove = activate();
+        remove.log_id.index = 3;
+        remove.payload = EntryPayload::Normal(LogCommand::txn(vec![
+            WriteOp::put(b"key", b"new"),
+            WriteOp::delete(b"key"),
+            WriteOp::delete(b"key"),
+        ]));
+        sm.apply([
+            remove,
+            entry(4, D1Command::Activate { shard: 7, epoch: 3 }),
+            entry(5, write(1, 0)),
+        ])
+        .await?;
+        assert_eq!(sm.d1_metadata().await, Some((7, 3, 1)));
+        assert_eq!(sm.get_raw(b"key").await, Some(vec![1]));
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_crash_child() -> anyhow::Result<()> {
+        let Some(path) = std::env::var_os("D2_MIGRATION_CRASH_DIRECTORY") else {
+            return Ok(());
+        };
+        let path = std::path::PathBuf::from(path);
+        legacy_fixture(&path.join("state.db")).await?;
+        let mut sm = Arc::new(StateMachine::open(path.join("state.db"))?);
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (_release, gate) = std::sync::mpsc::channel();
+        *sm.apply_publish_gate.lock().unwrap() = Some(ApplyPublishGate {
+            entered,
+            release: gate,
+        });
+        let writer = tokio::spawn(async move { sm.apply([entry(3, write(2, 1))]).await });
+        ready.await?;
+        std::fs::write(path.join("synced"), b"ready")?;
+        // Parent kills this entire process after observing the fsync boundary.
+        writer.await??;
+        anyhow::bail!("parent did not kill migration child before publication")
+    }
+
+    #[tokio::test]
+    async fn process_death_after_migration_sync_recovers_complete_retry_identity(
+    ) -> anyhow::Result<()> {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "state_machine::incremental_apply_tests::migration_crash_child",
+                    "--nocapture",
+                ])
+                .env("D2_MIGRATION_CRASH_DIRECTORY", dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while !dir.path().join("synced").exists() {
+                anyhow::ensure!(
+                    child.0.try_wait()?.is_none(),
+                    "migration child exited before sync"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        child.0.kill()?;
+        child.0.wait()?;
+        let mut sm = Arc::new(StateMachine::open(dir.path().join("state.db"))?);
+        assert_eq!(sm.d1_metadata().await, Some((7, 3, 2)));
+        assert_eq!(sm.applied().await.unwrap().index, 3);
+        assert_eq!(sm.get_raw(b"key").await, Some(vec![2]));
+        assert_eq!(disk_records(&sm).len(), 2);
+        let results = sm
+            .apply([entry(4, write(1, 0)), entry(5, write(2, 1))])
+            .await?;
+        for (index, result) in results.iter().enumerate() {
+            assert!(
+                matches!(result.d1, Some(Ok(D1Result::Write { sequence, status: D1WriteStatus::Duplicate, .. })) if sequence == index as u64 + 1)
+            );
+        }
         Ok(())
     }
 }

@@ -190,7 +190,8 @@ safeguards, not production authentication or authorization.
 ## Synchronous work and runtime scheduling
 
 The TCP prototype uses a multithread Tokio runtime. State-machine apply still
-clones and validates its next state, serializes D1 retry metadata, syncs the
+stages and validates changed keys/new retry records, serializes incremental D1
+retry metadata, syncs the
 RocksDB batch, and only then publishes the in-memory state under the original
 write lock. Durable log callbacks similarly retain their original mutex through
 encoding, synchronous I/O and the log-flushed callback. These synchronous
@@ -206,8 +207,9 @@ election timeouts, or frame limits. A current-thread executor or a caller outsid
 Tokio keeps the previous inline behavior; this change does not promise responsive
 single-thread hosting. Snapshot build/install and some read-side cloning still
 perform synchronous work on their existing paths; this patch is not a complete
-blocking-work audit. It also does not remove full-state/dedup rewrite costs or
-guarantee availability under arbitrary CPU, I/O or network starvation.
+blocking-work audit. Incremental apply now removes full-state cloning and historical-dedup rewrites
+(see D2_D1_CONTRACT.md); full snapshots still have whole-state costs. This does
+not guarantee availability under arbitrary CPU, I/O or network starvation.
 
 A single-worker multithread regression checks that an explicitly spawned
 synchronous task permits another explicitly spawned task to run. Compatibility

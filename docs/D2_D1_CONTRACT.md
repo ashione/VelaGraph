@@ -99,20 +99,55 @@ retention/garbage-collection protocol; silently evicting ids would weaken the
 retry guarantee. This conservative limit deliberately bounds the experimental
 slice rather than pretending to offer unlimited production throughput.
 
-The state machine still clones its data map per apply and uses full logical
-snapshots. It is a correctness prototype, not a production memory/latency design.
+Apply stages only changed keys and newly accepted retry records. Full logical
+snapshots and the retained in-memory data/retry history remain; this is still a
+bounded prototype, not an unlimited production memory/latency design.
 The test transport remains unauthenticated and has no production backpressure.
 Process restart tests are not power-loss/WAL fault-injection evidence.
 
 ## Durable and snapshot format
 
 The existing `sm/data/`, `sm/applied`, `sm/membership` and `sm/snapshot` keys are
-unchanged. New `sm/d1` contains required JSON fields in declaration order:
-`version` (=1), `shard`, `epoch`, `sequence`, and `dedup`. Each retained record
-contains `request` (including its original epoch, condition and ordered bytes)
-and its original `sequence`. Missing `sm/d1` means the legacy byte-batch mode;
-unknown versions and malformed state fail reopen instead of being interpreted
-as empty metadata. Activated state without an applied marker is rejected.
+unchanged. Disk metadata version 2 stores `sm/d1` with required JSON fields in
+this order: `version` (=2), `shard`, `epoch`, and `sequence`. For example:
+
+```json
+{"version":2,"shard":7,"epoch":3,"sequence":1}
+```
+
+Each retained retry record is stored at `sm/dedup/` followed by its original
+sequence as eight big-endian bytes (sequence 1: `736d2f64656475702f0000000000000001`).
+Its value preserves the v1 record JSON: `request` (original shard, epoch, request
+id, condition and ordered operations) followed by `sequence`. Keys are ordered
+by sequence. Every record must match its key; sequence, ownership, uniqueness,
+completeness and the original dedup bounds are validated on reopen. Missing
+`sm/d1` means legacy byte-batch mode only if there are no retry records; orphan
+records and unknown versions fail closed. Activated state requires its applied
+marker.
+
+Version 1's complete `sm/d1` JSON remains readable. Opening it is read-only.
+The first successful apply atomically writes every retained v1 record to the
+incremental range, changes the header to v2, and persists any new data, retry
+records, sequence, membership and applied marker in the same synchronous batch.
+A pre-commit failure leaves both the published state and v1 disk layout unchanged.
+Any reported storage error leaves live state unpublished and is fatal to Raft
+storage processing. A real I/O/fsync error may have an uncertain durable outcome:
+stop and reopen to establish which complete atomic batch recovered; do not infer
+disk rollback from the error. The failure-injection test rejects before RocksDB
+write, and the process-crash test kills after successful sync. Neither is a
+power-loss or filesystem-corruption proof.
+Subsequent applies persist only newly accepted records and small metadata;
+rejections and exact retries do not rewrite old request bytes. No records are
+pruned, hashed in place of exact identity, or granted extra capacity.
+
+Apply keeps a changed-key overlay and a metadata/new-record overlay. Requests
+see both published and earlier-in-this-call retry history; ordered operations
+and legacy activation see earlier changes in the same call. Until fsync succeeds,
+the published data, sequence, dedup and marker are untouched. Publication runs
+under the same write lock and on the same non-yielding stack, without an await or
+detached task between persistence and publication. Failed persistence discards
+the overlay. Full snapshot install atomically replaces the complete retry range,
+so records belonging to a superseded snapshot cannot survive.
 
 Legacy snapshots remain a JSON array of sorted `[key_bytes, value_bytes]` pairs
 until activation. Activated snapshots have the exact envelope:
@@ -139,6 +174,16 @@ pre-batch `Put`/`Delete` experiments. Start those experiments with fresh data.
 To activate a legacy group, first upgrade **all replicas and clients**, and use
 an empty data map. Nonempty legacy data needs a separately designed migration;
 activation does not assign it an invented application sequence or retry history.
+
+For an already D1-aware v1 binary, the new disk-v2 header fails its strict v1
+D1 decoder. **Do not start an old binary against a migrated state.db.** An old
+binary must not silently load a partial retry history. Upgrade all replicas
+before accepting new work; mixed-version operation is not certified. Logical
+snapshot and Raft log/wire bytes stay v1-compatible, but that alone is not a
+supported in-place downgrade procedure. Preserve a pre-upgrade backup; restoring
+it loses later commits unless a separately validated recovery procedure transfers
+the complete state and retry identities. This change does not provide such a
+downgrade tool or rewrite user data on open.
 
 There is no version negotiation. **Mixed-version replication and rolling
 activation are unsupported. Do not downgrade a group after D1 activation.** Old
