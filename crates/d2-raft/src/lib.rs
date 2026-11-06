@@ -10,6 +10,7 @@
 //! The Raft log store is adapted from openraft's MIT/Apache-2.0 `memstore`
 //! example (https://github.com/databendlabs/openraft); see NOTICE.
 
+mod d1;
 mod durable_log_store;
 mod log_store;
 mod network;
@@ -18,6 +19,10 @@ mod state_machine;
 pub mod tcp;
 mod types;
 
+pub use d1::{
+    D1Command, D1Error, D1Result, D1WriteRequest, D1WriteStatus, MAX_BATCH_BYTES,
+    MAX_BATCH_OPERATIONS, MAX_DEDUP_BYTES, MAX_DEDUP_REQUESTS,
+};
 pub use durable_log_store::DurableLogStore;
 pub use log_store::LogStore;
 pub use network::{DropPolicy, NetworkFactory, Registry};

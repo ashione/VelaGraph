@@ -76,6 +76,8 @@
 - **完成定义**：3 节点集群可写入；杀掉 leader 后 30 秒内恢复；重复/乱序消息测试通过。
 - **依赖**：D1；选型已定 openraft `=0.9.25`，见 [`D2_CONSENSUS.md`](D2_CONSENSUS.md)；三节点原型、多进程 TCP 验证已实现；节点使用 RocksDB `raft.db` 持久化日志与 `state.db` 不透明字节批次状态机，重启可恢复；`Suite::test_all` 已通过；D1 本地字节 `StorageNode` 适配已实现，图引擎接线仍待做。
 
+- **应用语义切片**：版本化 `D1V1` 命令已复制 shard/epoch、request_id、expected sequence 与原子 data/sequence/dedup/applied marker；snapshot/restart 保留重试身份。详见 [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md)。尚非 `StorageNode`/图引擎接线；无淘汰去重预算耗尽后明确拒绝新写，不能视为生产容量方案。
+
 ### D3 元数据、路由与故障切换
 
 - **交付物**：catalog、分片到节点映射、成员变更、客户端路由缓存、故障检测。

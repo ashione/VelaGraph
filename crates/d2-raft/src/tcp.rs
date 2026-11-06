@@ -400,7 +400,12 @@ async fn handle_control_connection(
         },
         ControlRequest::Write { key, value } => {
             match raft.client_write(LogCommand::put(key, value)).await {
-                Ok(response) => ControlResponse::Index(response.log_id.index),
+                Ok(response) => match response.data.d1 {
+                    Some(Err(error)) => {
+                        ControlResponse::Err(format!("D1 application rejected: {error:?}"))
+                    }
+                    _ => ControlResponse::Index(response.log_id.index),
+                },
                 Err(error) => ControlResponse::Err(error.to_string()),
             }
         }

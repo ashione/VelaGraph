@@ -11,6 +11,13 @@ stores (`tests/conformance.rs`). A single-shard local D1 byte adapter exists in
 wiring `GraphEngine` through that adapter remains the next slice. This document
 still freezes the Raft library choice and the prototype boundaries.
 
+The next application-layer slice is now implemented as versioned `D1V1`
+commands: shard/epoch fencing, conditional sequence, caller request-id dedup,
+atomic metadata persistence and complete snapshot/restart retry identity. See
+[`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md) for its bounded prototype contract and
+upgrade restrictions. This is not a `StorageNode` implementation or graph-engine
+wiring.
+
 Related contracts: [`STORAGE_NODE_INTERFACE.md`](STORAGE_NODE_INTERFACE.md) (D1
 storage-node seam), [`TRANSACTIONS.md`](TRANSACTIONS.md) (K3 single-shard
 transaction boundary), and [`ROADMAP.md`](ROADMAP.md) (D2 scope).

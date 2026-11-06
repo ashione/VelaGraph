@@ -2,12 +2,19 @@
 
 An openraft prototype for D2. It proves the consensus seam with a durable
 RocksDB log and an applied opaque key/value state machine shaped for D1 batches.
-The TCP node also runs across real OS processes. The D1 graph `StorageNode`
-adapter is still the next slice; the in-process `Cluster::start` path remains an
+The TCP node also runs across real OS processes. A versioned D1 application command now carries shard/epoch fencing, conditional
+sequence and retry identity through Raft, snapshots and reopen. The D1 graph
+`StorageNode` adapter is still a separate slice; the in-process `Cluster::start` path remains an
 in-memory test fixture.
+
+See [`D2_D1_CONTRACT.md`](../../docs/D2_D1_CONTRACT.md) for activation, versioned
+persistence, upgrade limits, and the deliberately bounded no-eviction retry budget.
 
 ## What is implemented
 
+- Versioned `D1V1` commands with typed application results; atomic data,
+  sequence, dedup and applied-marker persistence; full retry identity in snapshots.
+  Activate only on empty legacy state, and never mix old/new replicas after activation.
 - Three-node cluster bootstrap: initialize all voters, or initialize one node,
   add two learners, and change membership.
 - Deterministic `LogCommand` (`Noop`, `TxnBatch(Vec<WriteOp>)`) and an applied
@@ -66,6 +73,9 @@ cargo test -p d2-raft --test multi_process
 cargo test -p d2-raft --test durable
 cargo test -p d2-raft --test conformance
 cargo test -p d2-raft --test d1_batch
+cargo test -p d2-raft --test d1_contract
+cargo test -p d2-raft --test d1_cluster
+cargo test -p d2-raft --test d1_tcp
 ```
 
 The in-process tests cover 100 replicated writes plus leader loss, a partitioned

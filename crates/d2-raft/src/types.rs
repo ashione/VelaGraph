@@ -32,6 +32,8 @@ impl WriteOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogCommand {
     Noop,
+    /// Version 1 D1 ownership, retry and conditional-write contract.
+    D1V1(crate::D1Command),
     /// An ordered, atomic batch of D1 key/value mutations.
     TxnBatch(Vec<WriteOp>),
 }
@@ -53,6 +55,9 @@ impl LogCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyResult {
     pub value: Option<String>,
+    /// None for legacy/no-op entries. Application rejections still advance applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1: Option<Result<crate::D1Result, crate::D1Error>>,
 }
 
 openraft::declare_raft_types!(
