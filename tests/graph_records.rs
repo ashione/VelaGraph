@@ -138,3 +138,39 @@ fn duplicate_and_missing_records_are_rejected() {
     assert!(store.delete_edge(99).is_err());
     assert!(store.delete_vertex(99).is_err());
 }
+
+#[test]
+fn property_only_update_preserves_adjacency() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    store.create_vertex(&vertex(1, &[])).unwrap();
+    store.create_vertex(&vertex(2, &[])).unwrap();
+    let mut edge = Edge::new(10, 1, 2, "knows");
+    store.create_edge(&edge).unwrap();
+    edge.properties.insert("since".into(), Value::Integer(2024));
+
+    store.update_edge(&edge).unwrap();
+
+    assert_eq!(store.get_edge(10).unwrap().unwrap(), edge);
+    assert_eq!(
+        store.out_edges(1, Some("knows"), 10).unwrap(),
+        vec![edge.clone()]
+    );
+    assert_eq!(store.in_edges(2, Some("knows"), 10).unwrap(), vec![edge]);
+}
+
+#[test]
+fn concurrent_mutations_from_one_store_are_serialized() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| store.create_vertex(&vertex(1, &[])));
+        let second = scope.spawn(|| store.create_vertex(&vertex(2, &[])));
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+    });
+
+    assert!(store.get_vertex(1).unwrap().is_some());
+    assert!(store.get_vertex(2).unwrap().is_some());
+}

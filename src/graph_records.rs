@@ -10,14 +10,17 @@
 //! the same vertices, edges, and adjacency entries as opaque D1 bytes. It does
 //! not implement transactions, routing, or replication by itself.
 //!
-//! The store assumes one writer per shard: it reads, validates, and then
-//! submits one batch, without a conditional write. Request ids are derived
-//! from the observed sequence, so replaying a batch with the same view is
-//! idempotent. The high-level methods do not expose a caller-supplied request
-//! id, so exactly-once retry after an unknown commit remains a D1 caller
+//! Mutations through one store are serialized by an internal mutex, but the
+//! store still assumes one writer per shard: it reads, validates, and then
+//! submits one batch, without a conditional write. Separate stores or external
+//! writers need higher-level coordination. Request ids are derived from the
+//! observed sequence, so replaying a batch with the same view is idempotent.
+//! The high-level methods do not expose a caller-supplied request id, so
+//! exactly-once retry after an unknown commit remains a D1 caller
 //! responsibility.
 
 use std::collections::BTreeSet;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
 use crate::graph::{
@@ -45,6 +48,7 @@ pub struct GraphRecordStore<S: StorageNode> {
     node: S,
     shard: ShardId,
     partition: u32,
+    write_lock: Mutex<()>,
 }
 
 impl<S: StorageNode> GraphRecordStore<S> {
@@ -54,7 +58,14 @@ impl<S: StorageNode> GraphRecordStore<S> {
             node,
             shard,
             partition,
+            write_lock: Mutex::new(()),
         }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn node(&self) -> &S {
@@ -76,6 +87,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Insert a vertex. The id must not exist.
     pub fn create_vertex(&self, vertex: &Vertex) -> Result<()> {
+        let _guard = self.lock();
         validate_vertex(vertex)?;
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, vertex.id)?.is_some() {
@@ -90,6 +102,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Replace an existing vertex. The id must exist.
     pub fn update_vertex(&self, vertex: &Vertex) -> Result<()> {
+        let _guard = self.lock();
         validate_vertex(vertex)?;
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, vertex.id)?.is_none() {
@@ -104,6 +117,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Delete a vertex and every incident edge and adjacency entry atomically.
     pub fn delete_vertex(&self, id: u64) -> Result<()> {
+        let _guard = self.lock();
         let view = self.node.read_view()?;
         if self.get_vertex_in(&view, id)?.is_none() {
             return Err(Error::VertexNotFound(id));
@@ -129,6 +143,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Insert an edge and both adjacency entries atomically.
     pub fn create_edge(&self, edge: &Edge) -> Result<()> {
+        let _guard = self.lock();
         validate_edge(edge)?;
         let view = self.node.read_view()?;
         if self.get_edge_in(&view, edge.id)?.is_some() {
@@ -144,6 +159,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
 
     /// Replace an existing edge and its adjacency entries atomically.
     pub fn update_edge(&self, edge: &Edge) -> Result<()> {
+        let _guard = self.lock();
         validate_edge(edge)?;
         let view = self.node.read_view()?;
         let previous = self
@@ -154,14 +170,52 @@ impl<S: StorageNode> GraphRecordStore<S> {
                 return Err(Error::EdgeEndpointNotFound(endpoint));
             }
         }
-        let mut operations = Vec::new();
-        self.delete_edge_ops(&previous, &mut operations);
-        operations.extend(self.put_edge_ops(edge)?);
+        let mut operations = vec![WriteOp::put(
+            edge_key(self.partition, edge.id),
+            codec::encode_edge(edge)?,
+        )];
+        let old_out = adjacency_key(
+            self.partition,
+            EdgeDirection::Out,
+            previous.from,
+            &previous.label,
+            previous.id,
+        );
+        let new_out = adjacency_key(
+            self.partition,
+            EdgeDirection::Out,
+            edge.from,
+            &edge.label,
+            edge.id,
+        );
+        if old_out != new_out {
+            operations.push(WriteOp::delete(old_out));
+        }
+        operations.push(WriteOp::put(new_out, Vec::new()));
+        let old_in = adjacency_key(
+            self.partition,
+            EdgeDirection::In,
+            previous.to,
+            &previous.label,
+            previous.id,
+        );
+        let new_in = adjacency_key(
+            self.partition,
+            EdgeDirection::In,
+            edge.to,
+            &edge.label,
+            edge.id,
+        );
+        if old_in != new_in {
+            operations.push(WriteOp::delete(old_in));
+        }
+        operations.push(WriteOp::put(new_in, Vec::new()));
         self.write(&view, operations)
     }
 
     /// Delete an edge and both adjacency entries atomically.
     pub fn delete_edge(&self, id: u64) -> Result<()> {
+        let _guard = self.lock();
         let view = self.node.read_view()?;
         let edge = self
             .get_edge_in(&view, id)?

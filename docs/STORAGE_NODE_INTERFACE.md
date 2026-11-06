@@ -42,9 +42,11 @@ any `StorageNode`. It reuses the K1 `graph/v1` key layout and record codec for
 vertices, edges, and outgoing/incoming adjacency entries, and applies each
 mutation as one `batch_write`. The adapter covers create/update/delete for
 vertices and edges, label-filtered adjacency reads, cascade deletion, and
-reopen. It assumes one writer per shard, caps adjacency reads (and therefore a
-single cascade delete) at 1,000 incident edges, and leaves multi-shard routing
-and transactions to D3/D4. Request ids are derived from the observed sequence;
+reopen. Mutations through one store are serialized, but the adapter assumes one
+writer per shard; separate stores need external coordination. It caps adjacency
+reads (and therefore a single cascade delete) at 1,000 incident edges and
+returns a storage error instead of a partial result, and leaves multi-shard
+routing and transactions to D3/D4. Request ids are derived from the observed sequence;
 exactly-once retry after an unknown commit still needs a caller-supplied id in a
 later slice. `GraphEngine` still
 uses its own RocksDB handle, so the existing K1 path remains authoritative until
