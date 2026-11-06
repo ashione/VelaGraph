@@ -1,8 +1,9 @@
-//! Isolated v2 append-only graph experiment. Not a distributed transaction.
+//! Isolated v2 graph experiment. Not a distributed transaction.
 use super::*;
 mod traversal;
 use rocksdb_sql_table::experimental_graph::{
-    AppendOnlyStore, CrossEdge, Direction, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
+    AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError,
+    PreparedBatch, VertexRef,
 };
 pub use traversal::{
     ObservedElementRef, ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3,
@@ -15,8 +16,9 @@ pub enum ExperimentalRouteError {
     Unsupported(&'static str),
     Route(RouteError),
     Graph(ExperimentalError),
-    /// The caller retains the original PreparedAppend for exact retry. A failed
-    /// stage never implies rollback of earlier or uncertain writes.
+    /// The caller retains the original PreparedAppend or PreparedEdgeMutation
+    /// for exact retry. A failed stage never implies rollback of earlier or
+    /// uncertain writes.
     Stage {
         stage: Stage,
         outcome: StageOutcome,
@@ -95,6 +97,39 @@ impl PreparedAppend {
     }
     pub fn reverse_request_id(&self) -> Option<RequestId> {
         self.reverse.as_ref().map(|p| p.batch.request_id())
+    }
+}
+/// Additive mutation kind; create APIs and their acknowledgement stay unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeMutationKind {
+    Properties,
+}
+/// Historical acknowledgement of the original request, not proof that the
+/// current properties still equal this mutation's result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationAcknowledgement {
+    AllBatchesAcknowledged,
+}
+/// Immutable exact retry of a properties-only source batch. Retain before
+/// submission; never reprepare automatically after an unknown outcome.
+#[derive(Clone, Debug)]
+pub struct PreparedEdgeMutation {
+    edge: EdgeRef,
+    prepared: PreparedAppend,
+}
+impl PreparedEdgeMutation {
+    pub fn edge(&self) -> EdgeRef {
+        self.edge
+    }
+    pub fn kind(&self) -> EdgeMutationKind {
+        EdgeMutationKind::Properties
+    }
+    /// The single participant request ID is also the operation ID.
+    pub fn operation_id(&self) -> RequestId {
+        self.prepared.source_request_id()
+    }
+    pub fn source_request_id(&self) -> RequestId {
+        self.operation_id()
     }
 }
 /// One frozen catalog and per-shard snapshot vector. Never a global snapshot.
@@ -184,6 +219,33 @@ impl ExperimentalReadSession {
         Ok(ObservedAdjacency {
             edges,
             completeness: AdjacencyCompleteness::Unverified,
+        })
+    }
+    /// Validate a complete observed edge and prepare a single source-shard CAS.
+    /// Identity, endpoints, label and both indexes are unchanged. The frozen
+    /// snapshot vector is not a global snapshot or a target write condition.
+    pub fn prepare_edge_properties(
+        &self,
+        edge: EdgeRef,
+        patch: &EdgePropertyPatch,
+    ) -> ExperimentalResult<PreparedEdgeMutation> {
+        let current = self
+            .get_edge(edge)?
+            .ok_or(ExperimentalError::Incomplete(edge))?;
+        let batch = self
+            .store(edge.partition)?
+            .prepare_source_properties(&current, patch)?;
+        self.op.check(None)?;
+        Ok(PreparedEdgeMutation {
+            edge,
+            prepared: PreparedAppend {
+                metadata: self.metadata.clone(),
+                source: Participant {
+                    placement: self.placements[&edge.partition].clone(),
+                    batch,
+                },
+                reverse: None,
+            },
         })
     }
     pub fn prepare_vertex(
@@ -315,6 +377,17 @@ impl RouteResolver {
             nodes,
             op,
         })
+    }
+    /// Submit the original immutable source mutation. Unknown results are
+    /// returned unchanged with the source request ID; no refresh/reprepare.
+    /// Exact retry acknowledges history and never reapplies over newer values.
+    pub fn experimental_commit_mutation(
+        &self,
+        prepared: &PreparedEdgeMutation,
+        timeout: Duration,
+    ) -> ExperimentalResult<MutationAcknowledgement> {
+        self.experimental_commit(&prepared.prepared, timeout)?;
+        Ok(MutationAcknowledgement::AllBatchesAcknowledged)
     }
     /// Exact retry of frozen batches and placements. Source then reverse. No
     /// automatic unknown-outcome retry, rollback, refresh, or repair.

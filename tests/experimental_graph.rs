@@ -899,3 +899,265 @@ fn edge_pages_reject_malformed_keys_envelopes_and_identity() {
             .is_err());
     }
 }
+
+fn property_patch(value: Value) -> rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
+    rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
+        set: BTreeMap::from([("x".into(), value)]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn edge_properties_reopen_exact_types_and_old_retries_preserve_new_values() {
+    use rocksdb_sql_table::experimental_graph::EdgePropertyPatch;
+    let dir = tempfile::tempdir().unwrap();
+    let final_edge;
+    let create;
+    let update;
+    {
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        let b = AppendOnlyStore::new(n.clone(), 7, 2);
+        vertex(&a, &n, 1);
+        vertex(&b, &n, 2);
+        let mut e = edge(1, 2);
+        e.properties.insert("remove".into(), Value::Boolean(true));
+        create = a
+            .prepare_source(&e)
+            .unwrap()
+            .combine(b.prepare_reverse(&e).unwrap())
+            .unwrap();
+        create.submit(&n).unwrap();
+        let before = n.admin().export().unwrap();
+        let patch = EdgePropertyPatch {
+            set: BTreeMap::from([
+                ("null".into(), Value::Null),
+                ("int".into(), Value::Integer(i64::MAX)),
+                ("min".into(), Value::Integer(i64::MIN)),
+                ("real".into(), Value::Real(-0.0)),
+                ("text".into(), Value::Text("精确".into())),
+                ("bool".into(), Value::Boolean(false)),
+            ]),
+            remove: ["remove".into(), "absent".into()].into(),
+        };
+        update = a.prepare_source_properties(&e, &patch).unwrap();
+        update.submit(&n).unwrap();
+        let after = n.admin().export().unwrap();
+        assert_eq!(after.sequence, before.sequence + 1);
+        assert_eq!(before.entries.len(), after.entries.len());
+        assert_eq!(
+            before
+                .entries
+                .iter()
+                .zip(&after.entries)
+                .filter(|(a, b)| a != b)
+                .count(),
+            1
+        ); // canonical Put only
+        let updated = a.get_edge(7).unwrap().unwrap();
+        assert_eq!(
+            (&updated.from, &updated.to, &updated.label),
+            (&e.from, &e.to, &e.label)
+        );
+        assert_eq!(updated.properties, patch.set);
+        assert_eq!(
+            match updated.properties["real"] {
+                Value::Real(v) => v.to_bits(),
+                _ => panic!(),
+            },
+            (-0.0f64).to_bits()
+        );
+        b.verify_reverse(&updated).unwrap();
+        let next = a
+            .prepare_source_properties(&updated, &property_patch(Value::Integer(2)))
+            .unwrap();
+        next.submit(&n).unwrap();
+        final_edge = a.get_edge(7).unwrap().unwrap();
+        create.submit(&n).unwrap();
+        update.submit(&n).unwrap();
+        assert_eq!(a.get_edge(7).unwrap(), Some(final_edge.clone()));
+        assert_eq!(n.read_view().unwrap().sequence, after.sequence + 1);
+    }
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    create.submit(&n).unwrap();
+    update.submit(&n).unwrap();
+    assert_eq!(a.get_edge(7).unwrap(), Some(final_edge));
+}
+
+#[test]
+fn edge_property_validation_and_racing_cas_fail_without_writes() {
+    use rocksdb_sql_table::experimental_graph::EdgePropertyPatch;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let b = AppendOnlyStore::new(n.clone(), 7, 2);
+    vertex(&a, &n, 1);
+    vertex(&b, &n, 2);
+    let e = edge(1, 2);
+    a.prepare_source(&e)
+        .unwrap()
+        .combine(b.prepare_reverse(&e).unwrap())
+        .unwrap()
+        .submit(&n)
+        .unwrap();
+    let before = n.admin().export().unwrap();
+    for patch in [
+        EdgePropertyPatch::default(),
+        EdgePropertyPatch {
+            remove: ["x".into()].into(),
+            ..property_patch(Value::Null)
+        },
+        property_patch(Value::Real(f64::NAN)),
+        property_patch(Value::Real(f64::INFINITY)),
+        property_patch(Value::Text("x".repeat(1024 * 1024))),
+    ] {
+        assert!(a.prepare_source_properties(&e, &patch).is_err());
+    }
+    let after = n.admin().export().unwrap();
+    assert_eq!(before.entries, after.entries);
+    assert_eq!(before.sequence, after.sequence);
+    let one = a
+        .prepare_source_properties(&e, &property_patch(Value::Integer(1)))
+        .unwrap();
+    let two = a
+        .prepare_source_properties(&e, &property_patch(Value::Integer(2)))
+        .unwrap();
+    one.submit(&n).unwrap();
+    assert!(matches!(
+        two.submit(&n),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::Conflict { .. }
+        ))
+    ));
+    // Explicitly stale expected source bytes cannot silently overwrite a newer record.
+    assert!(matches!(
+        a.prepare_source_properties(&e, &property_patch(Value::Null)),
+        Err(ExperimentalError::Incomplete(_))
+    ));
+    let current = a.get_edge(7).unwrap().unwrap();
+    let stale = a
+        .prepare_source_properties(&current, &property_patch(Value::Null))
+        .unwrap();
+    vertex(&a, &n, 42); // unrelated same-shard writes conservatively invalidate CAS
+    let before = n.admin().export().unwrap();
+    assert!(matches!(
+        stale.submit(&n),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::Conflict { .. }
+        ))
+    ));
+    assert_eq!(before.entries, n.admin().export().unwrap().entries);
+}
+
+#[test]
+fn edge_property_lost_ack_dedups_and_changed_requests_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    let b = AppendOnlyStore::new(n.clone(), 7, 2);
+    vertex(&a, &n, 1);
+    vertex(&b, &n, 2);
+    let e = edge(1, 2);
+    a.prepare_source(&e)
+        .unwrap()
+        .combine(b.prepare_reverse(&e).unwrap())
+        .unwrap()
+        .submit(&n)
+        .unwrap();
+    let prepared = a
+        .prepare_source_properties(&e, &property_patch(Value::Null))
+        .unwrap();
+    let transport = CommitThenTimeout {
+        node: n.clone(),
+        calls: std::sync::Mutex::new(vec![]),
+    };
+    assert!(matches!(
+        prepared.submit(&transport),
+        Err(ExperimentalError::Storage(StorageNodeError::Timeout { .. }))
+    ));
+    let committed = n.admin().export().unwrap();
+    prepared.submit(&transport).unwrap();
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(calls[0].0.operations.len(), 1);
+    let (request, condition) = calls[0].clone();
+    assert!(matches!(
+        n.batch_write_conditional(request.clone(), condition.map(|n| n + 1)),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    let mut changed = request;
+    changed.operations = vec![WriteOp::put(b"changed".to_vec(), vec![])];
+    assert!(matches!(
+        n.batch_write_conditional(changed, condition),
+        Err(StorageNodeError::IdempotencyConflict(_))
+    ));
+    assert_eq!(committed.entries, n.admin().export().unwrap().entries);
+    assert_eq!(committed.sequence, n.read_view().unwrap().sequence);
+}
+
+#[test]
+fn edge_property_prepared_source_is_fenced_by_invalidating_writes() {
+    for key in [
+        hex("67726170682f76322f702f000000012f7665727465782f0000000000000001"),
+        index(7, b"K"),
+        hex("67726170682f76322f702f000000012f656467652f0000000000000007"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        vertex(&a, &n, 1);
+        let e = edge(1, 2);
+        a.prepare_source(&e).unwrap().submit(&n).unwrap();
+        let prepared = a
+            .prepare_source_properties(&e, &property_patch(Value::Null))
+            .unwrap();
+        raw(&n, vec![WriteOp::Delete { key }]);
+        let before = n.admin().export().unwrap();
+        assert!(matches!(
+            prepared.submit(&n),
+            Err(ExperimentalError::Storage(
+                StorageNodeError::Conflict { .. }
+            ))
+        ));
+        assert!(a
+            .prepare_source_properties(&e, &property_patch(Value::Null))
+            .is_err());
+        assert_eq!(before.entries, n.admin().export().unwrap().entries);
+    }
+}
+
+#[test]
+fn edge_property_prepared_bytes_are_immutable_and_epoch_fencing_precedes_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let a = AppendOnlyStore::new(n.clone(), 7, 1);
+    vertex(&a, &n, 1);
+    let mut e = edge(1, 2);
+    e.properties.insert("x".into(), Value::Real(-0.0));
+    a.prepare_source(&e).unwrap().submit(&n).unwrap();
+    let mut wrong_zero = e.clone();
+    wrong_zero.properties.insert("x".into(), Value::Real(0.0));
+    assert!(matches!(
+        a.prepare_source_properties(&wrong_zero, &property_patch(Value::Null)),
+        Err(ExperimentalError::Incomplete(_))
+    ));
+    let mut patch = property_patch(Value::Integer(7));
+    let prepared = a.prepare_source_properties(&e, &patch).unwrap();
+    patch.set.insert("x".into(), Value::Integer(8));
+    e.properties.insert("x".into(), Value::Integer(9));
+    prepared.submit(&n).unwrap();
+    assert_eq!(
+        a.get_edge(7).unwrap().unwrap().properties["x"],
+        Value::Integer(7)
+    );
+    let before = n.admin().export().unwrap();
+    n.admin().set_epoch(1).unwrap();
+    assert!(matches!(
+        prepared.submit(&n),
+        Err(ExperimentalError::Storage(StorageNodeError::Fenced { .. }))
+    ));
+    let after = n.admin().export().unwrap();
+    assert_eq!(before.entries, after.entries);
+    assert_eq!(before.sequence, after.sequence);
+}

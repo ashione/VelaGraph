@@ -4,19 +4,22 @@ use replicated_graph::{
     remote::{snapshot_identified, RemoteIdentity},
     routing::{
         experimental::{
-            AdjacencyCompleteness, ExperimentalRouteError, ObservedPathElement, ObservedRow, Stage,
-            StageOutcome,
+            AdjacencyCompleteness, EdgeMutationKind, ExperimentalReadSession,
+            ExperimentalRouteError, MutationAcknowledgement, ObservedPathElement, ObservedRow,
+            Stage, StageOutcome,
         },
-        RemoteReplica, RouteResolver,
+        RemoteReplica, RouteError, RouteResolver,
     },
     run_blocking,
 };
 use rocksdb_sql_table::{
-    experimental_graph::{CrossEdge, Direction, EdgeRef, ExperimentalError, VertexRef},
-    Value, Vertex,
+    experimental_graph::{
+        CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError, VertexRef,
+    },
+    StorageNode, StorageNodeError, Value, Vertex, WriteOp, WriteRequest,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -728,6 +731,282 @@ async fn partial_registry_is_rejected_before_any_write() -> anyhow::Result<()> {
                 id: 40
             })?
             .is_none());
+        Ok(())
+    })
+    .await??;
+    Ok(())
+}
+
+// Value::PartialEq treats signed zeros as equal, so check real payloads by bits.
+fn assert_property_edge_exact(actual: &CrossEdge, expected: &CrossEdge) {
+    assert_eq!(actual.identity(), expected.identity());
+    assert_eq!(actual.from, expected.from);
+    assert_eq!(actual.to, expected.to);
+    assert_eq!(actual.label, expected.label);
+    assert_eq!(actual.properties.len(), expected.properties.len());
+    for (key, expected_value) in &expected.properties {
+        let actual_value = actual.properties.get(key).expect("property retained");
+        match (actual_value, expected_value) {
+            (Value::Real(actual), Value::Real(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{key}");
+            }
+            _ => assert_eq!(actual_value, expected_value, "{key}"),
+        }
+    }
+}
+
+fn assert_property_edge_complete(
+    session: &ExperimentalReadSession,
+    expected: &CrossEdge,
+) -> anyhow::Result<()> {
+    assert_property_edge_exact(&session.get_edge(expected.identity())?.unwrap(), expected);
+    // Independently traverse both indexes, including the self-loop's two roles.
+    for (endpoint, direction) in [
+        (expected.from, Direction::Out),
+        (expected.to, Direction::In),
+    ] {
+        let adjacency = session.observed_adjacency(endpoint, direction)?;
+        assert_eq!(adjacency.completeness, AdjacencyCompleteness::Unverified);
+        let matches: Vec<_> = adjacency
+            .edges
+            .iter()
+            .filter(|edge| edge.identity() == expected.identity())
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_property_edge_exact(matches[0], expected);
+        let vertex = session.get_vertex(endpoint)?.expect("endpoint retained");
+        assert_eq!(vertex.id, 7);
+        assert_eq!(vertex.labels, vec![format!("P{}", endpoint.partition)]);
+        assert_eq!(
+            vertex.properties,
+            BTreeMap::from([(
+                "untouched".into(),
+                Value::Integer(endpoint.partition as i64)
+            ),])
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_v2_property_mutations_in_real_processes() -> anyhow::Result<()> {
+    let _fixture = PROCESS_TEST_LOCK.lock().await;
+    timeout(Duration::from_secs(120), property_mutation_scenario()).await?
+}
+
+async fn property_mutation_scenario() -> anyhow::Result<()> {
+    let metadata = Group::start(410, 510).await?;
+    let mut a = Group::start(420, 520).await?;
+    let b = Group::start(430, 530).await?;
+    let catalog = Catalog::new_remote(
+        metadata.replicas[0].endpoint,
+        1,
+        metadata.placement.clone(),
+        BUDGET,
+    )?;
+    let resolver = RouteResolver::new_remote(
+        metadata.placement.clone(),
+        &metadata.replicas,
+        &[a.replicas.clone(), b.replicas.clone()].concat(),
+    )?;
+    let target_node = replicated_graph::RemoteStorageNode::new_identified(
+        b.replicas[0].endpoint,
+        430,
+        1,
+        530,
+        BUDGET,
+    )?;
+    let ap = a.placement.clone();
+    let bp = b.placement.clone();
+    let (resolver, unknown) = run_blocking(move || -> anyhow::Result<_> {
+        for (partition, placement) in [(1, ap.clone()), (2, bp), (3, ap)] {
+            catalog.commit_registration(&catalog.prepare_registration(
+                [partition as u8; 16], partition, placement,
+            )?)?;
+            let mut vertex = Vertex::new(7);
+            vertex.labels.push(format!("P{partition}"));
+            vertex.properties.insert("untouched".into(), Value::Integer(partition as i64));
+            let prepared = resolver.experimental_read_session(BUDGET)?
+                .prepare_vertex(partition, &vertex)?;
+            resolver.experimental_commit(&prepared, BUDGET)?;
+        }
+        // Cross-shard, distinct partitions on one shard, and a true self-loop.
+        for (id, target) in [(101, 2), (102, 3), (103, 1)] {
+            let original = CrossEdge {
+                id,
+                from: VertexRef { partition: 1, id: 7 },
+                to: VertexRef { partition: target, id: 7 },
+                label: "Properties".into(),
+                properties: BTreeMap::from([
+                    ("typed".into(), Value::Integer(1)),
+                    ("large".into(), Value::Integer(i64::MAX)),
+                    ("zero".into(), Value::Real(0.0)),
+                    ("removed".into(), Value::Null),
+                    ("nullable".into(), Value::Text("before".into())),
+                ]),
+            };
+            let create = resolver.experimental_read_session(BUDGET)?.prepare_edge(&original)?;
+            resolver.experimental_commit(&create, BUDGET)?;
+            let frozen = resolver.experimental_read_session(BUDGET)?;
+            assert_property_edge_complete(&frozen, &original)?;
+            let patch = EdgePropertyPatch {
+                set: BTreeMap::from([
+                    ("typed".into(), Value::Real(1.0)),
+                    ("zero".into(), Value::Real(-0.0)),
+                    ("nullable".into(), Value::Null),
+                ]),
+                remove: BTreeSet::from(["removed".into(), "already_absent".into()]),
+            };
+            let update1 = frozen.prepare_edge_properties(original.identity(), &patch)?;
+            let competitor = frozen.prepare_edge_properties(original.identity(), &EdgePropertyPatch {
+                set: BTreeMap::from([("competitor".into(), Value::Boolean(true))]),
+                remove: BTreeSet::new(),
+            })?;
+            assert_eq!(update1.edge(), original.identity());
+            assert_eq!(update1.kind(), EdgeMutationKind::Properties);
+            assert_eq!(update1.operation_id(), update1.source_request_id());
+            assert_ne!(update1.operation_id(), competitor.operation_id());
+            assert_eq!(resolver.experimental_commit_mutation(&update1, BUDGET)?,
+                MutationAcknowledgement::AllBatchesAcknowledged);
+            let mut first = original.clone();
+            first.properties.extend(patch.set);
+            first.properties.remove("removed");
+            let after_first = resolver.experimental_read_session(BUDGET)?;
+            assert_property_edge_complete(&after_first, &first)?;
+            assert_property_edge_complete(&frozen, &original)?;
+            match resolver.experimental_commit_mutation(&competitor, BUDGET) {
+                Err(ExperimentalRouteError::Stage {
+                    stage: Stage::Source,
+                    outcome: StageOutcome::Rejected,
+                    request_id,
+                    source_acknowledged_this_attempt: false,
+                    error: RouteError::Storage(StorageNodeError::Conflict { .. }),
+                }) => assert_eq!(request_id, competitor.source_request_id()),
+                other => panic!("expected source CAS conflict: {other:?}"),
+            }
+            // Re-preparing from an old session after a successful update must
+            // still use its original snapshot, rather than silently refreshing.
+            let stale = frozen.prepare_edge_properties(original.identity(), &EdgePropertyPatch {
+                set: BTreeMap::from([("stale".into(), Value::Boolean(true))]),
+                remove: BTreeSet::new(),
+            })?;
+            match resolver.experimental_commit_mutation(&stale, BUDGET) {
+                Err(ExperimentalRouteError::Stage {
+                    stage: Stage::Source,
+                    outcome: StageOutcome::Rejected,
+                    request_id,
+                    source_acknowledged_this_attempt: false,
+                    error: RouteError::Storage(StorageNodeError::Conflict { .. }),
+                }) => assert_eq!(request_id, stale.source_request_id()),
+                other => panic!("expected stale frozen-session CAS conflict: {other:?}"),
+            }
+            // Historical create acknowledgements must never restore old properties.
+            resolver.experimental_commit(&create, BUDGET)?;
+            assert_property_edge_complete(&resolver.experimental_read_session(BUDGET)?, &first)?;
+            let update2 = after_first.prepare_edge_properties(original.identity(), &EdgePropertyPatch {
+                set: BTreeMap::from([
+                    ("typed".into(), Value::Integer(1)),
+                    ("large".into(), Value::Integer(i64::MIN)),
+                    ("zero".into(), Value::Real(0.0)),
+                ]),
+                remove: BTreeSet::from(["nullable".into()]),
+            })?;
+            assert_eq!(resolver.experimental_commit_mutation(&update2, BUDGET)?,
+                MutationAcknowledgement::AllBatchesAcknowledged);
+            let mut second = first.clone();
+            second.properties.insert("typed".into(), Value::Integer(1));
+            second.properties.insert("large".into(), Value::Integer(i64::MIN));
+            second.properties.insert("zero".into(), Value::Real(0.0));
+            second.properties.remove("nullable");
+            assert_eq!(resolver.experimental_commit_mutation(&update1, BUDGET)?,
+                MutationAcknowledgement::AllBatchesAcknowledged);
+            assert_property_edge_complete(&resolver.experimental_read_session(BUDGET)?, &second)?;
+            assert_property_edge_complete(&after_first, &first)?;
+            assert_property_edge_complete(&frozen, &original)?;
+        }
+        let session = resolver.experimental_read_session(BUDGET)?;
+        let patch = EdgePropertyPatch {
+            set: BTreeMap::from([("last".into(), Value::Boolean(true))]),
+            remove: BTreeSet::new(),
+        };
+        let missing = EdgeRef { partition: 1, id: 999 };
+        assert!(matches!(session.prepare_edge_properties(missing, &patch),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge))) if edge == missing));
+        assert!(session.get_edge(missing)?.is_none());
+        // Force a source-only append by invalidating only the reverse shard's
+        // sequence between prepare and commit. Properties require a full edge.
+        let incomplete = CrossEdge {
+            id: 104,
+            from: VertexRef { partition: 1, id: 7 },
+            to: VertexRef { partition: 2, id: 7 },
+            label: "Incomplete".into(),
+            properties: BTreeMap::new(),
+        };
+        let append = session.prepare_edge(&incomplete)?;
+        let target_write = session.prepare_vertex(2, &Vertex::new(8))?;
+        resolver.experimental_commit(&target_write, BUDGET)?;
+        match resolver.experimental_commit(&append, BUDGET) {
+            Err(ExperimentalRouteError::Stage {
+                stage: Stage::Reverse,
+                outcome: StageOutcome::Incomplete,
+                source_acknowledged_this_attempt: true,
+                request_id,
+                ..
+            }) => assert_eq!(Some(request_id), append.reverse_request_id()),
+            other => panic!("expected source-only append: {other:?}"),
+        }
+        let partial = resolver.experimental_read_session(BUDGET)?;
+        assert!(matches!(partial.get_edge(incomplete.identity()),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
+                if edge == incomplete.identity()));
+        assert!(matches!(partial.prepare_edge_properties(incomplete.identity(), &patch),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
+                if edge == incomplete.identity()));
+        // Rejection is preparation-only: neither shard's sequence can advance,
+        // and the absent reverse index must not be repaired as a side effect.
+        let after_rejection = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(partial.snapshots, after_rejection.snapshots);
+        assert!(after_rejection.observed_adjacency(incomplete.to, Direction::In)?
+            .edges.iter().all(|edge| edge.identity() != incomplete.identity()));
+        assert!(matches!(after_rejection.get_edge(incomplete.identity()),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
+                if edge == incomplete.identity()));
+        let unknown = after_rejection.prepare_edge_properties(EdgeRef { partition: 1, id: 101 }, &patch)?;
+        // Trusted raw D1 fault injection: deleting the target endpoint must
+        // make a fresh session reject preparation before any source mutation.
+        let mut target_vertex_key = b"graph/v2/p/".to_vec();
+        target_vertex_key.extend(2u32.to_be_bytes());
+        target_vertex_key.extend(b"/vertex/");
+        target_vertex_key.extend(7u64.to_be_bytes());
+        target_node.batch_write(WriteRequest {
+            shard: 530,
+            epoch: 1,
+            request_id: [234; 16],
+            operations: vec![WriteOp::Delete { key: target_vertex_key }],
+        })?;
+        let invalid = resolver.experimental_read_session(BUDGET)?;
+        let invalid_ref = EdgeRef { partition: 1, id: 101 };
+        assert!(matches!(invalid.prepare_edge_properties(invalid_ref, &patch),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
+                if edge == invalid_ref));
+        assert_eq!(invalid.snapshots, resolver.experimental_read_session(BUDGET)?.snapshots);
+        Ok((resolver, unknown))
+    }).await??;
+    // Stop the source only after preparation. This is transport uncertainty,
+    // not an ACK-loss test and not evidence that the mutation was rolled back.
+    a.process.0.kill()?;
+    a.process.0.wait()?;
+    run_blocking(move || -> anyhow::Result<()> {
+        match resolver.experimental_commit_mutation(&unknown, BUDGET) {
+            Err(ExperimentalRouteError::Stage {
+                stage: Stage::Source,
+                outcome: StageOutcome::Unknown,
+                source_acknowledged_this_attempt: false,
+                request_id,
+                ..
+            }) => assert_eq!(request_id, unknown.source_request_id()),
+            other => panic!("expected source unknown with original request ID: {other:?}"),
+        }
         Ok(())
     })
     .await??;

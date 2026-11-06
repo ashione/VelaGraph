@@ -141,3 +141,9 @@ observed-only adjacency with unverified completeness. V1 contracts are unchanged
 The separate observed Gremlin entrypoint is an additive R12/D5 experimental
 scope exception, with qualified paths and explicitly Unverified results. No v1
 Gremlin/query-layer behavior inherits this exception.
+
+The additive properties-only v2 mutation is also covered by this explicit
+experiment exception: preparation verifies a complete observed edge; one
+conditional source-shard canonical Put changes properties only. It adds no
+format, identity/label/endpoint mutation, target write, or distributed transaction.
+V2 creation remains append-only and old exact retries retain historical dedup.
