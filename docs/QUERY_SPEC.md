@@ -257,3 +257,10 @@ and one logical memory budget covers all partitions. A single metadata snapshot
 and one view per shard yield a per-shard snapshot vector, not a globally
 consistent snapshot. See the linked contract for fanout, snapshot admission,
 end-to-end deadline, all-or-error semantics and memory exclusions.
+
+## Isolated v2 append-only experiment
+
+[EXPERIMENTAL_CROSS_EDGES.md](EXPERIMENTAL_CROSS_EDGES.md) documents a separate
+versioned namespace and explicitly non-atomic source/reverse append protocol.
+It does not change this document's existing v1/K3/Gremlin contract or complete
+D4/D5. Its out/in observations cannot certify missing-index completeness.

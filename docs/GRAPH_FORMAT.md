@@ -103,3 +103,10 @@ Edge `{id: 7, from: 1, to: 2, label: "K", properties: {x: true}}`:
 ```
 
 Any change to these bytes requires a new format version and a migration plan.
+
+## Isolated v2 append-only experiment
+
+[EXPERIMENTAL_CROSS_EDGES.md](EXPERIMENTAL_CROSS_EDGES.md) documents a separate
+versioned namespace and explicitly non-atomic source/reverse append protocol.
+It does not change this document's existing v1/K3/Gremlin contract or complete
+D4/D5. Its out/in observations cannot certify missing-index completeness.

@@ -1399,3 +1399,6 @@ mod global_scan_tests {
         root.in_group(30).shutdown(&data[1]).await;
     }
 }
+
+/// Explicitly non-atomic, append-only graph/v2 experiment.
+pub mod experimental;

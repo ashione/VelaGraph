@@ -1,0 +1,395 @@
+//! Isolated append-only graph/v2 experiment. No v1 API reads these records.
+//! Batches are shard-local; composing them is explicitly NOT a transaction.
+use crate::graph::{codec, validate_edge, validate_label, validate_vertex};
+use crate::{
+    Edge, KeyRange, ReadView, RequestId, ScanLimit, StorageNode, StorageNodeError, Value, Vertex,
+    WriteOp, WriteRequest,
+};
+use std::collections::BTreeMap;
+
+pub type Result<T> = std::result::Result<T, ExperimentalError>;
+#[derive(Debug, thiserror::Error)]
+pub enum ExperimentalError {
+    #[error("storage: {0}")]
+    Storage(#[from] StorageNodeError),
+    #[error("graph: {0}")]
+    Graph(#[from] crate::Error),
+    #[error("invalid experimental graph argument: {0}")]
+    Invalid(&'static str),
+    #[error("experimental entity already exists")]
+    AlreadyExists,
+    #[error("corrupt experimental graph data: {0}")]
+    Corrupt(&'static str),
+    #[error("experimental endpoint missing: {0:?}")]
+    MissingEndpoint(VertexRef),
+    #[error("incomplete or inconsistent experimental edge: {0:?}")]
+    Incomplete(EdgeRef),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VertexRef {
+    pub partition: u32,
+    pub id: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EdgeRef {
+    pub partition: u32,
+    pub id: u64,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrossEdge {
+    pub id: u64,
+    pub from: VertexRef,
+    pub to: VertexRef,
+    pub label: String,
+    pub properties: BTreeMap<String, Value>,
+}
+impl CrossEdge {
+    pub fn identity(&self) -> EdgeRef {
+        EdgeRef {
+            partition: self.from.partition,
+            id: self.id,
+        }
+    }
+    fn local(&self) -> Edge {
+        Edge {
+            id: self.id,
+            from: self.from.id,
+            to: self.to.id,
+            label: self.label.clone(),
+            properties: self.properties.clone(),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Out,
+    In,
+}
+/// Immutable exact retry identity. This is not a durable coordinator journal.
+#[derive(Clone, Debug)]
+pub struct PreparedBatch {
+    request: WriteRequest,
+    sequence: u64,
+}
+impl PreparedBatch {
+    pub fn request_id(&self) -> RequestId {
+        self.request.request_id
+    }
+    pub fn shard(&self) -> u64 {
+        self.request.shard
+    }
+    pub fn epoch(&self) -> u64 {
+        self.request.epoch
+    }
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn submit(&self, node: &impl StorageNode) -> Result<()> {
+        node.batch_write_conditional(self.request.clone(), Some(self.sequence))?;
+        Ok(())
+    }
+    /// Combine only requests validated against the exact same shard sequence.
+    pub fn combine(mut self, other: Self) -> Result<Self> {
+        if (self.shard(), self.epoch(), self.sequence)
+            != (other.shard(), other.epoch(), other.sequence)
+        {
+            return Err(ExperimentalError::Invalid("different shard snapshots"));
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for op in self
+            .request
+            .operations
+            .iter()
+            .chain(other.request.operations.iter())
+        {
+            let key = match op {
+                WriteOp::Put { key, .. } | WriteOp::Delete { key } => key,
+            };
+            if !keys.insert(key) {
+                return Err(ExperimentalError::Invalid(
+                    "combined batch contains duplicate keys",
+                ));
+            }
+        }
+        self.request.operations.extend(other.request.operations);
+        Ok(self)
+    }
+}
+/// No update, delete, v1 migration, or unqualified cross-edge API is provided.
+pub struct AppendOnlyStore<S> {
+    node: S,
+    shard: u64,
+    partition: u32,
+}
+impl<S: StorageNode> AppendOnlyStore<S> {
+    pub fn new(node: S, shard: u64, partition: u32) -> Self {
+        Self {
+            node,
+            shard,
+            partition,
+        }
+    }
+    fn view(&self) -> Result<ReadView> {
+        let v = self.node.read_view()?;
+        if v.shard != self.shard {
+            return Err(ExperimentalError::Invalid("shard mismatch"));
+        }
+        Ok(v)
+    }
+    fn batch(&self, v: &ReadView, operations: Vec<WriteOp>) -> Result<PreparedBatch> {
+        let mut request_id = [0; 16];
+        getrandom::fill(&mut request_id)
+            .map_err(|_| ExperimentalError::Invalid("request entropy unavailable"))?;
+        Ok(PreparedBatch {
+            request: WriteRequest {
+                shard: self.shard,
+                epoch: v.epoch,
+                request_id,
+                operations,
+            },
+            sequence: v.sequence,
+        })
+    }
+    pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        let v = self.view()?;
+        self.vertex_in(id, &v)
+    }
+    fn vertex_in(&self, id: u64, v: &ReadView) -> Result<Option<Vertex>> {
+        self.node
+            .get(&record_key(self.partition, b"vertex/", id), v)?
+            .map(|bytes| {
+                let (p, rest) = unwrap_record(&bytes, 1)?;
+                if p != self.partition {
+                    return Err(ExperimentalError::Corrupt("vertex partition encoding"));
+                }
+                let vertex = codec::decode_vertex(rest)?;
+                if vertex.id != id {
+                    return Err(ExperimentalError::Corrupt("vertex key identity"));
+                }
+                Ok(vertex)
+            })
+            .transpose()
+    }
+    pub fn prepare_vertex(&self, vertex: &Vertex) -> Result<PreparedBatch> {
+        validate_vertex(vertex)?;
+        let v = self.view()?;
+        if self.vertex_in(vertex.id, &v)?.is_some() {
+            return Err(ExperimentalError::AlreadyExists);
+        }
+        let bytes = wrap_record(1, self.partition, &codec::encode_vertex(vertex)?);
+        check_record_size(&bytes)?;
+        self.batch(
+            &v,
+            vec![WriteOp::put(
+                record_key(self.partition, b"vertex/", vertex.id),
+                bytes,
+            )],
+        )
+    }
+    pub fn prepare_source(&self, edge: &CrossEdge) -> Result<PreparedBatch> {
+        validate_edge(&edge.local())?;
+        if edge.from.partition != self.partition {
+            return Err(ExperimentalError::Invalid("source owner mismatch"));
+        }
+        let v = self.view()?;
+        if self.vertex_in(edge.from.id, &v)?.is_none() {
+            return Err(ExperimentalError::MissingEndpoint(edge.from));
+        }
+        if self
+            .node
+            .get(&record_key(self.partition, b"edge/", edge.id), &v)?
+            .is_some()
+        {
+            return Err(ExperimentalError::AlreadyExists);
+        }
+        let bytes = wrap_record(2, edge.to.partition, &codec::encode_edge(&edge.local())?);
+        check_record_size(&bytes)?;
+        self.batch(
+            &v,
+            vec![
+                WriteOp::put(record_key(self.partition, b"edge/", edge.id), bytes),
+                WriteOp::put(index_key(edge, Direction::Out), Vec::new()),
+            ],
+        )
+    }
+    pub fn prepare_reverse(&self, edge: &CrossEdge) -> Result<PreparedBatch> {
+        validate_edge(&edge.local())?;
+        if edge.to.partition != self.partition {
+            return Err(ExperimentalError::Invalid("target partition mismatch"));
+        }
+        let v = self.view()?;
+        if self.vertex_in(edge.to.id, &v)?.is_none() {
+            return Err(ExperimentalError::MissingEndpoint(edge.to));
+        }
+        if self
+            .node
+            .get(&index_key(edge, Direction::In), &v)?
+            .is_some()
+        {
+            return Err(ExperimentalError::AlreadyExists);
+        }
+        self.batch(
+            &v,
+            vec![WriteOp::put(index_key(edge, Direction::In), Vec::new())],
+        )
+    }
+    pub fn get_edge(&self, id: u64) -> Result<Option<CrossEdge>> {
+        let v = self.view()?;
+        let Some(bytes) = self
+            .node
+            .get(&record_key(self.partition, b"edge/", id), &v)?
+        else {
+            return Ok(None);
+        };
+        let (to_partition, rest) = unwrap_record(&bytes, 2)?;
+        let local = codec::decode_edge(rest)?;
+        let edge = CrossEdge {
+            id: local.id,
+            from: VertexRef {
+                partition: self.partition,
+                id: local.from,
+            },
+            to: VertexRef {
+                partition: to_partition,
+                id: local.to,
+            },
+            label: local.label,
+            properties: local.properties,
+        };
+        if edge.id != id
+            || self.node.get(&index_key(&edge, Direction::Out), &v)? != Some(Vec::new())
+            || self.vertex_in(edge.from.id, &v)?.is_none()
+        {
+            return Err(ExperimentalError::Incomplete(edge.identity()));
+        }
+        Ok(Some(edge))
+    }
+    pub fn verify_reverse(&self, edge: &CrossEdge) -> Result<()> {
+        if edge.to.partition != self.partition {
+            return Err(ExperimentalError::Invalid("target partition mismatch"));
+        }
+        let v = self.view()?;
+        if self.node.get(&index_key(edge, Direction::In), &v)? != Some(Vec::new())
+            || self.vertex_in(edge.to.id, &v)?.is_none()
+        {
+            return Err(ExperimentalError::Incomplete(edge.identity()));
+        }
+        Ok(())
+    }
+    /// Only observed index entries, not proof that no index entries are missing.
+    pub fn observed_index(&self, id: u64, direction: Direction) -> Result<Vec<ObservedIndex>> {
+        let v = self.view()?;
+        if self.vertex_in(id, &v)?.is_none() {
+            return Err(ExperimentalError::MissingEndpoint(VertexRef {
+                partition: self.partition,
+                id,
+            }));
+        }
+        let prefix = index_prefix(self.partition, direction, id);
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() += 1;
+        let rows = self.node.scan(
+            KeyRange::new(prefix.clone(), end)?,
+            ScanLimit::new(1000, 1024 * 1024)?,
+            &v,
+        )?;
+        let mut refs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tail = &row.key[prefix.len()..];
+            if tail.len() < 14 || !row.value.is_empty() || tail[tail.len() - 13] != b'/' {
+                return Err(ExperimentalError::Corrupt("index encoding"));
+            }
+            let n = tail.len();
+            let label = std::str::from_utf8(&tail[..n - 13])
+                .map_err(|_| ExperimentalError::Corrupt("index label"))?
+                .to_owned();
+            let partition = u32::from_be_bytes(tail[n - 12..n - 8].try_into().unwrap());
+            let edge_id = u64::from_be_bytes(tail[n - 8..].try_into().unwrap());
+            validate_label(&label).map_err(|_| ExperimentalError::Corrupt("index label"))?;
+            if direction == Direction::Out && partition != self.partition {
+                return Err(ExperimentalError::Corrupt("outgoing owner mismatch"));
+            }
+            refs.push(ObservedIndex {
+                edge: EdgeRef {
+                    partition,
+                    id: edge_id,
+                },
+                label,
+            });
+        }
+        refs.sort_by_key(|r| (r.edge.id, r.edge.partition));
+        Ok(refs)
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ObservedIndex {
+    pub edge: EdgeRef,
+    pub label: String,
+}
+fn record_key(p: u32, kind: &[u8], id: u64) -> Vec<u8> {
+    let mut k = b"graph/v2/p/".to_vec();
+    k.extend(p.to_be_bytes());
+    k.push(b'/');
+    k.extend(kind);
+    k.extend(id.to_be_bytes());
+    k
+}
+fn index_prefix(p: u32, d: Direction, id: u64) -> Vec<u8> {
+    record_key(p, if d == Direction::Out { b"out/" } else { b"in/" }, id)
+        .into_iter()
+        .chain(*b"/")
+        .collect()
+}
+fn index_key(e: &CrossEdge, d: Direction) -> Vec<u8> {
+    let endpoint = if d == Direction::Out { e.from } else { e.to };
+    let mut k = index_prefix(endpoint.partition, d, endpoint.id);
+    k.extend(e.label.as_bytes());
+    k.push(b'/');
+    k.extend(e.from.partition.to_be_bytes());
+    k.extend(e.id.to_be_bytes());
+    k
+}
+// v2 protobuf envelope: version=2, kind, fixed32 partition field 3,
+// bytes field 4 containing the unchanged canonical v1 Vertex/Edge record.
+fn wrap_record(kind: u8, p: u32, record: &[u8]) -> Vec<u8> {
+    let mut b = vec![8, 2, 16, kind, 29];
+    b.extend(p.to_le_bytes());
+    b.push(34);
+    let mut n = record.len();
+    while n >= 128 {
+        b.push((n as u8 & 127) | 128);
+        n >>= 7;
+    }
+    b.push(n as u8);
+    b.extend(record);
+    b
+}
+fn unwrap_record(b: &[u8], kind: u8) -> Result<(u32, &[u8])> {
+    if b.len() < 11 || b[..5] != [8, 2, 16, kind, 29] || b[9] != 34 || b.len() > 1024 * 1024 {
+        return Err(ExperimentalError::Corrupt("v2 record envelope"));
+    }
+    let p = u32::from_le_bytes(b[5..9].try_into().unwrap());
+    let mut n = 0usize;
+    let mut at = 10;
+    for shift in (0..28).step_by(7) {
+        let byte = *b
+            .get(at)
+            .ok_or(ExperimentalError::Corrupt("v2 record length"))?;
+        at += 1;
+        n |= ((byte & 127) as usize) << shift;
+        if byte < 128 {
+            if n != b.len() - at || (shift > 0 && byte == 0) {
+                return Err(ExperimentalError::Corrupt("v2 record length"));
+            }
+            return Ok((p, &b[at..]));
+        }
+    }
+    Err(ExperimentalError::Corrupt("v2 record length"))
+}
+
+fn check_record_size(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(StorageNodeError::ResourceExhausted("v2 record exceeds 1 MiB".into()).into());
+    }
+    Ok(())
+}

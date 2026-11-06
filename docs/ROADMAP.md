@@ -218,3 +218,10 @@ order, one snapshot per shard and one absolute deadline. It has no cross-edge
 traversal, global snapshot isolation or transactions. Full-copy snapshot and
 logical query budgets have explicit distinct bounds/exclusions. Actual metadata
 and two independent data processes exercise the functional path. D5 remains open.
+
+## Isolated v2 append-only experiment
+
+[EXPERIMENTAL_CROSS_EDGES.md](EXPERIMENTAL_CROSS_EDGES.md) documents a separate
+versioned namespace and explicitly non-atomic source/reverse append protocol.
+It does not change this document's existing v1/K3/Gremlin contract or complete
+D4/D5. Its out/in observations cannot certify missing-index completeness.

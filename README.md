@@ -521,3 +521,12 @@ partition-to-data-group routing through `RouteResolver::new_remote`. See
 and Gremlin are tested across nine independent processes (metadata plus two data
 groups). This is not production security, validated automatic failover, online
 migration, or cross-shard queries/transactions.
+
+### Isolated cross-shard edge experiment
+
+A separate [append-only graph/v2 experiment](docs/EXPERIMENTAL_CROSS_EDGES.md)
+supports qualified vertices and source-owned edges across shards, with explicit
+non-atomic staged writes and unknown/incomplete outcomes. Its out/in API returns
+index observations with **unverified completeness**, not complete Gremlin results.
+V1 data and atomicity stay unchanged; v1 entities do not participate. No automatic
+repair, migration, failover guarantee or production deployment is implied.
