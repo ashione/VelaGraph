@@ -1089,6 +1089,181 @@ mod global_scan_tests {
         rocksdb_sql_table::WriteOp::Put { key, value }
     }
 
+    // Canonical raw fixtures avoid thousands of Raft commits in budget tests.
+    fn bare_v2_edge(partition: u32, id: u64) -> Vec<rocksdb_sql_table::WriteOp> {
+        use rocksdb_sql_table::WriteOp;
+        let key = |kind: &[u8], id: u64| {
+            [
+                b"graph/v2/p/".as_slice(),
+                &partition.to_be_bytes(),
+                b"/",
+                kind,
+                &id.to_be_bytes(),
+            ]
+            .concat()
+        };
+        let mut payload = vec![8];
+        let mut n = id;
+        while n >= 128 {
+            payload.push((n as u8 & 127) | 128);
+            n >>= 7;
+        }
+        payload.push(n as u8);
+        payload.extend([16, 1, 24, 2, 34, 1, b'K']);
+        let mut record = vec![8, 1, 16, 2, 26, payload.len() as u8];
+        record.extend(payload);
+        let mut value = vec![8, 2, 16, 2, 29];
+        value.extend(partition.to_le_bytes());
+        value.extend([34, record.len() as u8]);
+        value.extend(record);
+        let mut ops = vec![WriteOp::put(key(b"edge/", id), value)];
+        for kind in [b"out/".as_slice(), b"in/".as_slice()] {
+            let mut k = key(kind, if kind == b"out/" { 1 } else { 2 });
+            k.extend(b"/K/");
+            k.extend(partition.to_be_bytes());
+            k.extend(id.to_be_bytes());
+            ops.push(WriteOp::put(k, Vec::new()));
+        }
+        ops
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_edge_pages_global_order_and_shared_work_budget() {
+        use super::experimental::{ExperimentalRouteError, ObservedRowV3 as R};
+        use rocksdb_sql_table::experimental_graph::EdgeRef;
+        let root = Cluster::new();
+        let meta = start(&root, 10).await;
+        let data = start(&root, 20).await;
+        let catalog = Catalog::new(&meta, place(10), TEST_TIMEOUT).unwrap();
+        let adapter = ReplicatedStorageNode::new(&data, 20, TEST_TIMEOUT).unwrap();
+        let resolver = RouteResolver::new(
+            place(10),
+            std::slice::from_ref(&meta),
+            std::slice::from_ref(&data),
+        )
+        .unwrap();
+        crate::run_blocking(move || {
+            for p in [1, 2] {
+                register(&catalog, p, place(20));
+                let mut operations = vec![bare_v2_vertex(p, 1), bare_v2_vertex(p, 2)];
+                operations.extend((1..=200).flat_map(|id| bare_v2_edge(p, id)));
+                adapter
+                    .batch_write(WriteRequest {
+                        shard: 20,
+                        epoch: 1,
+                        request_id: [p as u8; 16],
+                        operations,
+                    })
+                    .unwrap();
+            }
+            let frozen = resolver
+                .experimental_read_session(Duration::from_secs(60))
+                .unwrap();
+            let expected: Vec<_> = (1..=200)
+                .flat_map(|id| [1, 2].map(|partition| R::Edge(EdgeRef { partition, id })))
+                .collect();
+            assert_eq!(
+                frozen
+                    .observed_gremlin_v3(999, "g.E().limit(400)")
+                    .unwrap()
+                    .rows,
+                expected
+            );
+            assert_eq!(
+                frozen.observed_gremlin_v3(999, "g.E()").unwrap().rows,
+                expected[..100]
+            );
+            assert_eq!(
+                frozen
+                    .observed_gremlin_v3(999, "g.E().limit(129)")
+                    .unwrap()
+                    .rows,
+                expected[..129]
+            );
+            let mut checks = bare_v2_edge(1, 1);
+            checks.remove(0); // outgoing/incoming then each endpoint
+            checks.extend([bare_v2_vertex(1, 1), bare_v2_vertex(1, 2)]);
+            for (index, restore) in checks.into_iter().enumerate() {
+                let key = match &restore { rocksdb_sql_table::WriteOp::Put { key, .. } => key.clone(), _ => unreachable!() };
+                adapter.batch_write(WriteRequest { shard:20,epoch:1,request_id:[20 + index as u8 * 2;16],operations:vec![rocksdb_sql_table::WriteOp::Delete {key}] }).unwrap();
+                let broken = resolver.experimental_read_session(Duration::from_secs(60)).unwrap();
+                for q in ["g.E(1)", "g.E().hasLabel('Missing').count()"] {
+                    assert!(matches!(broken.observed_gremlin_v3(1,q), Err(ExperimentalRouteError::Graph(rocksdb_sql_table::experimental_graph::ExperimentalError::Incomplete(_)))), "{index} {q}");
+                }
+                adapter.batch_write(WriteRequest { shard:20,epoch:1,request_id:[21 + index as u8 * 2;16],operations:vec![restore] }).unwrap();
+            }
+            for p in [1, 2] {
+                for (chunk, first) in (201..=5000).step_by(1000).enumerate() {
+                    adapter.batch_write(WriteRequest {shard:20,epoch:1,request_id:[40 + p as u8 * 5 + chunk as u8;16],operations:(first..=(first+999).min(5000)).flat_map(|id|bare_v2_edge(p,id)).collect()}).unwrap();
+                }
+            }
+            let current = resolver
+                .experimental_read_session(Duration::from_secs(60))
+                .unwrap();
+            assert_eq!(
+                current
+                    .observed_gremlin_v3(999, "g.E().count()")
+                    .unwrap()
+                    .rows,
+                vec![R::Count(10000)]
+            );
+            for q in [
+                "g.E().has('missing').count()",
+                "g.E().label().limit(1)",
+                "g.E().values('missing').count()",
+            ] {
+                assert!(
+                    matches!(
+                        current.observed_gremlin_v3(999, q),
+                        Err(ExperimentalRouteError::Query(
+                            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        ))
+                    ),
+                    "{q}"
+                );
+            }
+            assert_eq!(
+                current
+                    .observed_gremlin_v3(999, "g.E().limit(1000).count()")
+                    .unwrap()
+                    .rows,
+                vec![R::Count(1000)]
+            );
+            adapter
+                .batch_write(WriteRequest {
+                    shard: 20,
+                    epoch: 1,
+                    request_id: [9; 16],
+                    operations: bare_v2_edge(1, 5001),
+                })
+                .unwrap();
+            let latest = resolver
+                .experimental_read_session(Duration::from_secs(60))
+                .unwrap();
+            for q in ["g.E().count()", "g.E().has('missing').limit(1)"] {
+                assert!(
+                    matches!(
+                        latest.observed_gremlin_v3(999, q),
+                        Err(ExperimentalRouteError::Query(
+                            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        ))
+                    ),
+                    "{q}"
+                );
+            }
+            assert_eq!(
+                frozen
+                    .observed_gremlin_v3(999, "g.E().count()")
+                    .unwrap()
+                    .rows,
+                vec![R::Count(400)]
+            );
+        })
+        .await
+        .unwrap();
+        root.in_group(10).shutdown(&meta).await;
+        root.in_group(20).shutdown(&data).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn observed_global_vertex_pages_share_acquisition_and_filter_budgets() {
         use super::experimental::{AdjacencyCompleteness, ExperimentalRouteError, ObservedRow};

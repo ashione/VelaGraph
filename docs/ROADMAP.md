@@ -234,3 +234,9 @@ projections with qualified provenance and preserved bag multiplicity, keeping
 the original Eq API intact. Results always expose Unverified completeness and a
 per-shard snapshot vector. Full adjacency visibility, global consistency, repair
 and complete D5 remain deferred. See EXPERIMENTAL_CROSS_EDGES.md.
+
+Experimental graph/v2 now exposes additive observed_gremlin_v3 E()/E(ids)
+filtering and projection, qualified EdgeRef results and paths, bounded canonical
+paging and source/reverse/endpoint checks. All results remain Unverified;
+edge-to-vertex traversal, repair, cross-shard transactions and completeness
+certification remain future work. Legacy observed APIs are unchanged.

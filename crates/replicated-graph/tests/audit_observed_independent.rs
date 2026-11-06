@@ -147,7 +147,19 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
                 from: vr(from),
                 to: vr(to),
                 label: "K".into(),
-                properties: BTreeMap::new(),
+                properties: BTreeMap::from([
+                    (
+                        "x".into(),
+                        if id == 9 {
+                            rocksdb_sql_table::Value::Null
+                        } else {
+                            rocksdb_sql_table::Value::Integer(1)
+                        },
+                    ),
+                    ("real".into(), rocksdb_sql_table::Value::Real(-0.0)),
+                    ("bool".into(), rocksdb_sql_table::Value::Boolean(true)),
+                    ("text".into(), rocksdb_sql_table::Value::Text("同值".into())),
+                ]),
             };
             let prepared = resolver
                 .experimental_read_session(BUDGET)?
@@ -159,6 +171,110 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             vec![ObservedRow::Count(0)]
         );
         let s = resolver.experimental_read_session(BUDGET)?;
+        use replicated_graph::routing::experimental::{
+            ObservedElementRef as Element, ObservedRowV3 as R3,
+        };
+        let er = |partition, id| EdgeRef { partition, id };
+        assert_eq!(
+            frozen.observed_gremlin_v3(99, "g.E().count()")?.rows,
+            vec![R3::Count(0)]
+        );
+        let all_edges = s.observed_gremlin_v3(99, "g.E()")?;
+        assert_eq!(
+            all_edges.rows,
+            [(1, 9), (2, 9), (1, 10), (1, 11), (1, 12)].map(|(p, id)| R3::Edge(er(p, id)))
+        );
+        for (q, n) in [
+            ("g.E().has('x',null).count()", 2),
+            ("g.E().has('x',1).count()", 3),
+            ("g.E().has('x',1.0).count()", 0),
+            ("g.E().has('x').count()", 5),
+            ("g.E().hasLabel('Missing').count()", 0),
+            ("g.E().limit(1).has('x',1).count()", 0),
+            ("g.E().has('x',1).limit(1).count()", 1),
+        ] {
+            assert_eq!(
+                s.observed_gremlin_v3(99, q)?.rows,
+                vec![R3::Count(n)],
+                "{q}"
+            );
+        }
+        for (key, value) in [
+            ("x", rocksdb_sql_table::Value::Null),
+            ("real", rocksdb_sql_table::Value::Real(-0.0)),
+            ("bool", rocksdb_sql_table::Value::Boolean(true)),
+            ("text", rocksdb_sql_table::Value::Text("同值".into())),
+        ] {
+            assert_eq!(
+                s.observed_gremlin_v3(1, &format!("g.E(9,9).values('{key}')"))?
+                    .rows,
+                vec![
+                    R3::Value {
+                        source: Element::Edge(er(1, 9)),
+                        value
+                    };
+                    2
+                ]
+            );
+        }
+        assert_eq!(all_edges.snapshots, s.snapshots);
+        assert_eq!(all_edges.completeness, AdjacencyCompleteness::Unverified);
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(12,9,999,9)")?.rows,
+            [12, 9, 9].map(|id| R3::Edge(er(1, id)))
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(99, "g.E().limit(2).count()")?.rows,
+            vec![R3::Count(2)]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(9).path()")?.rows,
+            vec![R3::Path(vec![ObservedPathElement::Edge(er(1, 9))])]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(9).label()")?.rows,
+            vec![R3::Value {
+                source: Element::Edge(er(1, 9)),
+                value: rocksdb_sql_table::Value::Text("K".into())
+            }]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(99, "g.E().hasLabel('K').count()")?
+                .rows,
+            vec![R3::Count(5)]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(99, "g.E().values('missing').count()")?
+                .rows,
+            vec![R3::Count(0)]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(99, "g.E().has('missing').count()")?
+                .rows,
+            vec![R3::Count(0)]
+        );
+        for q in [
+            "g.E().out()",
+            "g.E(999).in()",
+            "g.E().limit(0).both()",
+            "g.E().outE()",
+            "g.E().inV()",
+            "g.E().id()",
+            "g.E().values('missing').path()",
+            "g.E().label().has('x')",
+        ] {
+            assert!(s.observed_gremlin_v3(1, q).is_err(), "{q}");
+        }
+        assert!(s.observed_gremlin_v2(1, "g.E()").is_err());
+        assert!(s.observed_gremlin(1, "g.E()").is_err());
+        assert!(s.observed_gremlin_v3(99, "g.E(9).limit(0)").is_err());
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).label()")?.rows,
+            vec![R3::Value {
+                source: Element::Vertex(vr(1)),
+                value: rocksdb_sql_table::Value::Text("P1".into())
+            }]
+        );
         let r = s.observed_gremlin(1, "g.V(7).both()")?;
         assert_eq!(r.completeness, AdjacencyCompleteness::Unverified);
         assert_eq!(
@@ -249,6 +365,23 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
                 ExperimentalError::Incomplete(_)
             ))
         ));
+        for q in [
+            "g.E()",
+            "g.E(99)",
+            "g.E().hasLabel('Missing').limit(1)",
+            "g.E().count()",
+        ] {
+            assert!(matches!(
+                fresh.observed_gremlin_v3(1, q),
+                Err(ExperimentalRouteError::Graph(
+                    ExperimentalError::Incomplete(_)
+                ))
+            ));
+        }
+        assert_eq!(
+            fresh.observed_gremlin_v3(1, "g.E().limit(1)")?.rows,
+            vec![R3::Edge(er(1, 9))]
+        );
         let incoming = fresh.observed_gremlin(2, "g.V(7).in().count()")?;
         assert_eq!(incoming.rows, vec![ObservedRow::Count(2)]);
         assert_eq!(incoming.completeness, AdjacencyCompleteness::Unverified);
@@ -459,6 +592,42 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
                 rocksdb_sql_table::Error::TraversalLimitExceeded(_)
             ))
         ));
+        use replicated_graph::routing::experimental::ObservedRowV3 as R3;
+        let wide_edge = CrossEdge {
+            id: 90,
+            from: vr(1, 7),
+            to: vr(2, 7),
+            label: "wide".into(),
+            properties: BTreeMap::from([("blob".into(), Value::Text("x".repeat(800_000)))]),
+        };
+        let prepared = wide_session.prepare_edge(&wide_edge)?;
+        resolver.experimental_commit(&prepared, BUDGET)?;
+        let edges = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(
+            edges
+                .observed_gremlin_v3(1, &format!("g.E({ids}).count()"))?
+                .rows,
+            vec![R3::Count(32)]
+        );
+        assert!(matches!(
+            edges.observed_gremlin_v3(1, &format!("g.E({ids}).values('blob').limit(1)")),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        let more_ids = std::iter::repeat_n("90", 48).collect::<Vec<_>>().join(",");
+        assert!(matches!(
+            edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).has('missing').limit(1)")),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        assert_eq!(
+            edges
+                .observed_gremlin_v3(1, &format!("g.E({ids}).limit(1).values('blob').count()"))?
+                .rows,
+            vec![R3::Count(1)]
+        );
         Ok(())
     })
     .await??;

@@ -199,6 +199,14 @@ pub struct ScanCursor {
 }
 
 impl ScanCursor {
+    pub(crate) fn matches_page(&self, view: &ReadView, range: &KeyRange, last: &[u8]) -> bool {
+        Arc::ptr_eq(&self.view.data, &view.data)
+            && (self.view.shard, self.view.epoch, self.view.sequence)
+                == (view.shard, view.epoch, view.sequence)
+            && &self.range == range
+            && self.after == last
+    }
+
     // Query accounting excludes the shared view. Range and cursor headers are
     // included in the fixed query control charge; this is the copied resume key.
     pub(crate) fn query_resume_bytes(&self) -> usize {

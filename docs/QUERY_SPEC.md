@@ -298,3 +298,9 @@ rows; present Null remains; label is the first stored label or empty Text.
 signed zeros compare equal); original observed Eq types/API remain unchanged.
 Shared budgets, deadline, snapshots and Unverified status are specified in
 EXPERIMENTAL_CROSS_EDGES.md; these are not complete D5 results.
+
+The additive experimental `observed_gremlin_v3` also accepts bounded E starts
+with has/hasLabel/values/label/limit/path/count and qualified edge provenance.
+Old observed APIs still reject E. See [v3 edge observations](EXPERIMENTAL_CROSS_EDGES.md#additive-edge-observations-v3)
+for ordering, strict validation, shared budgets and Unverified semantics; this
+does not broaden v1 global traversal or establish a consistent global snapshot.

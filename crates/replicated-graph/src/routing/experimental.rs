@@ -5,7 +5,8 @@ use rocksdb_sql_table::experimental_graph::{
     AppendOnlyStore, CrossEdge, Direction, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
 };
 pub use traversal::{
-    ObservedPathElement, ObservedRow, ObservedRowV2, ObservedTraversal, ObservedTraversalV2,
+    ObservedElementRef, ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3,
+    ObservedTraversal, ObservedTraversalV2, ObservedTraversalV3,
 };
 
 #[derive(Debug)]

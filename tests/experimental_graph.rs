@@ -709,3 +709,193 @@ fn vertex_pages_reject_corrupt_keys_envelopes_and_identity_without_partial_succe
         ));
     }
 }
+
+#[derive(Clone)]
+struct EdgePaged {
+    node: Shared,
+    fault: u8,
+}
+impl StorageNode for EdgePaged {
+    fn read_view(&self) -> StorageResult<ReadView> {
+        self.node.read_view()
+    }
+    fn get(&self, key: &[u8], view: &ReadView) -> StorageResult<Option<Vec<u8>>> {
+        self.node.get(key, view)
+    }
+    fn scan(
+        &self,
+        range: KeyRange,
+        limit: ScanLimit,
+        view: &ReadView,
+    ) -> StorageResult<Vec<KeyValue>> {
+        self.node.scan(range, limit, view)
+    }
+    fn scan_page(
+        &self,
+        range: KeyRange,
+        limit: ScanLimit,
+        view: &ReadView,
+        cursor: Option<&rocksdb_sql_table::ScanCursor>,
+    ) -> StorageResult<rocksdb_sql_table::ScanPage> {
+        let limit = if self.fault == 4 {
+            ScanLimit::new(3, 4096)?
+        } else {
+            limit
+        };
+        let mut page = self.node.0.scan_page(range.clone(), limit, view, cursor)?;
+        if self.fault == 6 {
+            let other = self.node.read_view()?;
+            page.next_cursor = self
+                .node
+                .0
+                .scan_page(range, limit, &other, None)?
+                .next_cursor;
+        } else if self.fault == 7 {
+            let mut other = range;
+            other.start.push(0);
+            page.next_cursor = self.node.0.scan_page(other, limit, view, None)?.next_cursor;
+        }
+        match self.fault {
+            1 => page.rows.reverse(),
+            2 => page.rows.clear(),
+            3 => {
+                page.rows.pop();
+            }
+            5 => {
+                if let Some(row) = page.rows.first_mut() {
+                    row.value.resize(4096, 0);
+                }
+            }
+            _ => {}
+        }
+        Ok(page)
+    }
+    fn batch_write(&self, request: WriteRequest) -> StorageResult<WriteResult> {
+        self.node.batch_write(request)
+    }
+    fn admin(&self) -> &dyn StorageAdmin {
+        self.node.admin()
+    }
+}
+#[test]
+fn edge_pages_validate_bounds_order_continuation_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let n = node(dir.path());
+        let a = AppendOnlyStore::new(n.clone(), 7, 1);
+        vertex(&a, &n, 1);
+        vertex(&a, &n, 2);
+        for id in [u64::MAX, 300, 0, 1, 128, 129] {
+            let mut e = edge(1, 1);
+            e.id = id;
+            a.prepare_source(&e)
+                .unwrap()
+                .combine(a.prepare_reverse(&e).unwrap())
+                .unwrap()
+                .submit(&n)
+                .unwrap();
+        }
+        assert!(matches!(
+            a.edge_page(None, ScanLimit::new(1, 1024).unwrap()),
+            Err(ExperimentalError::Storage(StorageNodeError::Unsupported(_)))
+        ));
+        for fault in 1..=7 {
+            let store = AppendOnlyStore::new(
+                EdgePaged {
+                    node: n.clone(),
+                    fault,
+                },
+                7,
+                1,
+            );
+            assert!(
+                matches!(
+                    store.edge_page(None, ScanLimit::new(2, 1024).unwrap()),
+                    Err(ExperimentalError::Corrupt(_))
+                ),
+                "fault {fault}"
+            );
+        }
+    }
+    let a = AppendOnlyStore::new(LocalStorageNode::open(dir.path(), 7).unwrap(), 7, 1);
+    let mut after = None;
+    let mut ids = vec![];
+    loop {
+        let page = a
+            .edge_page(after, ScanLimit::new(2, 1024).unwrap())
+            .unwrap();
+        assert!(page.edges.len() <= 2 && page.raw_bytes <= 1024);
+        ids.extend(page.edges.iter().map(|e| e.id));
+        after = page.next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(ids, [0, 1, 128, 129, 300, u64::MAX]);
+    assert!(a
+        .edge_page(Some(u64::MAX), ScanLimit::new(1, 1024).unwrap())
+        .unwrap()
+        .edges
+        .is_empty());
+    assert!(matches!(
+        a.edge_page(None, ScanLimit::new(1, 1).unwrap()),
+        Err(ExperimentalError::Storage(
+            StorageNodeError::ResourceExhausted(_)
+        ))
+    ));
+    for limit in [
+        ScanLimit {
+            max_rows: 0,
+            max_bytes: 100,
+        },
+        ScanLimit {
+            max_rows: 1,
+            max_bytes: 0,
+        },
+        ScanLimit::new(129, 1024).unwrap(),
+        ScanLimit::new(1, 1024 * 1024 + 65).unwrap(),
+    ] {
+        assert!(matches!(
+            a.edge_page(None, limit),
+            Err(ExperimentalError::Invalid(_))
+        ));
+    }
+}
+#[test]
+fn edge_pages_reject_malformed_keys_envelopes_and_identity() {
+    let prefix = hex("67726170682f76322f702f000000012f656467652f");
+    for case in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let n = node(dir.path());
+            let a = AppendOnlyStore::new(n.clone(), 7, 1);
+            vertex(&a, &n, 1);
+            let mut e = edge(1, 2);
+            e.id = 1;
+            a.prepare_source(&e).unwrap().submit(&n).unwrap();
+            let old_key = [prefix.clone(), 1u64.to_be_bytes().to_vec()].concat();
+            let mut key = [prefix.clone(), 2u64.to_be_bytes().to_vec()].concat();
+            let mut value = n.get(&old_key, &n.read_view().unwrap()).unwrap().unwrap();
+            match case {
+                0 => key.push(0),
+                1 => value[3] = 1,
+                2 => value[0] = 0,
+                4 => {
+                    key = old_key;
+                    key.push(0);
+                }
+                _ => {}
+            }
+            raw(&n, vec![WriteOp::Put { key, value }]);
+        }
+        let a = AppendOnlyStore::new(LocalStorageNode::open(dir.path(), 7).unwrap(), 7, 1);
+        let first = a.edge_page(None, ScanLimit::new(1, 1024).unwrap()).unwrap();
+        assert_eq!(first.next_after, Some(1));
+        assert!(a
+            .edge_page(first.next_after, ScanLimit::new(128, 1024).unwrap())
+            .is_err());
+        assert!(a
+            .edge_page(None, ScanLimit::new(128, 1024).unwrap())
+            .is_err());
+    }
+}
