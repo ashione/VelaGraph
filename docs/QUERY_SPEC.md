@@ -93,6 +93,20 @@ Rules:
   `UnsupportedGremlinValue` because v0 does not add a separate id row type.
 - A missing vertex/edge id yields no row, not an error.
 
+### Single-node read consistency
+
+Each execution of a parsed query pins one RocksDB snapshot before its first
+read. All start scans and point reads, adjacency entries, edge payloads and
+target vertices use that same sequence through successful return. An atomic
+concurrent commit is therefore observed entirely before or after the query's
+snapshot, never as a mixture. Reusing a parsed query acquires a new snapshot
+on each execution. Parsing precedes snapshot acquisition and the execution
+deadline includes snapshot acquisition; parsing itself is outside that deadline.
+
+This is a local single-partition guarantee, not a Raft read, distributed
+snapshot, or transaction with a query-visible write overlay. The internal
+backend does not change the storage-node scan contract.
+
 ## 5. Value mapping
 
 | Gremlin literal | Stored `Value` |

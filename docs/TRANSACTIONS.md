@@ -87,13 +87,13 @@ Rules:
 - Read limits from `QUERY_SPEC.md` still apply to scans; a view must not become an
   unbounded full-graph escape hatch.
 - The sequence is the pinned RocksDB sequence, not wall-clock time.
-- Gremlin execution on a read view is a later K3 slice; until it lands, callers
-  can use the view for the point/adjacency reads above and the engine API for
-  queries. The implementation MUST NOT silently run a "snapshot" query on the
-  live engine.
-- K3a implements the point and adjacency methods above; bounded scan methods
-  remain a follow-up even though the read-view rule above already applies to
-  them.
+- Each `GraphEngine::gremlin` / `GremlinQuery::execute` execution pins one
+  read view after parsing, before any graph reads. Start records, adjacency,
+  edge records and target vertices all use this sequence; concurrent commits
+  are visible only to subsequent executions.
+- The query-only backend uses checked bounded scans and an incremental checked
+  adjacency visitor. Public read-view point/adjacency APIs remain unchanged;
+  there is no new public query-on-existing-view API in this slice.
 - A view holds a RocksDB snapshot; callers should keep its lifetime bounded.
   Snapshot creation copies no graph data.
 
@@ -239,8 +239,8 @@ harness.
 - No graph key or payload change is introduced by K3. Snapshot/read-view and
   transaction state are runtime state, not persisted formats.
 - Existing `GraphEngine` autocommit callers compile unchanged.
-- The new API is additive; `GraphEngine::gremlin` continues to read from the
-  current engine until snapshot query execution is implemented.
+- Existing Gremlin APIs are unchanged; each execution now reads a single
+  snapshot rather than potentially mixing live reads across concurrent commits.
 - Reopen tests must show old data remains readable and that a committed
   transaction survives reopen.
 - D1 can later wrap the same commit unit in a storage-node `batch_write`; D4
@@ -276,13 +276,14 @@ harness.
 - Per-key version indexes and non-conservative conflict detection.
 - Transaction retry, idempotency keys, and client request IDs (D1 node layer).
 - SQL/graph combined transactions.
-- Gremlin execution over a read view is a K3 implementation slice, not a change
-  to the K2 query contract.
+- Gremlin through replicated storage needs a bounded, paginated read interface;
+  the local query backend does not alter the D1 scan contract or provide Raft reads.
 
 ## 10. Implementation slices
 
 1. **K3a — read views (implemented):** snapshot-backed `GraphReadView`,
-   point/adjacency reads, and stability tests. Gremlin integration is deferred.
+   point/adjacency reads, and stability tests. Gremlin now pins one view per
+   execution with checked bounded scans and incremental adjacency reads.
 2. **K3b — transactions (implemented):** overlay, validation, one-batch synced
    commit, conflict detection, cascade tests.
 3. **K3c — recovery (implemented):** process-crash harness in

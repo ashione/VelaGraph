@@ -14,8 +14,71 @@ use std::time::{Duration, Instant};
 use gremlin_rs::{parse_query, ParseTree};
 
 use crate::error::{Error, Result};
-use crate::graph::{Edge, GraphEngine, Vertex};
+use crate::graph::{Edge, GraphEngine, GraphReadView, Vertex};
 use crate::value::Value;
+
+/// Query-only reads from one stable sequence. Implementations must never mix
+/// live reads into a view, silently truncate an internal cap, or collect an
+/// unbounded adjacency list. This is not a distributed storage-node contract.
+pub(crate) trait QueryReadBackend {
+    fn get_vertex(&self, id: u64) -> Result<Option<Vertex>>;
+    fn get_edge(&self, id: u64) -> Result<Option<Edge>>;
+    fn scan_vertices_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Vertex>, bool)>;
+    fn scan_edges_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Edge>, bool)>;
+    fn visit_adjacent_edges(
+        &self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(Edge) -> Result<()>,
+    ) -> Result<()>;
+}
+
+impl QueryReadBackend for GraphReadView<'_> {
+    fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
+        GraphReadView::get_vertex(self, id)
+    }
+
+    fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
+        GraphReadView::get_edge(self, id)
+    }
+
+    fn scan_vertices_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Vertex>, bool)> {
+        GraphReadView::scan_vertices_checked(self, limit, check)
+    }
+
+    fn scan_edges_checked(
+        &self,
+        limit: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(Vec<Edge>, bool)> {
+        GraphReadView::scan_edges_checked(self, limit, check)
+    }
+
+    fn visit_adjacent_edges(
+        &self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(Edge) -> Result<()>,
+    ) -> Result<()> {
+        GraphReadView::visit_adjacent_edges(self, vertex_id, incoming, label, check, visit)
+    }
+}
 
 /// Maximum number of `out`/`in`/`both` steps in one query.
 pub const MAX_GREMLIN_EDGE_STEPS: usize = 3;
@@ -241,7 +304,8 @@ impl GremlinQuery {
         &self.steps
     }
 
-    /// Execute this query against `graph`.
+    /// Execute this query against one snapshot of `graph`.
+    /// Concurrent commits become visible only to subsequent executions.
     pub fn execute(&self, graph: &GraphEngine) -> Result<GremlinResult> {
         let deadline = Instant::now() + GREMLIN_DEADLINE;
         self.execute_checked(graph, &|| {
@@ -258,6 +322,17 @@ impl GremlinQuery {
     fn execute_checked(
         &self,
         graph: &GraphEngine,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<GremlinResult> {
+        check()?;
+        let view = graph.read_view();
+        self.execute_on_read(&view, check)
+    }
+
+    // The backend represents one stable read view for the entire execution.
+    fn execute_on_read(
+        &self,
+        graph: &impl QueryReadBackend,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<GremlinResult> {
         check()?;
@@ -299,7 +374,7 @@ impl GremlinQuery {
 
     fn start_rows(
         &self,
-        graph: &GraphEngine,
+        graph: &impl QueryReadBackend,
         limit: Option<usize>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Row>> {
@@ -435,7 +510,7 @@ impl Row {
 }
 
 fn apply_step(
-    graph: &GraphEngine,
+    graph: &impl QueryReadBackend,
     rows: Vec<Row>,
     step: &GremlinStep,
     check: &dyn Fn() -> Result<()>,
@@ -568,7 +643,7 @@ enum Direction {
 }
 
 fn expand(
-    graph: &GraphEngine,
+    graph: &impl QueryReadBackend,
     rows: Vec<Row>,
     direction: Direction,
     label: Option<&str>,
@@ -1108,5 +1183,136 @@ mod budget_tests {
             bounded.execute(&graph).unwrap().rows,
             vec![GremlinRow::Vertex(1)]
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::Barrier;
+
+    fn populate(graph: &GraphEngine) {
+        for id in 1..=3 {
+            let mut vertex = Vertex::new(id);
+            vertex.labels.push("old".into());
+            vertex
+                .properties
+                .insert("version".into(), Value::Integer(0));
+            graph.create_vertex(&vertex).unwrap();
+        }
+        for (id, from, to, label) in [(9, 1, 2, "A"), (3, 1, 3, "Z"), (5, 2, 3, "A")] {
+            graph.create_edge(&Edge::new(id, from, to, label)).unwrap();
+        }
+    }
+
+    fn replace_graph(graph: &GraphEngine) {
+        let mut transaction = graph.begin().unwrap();
+        for id in 1..=3 {
+            transaction.delete_vertex(id).unwrap();
+        }
+        for id in 1..=4 {
+            let mut vertex = Vertex::new(id);
+            vertex.labels.push("new".into());
+            vertex
+                .properties
+                .insert("version".into(), Value::Integer(1));
+            transaction.create_vertex(&vertex).unwrap();
+        }
+        transaction.create_edge(&Edge::new(3, 1, 4, "NEW")).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn old_view_keeps_points_scans_adjacency_and_properties_at_one_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        populate(&graph);
+        let view = graph.read_view();
+        let sequence = view.sequence();
+        let texts = [
+            "g.V().values('version')",
+            "g.V(3,1,1,99).label()",
+            "g.E().label()",
+            "g.E(9,3,9,99).id()",
+            "g.V(1).out().path()",
+            "g.V(3).in('A').id()",
+            "g.V(2).both().id()",
+            "g.V().limit(2).values('version')",
+            "g.E().limit(2).id()",
+            "g.V().hasLabel('old').has('version',0).count()",
+            "g.V(1).out().out().values('version')",
+        ];
+        let queries: Vec<_> = texts
+            .iter()
+            .map(|text| GremlinQuery::parse(text).unwrap())
+            .collect();
+        let before: Vec<_> = queries
+            .iter()
+            .map(|q| q.execute_on_read(&view, &|| Ok(())).unwrap())
+            .collect();
+        std::thread::scope(|scope| scope.spawn(|| replace_graph(&graph)).join().unwrap());
+        assert_eq!(view.sequence(), sequence);
+        assert!(graph.read_view().sequence() > sequence);
+        for (query, expected) in queries.iter().zip(before) {
+            assert_eq!(query.execute_on_read(&view, &|| Ok(())).unwrap(), expected);
+            assert_ne!(query.execute(&graph).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn concurrent_commit_at_every_execution_checkpoint_cannot_mix_snapshots() {
+        // Synchronize the writer before continuing at each checkpoint; neither
+        // sleeps nor a lucky thread schedule can make this test pass.
+        for text in [
+            "g.V().values('version')",
+            "g.E().label()",
+            "g.V(3,1,1).label()",
+            "g.E(9,3,9).label()",
+            "g.V(1).out().out().values('version')",
+            "g.V(3).in('A').values('version')",
+            "g.V(2).both().path()",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let graph = GraphEngine::open(dir.path()).unwrap();
+            populate(&graph);
+            let query = GremlinQuery::parse(text).unwrap();
+            let calls = Cell::new(0);
+            let expected = query
+                .execute_checked(&graph, &|| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            // Checkpoint 1 precedes snapshot acquisition. All later checkpoints
+            // must observe the originally pinned sequence despite this commit.
+            for pause_at in 2..=calls.get() {
+                let current = Cell::new(0);
+                let barrier = Barrier::new(2);
+                let actual = std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        barrier.wait();
+                        replace_graph(&graph);
+                        barrier.wait();
+                    });
+                    let result = query.execute_checked(&graph, &|| {
+                        current.set(current.get() + 1);
+                        if current.get() == pause_at {
+                            barrier.wait();
+                            barrier.wait();
+                        }
+                        Ok(())
+                    });
+                    writer.join().unwrap();
+                    result.unwrap()
+                });
+                assert_eq!(actual, expected, "{text} at checkpoint {pause_at}");
+                assert_ne!(query.execute(&graph).unwrap(), expected);
+                for id in 1..=4 {
+                    graph.delete_vertex(id).unwrap();
+                }
+                populate(&graph);
+            }
+        }
     }
 }

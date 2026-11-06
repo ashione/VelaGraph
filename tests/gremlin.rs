@@ -344,3 +344,36 @@ fn adjacency_order_and_self_loop_dedup_survive_streaming() {
         vec![GremlinRow::Count(3)]
     );
 }
+
+#[test]
+fn snapshot_start_scans_preserve_exact_row_boundary_and_leading_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = GraphEngine::open(dir.path()).unwrap();
+    for id in 0..10_000 {
+        graph.create_vertex(&Vertex::new(id)).unwrap();
+        graph.create_edge(&Edge::new(id, id, id, "LOOP")).unwrap();
+    }
+    for start in ["V", "E"] {
+        assert_eq!(
+            graph.gremlin(&format!("g.{start}().count()")).unwrap().rows,
+            vec![GremlinRow::Count(10_000)]
+        );
+    }
+    graph.create_vertex(&Vertex::new(10_000)).unwrap();
+    graph.create_edge(&Edge::new(10_000, 0, 0, "LOOP")).unwrap();
+    for start in ["V", "E"] {
+        for suffix in ["", ".count()", ".hasLabel('absent').limit(1)"] {
+            assert!(matches!(
+                graph.gremlin(&format!("g.{start}(){suffix}")),
+                Err(Error::TraversalLimitExceeded(_))
+            ));
+        }
+        assert_eq!(
+            graph
+                .gremlin(&format!("g.{start}().limit(1000).count()"))
+                .unwrap()
+                .rows,
+            vec![GremlinRow::Count(1000)]
+        );
+    }
+}
