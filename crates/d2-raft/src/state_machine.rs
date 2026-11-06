@@ -13,6 +13,7 @@ use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, WriteBatch, W
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::blocking::blocking_section;
 use crate::d1::D1State;
 use crate::types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};
 use crate::{D1Command, D1Error, D1Result, D1WriteStatus};
@@ -115,12 +116,21 @@ pub struct D1ReadSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct D1ReadLimit;
 
+#[cfg(test)]
+#[derive(Debug)]
+struct ApplyPublishGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Debug, Default)]
 pub struct StateMachine {
     pub state: RwLock<StateMachineData>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     storage: Option<Arc<StateMachineStorage>>,
+    #[cfg(test)]
+    apply_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
 }
 
 impl StateMachine {
@@ -187,6 +197,8 @@ impl StateMachine {
             snapshot_idx: AtomicU64::new(snapshot_idx),
             current_snapshot: RwLock::new(current_snapshot),
             storage: Some(storage),
+            #[cfg(test)]
+            apply_publish_gate: Default::default(),
         })
     }
 
@@ -331,61 +343,70 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
         let mut sm = self.state.write().await;
-        let mut next = sm.clone();
-        let mut out = Vec::new();
-        let mut batch = WriteBatch::default();
+        blocking_section(|| {
+            let mut next = sm.clone();
+            let mut out = Vec::new();
+            let mut batch = WriteBatch::default();
 
-        for entry in entries {
-            next.last_applied_log = Some(entry.log_id);
-            match entry.payload {
-                EntryPayload::Blank => out.push(ApplyResult {
-                    value: None,
-                    d1: None,
-                }),
-                EntryPayload::Membership(mem) => {
-                    next.last_membership = StoredMembership::new(Some(entry.log_id), mem);
-                    out.push(ApplyResult {
+            for entry in entries {
+                next.last_applied_log = Some(entry.log_id);
+                match entry.payload {
+                    EntryPayload::Blank => out.push(ApplyResult {
                         value: None,
                         d1: None,
-                    });
-                }
-                EntryPayload::Normal(cmd) => {
-                    let mut result = ApplyResult {
-                        value: None,
-                        d1: None,
-                    };
-                    match cmd {
-                        LogCommand::Noop => {}
-                        LogCommand::TxnBatch(operations) => {
-                            if next.d1.is_some() {
-                                result.d1 = Some(Err(D1Error::LegacyWriteDisabled));
-                            } else {
-                                apply_operations(&mut next, &mut batch, operations);
+                    }),
+                    EntryPayload::Membership(mem) => {
+                        next.last_membership = StoredMembership::new(Some(entry.log_id), mem);
+                        out.push(ApplyResult {
+                            value: None,
+                            d1: None,
+                        });
+                    }
+                    EntryPayload::Normal(cmd) => {
+                        let mut result = ApplyResult {
+                            value: None,
+                            d1: None,
+                        };
+                        match cmd {
+                            LogCommand::Noop => {}
+                            LogCommand::TxnBatch(operations) => {
+                                if next.d1.is_some() {
+                                    result.d1 = Some(Err(D1Error::LegacyWriteDisabled));
+                                } else {
+                                    apply_operations(&mut next, &mut batch, operations);
+                                }
+                            }
+                            LogCommand::D1V1(command) => {
+                                result.d1 = Some(apply_d1(&mut next, &mut batch, command));
                             }
                         }
-                        LogCommand::D1V1(command) => {
-                            result.d1 = Some(apply_d1(&mut next, &mut batch, command));
-                        }
+                        out.push(result);
                     }
-                    out.push(result);
                 }
             }
-        }
 
-        if let Some(storage) = &self.storage {
-            let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
-            let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
-            if let Some(d1) = &next.d1 {
-                batch.put(D1_KEY, serde_json::to_vec(d1).map_err(write_error)?);
-            } else {
-                batch.delete(D1_KEY);
+            if let Some(storage) = &self.storage {
+                let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
+                let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
+                if let Some(d1) = &next.d1 {
+                    batch.put(D1_KEY, serde_json::to_vec(d1).map_err(write_error)?);
+                } else {
+                    batch.delete(D1_KEY);
+                }
+                batch.put(APPLIED_KEY, applied);
+                batch.put(MEMBERSHIP_KEY, membership);
+                storage.write_sync(batch)?;
             }
-            batch.put(APPLIED_KEY, applied);
-            batch.put(MEMBERSHIP_KEY, membership);
-            storage.write_sync(batch)?;
-        }
-        *sm = next;
-        Ok(out)
+            #[cfg(test)]
+            if let Some(gate) = self.apply_publish_gate.lock().unwrap().take() {
+                let _ = gate.entered.send(());
+                gate.release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("test must release apply publication gate");
+            }
+            *sm = next;
+            Ok(out)
+        })
     }
 
     async fn begin_receiving_snapshot(
@@ -563,5 +584,93 @@ fn apply_d1(
             }
             Ok(result)
         }
+    }
+}
+
+#[cfg(test)]
+mod apply_publication_tests {
+    use super::*;
+    use openraft::CommittedLeaderId;
+    use std::time::Duration;
+
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    fn entry(index: u64, value: &str) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(LogCommand::put("key", value)),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn abort_during_persisted_apply_keeps_publication_and_fences_old_install(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = Arc::new(StateMachine::open(dir.path())?);
+        state.apply([entry(1, "old")]).await?;
+        let old = state.build_snapshot().await?;
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let release = ReleaseOnDrop(Some(release));
+        *state.apply_publish_gate.lock().unwrap() = Some(ApplyPublishGate {
+            entered,
+            release: gate,
+        });
+        let mut writer = state.clone();
+        let apply = tokio::spawn(async move { writer.apply([entry(2, "new")]).await });
+        tokio::time::timeout(Duration::from_secs(5), ready).await??;
+        // The actual durable write has completed, but the original write lock
+        // must still exclude snapshots until publication on the same stack.
+        let persisted = state
+            .storage
+            .as_ref()
+            .unwrap()
+            .db
+            .get(APPLIED_KEY)?
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Option<LogId<NodeId>>>(&persisted)?,
+            Some(entry(2, "").log_id)
+        );
+        assert!(state.state.try_read().is_err());
+        apply.abort();
+        let (started, installing) = tokio::sync::oneshot::channel();
+        let mut installer = state.clone();
+        let install = tokio::spawn(async move {
+            started.send(()).unwrap();
+            installer.install_snapshot(&old.meta, old.snapshot).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), installing).await??;
+        assert!(
+            !install.is_finished(),
+            "snapshot install bypassed apply lock"
+        );
+        drop(release); // Also released automatically on every earlier error/panic.
+                       // Abort may be observed after the non-yielding section, or completion
+                       // may win the race. Neither outcome implies rollback of the disk write.
+        match apply.await {
+            Ok(result) => {
+                result?;
+            }
+            Err(error) => assert!(error.is_cancelled()),
+        }
+        assert!(
+            install.await?.is_err(),
+            "old install regressed applied state"
+        );
+        assert_eq!(state.applied().await, Some(entry(2, "").log_id));
+        assert_eq!(state.get("key").await.as_deref(), Some("new"));
+        drop(state);
+        let reopened = StateMachine::open(dir.path())?;
+        assert_eq!(reopened.applied().await, Some(entry(2, "").log_id));
+        assert_eq!(reopened.get("key").await.as_deref(), Some("new"));
+        Ok(())
     }
 }

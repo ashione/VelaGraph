@@ -185,3 +185,48 @@ safeguards, not production authentication or authorization.
 - [raft-rs on crates.io](https://crates.io/crates/raft)
 - [tikv/raft-rs](https://github.com/tikv/raft-rs)
 - [async-raft on crates.io](https://crates.io/crates/async-raft)
+
+
+## Synchronous work and runtime scheduling
+
+The TCP prototype uses a multithread Tokio runtime. State-machine apply still
+clones and validates its next state, serializes D1 retry metadata, syncs the
+RocksDB batch, and only then publishes the in-memory state under the original
+write lock. Durable log callbacks similarly retain their original mutex through
+encoding, synchronous I/O and the log-flushed callback. These synchronous
+sections now use `block_in_place` so Tokio can replace the occupied async worker
+and continue scheduling heartbeats and unrelated RPCs. TCP JSON encode/decode
+uses the same private helper while retaining the existing connection/outbound
+admission and absolute deadline.
+
+This is not detached background work, a new await point within a mutation, or a
+cancellable persistence operation. It does not change flush ordering, record or
+wire bytes, request identity, unknown-outcome handling, admission limits,
+election timeouts, or frame limits. A current-thread executor or a caller outside
+Tokio keeps the previous inline behavior; this change does not promise responsive
+single-thread hosting. Snapshot build/install and some read-side cloning still
+perform synchronous work on their existing paths; this patch is not a complete
+blocking-work audit. It also does not remove full-state/dedup rewrite costs or
+guarantee availability under arbitrary CPU, I/O or network starvation.
+
+A single-worker multithread regression checks that an explicitly spawned
+synchronous task permits another explicitly spawned task to run. Compatibility
+tests cover current-thread and non-runtime calls. An actual durable-apply test
+pauses after fsync and before publication, aborts its caller, starts an old
+snapshot install, then verifies publication, fencing and reopen consistency.
+Bounded log reads seek to the requested lower index and stop at the upper
+bound rather than scanning historical values. TCP encoding coalesces small
+JSON tokens through a fixed 8 KiB scratch buffer; the existing encoded-frame
+limit and final absolute deadline remain enforced before network transmission.
+The scratch buffer is additional bounded allocation, not a larger wire limit.
+
+The unchanged large paged snapshot scenario can be exercised on Linux with constrained CPU affinity:
+
+```sh
+taskset -c 0,1 cargo test --locked -p replicated-graph --test remote_process
+```
+
+Select two CPU IDs actually available to the process. The fixture retains all
+page-size, sortedness, frozen-view, replay, post-mutation and Gremlin assertions;
+context on seed rows and snapshot stages distinguishes write preparation failures
+from page-transfer failures. No automatic replay or leader replacement is added.

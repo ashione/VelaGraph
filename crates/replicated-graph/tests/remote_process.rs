@@ -1,5 +1,6 @@
 //! Real independent Raft processes, graph CRUD and client-side standard Gremlin.
 //! This functional test deliberately does not claim crash/failover coverage.
+use anyhow::Context;
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{run_blocking, RemoteStorageNode};
 use rocksdb_sql_table::{
@@ -255,16 +256,23 @@ async fn paged_snapshot_roundtrip(endpoint: std::net::SocketAddr) -> anyhow::Res
             },
             budget,
         )
-        .await?;
+        .await
+        .with_context(|| format!("paged fixture seed row {index}"))?;
     }
-    let before = paged_snapshot(endpoint, 7, budget).await?;
-    let descriptor = open_snapshot(endpoint, None, 7, budget).await?;
+    let before = paged_snapshot(endpoint, 7, budget)
+        .await
+        .context("initial paged download")?;
+    let descriptor = open_snapshot(endpoint, None, 7, budget)
+        .await
+        .context("open pinned snapshot")?;
     assert_eq!(descriptor.shard, before.shard);
     assert_eq!(descriptor.epoch, before.epoch);
     assert_eq!(descriptor.sequence, before.sequence);
     assert_eq!(descriptor.rows, before.entries.len());
     assert!(descriptor.bytes > 2 * PAGE_BYTES);
-    let first = snapshot_page(endpoint, None, descriptor.clone(), None, budget).await?;
+    let first = snapshot_page(endpoint, None, descriptor.clone(), None, budget)
+        .await
+        .context("first pinned page")?;
     assert!(first.next.is_some());
     let first_entries = first.entries.clone();
 
@@ -317,7 +325,9 @@ async fn paged_snapshot_roundtrip(endpoint: std::net::SocketAddr) -> anyhow::Res
         .await
         .is_err());
 
-    let after = paged_snapshot(endpoint, 7, budget).await?;
+    let after = paged_snapshot(endpoint, 7, budget)
+        .await
+        .context("final paged download")?;
     assert_eq!(after.sequence, before.sequence + 3);
     assert_eq!(after.entries.len(), before.entries.len());
     assert_ne!(after.entries, before.entries);
