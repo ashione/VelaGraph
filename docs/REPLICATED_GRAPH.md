@@ -186,7 +186,9 @@ The query row cap is 10,000, not the CRUD adjacency convenience cap of 1,000.
 Pages are at most 256 rows / 16 MiB, and individual records share the 16 MiB bound.
 Oversized records, unsupported pagination, stale epochs, incompatible runtime
 contexts, read-barrier failures and query limits return errors, never truncated
-success. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
+success. These caps do not bound total query heap or process RSS: repeated
+traversers can duplicate large property payloads. Aggregate byte accounting is
+not implemented. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
 
 This closes only the bounded, in-process, single-shard replicated query path.
 K3 write-overlay transactions still belong to `GraphEngine`; cross-shard queries,

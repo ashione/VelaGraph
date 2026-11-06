@@ -375,3 +375,162 @@ fn missing_pagination_fails_without_legacy_scan_fallback() {
         Err(Error::StorageNode(StorageNodeError::InvalidArgument(_)))
     ));
 }
+
+#[test]
+fn paged_order_and_multiplicity_match_local_corpus() {
+    let vertices = (0..12).map(Vertex::new).collect::<Vec<_>>();
+    let edges = (0..1100)
+        .map(|id| {
+            Edge::new(
+                id,
+                (id * 7 + 3) % 12,
+                (id * 11 + 1) % 12,
+                ["A", "AA", "Z"][(id % 3) as usize],
+            )
+        })
+        .collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    let local = GraphEngine::open(dir.path()).unwrap();
+    for v in &vertices {
+        local.create_vertex(v).unwrap();
+    }
+    for e in &edges {
+        local.create_edge(e).unwrap();
+    }
+    let store = GraphRecordStore::new(Node::new(&vertices, &edges), 7, 0);
+    for start in ["g.V()", "g.V(3,3,999,1)", "g.V(0)", "g.V(2)"] {
+        for traversal in ["out()", "in()", "both()", "out('A')", "both('AA')"] {
+            for finish in ["count()", "limit(77).path()", "limit(1).id()"] {
+                let q = format!("{start}.{traversal}.{finish}");
+                assert_eq!(
+                    local.gremlin(&q).unwrap(),
+                    store.execute_gremlin(&q).unwrap(),
+                    "{q}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_partition_and_retained_sequence() {
+    let store = GraphRecordStore::new(Node::new(&[Vertex::new(1)], &[]), 7, 1);
+    assert_eq!(
+        store.execute_gremlin("g.V().count()").unwrap().rows,
+        vec![GremlinRow::Count(0)]
+    );
+    assert_eq!(
+        store.execute_gremlin("g.V(1).count()").unwrap().rows,
+        vec![GremlinRow::Count(0)]
+    );
+    let wrong_shard = GraphRecordStore::new(Node::new(&[], &[]), 8, 0);
+    assert!(matches!(
+        wrong_shard.execute_gremlin("g.V()"),
+        Err(Error::StorageNode(StorageNodeError::InvalidArgument(_)))
+    ));
+    let store = GraphRecordStore::new(Node::new(&[Vertex::new(1)], &[]), 7, 0);
+    let retained = store.read_view().unwrap();
+    *store.node().live.lock().unwrap() = view(&[], &[], 2);
+    assert_eq!(retained.sequence(), 1);
+    assert_eq!(
+        retained.execute_gremlin("g.V().count()").unwrap().rows,
+        vec![GremlinRow::Count(1)]
+    );
+    assert_eq!(
+        store.execute_gremlin("g.V().count()").unwrap().rows,
+        vec![GremlinRow::Count(0)]
+    );
+}
+
+struct FailingPageNode {
+    inner: Node,
+    calls: AtomicUsize,
+    slow_view: bool,
+}
+impl StorageNode for FailingPageNode {
+    fn read_view(&self) -> std::result::Result<ReadView, StorageNodeError> {
+        if self.slow_view {
+            std::thread::sleep(std::time::Duration::from_millis(5050));
+        }
+        self.inner.read_view()
+    }
+    fn get(
+        &self,
+        key: &[u8],
+        view: &ReadView,
+    ) -> std::result::Result<Option<Vec<u8>>, StorageNodeError> {
+        self.inner.get(key, view)
+    }
+    fn scan(
+        &self,
+        _: KeyRange,
+        _: ScanLimit,
+        _: &ReadView,
+    ) -> std::result::Result<Vec<KeyValue>, StorageNodeError> {
+        panic!("fallback not allowed")
+    }
+    fn scan_page(
+        &self,
+        r: KeyRange,
+        l: ScanLimit,
+        v: &ReadView,
+        c: Option<&ScanCursor>,
+    ) -> std::result::Result<ScanPage, StorageNodeError> {
+        assert!(l.max_rows <= 256);
+        assert!(l.max_bytes <= GRAPH_QUERY_PAGE_BYTES);
+        assert_eq!(v.sequence, 1);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            return Err(StorageNodeError::Fenced {
+                shard: 7,
+                epoch: 1,
+                current: 2,
+            });
+        }
+        self.inner.scan_page(r, l, v, c)
+    }
+    fn batch_write(&self, _: WriteRequest) -> std::result::Result<WriteResult, StorageNodeError> {
+        unreachable!()
+    }
+    fn admin(&self) -> &dyn StorageAdmin {
+        unreachable!()
+    }
+}
+#[test]
+fn mid_page_fence_never_returns_partial_success() {
+    let vertices = (0..600).map(Vertex::new).collect::<Vec<_>>();
+    let store = GraphRecordStore::new(
+        FailingPageNode {
+            inner: Node::new(&vertices, &[]),
+            calls: AtomicUsize::new(0),
+            slow_view: false,
+        },
+        7,
+        0,
+    );
+    assert!(matches!(
+        store.execute_gremlin("g.V().count()"),
+        Err(Error::StorageNode(StorageNodeError::Fenced {
+            current: 2,
+            ..
+        }))
+    ));
+    assert_eq!(store.node().calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.node().inner.acquisitions.load(Ordering::SeqCst), 1);
+}
+#[test]
+fn acquisition_time_is_in_query_deadline() {
+    let store = GraphRecordStore::new(
+        FailingPageNode {
+            inner: Node::new(&[], &[]),
+            calls: AtomicUsize::new(0),
+            slow_view: true,
+        },
+        7,
+        0,
+    );
+    assert!(matches!(
+        store.execute_gremlin("g.V().count()"),
+        Err(Error::TraversalLimitExceeded(_))
+    ));
+    assert_eq!(store.node().calls.load(Ordering::SeqCst), 0);
+}

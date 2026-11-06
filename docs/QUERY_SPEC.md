@@ -140,6 +140,10 @@ A leading limit need not read or decode later records. This D1-only byte bound
 does not change the existing local RocksDB query contract or graph encoding.
 The 5-second cooperative execution deadline includes new-view acquisition; it
 cannot preempt a single adapter dispatch, decode, allocation or destructor.
+These are per-view, per-page, per-record and row-cardinality bounds, **not a total
+query heap or process RSS bound**. Repeated traversers can copy the same large
+vertex properties many times; output materialization can therefore exceed the
+view's byte size. Aggregate byte accounting remains future work.
 
 ## 5. Value mapping
 
