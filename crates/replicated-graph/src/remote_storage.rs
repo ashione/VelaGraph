@@ -15,7 +15,7 @@ use d2_raft::{D1Result, D1WriteRequest, D1WriteStatus};
 use rocksdb_sql_table::{
     Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
     Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
-    WriteResult, WriteStatus, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
+    WriteResult, WriteStatus,
 };
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -179,6 +179,15 @@ fn map_error(
 ) -> StorageNodeError {
     match error {
         RemoteError::NotLeader { leader } => StorageNodeError::NotLeader { leader },
+        RemoteError::Application(d2_raft::D1Error::Fenced { requested, current })
+            if id.is_none() && epoch == 0 =>
+        {
+            StorageNodeError::Fenced {
+                shard,
+                epoch: requested,
+                current,
+            }
+        }
         RemoteError::Application(error) => {
             application_error(error, shard, epoch, id.unwrap_or([0; 16]))
         }
@@ -189,10 +198,12 @@ fn map_error(
             StorageNodeError::ResourceExhausted("remote service limit exceeded".into())
         }
         RemoteError::Timeout { .. } => StorageNodeError::Timeout { request_id: id },
-        RemoteError::Unavailable | RemoteError::Protocol if id.is_some() => {
+        RemoteError::Unavailable | RemoteError::SessionUnavailable | RemoteError::Protocol
+            if id.is_some() =>
+        {
             StorageNodeError::Timeout { request_id: id }
         }
-        RemoteError::Unavailable => {
+        RemoteError::Unavailable | RemoteError::SessionUnavailable => {
             StorageNodeError::Unavailable("remote service unavailable".into())
         }
         RemoteError::Protocol => {
@@ -212,44 +223,36 @@ impl StorageNode for RemoteStorageNode {
     }
 
     fn read_view(&self) -> Result<ReadView> {
-        let (endpoint, shard, deadline) = (self.endpoint, self.shard, self.deadline);
+        let (endpoint, shard) = (self.endpoint, self.shard);
+        let end = self
+            .absolute_deadline
+            .unwrap_or_else(|| Instant::now() + self.deadline);
         let identity = self.identity;
         self.dispatch(None, async move {
+            let deadline = end.saturating_duration_since(Instant::now());
             let snapshot = match identity {
                 Some(identity) => {
-                    remote::snapshot_identified(endpoint, identity, shard, deadline).await
+                    remote::paged_snapshot_identified(endpoint, identity, shard, deadline).await
                 }
-                None => remote::snapshot(endpoint, shard, deadline).await,
+                None => remote::paged_snapshot(endpoint, shard, deadline).await,
             }
             .map_err(|e| map_error(e, shard, 0, None))?;
-            if snapshot.shard != shard {
-                return Err(StorageNodeError::Corrupt(
-                    "remote snapshot shard mismatch".into(),
-                ));
+            // Transport validated all rows and metadata before exposing a result.
+            // Move into the existing complete local view, checking the same
+            // absolute deadline throughout this bounded synchronous assembly.
+            let mut entries = std::collections::BTreeMap::new();
+            for (key, value) in snapshot.entries {
+                if Instant::now() >= end {
+                    return Err(StorageNodeError::Timeout { request_id: None });
+                }
+                entries.insert(key, value);
             }
-            let bytes = snapshot.entries.iter().fold(0usize, |n, (key, value)| {
-                n.saturating_add(key.len()).saturating_add(value.len())
-            });
-            if snapshot.entries.len() > MAX_VIEW_ROWS || bytes > MAX_VIEW_BYTES {
-                return Err(StorageNodeError::ResourceExhausted(
-                    "remote snapshot limit exceeded".into(),
-                ));
+            let view =
+                ReadView::from_entries(snapshot.shard, snapshot.epoch, snapshot.sequence, entries)?;
+            if Instant::now() >= end {
+                return Err(StorageNodeError::Timeout { request_id: None });
             }
-            if snapshot
-                .entries
-                .windows(2)
-                .any(|pair| pair[0].0 >= pair[1].0)
-            {
-                return Err(StorageNodeError::Corrupt(
-                    "remote snapshot keys not strictly ordered".into(),
-                ));
-            }
-            ReadView::from_entries(
-                snapshot.shard,
-                snapshot.epoch,
-                snapshot.sequence,
-                snapshot.entries.into_iter().collect(),
-            )
+            Ok(view)
         })
     }
 
@@ -470,6 +473,7 @@ mod tests {
         ));
         for error in [
             RemoteError::Unavailable,
+            RemoteError::SessionUnavailable,
             RemoteError::Protocol,
             RemoteError::Timeout { request_id: None },
         ] {

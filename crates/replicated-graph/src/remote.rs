@@ -22,6 +22,13 @@ pub const MAX_IN_FLIGHT: usize = 16;
 const VERSION: u32 = 1;
 /// Largest accepted client or server operation budget.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
+mod paged;
+pub use paged::{
+    close_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified, snapshot_page,
+    SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES, MAX_PAGE_ROWS,
+    MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS, SESSION_TTL,
+};
+
 static CLIENT_ADMISSION: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
 
 /// Transport errors never imply that an already dispatched write was aborted.
@@ -39,6 +46,8 @@ pub enum RemoteError {
     Unavailable,
     #[error("deadline exceeded; retain original write identity: {request_id:?}")]
     Timeout { request_id: Option<[u8; 16]> },
+    #[error("snapshot session unavailable (closed, expired, or previous server incarnation)")]
+    SessionUnavailable,
     #[error("invalid remote protocol")]
     Protocol,
 }
@@ -71,9 +80,25 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
-    Probe { shard: u64 },
-    Snapshot { shard: u64 },
-    Metadata { shard: u64 },
+    Probe {
+        shard: u64,
+    },
+    Snapshot {
+        shard: u64,
+    },
+    Metadata {
+        shard: u64,
+    },
+    OpenSnapshot {
+        shard: u64,
+    },
+    SnapshotPage {
+        descriptor: SnapshotDescriptor,
+        cursor: Option<SnapshotCursor>,
+    },
+    CloseSnapshot {
+        descriptor: SnapshotDescriptor,
+    },
     Write(D1WriteRequest),
 }
 #[derive(Serialize, Deserialize)]
@@ -87,6 +112,9 @@ enum Reply {
     Probe,
     Snapshot(RemoteSnapshot),
     Metadata(u64, u64, u64),
+    OpenSnapshot(SnapshotDescriptor),
+    SnapshotPage(SnapshotPage),
+    CloseSnapshot,
     Write(D1Result),
 }
 
@@ -95,6 +123,7 @@ enum Reply {
 /// cancellation never proves that an already submitted Raft write aborted.
 pub struct GraphService {
     address: SocketAddr,
+    sessions: Arc<paged::Sessions>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
 }
@@ -130,14 +159,19 @@ impl GraphService {
             .map_err(|_| RemoteError::Unavailable)?;
         let raft = node.raft.clone();
         let state = node.state_machine.clone();
+        let sessions = Arc::new(paged::Sessions::new()?);
+        let worker_sessions = sessions.clone();
         let (stop, mut stopped) = watch::channel(false);
         let admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let task = tokio::spawn(async move {
+            let sessions = worker_sessions;
+            let mut cleanup = tokio::time::interval(Duration::from_millis(100));
             let mut handlers = JoinSet::new();
             loop {
                 while handlers.try_join_next().is_some() {}
                 let accepted = tokio::select! {
                     _ = stopped.changed() => break,
+                    _ = cleanup.tick() => { sessions.expire(); continue; },
                     _ = handlers.join_next(), if !handlers.is_empty() => continue,
                     result = listener.accept() => result,
                 };
@@ -147,6 +181,7 @@ impl GraphService {
                 };
                 let raft = raft.clone();
                 let state = state.clone();
+                let sessions = sessions.clone();
                 let end = Instant::now() + deadline;
                 handlers.spawn(async move {
                     let _permit = permit;
@@ -164,7 +199,7 @@ impl GraphService {
                     }
                     let result = match tokio::time::timeout_at(
                         end,
-                        execute(raft, state, identity, shard, request),
+                        execute(raft, state, identity, shard, request, sessions, end),
                     )
                     .await
                     {
@@ -184,10 +219,16 @@ impl GraphService {
         });
         Ok(Self {
             address,
+            sessions,
             stop,
             task: Some(task),
         })
     }
+    /// Local diagnostic counters; not a remote administration endpoint.
+    pub fn snapshot_stats(&self) -> SnapshotStats {
+        self.sessions.stats()
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
@@ -212,6 +253,8 @@ async fn execute(
     identity: RemoteIdentity,
     shard: u64,
     request: Request,
+    sessions: Arc<paged::Sessions>,
+    end: Instant,
 ) -> Result<Reply, RemoteError> {
     if request.version != VERSION {
         return Err(RemoteError::Protocol);
@@ -223,6 +266,32 @@ async fn execute(
         return Err(RemoteError::InvalidArgument);
     }
     match request.operation {
+        Operation::OpenSnapshot { shard: requested } => {
+            if requested != shard {
+                return Err(RemoteError::InvalidArgument);
+            }
+            raft.ensure_linearizable().await.map_err(|e| {
+                if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
+                    RemoteError::NotLeader {
+                        leader: hint.leader_id,
+                    }
+                } else {
+                    RemoteError::Unavailable
+                }
+            })?;
+            sessions
+                .open(&state, identity, shard, end)
+                .await
+                .map(Reply::OpenSnapshot)
+        }
+        Operation::SnapshotPage { descriptor, cursor } => sessions
+            .page(&state, identity, shard, descriptor, cursor, end)
+            .await
+            .map(Reply::SnapshotPage),
+        Operation::CloseSnapshot { descriptor } => {
+            sessions.close(identity, shard, &descriptor)?;
+            Ok(Reply::CloseSnapshot)
+        }
         Operation::Probe { shard: requested } => {
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
