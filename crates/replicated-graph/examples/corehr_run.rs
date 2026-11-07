@@ -404,13 +404,14 @@ async fn main() -> anyhow::Result<()> {
                         ensure!(!expect_error, "unexpected success {query}");
                         ensure!(output.completeness == AdjacencyCompleteness::Unverified);
                         let actual = observed(&output.rows);
-                        ensure!(actual == c["expected"], "oracle mismatch {query}: {actual} != {}", c["expected"]);
+                        let expected = c.get("client_expected").unwrap_or(&c["expected"]);
+                        ensure!(actual == *expected, "client oracle mismatch {query}: {actual} != {expected}");
                         json!({"correct":true,"rows":output.rows.len()})
                     },
                     Err(e) => {
                         ensure!(expect_error, "unexpected client error {query}: {e:?}");
                         if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "dedup client must explicitly reject Unsupported: {e:?}"); }
-                        ensure!(client_unsupported || matches!(&e,
+                        ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
                             ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
                             | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
                             | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)
@@ -485,7 +486,12 @@ async fn main() -> anyhow::Result<()> {
                         query_failures += 1;
                         result_json = json!({"unexpected_failure":format!("{e:?}")});
                     } else {
-                        ensure!(e == QueryFailure::Unsupported, "unexpected rejection {e:?}");
+                        let expected_error = if c["server_expected_error"] == "InvalidArgument" {
+                            QueryFailure::InvalidArgument
+                        } else {
+                            QueryFailure::Unsupported
+                        };
+                        ensure!(e == expected_error, "unexpected rejection {e:?}");
                         result_json = json!({"expected_rejection":format!("{e:?}")});
                     }
                 }
