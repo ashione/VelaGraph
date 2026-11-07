@@ -396,6 +396,14 @@ fn application_error(
         | D1Error::CapacityConflict { .. } => {
             StorageNodeError::InvalidArgument("invalid D1 request".into())
         }
+        D1Error::ManagedWriteRequired
+        | D1Error::ManagedWritesNotEnabled
+        | D1Error::UnverifiedWriteHistory => {
+            StorageNodeError::Unsupported("managed D1 write mode boundary".into())
+        }
+        D1Error::InvalidManagedMode | D1Error::ManagedModeConflict => {
+            StorageNodeError::InvalidArgument("invalid managed D1 mode".into())
+        }
         D1Error::LegacyDataPresent | D1Error::LegacyWriteDisabled => {
             StorageNodeError::Unsupported("legacy D1 mode boundary".into())
         }

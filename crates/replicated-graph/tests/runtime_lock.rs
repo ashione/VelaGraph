@@ -85,7 +85,7 @@ async fn concurrent_direct_crud_and_prepared_commit_do_not_block_worker() {
     ));
     // Freeze snapshot acquisition while a permitted blocking caller owns the
     // graph mutex. Incorrect direct calls would wait until that caller times out.
-    let state_guard = node.state_machine.state.write().await;
+    let state_guard = node.state_machine.pause_state().await;
     let g = graph.clone();
     let pending = tokio::spawn(run_blocking(move || g.create_vertex(&Vertex::new(1))));
     tokio::time::timeout(Duration::from_secs(5), signal)

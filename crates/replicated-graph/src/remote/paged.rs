@@ -753,27 +753,64 @@ mod tests {
     async fn exact_page_and_session_payload_caps_release_all_reservations() {
         use openraft::storage::RaftStateMachine;
         use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-        let state = Arc::new(StateMachine::default());
-        state
-            .clone()
-            .apply([Entry {
-                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
-                payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Activate {
-                    shard: 7,
-                    epoch: 1,
-                })),
-            }])
-            .await
-            .unwrap();
+        async fn fixture(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Arc<StateMachine> {
+            let mut state = Arc::new(StateMachine::default());
+            state
+                .apply([Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                    payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Activate {
+                        shard: 7,
+                        epoch: 1,
+                    })),
+                }])
+                .await
+                .unwrap();
+            state
+                .apply([Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+                    payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::SetDedupCapacity {
+                        shard: 7,
+                        epoch: 1,
+                        expected_bytes: d2_raft::MAX_DEDUP_BYTES,
+                        new_bytes: d2_raft::EXTENDED_DEDUP_BYTES,
+                    })),
+                }])
+                .await
+                .unwrap();
+            for (i, chunk) in entries.chunks(4).enumerate() {
+                let operations = chunk
+                    .iter()
+                    .map(|(key, value)| d2_raft::WriteOp::Put {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                let result = state
+                    .apply([Entry {
+                        log_id: LogId::new(CommittedLeaderId::new(1, 1), i as u64 + 3),
+                        payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Write(
+                            d2_raft::D1WriteRequest {
+                                shard: 7,
+                                epoch: 1,
+                                request_id: (i as u128).to_be_bytes(),
+                                expected_sequence: None,
+                                operations,
+                            },
+                        ))),
+                    }])
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(result[0].d1, Some(Ok(D1Result::Write { .. }))),
+                    "{result:?}"
+                );
+            }
+            state
+        }
         let sessions = Sessions::new().unwrap();
         let id = RemoteIdentity { group: 1, node: 2 };
         let end = Instant::now() + Duration::from_secs(20);
-        state
-            .state
-            .write()
-            .await
-            .data
-            .insert(vec![0], vec![0; MAX_PAGE_BYTES - 1]);
+        let state = fixture(vec![(vec![0], vec![0; MAX_PAGE_BYTES - 1])]).await;
         let d = sessions.open(&state, id, 7, end).await.unwrap();
         let page = sessions
             .page(&state, id, 7, d.clone(), None, end)
@@ -785,20 +822,18 @@ mod tests {
         );
         assert!(page.next.is_none());
         sessions.close(id, 7, &d).unwrap();
-        state
-            .state
-            .write()
-            .await
-            .data
-            .insert(vec![0], vec![0; MAX_PAGE_BYTES]);
+        let state = fixture(vec![(vec![0], vec![0; MAX_PAGE_BYTES])]).await;
         assert!(matches!(
             sessions.open(&state, id, 7, end).await,
             Err(RemoteError::ResourceExhausted)
         ));
         assert_eq!(sessions.stats().retained_bytes, 0);
-        state.state.write().await.data = (0..MAX_PAGE_ROWS + 1)
-            .map(|n| ((n as u64).to_be_bytes().to_vec(), vec![]))
-            .collect();
+        let state = fixture(
+            (0..MAX_PAGE_ROWS + 1)
+                .map(|n| ((n as u64).to_be_bytes().to_vec(), vec![]))
+                .collect(),
+        )
+        .await;
         let d = sessions.open(&state, id, 7, end).await.unwrap();
         let page = sessions
             .page(&state, id, 7, d.clone(), None, end)
@@ -813,9 +848,12 @@ mod tests {
             Err(RemoteError::SessionUnavailable)
         ));
         sessions.close(id, 7, &d).unwrap();
-        state.state.write().await.data = (0..32u8)
-            .map(|n| (vec![n], vec![0; MAX_PAGE_BYTES - 1]))
-            .collect();
+        let state = fixture(
+            (0..32u8)
+                .map(|n| (vec![n], vec![0; MAX_PAGE_BYTES - 1]))
+                .collect(),
+        )
+        .await;
         let first = sessions.open(&state, id, 7, end).await.unwrap();
         let second = sessions.open(&state, id, 7, end).await.unwrap();
         assert_eq!(first.bytes, MAX_SESSION_BYTES);
@@ -826,7 +864,13 @@ mod tests {
         ));
         sessions.close(id, 7, &first).unwrap();
         sessions.close(id, 7, &second).unwrap();
-        state.state.write().await.data.insert(vec![32], vec![]);
+        let state = fixture(
+            (0..32u8)
+                .map(|n| (vec![n], vec![0; MAX_PAGE_BYTES - 1]))
+                .chain(std::iter::once((vec![32], vec![])))
+                .collect(),
+        )
+        .await;
         assert!(matches!(
             sessions.open(&state, id, 7, end).await,
             Err(RemoteError::ResourceExhausted)

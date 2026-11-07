@@ -54,7 +54,28 @@ struct D1MetadataV3 {
     dedup_bytes_limit: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1MetadataV4 {
+    version: u32,
+    shard: u64,
+    epoch: u64,
+    sequence: u64,
+    dedup_bytes_limit: Option<usize>,
+    managed: crate::D1ManagedMode,
+}
+
 fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
+    if let Some(managed) = &state.managed {
+        return serde_json::to_vec(&D1MetadataV4 {
+            version: 4,
+            shard: state.shard,
+            epoch: state.epoch,
+            sequence: state.sequence,
+            dedup_bytes_limit: state.dedup_bytes_limit,
+            managed: managed.clone(),
+        });
+    }
     match state.dedup_bytes_limit {
         None => serde_json::to_vec(&D1MetadataV2::of(state)),
         Some(dedup_bytes_limit) => serde_json::to_vec(&D1MetadataV3 {
@@ -219,6 +240,12 @@ fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<DecodedSnapshot> {
     for (key, value) in entries {
         anyhow::ensure!(data.insert(key, value).is_none(), "duplicate snapshot key");
     }
+    if let Some(state) = &d1 {
+        anyhow::ensure!(
+            state.managed.is_none() || state.matches_data(&data),
+            "managed snapshot data differs from committed history"
+        );
+    }
     Ok(DecodedSnapshot { data, d1 })
 }
 
@@ -278,9 +305,15 @@ struct ApplyPublishGate {
     release: std::sync::mpsc::Receiver<()>,
 }
 
+/// Opaque publication pause for deterministic diagnostics. It exposes no data
+/// or mutation methods; dropping it resumes state-machine work.
+pub struct StateMachinePause<'a> {
+    _guard: tokio::sync::RwLockWriteGuard<'a, StateMachineData>,
+}
+
 #[derive(Debug, Default)]
 pub struct StateMachine {
-    pub state: RwLock<StateMachineData>,
+    state: RwLock<StateMachineData>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     storage: Option<Arc<StateMachineStorage>>,
@@ -291,6 +324,14 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
+    /// Pause state reads/publication for diagnostics without exposing mutable data.
+    /// Do not retain this guard in normal serving code.
+    pub async fn pause_state(&self) -> StateMachinePause<'_> {
+        StateMachinePause {
+            _guard: self.state.write().await,
+        }
+    }
+
     /// Open a state machine backed by RocksDB at `path`.
     ///
     /// The persisted keys, applied index, membership and latest snapshot are
@@ -352,6 +393,19 @@ impl StateMachine {
                     state.sequence = meta.sequence;
                     d1 = Some(state);
                 }
+                4 => {
+                    let meta: D1MetadataV4 = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        meta.sequence <= MAX_DEDUP_REQUESTS as u64,
+                        "D1 dedup capacity exceeded"
+                    );
+                    let mut state = D1State::new(meta.shard, meta.epoch);
+                    state.version = 3;
+                    state.sequence = meta.sequence;
+                    state.dedup_bytes_limit = meta.dedup_bytes_limit;
+                    state.managed = Some(meta.managed);
+                    d1 = Some(state);
+                }
                 _ => anyhow::bail!("unsupported D1 disk version"),
             }
         }
@@ -408,6 +462,12 @@ impl StateMachine {
             data.insert(key[DATA_PREFIX.len()..].to_vec(), value.to_vec());
         }
         drop(iter);
+        if let Some(d1) = &d1 {
+            anyhow::ensure!(
+                d1.managed.is_none() || d1.matches_data(&data),
+                "managed disk data differs from committed history"
+            );
+        }
         let current_snapshot = load_snapshot(&storage.db)?;
 
         let snapshot_idx = current_snapshot
@@ -439,6 +499,35 @@ impl StateMachine {
         d1.check_shard(shard)?;
         d1.check_epoch(epoch)?;
         Ok(d1.capacity())
+    }
+
+    /// Local capture only; network callers must first establish a leader read barrier.
+    pub async fn d1_managed_mode(
+        &self,
+        shard: u64,
+        epoch: u64,
+    ) -> Result<Option<crate::D1ManagedMode>, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        Ok(d1.managed.clone())
+    }
+
+    /// Identity status is shard-local. Unknown is not an abort decision.
+    pub async fn d1_managed_status(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<crate::D1ManagedStatus, D1Error> {
+        let state = self.state.read().await;
+        state
+            .d1
+            .as_ref()
+            .ok_or(D1Error::NotActivated)?
+            .managed_status(shard, epoch, mode_id, request_id)
     }
 
     /// Capture D1 metadata and bytes under one lock, checking bounds before cloning.
@@ -703,6 +792,20 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             .into());
         }
         if let (Some(current), Some(incoming)) = (&sm.d1, &d1) {
+            if current.managed.is_some()
+                && (current.managed != incoming.managed
+                    || incoming.epoch < current.epoch
+                    || incoming.sequence < current.sequence
+                    || incoming.dedup.get(..current.dedup.len()) != Some(current.dedup.as_slice()))
+            {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(
+                        "snapshot would regress managed write fence or transaction history",
+                    ),
+                )
+                .into());
+            }
             if incoming.bytes_limit() < current.bytes_limit() {
                 return Err(StorageIOError::read_snapshot(
                     Some(meta.signature()),
@@ -819,6 +922,7 @@ impl ApplyDelta {
             if let Some(previous) = state.d1.as_mut() {
                 previous.version = next.version;
                 previous.dedup_bytes_limit = next.dedup_bytes_limit;
+                previous.managed = next.managed;
                 previous.epoch = next.epoch;
                 previous.sequence = next.sequence;
                 previous.dedup.append(&mut next.dedup);
@@ -906,6 +1010,52 @@ fn apply_d1(
             expected_bytes,
             new_bytes,
         ),
+        D1Command::EnableManagedWrites {
+            shard,
+            epoch,
+            expected_sequence,
+            mode_id,
+        } => {
+            // All D1 data must have a replayable identity before opting in,
+            // including legacy history and earlier writes in this apply batch.
+            let d1 = next.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            let expected = d1.replayed_data(base.d1.as_ref());
+            let mismatch = expected.len() != next.data_len
+                || base
+                    .data
+                    .iter()
+                    .filter(|(key, _)| !next.data.contains_key(*key))
+                    .any(|(key, value)| {
+                        expected.get(key.as_slice()).copied() != Some(value.as_slice())
+                    })
+                || next
+                    .data
+                    .iter()
+                    .any(|(key, value)| expected.get(key.as_slice()).copied() != value.as_deref());
+            if mismatch {
+                return Err(D1Error::UnverifiedWriteHistory);
+            }
+            next.d1
+                .as_mut()
+                .unwrap()
+                .enable_managed(shard, epoch, expected_sequence, mode_id)
+        }
+        D1Command::ManagedWrite { mode_id, request } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            let result = d1.managed_write(mode_id, &request, base.d1.as_ref())?;
+            if matches!(
+                result,
+                D1Result::ManagedWrite {
+                    status: D1WriteStatus::Committed,
+                    ..
+                }
+            ) {
+                apply_operations(base, next, batch, request.operations);
+            }
+            Ok(result)
+        }
         D1Command::Write(request) => {
             let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
             let result = d1.write_with_history(&request, base.d1.as_ref())?;
@@ -1766,3 +1916,7 @@ mod capacity_persistence_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "managed_state_tests.rs"]
+mod managed_state_tests;

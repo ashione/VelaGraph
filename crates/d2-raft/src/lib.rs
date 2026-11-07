@@ -21,14 +21,17 @@ pub mod tcp;
 mod types;
 
 pub use d1::{
-    D1Capacity, D1Command, D1Error, D1Result, D1WriteRequest, D1WriteStatus, EXTENDED_DEDUP_BYTES,
-    MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_DEDUP_BYTES, MAX_DEDUP_REQUESTS,
+    D1Capacity, D1Command, D1Error, D1ManagedMode, D1ManagedStatus, D1Result, D1WriteRequest,
+    D1WriteStatus, EXTENDED_DEDUP_BYTES, MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_DEDUP_BYTES,
+    MAX_DEDUP_REQUESTS,
 };
 pub use durable_log_store::DurableLogStore;
 pub use log_store::LogStore;
 pub use network::{DropPolicy, GroupId, NetworkFactory, Registry};
 pub use node::{Cluster, Node, NodeHandle};
-pub use state_machine::{D1ReadLimit, D1ReadSnapshot, StateMachine, StateMachineData};
+pub use state_machine::{
+    D1ReadLimit, D1ReadSnapshot, StateMachine, StateMachineData, StateMachinePause,
+};
 pub use tcp::{
     add_learner, change_membership, initialize_cluster, send_control, ControlRequest,
     ControlResponse, NodeStatus, TcpNode, TcpNodeConfig,

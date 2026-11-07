@@ -25,6 +25,10 @@ The additive [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md)
 lets applications require a global committed snapshot without silently falling
 back: that requirement currently fails with Unsupported, including for jobs.
 It does not yet implement global MVCC or cross-shard transactions.
+An opt-in [managed shard write fence](docs/MANAGED_SHARD_WRITES.md) persists
+write-mode identity and rejects old raw writers after explicit activation. It
+adds shard-local atomic batch identities only; default graph APIs are unchanged
+and global transactions remain unimplemented.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.
