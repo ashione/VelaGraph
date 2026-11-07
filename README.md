@@ -695,3 +695,8 @@ one exact original external-ID/Plan binding without transferring the full Journa
 The derived index shares the admission/applied-marker sync batch and is rebuilt
 atomically on snapshot install. All 256-request, 1,024-transaction and 16 MiB
 Journal limits remain; this does not provide unlimited write lifetime or GC.
+
+The bounded [durable terminal-segment index](docs/DURABLE_DECISION_SEGMENTS.md) now
+backs coordinator proofs and certified participant reads with exact absolute-ordinal
+disk segments. Full Journal authority, all lifetime caps and whole snapshots remain;
+this is a recovery/read foundation, not unlimited writes or a performance claim.

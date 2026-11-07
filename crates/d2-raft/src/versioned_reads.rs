@@ -149,31 +149,6 @@ impl State {
 }
 
 impl D1State {
-    /// Compare exact retained terminal records, not a numeric watermark. This
-    /// method runs under the caller's same state lock as snapshot materialization.
-    pub(crate) fn certified_terminal_prefix(
-        &self,
-        expected: &crate::terminal_prefix::TerminalPrefix,
-    ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
-        let state = self
-            .visibility
-            .as_ref()
-            .ok_or(D1Error::VisibilityNotEnabled)?;
-        if expected.version() > state.applied {
-            return Err(D1Error::VisibilityNotApplied);
-        }
-        if state.baseline_sequence != 0 {
-            return Err(D1Error::VisibilityHistory);
-        }
-        let retained = state
-            .journal
-            .terminal_prefix(expected.version())
-            .map_err(|_| D1Error::VisibilityHistory)?;
-        if &retained != expected {
-            return Err(D1Error::VisibilityHistory);
-        }
-        Ok(retained)
-    }
     pub(crate) fn check_cohort(&self, journal: &Journal) -> Result<(), D1Error> {
         if self
             .visibility

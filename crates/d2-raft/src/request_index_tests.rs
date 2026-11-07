@@ -131,7 +131,7 @@ fn fail_sync(sm: &StateMachine) {
 }
 
 #[tokio::test]
-async fn coordinator_v5_v8_and_logical_snapshot_golden() {
+async fn coordinator_v5_v9_and_logical_snapshot_golden() {
     let mut sm = Arc::new(StateMachine::default());
     setup(&mut sm).await;
     let ones = vec!["1"; 16].join(",");
@@ -142,7 +142,7 @@ async fn coordinator_v5_v8_and_logical_snapshot_golden() {
     assert_eq!(serde_json::to_string(d1).unwrap(), golden_state);
     assert_eq!(
         d1_metadata_bytes(d1).unwrap(),
-        format!("{{\"version\":8,\"state\":{golden_state}}}").as_bytes()
+        format!("{{\"version\":9,\"state\":{golden_state}}}").as_bytes()
     );
     #[derive(Serialize)]
     struct Legacy<'a> {
@@ -229,7 +229,7 @@ async fn index_admission_batch_retry_failure_and_reopen_are_atomic() {
                 .unwrap()
         )
         .unwrap()["version"],
-        8
+        9
     );
 }
 
@@ -344,7 +344,7 @@ async fn corrupt_missing_extra_or_rewritten_index_fails_closed() {
             9 => {
                 let mut v: serde_json::Value =
                     serde_json::from_slice(&db.get(D1_KEY).unwrap().unwrap()).unwrap();
-                v["version"] = 9.into();
+                v["version"] = 11.into();
                 db.put(D1_KEY, serde_json::to_vec(&v).unwrap()).unwrap();
             }
             10 => {

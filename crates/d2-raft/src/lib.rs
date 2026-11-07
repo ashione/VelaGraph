@@ -13,6 +13,7 @@
 mod blocking;
 pub mod cohort_reads;
 mod d1;
+mod decision_segments;
 mod durable_log_store;
 mod log_store;
 pub mod managed_rpc;

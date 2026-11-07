@@ -73,7 +73,11 @@ fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
             state: D1State,
         }
         return serde_json::to_vec(&Metadata {
-            version: 7,
+            version: if crate::decision_segments::enabled(state) {
+                10
+            } else {
+                7
+            },
             state: state.stage(),
         });
     }
@@ -95,7 +99,14 @@ fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
             version: u32,
             state: &'a D1State,
         }
-        return serde_json::to_vec(&Metadata { version: 8, state });
+        return serde_json::to_vec(&Metadata {
+            version: if crate::decision_segments::enabled(state) {
+                9
+            } else {
+                8
+            },
+            state,
+        });
     }
     if let Some(managed) = &state.managed {
         return serde_json::to_vec(&D1MetadataV4 {
@@ -285,6 +296,8 @@ struct StateMachineStorage {
     db: DB,
     legacy_d1: AtomicBool,
     request_indexed: AtomicBool,
+    decision_indexed: AtomicBool,
+    decision_manifest: std::sync::Mutex<Option<Vec<u8>>>,
     request_manifest: std::sync::Mutex<Option<Vec<u8>>>,
     #[cfg(test)]
     fail_next_write: AtomicBool,
@@ -378,6 +391,8 @@ impl StateMachine {
             db,
             legacy_d1: AtomicBool::new(false),
             request_indexed: AtomicBool::new(false),
+            decision_indexed: AtomicBool::new(false),
+            decision_manifest: Default::default(),
             request_manifest: Default::default(),
             #[cfg(test)]
             fail_next_write: AtomicBool::new(false),
@@ -441,7 +456,7 @@ impl StateMachine {
                     state.managed = Some(meta.managed);
                     d1 = Some(state);
                 }
-                5 | 8 => {
+                5 | 8 | 9 => {
                     #[derive(Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct Metadata {
@@ -450,12 +465,19 @@ impl StateMachine {
                     }
                     let meta: Metadata = serde_json::from_slice(&bytes)?;
                     anyhow::ensure!(
-                        matches!(meta.version, 5 | 8) && meta.state.coordinator.is_some(),
+                        matches!(meta.version, 5 | 8 | 9) && meta.state.coordinator.is_some(),
                         "invalid coordinator metadata"
                     );
                     storage
                         .request_indexed
-                        .store(meta.version == 8, Ordering::Relaxed);
+                        .store(matches!(meta.version, 8 | 9), Ordering::Relaxed);
+                    anyhow::ensure!(
+                        meta.version != 9 || crate::decision_segments::enabled(&meta.state),
+                        "decision index requires bound coordinator"
+                    );
+                    storage
+                        .decision_indexed
+                        .store(meta.version == 9, Ordering::Relaxed);
                     d1 = Some(meta.state);
                 }
                 6 => {
@@ -474,7 +496,7 @@ impl StateMachine {
                     );
                     d1 = Some(meta.state);
                 }
-                7 => {
+                7 | 10 => {
                     #[derive(Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct Metadata {
@@ -483,11 +505,18 @@ impl StateMachine {
                     }
                     let meta: Metadata = serde_json::from_slice(&bytes)?;
                     anyhow::ensure!(
-                        meta.version == 7
+                        matches!(meta.version, 7 | 10)
                             && meta.state.visibility.is_some()
                             && meta.state.dedup.is_empty(),
                         "invalid visibility metadata"
                     );
+                    anyhow::ensure!(
+                        meta.version != 10 || crate::decision_segments::enabled(&meta.state),
+                        "decision index requires bound member"
+                    );
+                    storage
+                        .decision_indexed
+                        .store(meta.version == 10, Ordering::Relaxed);
                     d1 = Some(meta.state);
                 }
                 _ => anyhow::bail!("unsupported D1 disk version"),
@@ -538,6 +567,14 @@ impl StateMachine {
         )?;
         *storage.request_manifest.lock().unwrap() =
             storage.db.get(crate::request_index::MANIFEST_KEY)?;
+        crate::decision_segments::validate(
+            &storage.db,
+            d1.as_ref(),
+            last_applied_log,
+            storage.decision_indexed.load(Ordering::Relaxed),
+        )?;
+        *storage.decision_manifest.lock().unwrap() =
+            storage.db.get(crate::decision_segments::MANIFEST_KEY)?;
         let last_membership = match storage.db.get(MEMBERSHIP_KEY)? {
             Some(value) => serde_json::from_slice(&value)?,
             None => StoredMembership::default(),
@@ -669,6 +706,79 @@ impl StateMachine {
         d1.read_at(version, limit)
     }
 
+    fn decision_frontier(&self, d1: &D1State) -> Result<u64, D1Error> {
+        let storage = self
+            .storage
+            .as_ref()
+            .filter(|s| s.decision_indexed.load(Ordering::Relaxed));
+        blocking_section(|| {
+            if let Some(storage) = storage {
+                let manifest = storage
+                    .decision_manifest
+                    .lock()
+                    .map_err(|_| D1Error::DecisionIndexUnavailable)?;
+                crate::decision_segments::frontier(
+                    d1,
+                    Some((
+                        &storage.db,
+                        manifest.as_deref().ok_or(D1Error::DecisionIndexHistory)?,
+                    )),
+                )
+            } else {
+                crate::decision_segments::frontier(d1, None)
+            }
+        })
+    }
+    fn decision_prefix(
+        &self,
+        d1: &D1State,
+        version: u64,
+    ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+        let storage = self
+            .storage
+            .as_ref()
+            .filter(|s| s.decision_indexed.load(Ordering::Relaxed));
+        blocking_section(|| {
+            if let Some(storage) = storage {
+                let manifest = storage
+                    .decision_manifest
+                    .lock()
+                    .map_err(|_| D1Error::DecisionIndexUnavailable)?;
+                crate::decision_segments::prefix(
+                    d1,
+                    version,
+                    Some((
+                        &storage.db,
+                        manifest.as_deref().ok_or(D1Error::DecisionIndexHistory)?,
+                    )),
+                )
+            } else {
+                crate::decision_segments::prefix(d1, version, None)
+            }
+        })
+    }
+    fn certified_decision_prefix(
+        &self,
+        d1: &D1State,
+        expected: &crate::terminal_prefix::TerminalPrefix,
+    ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+        let state = d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?;
+        if expected.version() > state.applied {
+            return Err(D1Error::VisibilityNotApplied);
+        }
+        if state.baseline_sequence != 0 {
+            return Err(D1Error::VisibilityHistory);
+        }
+        let retained = self.decision_prefix(d1, expected.version())?;
+        if &retained != expected {
+            return Err(D1Error::VisibilityHistory);
+        }
+        Ok(retained)
+    }
+
     /// Local readiness metadata. A distributed caller must establish a leader
     /// barrier and verify the complete fixed cohort before choosing a cut.
     pub async fn participant_visibility_info(
@@ -692,7 +802,11 @@ impl StateMachine {
             authority: d1.participant.as_ref().unwrap().authority.clone(),
             baseline_sequence: visibility.baseline_sequence,
             cohort: visibility.journal.cohort().cloned(),
-            applied_prefix: visibility.applied,
+            applied_prefix: if visibility.journal.cohort().is_some() {
+                self.decision_frontier(d1)?
+            } else {
+                visibility.applied
+            },
         })
     }
 
@@ -740,6 +854,7 @@ impl StateMachine {
         {
             return Err(D1Error::VisibilityHistory);
         }
+        self.decision_prefix(d1, version)?;
         Ok(visibility.journal.clone())
     }
 
@@ -799,6 +914,7 @@ impl StateMachine {
         {
             return Err(D1Error::VisibilityHistory);
         }
+        self.decision_prefix(d1, version)?;
         let snapshot = d1.read_at(version, limit)?;
         Ok((snapshot, visibility.journal.clone()))
     }
@@ -818,7 +934,7 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        d1.certified_terminal_prefix(expected)
+        self.certified_decision_prefix(d1, expected)
     }
 
     /// Both returned rows and evidence come from the same participant state lock.
@@ -844,7 +960,7 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        let retained = d1.certified_terminal_prefix(expected)?;
+        let retained = self.certified_decision_prefix(d1, expected)?;
         Ok((d1.read_at(expected.version(), limit)?, retained))
     }
 
@@ -964,7 +1080,7 @@ impl StateMachine {
                 .cohort()
                 .cloned()
                 .ok_or(D1Error::VisibilityHistory)?,
-            resolved_prefix: journal.resolved_prefix(),
+            resolved_prefix: self.decision_frontier(d1)?,
         })
     }
 
@@ -988,9 +1104,10 @@ impl StateMachine {
             .coordinator
             .as_ref()
             .ok_or(D1Error::CoordinatorNotEnabled)?;
-        journal
-            .terminal_prefix(version)
-            .map_err(|_| D1Error::VisibilityUnresolved)
+        if version > journal.resolved_prefix() {
+            return Err(D1Error::VisibilityUnresolved);
+        }
+        self.decision_prefix(d1, version)
     }
 
     /// Local diagnostic metadata, not a linearizable distributed read.
@@ -1166,6 +1283,23 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     )));
                 }
                 drop(expected);
+                let expected = storage.decision_manifest.lock().unwrap();
+                if storage
+                    .db
+                    .get(crate::decision_segments::MANIFEST_KEY)
+                    .map_err(write_error)?
+                    .as_deref()
+                    != expected.as_deref()
+                {
+                    return Err(write_error(std::io::Error::other(
+                        "decision manifest changed",
+                    )));
+                }
+                drop(expected);
+                if storage.decision_indexed.load(Ordering::Relaxed) {
+                    crate::decision_segments::check_tail(&storage.db, sm.d1.as_ref().unwrap())
+                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                }
                 let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
                 let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
                 if let Some(d1) = &next.d1 {
@@ -1188,11 +1322,27 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     false,
                 )
                 .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                let decision_manifest = crate::decision_segments::stage(
+                    &mut batch,
+                    sm.d1.as_ref(),
+                    next.d1.as_ref(),
+                    next.last_applied_log,
+                    storage.decision_indexed.load(Ordering::Relaxed),
+                    false,
+                )
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
                 batch.put(APPLIED_KEY, applied);
                 batch.put(MEMBERSHIP_KEY, membership);
                 storage.write_sync(batch)?;
                 storage.legacy_d1.store(false, Ordering::Relaxed);
                 *storage.request_manifest.lock().unwrap() = request_manifest;
+                *storage.decision_manifest.lock().unwrap() = decision_manifest;
+                storage.decision_indexed.store(
+                    next.d1
+                        .as_ref()
+                        .is_some_and(crate::decision_segments::enabled),
+                    Ordering::Relaxed,
+                );
                 storage.request_indexed.store(
                     next.d1.as_ref().is_some_and(|s| s.coordinator.is_some()),
                     Ordering::Relaxed,
@@ -1396,12 +1546,28 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 true,
             )
             .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+            let decision_manifest = crate::decision_segments::stage(
+                &mut batch,
+                sm.d1.as_ref(),
+                next.d1.as_ref(),
+                next.last_applied_log,
+                storage.decision_indexed.load(Ordering::Relaxed),
+                true,
+            )
+            .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
             put_snapshot(&mut batch, &stored)?;
             storage.write_sync(batch)?;
             storage.legacy_d1.store(false, Ordering::Relaxed);
             *storage.request_manifest.lock().unwrap() = request_manifest;
+            *storage.decision_manifest.lock().unwrap() = decision_manifest;
+            storage.decision_indexed.store(
+                next.d1
+                    .as_ref()
+                    .is_some_and(crate::decision_segments::enabled),
+                Ordering::Relaxed,
+            );
             storage.request_indexed.store(
                 next.d1.as_ref().is_some_and(|s| s.coordinator.is_some()),
                 Ordering::Relaxed,
@@ -2889,3 +3055,7 @@ mod versioned_state_tests;
 #[cfg(test)]
 #[path = "request_index_tests.rs"]
 mod request_index_tests;
+
+#[cfg(test)]
+#[path = "decision_segment_tests.rs"]
+mod decision_segment_tests;
