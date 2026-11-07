@@ -51,6 +51,9 @@ async fn submit(node: &NodeHandle, command: D1Command) -> std::result::Result<D1
 }
 async fn start(cluster: &Cluster, shard: u64) -> NodeHandle {
     let node = cluster.in_group(shard).start(1).await.unwrap();
+    initialize(node, shard).await
+}
+async fn initialize(node: NodeHandle, shard: u64) -> NodeHandle {
     node.raft
         .initialize(BTreeMap::from([(
             1,
@@ -174,7 +177,7 @@ async fn graph_cross_shard_commit_partial_apply_and_same_plan_retry() {
     let c = start(&cluster, 9).await;
     let a = start(&cluster, 7).await;
     let b = start(&cluster, 8).await;
-    let graph = graph(&c, &a, &b);
+    let graph = self::graph(&c, &a, &b);
     vertex(&graph, 7, 1).await;
     vertex(&graph, 8, 1).await;
     let old = snapshot(&graph).await;
@@ -284,7 +287,7 @@ async fn graph_conflicts_abort_missing_endpoints_and_concurrent_retry_are_explic
     let c = start(&cluster, 9).await;
     let a = start(&cluster, 7).await;
     let b = start(&cluster, 8).await;
-    let graph = graph(&c, &a, &b);
+    let graph = self::graph(&c, &a, &b);
     vertex(&graph, 7, 1).await;
     let before = snapshot(&graph).await;
     assert!(before.prepare_edge(&edge(7, 8, 10)).is_err());
@@ -348,7 +351,7 @@ async fn committed_decision_is_not_misreported_when_a_member_stops() {
     let c = start(&cluster, 9).await;
     let a = start(&cluster, 7).await;
     let b = start(&cluster, 8).await;
-    let graph = graph(&c, &a, &b);
+    let graph = self::graph(&c, &a, &b);
     vertex(&graph, 7, 1).await;
     vertex(&graph, 8, 1).await;
     let before = snapshot(&graph).await;
@@ -387,7 +390,7 @@ async fn abort_does_not_require_unavailable_participants_or_nonparticipants() {
     let c = start(&cluster, 9).await;
     let a = start(&cluster, 7).await;
     let b = start(&cluster, 8).await;
-    let graph = graph(&c, &a, &b);
+    let graph = self::graph(&c, &a, &b);
     vertex(&graph, 7, 1).await;
     vertex(&graph, 8, 1).await;
     let view = snapshot(&graph).await;
@@ -485,5 +488,295 @@ async fn abort_does_not_require_unavailable_participants_or_nonparticipants() {
     ));
     for node in [&a, &c] {
         node.raft.shutdown().await.unwrap();
+    }
+}
+
+fn edge_patch(value: i64) -> rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
+    rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
+        set: BTreeMap::from([("weight".into(), rocksdb_sql_table::Value::Integer(value))]),
+        remove: Default::default(),
+    }
+}
+fn vertex_patch(value: i64) -> rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
+    rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
+        set: BTreeMap::from([("rank".into(), rocksdb_sql_table::Value::Integer(value))]),
+        remove: Default::default(),
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_property_read_dependency_conflicts_when_only_target_changes() {
+    let cluster = Cluster::new();
+    let c = start(&cluster, 9).await;
+    let a = start(&cluster, 7).await;
+    let b = start(&cluster, 8).await;
+    let graph = self::graph(&c, &a, &b);
+    vertex(&graph, 7, 1).await;
+    vertex(&graph, 8, 1).await;
+    let e = edge(7, 8, 50);
+    let create = snapshot(&graph).await.prepare_edge(&e).unwrap();
+    graph.execute(&create).await.unwrap();
+    let old = snapshot(&graph).await;
+    let properties = old
+        .prepare_edge_properties(e.identity(), &edge_patch(1))
+        .unwrap();
+    assert_eq!(properties.participants(), 2);
+    let source_before = a.state_machine.d1_metadata().await.unwrap();
+    let target_change = old
+        .prepare_vertex_properties(e.to, &vertex_patch(2))
+        .unwrap();
+    graph.execute(&target_change).await.unwrap();
+    assert_eq!(a.state_machine.d1_metadata().await.unwrap(), source_before);
+    assert!(matches!(
+        graph.execute(&properties).await,
+        Err(Error::Application(D1Error::Conflict { .. }))
+    ));
+    assert!(matches!(
+        graph.abort(&properties).await.unwrap(),
+        Outcome::Aborted { visible: true, .. }
+    ));
+    assert_eq!(
+        snapshot(&graph).await.edge(e.identity()).unwrap(),
+        Some(e.clone())
+    );
+    let fresh = snapshot(&graph).await;
+    let update = fresh
+        .prepare_edge_properties(e.identity(), &edge_patch(3))
+        .unwrap();
+    let target_sequence = b.state_machine.d1_metadata().await.unwrap().2;
+    assert!(matches!(
+        graph.execute(&update).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    assert_eq!(
+        b.state_machine.d1_metadata().await.unwrap().2,
+        target_sequence + 1
+    );
+    let now = snapshot(&graph).await;
+    assert_eq!(
+        now.edge(e.identity()).unwrap().unwrap().properties["weight"],
+        rocksdb_sql_table::Value::Integer(3)
+    );
+    assert_eq!(
+        now.vertex(e.to).unwrap().unwrap().properties["rank"],
+        rocksdb_sql_table::Value::Integer(2)
+    );
+    assert_eq!(old.edge(e.identity()).unwrap(), Some(e));
+    for node in [&a, &b, &c] {
+        node.raft.shutdown().await.unwrap();
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_target_guard_blocks_competitor_and_delete_preserves_old_views() {
+    let cluster = Cluster::new();
+    let c = start(&cluster, 9).await;
+    let a = start(&cluster, 7).await;
+    let b = start(&cluster, 8).await;
+    let graph = self::graph(&c, &a, &b);
+    vertex(&graph, 7, 1).await;
+    vertex(&graph, 8, 1).await;
+    let e = edge(8, 7, 60);
+    let create = snapshot(&graph).await.prepare_edge(&e).unwrap();
+    graph.execute(&create).await.unwrap();
+    let old = snapshot(&graph).await;
+    let update = old
+        .prepare_edge_properties(e.identity(), &edge_patch(1))
+        .unwrap();
+    let competitor = old
+        .prepare_vertex_properties(e.to, &vertex_patch(2))
+        .unwrap();
+    graph
+        .command(Command::Begin {
+            id: update.id,
+            participants: update.parts.iter().map(|p| p.descriptor.clone()).collect(),
+        })
+        .await
+        .unwrap();
+    let guard = &update.parts[0];
+    assert_eq!(guard.descriptor.shard, 7);
+    participant_driver::prepare(
+        &c,
+        &a,
+        authority(),
+        1,
+        guard.descriptor.clone(),
+        guard.request.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        graph.execute(&competitor).await,
+        Err(Error::Application(D1Error::ParticipantBusy))
+    ));
+    assert!(matches!(
+        graph.abort(&competitor).await.unwrap(),
+        Outcome::Aborted { visible: false, .. }
+    ));
+    assert!(matches!(
+        graph.execute(&update).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    graph.abort(&competitor).await.unwrap();
+    let before_delete = snapshot(&graph).await;
+    let deletion = before_delete.prepare_edge_delete(e.identity()).unwrap();
+    let stale_properties = before_delete
+        .prepare_edge_properties(e.identity(), &edge_patch(9))
+        .unwrap();
+    let (ordinal, decision) = graph.decide(&deletion, false).await.unwrap();
+    assert_eq!(decision, Decision::Commit);
+    versioned_reads::advance(&c, &b, authority(), 1, target(8), ordinal)
+        .await
+        .unwrap();
+    assert!(snapshot(&graph).await.edge(e.identity()).unwrap().is_some());
+    assert!(graph
+        .snapshot(Some(ordinal), limit(), Duration::from_secs(20))
+        .await
+        .is_err());
+    assert!(matches!(
+        graph.execute(&deletion).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    let after = snapshot(&graph).await;
+    assert!(after.edge(e.identity()).unwrap().is_none());
+    assert!(after
+        .observed_adjacency(e.from, Direction::Out)
+        .unwrap()
+        .is_empty());
+    assert!(after
+        .observed_adjacency(e.to, Direction::In)
+        .unwrap()
+        .is_empty());
+    assert!(before_delete.edge(e.identity()).unwrap().is_some());
+    let tombstone = after
+        .store(e.from.partition)
+        .unwrap()
+        .get_edge_record(e.id)
+        .unwrap()
+        .unwrap();
+    match tombstone {
+        EdgeRecord::Deleted(t) => assert_eq!(t.operation_id, deletion.id()),
+        _ => panic!("expected tombstone"),
+    }
+    assert!(graph.execute(&stale_properties).await.is_err());
+    graph.abort(&stale_properties).await.unwrap();
+    assert!(after.prepare_edge(&e).is_err());
+    assert_eq!(
+        graph.execute(&deletion).await.unwrap(),
+        Outcome::Committed {
+            ordinal,
+            visible: true
+        }
+    );
+    for node in [&a, &b, &c] {
+        node.raft.shutdown().await.unwrap();
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_shard_self_loop_mutations_and_tombstone_identity_survive_reopen() {
+    let cluster = Cluster::new();
+    let cdir = tempfile::tempdir().unwrap();
+    let adir = tempfile::tempdir().unwrap();
+    let bdir = tempfile::tempdir().unwrap();
+    let c = initialize(
+        cluster
+            .in_group(9)
+            .start_durable(1, cdir.path())
+            .await
+            .unwrap(),
+        9,
+    )
+    .await;
+    let a = initialize(
+        cluster
+            .in_group(7)
+            .start_durable(1, adir.path())
+            .await
+            .unwrap(),
+        7,
+    )
+    .await;
+    let b = initialize(
+        cluster
+            .in_group(8)
+            .start_durable(1, bdir.path())
+            .await
+            .unwrap(),
+        8,
+    )
+    .await;
+    let graph = self::graph(&c, &a, &b);
+    vertex(&graph, 7, 1).await;
+    let e = edge(7, 7, 70);
+    let create = snapshot(&graph).await.prepare_edge(&e).unwrap();
+    graph.execute(&create).await.unwrap();
+    let props = snapshot(&graph)
+        .await
+        .prepare_edge_properties(e.identity(), &edge_patch(5))
+        .unwrap();
+    assert_eq!(props.participants(), 1);
+    graph.execute(&props).await.unwrap();
+    let old_version = snapshot(&graph).await.version().unwrap();
+    let deletion = snapshot(&graph)
+        .await
+        .prepare_edge_delete(e.identity())
+        .unwrap();
+    assert_eq!(deletion.participants(), 1);
+    graph.execute(&deletion).await.unwrap();
+    let delete_id = deletion.id();
+    drop(graph);
+    for (node, shard) in [(&a, 7), (&b, 8), (&c, 9)] {
+        cluster.in_group(shard).shutdown(node).await;
+    }
+    drop(a);
+    drop(b);
+    drop(c);
+    let c = cluster
+        .in_group(9)
+        .start_durable(1, cdir.path())
+        .await
+        .unwrap();
+    let a = cluster
+        .in_group(7)
+        .start_durable(1, adir.path())
+        .await
+        .unwrap();
+    let b = cluster
+        .in_group(8)
+        .start_durable(1, bdir.path())
+        .await
+        .unwrap();
+    for node in [&a, &b, &c] {
+        node.raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "reopened leader")
+            .await
+            .unwrap();
+    }
+    let graph = self::graph(&c, &a, &b);
+    let after = snapshot(&graph).await;
+    assert!(after.edge(e.identity()).unwrap().is_none());
+    match after
+        .store(7)
+        .unwrap()
+        .get_edge_record(e.id)
+        .unwrap()
+        .unwrap()
+    {
+        EdgeRecord::Deleted(t) => assert_eq!(t.operation_id, delete_id),
+        _ => panic!("missing tombstone"),
+    }
+    let old = graph
+        .snapshot(Some(old_version), limit(), Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(
+        old.edge(e.identity()).unwrap().unwrap().properties["weight"],
+        rocksdb_sql_table::Value::Integer(5)
+    );
+    assert!(matches!(
+        graph.execute(&deletion).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    for (node, shard) in [(&a, 7), (&b, 8), (&c, 9)] {
+        cluster.in_group(shard).shutdown(node).await;
     }
 }

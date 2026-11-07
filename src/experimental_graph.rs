@@ -613,6 +613,23 @@ impl<S: StorageNode> AppendOnlyStore<S> {
             }],
         )
     }
+    /// Condition a read dependency without changing its graph value. The
+    /// original reverse-index bytes are written back under the same sequence
+    /// CAS; participant prepare locks this dependency until a decision. This
+    /// is a real write for sequence, dedup and capacity accounting.
+    pub fn prepare_reverse_guard(&self, edge: &CrossEdge) -> Result<PreparedBatch> {
+        if edge.to.partition != self.partition {
+            return Err(ExperimentalError::Invalid("target partition mismatch"));
+        }
+        let view = self.view()?;
+        let key = index_key(edge, Direction::In);
+        let value = self.node.get(&key, &view)?;
+        if value != Some(Vec::new()) || self.vertex_in(edge.to.id, &view)?.is_none() {
+            return Err(ExperimentalError::Incomplete(edge.identity()));
+        }
+        self.batch(&view, vec![WriteOp::put(key, value.unwrap())])
+    }
+
     /// A tombstone is absent only when its reverse index is absent too.
     pub fn verify_deleted_reverse(&self, tombstone: &EdgeTombstone) -> Result<()> {
         let edge = &tombstone.edge;
