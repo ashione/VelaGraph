@@ -152,7 +152,12 @@ impl Sessions {
         if (current.0, current.1) != (shard, session.descriptor.stamp.epoch) {
             return Err(RemoteError::SessionUnavailable);
         }
-        if request.remaining.bytes > MAX_BYTES || request.remaining.work > MAX_WORK {
+        let budget = if matches!(request.fragment, Fragment::Scan(_)) {
+            scan::SCAN_CEILING
+        } else {
+            CEILING
+        };
+        if request.remaining.bytes > budget.bytes || request.remaining.work > budget.work {
             return Err(RemoteError::InvalidArgument);
         }
         let permit = FRAGMENT_SLOTS
@@ -169,11 +174,11 @@ impl Sessions {
                 bytes: request
                     .remaining
                     .bytes
-                    .min(MAX_BYTES.saturating_sub(used.bytes)),
+                    .min(budget.bytes.saturating_sub(used.bytes)),
                 work: request
                     .remaining
                     .work
-                    .min(MAX_WORK.saturating_sub(used.work)),
+                    .min(budget.work.saturating_sub(used.work)),
             };
             let node = MeteredNode {
                 frozen: query::FrozenNode {
@@ -191,7 +196,7 @@ impl Sessions {
                     descriptor: session.descriptor.clone(),
                     // Reserve maximum counter widths so replacing them with actual
                     // cost cannot grow the already-admitted encoded result.
-                    cost: CEILING,
+                    cost: budget,
                     value,
                 };
                 let bytes = bounded_encode(&output, end)?;
@@ -241,6 +246,7 @@ fn run_fragment(
     fragment: Fragment,
 ) -> Result<FragmentValue, QueryFailure> {
     match fragment {
+        Fragment::Scan(request) => run_scan_fragment(node, shard, request).map(FragmentValue::Scan),
         Fragment::Exists(v) => Ok(FragmentValue::Bool(
             AppendOnlyStore::new(node.clone(), shard, v.partition)
                 .get_vertex(v.id)
@@ -373,6 +379,66 @@ fn run_fragment(
     }
 }
 
+fn run_scan_fragment(
+    node: &MeteredNode,
+    shard: u64,
+    mut request: scan::ScanRequest,
+) -> Result<scan::ScanResult, QueryFailure> {
+    let page = AppendOnlyStore::new(node.clone(), shard, request.partition)
+        .vertex_page(
+            request.after,
+            ScanLimit {
+                max_rows: scan::PAGE_ROWS,
+                max_bytes: scan::PAGE_BYTES,
+            },
+        )
+        .map_err(graph_error)?;
+    let scanned = page.vertices.len();
+    let mut matched = 0;
+    let mut ids = Vec::new();
+    for vertex in page.vertices {
+        node.check_execution_context()
+            .map_err(query::storage_error)?;
+        if request.stopped() {
+            break;
+        }
+        let mut keep = true;
+        for step in &mut request.steps {
+            node.charge(0, 1).map_err(query::storage_error)?;
+            keep = match step {
+                scan::ScanStep::Has { key, value } => match value {
+                    Some(value) => vertex.properties.get(key) == Some(value),
+                    None => vertex.properties.contains_key(key),
+                },
+                scan::ScanStep::HasLabel(labels) => {
+                    vertex.labels.iter().any(|l| labels.contains(l))
+                }
+                scan::ScanStep::Limit(n) => {
+                    *n -= 1;
+                    true
+                }
+            };
+            if !keep {
+                break;
+            }
+        }
+        if keep {
+            matched += 1;
+            if !request.count {
+                node.charge(16, 0).map_err(query::storage_error)?;
+                ids.push(vertex.id);
+            }
+        }
+    }
+    Ok(scan::ScanResult {
+        next_after: page.next_after,
+        scanned,
+        matched,
+        ids,
+        limits: request.limits(),
+    })
+}
+
 #[derive(Clone)]
 struct MeteredNode {
     frozen: query::FrozenNode,
@@ -434,12 +500,37 @@ impl StorageNode for MeteredNode {
     }
     fn scan_page(
         &self,
-        _: KeyRange,
-        _: ScanLimit,
-        _: &ReadView,
-        _: Option<&ScanCursor>,
+        range: KeyRange,
+        limit: ScanLimit,
+        view: &ReadView,
+        cursor: Option<&ScanCursor>,
     ) -> Result<ScanPage, StorageNodeError> {
-        Err(StorageNodeError::Unsupported("fragment scan paging".into()))
+        self.charge(128, 1)?;
+        let used = *self.cost.lock().unwrap();
+        let limit = ScanLimit {
+            max_rows: limit
+                .max_rows
+                .min(scan::PAGE_ROWS)
+                .min(self.ceiling.work.saturating_sub(used.work)),
+            max_bytes: limit
+                .max_bytes
+                .min(scan::PAGE_BYTES)
+                .min(self.ceiling.bytes.saturating_sub(used.bytes) / 4),
+        };
+        if limit.max_rows == 0 || limit.max_bytes == 0 {
+            return Err(StorageNodeError::ResourceExhausted(
+                "distributed scan budget".into(),
+            ));
+        }
+        let page = self.frozen.scan_page(range, limit, view, cursor)?;
+        self.charge(
+            page.rows
+                .iter()
+                .map(|r| 128 + (r.key.len() + r.value.len()) * 4)
+                .sum(),
+            page.rows.len(),
+        )?;
+        Ok(page)
     }
     fn batch_write(&self, _: WriteRequest) -> Result<WriteResult, StorageNodeError> {
         Err(StorageNodeError::Unsupported("query is read only".into()))
@@ -471,6 +562,75 @@ mod tests {
             },
             cost: Arc::new(Mutex::new(Cost::default())),
             ceiling,
+        }
+    }
+    #[test]
+    fn pages_continue_without_truncation_and_budget_or_large_entry_fails() {
+        let entries = (0..300u64)
+            .map(|n| (n.to_be_bytes().to_vec(), vec![1; 10]))
+            .collect();
+        let node = node(entries, scan::SCAN_CEILING);
+        let range = KeyRange::new(vec![0], vec![255]).unwrap();
+        let limit = ScanLimit::new(128, 1024).unwrap();
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = node
+                .scan_page(range.clone(), limit, &node.frozen.view, cursor.as_ref())
+                .unwrap();
+            assert!(page.rows.len() <= 128);
+            seen.extend(
+                page.rows
+                    .iter()
+                    .map(|r| u64::from_be_bytes(r.key.as_slice().try_into().unwrap())),
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, (0..300).collect::<Vec<_>>());
+        let denied = MeteredNode {
+            ceiling: Cost {
+                bytes: 1024,
+                work: 1,
+            },
+            ..node.clone()
+        };
+        assert!(matches!(
+            denied.scan_page(range.clone(), limit, &denied.frozen.view, None),
+            Err(StorageNodeError::ResourceExhausted(_))
+        ));
+        let tiny = ScanLimit::new(128, 1).unwrap();
+        assert!(matches!(
+            node.scan_page(range, tiny, &node.frozen.view, None),
+            Err(StorageNodeError::ResourceExhausted(_))
+        ));
+    }
+    #[test]
+    fn scan_checks_corruption_before_filters_and_later_limit() {
+        let mut key = b"graph/v2/p/".to_vec();
+        key.extend(1u32.to_be_bytes());
+        key.extend(b"/vertex/");
+        key.extend(1u64.to_be_bytes());
+        for key in [key.clone(), [key.as_slice(), &[0]].concat()] {
+            let node = node(BTreeMap::from([(key, vec![0])]), scan::SCAN_CEILING);
+            let request = scan::ScanRequest {
+                partition: 1,
+                after: None,
+                count: true,
+                steps: vec![
+                    scan::ScanStep::Has {
+                        key: "missing".into(),
+                        value: None,
+                    },
+                    scan::ScanStep::Limit(1),
+                ],
+            };
+            assert!(matches!(
+                run_scan_fragment(&node, 1, request),
+                Err(QueryFailure::IncompleteOrCorrupt)
+            ));
         }
     }
     #[test]

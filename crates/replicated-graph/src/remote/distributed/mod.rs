@@ -7,6 +7,7 @@ use rocksdb_sql_table::{
     Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
+mod scan;
 mod sessions;
 pub(super) use sessions::Sessions;
 
@@ -127,6 +128,7 @@ struct IncomingEdge {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Fragment {
+    Scan(scan::ScanRequest),
     Exists(VertexId),
     Out(VertexId),
     In(VertexId),
@@ -152,6 +154,10 @@ enum Fragment {
 impl Fragment {
     fn validate(&self) -> Result<(), RemoteError> {
         let bytes = match self {
+            Self::Scan(request) => {
+                request.validate()?;
+                0
+            }
             Self::Exists(_) | Self::Out(_) | Self::In(_) => 0,
             Self::ResolveIncoming { edge, .. } => {
                 if edge.label.len() > 64 {
@@ -184,6 +190,7 @@ impl Fragment {
     }
     fn partition(&self) -> u32 {
         match self {
+            Self::Scan(request) => request.partition,
             Self::Exists(v) | Self::Out(v) | Self::In(v) => v.partition,
             Self::ResolveIncoming { edge, .. } => edge.partition,
             Self::VerifyReverse(e) => e.to.partition,
@@ -214,6 +221,7 @@ impl Cost {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn remaining(self) -> Self {
         Self {
             bytes: MAX_BYTES.saturating_sub(self.bytes),
@@ -234,6 +242,7 @@ pub(super) struct FragmentRequest {
 }
 #[derive(Debug, Serialize, Deserialize)]
 enum FragmentValue {
+    Scan(scan::ScanResult),
     Bool(bool),
     Edges(Vec<EdgeHop>),
     Incoming(Vec<IncomingEdge>),
@@ -274,6 +283,10 @@ fn validate_request(request: &DistributedRequest) -> Result<(), RemoteError> {
 }
 fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     let query = GremlinQuery::parse(&request.text).map_err(query::graph_error)?;
+    if scan::is_global(&query) {
+        scan::steps(&query)?;
+        return Ok(query);
+    }
     if !matches!(query.start(), GremlinStart::Vertices(ids) if !ids.is_empty()) {
         return Err(QueryFailure::Unsupported);
     }
@@ -344,6 +357,7 @@ struct Execution<'a> {
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     end: Instant,
     cost: Cost,
+    ceiling: Cost,
 }
 impl Execution<'_> {
     fn route(&self, partition: u32) -> Result<&PartitionRoute, QueryFailure> {
@@ -363,16 +377,22 @@ impl Execution<'_> {
             .1
             .clone();
         // Charge request encoding and transport work before allocating/sending.
-        self.cost.charge(512, 1, CEILING)?;
+        self.cost.charge(512, 1, self.ceiling)?;
         let request = FragmentRequest {
             descriptor: descriptor.clone(),
             fragment,
-            remaining: self.cost.remaining(),
+            remaining: Cost {
+                bytes: self.ceiling.bytes.saturating_sub(self.cost.bytes),
+                work: self.ceiling.work.saturating_sub(self.cost.work),
+            },
         };
         let encoded = serde_json::to_vec(&request).map_err(|_| QueryFailure::InvalidArgument)?;
-        self.cost.charge(encoded.len() * 2, 0, CEILING)?;
+        self.cost.charge(encoded.len() * 2, 0, self.ceiling)?;
         let request = FragmentRequest {
-            remaining: self.cost.remaining(),
+            remaining: Cost {
+                bytes: self.ceiling.bytes.saturating_sub(self.cost.bytes),
+                work: self.ceiling.work.saturating_sub(self.cost.work),
+            },
             ..request
         };
         let reply = rpc(
@@ -393,7 +413,7 @@ impl Execution<'_> {
             return Err(QueryFailure::IncompleteOrCorrupt);
         }
         self.cost
-            .charge(output.cost.bytes, output.cost.work, CEILING)?;
+            .charge(output.cost.bytes, output.cost.work, self.ceiling)?;
         Ok(output.value)
     }
     async fn boolean(&mut self, fragment: Fragment) -> Result<bool, QueryFailure> {
@@ -442,7 +462,7 @@ impl Execution<'_> {
             if label.is_some_and(|label| label != edge.label) {
                 continue;
             }
-            self.cost.charge(256 + edge.label.len(), 1, CEILING)?;
+            self.cost.charge(256 + edge.label.len(), 1, self.ceiling)?;
             edges.push(edge);
         }
         Ok(edges)
@@ -454,6 +474,9 @@ impl Execution<'_> {
         query: &GremlinQuery,
     ) -> DistributedResponse {
         self.route(request.start_partition)?;
+        if scan::is_global(query) {
+            return self.run_scan(query).await;
+        }
         let mut rows = Vec::new();
         let GremlinStart::Vertices(ids) = query.start() else {
             return Err(QueryFailure::Unsupported);
@@ -522,7 +545,7 @@ impl Execution<'_> {
                             if label.as_ref().is_some_and(|l| l != &edge.label) {
                                 continue;
                             }
-                            self.cost.charge(row.path.len() * 32, 0, CEILING)?;
+                            self.cost.charge(row.path.len() * 32, 0, self.ceiling)?;
                             let mut path = row.path.clone();
                             path.push(QualifiedElement::Edge {
                                 partition: edge.from.partition,
@@ -632,7 +655,7 @@ impl Execution<'_> {
             },
         };
         let bytes = bounded_encode(&output, self.end)?;
-        self.cost.charge(bytes.len() * 2, 0, CEILING)?;
+        self.cost.charge(bytes.len() * 2, 0, self.ceiling)?;
         check(self.end)?;
         Ok(output)
     }
@@ -670,6 +693,11 @@ async fn execute(
     let query = plan(&request)?;
     let mut execution = Execution {
         catalog,
+        ceiling: if scan::is_global(&query) {
+            scan::SCAN_CEILING
+        } else {
+            CEILING
+        },
         sessions: BTreeMap::new(),
         end,
         cost: Cost {
@@ -685,7 +713,7 @@ async fn execute(
                 continue;
             }
             check(end)?;
-            execution.cost.charge(1024, 1, CEILING)?;
+            execution.cost.charge(1024, 1, execution.ceiling)?;
             let remaining = end.saturating_duration_since(Instant::now());
             let reply = rpc(
                 route.endpoint,
@@ -909,10 +937,35 @@ fn validate_output(
         })
         .collect();
     let hops = directions.len();
-    let out = hops != 0;
+    if scan::is_global(&query) && !count {
+        let keys = output
+            .rows
+            .iter()
+            .map(|row| match row {
+                QueryRow::Element(QualifiedElement::Vertex { partition, id }) => {
+                    Ok((*partition, *id))
+                }
+                _ => Err(RemoteError::Protocol),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let cap = query
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Existing(GremlinStep::Limit(n)) => Some(*n),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(100);
+        if keys.len() > cap || keys.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(RemoteError::Protocol);
+        }
+    }
+    let out = hops != 0 || scan::is_global(&query);
     let valid_vertex = |v: &QualifiedElement| matches!(v, QualifiedElement::Vertex { partition, .. } if out || *partition == request.start_partition);
     if count {
-        return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= MAX_ROWS as u64) {
+        return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= if scan::is_global(&query) { scan::SCAN_CEILING.work as u64 } else { MAX_ROWS as u64 })
+        {
             Ok(())
         } else {
             Err(RemoteError::Protocol)
@@ -995,7 +1048,6 @@ mod tests {
     #[test]
     fn plan_is_validated_before_empty_stream_can_hide_unsupported_steps() {
         for text in [
-            "g.V()",
             "g.E(1)",
             "g.V(999).both()",
             "g.V(999).values('a').has('a')",

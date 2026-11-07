@@ -18,7 +18,8 @@ The client sends `DistributedRequest { start_partition, text, timeout_millis }`.
 The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` / `in()`
 steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limit`, vertex-identity `dedup()`, terminal `path` or
 `count`, and `values(key)` followed only by `limit`/`count`. Unsupported start and
-step forms fail explicitly through the official parser. No global V/E scan,
+step forms fail explicitly through the official parser. A separate [global vertex scan](SERVER_GLOBAL_SCAN.md) supports `g.V()` with
+filters/limit/count and its own explicit bounded budget. No global E scan,
 `both()`, mutation, alternate query dialect or textual
 query rewriting is provided by this slice.
 
@@ -172,7 +173,7 @@ at 128 MiB across sessions, with a 64 MiB / 1,000,000-record per-session limit.
 Snapshot acquisition reserves its full per-session byte allowance before copying
 and releases the unused reservation afterward.
 
-One execution has a cumulative 64 MiB logical-byte allowance, 10,000 work units
+An explicit-ID traversal execution has a cumulative 64 MiB logical-byte allowance, 10,000 work units
 and 10,000 intermediate rows. Each adjacency index scan is bounded to 1,000 entries /
 1 MiB. Query/fragment encoded output is limited to 2 MiB, and transport frames
 retain the existing 16 MiB hard bound. Coordinator requests are limited to

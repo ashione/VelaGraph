@@ -352,3 +352,12 @@ vertex steps or terminal `count()`. Scalar/path/edge deduplication, scopes,
 arguments and `by()` are explicitly unsupported. This additive observed AST step
 does not enlarge the v0 subset table or client-side observed executor. All
 upstream validation and cumulative resource limits still apply before dedup.
+
+### Experimental server global V scan
+
+The [server global vertex scan](SERVER_GLOBAL_SCAN.md) adds `g.V()` with
+ordered has/hasLabel/limit and terminal count on the v2 vertex namespace. Its
+stable order is (partition ID, local ID), distinct from the older client global
+scan order. It uses data-local pages and fixed per-shard sessions, explicit
+scan budgets and Unverified results, never a global atomic snapshot claim.
+Global adjacency/projections/E/path/dedup remain unsupported in this slice.

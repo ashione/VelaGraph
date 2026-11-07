@@ -36,7 +36,9 @@ A separate [bounded distributed observed query
 experiment](docs/DISTRIBUTED_QUERY.md) now coordinates explicit vertex starts
 and up to three incoming/outgoing hops across fixed data shards on server-retained
 snapshots. It uses a caller-maintained static catalog, not live metadata
-discovery, and still returns Unverified observations.
+discovery, and still returns Unverified observations. Its separately bounded
+[global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
+filters/limit/count without downloading the graph to the coordinator.
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
 the transaction/recovery contract is in [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md);
