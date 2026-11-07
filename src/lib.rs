@@ -56,6 +56,7 @@ pub use gremlin::{
     ObservedGremlinStep, PathElement, DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE,
     MAX_GREMLIN_ACCOUNTED_BYTES, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,
     MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS, MAX_GREMLIN_STRUCTURAL_MARKS,
+    MAX_OBSERVED_GREMLIN_REPEAT_TIMES,
 };
 pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use storage_node::{

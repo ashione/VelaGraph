@@ -291,3 +291,9 @@ shard sessions, with local filter/limit/count pushdown and deterministic
 (partition, ID) order. This does not add global E, adjacency, pagination, native
 recursion or global atomic snapshots. See `SERVER_GLOBAL_SCAN.md` for its explicit
 new scan budget and untouched explicit-ID traversal bounds.
+
+A first native hierarchy slice now supports one bounded `repeat(single in/out)`
+with `times(1..32)` and optional post-emit inside explicit-ID server queries.
+It preserves path bags, finite cycles, fixed snapshots and existing budgets.
+Arbitrary/unbounded recursion, nested repeats and global-start adjacency remain
+deferred; see `SERVER_HIERARCHY.md`.

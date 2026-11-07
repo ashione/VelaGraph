@@ -328,6 +328,96 @@ async fn corehr_incoming_matches_ordered_bag_oracle_across_three_processes() -> 
                 })
                 .collect(),
         ));
+        let repeat_model = |mut frontier: Paths, label: &str, incoming: bool, n, emit| {
+            let mut result = Vec::new();
+            for _ in 0..n {
+                frontier = hop(frontier, label, incoming);
+                if emit {
+                    result.extend(frontier.clone());
+                }
+            }
+            if emit {
+                result
+            } else {
+                frontier
+            }
+        };
+        for (start, text, label, incoming, n, emit, paths) in [
+            (
+                200,
+                "g.V(200).repeat(__.out('reports_to')).emit().times(32).path()",
+                "reports_to",
+                false,
+                32,
+                true,
+                true,
+            ),
+            (
+                200,
+                "g.V(200).repeat(__.out('reports_to')).times(3).path()",
+                "reports_to",
+                false,
+                3,
+                false,
+                true,
+            ),
+            (
+                200,
+                "g.V(200).repeat(__.out('reports_to')).times(4).count()",
+                "reports_to",
+                false,
+                4,
+                false,
+                false,
+            ),
+            (
+                1,
+                "g.V(1).repeat(__.in('reports_to')).emit().times(3).count()",
+                "reports_to",
+                true,
+                3,
+                true,
+                false,
+            ),
+            (
+                1,
+                "g.V(1).repeat(__.in('reports_to')).times(3).count()",
+                "reports_to",
+                true,
+                3,
+                false,
+                false,
+            ),
+            (
+                225,
+                "g.V(225).repeat(__.out('parent_department')).emit().times(8).path()",
+                "parent_department",
+                false,
+                8,
+                true,
+                true,
+            ),
+            (
+                201,
+                "g.V(201).repeat(__.in('parent_department')).emit().times(8).count()",
+                "parent_department",
+                true,
+                8,
+                true,
+                false,
+            ),
+        ] {
+            let expected = repeat_model(starts(&[start]), label, incoming, n, emit);
+            cases.push((
+                start,
+                text,
+                if paths {
+                    expected.into_iter().map(QueryRow::Path).collect()
+                } else {
+                    vec![QueryRow::Count(expected.len() as u64)]
+                },
+            ));
+        }
         let mut all = (1..=225)
             .map(|id| (part(id), id))
             .chain(std::iter::once((1, 1)))
