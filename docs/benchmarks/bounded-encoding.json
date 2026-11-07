@@ -1,5 +1,6 @@
 {
-  "baseline_main": "8264ff9982ac1a9a61fb1256725faad2bb7d67e1",
+  "baseline_main": "09773b319af380ca7da1524395aa3734bb8f3975",
+  "candidate_source_commit": "a78575827a832e71f1e1ba52fff761deba025fd9",
   "order": [
     "baseline-first",
     "candidate-first",
@@ -15,25 +16,25 @@
     "baseline-first": [
       {
         "sample": 0,
-        "seconds": 4.579265398,
-        "start_seconds": 0.445768981,
-        "after_start_seconds": 4.133496417000001,
-        "requests": 1564,
+        "seconds": 5.093019826,
+        "start_seconds": 0.40121058,
+        "after_start_seconds": 4.691809246,
+        "requests": 1566,
         "count": 199999
       },
       {
         "sample": 1,
-        "seconds": 4.56709267,
-        "start_seconds": 0.414714025,
-        "after_start_seconds": 4.152378645,
+        "seconds": 5.23150516,
+        "start_seconds": 0.430424221,
+        "after_start_seconds": 4.801080939,
         "requests": 1565,
         "count": 199999
       },
       {
         "sample": 2,
-        "seconds": 4.414887638,
-        "start_seconds": 0.346851008,
-        "after_start_seconds": 4.06803663,
+        "seconds": 4.635345346,
+        "start_seconds": 0.374629627,
+        "after_start_seconds": 4.260715719,
         "requests": 1565,
         "count": 199999
       }
@@ -41,25 +42,25 @@
     "candidate-first": [
       {
         "sample": 0,
-        "seconds": 4.106270494,
-        "start_seconds": 0.382156724,
-        "after_start_seconds": 3.72411377,
-        "requests": 1565,
+        "seconds": 4.421899916,
+        "start_seconds": 0.415981464,
+        "after_start_seconds": 4.005918452,
+        "requests": 1564,
         "count": 199999
       },
       {
         "sample": 1,
-        "seconds": 4.184821333,
-        "start_seconds": 0.42369379,
-        "after_start_seconds": 3.761127543,
+        "seconds": 4.266322701,
+        "start_seconds": 0.409181877,
+        "after_start_seconds": 3.857140824,
         "requests": 1565,
         "count": 199999
       },
       {
         "sample": 2,
-        "seconds": 4.043648868,
-        "start_seconds": 0.316263485,
-        "after_start_seconds": 3.727385383,
+        "seconds": 4.245623252,
+        "start_seconds": 0.361207531,
+        "after_start_seconds": 3.884415721,
         "requests": 1565,
         "count": 199999
       }
@@ -67,52 +68,52 @@
     "candidate-second": [
       {
         "sample": 0,
-        "seconds": 4.303863042,
-        "start_seconds": 0.357832911,
-        "after_start_seconds": 3.9460301309999997,
-        "requests": 1565,
+        "seconds": 4.304089989,
+        "start_seconds": 0.365257118,
+        "after_start_seconds": 3.9388328710000002,
+        "requests": 1564,
         "count": 199999
       },
       {
         "sample": 1,
-        "seconds": 4.433002552,
-        "start_seconds": 0.394779352,
-        "after_start_seconds": 4.0382232,
+        "seconds": 4.487133861,
+        "start_seconds": 0.380548259,
+        "after_start_seconds": 4.106585602,
         "requests": 1565,
         "count": 199999
       },
       {
         "sample": 2,
-        "seconds": 4.366737374,
-        "start_seconds": 0.358322642,
-        "after_start_seconds": 4.008414732,
-        "requests": 1565,
+        "seconds": 4.127680781,
+        "start_seconds": 0.385429012,
+        "after_start_seconds": 3.7422517689999997,
+        "requests": 1564,
         "count": 199999
       }
     ],
     "baseline-second": [
       {
         "sample": 0,
-        "seconds": 4.686024757,
-        "start_seconds": 0.368664534,
-        "after_start_seconds": 4.3173602230000006,
-        "requests": 1564,
+        "seconds": 4.60316524,
+        "start_seconds": 0.385394203,
+        "after_start_seconds": 4.217771037,
+        "requests": 1565,
         "count": 199999
       },
       {
         "sample": 1,
-        "seconds": 4.981331555,
-        "start_seconds": 0.368433991,
-        "after_start_seconds": 4.612897564,
+        "seconds": 4.791083654,
+        "start_seconds": 0.471404162,
+        "after_start_seconds": 4.319679492000001,
         "requests": 1565,
         "count": 199999
       },
       {
         "sample": 2,
-        "seconds": 4.503424875,
-        "start_seconds": 0.330213558,
-        "after_start_seconds": 4.173211317000001,
-        "requests": 1565,
+        "seconds": 4.368535652,
+        "start_seconds": 0.360920137,
+        "after_start_seconds": 4.007615515,
+        "requests": 1564,
         "count": 199999
       }
     ]
@@ -120,47 +121,47 @@
   "summary": {
     "baseline": {
       "seconds": {
-        "median": 4.573179034000001,
-        "min": 4.414887638,
-        "max": 4.981331555
+        "median": 4.7132145,
+        "min": 4.368535652,
+        "max": 5.23150516
       },
       "start_seconds": {
-        "median": 0.3685492625,
-        "min": 0.330213558,
-        "max": 0.445768981
+        "median": 0.3933023915,
+        "min": 0.360920137,
+        "max": 0.471404162
       },
       "after_start_seconds": {
-        "median": 4.162794981,
-        "min": 4.06803663,
-        "max": 4.612897564
+        "median": 4.2901976055,
+        "min": 4.007615515,
+        "max": 4.801080939
       }
     },
     "candidate": {
       "seconds": {
-        "median": 4.2443421875,
-        "min": 4.043648868,
-        "max": 4.433002552
+        "median": 4.285206345000001,
+        "min": 4.127680781,
+        "max": 4.487133861
       },
       "start_seconds": {
-        "median": 0.370239683,
-        "min": 0.316263485,
-        "max": 0.42369379
+        "median": 0.3829886355,
+        "min": 0.361207531,
+        "max": 0.415981464
       },
       "after_start_seconds": {
-        "median": 3.8535788369999997,
-        "min": 3.72411377,
-        "max": 4.0382232
+        "median": 3.9116242960000003,
+        "min": 3.7422517689999997,
+        "max": 4.106585602
       }
     }
   },
-  "end_to_end_reduction_percent": 7.190552656154781,
-  "after_start_reduction_percent": 7.428089670794202,
+  "end_to_end_reduction_percent": 9.081024320026165,
+  "after_start_reduction_percent": 8.824146212162166,
   "scope": "Generic bounded JSON serialization for distributed query responses, not a CoreHR-specific execution rule.",
   "performance_scope": "End-to-end speedup measured only for this synthetic CoreHR CEO count workload on one host. No universal speedup or production SLA claim.",
   "binary_sha256": {
-    "candidate-runner": "ac31e4dac4bfbb71894387b5f2b40020a3241e84492c78c289843fba03453a89",
+    "candidate-runner": "5edcbfb92f87e8da3640411574a023dc81c378dbb8127f0c60d97ddd7575e4d7",
     "baseline-node": "7c932903d364408ec9249a2ab082aad3fa12bce23198e6de9fda74b52694296a",
-    "candidate-node": "2dda4401d587ac887a4d68966eaee996201e87dd8a9390847740642fb9f4e1ad",
+    "candidate-node": "f79bff0fe7c6230df73407c315c621810c13d95527ce0a3ac7db879738a66e06",
     "baseline-runner": "03fa640cf2760777888dfcb0a91c24da6d0a8dcae2bde04df40a834c88e23ce2"
   },
   "fixture_sha256": {
@@ -171,21 +172,73 @@
   },
   "driver_sha256": "e57fe01dcd4dcd731cb5b761820cab9000cb1994ea201fce7a37161537ae6312",
   "raw_evidence_sha256": {
-    "baseline-first/out.jsonl": "bc70d6373dcfbc20e66e9f7dad36f3ae02241e54bb68f24feee0a155ec6839d3",
-    "baseline-first/receipt.json": "a0a3c7b9f0159049f3a00046d20daf7f89aa32dbaf46db96a21f0e714210ce54",
-    "baseline-first/cleanup.json": "b897e19fc68664985c5cf7549d83491cc50267fa625008ee73f8248b59468811",
+    "baseline-first/out.jsonl": "a62543b7085296e731cca5661b9857851dc6cdc106746a25f300b0af7c355674",
+    "baseline-first/receipt.json": "7a29ecd325b1d7d2931be71fa42afb6525451ba71a70aaee5687d9471824fa02",
+    "baseline-first/cleanup.json": "1a197d56a145d3a9afa49d456d2424d7a1f93ad941313bf88924b737b4134e87",
     "baseline-first/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "candidate-first/out.jsonl": "4f961225051bbc3b5378bdc6417dfc3f5de1b183219c207f11a8fa5877aa0917",
-    "candidate-first/receipt.json": "0ce78c8bba2c3a95228362f7f168ecac01ba054af6e731929f43e22ec6110d42",
-    "candidate-first/cleanup.json": "620edc7fc0dac6e8683fec14f1423e52a78de017b8a7a1c2b1f7ec0fc4d8fd68",
+    "candidate-first/out.jsonl": "0dd6d41ce20d38cd3e68e2371e0452c0a659579aea04dcb466dfb078ddb46c57",
+    "candidate-first/receipt.json": "4dd6508bc9957f9577be8e051e5b9bef84cad03c9c13a84518921516867320ec",
+    "candidate-first/cleanup.json": "cb9dc581af0125e85f53717d7ca95ed83c6c64c091c615f77736744d404d4b6b",
     "candidate-first/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "candidate-second/out.jsonl": "eb6c221fc7e017e5eeb4d6974b53faf3666535547cac075dcfdc1070a4e12ce5",
-    "candidate-second/receipt.json": "60fdcb38f72ba6fb99fb79f2c822d54e971fc33982442570c81657e9b6b902cd",
-    "candidate-second/cleanup.json": "cb2b06edd64ade2349410da809bbda79662774a37e5eff04ae3936a5b725f5b5",
+    "candidate-second/out.jsonl": "751cd4292fad9befb23a08f1a2bfb088a1bec0b263dde5abfe1d4877ef1a129d",
+    "candidate-second/receipt.json": "017b8b6c68ea1e5f80e9a79f77ac77a54efcf5b567cc48c4281e2025972f5c37",
+    "candidate-second/cleanup.json": "62b58c8c2fae79351b7719fbea367c49029e3ba26310fd813ea6de679639f457",
     "candidate-second/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "baseline-second/out.jsonl": "5c8df46f488dca7f7a1c08462328a083383edca449abd7c2e251070df7a48999",
-    "baseline-second/receipt.json": "254dbdad91843fffb6e159315c07399910fa6f92a55a9797ef26cc7da0fd42f2",
-    "baseline-second/cleanup.json": "81c10acfa25de0bff123db1c7daad9b348c823c30c9377b640e06f2be4176210",
+    "baseline-second/out.jsonl": "b5a737e2e1f2c9aca4549d4b5ab96a330e5bb8fdf247f0fc27f0a55f959dfc4a",
+    "baseline-second/receipt.json": "bc9bd5200a4114aa7786452b959051f0d2d1287e88f2b9f816010da07915b887",
+    "baseline-second/cleanup.json": "5404a3baf66dbc23fa9b12f726576a7146be98abcbf5de70a6a444cb4e665c9c",
     "baseline-second/stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "preliminary_observation": {
+    "end_to_end_reduction_percent": 7.190552656154781,
+    "summary": {
+      "baseline": {
+        "seconds": {
+          "median": 4.573179034000001,
+          "min": 4.414887638,
+          "max": 4.981331555
+        },
+        "start_seconds": {
+          "median": 0.3685492625,
+          "min": 0.330213558,
+          "max": 0.445768981
+        },
+        "after_start_seconds": {
+          "median": 4.162794981,
+          "min": 4.06803663,
+          "max": 4.612897564
+        }
+      },
+      "candidate": {
+        "seconds": {
+          "median": 4.2443421875,
+          "min": 4.043648868,
+          "max": 4.433002552
+        },
+        "start_seconds": {
+          "median": 0.370239683,
+          "min": 0.316263485,
+          "max": 0.42369379
+        },
+        "after_start_seconds": {
+          "median": 3.8535788369999997,
+          "min": 3.72411377,
+          "max": 4.0382232
+        }
+      }
+    },
+    "binary_sha256": {
+      "candidate-runner": "ac31e4dac4bfbb71894387b5f2b40020a3241e84492c78c289843fba03453a89",
+      "baseline-node": "7c932903d364408ec9249a2ab082aad3fa12bce23198e6de9fda74b52694296a",
+      "candidate-node": "2dda4401d587ac887a4d68966eaee996201e87dd8a9390847740642fb9f4e1ad",
+      "baseline-runner": "03fa640cf2760777888dfcb0a91c24da6d0a8dcae2bde04df40a834c88e23ce2"
+    },
+    "note": "Earlier iteration before additional generic regression tests. Not pooled with final exact-source samples; retained to disclose observed variation."
+  },
+  "source_ci": {
+    "head": "a78575827a832e71f1e1ba52fff761deba025fd9",
+    "ci": "https://github.com/ashione/superagent-playground/actions/runs/42367681607",
+    "full_scale": "https://github.com/ashione/superagent-playground/actions/runs/42367681638",
+    "both_succeeded": true
   }
 }

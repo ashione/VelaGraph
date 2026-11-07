@@ -32,16 +32,20 @@ that arbitrary hand-constructed paths are valid query results.
 
 The existing non-CoreHR real-process distributed graph suite independently
 covers `knows` edges, cross-shard paths, parallel edges, cycles/self-loops,
-large properties, and corruption/resource failures. Full remote CI is required
-before merge; application-level profiling is not correctness evidence.
+large properties, and corruption/resource failures. All 131 library tests,
+all-target Clippy, two distributed process tests and one remote-query process
+test passed locally. The exact candidate source commit
+also passed both ordinary and full-scale CI. Every later head still requires
+its own CI before merge; profiling is not correctness evidence.
 
 ## Matched end-to-end observation
 
-Baseline production source: `8264ff9982ac1a9a61fb1256725faad2bb7d67e1`
-(tree `d0217515137b7cb8d2bc8652b633c764a5c5a3fa`). Subsequent main changes
-through `09773b319af380ca7da1524395aa3734bb8f3975` add validation/fixtures,
-not production query behavior. Both variants were explicitly rebuilt in release
-mode, with identical driver and fixture, two Tokio threads per process, and no
+Baseline source: `09773b319af380ca7da1524395aa3734bb8f3975`.
+Candidate source: `a78575827a832e71f1e1ba52fff761deba025fd9`
+(tree `10faa4b4162b201f253a2b03473c9add23b48ab2`). All 189 candidate blobs
+were verified against that tree after the measurement. This evidence update
+changes only documentation, not production/test Rust source. Both variants
+were explicitly rebuilt in release mode, with identical driver and fixture, two Tokio threads per process, and no
 profiling instrumentation. Order: A/B/B/A, fresh databases for each process run,
 three query samples per process, six samples but only two process runs per variant.
 
@@ -50,13 +54,15 @@ regression workload, **not as a prerequisite or specialization of the optimizati
 All twelve CEO count results were 199,999 with exact fixed snapshots and successful
 replay. Import is excluded; Start/snapshot preparation is included.
 
-- End-to-end median: **4.573 s → 4.244 s**, **7.19% lower**.
-- Baseline range: 4.415–4.981 s. Candidate range: 4.044–4.433 s.
-- Predeclared secondary observation, after Start: median 4.163 s → 3.854 s.
-- Start itself: medians 0.369 s and 0.370 s.
+- End-to-end median: **4.713 s → 4.285 s**, **9.08% lower**.
+- Baseline range: 4.369–5.232 s. Candidate range: 4.128–4.487 s.
+- Predeclared secondary observation, after Start: median 4.290 s → 3.912 s.
+- Start itself: medians 0.393 s and 0.383 s.
 
-Ranges overlap slightly. This narrow result is not statistical proof of a
-universal speedup, throughput, production latency, or high availability.
+An earlier iteration observed 7.19% lower median. Its samples are retained
+separately in the evidence and are not pooled with this final-source run.
+The variation and overlapping ranges matter: this narrow result is not
+statistical proof of a universal speedup, throughput, production latency, or high availability.
 All shards are separate processes on **one cloud host**, not physical multi-host
 execution. Only this workload has an end-to-end speed measurement here.
 
