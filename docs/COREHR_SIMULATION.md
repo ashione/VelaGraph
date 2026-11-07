@@ -121,3 +121,7 @@ bounded global-scan and native hierarchy implementations are included in the
 corresponding engine revisions. Do not infer universal query support from a passing
 simulation. A failure is actionable evidence, not a reason to raise limits or
 silently substitute a different query.
+
+## Incremental hierarchy count jobs
+
+See `COREHR_COUNT_JOB_RESULTS.md` and `corehr-count-job-results.json` for the separate count-job API, full-organization count oracle, retained failed department probe and bounded fix. Build `corehr_jobs_run` as a replicated-graph example and set `COREHR_JOBS_MATRIX=1` to run its dedicated job matrix against a generated fixture and a fresh database. These results do not change the ordinary synchronous traversal limits or promise paginated vertex/path output.
