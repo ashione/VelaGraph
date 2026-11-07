@@ -38,6 +38,8 @@ use tokio::{
     sync::Notify,
     time::{sleep, timeout},
 };
+#[path = "distributed_query/byte_batches.rs"]
+mod byte_batches;
 #[path = "distributed_query/corehr.rs"]
 mod corehr;
 #[path = "distributed_query/jobs.rs"]

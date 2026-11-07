@@ -1,6 +1,7 @@
 //! Incremental native count jobs. Progress is not a partial query result.
 use super::*;
 use std::sync::Mutex;
+mod packing;
 mod parallel;
 mod rows;
 
@@ -655,16 +656,15 @@ impl Job {
                 .find(|route| route.partition == partition)
                 .ok_or(QueryFailure::UnsupportedScope)?
                 .shard;
-            for chunk in group.chunks(BATCH_ROWS) {
-                pending.push(parallel::Batch {
-                    shard,
-                    indices: chunk.iter().map(|(index, _)| *index).collect(),
-                    fragment: Fragment::HierarchyBatch {
-                        partition,
-                        fragments: chunk.iter().map(|(_, f)| f.clone()).collect(),
-                    },
-                });
-            }
+            let ceiling = self.ceiling();
+            pending.extend(packing::pack(
+                partition,
+                shard,
+                group,
+                &mut self.cost,
+                ceiling,
+                end,
+            )?);
         }
         parallel::run(self, pending, &mut outputs, end).await?;
         outputs
