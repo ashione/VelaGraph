@@ -13,8 +13,10 @@ unbounded recursion, or global start are admitted by this API.
 ## Progress is not a result
 
 Start pins every configured shard and returns a token, `next_sequence: 0`, and
-its fixed snapshot stamps. Advance processes at most 16 distinct frontier
-vertices. The next request uses the returned sequence. The coordinator, not the
+its fixed snapshot stamps. Advance processes up to eight sequential micro-pages, each containing at most
+16 distinct frontier vertices. It yields between completed pages after a
+50-millisecond cooperative work quantum; an individual page can take longer,
+subject to the unchanged request deadline. The next request uses the returned sequence. The coordinator, not the
 client, expands and validates all edges. A client merely polls native work; it
 does not execute a per-hop graph query or download graph snapshots.
 
@@ -57,7 +59,7 @@ remain separate even on self-cycles. The emitted flag only controls the final
 unique count; it never suppresses traversal at later depths. Reusing the same
 identity entry avoids storing that vertex independently in frontier, next frontier,
 and seen containers. A bounded ordered cursor scans at most 128 identity entries
-per Advance and expands at most 16 active vertices. Inactive seen-only entries
+per micro-page and expands at most 16 active vertices. Inactive seen-only entries
 also incur scan work and may require progress requests that
 expand no vertices. No full-table reset is hidden at a depth transition. Other
 count modes keep their existing weighted-frontier representation.
@@ -82,7 +84,8 @@ The new API has its own budgets, not a claim that every old query cap is unchang
   allowance per allocated tree entry remains, plus bounded page buffers. This is
   not a process-RSS ceiling. Unemitted start identities are also retained and count
   toward the cap in compact mode. No full paths are stored.
-- At most 16 vertices advanced per request, 128 leaves per batched shard RPC,
+- At most eight sequential micro-pages per request, each advancing at most 16
+  vertices; 128 leaves per batched shard RPC,
   and 16,384 observed edges retained for one step. Sixteen vertices at the
   existing 1,000-neighbor cap fit this entry bound even before label filtering.
   Existing 16 KiB serialized-fragment and
@@ -117,3 +120,7 @@ flag, endpoint, partition and Gremlin query. `hierarchy-advance` takes endpoint,
 Each command sends one request and prints its native JSON output. There is no
 automatic polling, resubmission, or client-side graph execution. The existing
 `--timeout-ms` accepts 1..5000 for every command.
+
+Micro-page coalescing reduces client polling round trips only. Partition RPCs
+remain serial, and weighted frontier aggregation remains at the coordinator.
+It does not implement shard-local subtree aggregation or parallel RPC execution.

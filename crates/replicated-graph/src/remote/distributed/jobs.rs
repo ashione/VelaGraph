@@ -7,6 +7,9 @@ pub(super) const BATCH_ROWS: usize = 128;
 // One adjacency is bounded to 1,000 entries. Sixteen frontiers therefore
 // cannot exceed the 16,384-entry work-page bound, even before label filtering.
 const ADVANCE_ROWS: usize = 16;
+// Reuse bounded page buffers; never multiply the observation-page ceiling.
+const ADVANCE_PAGES: usize = 8;
+const ADVANCE_QUANTUM: Duration = Duration::from_millis(50);
 pub(super) const JOB_CEILING: Cost = Cost {
     bytes: 1024 * 1024 * 1024,
     work: 8_000_000,
@@ -482,6 +485,19 @@ impl Job {
             .collect()
     }
     async fn advance(&mut self, end: Instant) -> Result<(), QueryFailure> {
+        // A completed micro-page is the only safe yield boundary. The outer
+        // request retains one replay sequence and is removed before any await.
+        // Budget and lease checks remain cumulative across every micro-page.
+        let yield_at = (Instant::now() + ADVANCE_QUANTUM).min(end);
+        for _ in 0..ADVANCE_PAGES {
+            self.advance_page(end).await?;
+            if self.completed || Instant::now() >= yield_at {
+                break;
+            }
+        }
+        Ok(())
+    }
+    async fn advance_page(&mut self, end: Instant) -> Result<(), QueryFailure> {
         let end = end.min(self.expires);
         check(end)?;
         self.charge(256, 1)?;
@@ -1154,6 +1170,313 @@ mod tests {
         }
         assert!(validate_output(&malformed, &request).is_err());
     }
+    // Seventeen dead-end vertices require two pages without graph growth. Tests
+    // allow a quantum yield between them, so scheduler load cannot make them flaky.
+    async fn two_page_fixture() -> (Arc<Jobs>, Arc<StaticCatalog>, [u8; 16], TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let route = PartitionRoute {
+            partition: 0,
+            shard: 1,
+            epoch: 1,
+            identity: RemoteIdentity { group: 1, node: 1 },
+            endpoint: listener.local_addr().unwrap(),
+        };
+        let descriptor = Descriptor {
+            stamp: QueryStamp {
+                identity: route.identity,
+                shard: 1,
+                epoch: 1,
+                sequence: 1,
+            },
+            incarnation: [1; 16],
+            token: [2; 16],
+        };
+        let catalog = Arc::new(StaticCatalog {
+            partitions: vec![route.clone()],
+        });
+        let permit = JOB_SLOTS.acquire().await.unwrap();
+        let retained = RETAINED_SLOTS.acquire().await.unwrap();
+        let expires = Instant::now() + Duration::from_secs(5);
+        let job = Job {
+            catalog: catalog.clone(),
+            sessions: BTreeMap::from([(1, (route, descriptor))]),
+            expires,
+            cost: Cost::default(),
+            compact: None,
+            plan: parse("g.V(1).repeat(__.out()).times(1).count()").unwrap(),
+            frontier: (0..17)
+                .map(|id| (VertexId { partition: 0, id }, 1))
+                .collect(),
+            next: BTreeMap::new(),
+            seen: BTreeSet::new(),
+            depth: 0,
+            total: 0,
+            next_mass: 0,
+            initialized: true,
+            sequence: 0,
+            last: None,
+            completed: false,
+            _permit: Some(permit),
+            _retained: retained,
+        };
+        let jobs = Arc::new(Jobs::new());
+        let token = [93; 16];
+        jobs.values.lock().unwrap().insert(
+            token,
+            Entry {
+                expires,
+                job: Arc::new(tokio::sync::Mutex::new(job)),
+            },
+        );
+        (jobs, catalog, token, listener)
+    }
+
+    #[derive(Clone, Copy)]
+    enum PageReply {
+        Empty,
+        CorruptSecond,
+        ExhaustWork,
+        ExhaustBytes,
+    }
+
+    async fn mock_page_reply(
+        socket: &mut TcpStream,
+        request: super::super::super::Request,
+        mode: PageReply,
+        pages: &std::sync::atomic::AtomicUsize,
+    ) {
+        use std::sync::atomic::Ordering;
+        let reply = match request.operation {
+            Operation::QueryFragment(request) => {
+                let page = pages.fetch_add(1, Ordering::SeqCst);
+                let Fragment::HierarchyBatch { fragments, .. } = request.fragment else {
+                    panic!("expected hierarchy batch");
+                };
+                assert_eq!(fragments.len(), if page == 0 { 16 } else { 1 });
+                assert!(fragments.iter().all(|f| matches!(f, Fragment::Out(_))));
+                let cost = match mode {
+                    PageReply::ExhaustWork => Cost {
+                        bytes: 0,
+                        work: request.remaining.work,
+                    },
+                    PageReply::ExhaustBytes => Cost {
+                        bytes: request.remaining.bytes,
+                        work: 0,
+                    },
+                    _ => Cost::default(),
+                };
+                let value = if matches!(mode, PageReply::CorruptSecond) && page == 1 {
+                    FragmentValue::Bool(true)
+                } else {
+                    FragmentValue::HierarchyBatch(
+                        fragments
+                            .iter()
+                            .map(|_| FragmentValue::Edges(vec![]))
+                            .collect(),
+                    )
+                };
+                Reply::QueryFragment(Ok(FragmentOutput {
+                    descriptor: request.descriptor,
+                    cost,
+                    value,
+                }))
+            }
+            Operation::CloseQuery { .. } => Reply::CloseQuery,
+            _ => panic!("unexpected mock operation"),
+        };
+        write_frame(
+            socket,
+            &super::super::super::Response {
+                version: VERSION,
+                result: Ok(reply),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn spawn_page_server(
+        listener: TcpListener,
+        mode: PageReply,
+        pages: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_frame(&mut socket, Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                mock_page_reply(&mut socket, request, mode, &pages).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn later_page_failure_and_cumulative_limits_remove_job() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mode in [
+            PageReply::CorruptSecond,
+            PageReply::ExhaustWork,
+            PageReply::ExhaustBytes,
+        ] {
+            let (jobs, catalog, token, listener) = two_page_fixture().await;
+            let pages = Arc::new(AtomicUsize::new(0));
+            let server = spawn_page_server(listener, mode, pages.clone());
+            let end = Instant::now() + Duration::from_secs(5);
+            let mut failed = false;
+            for sequence in 0..2 {
+                match jobs
+                    .handle(catalog.clone(), Request::Advance { token, sequence }, end)
+                    .await
+                {
+                    Ok(Output::Progress {
+                        complete: false,
+                        count: None,
+                        ..
+                    }) => {}
+                    Err(error) => {
+                        assert_eq!(
+                            error,
+                            if matches!(mode, PageReply::CorruptSecond) {
+                                QueryFailure::IncompleteOrCorrupt
+                            } else {
+                                QueryFailure::ResourceExhausted
+                            }
+                        );
+                        failed = true;
+                        break;
+                    }
+                    other => panic!("unexpected page result: {other:?}"),
+                }
+            }
+            assert!(failed);
+            assert_eq!(
+                pages.load(Ordering::SeqCst),
+                if matches!(mode, PageReply::CorruptSecond) {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert!(!jobs.values.lock().unwrap().contains_key(&token));
+            assert!(matches!(
+                jobs.handle(catalog, Request::Advance { token, sequence: 0 }, end)
+                    .await,
+                Err(QueryFailure::Unavailable)
+            ));
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_pages_replay_without_additional_fragment_rpc() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (jobs, catalog, token, listener) = two_page_fixture().await;
+        let pages = Arc::new(AtomicUsize::new(0));
+        let server = spawn_page_server(listener, PageReply::Empty, pages.clone());
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut completed = false;
+        for sequence in 0..2 {
+            let output = jobs
+                .handle(catalog.clone(), Request::Advance { token, sequence }, end)
+                .await
+                .unwrap();
+            let before_replay = pages.load(Ordering::SeqCst);
+            let replay = jobs
+                .handle(catalog.clone(), Request::Advance { token, sequence }, end)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&output).unwrap(),
+                serde_json::to_value(&replay).unwrap()
+            );
+            assert_eq!(pages.load(Ordering::SeqCst), before_replay);
+            let Output::Progress {
+                next_sequence,
+                complete,
+                count,
+                ..
+            } = output
+            else {
+                panic!("expected progress")
+            };
+            assert_eq!(next_sequence, sequence + 1);
+            assert_eq!(count, complete.then_some(0));
+            if complete {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(pages.load(Ordering::SeqCst), 2);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_later_page_cannot_resume_completed_page_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (jobs, catalog, token, listener) = two_page_fixture().await;
+        let pages = Arc::new(AtomicUsize::new(0));
+        let (blocked, wait_blocked) = tokio::sync::oneshot::channel();
+        let observed = pages.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let end = Instant::now() + Duration::from_secs(5);
+            let request = read_frame(&mut socket, end).await.unwrap();
+            mock_page_reply(&mut socket, request, PageReply::Empty, &observed).await;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request: super::super::super::Request = read_frame(&mut socket, end).await.unwrap();
+            let Operation::QueryFragment(request) = request.operation else {
+                panic!("expected second page")
+            };
+            let Fragment::HierarchyBatch { fragments, .. } = request.fragment else {
+                panic!("expected batch")
+            };
+            assert_eq!(fragments.len(), 1);
+            observed.fetch_add(1, Ordering::SeqCst);
+            blocked.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let worker = jobs.clone();
+        let worker_catalog = catalog.clone();
+        let task = tokio::spawn(async move {
+            let end = Instant::now() + Duration::from_secs(5);
+            for sequence in 0..2 {
+                worker
+                    .handle(
+                        worker_catalog.clone(),
+                        Request::Advance { token, sequence },
+                        end,
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait_blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pages.load(Ordering::SeqCst), 2);
+        assert!(!jobs.values.lock().unwrap().contains_key(&token));
+        task.abort();
+        let _ = task.await;
+        assert!(matches!(
+            jobs.handle(
+                catalog,
+                Request::Advance { token, sequence: 0 },
+                Instant::now() + Duration::from_secs(5)
+            )
+            .await,
+            Err(QueryFailure::Unavailable)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn cancelled_advance_cannot_resume_a_consumed_frontier() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
