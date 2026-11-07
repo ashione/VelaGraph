@@ -22,6 +22,7 @@ mod state_machine;
 pub mod tcp;
 pub mod transaction_decisions;
 mod types;
+pub mod versioned_reads;
 
 pub use d1::{
     D1Capacity, D1Command, D1Error, D1ManagedMode, D1ManagedStatus, D1Result, D1WriteRequest,

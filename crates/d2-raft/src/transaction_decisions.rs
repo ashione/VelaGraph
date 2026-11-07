@@ -116,6 +116,14 @@ impl Journal {
         Ok(journal)
     }
 
+    pub fn transaction_count(&self) -> usize {
+        self.transactions.len()
+    }
+    pub fn transaction_at(&self, ordinal: u64) -> Option<&Transaction> {
+        let index = usize::try_from(ordinal.checked_sub(1)?).ok()?;
+        self.transactions.get(index)
+    }
+
     pub fn authority(&self) -> [u8; 16] {
         self.authority
     }

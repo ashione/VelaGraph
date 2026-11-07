@@ -527,4 +527,112 @@ mod tests {
         node.raft.shutdown().await.unwrap();
         coordinator.raft.shutdown().await.unwrap();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn versioned_relay_refuses_lagging_shard_instead_of_returning_partial_version() {
+        use crate::versioned_reads::{self, ReadLimit, Target};
+        let cluster = Cluster::new();
+        let authority = Authority {
+            shard: 9,
+            mode: [9; 16],
+        };
+        let coordinator = start(&cluster, 9, [9; 16], &authority, true).await;
+        let first = start(&cluster, 7, [7; 16], &authority, false).await;
+        let second = start(&cluster, 8, [8; 16], &authority, false).await;
+        for (node, shard) in [(&first, 7), (&second, 8)] {
+            submit(
+                node,
+                D1Command::EnableVersionedReads {
+                    shard,
+                    epoch: 1,
+                    mode_id: [shard as u8; 16],
+                    journal: crate::transaction_decisions::Journal::new([9; 16]).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        submit(
+            &coordinator,
+            D1Command::Coordinator {
+                shard: 9,
+                epoch: 1,
+                mode_id: [9; 16],
+                command: Command::Begin {
+                    id: [6; 16],
+                    participants: vec![descriptor(7), descriptor(8)],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        for (node, shard) in [(&first, 7), (&second, 8)] {
+            prepare(
+                &coordinator,
+                node,
+                authority.clone(),
+                1,
+                descriptor(shard),
+                request(shard),
+            )
+            .await
+            .unwrap();
+        }
+        submit(
+            &coordinator,
+            D1Command::Coordinator {
+                shard: 9,
+                epoch: 1,
+                mode_id: [9; 16],
+                command: Command::Decide {
+                    id: [6; 16],
+                    decision: Decision::Commit,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let target = |shard| Target {
+            shard,
+            epoch: 1,
+            mode: [shard as u8; 16],
+        };
+        let limit = || ReadLimit {
+            rows: 10,
+            bytes: 100,
+            operations: 100,
+        };
+        versioned_reads::advance(&coordinator, &first, authority.clone(), 1, target(7), 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            versioned_reads::read(&second, target(8), 1, limit()).await,
+            Err(Error::Application(D1Error::VisibilityNotApplied))
+        ));
+        assert_eq!(
+            versioned_reads::read(&first, target(7), 0, limit())
+                .await
+                .unwrap()
+                .entries,
+            versioned_reads::read(&second, target(8), 0, limit())
+                .await
+                .unwrap()
+                .entries
+        );
+        versioned_reads::advance(&coordinator, &second, authority, 1, target(8), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            versioned_reads::read(&first, target(7), 1, limit())
+                .await
+                .unwrap()
+                .entries,
+            versioned_reads::read(&second, target(8), 1, limit())
+                .await
+                .unwrap()
+                .entries
+        );
+        for node in [&first, &second, &coordinator] {
+            node.raft.shutdown().await.unwrap();
+        }
+    }
 }

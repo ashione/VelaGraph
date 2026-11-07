@@ -34,7 +34,10 @@ transaction decisions on a dedicated empty shard. Opt-in
 [participant intents](docs/PARTICIPANT_WRITES.md) now retain prepares and apply
 trusted coordinator decisions atomically per shard through an in-process relay.
 They do not yet provide global read visibility or wire existing graph writers
-through distributed transactions.
+through distributed transactions. Explicit [versioned participant reads](docs/VERSIONED_PARTICIPANT_READS.md)
+now consume contiguous applied decision prefixes and replay retained history for
+one requested version; a lagging shard refuses that version. Global query admission
+and certification of a common initial baseline remain unfinished.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.

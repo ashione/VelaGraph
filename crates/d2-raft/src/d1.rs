@@ -52,6 +52,20 @@ pub enum D1Command {
         new_bytes: usize,
     },
     Write(D1WriteRequest),
+    EnableVersionedReads {
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        journal: crate::transaction_decisions::Journal,
+    },
+    AdvanceVisibility {
+        authority: crate::participant_writes::Authority,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        ordinal: u64,
+        journal: crate::transaction_decisions::Journal,
+    },
     EnableParticipant {
         shard: u64,
         epoch: u64,
@@ -103,6 +117,9 @@ pub enum D1WriteStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum D1Result {
+    Visibility {
+        applied_prefix: u64,
+    },
     Participant(crate::participant_writes::Status),
     Coordinator {
         resolved_prefix: u64,
@@ -156,6 +173,13 @@ pub enum D1Error {
     InvalidManagedMode,
     ManagedModeConflict,
     UnverifiedWriteHistory,
+    VisibilityNotEnabled,
+    VisibilityRequired,
+    VisibilityHistory,
+    VisibilityGap,
+    VisibilityUnresolved,
+    VisibilityNotApplied,
+    VisibilityReadLimit,
     ParticipantOnly,
     ParticipantNotEnabled,
     ParticipantAuthority,
@@ -205,6 +229,8 @@ pub(crate) struct D1State {
     pub(crate) coordinator: Option<crate::transaction_decisions::Journal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) participant: Option<crate::participant_writes::State>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) visibility: Option<crate::versioned_reads::State>,
     pub shard: u64,
     pub epoch: u64,
     pub sequence: u64,
@@ -219,6 +245,7 @@ impl D1State {
             managed: None,
             coordinator: None,
             participant: None,
+            visibility: None,
             shard,
             epoch,
             sequence: 0,
@@ -234,13 +261,43 @@ impl D1State {
                     self.dedup_bytes_limit,
                     self.managed.is_some(),
                     self.coordinator.is_some(),
-                    self.participant.is_some()
+                    self.participant.is_some(),
+                    self.visibility.is_some()
                 ),
-                (1, None, false, false, false)
-                    | (2, Some(EXTENDED_DEDUP_BYTES), false, false, false)
-                    | (3, None | Some(EXTENDED_DEDUP_BYTES), true, false, false)
-                    | (4, None | Some(EXTENDED_DEDUP_BYTES), true, true, false)
-                    | (5, None | Some(EXTENDED_DEDUP_BYTES), true, false, true)
+                (1, None, false, false, false, false)
+                    | (2, Some(EXTENDED_DEDUP_BYTES), false, false, false, false)
+                    | (
+                        3,
+                        None | Some(EXTENDED_DEDUP_BYTES),
+                        true,
+                        false,
+                        false,
+                        false
+                    )
+                    | (
+                        4,
+                        None | Some(EXTENDED_DEDUP_BYTES),
+                        true,
+                        true,
+                        false,
+                        false
+                    )
+                    | (
+                        5,
+                        None | Some(EXTENDED_DEDUP_BYTES),
+                        true,
+                        false,
+                        true,
+                        false
+                    )
+                    | (
+                        6,
+                        None | Some(EXTENDED_DEDUP_BYTES),
+                        true,
+                        false,
+                        true,
+                        true
+                    )
             ),
             "unsupported D1 state version/capacity"
         );
@@ -268,6 +325,9 @@ impl D1State {
         }
         if let Some(participant) = &self.participant {
             participant.validate(self)?;
+        }
+        if let Some(visibility) = &self.visibility {
+            visibility.validate(self)?;
         }
         let mut ids = std::collections::BTreeSet::new();
         let mut previous = 0;
@@ -390,7 +450,9 @@ impl D1State {
             return Err(D1Error::InvalidDedupCapacity);
         }
         if new_bytes == EXTENDED_DEDUP_BYTES {
-            self.version = if self.participant.is_some() {
+            self.version = if self.visibility.is_some() {
+                6
+            } else if self.participant.is_some() {
                 5
             } else if self.coordinator.is_some() {
                 4
@@ -435,6 +497,7 @@ impl D1State {
             managed: self.managed.clone(),
             coordinator: self.coordinator.clone(),
             participant: self.participant.clone(),
+            visibility: self.visibility.clone(),
             shard: self.shard,
             epoch: self.epoch,
             sequence: self.sequence,
