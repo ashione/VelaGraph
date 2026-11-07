@@ -53,6 +53,9 @@ pub const MAX_GREMLIN_ACCOUNTED_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum adjacency steps in one query: `out`/`in`/`both` and, for
 /// observed queries, `outE`/`inE`/`bothE` combined.
 pub const MAX_GREMLIN_EDGE_STEPS: usize = 3;
+/// Maximum iterations of one bounded server-coordinated observed `repeat`.
+/// Ordinary adjacency steps outside the repeat retain their separate three-step cap.
+pub const MAX_OBSERVED_GREMLIN_REPEAT_TIMES: usize = 32;
 /// Maximum rows materialized before an explicit `limit` is reached.
 pub const MAX_GREMLIN_ROWS: usize = 10_000;
 /// Default result cap when a query has no explicit `limit`.
@@ -76,6 +79,7 @@ const RULE_SPAWN: usize = 14;
 const RULE_SPAWN_E: usize = 17;
 const RULE_SPAWN_V: usize = 18;
 const RULE_CHAIN: usize = 26;
+const RULE_NESTED_TRAVERSAL: usize = 27;
 const RULE_METHOD: usize = 29;
 
 const RULE_METHOD_BOTHE: usize = 45;
@@ -87,6 +91,7 @@ const RULE_METHOD_OUTV: usize = 119;
 const RULE_METHOD_BOTH: usize = 44;
 const RULE_METHOD_COUNT: usize = 59;
 const RULE_METHOD_DEDUP: usize = 63;
+const RULE_METHOD_EMIT: usize = 70;
 const RULE_METHOD_HAS: usize = 79;
 const RULE_METHOD_HAS_LABEL: usize = 82;
 const RULE_METHOD_ID: usize = 85;
@@ -95,6 +100,9 @@ const RULE_METHOD_LABEL: usize = 95;
 const RULE_METHOD_LIMIT: usize = 97;
 const RULE_METHOD_OUT: usize = 117;
 const RULE_METHOD_PATH: usize = 121;
+const RULE_METHOD_REPEAT: usize = 131;
+const RULE_METHOD_TIMES: usize = 148;
+const RULE_INTEGER_LITERAL: usize = 292;
 const RULE_METHOD_VALUES: usize = 161;
 
 /// Where a traversal starts.
@@ -137,6 +145,14 @@ pub enum ObservedGremlinStep {
     Existing(GremlinStep),
     /// Vertex identity deduplication, currently executed only by the server coordinator.
     Dedup,
+    /// One incoming/outgoing vertex adjacency repeated a bounded number of times.
+    /// `emit` is post-body only. Executed only by the server coordinator.
+    Repeat {
+        incoming: bool,
+        label: Option<String>,
+        times: usize,
+        emit: bool,
+    },
     OutE(Option<String>),
     InE(Option<String>),
     BothE(Option<String>),
@@ -155,9 +171,10 @@ pub struct ObservedGremlinQuery {
 }
 
 impl ObservedGremlinQuery {
-    /// Parse the v0 subset plus edge-producing and edge-endpoint steps.
-    /// Adjacency steps share a maximum of three; endpoint steps remain bounded
-    /// by the structural admission cap. `path` and `count` must be terminal.
+    /// Parse the v0 subset plus observed edge/endpoint, dedup and bounded repeat steps.
+    /// Ordinary adjacency steps share a maximum of three. One repeat has a separate
+    /// 32-iteration bound; server execution also bounds the combined depth. All
+    /// steps share structural admission. `path` and `count` must be terminal.
     pub fn parse(input: &str) -> Result<Self> {
         parse_validated_query(input, true)
     }
@@ -288,14 +305,14 @@ fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQ
             collect_chain(child, &mut method_nodes)?;
         }
     }
-    let mut steps = Vec::with_capacity(method_nodes.len());
-    for node in method_nodes {
-        steps.push(if observed {
-            parse_observed_step(node)?
-        } else {
-            ObservedGremlinStep::Existing(parse_step(node)?)
-        });
-    }
+    let steps = if observed {
+        parse_observed_steps(&method_nodes)?
+    } else {
+        method_nodes
+            .into_iter()
+            .map(|node| parse_step(node).map(ObservedGremlinStep::Existing))
+            .collect::<Result<Vec<_>>>()?
+    };
 
     let edge_steps = steps
         .iter()
@@ -905,6 +922,163 @@ fn parse_start_ids(
     } else {
         GremlinStart::Edges(ids)
     })
+}
+
+// Modulators belong to the immediately preceding repeat. Coalesce only the
+// documented post-body forms, using official method/nested-traversal identities.
+// Never search through nested methods or rewrite the original query text.
+fn parse_observed_steps(nodes: &[&ParseTree]) -> Result<Vec<ObservedGremlinStep>> {
+    let mut steps = Vec::with_capacity(nodes.len());
+    let mut index = 0;
+    let mut repeated = false;
+    while index < nodes.len() {
+        let specific = specific_method(nodes[index])?;
+        if rule_index(specific) != Some(RULE_METHOD_REPEAT) {
+            steps.push(parse_observed_step(nodes[index])?);
+            index += 1;
+            continue;
+        }
+        if repeated {
+            return Err(Error::UnsupportedGremlinStep(
+                "multiple repeat steps are not supported".into(),
+            ));
+        }
+        repeated = true;
+        let (incoming, label) = parse_repeat_body(specific)?;
+        index += 1;
+        let mut emit = false;
+        if let Some(node) = nodes.get(index) {
+            let specific = specific_method(node)?;
+            if rule_index(specific) == Some(RULE_METHOD_EMIT) {
+                validate_repeat_emit(specific)?;
+                emit = true;
+                index += 1;
+            }
+        }
+        let times = nodes
+            .get(index)
+            .map(|node| specific_method(node))
+            .transpose()?
+            .filter(|node| rule_index(node) == Some(RULE_METHOD_TIMES))
+            .ok_or_else(|| {
+                Error::UnsupportedGremlinArgument(
+                    "repeat requires an adjacent bounded times(n) modulator".into(),
+                )
+            })?;
+        let times = parse_repeat_times(times)?;
+        index += 1;
+        // times(n).emit() is the same post-body form. A second emit remains an
+        // unsupported standalone method rather than silently replacing the first.
+        if !emit {
+            if let Some(node) = nodes.get(index) {
+                let specific = specific_method(node)?;
+                if rule_index(specific) == Some(RULE_METHOD_EMIT) {
+                    validate_repeat_emit(specific)?;
+                    emit = true;
+                    index += 1;
+                }
+            }
+        }
+        steps.push(ObservedGremlinStep::Repeat {
+            incoming,
+            label,
+            times,
+            emit,
+        });
+    }
+    Ok(steps)
+}
+
+fn specific_method(node: &ParseTree) -> Result<&ParseTree> {
+    node.children()
+        .iter()
+        .find(|child| rule_index(child).is_some_and(|index| index >= 30))
+        .ok_or_else(|| Error::UnsupportedGremlinStep(node.text()))
+}
+
+fn parse_repeat_body(node: &ParseTree) -> Result<(bool, Option<String>)> {
+    let arguments: Vec<_> = node
+        .children()
+        .iter()
+        .filter(|child| rule_index(child).is_some())
+        .collect();
+    let [body] = arguments.as_slice() else {
+        return Err(Error::UnsupportedGremlinArgument(
+            "repeat accepts exactly one unnamed traversal".into(),
+        ));
+    };
+    if rule_index(body) != Some(RULE_NESTED_TRAVERSAL) {
+        return Err(Error::UnsupportedGremlinArgument(
+            "repeat requires an anonymous traversal".into(),
+        ));
+    }
+    let mut body_steps = Vec::new();
+    for child in body.children() {
+        match rule_index(child) {
+            Some(RULE_CHAIN) => collect_chain(child, &mut body_steps)?,
+            // The official nestedTraversal rule allows an optional `__.` prefix.
+            None => {}
+            _ => {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "repeat requires a single in/out vertex adjacency".into(),
+                ))
+            }
+        }
+    }
+    let [step] = body_steps.as_slice() else {
+        return Err(Error::UnsupportedGremlinArgument(
+            "repeat requires a single in/out vertex adjacency".into(),
+        ));
+    };
+    match rule_index(specific_method(step)?) {
+        Some(RULE_METHOD_OUT | RULE_METHOD_IN) => match parse_step(step)? {
+            GremlinStep::Out(label) => Ok((false, label)),
+            GremlinStep::In(label) => Ok((true, label)),
+            _ => unreachable!("official adjacency rule checked above"),
+        },
+        _ => Err(Error::UnsupportedGremlinStep(
+            "repeat body supports only a single in/out vertex adjacency".into(),
+        )),
+    }
+}
+
+fn validate_repeat_emit(node: &ParseTree) -> Result<()> {
+    if node
+        .children()
+        .iter()
+        .any(|child| rule_index(child).is_some())
+    {
+        return Err(Error::UnsupportedGremlinArgument(
+            "repeat supports only unconditional emit()".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_repeat_times(node: &ParseTree) -> Result<usize> {
+    let literal = node
+        .children()
+        .iter()
+        .find(|child| rule_index(child) == Some(RULE_INTEGER_LITERAL))
+        .ok_or_else(|| {
+            Error::UnsupportedGremlinArgument("times requires an integer literal".into())
+        })?;
+    let Value::Integer(times) = parse_literal(&literal.text())? else {
+        return Err(Error::UnsupportedGremlinArgument(
+            "times requires an integer literal".into(),
+        ));
+    };
+    if times <= 0 {
+        return Err(Error::UnsupportedGremlinArgument(
+            "times requires a positive integer; times(0) is not supported".into(),
+        ));
+    }
+    if times > MAX_OBSERVED_GREMLIN_REPEAT_TIMES as i64 {
+        return Err(Error::TraversalLimitExceeded(format!(
+            "repeat has {times} iterations; the limit is {MAX_OBSERVED_GREMLIN_REPEAT_TIMES}"
+        )));
+    }
+    Ok(times as usize)
 }
 
 fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {

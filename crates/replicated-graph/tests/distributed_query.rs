@@ -208,10 +208,10 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
     let b = Shared(Arc::new(LocalStorageNode::open(b_dir.path(), 130)?));
     let source = AppendOnlyStore::new(a.clone(), 120, 0);
     let target = AppendOnlyStore::new(b.clone(), 130, 1);
-    for id in [1, 7, 8, 9, 10, 40, 41, 42, 43, 44, 45] {
+    for id in [1, 7, 8, 9, 10, 11, 12, 40, 41, 42, 43, 44, 45] {
         source.prepare_vertex(&Vertex::new(id))?.submit(&a)?;
     }
-    for id in [1, 2, 3, 8, 10, 40, 41, 42, 43, 44, 45] {
+    for id in [1, 2, 3, 8, 10, 12, 40, 41, 42, 43, 44, 45] {
         let mut v = Vertex::new(id);
         v.labels.push("person".into());
         v.properties
@@ -241,6 +241,37 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
         };
         source.prepare_source(&edge)?.submit(&a)?;
         target.prepare_reverse(&edge)?.submit(&b)?;
+    }
+    // Isolated self-loop and cross-shard parallel-edge cycle for native repeat.
+    for (id, from, to) in [
+        (7000, (0, 11), (0, 11)),
+        (7001, (0, 12), (1, 12)),
+        (7002, (0, 12), (1, 12)),
+        (7003, (1, 12), (0, 12)),
+    ] {
+        let edge = CrossEdge {
+            id,
+            from: VertexRef {
+                partition: from.0,
+                id: from.1,
+            },
+            to: VertexRef {
+                partition: to.0,
+                id: to.1,
+            },
+            label: "hierarchy".into(),
+            properties: BTreeMap::new(),
+        };
+        if from.0 == 0 {
+            source.prepare_source(&edge)?.submit(&a)?;
+        } else {
+            target.prepare_source(&edge)?.submit(&b)?;
+        }
+        if to.0 == 0 {
+            source.prepare_reverse(&edge)?.submit(&a)?;
+        } else {
+            target.prepare_reverse(&edge)?.submit(&b)?;
+        }
     }
     // Return to the original shard on hop two, including overlapping edge IDs.
     // Hop three revisits the same shard/session and preserves parallel-edge bags.
@@ -731,6 +762,108 @@ async fn scenario() -> anyhow::Result<()> {
         rows(endpoint, "g.V(1).out().out().path()").await?,
         two_hop_paths
     );
+    assert_eq!(
+        rows(endpoint, "g.V(1).repeat(__.out()).times(2).path()").await?,
+        two_hop_paths
+    );
+    let repeat_open_a = ap.opened.load(Ordering::SeqCst);
+    let repeat_open_b = bp.opened.load(Ordering::SeqCst);
+    assert_eq!(
+        rows(
+            endpoint,
+            "g.V(11).repeat(__.out('hierarchy')).times(32).count()"
+        )
+        .await?,
+        vec![QueryRow::Count(1)]
+    );
+    assert_eq!(ap.opened.load(Ordering::SeqCst) - repeat_open_a, 1);
+    assert_eq!(bp.opened.load(Ordering::SeqCst) - repeat_open_b, 1);
+    let loop_path = rows(
+        endpoint,
+        "g.V(11).repeat(__.out('hierarchy')).times(32).path()",
+    )
+    .await?;
+    let QueryRow::Path(loop_path) = &loop_path[0] else {
+        panic!()
+    };
+    assert_eq!(loop_path.len(), 65);
+    assert!(loop_path.iter().step_by(2).all(|v| *v == vertex(0, 11)));
+    assert_eq!(
+        rows(
+            endpoint,
+            "g.V(11,11).repeat(__.out('hierarchy')).emit().times(3).count()"
+        )
+        .await?,
+        vec![QueryRow::Count(6)]
+    );
+    assert_eq!(
+        rows(
+            endpoint,
+            "g.V(11).repeat(__.out('hierarchy')).emit().times(32).dedup().count()"
+        )
+        .await?,
+        vec![QueryRow::Count(1)]
+    );
+    assert_eq!(
+        rows(
+            endpoint,
+            "g.V(12).repeat(__.out('hierarchy')).emit().times(6).count()"
+        )
+        .await?,
+        vec![QueryRow::Count(28)]
+    );
+    assert_eq!(
+        rows(
+            endpoint,
+            "g.V(12).repeat(__.in('hierarchy')).emit().times(6).dedup().count()"
+        )
+        .await?,
+        vec![QueryRow::Count(2)]
+    );
+    assert_eq!(
+        rows(
+            endpoint,
+            "g.V(999).repeat(__.in()).emit().times(32).count()"
+        )
+        .await?,
+        vec![QueryRow::Count(0)]
+    );
+    for text in [
+        "g.V(12).repeat(__.out('hierarchy')).emit().times(32).limit(1).count()",
+        "g.V(12).repeat(__.out('hierarchy')).times(32).count()",
+    ] {
+        assert_eq!(
+            distributed::query(
+                endpoint,
+                DistributedRequest {
+                    start_partition: 0,
+                    text: text.into(),
+                    timeout_millis: 5000
+                },
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::ResourceExhausted)
+        );
+    }
+    for text in [
+        "g.V(8).repeat(__.out()).times(2).count()",
+        "g.V(9).repeat(__.out('filtered-out')).emit().times(2).limit(1).count()",
+    ] {
+        assert_eq!(
+            distributed::query(
+                endpoint,
+                DistributedRequest {
+                    start_partition: 0,
+                    text: text.into(),
+                    timeout_millis: 5000
+                },
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::IncompleteOrCorrupt)
+        );
+    }
     let opened_a = ap.opened.load(Ordering::SeqCst);
     let opened_b = bp.opened.load(Ordering::SeqCst);
     assert_eq!(

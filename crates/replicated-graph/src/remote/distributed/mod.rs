@@ -7,6 +7,7 @@ use rocksdb_sql_table::{
     Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
+mod hierarchy;
 mod scan;
 mod sessions;
 pub(super) use sessions::Sessions;
@@ -290,6 +291,7 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     if !matches!(query.start(), GremlinStart::Vertices(ids) if !ids.is_empty()) {
         return Err(QueryFailure::Unsupported);
     }
+    hierarchy::validate_depth(&query)?;
     let mut scalar = false;
     for (index, step) in query.steps().iter().enumerate() {
         if scalar
@@ -305,7 +307,8 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
             // steps. All hops share this execution's sessions, deadline and cost.
             Step::Existing(GremlinStep::Out(_))
             | Step::Existing(GremlinStep::In(_))
-            | Step::Dedup => {}
+            | Step::Dedup
+            | Step::Repeat { .. } => {}
             Step::Existing(GremlinStep::Has { .. })
             | Step::Existing(GremlinStep::HasLabel(_))
             | Step::Existing(GremlinStep::Limit(_)) => {}
@@ -468,6 +471,63 @@ impl Execution<'_> {
         Ok(edges)
     }
 
+    async fn expand(
+        &mut self,
+        rows: Vec<Traverser>,
+        incoming: bool,
+        label: Option<&str>,
+    ) -> Result<Vec<Traverser>, QueryFailure> {
+        let mut next = Vec::new();
+        for row in rows {
+            let edges = if incoming {
+                self.incoming(row.vertex, label).await?
+            } else {
+                let FragmentValue::Edges(edges) = self.fragment(Fragment::Out(row.vertex)).await?
+                else {
+                    return Err(QueryFailure::IncompleteOrCorrupt);
+                };
+                edges
+            };
+            if edges.len() > 1000
+                || edges
+                    .windows(2)
+                    .any(|w| (w[0].id, w[0].from.partition) >= (w[1].id, w[1].from.partition))
+            {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            }
+            for edge in edges {
+                if (if incoming { edge.to } else { edge.from }) != row.vertex {
+                    return Err(QueryFailure::IncompleteOrCorrupt);
+                }
+                // Incoming validation already checked both sides before
+                // filtering. Outgoing expansion still needs target verification.
+                if !incoming && !self.boolean(Fragment::VerifyReverse(edge.clone())).await? {
+                    return Err(QueryFailure::IncompleteOrCorrupt);
+                }
+                if label.is_some_and(|l| l != edge.label) {
+                    continue;
+                }
+                self.cost.charge(row.path.len() * 32, 0, self.ceiling)?;
+                let mut path = row.path.clone();
+                path.push(QualifiedElement::Edge {
+                    partition: edge.from.partition,
+                    id: edge.id,
+                });
+                let vertex = if incoming { edge.from } else { edge.to };
+                path.push(vertex.element());
+                push(
+                    &mut next,
+                    Traverser {
+                        vertex,
+                        path,
+                        value: None,
+                    },
+                    &mut self.cost,
+                )?;
+            }
+        }
+        Ok(next)
+    }
     async fn run(
         &mut self,
         request: &DistributedRequest,
@@ -511,60 +571,23 @@ impl Execution<'_> {
                 }
                 Step::Existing(GremlinStep::Out(label))
                 | Step::Existing(GremlinStep::In(label)) => {
-                    let incoming = matches!(step, Step::Existing(GremlinStep::In(_)));
-                    let mut next = Vec::new();
-                    for row in rows {
-                        let edges = if incoming {
-                            self.incoming(row.vertex, label.as_deref()).await?
-                        } else {
-                            let FragmentValue::Edges(edges) =
-                                self.fragment(Fragment::Out(row.vertex)).await?
-                            else {
-                                return Err(QueryFailure::IncompleteOrCorrupt);
-                            };
-                            edges
-                        };
-                        if edges.len() > 1000
-                            || edges.windows(2).any(|w| {
-                                (w[0].id, w[0].from.partition) >= (w[1].id, w[1].from.partition)
-                            })
-                        {
-                            return Err(QueryFailure::IncompleteOrCorrupt);
-                        }
-                        for edge in edges {
-                            if (if incoming { edge.to } else { edge.from }) != row.vertex {
-                                return Err(QueryFailure::IncompleteOrCorrupt);
-                            }
-                            // Incoming validation already checked both sides before
-                            // filtering. Outgoing expansion still needs target verification.
-                            if !incoming
-                                && !self.boolean(Fragment::VerifyReverse(edge.clone())).await?
-                            {
-                                return Err(QueryFailure::IncompleteOrCorrupt);
-                            }
-                            if label.as_ref().is_some_and(|l| l != &edge.label) {
-                                continue;
-                            }
-                            self.cost.charge(row.path.len() * 32, 0, self.ceiling)?;
-                            let mut path = row.path.clone();
-                            path.push(QualifiedElement::Edge {
-                                partition: edge.from.partition,
-                                id: edge.id,
-                            });
-                            let vertex = if incoming { edge.from } else { edge.to };
-                            path.push(vertex.element());
-                            push(
-                                &mut next,
-                                Traverser {
-                                    vertex,
-                                    path,
-                                    value: None,
-                                },
-                                &mut self.cost,
-                            )?;
-                        }
-                    }
-                    rows = next;
+                    rows = self
+                        .expand(
+                            rows,
+                            matches!(step, Step::Existing(GremlinStep::In(_))),
+                            label.as_deref(),
+                        )
+                        .await?;
+                }
+                Step::Repeat {
+                    incoming,
+                    label,
+                    times,
+                    emit,
+                } => {
+                    rows = self
+                        .repeat(rows, *incoming, label.as_deref(), *times, *emit)
+                        .await?;
                 }
                 Step::Existing(GremlinStep::Has { .. })
                 | Step::Existing(GremlinStep::HasLabel(_)) => {
@@ -927,16 +950,8 @@ fn validate_output(
         .steps()
         .iter()
         .any(|s| matches!(s, Step::Existing(GremlinStep::Values(_))));
-    let directions: Vec<_> = query
-        .steps()
-        .iter()
-        .filter_map(|s| match s {
-            Step::Existing(GremlinStep::Out(_)) => Some(false),
-            Step::Existing(GremlinStep::In(_)) => Some(true),
-            _ => None,
-        })
-        .collect();
-    let hops = directions.len();
+    let directions = hierarchy::path_directions(&query);
+    let hops = directions.iter().map(Vec::len).max().unwrap_or(0);
     if scan::is_global(&query) && !count {
         let keys = output
             .rows
@@ -975,13 +990,15 @@ fn validate_output(
         let valid = match row {
             QueryRow::Element(v) => !path && !scalar && valid_vertex(v),
             QueryRow::Path(p) if path => {
-                p.len() == 1 + 2 * hops
-                    && matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
-                    && p.windows(3).step_by(2).zip(&directions).all(|(hop, incoming)| {
-                        matches!(hop,
-                            [QualifiedElement::Vertex { partition: source, .. },
-                             QualifiedElement::Edge { partition: owner, .. },
-                             QualifiedElement::Vertex { partition: target, .. }] if owner == if *incoming { target } else { source })
+                matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
+                    && directions.iter().any(|directions| {
+                        p.len() == 1 + 2 * directions.len()
+                        && p.windows(3).step_by(2).zip(directions).all(|(hop, incoming)| {
+                            matches!(hop,
+                                [QualifiedElement::Vertex { partition: source, .. },
+                                 QualifiedElement::Edge { partition: owner, .. },
+                                 QualifiedElement::Vertex { partition: target, .. }] if owner == if *incoming { target } else { source })
+                        })
                     })
             }
             QueryRow::Value {

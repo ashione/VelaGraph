@@ -18,7 +18,9 @@ The client sends `DistributedRequest { start_partition, text, timeout_millis }`.
 The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` / `in()`
 steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limit`, vertex-identity `dedup()`, terminal `path` or
 `count`, and `values(key)` followed only by `limit`/`count`. Unsupported start and
-step forms fail explicitly through the official parser. A separate [global vertex scan](SERVER_GLOBAL_SCAN.md) supports `g.V()` with
+step forms fail explicitly through the official parser. A separately specified
+[native bounded hierarchy repeat](SERVER_HIERARCHY.md) adds one repeated
+single-adjacency body, mandatory depth 1..32, and optional post-emit. A separate [global vertex scan](SERVER_GLOBAL_SCAN.md) supports `g.V()` with
 filters/limit/count and its own explicit bounded budget. No global E scan,
 `both()`, mutation, alternate query dialect or textual
 query rewriting is provided by this slice.
@@ -116,8 +118,10 @@ Parallel edges and duplicate input IDs retain multiplicity unless an explicit
 retain qualified vertex and edge identities at every hop, so equal local IDs in
 different partitions remain distinct. Cycles and revisiting a shard are allowed:
 each hop uses the original retained session, never a newly acquired snapshot.
-The official parser rejects more than three combined incoming/outgoing hops before any session is
-opened, even for a missing start or a preceding `limit(1)`.
+The official parser rejects more than three ordinary unrolled incoming/outgoing
+hops before any session is opened, even for a missing start or a preceding
+`limit(1)`. The explicit bounded-repeat extension has its separately documented
+maximum expanded depth of 32; it does not enlarge traversal resource budgets.
 
 Limits execute in their original positions. In particular,
 `out().limit(2).has('active',true)` tests only the first two expanded rows,

@@ -106,6 +106,11 @@ fn validate_steps(query: &rocksdb_sql_table::ObservedGremlinQuery) -> Experiment
             ));
         }
         match step {
+            Step::Repeat { .. } => {
+                return Err(ExperimentalRouteError::Unsupported(
+                    "repeat is only supported by the server coordinator",
+                ));
+            }
             Step::OutE(_) | Step::InE(_) | Step::BothE(_) => {
                 if edge_stream {
                     return Err(ExperimentalRouteError::Unsupported(
@@ -486,5 +491,30 @@ impl ExperimentalReadSession {
             metadata_sequence: self.metadata_sequence,
             snapshots: self.snapshots.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_observed_executor_rejects_server_only_repeat_before_reads() {
+        for text in [
+            "g.V(1).repeat(__.out()).times(2)",
+            "g.V().repeat(__.in()).emit().times(32)",
+            "g.E(1).repeat(__.out()).times(1)",
+        ] {
+            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            assert!(matches!(
+                validate_steps(&query),
+                Err(ExperimentalRouteError::Unsupported(_))
+            ));
+        }
+        let scalar = rocksdb_sql_table::ObservedGremlinQuery::parse(
+            "g.V(1).values('x').repeat(__.out()).times(2)",
+        )
+        .unwrap();
+        assert!(validate_steps(&scalar).is_err());
     }
 }

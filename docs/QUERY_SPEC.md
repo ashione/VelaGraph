@@ -361,3 +361,40 @@ stable order is (partition ID, local ID), distinct from the older client global
 scan order. It uses data-local pages and fixed per-shard sessions, explicit
 scan budgets and Unverified results, never a global atomic snapshot claim.
 Global adjacency/projections/E/path/dedup remain unsupported in this slice.
+
+### Experimental bounded repeat AST
+
+The additive observed parser recognizes one standard bounded
+`repeat(body).times(n)`, `repeat(body).emit().times(n)`, or
+`repeat(body).times(n).emit()` group and represents it as one
+`ObservedGremlinStep::Repeat { incoming, label, times, emit }`. The body must be
+exactly one `out()`/`in()` vertex adjacency with zero or one validated label.
+The official anonymous-traversal forms `__.out('reports')` and `out('reports')`
+(and incoming equivalents) are accepted without rewriting query text.
+
+- `times` requires an integer literal in `1..=32`, using the existing supported
+  integer literal mapping. Zero and negative values are
+  `UnsupportedGremlinArgument`; more than 32 is `TraversalLimitExceeded`.
+  Zero is explicitly unsupported, not an interpretation of `times(0)` semantics.
+- `emit()` is unconditional and post-body only. The two supported post-body
+  modulator orders have the same AST; neither emits the original start rows.
+- Pre-emit/pre-times, conditional emit, until, nested or multiple repeats,
+  named repeats, multi-step bodies, `both`, edge-producing bodies, labels
+  (`as`) and `by` modulators remain unsupported. A missing or non-adjacent
+  `times` is rejected rather than executed as an unbounded traversal.
+- Ordinary adjacency outside the repeat retains the independent three-step
+  parser bound. The server coordinator additionally validates the combined
+  repeated and ordinary depth against 32 before acquiring sessions.
+- The same 64-mark/16-KiB admission and terminal `path`/`count` rules apply.
+  Stream-type validation remains an executor responsibility, including empty
+  scalar/edge streams. The server accepts repeat only for explicit V starts.
+
+This is a server-coordinated experimental capability, not an extension of v0
+or the client-side observed executor. The legacy `GremlinStep` enum and
+`GremlinQuery::parse` remain unchanged and reject repeat. The client-side
+`observed_gremlin_v3` validator explicitly rejects this additive AST step.
+All executions retain their existing cumulative resource bounds and
+Unverified completeness; this does not implement general Gremlin loops.
+
+See [native execution semantics](SERVER_HIERARCHY.md) for ordered bags, cycles,
+emission, budgets and fixed-session consistency.

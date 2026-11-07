@@ -17,7 +17,7 @@ fn parser_stress_isolated() {
             .unwrap();
         return;
     }
-    for case in ["ids", "chain", "nested", "malformed", "lexical"] {
+    for case in ["ids", "chain", "nested", "repeat", "malformed", "lexical"] {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "parser_stress_isolated", "--nocapture"])
             .env(CHILD, case)
@@ -102,6 +102,22 @@ fn stress_case(case: &str) {
                     delimiters.1.repeat(2000)
                 ));
             }
+        }
+        "repeat" => {
+            // Max admitted repeated bodies and modulators must also fit the
+            // established 2 MiB parser/validation/destruction stack envelope.
+            let suffix = ").repeat(__.out()).emit().times(32)";
+            let one = format!("g.V(1{suffix}");
+            let marks = one.bytes().filter(|b| b"()[]{},.:;".contains(b)).count();
+            let ids = vec!["1"; MAX_GREMLIN_STRUCTURAL_MARKS + 1 - marks].join(",");
+            ObservedGremlinQuery::parse(&format!("g.V({ids}{suffix}")).unwrap();
+            complexity(&format!("g.V(1,{ids}{suffix}"));
+            let nested = format!(
+                "g.V(1).{}__.out(){}",
+                "repeat(__.".repeat(9),
+                ").times(1)".repeat(9),
+            );
+            assert!(ObservedGremlinQuery::parse(&nested).is_err());
         }
         "malformed" => {
             for prefix in [
