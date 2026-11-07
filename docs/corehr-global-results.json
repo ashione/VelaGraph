@@ -1,0 +1,1782 @@
+{
+  "tested_candidate": {
+    "pr": 60,
+    "head": "9ea6f9baf38a0c0a1c0b78cf1ca9b33c1b3fd52f",
+    "tree": "f123c1efeca0ebfcdd48f9a387c8bf67eb3fa1b6"
+  },
+  "profile": "release graph-node; dev harness; TOKIO_WORKER_THREADS=2",
+  "scale": {
+    "people": 200000,
+    "departments": 5000,
+    "vertices": 205000,
+    "edges": 454998,
+    "cross_partition_edges": 303483,
+    "multi_department_people": 40000,
+    "three_department_people": 10000
+  },
+  "source_sha256": {
+    "README.md": "5720827f2e016619834b63765125cf5ee3d5b42c7e3bcca1858b1bfd462dfa37",
+    "crates/replicated-graph/src/remote/distributed/mod.rs": "bf7d1c0604bf2e09cb80aaf883484f2dcf823db661013496c33fe331d3426e14",
+    "crates/replicated-graph/src/remote/distributed/scan.rs": "bccb01b29c143d6e8e48e75a309b28cd63bea1779178e145fe7777d037c4113a",
+    "crates/replicated-graph/src/remote/distributed/sessions.rs": "e3bc6effa1c5fa1245c6465eb4fd866518a5fce4d68942af67c0e0fd7e3f45ab",
+    "crates/replicated-graph/tests/distributed_query.rs": "1d060411797d8f768dbbe7d7e4d4ff0aa05b1846a9e23cfdd2893a53f9bebcc2",
+    "crates/replicated-graph/tests/distributed_query/corehr.rs": "ca1b4723600a5faaf2f0856c8fbeead02464a87e521961d6092eef6b97d4b307",
+    "docs/DISTRIBUTED_QUERY.md": "7f4b88d1bd7986990061a6d4f20d942c039480be92a698836d79c68da7dfd05b",
+    "docs/QUERY_SPEC.md": "ebd12a338d0593819883ea6de0f01c13b72f9461193953d6792814ca09cfeca8",
+    "docs/ROADMAP.md": "eab3bc0a9eb9a4dffc3cd387af1b09818306ff1bd6958ec1981eabde085542b4",
+    "docs/SERVER_GLOBAL_SCAN.md": "c34406b9f9102b29ea91cd8a781322b1dc961a0f56e383c6b38e239dc00d9fdb",
+    "examples/corehr/model.rs": "0bd00499e13a0215206164ac37a75a87a17d0fbc572a2e6f55bf1c16022a7ed1",
+    "examples/corehr_fixture.rs": "a8bb40f47996f64c13f1bf38dcbaf021b34990d62f3b7105b6aee1dc08a0d79c",
+    "crates/replicated-graph/examples/corehr_run.rs": "d9356b7ed1ffaaf0aa13b5c9513f4717dfbe49a195e629f498c27c5de24b2dd6"
+  },
+  "binary_sha256": {
+    "corehr_fixture": "d210183b038836015fc8d6b8053f05cf7798f6034dd76b8fee6fea1dc94f6362",
+    "graph-node": "10bec97db2b340604b05ad9380a9168c52361caa0d7d3da4b6efb43dd16d391a",
+    "corehr_run": "15fc9826f473f62c3558841a2a6585a7784547c2d913a71ff37026fb99aa837a"
+  },
+  "runs": {
+    "smoke": {
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 38.73141146299895,
+        "tokio_worker_threads": 2
+      },
+      "server_cases": 55,
+      "correct_samples": 350,
+      "expected_rejections": {
+        "recursive_repeat": "Unsupported",
+        "offset_pagination": "Unsupported",
+        "sort": "Unsupported",
+        "predicate": "Unsupported",
+        "global_zero_limit_count": "InvalidArgument"
+      },
+      "client_cases": 55,
+      "client_correct": 41,
+      "client_reject": 14,
+      "resources": {
+        "complete": true,
+        "database_bytes": 8794104,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   15908 kB",
+              "VmRSS:\t   15908 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t   32060 kB",
+              "VmRSS:\t   32060 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t   32048 kB",
+              "VmRSS:\t   32048 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t   33216 kB",
+              "VmRSS:\t   33216 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t   76024 kB",
+          "VmRSS:\t   76024 kB"
+        ]
+      },
+      "import": [
+        {
+          "event": "load",
+          "kind": "offline-encoded fixture imported through Raft; not ordinary graph mutation throughput",
+          "kv_rows": 15694,
+          "latency": {
+            "max_ms": 68.66170100000001,
+            "min_ms": 4.585906,
+            "n": 6,
+            "p50_ms": 65.106129,
+            "p95_ms": 68.66170100000001
+          },
+          "seconds": 0.222276248
+        }
+      ],
+      "kv_verified": [
+        {
+          "event": "all_kv_verified",
+          "rows": 5289,
+          "seconds": 0.073441233,
+          "shard": 1
+        },
+        {
+          "event": "all_kv_verified",
+          "rows": 5248,
+          "seconds": 0.071744963,
+          "shard": 2
+        },
+        {
+          "event": "all_kv_verified",
+          "rows": 5157,
+          "seconds": 0.070499059,
+          "shard": 3
+        }
+      ],
+      "client_session": [
+        {
+          "error": null,
+          "event": "client_session",
+          "seconds": 0.230458741
+        }
+      ],
+      "queries": [
+        {
+          "name": "manager_1",
+          "query": "g.V(1).out('reports_to')",
+          "latency": {
+            "max_ms": 13.857169,
+            "min_ms": 7.907700999999999,
+            "n": 7,
+            "p50_ms": 10.50731,
+            "p95_ms": 13.857169
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_1",
+          "query": "g.V(1).in('reports_to')",
+          "latency": {
+            "max_ms": 14.808468999999999,
+            "min_ms": 11.524601,
+            "n": 7,
+            "p50_ms": 13.855421999999999,
+            "p95_ms": 14.808468999999999
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_1",
+          "query": "g.V(1).out('member_of')",
+          "latency": {
+            "max_ms": 10.101306,
+            "min_ms": 7.740045,
+            "n": 7,
+            "p50_ms": 8.982173,
+            "p95_ms": 10.101306
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_20",
+          "query": "g.V(20).out('reports_to')",
+          "latency": {
+            "max_ms": 10.492699,
+            "min_ms": 9.286776,
+            "n": 7,
+            "p50_ms": 9.709311,
+            "p95_ms": 10.492699
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_20",
+          "query": "g.V(20).in('reports_to')",
+          "latency": {
+            "max_ms": 17.243471,
+            "min_ms": 11.343729,
+            "n": 7,
+            "p50_ms": 12.018594,
+            "p95_ms": 17.243471
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_20",
+          "query": "g.V(20).out('member_of')",
+          "latency": {
+            "max_ms": 10.296710000000001,
+            "min_ms": 9.20324,
+            "n": 7,
+            "p50_ms": 9.942762,
+            "p95_ms": 10.296710000000001
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_1000",
+          "query": "g.V(1000).out('reports_to')",
+          "latency": {
+            "max_ms": 11.128064,
+            "min_ms": 9.321247,
+            "n": 7,
+            "p50_ms": 10.283363999999999,
+            "p95_ms": 11.128064
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_1000",
+          "query": "g.V(1000).in('reports_to')",
+          "latency": {
+            "max_ms": 9.658805,
+            "min_ms": 7.176943,
+            "n": 7,
+            "p50_ms": 7.412427,
+            "p95_ms": 9.658805
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_1000",
+          "query": "g.V(1000).out('member_of')",
+          "latency": {
+            "max_ms": 10.586264,
+            "min_ms": 9.18993,
+            "n": 7,
+            "p50_ms": 10.04774,
+            "p95_ms": 10.586264
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_2000",
+          "query": "g.V(2000).out('reports_to')",
+          "latency": {
+            "max_ms": 10.806871,
+            "min_ms": 9.015643,
+            "n": 7,
+            "p50_ms": 9.864695,
+            "p95_ms": 10.806871
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_2000",
+          "query": "g.V(2000).in('reports_to')",
+          "latency": {
+            "max_ms": 9.774168,
+            "min_ms": 7.054749,
+            "n": 7,
+            "p50_ms": 7.333889,
+            "p95_ms": 9.774168
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_2000",
+          "query": "g.V(2000).out('member_of')",
+          "latency": {
+            "max_ms": 11.341785999999999,
+            "min_ms": 9.827098,
+            "n": 7,
+            "p50_ms": 9.952977,
+            "p95_ms": 11.341785999999999
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_chain_three_hops",
+          "query": "g.V(2000).out('reports_to').out('reports_to').out('reports_to')",
+          "latency": {
+            "max_ms": 21.193566,
+            "min_ms": 15.282832999999998,
+            "n": 7,
+            "p50_ms": 16.838441999999997,
+            "p95_ms": 21.193566
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "reports_two_hops",
+          "query": "g.V(1).in('reports_to').in('reports_to')",
+          "latency": {
+            "max_ms": 55.694329,
+            "min_ms": 43.320847,
+            "n": 7,
+            "p50_ms": 46.492976999999996,
+            "p95_ms": 55.694329
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_ancestors_three_hops",
+          "query": "g.V(2050).out('parent_department').out('parent_department').out('parent_department')",
+          "latency": {
+            "max_ms": 15.24011,
+            "min_ms": 12.61368,
+            "n": 7,
+            "p50_ms": 13.912879,
+            "p95_ms": 15.24011
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_descendants_two_hops",
+          "query": "g.V(2002).in('parent_department').in('parent_department')",
+          "latency": {
+            "max_ms": 156.107414,
+            "min_ms": 143.331479,
+            "n": 7,
+            "p50_ms": 153.174547,
+            "p95_ms": 156.107414
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_members",
+          "query": "g.V(2002).in('member_of').limit(1000)",
+          "latency": {
+            "max_ms": 99.115058,
+            "min_ms": 90.436331,
+            "n": 7,
+            "p50_ms": 93.514456,
+            "p95_ms": 99.115058
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "active_department_members",
+          "query": "g.V(2002).in('member_of').has('active',true).limit(1000)",
+          "latency": {
+            "max_ms": 192.825363,
+            "min_ms": 155.017033,
+            "n": 7,
+            "p50_ms": 169.052491,
+            "p95_ms": 192.825363
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "colleagues_via_department",
+          "query": "g.V(20).out('member_of').in('member_of').limit(25)",
+          "latency": {
+            "max_ms": 152.85333400000002,
+            "min_ms": 131.41945099999998,
+            "n": 7,
+            "p50_ms": 137.247,
+            "p95_ms": 152.85333400000002
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_parent_join",
+          "query": "g.V(20).out('member_of').out('parent_department')",
+          "latency": {
+            "max_ms": 15.638421999999998,
+            "min_ms": 14.111876,
+            "n": 7,
+            "p50_ms": 14.461287,
+            "p95_ms": 15.638421999999998
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "missing_person",
+          "query": "g.V(2051)",
+          "latency": {
+            "max_ms": 7.033287,
+            "min_ms": 6.53032,
+            "n": 7,
+            "p50_ms": 6.659921,
+            "p95_ms": 7.033287
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_report_count",
+          "query": "g.V(1).in('reports_to').count()",
+          "latency": {
+            "max_ms": 13.567713,
+            "min_ms": 13.036434,
+            "n": 7,
+            "p50_ms": 13.380101,
+            "p95_ms": 13.567713
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "filtered_join_count",
+          "query": "g.V(20).out('member_of').hasLabel('department').count()",
+          "latency": {
+            "max_ms": 15.881172,
+            "min_ms": 13.942221,
+            "n": 7,
+            "p50_ms": 14.595409,
+            "p95_ms": 15.881172
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "person_name_projection",
+          "query": "g.V(20).values('name')",
+          "latency": {
+            "max_ms": 8.731961,
+            "min_ms": 7.313933,
+            "n": 7,
+            "p50_ms": 8.141443,
+            "p95_ms": 8.731961
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "duplicate_start_bag",
+          "query": "g.V(20,20).out('member_of')",
+          "latency": {
+            "max_ms": 12.118834999999999,
+            "min_ms": 11.040433,
+            "n": 7,
+            "p50_ms": 11.47107,
+            "p95_ms": 12.118834999999999
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "colleagues_bag_count",
+          "query": "g.V(20).out('member_of').in('member_of').count()",
+          "latency": {
+            "max_ms": 138.430434,
+            "min_ms": 125.47086499999999,
+            "n": 7,
+            "p50_ms": 132.045127,
+            "p95_ms": 138.430434
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "dedup_join",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().limit(1000)",
+          "latency": {
+            "max_ms": 143.984091,
+            "min_ms": 136.33691100000001,
+            "n": 7,
+            "p50_ms": 139.491154,
+            "p95_ms": 143.984091
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "unique_colleague_count",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().count()",
+          "latency": {
+            "max_ms": 139.55358800000002,
+            "min_ms": 131.683087,
+            "n": 7,
+            "p50_ms": 137.53098699999998,
+            "p95_ms": 139.55358800000002
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "active_unique_colleague_count",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().has('active',true).count()",
+          "latency": {
+            "max_ms": 225.460892,
+            "min_ms": 208.515425,
+            "n": 7,
+            "p50_ms": 217.00609400000002,
+            "p95_ms": 225.460892
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "limit_before_dedup",
+          "query": "g.V(20).out('member_of').in('member_of').limit(169).dedup()",
+          "latency": {
+            "max_ms": 148.674648,
+            "min_ms": 133.701249,
+            "n": 7,
+            "p50_ms": 142.822271,
+            "p95_ms": 148.674648
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "limit_after_dedup",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().limit(169)",
+          "latency": {
+            "max_ms": 151.441773,
+            "min_ms": 130.960452,
+            "n": 7,
+            "p50_ms": 136.088604,
+            "p95_ms": 151.441773
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "duplicate_starts_dedup",
+          "query": "g.V(20,20).dedup().dedup().count()",
+          "latency": {
+            "max_ms": 11.692909,
+            "min_ms": 10.524728000000001,
+            "n": 7,
+            "p50_ms": 11.173013000000001,
+            "p95_ms": 11.692909
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "duplicate_memberships_unique_count",
+          "query": "g.V(20,20).out('member_of').dedup().count()",
+          "latency": {
+            "max_ms": 17.006375000000002,
+            "min_ms": 15.259849,
+            "n": 7,
+            "p50_ms": 16.056783000000003,
+            "p95_ms": 17.006375000000002
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "empty_dedup_count",
+          "query": "g.V(2000).in('reports_to').dedup().count()",
+          "latency": {
+            "max_ms": 14.569195,
+            "min_ms": 9.765467,
+            "n": 7,
+            "p50_ms": 11.126548,
+            "p95_ms": 14.569195
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "dedup_first_path",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().limit(1000).path()",
+          "latency": {
+            "max_ms": 184.31438,
+            "min_ms": 150.748827,
+            "n": 7,
+            "p50_ms": 170.70218400000002,
+            "p95_ms": 184.31438
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "recursive_repeat",
+          "query": "g.V(1).repeat(in('reports_to')).emit()",
+          "latency": {
+            "max_ms": 5.02071,
+            "min_ms": 5.02071,
+            "n": 1,
+            "p50_ms": 5.02071,
+            "p95_ms": 5.02071
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "offset_pagination",
+          "query": "g.V(1).in('reports_to').range(2,5)",
+          "latency": {
+            "max_ms": 3.21841,
+            "min_ms": 3.21841,
+            "n": 1,
+            "p50_ms": 3.21841,
+            "p95_ms": 3.21841
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "sort",
+          "query": "g.V(1).in('reports_to').order()",
+          "latency": {
+            "max_ms": 3.288135,
+            "min_ms": 3.288135,
+            "n": 1,
+            "p50_ms": 3.288135,
+            "p95_ms": 3.288135
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "predicate",
+          "query": "g.V(1).has('level',gt(2))",
+          "latency": {
+            "max_ms": 2.6147929999999997,
+            "min_ms": 2.6147929999999997,
+            "n": 1,
+            "p50_ms": 2.6147929999999997,
+            "p95_ms": 2.6147929999999997
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "global_count",
+          "query": "g.V().count()",
+          "latency": {
+            "max_ms": 29.48732,
+            "min_ms": 19.407817,
+            "n": 7,
+            "p50_ms": 21.038629,
+            "p95_ms": 29.48732
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_people_count",
+          "query": "g.V().hasLabel('person').count()",
+          "latency": {
+            "max_ms": 33.316814,
+            "min_ms": 20.748323,
+            "n": 7,
+            "p50_ms": 23.447307000000002,
+            "p95_ms": 33.316814
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_departments_count",
+          "query": "g.V().hasLabel('department').count()",
+          "latency": {
+            "max_ms": 23.369153999999998,
+            "min_ms": 20.226117,
+            "n": 7,
+            "p50_ms": 21.610029,
+            "p95_ms": 23.369153999999998
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_active_people_count",
+          "query": "g.V().hasLabel('person').has('active',true).count()",
+          "latency": {
+            "max_ms": 26.253031,
+            "min_ms": 20.918188,
+            "n": 7,
+            "p50_ms": 22.316972,
+            "p95_ms": 26.253031
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_inactive_people_count",
+          "query": "g.V().hasLabel('person').has('active',false).count()",
+          "latency": {
+            "max_ms": 24.180454,
+            "min_ms": 21.573568,
+            "n": 7,
+            "p50_ms": 22.446522,
+            "p95_ms": 24.180454
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_active_departments_count",
+          "query": "g.V().hasLabel('department').has('active',true).count()",
+          "latency": {
+            "max_ms": 23.890987,
+            "min_ms": 20.676575,
+            "n": 7,
+            "p50_ms": 21.501434,
+            "p95_ms": 23.890987
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_multi_department_count",
+          "query": "g.V().has('multi_department',true).count()",
+          "latency": {
+            "max_ms": 22.776141,
+            "min_ms": 19.723521,
+            "n": 7,
+            "p50_ms": 21.064407,
+            "p95_ms": 22.776141
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_cn_people_count",
+          "query": "g.V().hasLabel('person').has('country','CN').count()",
+          "latency": {
+            "max_ms": 26.758315,
+            "min_ms": 21.38871,
+            "n": 7,
+            "p50_ms": 22.171327,
+            "p95_ms": 26.758315
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_missing_label_count",
+          "query": "g.V().hasLabel('not_present').count()",
+          "latency": {
+            "max_ms": 22.05695,
+            "min_ms": 19.381621000000003,
+            "n": 7,
+            "p50_ms": 20.545547,
+            "p95_ms": 22.05695
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_zero_limit_count",
+          "query": "g.V().limit(0).count()",
+          "latency": {
+            "max_ms": 3.38533,
+            "min_ms": 3.38533,
+            "n": 1,
+            "p50_ms": 3.38533,
+            "p95_ms": 3.38533
+          },
+          "correct_samples": 0,
+          "expected_rejection": "InvalidArgument"
+        },
+        {
+          "name": "global_limit_before_department_count",
+          "query": "g.V().limit(300).hasLabel('department').count()",
+          "latency": {
+            "max_ms": 13.94389,
+            "min_ms": 12.296306999999999,
+            "n": 7,
+            "p50_ms": 12.948041,
+            "p95_ms": 13.94389
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_limit_after_department_count",
+          "query": "g.V().hasLabel('department').limit(300).count()",
+          "latency": {
+            "max_ms": 23.902825999999997,
+            "min_ms": 19.979315,
+            "n": 7,
+            "p50_ms": 21.932712,
+            "p95_ms": 23.902825999999997
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_default_prefix",
+          "query": "g.V()",
+          "latency": {
+            "max_ms": 10.699449999999999,
+            "min_ms": 6.813957,
+            "n": 7,
+            "p50_ms": 7.563445000000001,
+            "p95_ms": 10.699449999999999
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_page_prefix",
+          "query": "g.V().limit(300)",
+          "latency": {
+            "max_ms": 15.418411,
+            "min_ms": 9.989312,
+            "n": 7,
+            "p50_ms": 10.388012,
+            "p95_ms": 15.418411
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_active_prefix",
+          "query": "g.V().has('active',true).limit(300)",
+          "latency": {
+            "max_ms": 15.539463999999999,
+            "min_ms": 13.890519000000001,
+            "n": 7,
+            "p50_ms": 14.636641000000001,
+            "p95_ms": 15.539463999999999
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_cn_departments",
+          "query": "g.V().hasLabel('department').has('country','CN').limit(1000)",
+          "latency": {
+            "max_ms": 26.99165,
+            "min_ms": 20.927722,
+            "n": 7,
+            "p50_ms": 22.224522,
+            "p95_ms": 26.99165
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        }
+      ]
+    },
+    "full": {
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 284.3294603230024,
+        "tokio_worker_threads": 2
+      },
+      "server_cases": 55,
+      "correct_samples": 350,
+      "expected_rejections": {
+        "recursive_repeat": "Unsupported",
+        "offset_pagination": "Unsupported",
+        "sort": "Unsupported",
+        "predicate": "Unsupported",
+        "global_zero_limit_count": "InvalidArgument"
+      },
+      "client_cases": 0,
+      "client_correct": 0,
+      "client_reject": 0,
+      "resources": {
+        "complete": true,
+        "database_bytes": 830780800,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   16352 kB",
+              "VmRSS:\t   16352 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t  848320 kB",
+              "VmRSS:\t  848320 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t  865416 kB",
+              "VmRSS:\t  865416 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t  849060 kB",
+              "VmRSS:\t  849060 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t  261560 kB",
+          "VmRSS:\t  261560 kB"
+        ]
+      },
+      "import": [
+        {
+          "event": "load",
+          "kind": "offline-encoded fixture imported through Raft; not ordinary graph mutation throughput",
+          "kv_rows": 1569994,
+          "latency": {
+            "max_ms": 143.646358,
+            "min_ms": 37.824903,
+            "n": 315,
+            "p50_ms": 61.166599000000005,
+            "p95_ms": 125.57553599999999
+          },
+          "seconds": 22.279529656
+        }
+      ],
+      "kv_verified": [
+        {
+          "event": "all_kv_verified",
+          "rows": 523557,
+          "seconds": 7.832012331,
+          "shard": 1
+        },
+        {
+          "event": "all_kv_verified",
+          "rows": 523688,
+          "seconds": 7.727698178,
+          "shard": 2
+        },
+        {
+          "event": "all_kv_verified",
+          "rows": 522749,
+          "seconds": 7.561679114,
+          "shard": 3
+        }
+      ],
+      "client_session": [
+        {
+          "error": "Route(Storage(ResourceExhausted(\"global scan fanout or aggregate snapshot limit exceeded\")))",
+          "event": "client_session",
+          "seconds": 8.1226026
+        }
+      ],
+      "queries": [
+        {
+          "name": "manager_1",
+          "query": "g.V(1).out('reports_to')",
+          "latency": {
+            "max_ms": 523.861406,
+            "min_ms": 361.725979,
+            "n": 7,
+            "p50_ms": 403.079471,
+            "p95_ms": 523.861406
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_1",
+          "query": "g.V(1).in('reports_to')",
+          "latency": {
+            "max_ms": 502.54837900000007,
+            "min_ms": 371.393461,
+            "n": 7,
+            "p50_ms": 433.917711,
+            "p95_ms": 502.54837900000007
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_1",
+          "query": "g.V(1).out('member_of')",
+          "latency": {
+            "max_ms": 436.24086,
+            "min_ms": 355.596696,
+            "n": 7,
+            "p50_ms": 405.62149800000003,
+            "p95_ms": 436.24086
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_20",
+          "query": "g.V(20).out('reports_to')",
+          "latency": {
+            "max_ms": 460.904093,
+            "min_ms": 372.253074,
+            "n": 7,
+            "p50_ms": 390.920333,
+            "p95_ms": 460.904093
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_20",
+          "query": "g.V(20).in('reports_to')",
+          "latency": {
+            "max_ms": 452.337153,
+            "min_ms": 348.084546,
+            "n": 7,
+            "p50_ms": 409.329017,
+            "p95_ms": 452.337153
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_20",
+          "query": "g.V(20).out('member_of')",
+          "latency": {
+            "max_ms": 417.783737,
+            "min_ms": 369.301027,
+            "n": 7,
+            "p50_ms": 384.81737,
+            "p95_ms": 417.783737
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_100000",
+          "query": "g.V(100000).out('reports_to')",
+          "latency": {
+            "max_ms": 416.949947,
+            "min_ms": 379.705128,
+            "n": 7,
+            "p50_ms": 396.71500799999995,
+            "p95_ms": 416.949947
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_100000",
+          "query": "g.V(100000).in('reports_to')",
+          "latency": {
+            "max_ms": 395.572,
+            "min_ms": 352.59569600000003,
+            "n": 7,
+            "p50_ms": 375.86881900000003,
+            "p95_ms": 395.572
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_100000",
+          "query": "g.V(100000).out('member_of')",
+          "latency": {
+            "max_ms": 434.941008,
+            "min_ms": 352.248353,
+            "n": 7,
+            "p50_ms": 382.33673600000003,
+            "p95_ms": 434.941008
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_200000",
+          "query": "g.V(200000).out('reports_to')",
+          "latency": {
+            "max_ms": 424.96461,
+            "min_ms": 382.19090100000005,
+            "n": 7,
+            "p50_ms": 397.09907599999997,
+            "p95_ms": 424.96461
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_reports_200000",
+          "query": "g.V(200000).in('reports_to')",
+          "latency": {
+            "max_ms": 417.848068,
+            "min_ms": 346.52494099999996,
+            "n": 7,
+            "p50_ms": 384.087518,
+            "p95_ms": 417.848068
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "departments_200000",
+          "query": "g.V(200000).out('member_of')",
+          "latency": {
+            "max_ms": 414.65484200000003,
+            "min_ms": 350.859655,
+            "n": 7,
+            "p50_ms": 390.91904100000005,
+            "p95_ms": 414.65484200000003
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "manager_chain_three_hops",
+          "query": "g.V(200000).out('reports_to').out('reports_to').out('reports_to')",
+          "latency": {
+            "max_ms": 463.366955,
+            "min_ms": 375.68273899999997,
+            "n": 7,
+            "p50_ms": 402.739493,
+            "p95_ms": 463.366955
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "reports_two_hops",
+          "query": "g.V(1).in('reports_to').in('reports_to')",
+          "latency": {
+            "max_ms": 505.847433,
+            "min_ms": 417.890237,
+            "n": 7,
+            "p50_ms": 452.650515,
+            "p95_ms": 505.847433
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_ancestors_three_hops",
+          "query": "g.V(205000).out('parent_department').out('parent_department').out('parent_department')",
+          "latency": {
+            "max_ms": 482.43575100000004,
+            "min_ms": 359.234273,
+            "n": 7,
+            "p50_ms": 397.35817899999995,
+            "p95_ms": 482.43575100000004
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_descendants_two_hops",
+          "query": "g.V(200002).in('parent_department').in('parent_department')",
+          "latency": {
+            "max_ms": 969.812988,
+            "min_ms": 875.367505,
+            "n": 7,
+            "p50_ms": 950.206365,
+            "p95_ms": 969.812988
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_members",
+          "query": "g.V(200002).in('member_of').limit(1000)",
+          "latency": {
+            "max_ms": 579.290222,
+            "min_ms": 444.475316,
+            "n": 7,
+            "p50_ms": 524.057552,
+            "p95_ms": 579.290222
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "active_department_members",
+          "query": "g.V(200002).in('member_of').has('active',true).limit(1000)",
+          "latency": {
+            "max_ms": 622.2661790000001,
+            "min_ms": 522.6243870000001,
+            "n": 7,
+            "p50_ms": 574.720069,
+            "p95_ms": 622.2661790000001
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "colleagues_via_department",
+          "query": "g.V(20).out('member_of').in('member_of').limit(25)",
+          "latency": {
+            "max_ms": 614.215139,
+            "min_ms": 522.311791,
+            "n": 7,
+            "p50_ms": 564.5778849999999,
+            "p95_ms": 614.215139
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "department_parent_join",
+          "query": "g.V(20).out('member_of').out('parent_department')",
+          "latency": {
+            "max_ms": 501.672032,
+            "min_ms": 381.548068,
+            "n": 7,
+            "p50_ms": 429.70524,
+            "p95_ms": 501.672032
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "missing_person",
+          "query": "g.V(205001)",
+          "latency": {
+            "max_ms": 390.25603800000005,
+            "min_ms": 344.171687,
+            "n": 7,
+            "p50_ms": 383.306899,
+            "p95_ms": 390.25603800000005
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "direct_report_count",
+          "query": "g.V(1).in('reports_to').count()",
+          "latency": {
+            "max_ms": 436.118738,
+            "min_ms": 372.82102299999997,
+            "n": 7,
+            "p50_ms": 406.26445900000004,
+            "p95_ms": 436.118738
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "filtered_join_count",
+          "query": "g.V(20).out('member_of').hasLabel('department').count()",
+          "latency": {
+            "max_ms": 451.381371,
+            "min_ms": 365.202061,
+            "n": 7,
+            "p50_ms": 410.44829500000003,
+            "p95_ms": 451.381371
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "person_name_projection",
+          "query": "g.V(20).values('name')",
+          "latency": {
+            "max_ms": 424.774453,
+            "min_ms": 355.027667,
+            "n": 7,
+            "p50_ms": 382.751279,
+            "p95_ms": 424.774453
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "duplicate_start_bag",
+          "query": "g.V(20,20).out('member_of')",
+          "latency": {
+            "max_ms": 427.237478,
+            "min_ms": 375.03310600000003,
+            "n": 7,
+            "p50_ms": 403.768378,
+            "p95_ms": 427.237478
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "colleagues_bag_count",
+          "query": "g.V(20).out('member_of').in('member_of').count()",
+          "latency": {
+            "max_ms": 585.139724,
+            "min_ms": 540.417688,
+            "n": 7,
+            "p50_ms": 577.924904,
+            "p95_ms": 585.139724
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "dedup_join",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().limit(1000)",
+          "latency": {
+            "max_ms": 587.629878,
+            "min_ms": 524.9220879999999,
+            "n": 7,
+            "p50_ms": 553.702942,
+            "p95_ms": 587.629878
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "unique_colleague_count",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().count()",
+          "latency": {
+            "max_ms": 665.2750440000001,
+            "min_ms": 553.397087,
+            "n": 7,
+            "p50_ms": 604.917381,
+            "p95_ms": 665.2750440000001
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "active_unique_colleague_count",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().has('active',true).count()",
+          "latency": {
+            "max_ms": 675.634337,
+            "min_ms": 639.4085349999999,
+            "n": 7,
+            "p50_ms": 657.049859,
+            "p95_ms": 675.634337
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "limit_before_dedup",
+          "query": "g.V(20).out('member_of').in('member_of').limit(184).dedup()",
+          "latency": {
+            "max_ms": 586.582581,
+            "min_ms": 512.193388,
+            "n": 7,
+            "p50_ms": 567.402234,
+            "p95_ms": 586.582581
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "limit_after_dedup",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().limit(184)",
+          "latency": {
+            "max_ms": 649.147568,
+            "min_ms": 524.727434,
+            "n": 7,
+            "p50_ms": 576.7753759999999,
+            "p95_ms": 649.147568
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "duplicate_starts_dedup",
+          "query": "g.V(20,20).dedup().dedup().count()",
+          "latency": {
+            "max_ms": 428.355118,
+            "min_ms": 362.676278,
+            "n": 7,
+            "p50_ms": 400.182826,
+            "p95_ms": 428.355118
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "duplicate_memberships_unique_count",
+          "query": "g.V(20,20).out('member_of').dedup().count()",
+          "latency": {
+            "max_ms": 452.871165,
+            "min_ms": 402.312059,
+            "n": 7,
+            "p50_ms": 418.279741,
+            "p95_ms": 452.871165
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "empty_dedup_count",
+          "query": "g.V(200000).in('reports_to').dedup().count()",
+          "latency": {
+            "max_ms": 436.810085,
+            "min_ms": 363.069596,
+            "n": 7,
+            "p50_ms": 385.72596599999997,
+            "p95_ms": 436.810085
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "dedup_first_path",
+          "query": "g.V(20).out('member_of').in('member_of').dedup().limit(1000).path()",
+          "latency": {
+            "max_ms": 580.165176,
+            "min_ms": 537.387204,
+            "n": 7,
+            "p50_ms": 561.093173,
+            "p95_ms": 580.165176
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "recursive_repeat",
+          "query": "g.V(1).repeat(in('reports_to')).emit()",
+          "latency": {
+            "max_ms": 3.568627,
+            "min_ms": 3.568627,
+            "n": 1,
+            "p50_ms": 3.568627,
+            "p95_ms": 3.568627
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "offset_pagination",
+          "query": "g.V(1).in('reports_to').range(2,5)",
+          "latency": {
+            "max_ms": 2.70033,
+            "min_ms": 2.70033,
+            "n": 1,
+            "p50_ms": 2.70033,
+            "p95_ms": 2.70033
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "sort",
+          "query": "g.V(1).in('reports_to').order()",
+          "latency": {
+            "max_ms": 2.7134799999999997,
+            "min_ms": 2.7134799999999997,
+            "n": 1,
+            "p50_ms": 2.7134799999999997,
+            "p95_ms": 2.7134799999999997
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "predicate",
+          "query": "g.V(1).has('level',gt(2))",
+          "latency": {
+            "max_ms": 1.911304,
+            "min_ms": 1.911304,
+            "n": 1,
+            "p50_ms": 1.911304,
+            "p95_ms": 1.911304
+          },
+          "correct_samples": 0,
+          "expected_rejection": "Unsupported"
+        },
+        {
+          "name": "global_count",
+          "query": "g.V().count()",
+          "latency": {
+            "max_ms": 1367.7908400000001,
+            "min_ms": 1218.6042850000001,
+            "n": 7,
+            "p50_ms": 1278.325583,
+            "p95_ms": 1367.7908400000001
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_people_count",
+          "query": "g.V().hasLabel('person').count()",
+          "latency": {
+            "max_ms": 1315.069518,
+            "min_ms": 1254.198793,
+            "n": 7,
+            "p50_ms": 1290.588444,
+            "p95_ms": 1315.069518
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_departments_count",
+          "query": "g.V().hasLabel('department').count()",
+          "latency": {
+            "max_ms": 1358.839885,
+            "min_ms": 1262.6901099999998,
+            "n": 7,
+            "p50_ms": 1331.527444,
+            "p95_ms": 1358.839885
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_active_people_count",
+          "query": "g.V().hasLabel('person').has('active',true).count()",
+          "latency": {
+            "max_ms": 1377.022165,
+            "min_ms": 1312.8152049999999,
+            "n": 7,
+            "p50_ms": 1328.35307,
+            "p95_ms": 1377.022165
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_inactive_people_count",
+          "query": "g.V().hasLabel('person').has('active',false).count()",
+          "latency": {
+            "max_ms": 1328.602835,
+            "min_ms": 1234.384425,
+            "n": 7,
+            "p50_ms": 1318.119569,
+            "p95_ms": 1328.602835
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_active_departments_count",
+          "query": "g.V().hasLabel('department').has('active',true).count()",
+          "latency": {
+            "max_ms": 1475.617181,
+            "min_ms": 1281.199062,
+            "n": 7,
+            "p50_ms": 1362.502594,
+            "p95_ms": 1475.617181
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_multi_department_count",
+          "query": "g.V().has('multi_department',true).count()",
+          "latency": {
+            "max_ms": 1407.780408,
+            "min_ms": 1286.7194749999999,
+            "n": 7,
+            "p50_ms": 1326.06057,
+            "p95_ms": 1407.780408
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_cn_people_count",
+          "query": "g.V().hasLabel('person').has('country','CN').count()",
+          "latency": {
+            "max_ms": 1488.103201,
+            "min_ms": 1371.670707,
+            "n": 7,
+            "p50_ms": 1467.285689,
+            "p95_ms": 1488.103201
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_missing_label_count",
+          "query": "g.V().hasLabel('not_present').count()",
+          "latency": {
+            "max_ms": 1477.016557,
+            "min_ms": 1279.44845,
+            "n": 7,
+            "p50_ms": 1338.533531,
+            "p95_ms": 1477.016557
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_zero_limit_count",
+          "query": "g.V().limit(0).count()",
+          "latency": {
+            "max_ms": 2.8386980000000004,
+            "min_ms": 2.8386980000000004,
+            "n": 1,
+            "p50_ms": 2.8386980000000004,
+            "p95_ms": 2.8386980000000004
+          },
+          "correct_samples": 0,
+          "expected_rejection": "InvalidArgument"
+        },
+        {
+          "name": "global_limit_before_department_count",
+          "query": "g.V().limit(300).hasLabel('department').count()",
+          "latency": {
+            "max_ms": 414.938146,
+            "min_ms": 344.220629,
+            "n": 7,
+            "p50_ms": 374.369974,
+            "p95_ms": 414.938146
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_limit_after_department_count",
+          "query": "g.V().hasLabel('department').limit(300).count()",
+          "latency": {
+            "max_ms": 689.2008069999999,
+            "min_ms": 671.213066,
+            "n": 7,
+            "p50_ms": 678.011555,
+            "p95_ms": 689.2008069999999
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_default_prefix",
+          "query": "g.V()",
+          "latency": {
+            "max_ms": 401.022472,
+            "min_ms": 341.74173,
+            "n": 7,
+            "p50_ms": 379.30035699999996,
+            "p95_ms": 401.022472
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_page_prefix",
+          "query": "g.V().limit(300)",
+          "latency": {
+            "max_ms": 391.468764,
+            "min_ms": 361.797604,
+            "n": 7,
+            "p50_ms": 385.470616,
+            "p95_ms": 391.468764
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_active_prefix",
+          "query": "g.V().has('active',true).limit(300)",
+          "latency": {
+            "max_ms": 410.57897199999996,
+            "min_ms": 348.423858,
+            "n": 7,
+            "p50_ms": 382.017808,
+            "p95_ms": 410.57897199999996
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        },
+        {
+          "name": "global_cn_departments",
+          "query": "g.V().hasLabel('department').has('country','CN').limit(1000)",
+          "latency": {
+            "max_ms": 1557.516524,
+            "min_ms": 1349.912378,
+            "n": 7,
+            "p50_ms": 1419.385669,
+            "p95_ms": 1557.516524
+          },
+          "correct_samples": 7,
+          "expected_rejection": null
+        }
+      ]
+    }
+  },
+  "new_oracle_summary": {
+    "global_count": {
+      "query": "g.V().count()",
+      "expected_count": 205000,
+      "expected_rows": 0,
+      "expected_sha256": "5dec69070539bfc640178027985d41b5a4158694526be882542398aab7753ac9",
+      "client_expected_sha256": "5dec69070539bfc640178027985d41b5a4158694526be882542398aab7753ac9"
+    },
+    "global_people_count": {
+      "query": "g.V().hasLabel('person').count()",
+      "expected_count": 200000,
+      "expected_rows": 0,
+      "expected_sha256": "6ec15363c0cae37f15c0825967a5ae77b3511b6166f3971e8c504568fe2a13f0",
+      "client_expected_sha256": "6ec15363c0cae37f15c0825967a5ae77b3511b6166f3971e8c504568fe2a13f0"
+    },
+    "global_departments_count": {
+      "query": "g.V().hasLabel('department').count()",
+      "expected_count": 5000,
+      "expected_rows": 0,
+      "expected_sha256": "29a9ff2bc4dc228f9d89593251f51142d22525d448a1b43f1c1414e517a86c19",
+      "client_expected_sha256": "29a9ff2bc4dc228f9d89593251f51142d22525d448a1b43f1c1414e517a86c19"
+    },
+    "global_active_people_count": {
+      "query": "g.V().hasLabel('person').has('active',true).count()",
+      "expected_count": 190091,
+      "expected_rows": 0,
+      "expected_sha256": "70fd9dece054f43b79999faceb7a97c36156b0d29a8acb552f4c8c83a63f8a04",
+      "client_expected_sha256": "70fd9dece054f43b79999faceb7a97c36156b0d29a8acb552f4c8c83a63f8a04"
+    },
+    "global_inactive_people_count": {
+      "query": "g.V().hasLabel('person').has('active',false).count()",
+      "expected_count": 9909,
+      "expected_rows": 0,
+      "expected_sha256": "6f4e9f723d94b36fc4bb58e0b9b41ba9683128b1aa96ae7b06735c666ddf97b0",
+      "client_expected_sha256": "6f4e9f723d94b36fc4bb58e0b9b41ba9683128b1aa96ae7b06735c666ddf97b0"
+    },
+    "global_active_departments_count": {
+      "query": "g.V().hasLabel('department').has('active',true).count()",
+      "expected_count": 4716,
+      "expected_rows": 0,
+      "expected_sha256": "9edb9db5f0b88104034c6304f804797c9d5589713195666c282041991086aeac",
+      "client_expected_sha256": "9edb9db5f0b88104034c6304f804797c9d5589713195666c282041991086aeac"
+    },
+    "global_multi_department_count": {
+      "query": "g.V().has('multi_department',true).count()",
+      "expected_count": 40000,
+      "expected_rows": 0,
+      "expected_sha256": "64b385cd09ea39765a013b180aa2609576cd0d938fd72ee9fc953d5bb08dfb30",
+      "client_expected_sha256": "64b385cd09ea39765a013b180aa2609576cd0d938fd72ee9fc953d5bb08dfb30"
+    },
+    "global_cn_people_count": {
+      "query": "g.V().hasLabel('person').has('country','CN').count()",
+      "expected_count": 40012,
+      "expected_rows": 0,
+      "expected_sha256": "378a23609e41969d3fcf627fbc9fbe5d1b5af697c940478dc97ef92e015c0bc6",
+      "client_expected_sha256": "378a23609e41969d3fcf627fbc9fbe5d1b5af697c940478dc97ef92e015c0bc6"
+    },
+    "global_missing_label_count": {
+      "query": "g.V().hasLabel('not_present').count()",
+      "expected_count": 0,
+      "expected_rows": 0,
+      "expected_sha256": "618de7d9f46f3f697d827a1b6d84974760d5deda62e4e592adaa3c646602a94c",
+      "client_expected_sha256": "618de7d9f46f3f697d827a1b6d84974760d5deda62e4e592adaa3c646602a94c"
+    },
+    "global_limit_before_department_count": {
+      "query": "g.V().limit(300).hasLabel('department').count()",
+      "expected_count": 0,
+      "expected_rows": 0,
+      "expected_sha256": "618de7d9f46f3f697d827a1b6d84974760d5deda62e4e592adaa3c646602a94c",
+      "client_expected_sha256": "618de7d9f46f3f697d827a1b6d84974760d5deda62e4e592adaa3c646602a94c"
+    },
+    "global_limit_after_department_count": {
+      "query": "g.V().hasLabel('department').limit(300).count()",
+      "expected_count": 300,
+      "expected_rows": 0,
+      "expected_sha256": "f26845d445766e4a00209ecd38c7bfafd1625ee8def37bbf9f03166ff3985ae6",
+      "client_expected_sha256": "f26845d445766e4a00209ecd38c7bfafd1625ee8def37bbf9f03166ff3985ae6"
+    },
+    "global_default_prefix": {
+      "query": "g.V()",
+      "expected_count": null,
+      "expected_rows": 100,
+      "expected_sha256": "4bb9dd5a907c1ca19b029e75e39fea86037a868a5e7372a43786883fd6e7f989",
+      "client_expected_sha256": "419886c834403cc6b45f377ebc076328574e9bc888535e43d1ac1f8b8d45bdd2"
+    },
+    "global_page_prefix": {
+      "query": "g.V().limit(300)",
+      "expected_count": null,
+      "expected_rows": 300,
+      "expected_sha256": "3fbc9785bf59d5cf3639e6a4dac951a0a047e4c8b7e925193d1f8684c88fd653",
+      "client_expected_sha256": "f57cb319e406399ea6cf4048f08099faa6f34c50dd4f5e6f8a4c41d016e1d3e3"
+    },
+    "global_active_prefix": {
+      "query": "g.V().has('active',true).limit(300)",
+      "expected_count": null,
+      "expected_rows": 300,
+      "expected_sha256": "74b70fd06efcd1312bb342bd7c36c7c0af9019498a0cc995a417a618e6e5950c",
+      "client_expected_sha256": "0bce9a4309bd14bda0554bc438d525e36d6a12753f89b224c0378e035b146360"
+    },
+    "global_cn_departments": {
+      "query": "g.V().hasLabel('department').has('country','CN').limit(1000)",
+      "expected_count": null,
+      "expected_rows": 996,
+      "expected_sha256": "c4985a6b36e964692c265724056f7f6b3ab499dcc48570f79c15d728dd2bd55c",
+      "client_expected_sha256": "c168427707c2edc5bfdf98ac399895010a320617309a5a07860c09fad7a21b0b"
+    }
+  }
+}

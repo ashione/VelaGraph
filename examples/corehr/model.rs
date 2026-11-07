@@ -273,8 +273,142 @@ impl Model {
         ] {
             q.push(json!({"name":name,"partition":partition(1),"query":query,"expect_error":true}));
         }
-        q.push(json!({"name":"global_count","partition":1,"query":"g.V().count()","expect_error":self.people+self.departments>10000,"expected":{"count":self.people+self.departments}}));
+        q.push(json!({"name":"global_count","partition":1,"query":"g.V().count()","expected":{"count":self.people+self.departments},"server_supported":true}));
+        // Two public APIs intentionally use different qualified ordering.
+        // Derive both from IDs and model properties, never database output.
+        let client_order: Vec<_> = (1..=self.people + self.departments).collect();
+        let mut server_order = client_order.clone();
+        server_order.sort_by_key(|id| (partition(*id), *id));
+        let is_cn = |id: u64| mix(id ^ 0x434f554e545259).is_multiple_of(5);
+        let mut add_count = |name: &str, query: &str, server: usize, client: usize| {
+            q.push(json!({"name":name,"partition":1,"query":query,"expected":{"count":server},"client_expected":{"count":client},"server_supported":true}));
+        };
+        for (name, query, count) in [
+            (
+                "global_people_count",
+                "g.V().hasLabel('person').count()",
+                self.people as usize,
+            ),
+            (
+                "global_departments_count",
+                "g.V().hasLabel('department').count()",
+                self.departments as usize,
+            ),
+            (
+                "global_active_people_count",
+                "g.V().hasLabel('person').has('active',true).count()",
+                (1..=self.people).filter(|id| active(*id)).count(),
+            ),
+            (
+                "global_inactive_people_count",
+                "g.V().hasLabel('person').has('active',false).count()",
+                (1..=self.people).filter(|id| !active(*id)).count(),
+            ),
+            (
+                "global_active_departments_count",
+                "g.V().hasLabel('department').has('active',true).count()",
+                (self.people + 1..=self.people + self.departments)
+                    .filter(|id| active(*id))
+                    .count(),
+            ),
+            (
+                "global_multi_department_count",
+                "g.V().has('multi_department',true).count()",
+                (self.people / 5) as usize,
+            ),
+            (
+                "global_cn_people_count",
+                "g.V().hasLabel('person').has('country','CN').count()",
+                (1..=self.people).filter(|id| is_cn(*id)).count(),
+            ),
+            (
+                "global_missing_label_count",
+                "g.V().hasLabel('not_present').count()",
+                0,
+            ),
+            ("global_zero_limit_count", "g.V().limit(0).count()", 0),
+        ] {
+            add_count(name, query, count, count);
+        }
+        let before_server = server_order
+            .iter()
+            .take(300)
+            .filter(|id| **id > self.people)
+            .count();
+        let before_client = client_order
+            .iter()
+            .take(300)
+            .filter(|id| **id > self.people)
+            .count();
+        add_count(
+            "global_limit_before_department_count",
+            "g.V().limit(300).hasLabel('department').count()",
+            before_server,
+            before_client,
+        );
+        add_count(
+            "global_limit_after_department_count",
+            "g.V().hasLabel('department').limit(300).count()",
+            self.departments.min(300) as usize,
+            self.departments.min(300) as usize,
+        );
+        let mut add_list = |name: &str, query: &str, server: Vec<u64>, client: Vec<u64>| {
+            q.push(json!({"name":name,"partition":1,"query":query,"expected":verts(&server),"client_expected":verts(&client),"server_supported":true}));
+        };
+        add_list(
+            "global_default_prefix",
+            "g.V()",
+            server_order.iter().copied().take(100).collect(),
+            client_order.iter().copied().take(100).collect(),
+        );
+        add_list(
+            "global_page_prefix",
+            "g.V().limit(300)",
+            server_order.iter().copied().take(300).collect(),
+            client_order.iter().copied().take(300).collect(),
+        );
+        add_list(
+            "global_active_prefix",
+            "g.V().has('active',true).limit(300)",
+            server_order
+                .iter()
+                .copied()
+                .filter(|id| active(*id))
+                .take(300)
+                .collect(),
+            client_order
+                .iter()
+                .copied()
+                .filter(|id| active(*id))
+                .take(300)
+                .collect(),
+        );
+        add_list(
+            "global_cn_departments",
+            "g.V().hasLabel('department').has('country','CN').limit(1000)",
+            server_order
+                .iter()
+                .copied()
+                .filter(|id| *id > self.people && is_cn(*id))
+                .take(1000)
+                .collect(),
+            client_order
+                .iter()
+                .copied()
+                .filter(|id| *id > self.people && is_cn(*id))
+                .take(1000)
+                .collect(),
+        );
         for case in &mut q {
+            if case["name"] == "global_zero_limit_count" {
+                // Official parser accepts only limits 1..=1000. Internal
+                // exhausted counters do not expand the user-facing grammar.
+                case["server_supported"] = json!(false);
+                case["server_expected_error"] = json!("InvalidArgument");
+                case["expect_error"] = json!(true);
+                case.as_object_mut().unwrap().remove("expected");
+                case.as_object_mut().unwrap().remove("client_expected");
+            }
             if case["query"].as_str().unwrap().contains(".dedup()") {
                 case["client_expect_unsupported"] = json!(true);
             }
@@ -320,7 +454,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 40);
+    assert_eq!(q.len(), 55);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     assert!(
         get("unique_colleague_count")["expected"]["count"]
@@ -345,4 +479,36 @@ fn dedup_oracle_is_nonvacuous() {
         let last = p.as_array().unwrap().last().unwrap();
         assert_eq!(json!([last[1], last[2]]), *v);
     }
+}
+
+#[test]
+fn global_oracles_use_distinct_orders_and_real_properties() {
+    let m = Model::new(2000, 50);
+    let q = m.queries();
+    let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
+    assert_ne!(
+        get("global_page_prefix")["expected"],
+        get("global_page_prefix")["client_expected"]
+    );
+    assert_eq!(
+        get("global_page_prefix")["expected"]["vertices"][0],
+        json!([1, 3])
+    );
+    assert_eq!(
+        get("global_page_prefix")["client_expected"]["vertices"][0],
+        json!([2, 1])
+    );
+    assert_ne!(
+        get("global_limit_before_department_count")["expected"],
+        get("global_limit_after_department_count")["expected"]
+    );
+    assert_eq!(
+        get("global_active_people_count")["expected"]["count"]
+            .as_u64()
+            .unwrap()
+            + get("global_inactive_people_count")["expected"]["count"]
+                .as_u64()
+                .unwrap(),
+        m.people
+    );
 }
