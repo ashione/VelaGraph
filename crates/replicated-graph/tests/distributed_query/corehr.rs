@@ -90,6 +90,13 @@ fn fixture() -> anyhow::Result<Vec<Export>> {
             .insert("name".into(), Value::Text(format!("entity-{id}")));
         stores[index].prepare_vertex(&v)?.submit(&nodes[index])?;
     }
+    // Extra isolated records exercise multiple scan pages and equal local IDs
+    // in different partitions without altering the CoreHR relationship model.
+    for id in std::iter::once(1).chain(1000..1400) {
+        let mut v = Vertex::new(id);
+        v.labels.push("scan_extra".into());
+        stores[0].prepare_vertex(&v)?.submit(&nodes[0])?;
+    }
     for edge in model() {
         let from = edge.from.partition as usize - 1;
         let to = edge.to.partition as usize - 1;
@@ -320,6 +327,71 @@ async fn corehr_incoming_matches_ordered_bag_oracle_across_three_processes() -> 
                     value: Value::Text(format!("entity-{}", end_id(p))),
                 })
                 .collect(),
+        ));
+        let mut all = (1..=225)
+            .map(|id| (part(id), id))
+            .chain(std::iter::once((1, 1)))
+            .chain((1000..1400).map(|id| (1, id)))
+            .collect::<Vec<_>>();
+        all.sort_unstable();
+        let elements = |xs: Vec<(u32, u64)>| {
+            xs.into_iter()
+                .map(|(p, id)| QueryRow::Element(vertex(p, id)))
+                .collect::<Vec<_>>()
+        };
+        let person = |(p, id): &(u32, u64)| *id <= 200 && *p == part(*id);
+        cases.push((1, "g.V().count()", vec![QueryRow::Count(all.len() as u64)]));
+        cases.push((
+            1,
+            "g.V()",
+            elements(all.iter().copied().take(100).collect()),
+        ));
+        cases.push((1, "g.V().limit(1000)", elements(all.clone())));
+        cases.push((
+            1,
+            "g.V().hasLabel('person').count()",
+            vec![QueryRow::Count(200)],
+        ));
+        cases.push((
+            1,
+            "g.V().hasLabel('person').has('active',true).count()",
+            vec![QueryRow::Count(160)],
+        ));
+        cases.push((1, "g.V().has('missing').count()", vec![QueryRow::Count(0)]));
+        cases.push((
+            1,
+            "g.V().limit(80).hasLabel('person').count()",
+            vec![QueryRow::Count(
+                all.iter().take(80).filter(|v| person(v)).count() as u64,
+            )],
+        ));
+        cases.push((
+            1,
+            "g.V().hasLabel('person').limit(80).count()",
+            vec![QueryRow::Count(80)],
+        ));
+        cases.push((
+            1,
+            "g.V().limit(500).hasLabel('person').limit(90)",
+            elements(
+                all.iter()
+                    .copied()
+                    .take(500)
+                    .filter(person)
+                    .take(90)
+                    .collect(),
+            ),
+        ));
+        cases.push((
+            1,
+            "g.V().hasLabel('department').limit(23)",
+            elements(
+                all.iter()
+                    .copied()
+                    .filter(|(p, id)| *id > 200 && *id <= 225 && *p == part(*id))
+                    .take(23)
+                    .collect(),
+            ),
         ));
         for (start, text, expected) in cases {
             let output = distributed::query(

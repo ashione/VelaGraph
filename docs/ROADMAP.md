@@ -285,3 +285,9 @@ The experimental server coordinator additionally supports bounded vertex
 Identity is partition-qualified, order/path follow the first occurrence, and
 upstream corruption/work cannot be bypassed. This does not add global scans,
 scalar deduplication, pagination, native recursive traversal or global snapshots.
+
+Server global `V()` scanning now has a separate bounded iterator over retained
+shard sessions, with local filter/limit/count pushdown and deterministic
+(partition, ID) order. This does not add global E, adjacency, pagination, native
+recursion or global atomic snapshots. See `SERVER_GLOBAL_SCAN.md` for its explicit
+new scan budget and untouched explicit-ID traversal bounds.
