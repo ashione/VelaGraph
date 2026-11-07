@@ -667,3 +667,12 @@ and fixed-version certified sessions with a small standard Gremlin point/adjacen
 subset over server-owned Raft handles. It is bounded plaintext for trusted networks, not multi-host Raft
 placement, authentication, remote Global Gremlin, indexed MVCC or production
 availability. See [the contract and limits](docs/MANAGED_GRAPH_GATEWAY.md).
+
+The additive [remote managed-node transport](docs/REMOTE_MANAGED_TRANSPORT.md)
+allows this managed gateway to use a coordinator and participants in independent
+processes. External Gremlin reads, canonical request identity and persisted-Plan
+recovery are unchanged. Same-version sessions require the complete cohort and
+matching retained terminal-prefix evidence. This trusted plaintext, fixed-endpoint
+slice does not enable the older remote GlobalCommittedSnapshot API or claim
+multi-machine validation, automatic failover, authentication/TLS or production
+D4/D5 completion.

@@ -1,6 +1,6 @@
 use super::*;
 use d2_raft::transaction_decisions::Member;
-use d2_raft::{Cluster, D1Result};
+use d2_raft::{participant_driver, Cluster, D1Command, D1Result, LogCommand};
 use rocksdb_sql_table::experimental_graph::Direction;
 fn authority() -> Authority {
     Authority {

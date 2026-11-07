@@ -1,9 +1,11 @@
 //! Complete fixed-cohort, empty-baseline materialized snapshots. This trusted
-//! in-process primitive does not enable the remote graph Global query API.
+//! local/remote primitive does not enable the remote graph Global query API.
+use crate::managed_rpc::{self, NodeRef};
 use crate::participant_writes::Authority;
 use crate::transaction_decisions::Cohort;
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
 use crate::{D1Error, NodeHandle};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,8 @@ pub enum Error {
 }
 
 /// Lightweight leader-observed readiness, not itself a read certificate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VisibilityInfo {
     pub authority: Authority,
     pub baseline_sequence: u64,
@@ -86,6 +89,44 @@ pub async fn acquire(
     limit: ReadLimit,
     lifetime: Duration,
 ) -> Result<SnapshotSession, Error> {
+    acquire_endpoints(
+        NodeRef::Local(coordinator),
+        authority,
+        coordinator_epoch,
+        members
+            .into_iter()
+            .map(|(n, t)| (NodeRef::Local(n), t))
+            .collect(),
+        version,
+        limit,
+        lifetime,
+    )
+    .await
+}
+
+impl From<managed_rpc::Error> for Error {
+    fn from(error: managed_rpc::Error) -> Self {
+        match error {
+            managed_rpc::Error::Application(e) => Self::Application(e),
+            managed_rpc::Error::Identity | managed_rpc::Error::Protocol => Self::Identity,
+            managed_rpc::Error::Capacity => Self::Capacity,
+            managed_rpc::Error::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// The same complete-cohort protocol over explicitly pinned trusted endpoints.
+/// No unchecked constructor can turn remote rows into a certified session.
+#[allow(clippy::too_many_arguments)]
+pub async fn acquire_endpoints(
+    coordinator: NodeRef<'_>,
+    authority: Authority,
+    coordinator_epoch: u64,
+    members: Vec<(NodeRef<'_>, Target)>,
+    version: Option<u64>,
+    limit: ReadLimit,
+    lifetime: Duration,
+) -> Result<SnapshotSession, Error> {
     if lifetime.is_zero()
         || lifetime > MAX_SESSION_LIFETIME
         || limit.rows == 0
@@ -111,16 +152,7 @@ pub async fn acquire(
         }
     };
     let result = tokio::time::timeout(lifetime.min(MAX_ACQUIRE_TIME), async {
-        coordinator
-            .raft
-            .ensure_linearizable()
-            .await
-            .map_err(|_| Error::Unavailable)?;
-        let journal = coordinator
-            .state_machine
-            .coordinator_journal(authority.shard, coordinator_epoch, authority.mode)
-            .await
-            .map_err(Error::Application)?;
+        let journal = coordinator.journal(&authority, coordinator_epoch).await?;
         let cohort = journal.cohort().cloned().ok_or(Error::UnboundCohort)?;
         if cohort.coordinator_shard != authority.shard
             || cohort.coordinator_epoch != coordinator_epoch
@@ -139,15 +171,7 @@ pub async fn acquire(
         let mut common = journal.resolved_prefix();
         for (node, target) in &members {
             check_deadline()?;
-            node.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|_| Error::Unavailable)?;
-            let info = node
-                .state_machine
-                .participant_visibility_info(target.shard, target.epoch, target.mode)
-                .await
-                .map_err(Error::Application)?;
+            let info = node.visibility(target).await?;
             if info.baseline_sequence != 0
                 || info.authority != authority
                 || info.cohort.as_ref() != Some(&cohort)
@@ -166,10 +190,6 @@ pub async fn acquire(
         let mut operations = 0usize;
         for (node, target) in members {
             check_deadline()?;
-            node.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|_| Error::Unavailable)?;
             let remaining = ReadLimit {
                 rows: limit.rows.saturating_sub(rows),
                 bytes: limit.bytes.saturating_sub(bytes),
@@ -179,20 +199,13 @@ pub async fn acquire(
             if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
                 return Err(Error::Capacity);
             }
-            let snapshot = node
-                .state_machine
-                .certified_participant_read(
-                    target.shard,
-                    target.epoch,
-                    target.mode,
-                    version,
-                    remaining,
-                    &journal,
-                )
-                .await
-                .map_err(Error::Application)?;
+            let snapshot = node.read(&target, version, remaining, &journal).await?;
             check_deadline()?;
-            if snapshot.baseline_sequence != 0
+            if snapshot.shard != target.shard
+                || snapshot.epoch != target.epoch
+                || snapshot.version != version
+                || snapshot.applied_prefix < version
+                || snapshot.baseline_sequence != 0
                 || snapshot.authority != authority
                 || snapshot.cohort.as_ref() != Some(&cohort)
             {

@@ -369,3 +369,14 @@ Typed reads remain private execution plumbing. Real loopback tests cover transac
 apply, restart, identity and resource failure paths. This is not multi-host Raft
 placement, auth/TLS, remote GlobalCommittedSnapshot Gremlin, indexed MVCC, GC or
 full D4/D5 production completion. See [gateway contract](MANAGED_GRAPH_GATEWAY.md).
+
+### Fixed remote managed-node transport
+
+The managed gateway can now pin coordinator and participant RPC endpoints in
+separate OS processes while retaining its original external protocol, durable
+request Plan and same-V Gremlin sessions. The local and remote paths share the
+complete-cohort acquisition algorithm and compare retained terminal-prefix
+evidence. Real child-process tests cover partial publication and persistent
+restart recovery. This is a trusted plaintext, static-placement single-replica
+validation slice, not multi-machine/HA evidence, auth/TLS, old remote Global
+query admission or D4/D5 completion. See [contract](REMOTE_MANAGED_TRANSPORT.md).

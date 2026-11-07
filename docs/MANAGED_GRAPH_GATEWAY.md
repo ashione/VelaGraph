@@ -172,3 +172,14 @@ Gremlin tests also cover stream-type preflight on empty results, missing versus
 Null properties, projection/limit/count order, label order, qualified source IDs,
 protocol golden fixtures and old typed-wire rejection. These tests do not constitute multi-host, authenticated, full-workspace CI or
 production scalability validation.
+
+## Additive remote placement
+
+`Gateway::bind_remote(RemoteConfig, ...)` replaces owned local node handles with
+fixed trusted internal RPC clients. The local constructor and this document's
+external wire, canonical commands, durable Plan identities, Gremlin subset and
+session/restart semantics are unchanged. The internal transport validates node,
+role and complete cohort identity and returns participant-retained terminal-prefix
+evidence for same-V captures. See [transport contract](REMOTE_MANAGED_TRANSPORT.md)
+for bounds, trust assumptions and real independent-process validation. Earlier
+"in-process handles" statements describe the original local placement only.

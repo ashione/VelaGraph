@@ -443,7 +443,7 @@ async fn partial_apply_refuses_explicit_new_version_and_preserves_commit() {
         external_id: [3; 16],
         mutation: Mutation::CreateEdge { edge: edge() },
     };
-    let config = f.config();
+    let config = OwnedConfig::from(f.config());
     let graph = config.graph();
     let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
     let candidate = write.mutation.prepare(&snapshot).unwrap();
@@ -649,7 +649,7 @@ async fn session_budgets_expiry_malformed_fields_and_oversized_frames() {
     }
     assert_eq!(g.retained_payload_charge(), 0);
     // A trusted local plan seeds escaped data whose remote JSON would exceed 1 MiB.
-    let config = f.config();
+    let config = OwnedConfig::from(f.config());
     let graph = config.graph();
     let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
     let mut large = Vertex::new(1);
@@ -759,7 +759,7 @@ async fn persistent_restart_recovers_original_partial_plan_and_rejects_old_token
         external_id: [3; 16],
         mutation: Mutation::CreateEdge { edge: edge() },
     };
-    let config = f.config();
+    let config = OwnedConfig::from(f.config());
     let graph = config.graph();
     let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
     let candidate = write.mutation.prepare(&snapshot).unwrap();
@@ -865,7 +865,7 @@ async fn stale_admitted_request_remains_pending_until_explicit_abort() {
     let _test = TEST_GATE.lock().await;
     let f = Fixture::new().await;
     let g = f.gateway().await;
-    let config = f.config();
+    let config = OwnedConfig::from(f.config());
     let graph = config.graph();
     let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
     let stale = create(1, 7, 1);
@@ -1067,7 +1067,7 @@ async fn timeout_after_partial_prepare_keeps_id_and_retry_needs_no_capture_capac
     .unwrap();
     committed(&call(&g, Operation::Submit(create(1, 7, 1))).await.unwrap());
     committed(&call(&g, Operation::Submit(create(2, 8, 1))).await.unwrap());
-    let config = f.config();
+    let config = OwnedConfig::from(f.config());
     let graph = config.graph();
     let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
     let write = Write {

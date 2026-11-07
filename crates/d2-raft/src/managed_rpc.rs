@@ -1,0 +1,1682 @@
+//! Bounded, trusted internal managed-transaction transport. This is neither an
+//! authenticated service nor a public graph query API. Journal evidence must
+//! come from a leader observation by a trusted caller. Timeouts are uncertain
+//! outcomes and never authorize abort, identity replacement, or fallback reads.
+use crate::cohort_reads::VisibilityInfo;
+use crate::participant_writes::{Authority, Status};
+use crate::transaction_decisions::{Cohort, Command, Journal, Participant};
+use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
+use crate::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, NodeHandle};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{oneshot, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+
+/// JSON framing limit, enforced before allocation and while serialization runs.
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const CONCURRENCY: usize = 4;
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Error {
+    Application(D1Error),
+    Identity,
+    Capacity,
+    Unavailable,
+    Protocol,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "managed RPC: {self:?}")
+    }
+}
+impl std::error::Error for Error {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    Coordinator,
+    Participant,
+}
+
+/// Fixed deployment identity, not a credential or a routing hint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Identity {
+    pub group: u64,
+    pub node: u64,
+    pub target: Target,
+    pub role: Role,
+    pub authority: Authority,
+    pub cohort: Cohort,
+}
+impl Identity {
+    fn validate(&self) -> Result<(), Error> {
+        if self.cohort.validate().is_err()
+            || self.authority.shard != self.cohort.coordinator_shard
+            || self.authority.mode == [0; 16]
+            || self.target.mode == [0; 16]
+        {
+            return Err(Error::Identity);
+        }
+        let matches = match self.role {
+            Role::Coordinator => {
+                self.target.shard == self.authority.shard
+                    && self.target.mode == self.authority.mode
+                    && self.target.epoch == self.cohort.coordinator_epoch
+            }
+            Role::Participant => self.cohort.members.iter().any(|m| {
+                m.shard == self.target.shard
+                    && m.epoch == self.target.epoch
+                    && m.mode == self.target.mode
+            }),
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(Error::Identity)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    version: u32,
+    identity: Identity,
+    nonce: u64,
+    operation: Operation,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum Operation {
+    Journal {
+        authority: Authority,
+        epoch: u64,
+    },
+    Command {
+        authority: Authority,
+        epoch: u64,
+        command: Command,
+    },
+    Visibility {
+        target: Target,
+    },
+    Prepare {
+        authority: Authority,
+        participant: Participant,
+        request: D1WriteRequest,
+        journal: Journal,
+    },
+    Advance {
+        authority: Authority,
+        target: Target,
+        ordinal: u64,
+        journal: Journal,
+    },
+    Prefix {
+        target: Target,
+        version: u64,
+        journal: Journal,
+    },
+    Read {
+        target: Target,
+        version: u64,
+        limit: ReadLimit,
+        journal: Journal,
+    },
+}
+impl Operation {
+    fn tag(&self) -> u8 {
+        match self {
+            Self::Journal { .. } => 1,
+            Self::Command { .. } => 2,
+            Self::Visibility { .. } => 3,
+            Self::Prepare { .. } => 4,
+            Self::Advance { .. } => 5,
+            Self::Prefix { .. } => 6,
+            Self::Read { .. } => 7,
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reply {
+    version: u32,
+    operation: u8,
+    identity: Identity,
+    nonce: u64,
+    result: Result<Value, Error>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum Value {
+    Journal(Journal),
+    Unit,
+    Visibility(VisibilityInfo),
+    Status(Status),
+    Prefix(u64),
+    Evidence(Journal),
+    Snapshot(Snapshot, Journal),
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    shard: u64,
+    epoch: u64,
+    authority: Authority,
+    version: u64,
+    baseline_sequence: u64,
+    cohort: Option<Cohort>,
+    applied_prefix: u64,
+    local_sequence: u64,
+    replay_operations: usize,
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+impl From<ReadSnapshot> for Snapshot {
+    fn from(s: ReadSnapshot) -> Self {
+        Self {
+            shard: s.shard,
+            epoch: s.epoch,
+            authority: s.authority,
+            version: s.version,
+            baseline_sequence: s.baseline_sequence,
+            cohort: s.cohort,
+            applied_prefix: s.applied_prefix,
+            local_sequence: s.local_sequence,
+            replay_operations: s.replay_operations,
+            entries: s.entries.into_iter().collect(),
+        }
+    }
+}
+impl Snapshot {
+    fn into_read(self) -> Result<ReadSnapshot, Error> {
+        let mut entries = BTreeMap::new();
+        for (k, v) in self.entries {
+            if entries.insert(k, v).is_some() {
+                return Err(Error::Protocol);
+            }
+        }
+        Ok(ReadSnapshot {
+            shard: self.shard,
+            epoch: self.epoch,
+            authority: self.authority,
+            version: self.version,
+            baseline_sequence: self.baseline_sequence,
+            cohort: self.cohort,
+            applied_prefix: self.applied_prefix,
+            local_sequence: self.local_sequence,
+            replay_operations: self.replay_operations,
+            entries,
+        })
+    }
+}
+
+fn valid_timeout(timeout: Duration) -> Result<(), Error> {
+    if timeout.is_zero() || timeout > MAX_TIMEOUT {
+        Err(Error::Capacity)
+    } else {
+        Ok(())
+    }
+}
+fn cpu_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENCY)))
+}
+fn outbound_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENCY)))
+}
+// The permit lives in the blocking closure, including after a caller times out.
+async fn cpu<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
+    cpu_with_slots(cpu_slots().clone(), work).await
+}
+async fn cpu_with_slots<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    work: impl FnOnce() -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
+    let permit = slots
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| Error::Unavailable)?
+}
+struct BoundedWriter(Vec<u8>);
+impl Write for BoundedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_FRAME_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("frame capacity"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn encode_sync<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
+    let mut writer = BoundedWriter(Vec::new());
+    serde_json::to_writer(&mut writer, value).map_err(|_| Error::Capacity)?;
+    Ok(writer.0)
+}
+async fn encode<T: Serialize + Send + 'static>(value: T) -> Result<Vec<u8>, Error> {
+    cpu(move || encode_sync(&value)).await
+}
+async fn receive<T: DeserializeOwned + Send + 'static>(stream: &mut TcpStream) -> Result<T, Error> {
+    let length = stream.read_u32().await.map_err(|_| Error::Unavailable)? as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(Error::Capacity);
+    }
+    let mut bytes = vec![0; length];
+    stream
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    cpu(move || serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)).await
+}
+async fn send(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), Error> {
+    if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
+        return Err(Error::Capacity);
+    }
+    stream
+        .write_u32(bytes.len() as u32)
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|_| Error::Unavailable)
+}
+
+/// A fixed remote replica. No forwarding, discovery, or failover occurs.
+#[derive(Clone)]
+pub struct Client {
+    address: SocketAddr,
+    identity: Identity,
+    timeout: Duration,
+    slots: Arc<Semaphore>,
+    nonce: Arc<AtomicU64>,
+}
+impl Client {
+    pub fn new(address: SocketAddr, identity: Identity, timeout: Duration) -> Result<Self, Error> {
+        identity.validate()?;
+        valid_timeout(timeout)?;
+        Ok(Self {
+            address,
+            identity,
+            timeout,
+            slots: outbound_slots().clone(),
+            nonce: Arc::new(AtomicU64::new(1)),
+        })
+    }
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+    #[cfg(test)]
+    async fn call(&self, operation: Operation) -> Result<Value, Error> {
+        self.call_at(operation, tokio::time::Instant::now() + self.timeout)
+            .await
+    }
+    // Fail before connecting: the response envelope cannot make a request for
+    // another role, mode, cohort or participant valid on this fixed endpoint.
+    fn validate_operation(&self, operation: &Operation) -> Result<(), Error> {
+        let participant = |target: &Target| {
+            self.identity.role == Role::Participant && self.identity.target == *target
+        };
+        let history = |journal: &Journal| {
+            journal.authority() == self.identity.authority.mode
+                && journal.cohort() == Some(&self.identity.cohort)
+        };
+        let valid = match operation {
+            Operation::Journal { authority, epoch }
+            | Operation::Command {
+                authority, epoch, ..
+            } => {
+                self.identity.role == Role::Coordinator
+                    && self.identity.authority == *authority
+                    && self.identity.target.epoch == *epoch
+            }
+            Operation::Visibility { target } => participant(target),
+            Operation::Prepare {
+                authority,
+                participant: descriptor,
+                request,
+                journal,
+            } => {
+                participant(&Target {
+                    shard: descriptor.shard,
+                    epoch: descriptor.epoch,
+                    mode: descriptor.mode,
+                }) && self.identity.authority == *authority
+                    && history(journal)
+                    && request.shard == descriptor.shard
+                    && request.epoch == descriptor.epoch
+            }
+            Operation::Advance {
+                authority,
+                target,
+                journal,
+                ..
+            } => participant(target) && self.identity.authority == *authority && history(journal),
+            Operation::Prefix {
+                target, journal, ..
+            }
+            | Operation::Read {
+                target, journal, ..
+            } => participant(target) && history(journal),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::Identity)
+        }
+    }
+    async fn call_at(
+        &self,
+        operation: Operation,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, Error> {
+        self.validate_operation(&operation)?;
+        let _permit = self.slots.try_acquire().map_err(|_| Error::Capacity)?;
+        tokio::time::timeout_at(deadline, async {
+            // Retain the documented Rust 1.95 API while newer toolchains rename it.
+            #[allow(deprecated)]
+            let nonce = self
+                .nonce
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| Error::Capacity)?;
+            let operation_tag = operation.tag();
+            let bytes = encode(Request {
+                version: 1,
+                identity: self.identity.clone(),
+                nonce,
+                operation,
+            })
+            .await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Unavailable);
+            }
+            let mut stream = TcpStream::connect(self.address)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Unavailable);
+            }
+            send(&mut stream, &bytes).await?;
+            let reply: Reply = receive(&mut stream).await?;
+            if reply.version != 1
+                || reply.operation != operation_tag
+                || reply.identity != self.identity
+                || reply.nonce != nonce
+            {
+                return Err(Error::Identity);
+            }
+            reply.result
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+}
+
+/// Borrowed local/remote handle shared by managed graph and cohort algorithms.
+#[derive(Clone, Copy)]
+pub enum NodeRef<'a> {
+    Local(&'a NodeHandle),
+    Remote(&'a Client),
+}
+impl NodeRef<'_> {
+    async fn call(self, build: impl FnOnce() -> Operation) -> Result<Value, Error> {
+        let duration = match self {
+            Self::Local(_) => LOCAL_TIMEOUT,
+            Self::Remote(c) => c.timeout,
+        };
+        let deadline = tokio::time::Instant::now() + duration;
+        let op = build();
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable);
+        }
+        let result = tokio::time::timeout_at(deadline, async {
+            match self {
+                Self::Local(node) => dispatch(node, None, op, deadline).await,
+                Self::Remote(client) => client.call_at(op, deadline).await,
+            }
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable);
+        }
+        result
+    }
+    pub async fn journal(self, authority: &Authority, epoch: u64) -> Result<Journal, Error> {
+        match self
+            .call(|| Operation::Journal {
+                authority: authority.clone(),
+                epoch,
+            })
+            .await?
+        {
+            Value::Journal(v) => {
+                if matches!(self, Self::Local(_)) && v.cohort().is_none() {
+                    return Ok(v);
+                }
+                let cohort = evidence(authority, &v)?;
+                if cohort.coordinator_epoch != epoch
+                    || matches!(self, Self::Remote(c) if c.identity.role != Role::Coordinator
+                        || c.identity.authority != *authority || c.identity.target.epoch != epoch
+                        || c.identity.cohort != *cohort)
+                {
+                    return Err(Error::Identity);
+                }
+                Ok(v)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    pub async fn command(
+        self,
+        authority: &Authority,
+        epoch: u64,
+        command: Command,
+    ) -> Result<(), Error> {
+        match self
+            .call(|| Operation::Command {
+                authority: authority.clone(),
+                epoch,
+                command,
+            })
+            .await?
+        {
+            Value::Unit => Ok(()),
+            _ => Err(Error::Protocol),
+        }
+    }
+    pub async fn visibility(self, target: &Target) -> Result<VisibilityInfo, Error> {
+        match self
+            .call(|| Operation::Visibility {
+                target: target.clone(),
+            })
+            .await?
+        {
+            Value::Visibility(v) => {
+                let cohort = v.cohort.as_ref().ok_or(Error::Identity)?;
+                if v.baseline_sequence != 0
+                    || v.authority.mode == [0; 16]
+                    || cohort.coordinator_shard != v.authority.shard
+                    || !cohort.members.iter().any(|m| {
+                        m.shard == target.shard && m.epoch == target.epoch && m.mode == target.mode
+                    })
+                    || matches!(self, Self::Remote(c) if c.identity.role != Role::Participant
+                        || c.identity.target != *target || c.identity.authority != v.authority
+                        || c.identity.cohort != *cohort)
+                {
+                    return Err(Error::Identity);
+                }
+                Ok(v)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    pub async fn prepare(
+        self,
+        authority: &Authority,
+        participant: &Participant,
+        request: D1WriteRequest,
+        journal: &Journal,
+    ) -> Result<Status, Error> {
+        match self
+            .call(|| Operation::Prepare {
+                authority: authority.clone(),
+                participant: participant.clone(),
+                request,
+                journal: journal.clone(),
+            })
+            .await?
+        {
+            Value::Status(v) => Ok(v),
+            _ => Err(Error::Protocol),
+        }
+    }
+    pub async fn advance(
+        self,
+        authority: &Authority,
+        target: &Target,
+        ordinal: u64,
+        journal: &Journal,
+    ) -> Result<u64, Error> {
+        match self
+            .call(|| Operation::Advance {
+                authority: authority.clone(),
+                target: target.clone(),
+                ordinal,
+                journal: journal.clone(),
+            })
+            .await?
+        {
+            Value::Prefix(v) => Ok(v),
+            _ => Err(Error::Protocol),
+        }
+    }
+    pub async fn prefix(
+        self,
+        target: &Target,
+        version: u64,
+        journal: &Journal,
+    ) -> Result<(), Error> {
+        let timeout = match self {
+            Self::Local(_) => LOCAL_TIMEOUT,
+            Self::Remote(c) => c.timeout,
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::time::timeout_at(deadline, async {
+            match self
+                .call(|| Operation::Prefix {
+                    target: target.clone(),
+                    version,
+                    journal: journal.clone(),
+                })
+                .await?
+            {
+                Value::Evidence(retained) => {
+                    let observed = journal.clone();
+                    cpu(move || {
+                        if retained.same_terminal_prefix(&observed, version) {
+                            Ok(())
+                        } else {
+                            Err(Error::Identity)
+                        }
+                    })
+                    .await
+                }
+                _ => Err(Error::Protocol),
+            }
+        })
+        .await
+        .map_err(|_| Error::Unavailable)??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable);
+        }
+        Ok(())
+    }
+    pub async fn read(
+        self,
+        target: &Target,
+        version: u64,
+        limit: ReadLimit,
+        journal: &Journal,
+    ) -> Result<ReadSnapshot, Error> {
+        let timeout = match self {
+            Self::Local(_) => LOCAL_TIMEOUT,
+            Self::Remote(c) => c.timeout,
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = tokio::time::timeout_at(deadline, async {
+            let expected = limit.clone();
+            match self
+                .call(|| Operation::Read {
+                    target: target.clone(),
+                    version,
+                    limit,
+                    journal: journal.clone(),
+                })
+                .await?
+            {
+                Value::Snapshot(v, retained) => {
+                    if v.shard != target.shard
+                        || v.epoch != target.epoch
+                        || v.version != version
+                        || v.baseline_sequence != 0
+                        || v.cohort.as_ref() != journal.cohort()
+                        || v.authority.mode != journal.authority()
+                        || journal
+                            .cohort()
+                            .is_none_or(|c| v.authority.shard != c.coordinator_shard)
+                        || v.applied_prefix < version
+                    {
+                        return Err(Error::Identity);
+                    }
+                    if v.entries.len() > expected.rows
+                        || v.replay_operations > expected.operations
+                        || v.entries
+                            .iter()
+                            .try_fold(0usize, |sum, (k, v)| {
+                                sum.checked_add(k.len())?.checked_add(v.len())
+                            })
+                            .is_none_or(|bytes| bytes > expected.bytes)
+                    {
+                        return Err(Error::Capacity);
+                    }
+                    let observed = journal.clone();
+                    cpu(move || {
+                        if !retained.same_terminal_prefix(&observed, version) {
+                            return Err(Error::Identity);
+                        }
+                        v.into_read()
+                    })
+                    .await
+                }
+                _ => Err(Error::Protocol),
+            }
+        })
+        .await
+        .map_err(|_| Error::Unavailable)??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable);
+        }
+        Ok(result)
+    }
+}
+
+fn evidence<'a>(authority: &Authority, journal: &'a Journal) -> Result<&'a Cohort, Error> {
+    let cohort = journal.cohort().ok_or(Error::Identity)?;
+    if journal.authority() != authority.mode || cohort.coordinator_shard != authority.shard {
+        return Err(Error::Identity);
+    }
+    Ok(cohort)
+}
+async fn visibility(
+    node: &WorkNode,
+    target: &Target,
+    pinned: Option<&Identity>,
+) -> Result<VisibilityInfo, Error> {
+    if pinned.is_some_and(|p| p.role != Role::Participant || p.target != *target) {
+        return Err(Error::Identity);
+    }
+    let info = node
+        .state_machine
+        .participant_visibility_info(target.shard, target.epoch, target.mode)
+        .await
+        .map_err(Error::Application)?;
+    if info.baseline_sequence != 0
+        || info.cohort.is_none()
+        || pinned.is_some_and(|p| {
+            p.authority != info.authority || info.cohort.as_ref() != Some(&p.cohort)
+        })
+    {
+        return Err(Error::Identity);
+    }
+    Ok(info)
+}
+async fn checked_journal(
+    node: &WorkNode,
+    pinned: Option<&Identity>,
+    authority: &Authority,
+    epoch: u64,
+) -> Result<Journal, Error> {
+    if pinned.is_some_and(|p| {
+        p.role != Role::Coordinator || p.authority != *authority || p.target.epoch != epoch
+    }) {
+        return Err(Error::Identity);
+    }
+    let journal = node
+        .state_machine
+        .coordinator_journal(authority.shard, epoch, authority.mode)
+        .await
+        .map_err(Error::Application)?;
+    if pinned.is_none() && journal.cohort().is_none() {
+        return Ok(journal);
+    }
+    let cohort = evidence(authority, &journal)?;
+    if cohort.coordinator_epoch != epoch || pinned.is_some_and(|p| &p.cohort != cohort) {
+        return Err(Error::Identity);
+    }
+    Ok(journal)
+}
+async fn submit(
+    node: &WorkNode,
+    deadline: tokio::time::Instant,
+    command: D1Command,
+) -> Result<D1Result, Error> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Unavailable);
+    }
+    node.raft
+        .client_write(LogCommand::D1V1(command))
+        .await
+        .map_err(|_| Error::Unavailable)?
+        .data
+        .d1
+        .ok_or(Error::Protocol)?
+        .map_err(Error::Application)
+}
+struct WorkNode {
+    raft: crate::network::Raft,
+    state_machine: Arc<crate::StateMachine>,
+}
+async fn dispatch(
+    node: &NodeHandle,
+    pinned: Option<Identity>,
+    op: Operation,
+    deadline: tokio::time::Instant,
+) -> Result<Value, Error> {
+    let node = WorkNode {
+        raft: node.raft.clone(),
+        state_machine: node.state_machine.clone(),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    cpu(move || {
+        runtime.block_on(async {
+            let result =
+                tokio::time::timeout_at(deadline, execute(&node, pinned.as_ref(), op, deadline))
+                    .await
+                    .map_err(|_| Error::Unavailable)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Unavailable);
+            }
+            result
+        })
+    })
+    .await
+}
+async fn execute(
+    node: &WorkNode,
+    pinned: Option<&Identity>,
+    op: Operation,
+    deadline: tokio::time::Instant,
+) -> Result<Value, Error> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Unavailable);
+    }
+    node.raft
+        .ensure_linearizable()
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Unavailable);
+    }
+    match op {
+        Operation::Journal { authority, epoch } => Ok(Value::Journal(
+            checked_journal(node, pinned, &authority, epoch).await?,
+        )),
+        Operation::Command {
+            authority,
+            epoch,
+            command,
+        } => {
+            checked_journal(node, pinned, &authority, epoch).await?;
+            if matches!(command, Command::BindCohort { .. }) {
+                return Err(Error::Identity);
+            }
+            match submit(
+                node,
+                deadline,
+                D1Command::Coordinator {
+                    shard: authority.shard,
+                    epoch,
+                    mode_id: authority.mode,
+                    command,
+                },
+            )
+            .await?
+            {
+                D1Result::Coordinator { .. } => Ok(Value::Unit),
+                _ => Err(Error::Protocol),
+            }
+        }
+        Operation::Visibility { target } => {
+            Ok(Value::Visibility(visibility(node, &target, pinned).await?))
+        }
+        Operation::Prepare {
+            authority,
+            participant,
+            request,
+            journal,
+        } => {
+            let target = Target {
+                shard: participant.shard,
+                epoch: participant.epoch,
+                mode: participant.mode,
+            };
+            let info = visibility(node, &target, pinned).await?;
+            let cohort = evidence(&authority, &journal)?;
+            if info.authority != authority
+                || info.cohort.as_ref() != Some(cohort)
+                || request.shard != participant.shard
+                || request.epoch != participant.epoch
+                || !cohort.contains(&participant)
+            {
+                return Err(Error::Identity);
+            }
+            let tx = journal
+                .transaction(request.request_id)
+                .ok_or(Error::Identity)?;
+            if !tx.participants.contains(&participant) || tx.decision.is_some() {
+                return Err(Error::Identity);
+            }
+            if let Some(record) = journal.request_for_transaction(request.request_id) {
+                let payload = record.payload.clone();
+                let plan =
+                    crate::request_plans::Plan::decode(&payload).map_err(|_| Error::Identity)?;
+                if record.transaction_id != request.request_id
+                    || plan.id != request.request_id
+                    || plan.authority != authority
+                    || &plan.cohort != cohort
+                    || !plan
+                        .parts
+                        .iter()
+                        .any(|p| p.descriptor == participant && p.request == request)
+                {
+                    return Err(Error::Identity);
+                }
+            }
+            match submit(
+                node,
+                deadline,
+                D1Command::PrepareParticipant {
+                    authority,
+                    participant,
+                    request,
+                },
+            )
+            .await?
+            {
+                D1Result::Participant(status) => Ok(Value::Status(status)),
+                _ => Err(Error::Protocol),
+            }
+        }
+        Operation::Advance {
+            authority,
+            target,
+            ordinal,
+            journal,
+        } => {
+            let info = visibility(node, &target, pinned).await?;
+            if info.authority != authority
+                || info.cohort.as_ref() != Some(evidence(&authority, &journal)?)
+            {
+                return Err(Error::Identity);
+            }
+            match submit(
+                node,
+                deadline,
+                D1Command::AdvanceVisibility {
+                    authority,
+                    shard: target.shard,
+                    epoch: target.epoch,
+                    mode_id: target.mode,
+                    ordinal,
+                    journal,
+                },
+            )
+            .await?
+            {
+                D1Result::Visibility { applied_prefix } => Ok(Value::Prefix(applied_prefix)),
+                _ => Err(Error::Protocol),
+            }
+        }
+        Operation::Prefix {
+            target,
+            version,
+            journal,
+        } => {
+            let info = visibility(node, &target, pinned).await?;
+            if info.cohort.as_ref() != Some(evidence(&info.authority, &journal)?) {
+                return Err(Error::Identity);
+            }
+            let retained = node
+                .state_machine
+                .participant_prefix_evidence(
+                    target.shard,
+                    target.epoch,
+                    target.mode,
+                    version,
+                    &journal,
+                )
+                .await
+                .map_err(Error::Application)?;
+            Ok(Value::Evidence(retained))
+        }
+        Operation::Read {
+            target,
+            version,
+            limit,
+            journal,
+        } => {
+            let info = visibility(node, &target, pinned).await?;
+            if info.cohort.as_ref() != Some(evidence(&info.authority, &journal)?) {
+                return Err(Error::Identity);
+            }
+            let (snapshot, retained) = node
+                .state_machine
+                .certified_participant_read_with_evidence(
+                    target.shard,
+                    target.epoch,
+                    target.mode,
+                    version,
+                    limit,
+                    &journal,
+                )
+                .await
+                .map_err(Error::Application)?;
+            Ok(Value::Snapshot(snapshot.into(), retained))
+        }
+    }
+}
+
+/// Listener for exactly one configured node. Existing role activation is required.
+/// Shutdown stops admission and waits for bounded in-flight handlers.
+pub struct Server {
+    address: SocketAddr,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+impl Server {
+    pub async fn bind(
+        node: Arc<NodeHandle>,
+        identity: Identity,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        identity.validate()?;
+        valid_timeout(timeout)?;
+        if identity.node != node.id || identity.group != node.group_id() {
+            return Err(Error::Identity);
+        }
+        let probe = match identity.role {
+            Role::Coordinator => Operation::Journal {
+                authority: identity.authority.clone(),
+                epoch: identity.target.epoch,
+            },
+            Role::Participant => Operation::Visibility {
+                target: identity.target.clone(),
+            },
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::time::timeout_at(
+            deadline,
+            dispatch(&node, Some(identity.clone()), probe, deadline),
+        )
+        .await
+        .map_err(|_| Error::Unavailable)??;
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        let address = listener.local_addr().map_err(|_| Error::Unavailable)?;
+        let (stop, mut stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let slots = Arc::new(Semaphore::new(CONCURRENCY));
+            let mut handlers = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
+                    accepted = listener.accept() => {
+                        let Ok((mut stream,_)) = accepted else { break; };
+                        let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
+                        let node = node.clone(); let identity = identity.clone();
+                        handlers.spawn(async move {
+                            let _permit = permit;
+                            let deadline = tokio::time::Instant::now() + timeout;
+                            let _ = tokio::time::timeout_at(deadline, async {
+                                let request: Request = receive(&mut stream).await?;
+                                let operation = request.operation.tag();
+                                let result = if request.version != 1 { Err(Error::Protocol) } else if request.identity != identity { Err(Error::Identity) }
+                                    else { dispatch(&node,Some(identity.clone()),request.operation,deadline).await };
+                                let bytes = match encode(Reply { version:1,operation,identity:identity.clone(),nonce:request.nonce,result }).await {
+                                    Ok(bytes) => bytes,
+                                    Err(error) => encode(Reply { version:1,operation,identity,nonce:request.nonce,result:Err(error) }).await?,
+                                };
+                                if tokio::time::Instant::now() >= deadline { return Err(Error::Unavailable); }
+                                send(&mut stream,&bytes).await
+                            }).await;
+                        });
+                    }
+                }
+            }
+            while handlers.join_next().await.is_some() {}
+        });
+        Ok(Self {
+            address,
+            stop: Some(stop),
+            task: Some(task),
+        })
+    }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_writer_and_strict_json() {
+        let mut writer = BoundedWriter(vec![0; MAX_FRAME_BYTES - 1]);
+        assert!(writer.write_all(&[1, 2]).is_err());
+        assert_eq!(writer.0.len(), MAX_FRAME_BYTES - 1);
+        assert!(serde_json::from_str::<Operation>(
+            r#"{"Visibility":{"target":{"shard":1,"epoch":1,"mode":[0]},"extra":true}}"#
+        )
+        .is_err());
+        assert_eq!(valid_timeout(Duration::ZERO), Err(Error::Capacity));
+        assert_eq!(
+            valid_timeout(MAX_TIMEOUT + Duration::from_secs(1)),
+            Err(Error::Capacity)
+        );
+    }
+    #[test]
+    fn application_error_roundtrip() {
+        let error = Error::Application(D1Error::VisibilityNotApplied);
+        assert_eq!(
+            serde_json::from_slice::<Error>(&encode_sync(&error).unwrap()).unwrap(),
+            error
+        );
+    }
+    #[tokio::test]
+    async fn oversized_length_is_rejected_before_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_u32((MAX_FRAME_BYTES + 1) as u32)
+                .await
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            receive::<Request>(&mut stream).await,
+            Err(Error::Capacity)
+        ));
+        writer.await.unwrap();
+    }
+    fn identity() -> Identity {
+        Identity {
+            group: 9,
+            node: 1,
+            target: Target {
+                shard: 9,
+                epoch: 1,
+                mode: [9; 16],
+            },
+            role: Role::Coordinator,
+            authority: Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
+            cohort: Cohort {
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                members: vec![crate::transaction_decisions::Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                }],
+            },
+        }
+    }
+    #[test]
+    fn rejects_inconsistent_role_target_and_duplicate_snapshot_keys() {
+        let mut wrong = identity();
+        wrong.role = Role::Participant;
+        assert_eq!(wrong.validate(), Err(Error::Identity));
+        let mut wrong = identity();
+        wrong.target.epoch = 2;
+        assert_eq!(wrong.validate(), Err(Error::Identity));
+        let id = identity();
+        let snapshot = Snapshot {
+            shard: 7,
+            epoch: 1,
+            authority: id.authority,
+            version: 0,
+            baseline_sequence: 0,
+            cohort: Some(id.cohort),
+            applied_prefix: 0,
+            local_sequence: 0,
+            replay_operations: 0,
+            entries: vec![(vec![1], vec![2]), (vec![1], vec![3])],
+        };
+        assert!(matches!(snapshot.into_read(), Err(Error::Protocol)));
+    }
+    #[tokio::test]
+    async fn forged_replies_and_slow_input_fail_closed() {
+        for wrong in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::new(
+                listener.local_addr().unwrap(),
+                identity(),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Request = receive(&mut stream).await.unwrap();
+                let mut reply = Reply {
+                    version: 1,
+                    operation: request.operation.tag(),
+                    identity: request.identity,
+                    nonce: request.nonce,
+                    result: Ok(Value::Unit),
+                };
+                match wrong {
+                    0 => reply.identity.group += 1,
+                    1 => reply.nonce += 1,
+                    2 => reply.operation += 1,
+                    _ => reply.version += 1,
+                }
+                send(&mut stream, &encode(reply).await.unwrap())
+                    .await
+                    .unwrap();
+            });
+            assert!(matches!(
+                client
+                    .call(Operation::Journal {
+                        authority: identity().authority,
+                        epoch: 1
+                    })
+                    .await,
+                Err(Error::Identity)
+            ));
+            peer.await.unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(
+            listener.local_addr().unwrap(),
+            identity(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _: Request = receive(&mut stream).await.unwrap();
+            stream.write_u32(100).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        assert!(matches!(
+            client
+                .call(Operation::Journal {
+                    authority: identity().authority,
+                    epoch: 1
+                })
+                .await,
+            Err(Error::Unavailable)
+        ));
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn server_rejects_unready_state_and_wrong_node_at_startup() {
+        let cluster = crate::Cluster::new();
+        let node = Arc::new(cluster.in_group(9).start(1).await.unwrap());
+        let mut wrong = identity();
+        wrong.group = 10;
+        assert!(matches!(
+            Server::bind(
+                node.clone(),
+                wrong,
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_millis(50)
+            )
+            .await,
+            Err(Error::Identity)
+        ));
+        assert!(matches!(
+            Server::bind(
+                node.clone(),
+                identity(),
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_millis(50)
+            )
+            .await,
+            Err(Error::Unavailable)
+        ));
+        node.raft.shutdown().await.unwrap();
+    }
+    #[test]
+    fn independent_clients_share_outbound_admission() {
+        let a = Client::new(
+            "127.0.0.1:1".parse().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let b = Client::new(
+            "127.0.0.1:2".parse().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&a.slots, &b.slots));
+    }
+    #[test]
+    fn journal_is_encoded_once_and_terminal_proofs_detect_other_histories() {
+        let id = identity();
+        let mut observed = Journal::new(id.authority.mode).unwrap();
+        observed
+            .apply(Command::BindCohort {
+                cohort: id.cohort.clone(),
+            })
+            .unwrap();
+        let participant = Participant {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+            intent: [1; 32],
+        };
+        observed
+            .apply(Command::Begin {
+                id: [1; 16],
+                participants: vec![participant.clone()],
+            })
+            .unwrap();
+        observed
+            .apply(Command::Decide {
+                id: [1; 16],
+                decision: crate::transaction_decisions::Decision::Abort,
+            })
+            .unwrap();
+        let mut other = Journal::new(id.authority.mode).unwrap();
+        other
+            .apply(Command::BindCohort { cohort: id.cohort })
+            .unwrap();
+        other
+            .apply(Command::Begin {
+                id: [2; 16],
+                participants: vec![participant],
+            })
+            .unwrap();
+        other
+            .apply(Command::Decide {
+                id: [2; 16],
+                decision: crate::transaction_decisions::Decision::Abort,
+            })
+            .unwrap();
+        assert!(!observed.same_terminal_prefix(&other, 1));
+        let journal_bytes = observed.encode().unwrap();
+        let reply = encode_sync(&Value::Evidence(observed.clone())).unwrap();
+        assert!(reply
+            .windows(journal_bytes.len())
+            .any(|window| window == journal_bytes));
+        assert!(reply.len() < journal_bytes.len() + 32);
+        let Value::Evidence(decoded) = serde_json::from_slice::<Value>(&reply).unwrap() else {
+            panic!("wrong reply");
+        };
+        assert!(observed.same_terminal_prefix(&decoded, 1));
+    }
+    #[tokio::test]
+    async fn canceled_cpu_caller_retains_permit_until_work_finishes() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (entered, ready) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let work_slots = slots.clone();
+        let work = tokio::spawn(async move {
+            cpu_with_slots(work_slots, move || {
+                let _ = entered.send(());
+                blocked
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| Error::Unavailable)?;
+                Ok(())
+            })
+            .await
+        });
+        ready.await.unwrap();
+        work.abort();
+        let _ = work.await;
+        assert!(slots.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+    }
+    #[test]
+    fn frame_reserves_full_journal_and_admitted_payload() {
+        // Direct Journal JSON is already capped at MAX_JOURNAL_BYTES. A
+        // byte-array payload uses at most four JSON bytes per input byte;
+        // fixed identity/envelope fields are comfortably below 64 KiB.
+        let worst = crate::transaction_decisions::MAX_JOURNAL_BYTES
+            + 4 * crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES
+            + 64 * 1024;
+        assert!(MAX_FRAME_BYTES > worst);
+    }
+    async fn fake_value(id: Identity, value: Value) -> (Client, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            Client::new(listener.local_addr().unwrap(), id, Duration::from_secs(2)).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Request = receive(&mut stream).await.unwrap();
+            let reply = Reply {
+                version: 1,
+                operation: request.operation.tag(),
+                identity: request.identity,
+                nonce: request.nonce,
+                result: Ok(value),
+            };
+            send(&mut stream, &encode(reply).await.unwrap())
+                .await
+                .unwrap();
+        });
+        (client, peer)
+    }
+    fn terminal_journal(tx: u8) -> Journal {
+        let mut journal = Journal::new(identity().authority.mode).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: identity().cohort,
+            })
+            .unwrap();
+        journal
+            .apply(Command::Begin {
+                id: [tx; 16],
+                participants: vec![Participant {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                    intent: [1; 32],
+                }],
+            })
+            .unwrap();
+        journal
+            .apply(Command::Decide {
+                id: [tx; 16],
+                decision: crate::transaction_decisions::Decision::Abort,
+            })
+            .unwrap();
+        journal
+    }
+    #[tokio::test]
+    async fn matching_envelopes_cannot_substitute_journal_visibility_or_read_evidence() {
+        let observed = terminal_journal(1);
+        let mut wrong_cohort = identity().cohort;
+        wrong_cohort.members[0].epoch = 2;
+        let mut bad_journal = Journal::new(identity().authority.mode).unwrap();
+        bad_journal
+            .apply(Command::BindCohort {
+                cohort: wrong_cohort,
+            })
+            .unwrap();
+        let (client, peer) = fake_value(identity(), Value::Journal(bad_journal)).await;
+        assert!(matches!(
+            NodeRef::Remote(&client)
+                .journal(&identity().authority, 1)
+                .await,
+            Err(Error::Identity)
+        ));
+        peer.await.unwrap();
+
+        let mut participant_id = identity();
+        participant_id.role = Role::Participant;
+        participant_id.target = Target {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+        };
+        let target = participant_id.target.clone();
+        let info = VisibilityInfo {
+            authority: identity().authority,
+            baseline_sequence: 1,
+            cohort: Some(identity().cohort),
+            applied_prefix: 1,
+        };
+        let (client, peer) = fake_value(participant_id.clone(), Value::Visibility(info)).await;
+        assert!(matches!(
+            NodeRef::Remote(&client).visibility(&target).await,
+            Err(Error::Identity)
+        ));
+        peer.await.unwrap();
+
+        let (client, peer) =
+            fake_value(participant_id.clone(), Value::Evidence(terminal_journal(2))).await;
+        assert!(matches!(
+            NodeRef::Remote(&client).prefix(&target, 1, &observed).await,
+            Err(Error::Identity)
+        ));
+        peer.await.unwrap();
+        for fault in 0..5 {
+            let mut snapshot = Snapshot {
+                shard: 7,
+                epoch: 1,
+                authority: identity().authority,
+                version: 1,
+                baseline_sequence: 0,
+                cohort: Some(identity().cohort),
+                applied_prefix: 1,
+                local_sequence: 0,
+                replay_operations: 1,
+                entries: vec![(vec![1], vec![2])],
+            };
+            let mut retained = observed.clone();
+            match fault {
+                0 => retained = terminal_journal(2),
+                1 => snapshot.version = 0,
+                2 => snapshot.entries.push((vec![3], vec![4])),
+                3 => snapshot.entries[0].1 = vec![2; 10],
+                _ => snapshot.replay_operations = 2,
+            }
+            let (client, peer) =
+                fake_value(participant_id.clone(), Value::Snapshot(snapshot, retained)).await;
+            let result = NodeRef::Remote(&client)
+                .read(
+                    &target,
+                    1,
+                    ReadLimit {
+                        rows: 1,
+                        bytes: 2,
+                        operations: 1,
+                    },
+                    &observed,
+                )
+                .await;
+            if fault < 2 {
+                assert!(matches!(result, Err(Error::Identity)));
+            } else {
+                assert!(matches!(result, Err(Error::Capacity)));
+            }
+            peer.await.unwrap();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_server_bounds_incomplete_input_and_remains_available() {
+        let cluster = crate::Cluster::new();
+        let node = Arc::new(cluster.in_group(9).start(1).await.unwrap());
+        node.raft
+            .initialize(BTreeMap::from([(1, openraft::BasicNode::default())]))
+            .await
+            .unwrap();
+        node.raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |m| m.current_leader == Some(1) && m.last_applied.is_some(),
+                "leader",
+            )
+            .await
+            .unwrap();
+        for command in [
+            D1Command::Activate { shard: 9, epoch: 1 },
+            D1Command::EnableManagedWrites {
+                shard: 9,
+                epoch: 1,
+                expected_sequence: 0,
+                mode_id: [9; 16],
+            },
+            D1Command::EnableCoordinator {
+                shard: 9,
+                epoch: 1,
+                mode_id: [9; 16],
+            },
+            D1Command::Coordinator {
+                shard: 9,
+                epoch: 1,
+                mode_id: [9; 16],
+                command: Command::BindCohort {
+                    cohort: identity().cohort,
+                },
+            },
+        ] {
+            if matches!(command, D1Command::Coordinator { .. }) {
+                let result = crate::cohort_reads::acquire(
+                    &node,
+                    identity().authority,
+                    1,
+                    Vec::new(),
+                    None,
+                    ReadLimit {
+                        rows: 1,
+                        bytes: 1,
+                        operations: 1,
+                    },
+                    Duration::from_secs(1),
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(crate::cohort_reads::Error::UnboundCohort)
+                ));
+            }
+            node.raft
+                .client_write(LogCommand::D1V1(command))
+                .await
+                .unwrap()
+                .data
+                .d1
+                .unwrap()
+                .unwrap();
+        }
+        let server = Server::bind(
+            node.clone(),
+            identity(),
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        let mut slow = TcpStream::connect(server.local_addr()).await.unwrap();
+        slow.write_u32(100).await.unwrap();
+        slow.write_all(b"{").await.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), slow.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let client = Client::new(server.local_addr(), identity(), Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .journal(&identity().authority, 1)
+                .await
+                .unwrap()
+                .transaction_count(),
+            0
+        );
+        server.shutdown().await;
+        node.raft.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn wrong_fixed_target_mode_role_and_history_never_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut id = identity();
+        id.role = Role::Participant;
+        id.target = Target {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+        };
+        let client = Client::new(
+            listener.local_addr().unwrap(),
+            id.clone(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let node = NodeRef::Remote(&client);
+        let journal = terminal_journal(1);
+        let mut wrong = id.target.clone();
+        wrong.mode = [8; 16];
+        assert!(matches!(
+            node.prefix(&wrong, 1, &journal).await,
+            Err(Error::Identity)
+        ));
+        assert!(matches!(
+            node.read(
+                &wrong,
+                1,
+                ReadLimit {
+                    rows: 1,
+                    bytes: 1,
+                    operations: 1
+                },
+                &journal
+            )
+            .await,
+            Err(Error::Identity)
+        ));
+        assert!(matches!(
+            node.advance(&id.authority, &wrong, 1, &journal).await,
+            Err(Error::Identity)
+        ));
+        let descriptor = Participant {
+            shard: wrong.shard,
+            epoch: wrong.epoch,
+            mode: wrong.mode,
+            intent: [1; 32],
+        };
+        let request = D1WriteRequest {
+            shard: 7,
+            epoch: 1,
+            request_id: [1; 16],
+            expected_sequence: Some(0),
+            operations: vec![crate::WriteOp::put("a", "b")],
+        };
+        assert!(matches!(
+            node.prepare(&id.authority, &descriptor, request, &journal)
+                .await,
+            Err(Error::Identity)
+        ));
+        assert!(matches!(
+            node.command(
+                &id.authority,
+                1,
+                Command::Decide {
+                    id: [1; 16],
+                    decision: crate::transaction_decisions::Decision::Abort
+                }
+            )
+            .await,
+            Err(Error::Identity)
+        ));
+        let mut other = Journal::new([8; 16]).unwrap();
+        other
+            .apply(Command::BindCohort { cohort: id.cohort })
+            .unwrap();
+        assert!(matches!(
+            node.prefix(&id.target, 0, &other).await,
+            Err(Error::Identity)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+}
