@@ -652,3 +652,5 @@ The bounded explicit-ID server path also supports terminal selected-property
 vertex in one query. See [the map contract](docs/QUERY_SPEC.md#distributed-synchronous-selected-property-maps).
 It keeps the existing synchronous budgets and per-shard snapshot limits; this
 does not add global joins or general Gremlin support.
+
+Experimental [fixed-cohort snapshot sessions](docs/CERTIFIED_COHORT_READS.md) certify empty-baseline KV participants at one retained decision version. They do not enable the remote graph GlobalCommittedSnapshot API.

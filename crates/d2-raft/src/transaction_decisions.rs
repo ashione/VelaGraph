@@ -19,6 +19,44 @@ pub struct Participant {
     pub intent: [u8; 32],
 }
 
+/// Fixed ownership identities for a graph starting from empty participant baselines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Member {
+    pub shard: u64,
+    pub epoch: u64,
+    pub mode: [u8; 16],
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cohort {
+    pub coordinator_shard: u64,
+    pub coordinator_epoch: u64,
+    pub members: Vec<Member>,
+}
+impl Cohort {
+    pub fn contains(&self, participant: &Participant) -> bool {
+        self.members.iter().any(|m| {
+            m.shard == participant.shard
+                && m.epoch == participant.epoch
+                && m.mode == participant.mode
+        })
+    }
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.members.is_empty()
+            || self.members.len() > MAX_PARTICIPANTS
+            || self
+                .members
+                .iter()
+                .any(|m| m.mode == [0; 16] || m.shard == self.coordinator_shard)
+            || self.members.windows(2).any(|w| w[0].shard >= w[1].shard)
+        {
+            return Err(Error::InvalidParticipants);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Commit,
@@ -28,6 +66,9 @@ pub enum Decision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Command {
+    BindCohort {
+        cohort: Cohort,
+    },
     Begin {
         id: [u8; 16],
         participants: Vec<Participant>,
@@ -74,6 +115,7 @@ pub struct Journal {
     events: Vec<Command>,
     transactions: Vec<Transaction>,
     reserved_bytes: usize,
+    cohort: Option<Cohort>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,7 +129,7 @@ struct Encoding {
 impl From<Journal> for Encoding {
     fn from(journal: Journal) -> Self {
         Self {
-            version: 1,
+            version: if journal.cohort.is_some() { 2 } else { 1 },
             authority: journal.authority,
             events: journal.events,
         }
@@ -111,9 +153,14 @@ impl Journal {
             events: Vec::new(),
             transactions: Vec::new(),
             reserved_bytes: 0,
+            cohort: None,
         };
         journal.reserved_bytes = journal.encode()?.len();
         Ok(journal)
+    }
+
+    pub fn cohort(&self) -> Option<&Cohort> {
+        self.cohort.as_ref()
     }
 
     pub fn transaction_count(&self) -> usize {
@@ -180,7 +227,7 @@ impl Journal {
     // times the bounded participant/transaction lookup sizes, not journal bytes.
     fn append(&mut self, command: Command, limit: usize) -> Result<bool, Error> {
         let released = match &command {
-            Command::Begin { .. } => 0,
+            Command::BindCohort { .. } | Command::Begin { .. } => 0,
             Command::Prepared { .. } => Self::event_bytes(&command)? + 1,
             Command::Decide { id, .. } => self
                 .transaction(*id)
@@ -209,6 +256,20 @@ impl Journal {
 
     fn transition(&mut self, command: &Command) -> Result<bool, Error> {
         match command {
+            Command::BindCohort { cohort } => {
+                cohort.validate()?;
+                if let Some(existing) = &self.cohort {
+                    return if existing == cohort {
+                        Ok(false)
+                    } else {
+                        Err(Error::IdentityConflict)
+                    };
+                }
+                if !self.events.is_empty() {
+                    return Err(Error::IncompatibleHistory);
+                }
+                self.cohort = Some(cohort.clone());
+            }
             Command::Begin { id, participants } => {
                 if *id == [0; 16] {
                     return Err(Error::InvalidIdentity);
@@ -223,6 +284,13 @@ impl Journal {
                         .any(|pair| pair[0].shard >= pair[1].shard)
                 {
                     return Err(Error::InvalidParticipants);
+                }
+                if self
+                    .cohort
+                    .as_ref()
+                    .is_some_and(|c| participants.iter().any(|p| !c.contains(p)))
+                {
+                    return Err(Error::UnknownParticipant);
                 }
                 if let Some(tx) = self.transaction(*id) {
                     return if tx.participants == *participants {
@@ -290,7 +358,7 @@ impl Journal {
 
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(&Encoding {
-            version: 1,
+            version: if self.cohort.is_some() { 2 } else { 1 },
             authority: self.authority,
             events: self.events.clone(),
         })
@@ -308,7 +376,8 @@ impl Journal {
             return Err(Error::Capacity);
         }
         let encoded: Encoding = serde_json::from_slice(bytes).map_err(|_| Error::InvalidJournal)?;
-        if encoded.version != 1 || encoded.events.len() > MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2)
+        if !matches!(encoded.version, 1 | 2)
+            || encoded.events.len() > MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2) + 1
         {
             return Err(Error::InvalidJournal);
         }
@@ -318,7 +387,19 @@ impl Journal {
                 return Err(Error::InvalidJournal);
             }
         }
+        if encoded.version != if result.cohort.is_some() { 2 } else { 1 } {
+            return Err(Error::InvalidJournal);
+        }
         Ok(result)
+    }
+
+    /// Equality of the immutable terminal transaction cut, not later journal observations.
+    pub fn same_terminal_prefix(&self, other: &Self, version: u64) -> bool {
+        self.authority == other.authority
+            && self.cohort == other.cohort
+            && version <= self.resolved_prefix()
+            && version <= other.resolved_prefix()
+            && (1..=version).all(|v| self.transaction_at(v) == other.transaction_at(v))
     }
 
     /// Snapshot replacement may only extend this exact authority's history.
@@ -551,5 +632,140 @@ mod tests {
             Journal::decode(&serde_json::to_vec(&duplicate).unwrap()),
             Err(Error::InvalidJournal)
         );
+    }
+}
+
+#[cfg(test)]
+mod cohort_tests {
+    use super::*;
+    fn binding() -> Cohort {
+        Cohort {
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: vec![Member {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+            }],
+        }
+    }
+    #[test]
+    fn immutable_cohort_canonical_codec_and_begin_admission() {
+        let mut j = Journal::new([9; 16]).unwrap();
+        let bind = Command::BindCohort { cohort: binding() };
+        j.apply(bind.clone()).unwrap();
+        let encoded = j.encode().unwrap();
+        let nine = format!("[{}]", ["9"; 16].join(","));
+        let seven = format!("[{}]", ["7"; 16].join(","));
+        let golden = format!(
+            r#"{{"version":2,"authority":{nine},"events":[{{"BindCohort":{{"cohort":{{"coordinator_shard":9,"coordinator_epoch":1,"members":[{{"shard":7,"epoch":1,"mode":{seven}}}]}}}}}}]}}"#
+        );
+        assert_eq!(std::str::from_utf8(&encoded).unwrap(), golden);
+        assert_eq!(Journal::decode(&encoded).unwrap(), j);
+        j.apply(bind).unwrap();
+        assert_eq!(j.encode().unwrap(), encoded);
+        let mut wrong_version: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        wrong_version["version"] = 1.into();
+        assert_eq!(
+            Journal::decode(&serde_json::to_vec(&wrong_version).unwrap()),
+            Err(Error::InvalidJournal)
+        );
+        for (shard, epoch, mode) in [(8, 1, [7; 16]), (7, 2, [7; 16]), (7, 1, [8; 16])] {
+            assert_eq!(
+                j.apply(Command::Begin {
+                    id: [1; 16],
+                    participants: vec![Participant {
+                        shard,
+                        epoch,
+                        mode,
+                        intent: [1; 32]
+                    }]
+                }),
+                Err(Error::UnknownParticipant)
+            );
+            assert_eq!(j.encode().unwrap(), encoded);
+        }
+        j.apply(Command::Begin {
+            id: [1; 16],
+            participants: vec![Participant {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+                intent: [1; 32],
+            }],
+        })
+        .unwrap();
+        j.apply(Command::Decide {
+            id: [1; 16],
+            decision: Decision::Abort,
+        })
+        .unwrap();
+        assert_eq!(Journal::decode(&j.encode().unwrap()).unwrap(), j);
+        let mut unbound = Journal::new([9; 16]).unwrap();
+        unbound
+            .apply(Command::Begin {
+                id: [1; 16],
+                participants: vec![Participant {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                    intent: [1; 32],
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            unbound.apply(Command::BindCohort { cohort: binding() }),
+            Err(Error::IncompatibleHistory)
+        );
+        let mut changed = binding();
+        changed.coordinator_epoch = 2;
+        assert_eq!(
+            j.apply(Command::BindCohort { cohort: changed }),
+            Err(Error::IdentityConflict)
+        );
+        assert_eq!(j.reserved_size().unwrap(), j.encode().unwrap().len());
+    }
+    #[test]
+    fn cohort_members_cannot_be_empty_unsorted_duplicate_or_coordinator() {
+        for members in [
+            vec![],
+            vec![Member {
+                shard: 9,
+                epoch: 1,
+                mode: [9; 16],
+            }],
+            vec![
+                Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16]
+                };
+                2
+            ],
+            vec![
+                Member {
+                    shard: 8,
+                    epoch: 1,
+                    mode: [8; 16],
+                },
+                Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                },
+            ],
+        ] {
+            let mut j = Journal::new([9; 16]).unwrap();
+            assert_eq!(
+                j.apply(Command::BindCohort {
+                    cohort: Cohort {
+                        members,
+                        ..binding()
+                    }
+                }),
+                Err(Error::InvalidParticipants)
+            );
+            assert!(j.cohort().is_none());
+        }
     }
 }

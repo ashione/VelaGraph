@@ -654,6 +654,68 @@ impl StateMachine {
         d1.read_at(version, limit)
     }
 
+    /// Local readiness metadata. A distributed caller must establish a leader
+    /// barrier and verify the complete fixed cohort before choosing a cut.
+    pub async fn participant_visibility_info(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<crate::cohort_reads::VisibilityInfo, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let visibility = d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?;
+        Ok(crate::cohort_reads::VisibilityInfo {
+            authority: d1.participant.as_ref().unwrap().authority.clone(),
+            baseline_sequence: visibility.baseline_sequence,
+            cohort: visibility.journal.cohort().cloned(),
+            applied_prefix: visibility.applied,
+        })
+    }
+
+    /// Same-lock proof that the retained local cut equals a trusted coordinator
+    /// terminal prefix. Callers still need a leader barrier and a complete cohort.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn certified_participant_read(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        version: u64,
+        limit: crate::versioned_reads::ReadLimit,
+        journal: &crate::transaction_decisions::Journal,
+    ) -> Result<crate::versioned_reads::ReadSnapshot, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let visibility = d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?;
+        if version > visibility.applied {
+            return Err(D1Error::VisibilityNotApplied);
+        }
+        if journal.cohort().is_none()
+            || visibility.baseline_sequence != 0
+            || !visibility.journal.same_terminal_prefix(journal, version)
+        {
+            return Err(D1Error::VisibilityHistory);
+        }
+        d1.read_at(version, limit)
+    }
+
     /// Local diagnostic participant status. Establish a leader read barrier
     /// before using this for distributed recovery; Unknown never means Aborted.
     pub async fn participant_status(
@@ -1216,6 +1278,7 @@ fn apply_d1(
             {
                 return Err(D1Error::VisibilityHistory);
             }
+            d1.check_cohort(&journal)?;
             if d1.visibility.is_none() {
                 if !participant.records.is_empty() {
                     return Err(D1Error::VisibilityHistory);
@@ -1375,6 +1438,11 @@ fn apply_d1(
             {
                 return Err(D1Error::ManagedModeConflict);
             }
+            if let crate::transaction_decisions::Command::BindCohort { cohort } = &command {
+                if cohort.coordinator_shard != d1.shard || cohort.coordinator_epoch != d1.epoch {
+                    return Err(D1Error::ParticipantAuthority);
+                }
+            }
             let journal = d1
                 .coordinator
                 .as_mut()
@@ -1405,7 +1473,13 @@ fn apply_d1(
         } => {
             let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
             d1.check_shard(shard)?;
-            if d1.visibility.is_some() && new_epoch != d1.epoch {
+            if (d1.visibility.is_some()
+                || d1
+                    .coordinator
+                    .as_ref()
+                    .is_some_and(|j| j.cohort().is_some()))
+                && new_epoch != d1.epoch
+            {
                 return Err(D1Error::VisibilityRequired);
             }
             if d1.participant.as_ref().is_some_and(|s| s.pending()) && new_epoch != d1.epoch {

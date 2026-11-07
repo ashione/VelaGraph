@@ -23,8 +23,11 @@ pub struct ReadSnapshot {
     pub epoch: u64,
     pub authority: crate::participant_writes::Authority,
     pub version: u64,
+    pub baseline_sequence: u64,
+    pub cohort: Option<crate::transaction_decisions::Cohort>,
     pub applied_prefix: u64,
     pub local_sequence: u64,
+    pub replay_operations: usize,
     pub entries: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +48,8 @@ pub(crate) struct State {
 }
 impl State {
     pub fn validate_successor(&self, next: &Self) -> bool {
-        self.epoch == next.epoch
+        self.journal.cohort() == next.journal.cohort()
+            && self.epoch == next.epoch
             && self.baseline_sequence == next.baseline_sequence
             && next.applied >= self.applied
             && self.journal.validate_successor(&next.journal).is_ok()
@@ -73,6 +77,8 @@ impl State {
             self.applied <= self.journal.resolved_prefix(),
             "watermark crosses unresolved decision"
         );
+        d1.check_cohort(&self.journal)
+            .map_err(|e| anyhow::anyhow!("invalid cohort: {e:?}"))?;
         let mut sequence = self.baseline_sequence;
         let mut commits = 0;
         for ordinal in 1..=self.applied {
@@ -143,6 +149,40 @@ impl State {
 }
 
 impl D1State {
+    pub(crate) fn check_cohort(&self, journal: &Journal) -> Result<(), D1Error> {
+        if self
+            .visibility
+            .as_ref()
+            .is_some_and(|v| v.journal.cohort() != journal.cohort())
+        {
+            return Err(D1Error::VisibilityHistory);
+        }
+        if let Some(cohort) = journal.cohort() {
+            let participant = self
+                .participant
+                .as_ref()
+                .ok_or(D1Error::ParticipantNotEnabled)?;
+            let baseline = self
+                .visibility
+                .as_ref()
+                .map_or(self.sequence, |v| v.baseline_sequence);
+            if baseline != 0
+                || cohort.coordinator_shard != participant.authority.shard
+                || journal.authority() != participant.authority.mode
+                || !cohort.members.iter().any(|m| {
+                    m.shard == self.shard
+                        && m.epoch == self.epoch
+                        && self
+                            .managed
+                            .as_ref()
+                            .is_some_and(|mode| mode.mode_id == m.mode)
+                })
+            {
+                return Err(D1Error::VisibilityHistory);
+            }
+        }
+        Ok(())
+    }
     /// Stage only on an unpublished candidate. Caller publishes data and this
     /// watermark in the same sync batch. Exactly one decision advances at a time.
     pub(crate) fn advance_visibility(
@@ -151,6 +191,7 @@ impl D1State {
         journal: Journal,
         history: Option<&Self>,
     ) -> Result<(D1Result, Option<crate::D1WriteRequest>), D1Error> {
+        self.check_cohort(&journal)?;
         let versioned = self
             .visibility
             .as_ref()
@@ -306,8 +347,11 @@ impl D1State {
             epoch: self.epoch,
             authority: self.participant.as_ref().unwrap().authority.clone(),
             version,
+            baseline_sequence: state.baseline_sequence,
+            cohort: state.journal.cohort().cloned(),
             applied_prefix: state.applied,
             local_sequence: sequence,
+            replay_operations: operations,
             entries: entries
                 .into_iter()
                 .map(|(k, v)| (k.to_vec(), v.to_vec()))

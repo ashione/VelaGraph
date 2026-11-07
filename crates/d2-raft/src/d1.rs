@@ -312,6 +312,13 @@ impl D1State {
             );
         }
         if let Some(journal) = &self.coordinator {
+            if let Some(cohort) = journal.cohort() {
+                anyhow::ensure!(
+                    cohort.coordinator_shard == self.shard
+                        && cohort.coordinator_epoch == self.epoch,
+                    "cohort coordinator identity mismatch"
+                );
+            }
             anyhow::ensure!(
                 self.managed
                     .as_ref()
