@@ -412,6 +412,34 @@ immutable offset cursors and failure semantics.
 The explicit result-job slice additionally admits terminal standard
 `valueMap('key',...)` with 1–8 distinct keys. It preserves qualified-vertex
 provenance and standard singleton-list property-map semantics, including missing
-versus Null. Ordinary execution rejects this step. The new mode has an explicit
-separate bounded projection phase; it does not enlarge existing count or ID-only
+versus Null. The local/v1 and legacy observed execution paths reject this step;
+the explicit-start distributed synchronous path is specified below. The job
+mode has an explicit separate bounded projection phase; it does not enlarge existing count or ID-only
 budgets. See [property pages](HIERARCHY_PROPERTY_PAGES.md).
+
+### Distributed synchronous selected-property maps
+
+The isolated explicit-start server coordinator supports terminal
+`valueMap('key', ...)` after its supported vertex traversals, filters, `dedup()`
+and limits. This is not a new v1/local query feature. One to eight distinct,
+nonempty UTF-8 keys of at most 64 bytes are required; `valueMap()` (all
+properties), tokens, maps followed by another step, scalar-to-map and global
+`V()` maps remain explicitly unsupported or invalid. Admission occurs before
+reading even an empty stream.
+
+Each result has qualified vertex provenance and a canonical property map whose
+values are singleton lists. Missing properties are omitted, explicit Null is
+`[Null]`, and a vertex with no requested properties yields an empty map. Vertex
+stream order and duplicate multiplicity are preserved. Upstream traversal and
+integrity checks run before projection; no property failure returns a partial
+success. The usual default 100-result cap applies before property loading when
+there is no explicit limit. Selected maps are bounded to 2 KiB of tagged flat
+property JSON per vertex, matching the hierarchy map cap.
+
+This path uses the existing fixed per-shard sessions and unchanged synchronous
+5-second, 64-MiB, 10,000-work and 10,000-row limits. It does not use hierarchy job
+allowances, extend leases, retry RPCs or claim globally atomic snapshots. New
+clients, coordinator and data nodes must be upgraded together for these queries:
+`QueryRow::PropertyMap` is an additive wire variant and data nodes now accept the
+existing `Project` leaf in ordinary sessions. Old query forms and hierarchy job
+protocols are unchanged; older peers fail explicitly rather than dropping fields.

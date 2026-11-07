@@ -13,6 +13,7 @@ pub mod jobs;
 mod projection;
 mod scan;
 mod sessions;
+mod sync_projection;
 pub(super) use sessions::Sessions;
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -351,7 +352,9 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
             return Err(QueryFailure::Unsupported);
         }
         match step {
-            Step::ValueMap(_) => return Err(QueryFailure::Unsupported),
+            Step::ValueMap(keys) if index + 1 == query.steps().len() => {
+                projection::validate_keys(keys)?;
+            }
             // The official parser bounds the complete traversal to three edge
             // steps. All hops share this execution's sessions, deadline and cost.
             Step::Existing(GremlinStep::Out(_))
@@ -700,7 +703,7 @@ impl Execution<'_> {
                     }
                     rows = next;
                 }
-                Step::ValueMap(_) => return Err(QueryFailure::Unsupported),
+                Step::ValueMap(_) => {}
                 Step::Existing(GremlinStep::Path) | Step::Existing(GremlinStep::Count) => {}
                 _ => return Err(QueryFailure::Unsupported),
             }
@@ -721,6 +724,10 @@ impl Execution<'_> {
         {
             rows.truncate(100);
         }
+        let projected = match query.steps().last() {
+            Some(Step::ValueMap(keys)) => Some(self.project_rows(&rows, keys).await?),
+            _ => None,
+        };
         let output = DistributedOutput {
             completeness: QueryCompleteness::Unverified,
             snapshots: self
@@ -728,7 +735,9 @@ impl Execution<'_> {
                 .values()
                 .map(|(_, d)| d.stamp.clone())
                 .collect(),
-            rows: if count {
+            rows: if let Some(projected) = projected {
+                projected
+            } else if count {
                 vec![QueryRow::Count(rows.len() as u64)]
             } else {
                 rows.into_iter()
@@ -1058,6 +1067,10 @@ fn validate_output(
         .steps()
         .iter()
         .any(|s| matches!(s, Step::Existing(GremlinStep::Values(_))));
+    let map_keys = match query.steps().last() {
+        Some(Step::ValueMap(keys)) => Some(keys.as_slice()),
+        _ => None,
+    };
     let directions = hierarchy::path_directions(&query);
     let hops = directions.iter().map(Vec::len).max().unwrap_or(0);
     if scan::is_global(&query) && !count {
@@ -1096,7 +1109,12 @@ fn validate_output(
     }
     for row in &output.rows {
         let valid = match row {
-            QueryRow::Element(v) => !path && !scalar && valid_vertex(v),
+            QueryRow::Element(v) => !path && !scalar && map_keys.is_none() && valid_vertex(v),
+            QueryRow::PropertyMap { source, properties } => {
+                valid_vertex(source) && map_keys.is_some_and(|keys| {
+                    sync_projection::valid_map(properties, keys)
+                })
+            }
             QueryRow::Path(p) if path => {
                 matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
                     && directions.iter().any(|directions| {

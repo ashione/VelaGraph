@@ -282,3 +282,13 @@ API on the coordinator endpoint. Only terminal count (optionally dedup) over a
 single bounded repeat is admitted. Progress is not a query result; complete
 counts retain the Unverified snapshot-vector boundary. The API has separate
 finite budgets and leases. Existing synchronous requests are unchanged.
+
+### Terminal selected-property maps
+
+Explicit-ID synchronous queries can end in `valueMap('name','active',...)`.
+For example, `g.V(20).out('member_of').valueMap('name','active')` returns each
+observed department's selected fields and qualified vertex provenance in one
+response. Batch starts remain scoped to `start_partition`; join results may
+cross shards. Each vertex uses one multi-field Project leaf on its already
+retained snapshot. This is sequential bounded fetching, not a new cross-shard
+parallel projection executor. See [normative map semantics](QUERY_SPEC.md#distributed-synchronous-selected-property-maps).
