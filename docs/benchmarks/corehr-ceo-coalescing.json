@@ -1,0 +1,937 @@
+{
+  "baseline_tree": "bee260eac7ac3179c268d488328cfdd5c28dd5a3",
+  "candidate_base_tree": "31a05e7c18cbdad0b1e788ebdcec27b0403413be",
+  "order": [
+    "baseline-first",
+    "candidate-first",
+    "candidate-second",
+    "baseline-second"
+  ],
+  "profile": "release driver/coordinator/nodes",
+  "fixture_people": 200000,
+  "fixture_departments": 5000,
+  "query": "g.V(1).repeat(__.in('reports_to')).emit().times(32).count()",
+  "expected_count": 199999,
+  "runs": {
+    "baseline-first": {
+      "samples": [
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.641195,
+          "replay_verified": true,
+          "requests": 12503,
+          "rpc_latency": {
+            "max_ms": 497.117419,
+            "min_ms": 0.240201,
+            "n": 12503,
+            "p50_ms": 0.388114,
+            "p95_ms": 2.7549829999999997
+          },
+          "sample": 0,
+          "seconds": 9.799350481
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.51216,
+          "replay_verified": true,
+          "requests": 12503,
+          "rpc_latency": {
+            "max_ms": 347.420655,
+            "min_ms": 0.234422,
+            "n": 12503,
+            "p50_ms": 0.373201,
+            "p95_ms": 2.424205
+          },
+          "sample": 1,
+          "seconds": 8.698477369
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.460483,
+          "replay_verified": true,
+          "requests": 12503,
+          "rpc_latency": {
+            "max_ms": 383.617847,
+            "min_ms": 0.238789,
+            "n": 12503,
+            "p50_ms": 0.389956,
+            "p95_ms": 2.423825
+          },
+          "sample": 2,
+          "seconds": 9.156929545
+        }
+      ],
+      "resources": {
+        "complete": true,
+        "database_bytes": 830780830,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   16200 kB",
+              "VmRSS:\t   16200 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t  756560 kB",
+              "VmRSS:\t  756560 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t  771876 kB",
+              "VmRSS:\t  771876 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t  661008 kB",
+              "VmRSS:\t  661008 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t  246044 kB",
+          "VmRSS:\t  242996 kB"
+        ]
+      },
+      "receipt": {
+        "exit_code": 0,
+        "timed_out": false,
+        "wall_seconds": 45.90521370599163,
+        "profiled": false,
+        "driver_profile": "release",
+        "coordinator_profile": "release",
+        "node_profile": "release",
+        "samples": 3,
+        "case": "ceo_emit32",
+        "performance_comparable": true
+      }
+    },
+    "candidate-first": {
+      "samples": [
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.30563999999999997,
+          "replay_verified": true,
+          "requests": 1565,
+          "rpc_latency": {
+            "max_ms": 310.635663,
+            "min_ms": 1.6191149999999999,
+            "n": 1565,
+            "p50_ms": 2.165311,
+            "p95_ms": 18.521642
+          },
+          "sample": 0,
+          "seconds": 7.242160395
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.248353,
+          "replay_verified": true,
+          "requests": 1565,
+          "rpc_latency": {
+            "max_ms": 337.270463,
+            "min_ms": 1.489539,
+            "n": 1565,
+            "p50_ms": 2.131665,
+            "p95_ms": 18.41584
+          },
+          "sample": 1,
+          "seconds": 7.147498263
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.25443299999999996,
+          "replay_verified": true,
+          "requests": 1565,
+          "rpc_latency": {
+            "max_ms": 485.144014,
+            "min_ms": 1.418653,
+            "n": 1565,
+            "p50_ms": 2.017923,
+            "p95_ms": 20.120806
+          },
+          "sample": 2,
+          "seconds": 7.354506262
+        }
+      ],
+      "resources": {
+        "complete": true,
+        "database_bytes": 830780873,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   16180 kB",
+              "VmRSS:\t   16180 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t  581860 kB",
+              "VmRSS:\t  581860 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t  770636 kB",
+              "VmRSS:\t  770636 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t  755464 kB",
+              "VmRSS:\t  755464 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t  181168 kB",
+          "VmRSS:\t  181168 kB"
+        ]
+      },
+      "receipt": {
+        "exit_code": 0,
+        "timed_out": false,
+        "wall_seconds": 39.629552361002425,
+        "profiled": false,
+        "driver_profile": "release",
+        "coordinator_profile": "release",
+        "node_profile": "release",
+        "samples": 3,
+        "case": "ceo_emit32",
+        "performance_comparable": true
+      }
+    },
+    "candidate-second": {
+      "samples": [
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.577314,
+          "replay_verified": true,
+          "requests": 1565,
+          "rpc_latency": {
+            "max_ms": 397.043262,
+            "min_ms": 1.514092,
+            "n": 1565,
+            "p50_ms": 2.077302,
+            "p95_ms": 18.346885
+          },
+          "sample": 0,
+          "seconds": 7.005601157
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.25966900000000004,
+          "replay_verified": true,
+          "requests": 1565,
+          "rpc_latency": {
+            "max_ms": 343.889072,
+            "min_ms": 1.508666,
+            "n": 1565,
+            "p50_ms": 2.07028,
+            "p95_ms": 18.719506
+          },
+          "sample": 1,
+          "seconds": 7.009884913
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.335884,
+          "replay_verified": true,
+          "requests": 1565,
+          "rpc_latency": {
+            "max_ms": 321.301675,
+            "min_ms": 1.458925,
+            "n": 1565,
+            "p50_ms": 1.9938159999999998,
+            "p95_ms": 18.178184
+          },
+          "sample": 2,
+          "seconds": 6.734230575
+        }
+      ],
+      "resources": {
+        "complete": true,
+        "database_bytes": 830780912,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   15936 kB",
+              "VmRSS:\t   15936 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t  600504 kB",
+              "VmRSS:\t  600504 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t  770468 kB",
+              "VmRSS:\t  707720 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t  663184 kB",
+              "VmRSS:\t  663184 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t  249744 kB",
+          "VmRSS:\t  249744 kB"
+        ]
+      },
+      "receipt": {
+        "exit_code": 0,
+        "timed_out": false,
+        "wall_seconds": 38.545596012991155,
+        "profiled": false,
+        "driver_profile": "release",
+        "coordinator_profile": "release",
+        "node_profile": "release",
+        "samples": 3,
+        "case": "ceo_emit32",
+        "performance_comparable": true
+      }
+    },
+    "baseline-second": {
+      "samples": [
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.472829,
+          "replay_verified": true,
+          "requests": 12503,
+          "rpc_latency": {
+            "max_ms": 340.15970699999997,
+            "min_ms": 0.233209,
+            "n": 12503,
+            "p50_ms": 0.376865,
+            "p95_ms": 2.321389
+          },
+          "sample": 0,
+          "seconds": 8.517716161
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.519538,
+          "replay_verified": true,
+          "requests": 12503,
+          "rpc_latency": {
+            "max_ms": 296.867463,
+            "min_ms": 0.228703,
+            "n": 12503,
+            "p50_ms": 0.366039,
+            "p95_ms": 2.393967
+          },
+          "sample": 1,
+          "seconds": 8.46012606
+        },
+        {
+          "correct": true,
+          "count": 199999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32",
+          "partial_count_returned": false,
+          "phase": "release_profile",
+          "replay_ms": 0.617085,
+          "replay_verified": true,
+          "requests": 12503,
+          "rpc_latency": {
+            "max_ms": 348.44653,
+            "min_ms": 0.232148,
+            "n": 12503,
+            "p50_ms": 0.389414,
+            "p95_ms": 2.319304
+          },
+          "sample": 2,
+          "seconds": 8.821974553
+        }
+      ],
+      "resources": {
+        "complete": true,
+        "database_bytes": 830780873,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   16092 kB",
+              "VmRSS:\t   16092 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t  664708 kB",
+              "VmRSS:\t  664708 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t  587540 kB",
+              "VmRSS:\t  587540 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t  665936 kB",
+              "VmRSS:\t  665936 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t  237008 kB",
+          "VmRSS:\t  237008 kB"
+        ]
+      },
+      "receipt": {
+        "exit_code": 0,
+        "timed_out": false,
+        "wall_seconds": 43.41650959599065,
+        "profiled": false,
+        "driver_profile": "release",
+        "coordinator_profile": "release",
+        "node_profile": "release",
+        "samples": 3,
+        "case": "ceo_emit32",
+        "performance_comparable": true
+      }
+    }
+  },
+  "baseline": {
+    "seconds": [
+      9.799350481,
+      8.698477369,
+      9.156929545,
+      8.517716161,
+      8.46012606,
+      8.821974553
+    ],
+    "median_seconds": 8.760225961,
+    "min_seconds": 8.46012606,
+    "max_seconds": 9.799350481
+  },
+  "candidate": {
+    "seconds": [
+      7.242160395,
+      7.147498263,
+      7.354506262,
+      7.005601157,
+      7.009884913,
+      6.734230575
+    ],
+    "median_seconds": 7.078691588,
+    "min_seconds": 6.734230575,
+    "max_seconds": 7.354506262
+  },
+  "median_reduction_percent": 19.19510273463367,
+  "application_profile": {
+    "instrumented_not_in_comparison": true,
+    "rpc_categories": [
+      "adjacency",
+      "reverse_or_canonical_verification",
+      "start_exists"
+    ],
+    "samples": [
+      {
+        "advance_ns": 5866390148,
+        "advance_requests": 1564,
+        "count": 199999,
+        "event": "application_profile",
+        "leaves": [
+          200000,
+          199999,
+          1
+        ],
+        "logical_bytes": 889839929,
+        "rpc_calls": [
+          12514,
+          4698,
+          1
+        ],
+        "rpc_ns": [
+          3108989653,
+          2571230351,
+          372799
+        ],
+        "work": 2646926
+      },
+      {
+        "advance_ns": 5892572415,
+        "advance_requests": 1563,
+        "count": 199999,
+        "event": "application_profile",
+        "leaves": [
+          200000,
+          199999,
+          1
+        ],
+        "logical_bytes": 889908797,
+        "rpc_calls": [
+          12514,
+          4698,
+          1
+        ],
+        "rpc_ns": [
+          3124625660,
+          2582864025,
+          344738
+        ],
+        "work": 2646926
+      },
+      {
+        "advance_ns": 5572530480,
+        "advance_requests": 1564,
+        "count": 199999,
+        "event": "application_profile",
+        "leaves": [
+          200000,
+          199999,
+          1
+        ],
+        "logical_bytes": 889725181,
+        "rpc_calls": [
+          12514,
+          4698,
+          1
+        ],
+        "rpc_ns": [
+          2889923597,
+          2502527050,
+          339309
+        ],
+        "work": 2646926
+      }
+    ],
+    "interpretation": "fragment calls include encoding, transport, remote work and decode, not pure network latency",
+    "ptrace_unavailable": true
+  }
+}
