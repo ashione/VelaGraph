@@ -221,6 +221,21 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(record=bad), self.assertRaises(ValueError):
                 validate([bad] + self.records, self.manifest)
 
+    def test_reject_extra_success_or_failure_attestations(self):
+        for jobs, event, key, good, bad in (
+                (False, 'application_chain', 'correct', True, False),
+                (True, 'synchronous_guard', 'expected_rejection', 'ResourceExhausted', 'WRONG'),
+                (True, 'job_matrix_complete', 'complete', True, False)):
+            records = self.job_records() if jobs else self.records
+            for value in (good, bad, None, 1):
+                rows = records[:-1] + [{'event': event, key: value}] + records[-1:]
+                with self.subTest(event=event, extra=value), self.assertRaises(ValueError):
+                    validate(rows, self.manifest, jobs=jobs)
+            rows = copy.deepcopy(records)
+            next(r for r in rows if r['event'] == event)[key] = bad
+            with self.subTest(event=event, replacement=bad), self.assertRaises(ValueError):
+                validate(rows, self.manifest, jobs=jobs)
+
 
 if __name__ == '__main__':
     unittest.main()

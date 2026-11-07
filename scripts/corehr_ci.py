@@ -113,8 +113,9 @@ def validate(records, manifest, jobs=False):
                 else:
                     require(sample.get('expected_rejection') == c.get('server_expected_error', 'Unsupported'),
                             'wrong query rejection')
-        require(sum(r['event'] == 'application_chain' and r.get('correct') is True
-                    for r in records) == 2, 'missing hierarchy chain checks')
+        chains = [r for r in records if r['event'] == 'application_chain']
+        require(len(chains) == 2 and all(r.get('correct') is True for r in chains),
+                'missing, duplicate or failed hierarchy chain checks')
         return {'queries': len(actual), 'resources': end,
                 'latency': {r['name']: r['latency'] for r in actual}}
     people, departments = manifest['people'], manifest['departments']
@@ -195,15 +196,17 @@ def validate(records, manifest, jobs=False):
         cleanup = [r for r in rows if r['event'] == 'job_cleanup']
         require(len(cleanup) == 1 and cleanup[0]['cancelled'] is True and cleanup[0]['advance_unavailable'] is True,
                 'cleanup failed')
-    require(sum(r['event'] == 'synchronous_guard' and r.get('expected_rejection') == 'ResourceExhausted'
-                for r in records) == 2, 'missing unchanged synchronous guards')
+    guards = [r for r in records if r['event'] == 'synchronous_guard']
+    require(len(guards) == 2 and all(r.get('expected_rejection') == 'ResourceExhausted' for r in guards),
+            'missing, duplicate or failed synchronous guards')
     cancellations = [r for r in records if r['event'] == 'job_cancel_probe']
     require(len(cancellations) == 1 and cancellations[0].get('correct') is True
             and cancellations[0].get('partial_count_returned') is False
             and cancellations[0].get('advance_unavailable') is True, 'missing active cancellation')
     validate_snapshots(cancellations[0].get('fixed_snapshots'), expected_shards)
-    require(sum(r['event'] == 'job_matrix_complete' and r.get('complete') is True
-                for r in records) == 1, 'missing matrix completion')
+    completions = [r for r in records if r['event'] == 'job_matrix_complete']
+    require(len(completions) == 1 and completions[0].get('complete') is True,
+            'missing, duplicate or failed matrix completion')
     return {'resources': end, 'cases': {name: {
         'count': expected[name],
         'seconds': [r['seconds'] for r in matrix if r['name'] == name],
