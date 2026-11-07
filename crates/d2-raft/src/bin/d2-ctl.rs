@@ -17,6 +17,26 @@ async fn main() -> anyhow::Result<()> {
     let control = &args[0];
     let request = match args[1].as_str() {
         "status" => ControlRequest::Status,
+        "d1-capacity" => {
+            if args.len() != 4 {
+                bail!("d1-capacity needs <shard> <epoch>");
+            }
+            ControlRequest::D1Capacity {
+                shard: args[2].parse()?,
+                epoch: args[3].parse()?,
+            }
+        }
+        "d1-set-capacity" => {
+            if args.len() != 6 {
+                bail!("d1-set-capacity needs <shard> <epoch> <expected-bytes> <new-bytes>");
+            }
+            ControlRequest::D1SetCapacity {
+                shard: args[2].parse()?,
+                epoch: args[3].parse()?,
+                expected_bytes: args[4].parse()?,
+                new_bytes: args[5].parse()?,
+            }
+        }
         "init" => {
             let mut members = BTreeMap::new();
             for spec in &args[2..] {
@@ -72,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
     let response = send_control(control, request).await?;
     match response {
         ControlResponse::Err(error) => bail!("{error}"),
+        ControlResponse::D1Admin(Err(error)) | ControlResponse::D1Capacity(Err(error)) => {
+            bail!("D1 rejected: {error:?}")
+        }
         other => println!("{}", serde_json::to_string_pretty(&other)?),
     }
     Ok(())
@@ -79,6 +102,6 @@ async fn main() -> anyhow::Result<()> {
 
 fn usage() {
     eprintln!(
-        "usage:\n  d2-ctl <control-addr> status\n  d2-ctl <control-addr> init <id=raft-addr>...\n  d2-ctl <control-addr> add-learner <id> <raft-addr> [blocking|nonblocking]\n  d2-ctl <control-addr> membership <id,id,...>\n  d2-ctl <control-addr> write <key> <value>\n  d2-ctl <control-addr> get <key>\n  d2-ctl <control-addr> read <key>"
+        "usage:\n  d2-ctl <control-addr> status\n  d2-ctl <control-addr> d1-capacity <shard> <epoch>\n  d2-ctl <control-addr> d1-set-capacity <shard> <epoch> <expected-bytes> <new-bytes>\n  d2-ctl <control-addr> init <id=raft-addr>...\n  d2-ctl <control-addr> add-learner <id> <raft-addr> [blocking|nonblocking]\n  d2-ctl <control-addr> membership <id,id,...>\n  d2-ctl <control-addr> write <key> <value>\n  d2-ctl <control-addr> get <key>\n  d2-ctl <control-addr> read <key>"
     );
 }
