@@ -1,3 +1,7 @@
+//! Derived from OpenRaft's examples/memstore/src/log_store.rs (v0.9.25).
+//! Modified here: repository formatting and this provenance notice.
+//! Upstream terms: MIT OR Apache-2.0. See ../NOTICE and
+//! ../third-party/openraft/LICENSE-MIT and LICENSE-APACHE.
 //! Provide `LogStore`, which is a in-memory implementation of `RaftLogStore` for demonstration
 //! purpose only.
 

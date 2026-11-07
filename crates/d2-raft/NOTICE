@@ -1,3 +1,18 @@
-This crate's in-memory Raft log store is adapted from the openraft project's
-`memstore` example. openraft is licensed under MIT OR Apache-2.0:
-https://github.com/databendlabs/openraft
+This crate's src/log_store.rs is derived from OpenRaft's
+examples/memstore/src/log_store.rs. The source has been reformatted for this
+repository and includes a local provenance notice.
+
+Verified upstream reference: OpenRaft v0.9.25
+Commit: 8815cdba2826f74e848acef361ad03f93bb1c3f8
+Source:
+https://github.com/databendlabs/openraft/blob/8815cdba2826f74e848acef361ad03f93bb1c3f8/examples/memstore/src/log_store.rs
+
+Upstream licenses this example under MIT OR Apache-2.0:
+https://github.com/databendlabs/openraft/blob/8815cdba2826f74e848acef361ad03f93bb1c3f8/examples/memstore/Cargo.toml
+
+Unmodified upstream license texts are included in:
+  third-party/openraft/LICENSE-MIT
+  third-party/openraft/LICENSE-APACHE
+
+These third-party notices and license copies concern the OpenRaft-derived code.
+They do not select or change the license of other code in this repository.
