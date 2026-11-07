@@ -1,6 +1,7 @@
 //! Incremental native count jobs. Progress is not a partial query result.
 use super::*;
 use std::sync::Mutex;
+mod parallel;
 
 pub(super) const LEASE_MILLIS: u64 = 120_000;
 pub(super) const BATCH_ROWS: usize = 128;
@@ -193,6 +194,7 @@ impl Compact {
 struct Job {
     catalog: Arc<StaticCatalog>,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
+    row_bounds: BTreeMap<u64, usize>,
     expires: Instant,
     cost: Cost,
     plan: Plan,
@@ -257,6 +259,7 @@ impl Jobs {
                 let mut job = Job {
                     catalog,
                     sessions: BTreeMap::new(),
+                    row_bounds: BTreeMap::new(),
                     expires,
                     cost: Cost::default(),
                     compact: (plan.emit && plan.dedup).then(Compact::default),
@@ -413,7 +416,11 @@ impl Job {
             )
             .await
             .map_err(remote_failure)?;
-            let Reply::OpenQuery(descriptor) = reply else {
+            let Reply::OpenHierarchyQuery {
+                descriptor,
+                max_row_bytes,
+            } = reply
+            else {
                 return Err(QueryFailure::IncompleteOrCorrupt);
             };
             if descriptor.stamp.identity != route.identity
@@ -422,6 +429,7 @@ impl Job {
             {
                 return Err(QueryFailure::IncompleteOrCorrupt);
             }
+            self.row_bounds.insert(route.shard, max_row_bytes);
             self.sessions.insert(route.shard, (route, descriptor));
         }
         check(end)
@@ -451,34 +459,27 @@ impl Job {
             groups.entry(f.partition()).or_default().push((i, f));
         }
         let mut outputs: Vec<Option<FragmentValue>> = (0..n).map(|_| None).collect();
+        let mut pending = Vec::new();
         for (partition, group) in groups {
+            let shard = self
+                .catalog
+                .partitions
+                .iter()
+                .find(|route| route.partition == partition)
+                .ok_or(QueryFailure::UnsupportedScope)?
+                .shard;
             for chunk in group.chunks(BATCH_ROWS) {
-                check(end)?;
-                let mut execution = Execution {
-                    catalog: &self.catalog,
-                    sessions: self.sessions.clone(),
-                    end,
-                    cost: self.cost,
-                    ceiling: JOB_CEILING,
-                };
-                let result = execution
-                    .fragment(Fragment::HierarchyBatch {
+                pending.push(parallel::Batch {
+                    shard,
+                    indices: chunk.iter().map(|(index, _)| *index).collect(),
+                    fragment: Fragment::HierarchyBatch {
                         partition,
                         fragments: chunk.iter().map(|(_, f)| f.clone()).collect(),
-                    })
-                    .await;
-                self.cost = execution.cost;
-                let FragmentValue::HierarchyBatch(values) = result? else {
-                    return Err(QueryFailure::IncompleteOrCorrupt);
-                };
-                if values.len() != chunk.len() {
-                    return Err(QueryFailure::IncompleteOrCorrupt);
-                }
-                for ((index, _), value) in chunk.iter().zip(values) {
-                    outputs[*index] = Some(value);
-                }
+                    },
+                });
             }
         }
+        parallel::run(self, pending, &mut outputs, end).await?;
         outputs
             .into_iter()
             .map(|v| v.ok_or(QueryFailure::IncompleteOrCorrupt))
@@ -783,6 +784,15 @@ fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError
 }
 
 #[cfg(test)]
+pub(in crate::remote::distributed) fn hierarchy_reservation_for_test(
+    fragment: Fragment,
+    row: usize,
+    descriptor: &Descriptor,
+) -> Option<Cost> {
+    parallel::reservation_for_test(fragment, row, descriptor)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn vertex(id: usize) -> VertexId {
@@ -1063,6 +1073,7 @@ mod tests {
                     let mut job = Job {
                         catalog: Arc::new(StaticCatalog { partitions: vec![] }),
                         sessions: BTreeMap::new(),
+                        row_bounds: BTreeMap::new(),
                         expires: Instant::now() + Duration::from_secs(1),
                         cost: Cost::default(),
                         compact: None,
@@ -1200,6 +1211,7 @@ mod tests {
         let job = Job {
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
+            row_bounds: BTreeMap::new(),
             expires,
             cost: Cost::default(),
             compact: None,
@@ -1504,6 +1516,7 @@ mod tests {
         let job = Job {
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
+            row_bounds: BTreeMap::new(),
             expires,
             cost: Cost::default(),
             compact: None,

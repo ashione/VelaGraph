@@ -38,6 +38,44 @@ frontier resumable. A normal successful step installs the new state and response
 atomically before sending it. Cancel removes a known job and closes its views.
 There is no recovery across coordinator restart or token renewal.
 
+## Bounded cross-shard execution
+
+Within a micro-page, adjacency reads and canonical/reverse validation each run
+in waves of at most three independent shard sessions. A session has at most one
+RPC in flight. All replies in a wave must validate before their original indexed
+results are installed. The next layer still waits for complete validation; this
+is concurrent fragment execution and coordinator merging, not independent local
+subtree counts or a generic distributed query planner.
+
+Opening a hierarchy session additionally returns the maximum raw key-plus-value
+size in that exact frozen snapshot. The coordinator uses that metadata, the
+1,000-neighbor limit, read-accounting rules, and the 2 MiB encoded response cap to
+reserve a conservative byte/work upper bound for each concurrent batch. The sum
+of reservations cannot exceed the job's remaining global budget. For successful waves, returned actual costs
+are settled and unused allowances are available to later waves. Failed jobs are
+terminal; failure replies do not provide a complete coordinator cost ledger.
+Unknown/overflowing bounds, skewed large records or insufficient remaining
+allowance select the original serial path with the full remaining allowance.
+Thus splitting the accounting budget cannot newly reject a serial-admissible
+batch. This is not an equivalence guarantee under arbitrary concurrent load:
+existing connection/handler admission and request deadlines still apply.
+Hierarchy fragment workers wait asynchronously for a worker slot within the
+request deadline instead of rejecting merely because sibling RPCs hold slots.
+
+Cancellation drops all local RPC futures, invalidates the job and prevents
+resumption. Data workers already executing may finish or reach their deadline;
+their session accounting remains cumulative. No retries hide failed work.
+All observed index entries, including unrelated edge labels, still undergo the
+same canonical/reverse checks. Snapshot stamps, bag weights, cycle expansion and
+terminal dedup rules are unchanged. No partial count is returned on errors.
+
+The development-only wire protocol adds an `OpenHierarchyQuery` reply containing
+the descriptor and snapshot row bound. Deploy coordinator and data nodes together;
+this prototype does not support mixed versions of that hierarchy-open reply.
+Normal query-open and per-fragment descriptor encodings are unchanged.
+
+See [the reservation proof and release measurements](HIERARCHY_SHARD_PARALLELISM.md).
+
 ## Counting semantics and bounded memory
 
 This is a specialized count plan, not a generic path executor. Within each depth,
@@ -121,6 +159,7 @@ Each command sends one request and prints its native JSON output. There is no
 automatic polling, resubmission, or client-side graph execution. The existing
 `--timeout-ms` accepts 1..5000 for every command.
 
-Micro-page coalescing reduces client polling round trips only. Partition RPCs
-remain serial, and weighted frontier aggregation remains at the coordinator.
-It does not implement shard-local subtree aggregation or parallel RPC execution.
+Micro-page coalescing reduces client polling round trips. Within each page,
+independent shard RPCs now use the bounded waves described above; weighted
+frontier aggregation remains at the coordinator. No shard-local subtree
+aggregation is implemented.

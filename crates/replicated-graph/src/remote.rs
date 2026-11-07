@@ -131,6 +131,10 @@ enum Reply {
     CloseSnapshot,
     Query(query::QueryResponse),
     OpenQuery(distributed::Descriptor),
+    OpenHierarchyQuery {
+        descriptor: distributed::Descriptor,
+        max_row_bytes: usize,
+    },
     QueryFragment(Result<distributed::FragmentOutput, query::QueryFailure>),
     CloseQuery,
     Write(D1Result),
@@ -339,7 +343,10 @@ async fn execute(
                 query_sessions
                     .open_hierarchy(&state, identity, shard, end)
                     .await
-                    .map(Reply::OpenQuery)
+                    .map(|(descriptor, max_row_bytes)| Reply::OpenHierarchyQuery {
+                        descriptor,
+                        max_row_bytes,
+                    })
             })
             .await
             .map_err(|_| RemoteError::Timeout { request_id: None })?

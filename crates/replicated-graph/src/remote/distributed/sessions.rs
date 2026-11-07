@@ -50,6 +50,7 @@ impl Sessions {
     ) -> Result<Descriptor, RemoteError> {
         self.open_with_lease(state, identity, shard, (end, end), false)
             .await
+            .map(|(descriptor, _)| descriptor)
     }
     pub(in crate::remote) async fn open_hierarchy(
         &self,
@@ -57,7 +58,7 @@ impl Sessions {
         identity: RemoteIdentity,
         shard: u64,
         end: Instant,
-    ) -> Result<Descriptor, RemoteError> {
+    ) -> Result<(Descriptor, usize), RemoteError> {
         let now = Instant::now();
         let end = end.min(now + Duration::from_millis(MAX_TIMEOUT));
         let lease_end = now + Duration::from_millis(jobs::LEASE_MILLIS);
@@ -75,7 +76,7 @@ impl Sessions {
         shard: u64,
         deadlines: (Instant, Instant),
         hierarchy: bool,
-    ) -> Result<Descriptor, RemoteError> {
+    ) -> Result<(Descriptor, usize), RemoteError> {
         let (end, lease_end) = deadlines;
         check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
         self.expire();
@@ -94,6 +95,17 @@ impl Sessions {
             return Err(RemoteError::Protocol);
         }
         check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
+        // Record dimensions belong to this immutable snapshot. They bound read
+        // accounting before independent shards receive disjoint budget leases.
+        let mut max_row_bytes = 0;
+        if hierarchy {
+            for (index, (key, value)) in snapshot.entries.iter().enumerate() {
+                if index % 128 == 0 {
+                    check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
+                }
+                max_row_bytes = max_row_bytes.max(key.len().saturating_add(value.len()));
+            }
+        }
         let descriptor = Descriptor {
             stamp: QueryStamp {
                 identity,
@@ -127,7 +139,7 @@ impl Sessions {
             return Err(RemoteError::Unavailable);
         }
         values.insert(descriptor.token, Arc::new(session));
-        Ok(descriptor)
+        Ok((descriptor, max_row_bytes))
     }
     fn lookup(
         &self,
@@ -198,10 +210,20 @@ impl Sessions {
         if request.remaining.bytes > budget.bytes || request.remaining.work > budget.work {
             return Err(RemoteError::InvalidArgument);
         }
-        let permit = FRAGMENT_SLOTS
-            .try_acquire()
-            .map_err(|_| RemoteError::ResourceExhausted)?;
         let end = end.min(Instant::from_std(session.node.end));
+        // Independent shard waves may briefly fill the process-wide worker pool.
+        // Wait asynchronously within the existing deadline rather than rejecting
+        // a job solely because its siblings occupied the available workers.
+        let permit = if is_batch {
+            tokio::time::timeout_at(end, FRAGMENT_SLOTS.acquire())
+                .await
+                .map_err(|_| RemoteError::Timeout { request_id: None })?
+                .map_err(|_| RemoteError::ResourceExhausted)?
+        } else {
+            FRAGMENT_SLOTS
+                .try_acquire()
+                .map_err(|_| RemoteError::ResourceExhausted)?
+        };
         let end = if is_batch {
             end.min(Instant::now() + Duration::from_secs(5))
         } else {
@@ -870,7 +892,7 @@ mod epoch_tests {
         let sessions = Sessions::new().unwrap();
         let start = Instant::now();
         let end = start + Duration::from_secs(3);
-        let descriptor = sessions
+        let (descriptor, _) = sessions
             .open_hierarchy(&state, identity, 7, end)
             .await
             .unwrap();
@@ -1053,6 +1075,237 @@ mod epoch_tests {
             sessions.fragment(&state, identity, 7, request, end).await,
             Err(RemoteError::SessionUnavailable)
         ));
+        sessions.close(identity, 7, &descriptor).unwrap();
+    }
+    #[tokio::test]
+    async fn hierarchy_five_leaf_actual_costs_fit_snapshot_reservations() {
+        // Build valid graph bytes off the async executor, using a disposable local DB.
+        // Adapter exists only to let AppendOnlyStore share ownership of that DB.
+        #[derive(Clone)]
+        struct FixtureNode(Arc<rocksdb_sql_table::LocalStorageNode>);
+        impl StorageNode for FixtureNode {
+            fn read_view(&self) -> Result<ReadView, StorageNodeError> {
+                self.0.read_view()
+            }
+            fn get(
+                &self,
+                key: &[u8],
+                view: &ReadView,
+            ) -> Result<Option<Vec<u8>>, StorageNodeError> {
+                self.0.get(key, view)
+            }
+            fn scan(
+                &self,
+                range: KeyRange,
+                limit: ScanLimit,
+                view: &ReadView,
+            ) -> Result<Vec<KeyValue>, StorageNodeError> {
+                self.0.scan(range, limit, view)
+            }
+            fn batch_write(&self, request: WriteRequest) -> Result<WriteResult, StorageNodeError> {
+                self.0.batch_write(request)
+            }
+            fn batch_write_conditional(
+                &self,
+                request: WriteRequest,
+                sequence: Option<u64>,
+            ) -> Result<WriteResult, StorageNodeError> {
+                self.0.batch_write_conditional(request, sequence)
+            }
+            fn admin(&self) -> &dyn StorageAdmin {
+                self.0.admin()
+            }
+        }
+        let (mut entries, label) = tokio::task::spawn_blocking(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let node = FixtureNode(Arc::new(
+                rocksdb_sql_table::LocalStorageNode::open(dir.path(), 7).unwrap(),
+            ));
+            node.admin().set_epoch(1).unwrap();
+            let store = AppendOnlyStore::new(node.clone(), 7, 0);
+            let mut source = Vertex::new(1);
+            source.properties.insert(
+                "payload".into(),
+                rocksdb_sql_table::Value::Text("v".repeat(16 * 1024)),
+            );
+            for vertex in [source, Vertex::new(2)] {
+                store
+                    .prepare_vertex(&vertex)
+                    .unwrap()
+                    .submit(&node)
+                    .unwrap();
+            }
+            let label = "L".repeat(64); // maximum legal graph label, not an invalid giant label
+            for id in 10..18 {
+                let edge = CrossEdge {
+                    id,
+                    from: VertexRef {
+                        partition: 0,
+                        id: 1,
+                    },
+                    to: VertexRef {
+                        partition: 0,
+                        id: 2,
+                    },
+                    label: label.clone(),
+                    properties: BTreeMap::new(),
+                };
+                store.prepare_source(&edge).unwrap().submit(&node).unwrap();
+                store.prepare_reverse(&edge).unwrap().submit(&node).unwrap();
+            }
+            let entries: BTreeMap<_, _> = node
+                .admin()
+                .export()
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|row| (row.key, row.value))
+                .collect();
+            // All DB owners are dropped before TempDir cleanup.
+            drop(store);
+            drop(node);
+            (entries, label)
+        })
+        .await
+        .unwrap();
+
+        // The maximum is deliberately an uninterpreted/malformed raw row outside
+        // graph prefixes. OpenHierarchy must include it, not decode/filter it away.
+        let raw_key = b"uninterpreted/invalid-record".to_vec();
+        entries.insert(raw_key.clone(), vec![0xff; 32 * 1024]);
+        let expected_row_bound = entries
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .max()
+            .unwrap();
+        assert_eq!(expected_row_bound, raw_key.len() + 32 * 1024);
+
+        let mut state = Arc::new(StateMachine::default());
+        apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
+        apply(
+            &mut state,
+            2,
+            D1Command::Write(d2_raft::D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [42; 16],
+                expected_sequence: None,
+                operations: entries
+                    .iter()
+                    .map(|(k, v)| d2_raft::WriteOp::put(k, v))
+                    .collect(),
+            }),
+        )
+        .await;
+        let identity = RemoteIdentity { group: 2, node: 1 };
+        let sessions = Sessions::new().unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        let (descriptor, row_bound) = sessions
+            .open_hierarchy(&state, identity, 7, end)
+            .await
+            .unwrap();
+        assert_eq!(row_bound, expected_row_bound);
+        let pinned = sessions.lookup(identity, 7, &descriptor).unwrap();
+
+        // A subsequent oversized live row must not alter the advertised bound or
+        // any read performed through the already-open session.
+        apply(
+            &mut state,
+            3,
+            D1Command::Write(d2_raft::D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [43; 16],
+                expected_sequence: None,
+                operations: vec![d2_raft::WriteOp::put(b"later-live-row", vec![1; 64 * 1024])],
+            }),
+        )
+        .await;
+        assert!(pinned.node.view.get(b"later-live-row").is_none());
+        let source = VertexId {
+            partition: 0,
+            id: 1,
+        };
+        let target = VertexId {
+            partition: 0,
+            id: 2,
+        };
+        let edge = EdgeHop {
+            id: 10,
+            from: source,
+            to: target,
+            label: label.clone(),
+        };
+        let leaves = [
+            Fragment::Exists(source),
+            Fragment::In(target),
+            Fragment::Out(source),
+            Fragment::VerifyReverse(edge),
+            Fragment::ResolveIncoming {
+                target,
+                edge: IncomingEdge {
+                    id: 10,
+                    partition: 0,
+                    label,
+                },
+            },
+        ];
+        for (kind, leaf) in leaves.into_iter().enumerate() {
+            let fragment = Fragment::HierarchyBatch {
+                partition: 0,
+                fragments: vec![leaf],
+            };
+            let bound =
+                jobs::hierarchy_reservation_for_test(fragment.clone(), row_bound, &descriptor)
+                    .expect("finite reservation");
+            assert!(bound.bytes <= jobs::JOB_CEILING.bytes);
+            assert!(bound.work <= jobs::JOB_CEILING.work);
+            // Reproduce Execution's actual pre-transport charges, using the bound
+            // as the local ceiling. This catches missing request overhead too.
+            let mut total = Cost::default();
+            total.charge(512, 1, bound).unwrap();
+            let mut request = FragmentRequest {
+                descriptor: descriptor.clone(),
+                fragment,
+                remaining: Cost {
+                    bytes: bound.bytes - total.bytes,
+                    work: bound.work - total.work,
+                },
+            };
+            let bytes = serde_json::to_vec(&request).unwrap();
+            total.charge(bytes.len() * 2, 0, bound).unwrap();
+            request.remaining = Cost {
+                bytes: bound.bytes - total.bytes,
+                work: bound.work - total.work,
+            };
+            let before = *pinned.used.lock().unwrap();
+            let Reply::QueryFragment(Ok(output)) = sessions
+                .fragment(&state, identity, 7, request, end)
+                .await
+                .unwrap()
+            else {
+                panic!("leaf {kind} must succeed with its reservation");
+            };
+            assert_eq!(output.descriptor, descriptor);
+            assert!(output.cost.bytes > 0 && output.cost.work > 0);
+            total
+                .charge(output.cost.bytes, output.cost.work, bound)
+                .unwrap();
+            let after = *pinned.used.lock().unwrap();
+            assert_eq!(after.bytes - before.bytes, output.cost.bytes);
+            assert_eq!(after.work - before.work, output.cost.work);
+            let FragmentValue::HierarchyBatch(values) = output.value else {
+                panic!("batch expected");
+            };
+            assert_eq!(values.len(), 1);
+            match (&values[0], kind) {
+                (FragmentValue::Bool(true), 0 | 3) => {}
+                (FragmentValue::Incoming(edges), 1) => assert_eq!(edges.len(), 8),
+                (FragmentValue::Edges(edges), 2) => assert_eq!(edges.len(), 8),
+                (FragmentValue::Edge(edge), 4) => assert_eq!(edge.id, 10),
+                _ => panic!("wrong result for leaf {kind}"),
+            }
+        }
         sessions.close(identity, 7, &descriptor).unwrap();
     }
 }
