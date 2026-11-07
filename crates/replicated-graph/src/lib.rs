@@ -396,6 +396,16 @@ fn application_error(
         | D1Error::CapacityConflict { .. } => {
             StorageNodeError::InvalidArgument("invalid D1 request".into())
         }
+        D1Error::ParticipantOnly
+        | D1Error::ParticipantNotEnabled
+        | D1Error::ParticipantAuthority
+        | D1Error::ParticipantIdentity
+        | D1Error::ParticipantBusy
+        | D1Error::ParticipantCapacity
+        | D1Error::ParticipantUnknown
+        | D1Error::ParticipantDecisionConflict => {
+            StorageNodeError::Unsupported("participant D1 role boundary".into())
+        }
         D1Error::CoordinatorOnly
         | D1Error::CoordinatorNotEnabled
         | D1Error::CoordinatorRequiresEmptyShard

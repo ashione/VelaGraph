@@ -52,6 +52,23 @@ pub enum D1Command {
         new_bytes: usize,
     },
     Write(D1WriteRequest),
+    EnableParticipant {
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        authority: crate::participant_writes::Authority,
+    },
+    PrepareParticipant {
+        authority: crate::participant_writes::Authority,
+        participant: crate::transaction_decisions::Participant,
+        request: D1WriteRequest,
+    },
+    ResolveParticipant {
+        authority: crate::participant_writes::Authority,
+        participant: crate::transaction_decisions::Participant,
+        id: [u8; 16],
+        decision: crate::transaction_decisions::Decision,
+    },
     /// Irreversibly reserve an empty managed shard for coordinator decisions.
     EnableCoordinator {
         shard: u64,
@@ -86,6 +103,7 @@ pub enum D1WriteStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum D1Result {
+    Participant(crate::participant_writes::Status),
     Coordinator {
         resolved_prefix: u64,
     },
@@ -138,6 +156,14 @@ pub enum D1Error {
     InvalidManagedMode,
     ManagedModeConflict,
     UnverifiedWriteHistory,
+    ParticipantOnly,
+    ParticipantNotEnabled,
+    ParticipantAuthority,
+    ParticipantIdentity,
+    ParticipantBusy,
+    ParticipantCapacity,
+    ParticipantUnknown,
+    ParticipantDecisionConflict,
     CoordinatorOnly,
     CoordinatorNotEnabled,
     CoordinatorRequiresEmptyShard,
@@ -162,7 +188,7 @@ pub enum D1ManagedStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DedupRecord {
-    request: D1WriteRequest,
+    pub(crate) request: D1WriteRequest,
     pub(crate) sequence: u64,
 }
 
@@ -177,6 +203,8 @@ pub(crate) struct D1State {
     pub(crate) managed: Option<D1ManagedMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) coordinator: Option<crate::transaction_decisions::Journal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) participant: Option<crate::participant_writes::State>,
     pub shard: u64,
     pub epoch: u64,
     pub sequence: u64,
@@ -190,6 +218,7 @@ impl D1State {
             dedup_bytes_limit: None,
             managed: None,
             coordinator: None,
+            participant: None,
             shard,
             epoch,
             sequence: 0,
@@ -204,12 +233,14 @@ impl D1State {
                     self.version,
                     self.dedup_bytes_limit,
                     self.managed.is_some(),
-                    self.coordinator.is_some()
+                    self.coordinator.is_some(),
+                    self.participant.is_some()
                 ),
-                (1, None, false, false)
-                    | (2, Some(EXTENDED_DEDUP_BYTES), false, false)
-                    | (3, None | Some(EXTENDED_DEDUP_BYTES), true, false)
-                    | (4, None | Some(EXTENDED_DEDUP_BYTES), true, true)
+                (1, None, false, false, false)
+                    | (2, Some(EXTENDED_DEDUP_BYTES), false, false, false)
+                    | (3, None | Some(EXTENDED_DEDUP_BYTES), true, false, false)
+                    | (4, None | Some(EXTENDED_DEDUP_BYTES), true, true, false)
+                    | (5, None | Some(EXTENDED_DEDUP_BYTES), true, false, true)
             ),
             "unsupported D1 state version/capacity"
         );
@@ -234,6 +265,9 @@ impl D1State {
                 self.sequence == 0 && self.dedup.is_empty(),
                 "coordinator contains data history"
             );
+        }
+        if let Some(participant) = &self.participant {
+            participant.validate(self)?;
         }
         let mut ids = std::collections::BTreeSet::new();
         let mut previous = 0;
@@ -356,7 +390,9 @@ impl D1State {
             return Err(D1Error::InvalidDedupCapacity);
         }
         if new_bytes == EXTENDED_DEDUP_BYTES {
-            self.version = if self.coordinator.is_some() {
+            self.version = if self.participant.is_some() {
+                5
+            } else if self.coordinator.is_some() {
                 4
             } else if self.managed.is_some() {
                 3
@@ -398,6 +434,7 @@ impl D1State {
             dedup_bytes_limit: self.dedup_bytes_limit,
             managed: self.managed.clone(),
             coordinator: self.coordinator.clone(),
+            participant: self.participant.clone(),
             shard: self.shard,
             epoch: self.epoch,
             sequence: self.sequence,
@@ -473,6 +510,9 @@ impl D1State {
         if mode.mode_id != mode_id {
             return Err(D1Error::ManagedModeConflict);
         }
+        if self.participant.is_some() {
+            return Err(D1Error::ParticipantOnly);
+        }
         if self.coordinator.is_some() {
             return Err(D1Error::CoordinatorOnly);
         }
@@ -528,7 +568,7 @@ impl D1State {
             }))
     }
 
-    fn write_inner(
+    pub(crate) fn write_inner(
         &mut self,
         request: &D1WriteRequest,
         history: Option<&Self>,
@@ -602,13 +642,13 @@ impl D1WriteRequest {
 
     // Charge fixed per-request/per-operation overhead too: empty keys cannot
     // create millions of retained Vec allocations for zero accounted bytes.
-    fn retained_size(&self) -> usize {
+    pub(crate) fn retained_size(&self) -> usize {
         self.byte_size()
             .saturating_add(self.operations.len().saturating_mul(64))
             .saturating_add(128)
     }
 
-    fn validate(&self) -> Result<usize, D1Error> {
+    pub(crate) fn validate(&self) -> Result<usize, D1Error> {
         if self.operations.is_empty() {
             return Err(D1Error::EmptyBatch);
         }

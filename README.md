@@ -30,8 +30,11 @@ write-mode identity and rejects old raw writers after explicit activation. It
 adds shard-local atomic batch identities only; default graph APIs are unchanged
 and global transactions remain unimplemented. A separate opt-in
 [coordinator decision ledger](docs/TRANSACTION_DECISION_JOURNAL.md) persists
-transaction decisions on a dedicated empty shard, but does not prepare/apply
-participant data or provide global read visibility.
+transaction decisions on a dedicated empty shard. Opt-in
+[participant intents](docs/PARTICIPANT_WRITES.md) now retain prepares and apply
+trusted coordinator decisions atomically per shard through an in-process relay.
+They do not yet provide global read visibility or wire existing graph writers
+through distributed transactions.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.

@@ -116,6 +116,10 @@ commits and needs a separately approved offline recovery/migration procedure.
 Keep serving with compatible binaries if activation succeeded. An activation
 or write timeout has an uncertain outcome; inspect/retry the exact operation.
 
+A separately enabled [participant role](PARTICIPANT_WRITES.md) additionally fences
+ManagedWrite and publishes data only through prepared participant resolution.
+Managed-only mode retains the behavior above; role activation is never automatic.
+
 ## Tests and remaining work
 
 Tests cover activation racing ordinary remote writes, concurrent managed CAS

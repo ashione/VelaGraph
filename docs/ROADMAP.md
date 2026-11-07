@@ -21,6 +21,8 @@
 
 协调决策账本的独立基础切片已实现：空受管分片可显式转为专用协调角色，持久化 Begin/Prepared/Commit/Abort 与未决空洞检查。它只记录决定，尚未连接数据分片 prepare、原子跨片数据发布或 MVCC；resolved prefix **不是可读全局版本**，严格全局查询仍 Unsupported。见[契约](TRANSACTION_DECISION_JOURNAL.md)。
 
+参与者状态机已增加显式启用的 prepare/commit/abort 持久状态和可信进程内协调者转发：未决时保留条件写预约，读继续；已验证单片原子发布和旧快照稳定。它尚未接通远程 graph 写客户端、统一 MVCC 可见版本或 CoreHR 并发事务验收，跨片逐个发布仍可能被新查询看到混合状态；GlobalCommittedSnapshot 继续 Unsupported。见[参与者契约](PARTICIPANT_WRITES.md)。
+
 ### 已确认与待定
 
 | 项目 | 当前结论 | 状态 |
