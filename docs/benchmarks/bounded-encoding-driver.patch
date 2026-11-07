@@ -1,0 +1,51 @@
+--- a/crates/replicated-graph/examples/corehr_jobs_run.rs
++++ b/crates/replicated-graph/examples/corehr_jobs_run.rs
+@@ -108,33 +108,10 @@
+         });
+     }
+     for (name, start, query, count) in [
+-        (
+-            "ceo_emit32_dedup",
+-            1,
+-            "g.V(1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(),
+-            people - 1,
+-        ),
+-        (
+-            "duplicate_ceo_emit32_dedup",
+-            1,
+-            "g.V(1,1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(),
+-            people - 1,
+-        ),
+-        (
+-            "department_emit32_dedup",
+-            department,
+-            format!("g.V({department}).repeat(__.in('parent_department')).emit().times(32).dedup().count()"),
+-            departments - 1,
+-        ),
+-    ] {
+-        cases.push(JobCase {
+-            name,
+-            partition: 1 + (start % 3) as u32,
+-            query,
+-            count: Some(count),
+-            error: None,
+-        });
+-    }
++        ("ceo_emit32_dedup", 1, "g.V(1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(), people - 1),
++        ("duplicate_ceo_emit32_dedup", 1, "g.V(1,1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(), people - 1),
++        ("department_emit32_dedup", department, format!("g.V({department}).repeat(__.in('parent_department')).emit().times(32).dedup().count()"), departments - 1),
++    ] { cases.push(JobCase { name, partition: 1 + (start % 3) as u32, query, count: Some(count), error: None }); }
+     cases
+ }
+ async fn execute_job(
+@@ -743,6 +720,10 @@
+             }
+             cancel_active_job(service.local_addr()).await?;
+             let jobs=job_cases(people,departments);
++            if std::env::var_os("COREHR_PERF_CEO_ONLY").is_some() {
++                for sample in 0..3 { execute_job(service.local_addr(), &jobs[0], "release_profile", sample).await?; }
++                return Ok::<(),anyhow::Error>(());
++            }
+             let mut errors=Vec::new();
+             for index in [4,6] {
+                 if let Err(e)=execute_job(service.local_addr(),&jobs[index],"probe",0).await {errors.push(format!("{}: {e:#}",jobs[index].name));}

@@ -845,13 +845,23 @@ fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, Quer
     struct Writer {
         bytes: Vec<u8>,
         end: Instant,
+        until_deadline_check: usize,
     }
     impl io::Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if Instant::now() >= self.end || bytes.len() > MAX_WIRE.saturating_sub(self.bytes.len())
-            {
+            if bytes.len() > MAX_WIRE.saturating_sub(self.bytes.len()) {
                 return Err(io::Error::other("bounded query encoding"));
             }
+            // serde emits many tiny tokens. Amortize small-write checks over
+            // at most 8KiB, and check before every larger individual write.
+            // Keep byte admission on every write and avoid an extra buffer.
+            if bytes.len() >= self.until_deadline_check {
+                if Instant::now() >= self.end {
+                    return Err(io::Error::other("bounded query encoding"));
+                }
+                self.until_deadline_check = 8192;
+            }
+            self.until_deadline_check = self.until_deadline_check.saturating_sub(bytes.len());
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -862,7 +872,9 @@ fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, Quer
     let mut writer = Writer {
         bytes: Vec::new(),
         end,
+        until_deadline_check: 0,
     };
+    check(end)?;
     serde_json::to_writer(&mut writer, value).map_err(|_| {
         if Instant::now() >= end {
             QueryFailure::Timeout
@@ -870,6 +882,8 @@ fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, Quer
             QueryFailure::ResourceExhausted
         }
     })?;
+    // The final incomplete interval must not publish an expired result.
+    check(end)?;
     Ok(writer.bytes)
 }
 
@@ -1322,6 +1336,122 @@ mod tests {
             QueryFailure::ResourceExhausted
         );
     }
+    #[test]
+    fn amortized_deadline_preserves_exact_json_and_wire_boundary() {
+        let end = Instant::now() + Duration::from_secs(5);
+        for length in [0, 1, 8190, 8191, 8192, 8193, 16384, MAX_WIRE - 2] {
+            let value = "x".repeat(length);
+            let encoded = bounded_encode(&value, end).unwrap();
+            assert_eq!(encoded, serde_json::to_vec(&value).unwrap());
+            assert_eq!(encoded.len(), length + 2);
+        }
+        for length in [MAX_WIRE - 1, MAX_WIRE, MAX_WIRE + 1] {
+            assert_eq!(
+                bounded_encode(&"x".repeat(length), end).unwrap_err(),
+                QueryFailure::ResourceExhausted
+            );
+        }
+        let escaped = serde_json::json!({ "unicode": "部门", "nested": ["\u{0000}".repeat(8192), "\\\"\n".repeat(8192)] });
+        assert_eq!(
+            bounded_encode(&escaped, end).unwrap(),
+            serde_json::to_vec(&escaped).unwrap()
+        );
+    }
+
+    #[test]
+    fn amortized_deadline_is_independent_of_graph_result_distribution() {
+        fn check_rows(rows: Vec<QueryRow>) {
+            let reference = serde_json::to_vec(&rows).unwrap();
+            let actual = bounded_encode(&rows, Instant::now() + Duration::from_secs(5));
+            if reference.len() > MAX_WIRE {
+                assert_eq!(actual.unwrap_err(), QueryFailure::ResourceExhausted);
+            } else {
+                let actual = actual.unwrap();
+                assert_eq!(actual, reference);
+                assert_eq!(
+                    serde_json::from_slice::<Vec<QueryRow>>(&actual).unwrap(),
+                    rows
+                );
+            }
+        }
+        let vertex = |id| QualifiedElement::Vertex {
+            partition: (id % 3) as u32,
+            id,
+        };
+        // Serialization is unaware of topology or query syntax. Exercise short
+        // aggregates, sparse IDs, repeated high-fanout bags, and long paths.
+        for width in [0, 1, 17, 257, 4096] {
+            check_rows(vec![QueryRow::Count(width as u64)]);
+            check_rows(
+                (0..width)
+                    .map(|id| QueryRow::Element(vertex(id as u64 * 101)))
+                    .collect(),
+            );
+            check_rows((0..width).map(|_| QueryRow::Element(vertex(9))).collect());
+            check_rows(
+                (0..width)
+                    .map(|id| {
+                        QueryRow::Path((0..32).map(|hop| vertex((id + hop) as u64)).collect())
+                    })
+                    .collect(),
+            );
+        }
+        check_rows(
+            [
+                Value::Null,
+                Value::Integer(i64::MIN),
+                Value::Real(0.125),
+                Value::Boolean(true),
+                Value::Text("\u{0000}\n\"部门".repeat(2048)),
+            ]
+            .into_iter()
+            .map(|value| QueryRow::Value {
+                source: Some(vertex(42)),
+                value,
+            })
+            .collect(),
+        );
+        check_rows(vec![QueryRow::Count(u64::MAX)]);
+    }
+
+    #[test]
+    fn amortized_deadline_checks_final_partial_interval() {
+        struct ExpireAfterWriting {
+            end: Instant,
+        }
+        impl Serialize for ExpireAfterWriting {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let result = serializer.serialize_u8(1)?;
+                while Instant::now() < self.end {
+                    std::thread::yield_now();
+                }
+                Ok(result)
+            }
+        }
+        let end = Instant::now() + Duration::from_millis(2);
+        assert_eq!(
+            bounded_encode(&ExpireAfterWriting { end }, end).unwrap_err(),
+            QueryFailure::Timeout
+        );
+    }
+
+    #[test]
+    fn amortized_deadline_propagates_serializer_error() {
+        struct Refused;
+        impl Serialize for Refused {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut sequence = serializer.serialize_seq(Some(2))?;
+                sequence.serialize_element(&"x".repeat(8193))?;
+                Err(serde::ser::Error::custom("deliberate encoding failure"))
+            }
+        }
+        assert_eq!(
+            bounded_encode(&Refused, Instant::now() + Duration::from_secs(1)).unwrap_err(),
+            QueryFailure::ResourceExhausted
+        );
+    }
+
     #[test]
     fn client_validates_edge_owner_using_each_hop_direction() {
         let v = |partition| QualifiedElement::Vertex { partition, id: 1 };
