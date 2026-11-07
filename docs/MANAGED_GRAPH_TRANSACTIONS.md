@@ -1,8 +1,10 @@
 # Managed graph/v2 transactions
 
 Status: experimental trusted in-process end-to-end write/read slice over the
-fixed empty-baseline cohort. The existing remote GlobalCommittedSnapshot Gremlin
-interface remains Unsupported. This is not a production distributed graph API.
+fixed empty-baseline cohort. A separate [managed TCP gateway](MANAGED_GRAPH_GATEWAY.md)
+owns these handles and exposes bounded durable requests and fixed-version
+sessions. The existing remote GlobalCommittedSnapshot Gremlin interface remains
+Unsupported. This is not a production distributed graph API.
 
 ## Supported surface and mapping
 

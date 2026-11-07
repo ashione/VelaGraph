@@ -517,6 +517,55 @@ impl<'a> GraphCohort<'a> {
         }
         Ok(())
     }
+    /// Read the durable decision without preparing, deciding, or advancing it.
+    /// A known decision survives unavailable members as `visible: false`.
+    pub async fn status(&self, plan: &Plan) -> Result<Option<Outcome>> {
+        let journal = tokio::time::timeout(Duration::from_secs(30), self.journal())
+            .await
+            .map_err(|_| Error::Uncertain)??;
+        self.check_plan(plan, &journal)?;
+        let tx = journal.transaction(plan.id).ok_or(Error::Identity)?;
+        if tx.participants
+            != plan
+                .parts
+                .iter()
+                .map(|p| p.descriptor.clone())
+                .collect::<Vec<_>>()
+        {
+            return Err(Error::Identity);
+        }
+        let Some(decision) = tx.decision else {
+            return Ok(None);
+        };
+        let ordinal = tx.ordinal;
+        let visible = matches!(
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for (node, target) in &self.members {
+                    node.raft
+                        .ensure_linearizable()
+                        .await
+                        .map_err(|_| Error::Uncertain)?;
+                    node.state_machine
+                        .participant_prefix_applied(
+                            target.shard,
+                            target.epoch,
+                            target.mode,
+                            ordinal,
+                            &journal,
+                        )
+                        .await
+                        .map_err(Error::Application)?;
+                }
+                Ok::<(), Error>(())
+            })
+            .await,
+            Ok(Ok(()))
+        );
+        Ok(Some(match decision {
+            Decision::Commit => Outcome::Committed { ordinal, visible },
+            Decision::Abort => Outcome::Aborted { ordinal, visible },
+        }))
+    }
     /// Overall deadline covers Begin/Prepare/decision. On timeout the plan is
     /// still live; do not prepare a replacement. A known terminal decision is
     /// returned even when visibility catch-up cannot finish within the budget.

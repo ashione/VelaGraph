@@ -451,3 +451,59 @@ clients, coordinator and data nodes must be upgraded together for these queries:
 `QueryRow::PropertyMap` is an additive wire variant and data nodes now accept the
 existing `Project` leaf in ordinary sessions. Old query forms and hierarchy job
 protocols are unchanged; older peers fail explicitly rather than dropping fields.
+
+## Managed-session Gremlin subset
+
+The experimental `managed_gateway` uses standard Gremlin text and the existing
+`ObservedGremlinQuery::parse` official-grammar adapter, including its text,
+structural-mark, literal and terminal-step validation. It does not add grammar,
+aliases, steps or a typed external read language. Its private executor uses a
+certified fixed-cohort GraphSnapshot at the already opened session version V.
+This does not enable the older remote GlobalCommittedSnapshot query mode.
+
+The request includes a partition solely to locate one explicit `g.V(id)` or
+`g.E(id)` start under the existing partition-equals-shard mapping. E IDs are
+canonical source-owned edge IDs in that partition. Exactly one ID is supported;
+V()/E() scans, multiple IDs, and all other starts are Unsupported, not partial
+results. Missing IDs yield no row. The full AST is checked before any read, so
+empty starts cannot hide unsupported steps or invalid element/scalar transitions.
+
+Supported composition:
+
+- An optional first step `outE()` or `inE()` (zero or one label) requires a vertex
+  start and returns canonical qualified edges, including cross-partition edges.
+  No other adjacency or endpoint step is supported in this slice. Adjacency after
+  a preceding limit or projection is explicitly unsupported/invalid, never moved.
+- `values(key)`, `id()` and `label()` project vertex/edge elements to scalar rows.
+  Only limit and terminal count may follow a projection. Missing properties emit
+  no row; explicit Null remains. Vertex label is the first stored label, or empty
+  Text; an edge label is its stored label. ID projection requires i64.
+- `limit(n)` uses the existing 1..=1000 range and executes exactly where written.
+  `count()` is terminal and counts the current stream, before the implicit default
+  result cap. With no explicit limit, non-count results keep the first 100 rows
+  after the supported steps, matching the existing default result-cap semantics.
+- Adjacency order is ascending edge ID with canonical source partition as the
+  deterministic tie-break for equal IDs. Single-ID starts have no reordering or
+  implicit duplication. Limits and projections preserve stream order.
+
+Results use the existing qualified QueryRow element/value/count shapes. They do
+not return ad-hoc whole-record point payloads. Scalar provenance is retained.
+QueryData completeness stays Unverified against arbitrary low-level writes that
+might omit indexes, independently of its session's certified common version.
+All canonical edges, both edge halves, endpoints and properties are checked at V;
+no current or weaker read may fill a missing result.
+
+Unsupported features include filters, out/in/both, bothE, endpoint steps, path,
+dedup, repeat, valueMap, mutations and terminal iterators. Parse/Unsupported/
+InvalidArgument/resource failures remain distinct using the existing query error
+mapping. All failures are all-or-error with no partial rows. The former unpublished
+typed read request fields are rejected by strict deserialization.
+
+A complete observed adjacency is bounded by 1000 entries/1 MiB accounted payload;
+a later filter-label/limit/count does not bypass that validation cap. Read captures
+are bounded by the gateway's fixed snapshot budget, output logical rows by 1 MiB,
+and the full encoded response including JSON escaping by 1 MiB. Parser/execution
+and encoding/sending share at most five seconds, shortened by the connection
+budget and session expiry. Expired or closed sessions fail even for an empty
+query result. The wider managed gateway lifetime/recovery and memory exclusions
+are specified in [MANAGED_GRAPH_GATEWAY.md](MANAGED_GRAPH_GATEWAY.md).
