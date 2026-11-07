@@ -200,9 +200,6 @@ impl Sessions {
         end: Instant,
     ) -> Result<Reply, RemoteError> {
         request.fragment.validate()?;
-        if matches!(request.fragment, Fragment::Project { .. }) {
-            return Err(RemoteError::InvalidArgument);
-        }
         let session = self.lookup(identity, shard, &request.descriptor)?;
         let is_batch = matches!(request.fragment, Fragment::HierarchyBatch { .. });
         if session.hierarchy != is_batch {
@@ -1388,6 +1385,66 @@ mod epoch_tests {
             ),
             Err(QueryFailure::ResourceExhausted)
         ));
+        // Ordinary Project uses its original snapshot and cumulative synchronous
+        // allowance; a later mutation cannot change either during projection.
+        let ordinary = sessions.open(&state, identity, 7, end).await.unwrap();
+        let ordinary_session = sessions.lookup(identity, 7, &ordinary).unwrap();
+        let ordinary_end = ordinary_session.node.end;
+        apply(
+            &mut state,
+            4,
+            D1Command::Write(d2_raft::D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [44; 16],
+                expected_sequence: None,
+                operations: entries.keys().map(d2_raft::WriteOp::delete).collect(),
+            }),
+        )
+        .await;
+        let request = FragmentRequest {
+            descriptor: ordinary.clone(),
+            fragment: Fragment::Project {
+                vertex: source,
+                keys: vec!["姓名".into(), "null".into(), "missing".into()],
+            },
+            remaining: CEILING,
+        };
+        let mut work = 0;
+        for _ in 0..2 {
+            let Reply::QueryFragment(Ok(output)) = sessions
+                .fragment(&state, identity, 7, request.clone(), end)
+                .await
+                .unwrap()
+            else {
+                panic!("ordinary projection must retain its snapshot");
+            };
+            assert_eq!(output.descriptor, ordinary);
+            let FragmentValue::Projected { vertex, properties } = output.value else {
+                panic!("projected leaf expected")
+            };
+            assert_eq!(vertex, source);
+            assert_eq!(
+                properties,
+                BTreeMap::from([
+                    ("姓名".into(), Value::Text("员工".into())),
+                    ("null".into(), Value::Null)
+                ])
+            );
+            let used = *ordinary_session.used.lock().unwrap();
+            assert!(used.work > work);
+            work = used.work;
+            assert_eq!(ordinary_session.node.end, ordinary_end);
+        }
+        *ordinary_session.used.lock().unwrap() = CEILING;
+        assert!(matches!(
+            sessions
+                .fragment(&state, identity, 7, request, end)
+                .await
+                .unwrap(),
+            Reply::QueryFragment(Err(QueryFailure::ResourceExhausted))
+        ));
+        sessions.close(identity, 7, &ordinary).unwrap();
         sessions.close(identity, 7, &descriptor).unwrap();
     }
 }

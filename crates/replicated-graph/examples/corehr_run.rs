@@ -146,6 +146,12 @@ fn observed(rows: &[ObservedRowV3]) -> Value {
     json!({"vertices":rows.iter().map(|r|match r{ObservedRowV3::Vertex(v)=>json!([v.partition,v.id]),_=>json!(format!("{r:?}"))}).collect::<Vec<_>>()})
 }
 fn server_rows(rows: &[QueryRow]) -> Value {
+    if matches!(rows.first(), Some(QueryRow::PropertyMap { .. })) {
+        return json!({"maps": rows.iter().map(|r| match r {
+            QueryRow::PropertyMap { source: QualifiedElement::Vertex { partition, id }, properties } => json!({"source":[partition,id],"properties":properties}),
+            _ => panic!("mixed projected rows"),
+        }).collect::<Vec<_>>()});
+    }
     if matches!(rows.first(), Some(QueryRow::Path(_))) {
         return json!({"paths": rows.iter().map(|r| match r { QueryRow::Path(p) => p.iter().map(|e| match e { QualifiedElement::Vertex{partition,id} => json!(["v",partition,id]), QualifiedElement::Edge{partition,id} => json!(["e",partition,id]) }).collect::<Vec<_>>(), _ => panic!("mixed path rows") }).collect::<Vec<_>>()});
     }

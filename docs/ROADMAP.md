@@ -307,3 +307,11 @@ Emit plus terminal dedup now reuses a qualified identity entry for both depth
 weights and the emitted flag. This reduces duplicate state within the unchanged
 250,000-entry ceiling; cycles still propagate weighted bags and all resource
 limits remain enforced. Ordered result pagination remains a separate slice.
+
+The explicit-ID synchronous server path now supports bounded terminal selected
+`valueMap` for ordinary person/department joins, independently of long-running
+hierarchy jobs. Multi-field rows preserve qualified provenance, missing/Null
+semantics and bag order under the original synchronous budget. Global-start
+joins, arbitrary aggregations and general Gremlin remain deferred. CoreHR CI
+adds batch-person, batch-department, active-members and distinct-colleague map
+oracles on both smoke and 200,000-person fixtures.
