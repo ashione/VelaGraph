@@ -198,7 +198,10 @@ encoding, synchronous I/O and the log-flushed callback. These synchronous
 sections now use `block_in_place` so Tokio can replace the occupied async worker
 and continue scheduling heartbeats and unrelated RPCs. TCP JSON encode/decode
 uses the same private helper while retaining the existing connection/outbound
-admission and absolute deadline.
+admission and absolute deadline. The separate graph RPC transport has a
+[bounded small-frame decode exception](SMALL_FRAME_DECODING.md): bodies of at
+most 4 KiB parse inline, while larger decodes and encoding retain the helper.
+The Raft TCP transport is unchanged by that optimization.
 
 This is not detached background work, a new await point within a mutation, or a
 cancellable persistence operation. It does not change flush ordering, record or

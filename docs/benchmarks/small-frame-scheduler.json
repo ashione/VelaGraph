@@ -1,0 +1,774 @@
+{
+  "order": [
+    "baseline-first",
+    "candidate-first",
+    "candidate-second",
+    "baseline-second",
+    "candidate-third",
+    "baseline-third",
+    "baseline-fourth",
+    "candidate-fourth"
+  ],
+  "summary": {
+    "1024": {
+      "baseline": {
+        "frames_per_second": {
+          "values": [
+            44098.75522099116,
+            48635.75188496102,
+            47512.327930930725,
+            43146.472876225336
+          ],
+          "median": 45805.541575960946,
+          "min": 43146.472876225336,
+          "max": 48635.75188496102
+        },
+        "lateness_p95_us": {
+          "values": [
+            338,
+            481,
+            738,
+            455
+          ],
+          "median": 468.0,
+          "min": 338,
+          "max": 738
+        },
+        "lateness_p99_us": {
+          "values": [
+            638,
+            812,
+            1086,
+            913
+          ],
+          "median": 862.5,
+          "min": 638,
+          "max": 1086
+        },
+        "lateness_max_us": {
+          "values": [
+            1853,
+            1410,
+            2722,
+            1786
+          ],
+          "median": 1819.5,
+          "min": 1410,
+          "max": 2722
+        }
+      },
+      "candidate": {
+        "frames_per_second": {
+          "values": [
+            71893.88825158203,
+            72650.674809209,
+            64396.818605580345,
+            66192.64007220557
+          ],
+          "median": 69043.2641618938,
+          "min": 64396.818605580345,
+          "max": 72650.674809209
+        },
+        "lateness_p95_us": {
+          "values": [
+            403,
+            550,
+            618,
+            553
+          ],
+          "median": 551.5,
+          "min": 403,
+          "max": 618
+        },
+        "lateness_p99_us": {
+          "values": [
+            590,
+            678,
+            1626,
+            942
+          ],
+          "median": 810.0,
+          "min": 590,
+          "max": 1626
+        },
+        "lateness_max_us": {
+          "values": [
+            1368,
+            1153,
+            2377,
+            2363
+          ],
+          "median": 1865.5,
+          "min": 1153,
+          "max": 2377
+        }
+      }
+    },
+    "4096": {
+      "baseline": {
+        "frames_per_second": {
+          "values": [
+            47750.35890326206,
+            47261.32684712976,
+            48152.870846848185,
+            42860.3520260008
+          ],
+          "median": 47505.842875195915,
+          "min": 42860.3520260008,
+          "max": 48152.870846848185
+        },
+        "lateness_p95_us": {
+          "values": [
+            769,
+            705,
+            446,
+            703
+          ],
+          "median": 704.0,
+          "min": 446,
+          "max": 769
+        },
+        "lateness_p99_us": {
+          "values": [
+            822,
+            950,
+            541,
+            975
+          ],
+          "median": 886.0,
+          "min": 541,
+          "max": 975
+        },
+        "lateness_max_us": {
+          "values": [
+            2228,
+            2623,
+            906,
+            2366
+          ],
+          "median": 2297.0,
+          "min": 906,
+          "max": 2623
+        }
+      },
+      "candidate": {
+        "frames_per_second": {
+          "values": [
+            63098.99742693133,
+            60589.250990491295,
+            58981.29526920394,
+            59701.433838329045
+          ],
+          "median": 60145.342414410174,
+          "min": 58981.29526920394,
+          "max": 63098.99742693133
+        },
+        "lateness_p95_us": {
+          "values": [
+            452,
+            1084,
+            553,
+            1121
+          ],
+          "median": 818.5,
+          "min": 452,
+          "max": 1121
+        },
+        "lateness_p99_us": {
+          "values": [
+            664,
+            1327,
+            1145,
+            1178
+          ],
+          "median": 1161.5,
+          "min": 664,
+          "max": 1327
+        },
+        "lateness_max_us": {
+          "values": [
+            1426,
+            1620,
+            2661,
+            1807
+          ],
+          "median": 1713.5,
+          "min": 1426,
+          "max": 2661
+        }
+      }
+    },
+    "8192": {
+      "baseline": {
+        "frames_per_second": {
+          "values": [
+            46789.348875546304,
+            46210.52389460123,
+            46394.19691178304,
+            43557.05089936088
+          ],
+          "median": 46302.360403192135,
+          "min": 43557.05089936088,
+          "max": 46789.348875546304
+        },
+        "lateness_p95_us": {
+          "values": [
+            948,
+            685,
+            850,
+            348
+          ],
+          "median": 767.5,
+          "min": 348,
+          "max": 948
+        },
+        "lateness_p99_us": {
+          "values": [
+            1055,
+            759,
+            926,
+            468
+          ],
+          "median": 842.5,
+          "min": 468,
+          "max": 1055
+        },
+        "lateness_max_us": {
+          "values": [
+            1681,
+            2615,
+            1329,
+            1105
+          ],
+          "median": 1505.0,
+          "min": 1105,
+          "max": 2615
+        }
+      },
+      "candidate": {
+        "frames_per_second": {
+          "values": [
+            48622.27610677922,
+            47330.899287604145,
+            45012.45422869909,
+            45596.66046525012
+          ],
+          "median": 46463.77987642713,
+          "min": 45012.45422869909,
+          "max": 48622.27610677922
+        },
+        "lateness_p95_us": {
+          "values": [
+            560,
+            131,
+            849,
+            924
+          ],
+          "median": 704.5,
+          "min": 131,
+          "max": 924
+        },
+        "lateness_p99_us": {
+          "values": [
+            665,
+            241,
+            1616,
+            1072
+          ],
+          "median": 868.5,
+          "min": 241,
+          "max": 1616
+        },
+        "lateness_max_us": {
+          "values": [
+            1463,
+            1944,
+            4615,
+            4119
+          ],
+          "median": 3031.5,
+          "min": 1463,
+          "max": 4615
+        }
+      }
+    }
+  },
+  "runs": {
+    "baseline-first": {
+      "binary_sha256": "2c5b8353ebe75e6fa4a7db93e9a5fccd1be792b41c3ecbc88c90ed70ec23d495",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.725644065,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 44098.75522099116,
+          "lanes": 8,
+          "lateness_max_us": 1853,
+          "lateness_p95_us": 338,
+          "lateness_p99_us": 638,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 729,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.670152031,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 47750.35890326206,
+          "lanes": 8,
+          "lateness_max_us": 2228,
+          "lateness_p95_us": 769,
+          "lateness_p99_us": 822,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 673,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.683916335,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 46789.348875546304,
+          "lanes": 8,
+          "lateness_max_us": 1681,
+          "lateness_p95_us": 948,
+          "lateness_p99_us": 1055,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 686,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "718031c3f20e50c38aa6f4faa0714acf5729cff3279313adb2d79109f0375d1f"
+    },
+    "candidate-first": {
+      "binary_sha256": "4ce9824714140f8c1aad4c98264d48fdb60a0fefcd09d17a96ca3c77e3a4d3ab",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.445100422,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 71893.88825158203,
+          "lanes": 8,
+          "lateness_max_us": 1368,
+          "lateness_p95_us": 403,
+          "lateness_p99_us": 590,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 448,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.507139595,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 63098.99742693133,
+          "lanes": 8,
+          "lateness_max_us": 1426,
+          "lateness_p95_us": 452,
+          "lateness_p99_us": 664,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 510,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.658134554,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 48622.27610677922,
+          "lanes": 8,
+          "lateness_max_us": 1463,
+          "lateness_p95_us": 560,
+          "lateness_p99_us": 665,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 662,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "3264a7a4029cbec4365f784ac19fdda442f99fcee0b6a51905e7ec68771b1f9f"
+    },
+    "candidate-second": {
+      "binary_sha256": "4ce9824714140f8c1aad4c98264d48fdb60a0fefcd09d17a96ca3c77e3a4d3ab",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.440463906,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 72650.674809209,
+          "lanes": 8,
+          "lateness_max_us": 1153,
+          "lateness_p95_us": 550,
+          "lateness_p99_us": 678,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 444,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.528146486,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 60589.250990491295,
+          "lanes": 8,
+          "lateness_max_us": 1620,
+          "lateness_p95_us": 1084,
+          "lateness_p99_us": 1327,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 531,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.676091105,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 47330.899287604145,
+          "lanes": 8,
+          "lateness_max_us": 1944,
+          "lateness_p95_us": 131,
+          "lateness_p99_us": 241,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 680,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "5b0123b06b00dea0c483e80c3afdfeafc092a1c32fd4b1d4de5cb0fc976b843b"
+    },
+    "baseline-second": {
+      "binary_sha256": "2c5b8353ebe75e6fa4a7db93e9a5fccd1be792b41c3ecbc88c90ed70ec23d495",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.657952201,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 48635.75188496102,
+          "lanes": 8,
+          "lateness_max_us": 1410,
+          "lateness_p95_us": 481,
+          "lateness_p99_us": 812,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 661,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.677086365,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 47261.32684712976,
+          "lanes": 8,
+          "lateness_max_us": 2623,
+          "lateness_p95_us": 705,
+          "lateness_p99_us": 950,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 680,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.692482952,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 46210.52389460123,
+          "lanes": 8,
+          "lateness_max_us": 2615,
+          "lateness_p95_us": 685,
+          "lateness_p99_us": 759,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 695,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "415bc541f587c705d255bb76a58cf5c6851fb895042df37322b95ba088f99f19"
+    },
+    "candidate-third": {
+      "binary_sha256": "4ce9824714140f8c1aad4c98264d48fdb60a0fefcd09d17a96ca3c77e3a4d3ab",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.496918958,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 64396.818605580345,
+          "lanes": 8,
+          "lateness_max_us": 2377,
+          "lateness_p95_us": 618,
+          "lateness_p99_us": 1626,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 500,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.542544884,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 58981.29526920394,
+          "lanes": 8,
+          "lateness_max_us": 2661,
+          "lateness_p95_us": 553,
+          "lateness_p99_us": 1145,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 546,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.710914358,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 45012.45422869909,
+          "lanes": 8,
+          "lateness_max_us": 4615,
+          "lateness_p95_us": 849,
+          "lateness_p99_us": 1616,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 714,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "5acfbd1e4afbf15795d844491cf5f10a7e313d272cd128b50314cb58057882ef"
+    },
+    "baseline-third": {
+      "binary_sha256": "2c5b8353ebe75e6fa4a7db93e9a5fccd1be792b41c3ecbc88c90ed70ec23d495",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.673509411,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 47512.327930930725,
+          "lanes": 8,
+          "lateness_max_us": 2722,
+          "lateness_p95_us": 738,
+          "lateness_p99_us": 1086,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 676,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.664550201,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 48152.870846848185,
+          "lanes": 8,
+          "lateness_max_us": 906,
+          "lateness_p95_us": 446,
+          "lateness_p99_us": 541,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 668,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.689741436,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 46394.19691178304,
+          "lanes": 8,
+          "lateness_max_us": 1329,
+          "lateness_p95_us": 850,
+          "lateness_p99_us": 926,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 693,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "9251d397d8733e6e95ab49f7f22664df39d9e76b5efbb0e4458b3de8bc533109"
+    },
+    "baseline-fourth": {
+      "binary_sha256": "2c5b8353ebe75e6fa4a7db93e9a5fccd1be792b41c3ecbc88c90ed70ec23d495",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.741659697,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 43146.472876225336,
+          "lanes": 8,
+          "lateness_max_us": 1786,
+          "lateness_p95_us": 455,
+          "lateness_p99_us": 913,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 744,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.74661076,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 42860.3520260008,
+          "lanes": 8,
+          "lateness_max_us": 2366,
+          "lateness_p95_us": 703,
+          "lateness_p99_us": 975,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 749,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.734668655,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 43557.05089936088,
+          "lanes": 8,
+          "lateness_max_us": 1105,
+          "lateness_p95_us": 348,
+          "lateness_p99_us": 468,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 738,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "9e13b9c5233736b32b1eec5159b59f5023ba4cbb666d84e00a1dd376527d1136"
+    },
+    "candidate-fourth": {
+      "binary_sha256": "4ce9824714140f8c1aad4c98264d48fdb60a0fefcd09d17a96ca3c77e3a4d3ab",
+      "exit_code": 0,
+      "records": [
+        {
+          "body_bytes": 1024,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.483437433,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 66192.64007220557,
+          "lanes": 8,
+          "lateness_max_us": 2363,
+          "lateness_p95_us": 553,
+          "lateness_p99_us": 942,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 487,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 4096,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.536000527,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 59701.433838329045,
+          "lanes": 8,
+          "lateness_max_us": 1807,
+          "lateness_p95_us": 1121,
+          "lateness_p99_us": 1178,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 539,
+          "timed_out_lanes": 0,
+          "workers": 2
+        },
+        {
+          "body_bytes": 8192,
+          "completed_exchanges": 16000,
+          "completed_frames": 32000,
+          "elapsed_seconds": 0.701805783,
+          "exchanges_per_lane": 2000,
+          "frames_per_second": 45596.66046525012,
+          "lanes": 8,
+          "lateness_max_us": 4119,
+          "lateness_p95_us": 924,
+          "lateness_p99_us": 1072,
+          "probe": "generic_frame_scheduler_load",
+          "ticker_period_us": 1000,
+          "ticker_samples": 705,
+          "timed_out_lanes": 0,
+          "workers": 2
+        }
+      ],
+      "raw_sha256": "69fe796a5257895298068589d83a22a9a852476ac62ccf2b620e1a9f2347d645"
+    }
+  },
+  "limitations": [
+    "sampled timer lateness, not actual heartbeat or RPC latency",
+    "Skip misses ticks; percentiles do not count each skipped tick",
+    "same-lane try_join echo halves; one runtime on one cloud host",
+    "no warmup, fixed size order, encode/allocation/loopback costs included",
+    "old measured baseline, not new main83 end-to-end evidence"
+  ],
+  "sources": {
+    "baseline": "040c72560843eaa0354e83674de6f6e10e343488",
+    "candidate_production": "c651cad94cc4f66d0a2054c79ac61e322e846635",
+    "identical_probe_sha256": "fc1dd0ff10e9fcf58e67228c613b592c3f54df18c970e861d30a75a8aa451d82"
+  }
+}

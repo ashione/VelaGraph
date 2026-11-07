@@ -208,8 +208,7 @@ async fn next_frame(
             .read_exact(&mut bytes)
             .await
             .map_err(|_| RemoteError::Unavailable)?;
-        let frame: Frame =
-            blocking_json(|| serde_json::from_slice(&bytes)).map_err(|_| RemoteError::Protocol)?;
+        let frame: Frame = decode_frame_json(&bytes).map_err(|_| RemoteError::Protocol)?;
         if Instant::now() >= end {
             return Err(RemoteError::Timeout { request_id: None });
         }
@@ -615,6 +614,38 @@ mod channel_tests {
         ));
         assert!(connection.is_none());
         peer.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_channel_types_strict_decode_at_byte_boundary() {
+        use crate::remote::frame_decode_tests::{invalid_objects, padded};
+        tokio::spawn(async {
+            let frame = Frame {
+                version: PROTOCOL,
+                sequence: 1,
+                timeout_millis: 1000,
+                request: request(),
+            };
+            let frame_bytes = serde_json::to_vec(&frame).unwrap();
+            let answer_bytes = serde_json::to_vec(&answer(1, false)).unwrap();
+            for size in [4095, 4096, 4097] {
+                let decoded: Frame = decode_frame_json(&padded(&frame_bytes, size)).unwrap();
+                assert_eq!(decoded.sequence, 1);
+                assert_eq!(decoded.request.descriptor, descriptor());
+                let decoded: Answer = decode_frame_json(&padded(&answer_bytes, size)).unwrap();
+                assert_eq!(decoded.sequence, 1);
+                assert!(!decoded.retire);
+                assert_eq!(decoded.output.unwrap().descriptor, descriptor());
+                for invalid in invalid_objects(&frame_bytes) {
+                    assert!(decode_frame_json::<Frame>(&padded(&invalid, size)).is_err());
+                }
+                for invalid in invalid_objects(&answer_bytes) {
+                    assert!(decode_frame_json::<Answer>(&padded(&invalid, size)).is_err());
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
