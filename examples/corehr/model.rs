@@ -41,7 +41,7 @@ impl Model {
             });
         }
         for p in 1..=people {
-            // 40% of staff work in the largest 10% of departments; fixed integer hash.
+            // 40% preferential cohort selects the hot 10%; the rest selects all departments.
             let h = mix(p);
             let d = if p % 5 < 2 {
                 1 + h % (departments / 10)
@@ -204,20 +204,80 @@ impl Model {
         let colleagues = self.hop(&self.hop(&[20], "member_of", true), "member_of", false);
         assert_eq!(colleagues.iter().filter(|id| **id == 20).count(), 3);
         q.push(json!({"name":"colleagues_bag_count","partition":partition(20),"query":"g.V(20).out('member_of').in('member_of').count()","expected":{"count":colleagues.len()},"server_supported":false}));
+        // Independent relationship-list oracle: first occurrence of a qualified
+        // endpoint survives, preserving its complete path and stream position.
+        let mut seen = std::collections::BTreeSet::new();
+        let unique: Vec<_> = colleagues
+            .iter()
+            .copied()
+            .filter(|id| seen.insert((partition(*id), *id)))
+            .collect();
+        assert!(unique.len() < colleagues.len());
+        let verts = |ids: &[u64]| {
+            json!({"vertices": ids.iter()
+            .map(|id| json!([partition(*id), id])).collect::<Vec<_>>()})
+        };
+        let join = "g.V(20).out('member_of').in('member_of')";
+        q.push(json!({"name":"dedup_join","partition":partition(20),"query":format!("{join}.dedup().limit(1000)"),"expected":verts(&unique),"server_supported":true}));
+        q.push(json!({"name":"unique_colleague_count","partition":partition(20),"query":format!("{join}.dedup().count()"),"expected":{"count":unique.len()},"server_supported":true}));
+        q.push(json!({"name":"active_unique_colleague_count","partition":partition(20),"query":format!("{join}.dedup().has('active',true).count()"),"expected":{"count":unique.iter().filter(|id| active(**id)).count()},"server_supported":true}));
+        // Choose the first duplicate prefix so limit/dedup order is observably
+        // different for both smoke and full fixtures, not a vacuous prefix.
+        let mut seen = std::collections::BTreeSet::new();
+        let boundary = colleagues.iter().position(|id| !seen.insert(*id)).unwrap() + 1;
+        let mut seen = std::collections::BTreeSet::new();
+        let before: Vec<_> = colleagues[..boundary]
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let after: Vec<_> = unique.iter().copied().take(boundary).collect();
+        assert_ne!(before, after);
+        q.push(json!({"name":"limit_before_dedup","partition":partition(20),"query":format!("{join}.limit({boundary}).dedup()"),"expected":verts(&before),"server_supported":true}));
+        q.push(json!({"name":"limit_after_dedup","partition":partition(20),"query":format!("{join}.dedup().limit({boundary})"),"expected":verts(&after),"server_supported":true}));
+        q.push(json!({"name":"duplicate_starts_dedup","partition":partition(20),"query":"g.V(20,20).dedup().dedup().count()","expected":{"count":1},"server_supported":true}));
+        q.push(json!({"name":"duplicate_memberships_unique_count","partition":partition(20),"query":"g.V(20,20).out('member_of').dedup().count()","expected":{"count":3},"server_supported":true}));
+        q.push(json!({"name":"empty_dedup_count","partition":partition(self.people),"query":format!("g.V({}).in('reports_to').dedup().count()",self.people),"expected":{"count":0},"server_supported":true}));
+        let mut seen = std::collections::BTreeSet::new();
+        let mut paths = Vec::new();
+        for (out_idx, out) in self
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.from == 20 && e.label == "member_of")
+        {
+            for (in_idx, incoming) in self
+                .edges
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.to == out.to && e.label == "member_of")
+            {
+                if seen.insert((partition(incoming.from), incoming.from)) {
+                    paths.push(json!([
+                        ["v", partition(20), 20],
+                        ["e", partition(20), out_idx + 1],
+                        ["v", partition(out.to), out.to],
+                        ["e", partition(incoming.from), in_idx + 1],
+                        ["v", partition(incoming.from), incoming.from]
+                    ]));
+                }
+            }
+        }
+        assert_eq!(paths.len(), unique.len());
+        q.push(json!({"name":"dedup_first_path","partition":partition(20),"query":format!("{join}.dedup().limit(1000).path()"),"expected":{"paths":paths},"server_supported":true}));
         for (name, query) in [
             ("recursive_repeat", "g.V(1).repeat(in('reports_to')).emit()"),
             ("offset_pagination", "g.V(1).in('reports_to').range(2,5)"),
             ("sort", "g.V(1).in('reports_to').order()"),
             ("predicate", "g.V(1).has('level',gt(2))"),
-            (
-                "dedup_join",
-                "g.V(20).out('member_of').in('member_of').dedup()",
-            ),
         ] {
             q.push(json!({"name":name,"partition":partition(1),"query":query,"expect_error":true}));
         }
         q.push(json!({"name":"global_count","partition":1,"query":"g.V().count()","expect_error":self.people+self.departments>10000,"expected":{"count":self.people+self.departments}}));
         for case in &mut q {
+            if case["query"].as_str().unwrap().contains(".dedup()") {
+                case["client_expect_unsupported"] = json!(true);
+            }
             let name = case["name"].as_str().unwrap();
             if name.starts_with("direct_reports_")
                 || [
@@ -254,4 +314,35 @@ fn fixture_invariants() {
         .iter()
         .filter(|e| e.label != "member_of")
         .all(|e| e.to < e.from));
+}
+
+#[test]
+fn dedup_oracle_is_nonvacuous() {
+    let m = Model::new(2000, 50);
+    let q = m.queries();
+    assert_eq!(q.len(), 40);
+    let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
+    assert!(
+        get("unique_colleague_count")["expected"]["count"]
+            .as_u64()
+            .unwrap()
+            < get("colleagues_bag_count")["expected"]["count"]
+                .as_u64()
+                .unwrap()
+    );
+    assert_ne!(
+        get("limit_before_dedup")["expected"],
+        get("limit_after_dedup")["expected"]
+    );
+    let vertices = get("dedup_join")["expected"]["vertices"]
+        .as_array()
+        .unwrap();
+    let paths = get("dedup_first_path")["expected"]["paths"]
+        .as_array()
+        .unwrap();
+    assert_eq!(vertices.len(), paths.len());
+    for (v, p) in vertices.iter().zip(paths) {
+        let last = p.as_array().unwrap().last().unwrap();
+        assert_eq!(json!([last[1], last[2]]), *v);
+    }
 }
