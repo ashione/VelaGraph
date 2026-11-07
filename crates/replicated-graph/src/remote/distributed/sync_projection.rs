@@ -83,7 +83,6 @@ mod tests {
             "g.V(1).valueMap('a').count()",
             "g.V(1).valueMap('a').limit(1)",
             "g.V(1).values('a').valueMap('a')",
-            "g.V().valueMap('a')",
         ] {
             assert!(plan(&request(text)).is_err(), "{text}");
         }

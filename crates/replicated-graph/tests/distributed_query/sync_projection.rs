@@ -67,6 +67,7 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
         .await?
         .is_empty());
     for text in [
+        "g.V().valueMap('large')",
         "g.V(11).valueMap('large')",
         "g.V(1,11).valueMap('large')",
         "g.V(8).out('knows').out('returns').valueMap('name')",
@@ -87,11 +88,12 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
         );
     }
     for text in [
+        "g.V().limit(0).valueMap('name')",
         "g.V(9999).valueMap()",
         "g.V(9999).valueMap('name','name')",
         "g.V(9999).valueMap('name').count()",
         "g.V(9999).values('name').valueMap('name')",
-        "g.V().valueMap('name')",
+        "g.V().valueMap('name').count()",
     ] {
         let result = distributed::query(
             endpoint,

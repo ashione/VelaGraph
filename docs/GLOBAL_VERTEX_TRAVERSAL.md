@@ -25,8 +25,9 @@ Examples:
 - `g.V().limit(4).has('active',true).out().in().dedup()`
 
 At least one out/in or repeat step is required for this additive surface. Global `E`,
-`path`, `values`, `both`, no-hop `dedup`/`valueMap`, and other unsupported
-steps fail explicitly. Existing scan-only and explicit-ID contracts stay intact.
+`path`, `values`, `both`, and other unsupported steps fail explicitly.
+No-hop `dedup`/`valueMap` follow the separate [scan-only contract](SERVER_GLOBAL_SCAN.md).
+Explicit-ID contracts stay intact.
 
 ## Order, multiplicity and completeness
 

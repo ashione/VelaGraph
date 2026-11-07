@@ -364,7 +364,7 @@ The bounded [global scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md)
 extends this with an ordered scan-filter/limit prefix then out/in, filters,
 limit, dedup and terminal count/selected valueMap. It preserves separate scan
 and traversal budgets on the same sessions. Joined results have no implicit
-100-row truncation. Global E/path/values and no-hop map/dedup remain Unsupported. One bounded
+100-row truncation. Global E/path/values remain Unsupported. No-hop map/dedup follow the server global scan contract below. One bounded
 repeat is now admitted after the global scan prefix with the same combined
 32-depth check and cumulative traversal budget.
 
@@ -430,9 +430,9 @@ The isolated server coordinator supports terminal
 `valueMap('key', ...)` after its supported vertex traversals, filters, `dedup()`
 and limits. This is not a new v1/local query feature. One to eight distinct,
 nonempty UTF-8 keys of at most 64 bytes are required; `valueMap()` (all
-properties), tokens, maps followed by another step, scalar-to-map and no-hop global
-`V()` maps remain explicitly unsupported or invalid. Global maps after the
-explicitly supported scan-to-out/in composition are allowed. Admission occurs before
+properties), tokens, maps followed by another step and scalar-to-map remain
+explicitly unsupported or invalid. Global maps after the supported scan-to-out/in
+composition and no-hop global scans are allowed. Admission occurs before
 reading even an empty stream.
 
 Each result has qualified vertex provenance and a canonical property map whose
@@ -527,3 +527,16 @@ old `Read` subset, observed routing metadata and unrestricted remote
 GlobalCommittedSnapshot Unsupported behavior are unchanged. See
 [managed traversal and paging contract](MANAGED_FIXED_TRAVERSALS.md) for complete
 ordering, limits, trust, retained-result accounting and compatibility details.
+
+### Server global no-hop projection and identity dedup
+
+The experimental server coordinator accepts `g.V()` with ordered has/hasLabel,
+limit and vertex dedup steps, optionally followed by count or terminal selected-key
+valueMap. Vertex identity includes partition; scanning emits each identity once,
+so dedup is exact identity and never collapses equal IDs across partitions.
+Filters and limits keep their positions. Maps preserve scan order and the original
+retained shard sessions; missing properties are omitted and present values are
+singleton lists. Empty/all-key maps, map post-processing and scalar dedup remain
+unsupported. Existing scan output limits and separately accounted synchronous
+projection budgets apply. See SERVER_GLOBAL_SCAN.md. This does not change the
+Unverified consistency contract or enable hierarchy-job global starts.

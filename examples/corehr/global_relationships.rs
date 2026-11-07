@@ -41,6 +41,20 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         }
         cases.push(row);
     };
+    let selected_people: Vec<_> = source(m, true)
+        .into_iter()
+        .filter(|id| *id <= m.people && active(*id))
+        .take(25)
+        .collect();
+    add("global_scan_selected_maps",
+        "g.V().hasLabel('person').has('active',true).dedup().limit(25).valueMap('name','active','missing')".into(),
+        maps(m, &selected_people), None);
+    add(
+        "global_scan_dedup_count",
+        "g.V().dedup().count()".into(),
+        json!({"count":m.people + m.departments}),
+        None,
+    );
     let named = m.hop(&[20], "member_of", true);
     add(
         "global_join_named_memberships",
@@ -201,8 +215,8 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
     );
     for (name, query) in [
         (
-            "global_join_reject_nohop_dedup",
-            "g.V().hasLabel('person').limit(1).dedup().count()",
+            "global_scan_reject_scalar_dedup",
+            "g.V().hasLabel('person').limit(1).values('name').dedup().count()",
         ),
         (
             "global_join_reject_path",
@@ -210,7 +224,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         ),
     ] {
         cases.push(json!({"name":name,"partition":1,"query":query,"expect_error":true,
-            "client_expect_unsupported":true,"server_supported":false,"server_expected_error":"Unsupported"}));
+            "client_expect_unsupported":name != "global_scan_reject_scalar_dedup","server_supported":false,"server_expected_error":"Unsupported"}));
     }
     cases
 }
@@ -221,7 +235,12 @@ fn global_relationship_oracles_are_nonvacuous() {
         let m = Model::new(people, departments);
         let q = queries(&m);
         let get = |name: &str| q.iter().find(|r| r["name"] == name).unwrap();
-        assert_eq!(q.len(), 20);
+        assert_eq!(q.len(), 22);
+        assert_eq!(get("global_scan_reject_scalar_dedup")["expect_error"], true);
+        assert_eq!(
+            get("global_scan_reject_scalar_dedup")["client_expect_unsupported"],
+            false
+        );
         assert!(
             get("global_repeat_named_ancestors")["expected"]["vertices"]
                 .as_array()
@@ -288,7 +307,7 @@ fn global_relationship_oracles_are_nonvacuous() {
         }
         assert_eq!(
             q.iter().filter(|r| r["server_supported"] == true).count(),
-            18
+            20
         );
     }
 }

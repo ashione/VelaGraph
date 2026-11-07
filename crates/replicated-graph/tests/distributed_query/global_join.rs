@@ -60,7 +60,14 @@ fn text(ops: &[Op]) -> String {
 }
 fn oracle(model: &Model, ops: &[Op]) -> Vec<QueryRow> {
     let ids: Vec<Id> = model.vertices.keys().copied().collect();
-    evaluate(model, ids, ops)
+    let mut result = evaluate(model, ids, ops);
+    if !ops
+        .iter()
+        .any(|op| matches!(op, Op::Hop(..) | Op::Repeat(..) | Op::Limit(_) | Op::Count))
+    {
+        result.truncate(100);
+    }
+    result
 }
 fn evaluate(model: &Model, mut ids: Vec<Id>, ops: &[Op]) -> Vec<QueryRow> {
     for op in ops {
@@ -264,6 +271,26 @@ fn export(model: &Model, missing: Option<bool>) -> anyhow::Result<Vec<Export>> {
 fn cases() -> Vec<Vec<Op>> {
     use Op::*;
     let mut cases = vec![
+        vec![Map],
+        vec![Dedup, Map],
+        vec![Dedup, Limit(129), Map],
+        vec![Dedup, Count],
+        vec![Limit(100), Map],
+        vec![Label("node"), Dedup, Limit(100), Map],
+        vec![
+            Limit(7),
+            Dedup,
+            Has("active", Some(Value::Boolean(true))),
+            Map,
+        ],
+        vec![
+            Has("active", Some(Value::Boolean(true))),
+            Dedup,
+            Limit(7),
+            Map,
+        ],
+        vec![Label("none"), Dedup, Map],
+        vec![Label("none"), Dedup, Count],
         vec![Hop(false, Some("late"))],
         vec![Hop(false, Some("many"))],
         vec![Hop(false, Some("many")), Map],
