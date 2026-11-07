@@ -4,6 +4,9 @@ use std::sync::Mutex;
 
 pub(super) const LEASE_MILLIS: u64 = 120_000;
 pub(super) const BATCH_ROWS: usize = 128;
+// One adjacency is bounded to 1,000 entries. Sixteen frontiers therefore
+// cannot exceed the 16,384-entry work-page bound, even before label filtering.
+const ADVANCE_ROWS: usize = 16;
 pub(super) const JOB_CEILING: Cost = Cost {
     bytes: 1024 * 1024 * 1024,
     work: 8_000_000,
@@ -390,7 +393,7 @@ impl Job {
             self.initialized = true;
         }
         let mut current = Vec::new();
-        for _ in 0..BATCH_ROWS {
+        for _ in 0..ADVANCE_ROWS {
             if let Some(row) = self.frontier.pop_first() {
                 current.push(row);
             } else {
@@ -627,6 +630,15 @@ fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn advance_grain_fits_maximum_adjacencies_without_a_larger_page_budget() {
+        // Regression for 125 hot departments, whose unrelated membership
+        // observations must still be validated before label filtering.
+        let frontier: Vec<_> = (0..125).collect();
+        let pages: Vec<_> = frontier.chunks(ADVANCE_ROWS).collect();
+        assert_eq!(pages.iter().map(|p| p.len()).sum::<usize>(), 125);
+        assert!(pages.iter().all(|p| p.len() * 1000 <= MAX_PAGE_EDGES));
+    }
     #[test]
     fn admission_is_count_only_and_weights_are_bounded_qualified_bags() {
         for text in [

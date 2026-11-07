@@ -13,7 +13,7 @@ unbounded recursion, or global start are admitted by this API.
 ## Progress is not a result
 
 Start pins every configured shard and returns a token, `next_sequence: 0`, and
-its fixed snapshot stamps. Advance processes at most 128 distinct frontier
+its fixed snapshot stamps. Advance processes at most 16 distinct frontier
 vertices. The next request uses the returned sequence. The coordinator, not the
 client, expands and validates all edges. A client merely polls native work; it
 does not execute a per-hop graph query or download graph snapshots.
@@ -66,8 +66,10 @@ The new API has its own budgets, not a claim that every old query cap is unchang
   remain bounded by a five-second request deadline.
 - At most 250,000 combined frontier/next-frontier/seen keys (a conservative
   32 MiB tree-node allowance), plus bounded page buffers. No full paths are stored.
-- At most 128 vertices advanced per request, 128 leaves per batched shard RPC,
-  and 16,384 observed edges retained for one step. Existing 1,000-neighbor and
+- At most 16 vertices advanced per request, 128 leaves per batched shard RPC,
+  and 16,384 observed edges retained for one step. Sixteen vertices at the
+  existing 1,000-neighbor cap fit this entry bound even before label filtering.
+  Existing 16 KiB serialized-fragment and
   2 MiB wire-response ceilings still apply. A very broad single vertex or oversized
   batch fails, rather than silently truncating adjacency.
 - Maximum one billion represented paths in a level or emitted bag count; checked
