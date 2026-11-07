@@ -147,3 +147,8 @@ point-only recovery, exact identity/schema validation and old protocol rejection
 Existing managed graph and independent-process scenarios retain partial-commit,
 lost-ACK, original-Plan recovery and stable old-V coverage. These are correctness
 tests, not a throughput or 200,000-person dynamic consistency claim.
+
+The next [durable terminal-segment foundation](DURABLE_DECISION_SEGMENTS.md) uses
+bound coordinator disk version 9 and bound member version 10. The request index
+remains unchanged; terminal proofs now validate their requested persisted segments.
+All request/transaction/Journal caps and full archive retention still apply.

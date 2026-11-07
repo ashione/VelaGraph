@@ -422,3 +422,11 @@ Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
 通用全局筛选现在允许首个 out/in/repeat 前的顶点 dedup，与扫描已有唯一
 (partition,id) 身份等价；后续边遍历和 repeat 的 bag 重数不受影响。独立小图
 与 CoreHR 验证前缀/后缀去重、limit 原位置和汇合计数，不扩大预算或一致性声明。
+
+### 持久终态分段索引基础
+
+固定cohort协调者/成员将连续resolved/applied prefix按绝对ordinal保存为32条一段，
+与权威Journal、请求索引、数据和Raft水位同批持久化；实际Summary/Terminal/Prefix/Read
+读取所需段并核对精确历史。v9/v10坏段不回退，旧版本明确迁移，快照仍完整。
+保留256/1024/16MiB等上限，不引入独立成员quota，不宣称无限写入或性能改善；
+后续权威ledger拆分与完整cohort容量grant另行验收。见[契约](DURABLE_DECISION_SEGMENTS.md)。

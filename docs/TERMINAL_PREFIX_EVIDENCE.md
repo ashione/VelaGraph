@@ -110,3 +110,9 @@ latest-V, full durable archive bytes and read proof bytes. Prepare/advance still
 transport full history; their remaining cost must not be presented as solved.
 
 See [frozen A1 measurements and validation limits](TERMINAL_PREFIX_RESULTS.md).
+
+The [durable terminal-segment index](DURABLE_DECISION_SEGMENTS.md) now backs actual
+fixed-cohort Summary/Terminal/Prefix/Read paths. Its disk versions 9/10 retain the
+full Journal authority and exact A1 proof schema; old explicit legacy formats may
+project until atomic migration. Indexed target corruption never falls back to that
+projection. Proof work remains O(V) and all limits above remain unchanged.

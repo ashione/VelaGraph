@@ -12,12 +12,12 @@ pub const SEGMENT_TRANSACTIONS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Terminal {
-    id: [u8; 16],
-    ordinal: u64,
-    participants: Vec<Participant>,
-    prepared: Vec<bool>,
-    decision: Decision,
+pub(crate) struct Terminal {
+    pub(crate) id: [u8; 16],
+    pub(crate) ordinal: u64,
+    pub(crate) participants: Vec<Participant>,
+    pub(crate) prepared: Vec<bool>,
+    pub(crate) decision: Decision,
 }
 
 /// Private checked evidence. Construction/deserialization checks the complete
@@ -99,6 +99,21 @@ impl TryFrom<Encoding> for TerminalPrefix {
     }
 }
 impl TerminalPrefix {
+    pub(crate) fn from_segments(
+        authority: [u8; 16],
+        cohort: Cohort,
+        through: u64,
+        segments: Vec<Vec<Terminal>>,
+    ) -> Result<Self, Error> {
+        Self::try_from(Encoding {
+            version: 1,
+            authority,
+            cohort,
+            through,
+            segments,
+        })
+        .map_err(|_| Error::InvalidJournal)
+    }
     pub fn authority(&self) -> [u8; 16] {
         self.authority
     }

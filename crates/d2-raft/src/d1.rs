@@ -191,6 +191,8 @@ pub enum D1Error {
     CoordinatorOnly,
     CoordinatorNotEnabled,
     CoordinatorRequiresEmptyShard,
+    DecisionIndexHistory,
+    DecisionIndexUnavailable,
     RequestIndexHistory,
     RequestIndexUnavailable,
     CoordinatorRejected(crate::transaction_decisions::Error),
