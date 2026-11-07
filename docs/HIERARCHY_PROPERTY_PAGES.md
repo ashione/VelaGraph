@@ -7,9 +7,10 @@ The explicit result-job API adds a restricted standard Gremlin terminal
 
 Use the existing StartRows/Advance/Read/Cancel API and CLI. Declare the projection
 at Start with page_size 1..=128. ID-only result jobs remain unchanged, including
-their 1..=1000 page size. Ordinary synchronous/distributed query execution still
-rejects this newly parsed projection step explicitly; only the documented
-hierarchy result-job slice executes it.
+their 1..=1000 page size. The repeated hierarchy shape described here uses this
+result-job slice. Ordinary supported explicit-ID and global scan-to-out/in
+synchronous paths have a separate terminal valueMap contract in
+[QUERY_SPEC](QUERY_SPEC.md), without hierarchy-job allowances.
 
 ## Standard projection semantics
 

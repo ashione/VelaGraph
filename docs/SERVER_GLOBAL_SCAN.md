@@ -14,9 +14,11 @@ Examples:
 - `g.V().hasLabel('department').limit(1000)`
 - `g.V().limit(80).hasLabel('person').count()`
 
-Global E scans, adjacency after a global start, projections, path, dedup,
-ordering/modulators, recursive traversal, and user-visible pagination remain
-explicitly Unsupported. Existing explicit-ID traversal support is unchanged.
+A bounded [scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md) additionally
+allows a filter/limit prefix followed by out/in, filters, dedup, limit and terminal
+count or selected valueMap. Global E scans, path, ordering/modulators, recursive
+traversal and user-visible pagination remain Unsupported. A no-hop global
+valueMap/dedup remains Unsupported. Explicit-ID behavior is unchanged.
 All input is parsed with the official grammar; no rewriting or alternate syntax
 is used.
 
@@ -33,7 +35,7 @@ explicit-ID fragments. Every limit consumes rows at its original position:
 `limit(80).hasLabel('person')` filters the first 80 vertices, while
 `hasLabel('person').limit(80)` finds the first 80 people. Remaining limits carry
 across every page and partition. A limit can stop the source once no subsequent
-row could reach the output. For non-count queries without an explicit limit,
+row could reach the output. For scan-only non-count queries without an explicit limit,
 a final implicit limit of 100 supplies the ordinary output cap. Count has no
 implicit 100-row cap. Empty input gives count zero.
 

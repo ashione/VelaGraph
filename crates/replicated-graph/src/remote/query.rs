@@ -43,7 +43,7 @@ pub enum QueryRow {
     Path(Vec<QualifiedElement>),
     Count(u64),
     /// Selected vertex properties, each represented as a Gremlin singleton list.
-    /// Only the distributed explicit-start terminal valueMap surface emits this.
+    /// Only supported distributed terminal valueMap surfaces emit this.
     PropertyMap {
         source: QualifiedElement,
         properties: std::collections::BTreeMap<String, Vec<Value>>,

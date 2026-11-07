@@ -42,6 +42,8 @@ use tokio::{
 mod byte_batches;
 #[path = "distributed_query/corehr.rs"]
 mod corehr;
+#[path = "distributed_query/global_join.rs"]
+mod global_join;
 #[path = "distributed_query/jobs.rs"]
 mod jobs;
 #[path = "distributed_query/projected_pages.rs"]
@@ -1014,7 +1016,7 @@ async fn scenario() -> anyhow::Result<()> {
         vec![QueryRow::Count(0)]
     );
     for text in [
-        "g.V().out().count()",
+        "g.V().dedup().out().count()",
         "g.E(1).count()",
         "g.V(999).values('name').out()",
     ] {

@@ -13,11 +13,19 @@ static SESSION_SLOTS: Semaphore = Semaphore::const_new(8);
 static SESSION_BYTES: Semaphore = Semaphore::const_new(128 * 1024 * 1024);
 static FRAGMENT_SLOTS: Semaphore = Semaphore::const_new(8);
 
+// These unit fixtures share the real process-wide session/snapshot admission
+// pools. Serialize fixture lifetimes, not production operations: concurrent
+// acquisition behavior is still exercised explicitly inside the guarded tests.
+// A snapshot temporarily reserves 64 MiB before shrinking to its retained size.
+#[cfg(test)]
+static TEST_SESSION_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Session {
     descriptor: Descriptor,
     hierarchy: bool,
     node: query::FrozenNode,
     used: Mutex<Cost>,
+    scan_used: Mutex<Cost>,
     _slot: tokio::sync::SemaphorePermit<'static>,
     _bytes: tokio::sync::SemaphorePermit<'static>,
 }
@@ -131,6 +139,7 @@ impl Sessions {
                 end: lease_end.into_std(),
             },
             used: Mutex::new(Cost::default()),
+            scan_used: Mutex::new(Cost::default()),
             _slot: slot,
             _bytes: bytes,
         };
@@ -212,9 +221,10 @@ impl Sessions {
         if (current.0, current.1) != (shard, session.descriptor.stamp.epoch) {
             return Err(RemoteError::SessionUnavailable);
         }
+        let is_scan = matches!(request.fragment, Fragment::Scan(_));
         let budget = if is_batch {
             jobs::JOB_CEILING
-        } else if matches!(request.fragment, Fragment::Scan(_)) {
+        } else if is_scan {
             scan::SCAN_CEILING
         } else {
             CEILING
@@ -244,7 +254,27 @@ impl Sessions {
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             // Try-lock prevents a forged concurrent client from blocking a worker indefinitely.
-            let Ok(mut used) = session.used.try_lock() else {
+            // Retain the ordinary counter lock as the session-wide execution
+            // gate even when charging the independent scan ledger. Splitting
+            // accounting must not admit concurrent fragments on one session.
+            let _traversal_gate = if is_scan {
+                Some(
+                    session
+                        .used
+                        .try_lock()
+                        .map_err(|_| QueryFailure::ResourceExhausted)?,
+                )
+            } else {
+                None
+            };
+            // Scan and traversal have independent cumulative allowances on the
+            // same immutable session. Neither stage resets or borrows the other.
+            let ledger = if is_scan {
+                &session.scan_used
+            } else {
+                &session.used
+            };
+            let Ok(mut used) = ledger.try_lock() else {
                 return Err(QueryFailure::ResourceExhausted);
             };
             let ceiling = Cost {
@@ -825,8 +855,9 @@ mod tests {
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
-    #[test]
-    fn token_bound_view_expires_closes_and_retains_admission_while_in_use() {
+    #[tokio::test]
+    async fn token_bound_view_expires_closes_and_retains_admission_while_in_use() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let sessions = Sessions::new().unwrap();
         let identity = RemoteIdentity { group: 2, node: 1 };
         let descriptor = Descriptor {
@@ -847,6 +878,7 @@ mod lifetime_tests {
                 end: std::time::Instant::now() + Duration::from_secs(1),
             },
             used: Mutex::new(Cost::default()),
+            scan_used: Mutex::new(Cost::default()),
             _slot: SESSION_SLOTS.try_acquire().unwrap(),
             _bytes: SESSION_BYTES.try_acquire_many(0).unwrap(),
         });
@@ -881,6 +913,7 @@ mod lifetime_tests {
                 end: std::time::Instant::now() - Duration::from_millis(1),
             },
             used: Mutex::new(Cost::default()),
+            scan_used: Mutex::new(Cost::default()),
             _slot: SESSION_SLOTS.try_acquire().unwrap(),
             _bytes: SESSION_BYTES.try_acquire_many(0).unwrap(),
         });
@@ -916,7 +949,127 @@ mod epoch_tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn scan_and_traversal_ledgers_are_separate_cumulative_and_share_one_lease() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        let mut state = Arc::new(StateMachine::default());
+        apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
+        let identity = RemoteIdentity { group: 2, node: 1 };
+        let sessions = Sessions::new().unwrap();
+        let end = Instant::now() + Duration::from_secs(3);
+        let descriptor = sessions.open(&state, identity, 7, end).await.unwrap();
+        let session = sessions.lookup(identity, 7, &descriptor).unwrap();
+        let lease = session.node.end;
+        let blocked_scan = FragmentRequest {
+            descriptor: descriptor.clone(),
+            fragment: Fragment::Scan(scan::ScanRequest {
+                partition: 0,
+                after: None,
+                steps: vec![],
+                count: false,
+            }),
+            remaining: scan::SCAN_CEILING,
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = session.clone();
+        let holder = std::thread::spawn(move || {
+            let _busy = held.used.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let blocked = sessions
+            .fragment(&state, identity, 7, blocked_scan, end)
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(matches!(
+            blocked,
+            Reply::QueryFragment(Err(QueryFailure::ResourceExhausted))
+        ));
+        let mut scan_work = 0;
+        // These partitions share the same physical shard and session. Requesting
+        // a fresh remaining allowance cannot clear its scan counter.
+        for partition in [0, 9, 0] {
+            let request = FragmentRequest {
+                descriptor: descriptor.clone(),
+                fragment: Fragment::Scan(scan::ScanRequest {
+                    partition,
+                    after: None,
+                    steps: vec![],
+                    count: false,
+                }),
+                remaining: scan::SCAN_CEILING,
+            };
+            let Reply::QueryFragment(Ok(output)) = sessions
+                .fragment(&state, identity, 7, request, end + Duration::from_secs(1))
+                .await
+                .unwrap()
+            else {
+                panic!("scan must succeed")
+            };
+            assert_eq!(output.descriptor, descriptor);
+            assert!(session.scan_used.lock().unwrap().work > scan_work);
+            scan_work = session.scan_used.lock().unwrap().work;
+            assert_eq!(session.used.lock().unwrap().work, 0);
+            assert_eq!(session.node.end, lease);
+        }
+        *session.scan_used.lock().unwrap() = scan::SCAN_CEILING;
+        let traversal = FragmentRequest {
+            descriptor: descriptor.clone(),
+            fragment: Fragment::Exists(VertexId {
+                partition: 9,
+                id: 1,
+            }),
+            remaining: CEILING,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                sessions
+                    .fragment(&state, identity, 7, traversal.clone(), end)
+                    .await
+                    .unwrap(),
+                Reply::QueryFragment(Ok(_))
+            ));
+        }
+        assert_eq!(
+            session.scan_used.lock().unwrap().work,
+            scan::SCAN_CEILING.work
+        );
+        assert!(session.used.lock().unwrap().work > 0);
+        let scan = FragmentRequest {
+            descriptor: descriptor.clone(),
+            fragment: Fragment::Scan(scan::ScanRequest {
+                partition: 99,
+                after: Some(1),
+                steps: vec![scan::ScanStep::Limit(1)],
+                count: true,
+            }),
+            remaining: scan::SCAN_CEILING,
+        };
+        assert!(matches!(
+            sessions
+                .fragment(&state, identity, 7, scan, end)
+                .await
+                .unwrap(),
+            Reply::QueryFragment(Err(QueryFailure::ResourceExhausted))
+        ));
+        *session.used.lock().unwrap() = CEILING;
+        assert!(matches!(
+            sessions
+                .fragment(&state, identity, 7, traversal, end)
+                .await
+                .unwrap(),
+            Reply::QueryFragment(Err(QueryFailure::ResourceExhausted))
+        ));
+        assert_eq!(session.node.end, lease);
+        assert_eq!(sessions.values.lock().unwrap().len(), 1);
+        sessions.close(identity, 7, &descriptor).unwrap();
+    }
+    #[tokio::test]
     async fn hierarchy_lease_is_fixed_and_batches_share_cumulative_budget() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let mut state = Arc::new(StateMachine::default());
         apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
         let identity = RemoteIdentity { group: 2, node: 1 };
@@ -1049,6 +1202,7 @@ mod epoch_tests {
     }
     #[tokio::test]
     async fn fragment_lease_fencing_and_previous_incarnation_fail_closed() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let mut state = Arc::new(StateMachine::default());
         apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
         let identity = RemoteIdentity { group: 2, node: 1 };
@@ -1110,6 +1264,7 @@ mod epoch_tests {
     }
     #[tokio::test]
     async fn hierarchy_six_leaf_actual_costs_fit_snapshot_reservations() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         // Build valid graph bytes off the async executor, using a disposable local DB.
         // Adapter exists only to let AppendOnlyStore share ownership of that DB.
         #[derive(Clone)]
@@ -1410,6 +1565,35 @@ mod epoch_tests {
             },
             remaining: CEILING,
         };
+        let Reply::QueryFragment(Ok(scan_output)) = sessions
+            .fragment(
+                &state,
+                identity,
+                7,
+                FragmentRequest {
+                    descriptor: ordinary.clone(),
+                    fragment: Fragment::Scan(scan::ScanRequest {
+                        partition: 0,
+                        after: None,
+                        steps: vec![],
+                        count: false,
+                    }),
+                    remaining: scan::SCAN_CEILING,
+                },
+                end,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("scan uses the original view")
+        };
+        assert_eq!(scan_output.descriptor, ordinary);
+        let FragmentValue::Scan(page) = scan_output.value else {
+            panic!("scan page expected")
+        };
+        assert_eq!(page.ids, vec![1, 2]);
+        assert_eq!(ordinary_session.used.lock().unwrap().work, 0);
+        assert!(ordinary_session.scan_used.lock().unwrap().work > 0);
         let mut work = 0;
         for _ in 0..2 {
             let Reply::QueryFragment(Ok(output)) = sessions
@@ -1457,7 +1641,6 @@ mod channel_server_tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
 
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const IDENTITY: RemoteIdentity = RemoteIdentity { group: 2, node: 1 };
     const SHARD: u64 = 7;
     const OPERATION_LIMIT: Duration = Duration::from_secs(5);
@@ -1590,7 +1773,7 @@ mod channel_server_tests {
 
     #[tokio::test]
     async fn real_channel_retires_at_1024_and_reconnect_preserves_session_and_budget() {
-        let _serial = SERIAL.lock().await;
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;
@@ -1659,7 +1842,7 @@ mod channel_server_tests {
 
     #[tokio::test]
     async fn server_rejects_switch_to_another_valid_descriptor_without_executing_it() {
-        let _serial = SERIAL.lock().await;
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let (other, _) = sessions
             .open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT)
@@ -1685,7 +1868,7 @@ mod channel_server_tests {
 
     #[tokio::test]
     async fn aborting_real_idle_handler_closes_socket_without_reopening_session() {
-        let _serial = SERIAL.lock().await;
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;

@@ -21,7 +21,9 @@ steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limi
 step forms fail explicitly through the official parser. A separately specified
 [native bounded hierarchy repeat](SERVER_HIERARCHY.md) adds one repeated
 single-adjacency body, mandatory depth 1..32, and optional post-emit. A separate [global vertex scan](SERVER_GLOBAL_SCAN.md) supports `g.V()` with
-filters/limit/count and its own explicit bounded budget. No global E scan,
+filters/limit/count and its own explicit bounded budget; its
+[bounded composition](GLOBAL_VERTEX_TRAVERSAL.md) can feed out/in with
+filters, limits, dedup and terminal count/valueMap. No global E scan,
 `both()`, mutation, alternate query dialect or textual
 query rewriting is provided by this slice.
 
@@ -128,7 +130,7 @@ Limits execute in their original positions. In particular,
 whereas `out().has('active',true).limit(2)` selects the first two matches.
 Missing `values` properties drop rows; scalar results retain their qualified
 source. Terminal count is global and retains multiplicity. The ordinary default
-100-row output cap applies only when there is no explicit limit and no terminal
+100-row output cap applies to explicit-ID starts only, when there is no explicit limit and no terminal
 count, after required execution and validation. It is never applied separately
 by each shard.
 
