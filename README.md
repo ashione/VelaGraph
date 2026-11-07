@@ -60,7 +60,7 @@ identity state across traversal depths without suppressing cycles or increasing
 the identity cap. Count jobs do not return rows; separate [ordered hierarchy result jobs](docs/HIERARCHY_RESULT_PAGES.md) provide qualified vertex-identity pages, not property or path pages. A separate [global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
 filters/limit/count without downloading the graph to the coordinator. Its
 [bounded traversal composition](docs/GLOBAL_VERTEX_TRAVERSAL.md) can continue
-through out/in, filters, limits, dedup and terminal count or selected property maps,
+through out/in, one bounded repeat, filters, limits, dedup and terminal count or selected property maps,
 using separate cumulative scan/traversal budgets and the same fixed sessions.
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);

@@ -364,7 +364,9 @@ The bounded [global scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md)
 extends this with an ordered scan-filter/limit prefix then out/in, filters,
 limit, dedup and terminal count/selected valueMap. It preserves separate scan
 and traversal budgets on the same sessions. Joined results have no implicit
-100-row truncation. Global E/path/repeat and no-hop map/dedup remain Unsupported.
+100-row truncation. Global E/path/values and no-hop map/dedup remain Unsupported. One bounded
+repeat is now admitted after the global scan prefix with the same combined
+32-depth check and cumulative traversal budget.
 
 ### Experimental bounded repeat AST
 
@@ -391,7 +393,8 @@ The official anonymous-traversal forms `__.out('reports')` and `out('reports')`
   repeated and ordinary depth against 32 before acquiring sessions.
 - The same 64-mark/16-KiB admission and terminal `path`/`count` rules apply.
   Stream-type validation remains an executor responsibility, including empty
-  scalar/edge streams. The server accepts repeat only for explicit V starts.
+  scalar/edge streams. The server accepts repeat for explicit V starts and global V scan prefixes
+  under the bounded composition contract; hierarchy jobs still require explicit roots.
 
 This is a server-coordinated experimental capability, not an extension of v0
 or the client-side observed executor. The legacy `GremlinStep` enum and

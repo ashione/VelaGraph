@@ -20,7 +20,10 @@ bounded post-emit meaning. Only no-argument emit is supported.
 
 This is a deliberate first hierarchy slice. `until`, pre-repeat emit, nested or
 multiple repeats, predicates, arbitrary repeat bodies, mutation, labelled loops,
-`by`, global starts and edge starts remain explicitly unsupported. The old v0
+`by` and edge starts remain explicitly unsupported. Global vertex-filter starts
+are now accepted by the separately bounded [global composition](GLOBAL_VERTEX_TRAVERSAL.md);
+its suffix still excludes path/values. The examples here describe explicit-ID
+starts. The old v0
 parser/executor and client-side observed executor do not gain repeat execution.
 
 ## Depth, paths, cycles and ordering
@@ -68,6 +71,9 @@ All acquired views still form an independently pinned vector, not one globally
 atomic snapshot. Canonical edges, endpoints and reverse indexes retain the
 existing corruption validation, including observations filtered out by label.
 
+The explicit-ID default result limit does not apply to global composition. Its
+scan budget is separate; both forms share the following traversal budget.
+
 The existing explicit-ID budget remains **64 MiB cumulative logical bytes,
 10,000 work units, 10,000 intermediate/output rows**, the existing per-adjacency
 cap and maximum **5-second** request deadline. There is no new larger hierarchy
@@ -78,8 +84,8 @@ later limit/dedup/count. Broad descendant searches can therefore fail before
 reaching n; a later `limit(1)` cannot turn that failure into a successful prefix.
 
 Deadline, budget, corrupt observation, unavailable/expired session or epoch
-failure aborts the whole result, including previously emitted rows. The default
-100-row output cap applies after required execution, not as permission to stop
+failure aborts the whole result, including previously emitted rows. The explicit-ID
+default 100-row output cap applies after required execution, not as permission to stop
 validating the repeat early. A user-requested finite times bound is traversal
 semantics; exceeding an internal resource bound is always an error.
 

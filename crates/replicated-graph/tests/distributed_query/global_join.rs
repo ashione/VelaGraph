@@ -24,6 +24,7 @@ enum Op {
     Has(&'static str, Option<Value>),
     Limit(usize),
     Hop(bool, Option<&'static str>),
+    Repeat(bool, Option<&'static str>, usize, bool),
     Dedup,
     Count,
     Map,
@@ -44,6 +45,12 @@ fn text(ops: &[Op]) -> String {
                 if *incoming { "in" } else { "out" },
                 label.map(|s| format!("'{s}'")).unwrap_or_default()
             ),
+            Op::Repeat(incoming, label, times, emit) => format!(
+                ".repeat(__.{}({})).times({times}){}",
+                if *incoming { "in" } else { "out" },
+                label.map(|s| format!("'{s}'")).unwrap_or_default(),
+                if *emit { ".emit()" } else { "" }
+            ),
             Op::Dedup => ".dedup()".into(),
             Op::Count => ".count()".into(),
             Op::Map => ".valueMap('name','nullable','absent')".into(),
@@ -52,7 +59,10 @@ fn text(ops: &[Op]) -> String {
     text
 }
 fn oracle(model: &Model, ops: &[Op]) -> Vec<QueryRow> {
-    let mut ids: Vec<Id> = model.vertices.keys().copied().collect();
+    let ids: Vec<Id> = model.vertices.keys().copied().collect();
+    evaluate(model, ids, ops)
+}
+fn evaluate(model: &Model, mut ids: Vec<Id>, ops: &[Op]) -> Vec<QueryRow> {
     for op in ops {
         match op {
             Op::Label(label) => {
@@ -84,6 +94,26 @@ fn oracle(model: &Model, ops: &[Op]) -> Vec<QueryRow> {
                     }
                 }
                 ids = expanded;
+            }
+            Op::Repeat(incoming, label, times, emit) => {
+                let mut emitted = Vec::new();
+                for _ in 0..*times {
+                    ids = evaluate(model, ids, &[Op::Hop(*incoming, *label)])
+                        .into_iter()
+                        .map(|row| match row {
+                            QueryRow::Element(QualifiedElement::Vertex { partition, id }) => {
+                                (partition, id)
+                            }
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    if *emit {
+                        emitted.extend(ids.iter().copied());
+                    }
+                }
+                if *emit {
+                    ids = emitted;
+                }
             }
             Op::Dedup => {
                 let mut seen = BTreeSet::new();
@@ -321,6 +351,52 @@ fn cases() -> Vec<Vec<Op>> {
             Count,
         ]);
     }
+    for incoming in [false, true] {
+        for emit in [false, true] {
+            for suffix in [
+                vec![],
+                vec![Dedup, Count],
+                vec![Has("active", Some(Value::Boolean(true))), Limit(13), Map],
+            ] {
+                let mut case = vec![
+                    Label("node"),
+                    Limit(2),
+                    Repeat(incoming, Some("a"), 4, emit),
+                ];
+                case.extend(suffix);
+                cases.push(case);
+            }
+        }
+    }
+    cases.extend([
+        vec![Label("none"), Repeat(false, None, 32, true), Count],
+        vec![
+            Label("node"),
+            Limit(1),
+            Repeat(false, Some("many"), 1, true),
+        ],
+        vec![
+            Label("node"),
+            Limit(1),
+            Repeat(false, Some("a"), 2, true),
+            Hop(true, Some("b")),
+            Dedup,
+            Count,
+        ],
+        vec![
+            Label("node"),
+            Limit(2),
+            Hop(false, Some("a")),
+            Repeat(true, Some("b"), 2, false),
+            Count,
+        ],
+        vec![
+            Label("page"),
+            Limit(129),
+            Repeat(false, Some("page"), 1, true),
+            Count,
+        ],
+    ]);
     cases
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -376,6 +452,26 @@ async fn global_join_matches_independent_seeded_ordered_oracle() -> anyhow::Resu
                 actual.rows
             );
         }
+        // A tiny downstream answer cannot forgive cumulative repeated work.
+        for depth in [1, 32] {
+            let result = distributed::query(
+                service.local_addr(),
+                DistributedRequest {
+                    start_partition: 11,
+                    text: format!("g.V().hasLabel('node').limit(1).repeat(__.out('a')).times({depth}).emit().dedup().limit(1).count()"),
+                    timeout_millis: 5000,
+                },
+                BUDGET,
+            ).await?;
+            if depth == 1 {
+                ensure!(result?.rows == vec![QueryRow::Count(1)]);
+            } else {
+                ensure!(
+                    matches!(result, Err(QueryFailure::ResourceExhausted)),
+                    "cumulative repeat work: {result:?}"
+                );
+            }
+        }
         service.shutdown().await;
     }
     Ok(())
@@ -397,6 +493,21 @@ async fn global_join_late_corruption_is_not_hidden_by_filter_or_limit() -> anyho
                 id: u64::MAX,
             },
             label: "corrupt".into(),
+            properties: BTreeMap::new(),
+        });
+        // Incoming traversal reaches the corrupt canonical record only at
+        // depth two; outgoing reaches the absent reverse via the existing late edge.
+        model.edges.push(CrossEdge {
+            id: u64::MAX - 1,
+            from: VertexRef {
+                partition: 7,
+                id: u64::MAX,
+            },
+            to: VertexRef {
+                partition: 2,
+                id: 1201,
+            },
+            label: "bridge".into(),
             properties: BTreeMap::new(),
         });
         let copy = model.clone();
@@ -426,6 +537,12 @@ async fn global_join_late_corruption_is_not_hidden_by_filter_or_limit() -> anyho
         let direction = if missing_source { "in" } else { "out" };
         for query in [
             format!("g.V().hasLabel('node').{direction}().count()"),
+            format!(
+                "g.V().hasLabel('page').repeat(__.{direction}()).times(2).emit().limit(1).count()"
+            ),
+            format!(
+                "g.V().hasLabel('node').repeat(__.{direction}('absent')).times(2).limit(1).count()"
+            ),
             format!("g.V().hasLabel('node').{direction}('absent').limit(1).count()"),
         ] {
             let result = distributed::query(
