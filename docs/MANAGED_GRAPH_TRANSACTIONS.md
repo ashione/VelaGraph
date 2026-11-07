@@ -43,12 +43,14 @@ produces one request, one identity and one CAS, retaining both directions. Clien
 cannot supply an incomplete list of participant batches through this API. Aggregate
 plan operations and payload bytes are checked against D1 batch caps before sending.
 
-Plan does not serialize and is not a durable retry file. Keep the exact value while
+A direct, unadmitted Plan is not a durable retry file. Keep the exact value while
 an outcome is uncertain. If the process loses it before every participant has
 prepared, the current journal cannot reconstruct the unprepared payload. Operators
 must inspect the durable coordinator/participant state and explicitly abort a
 still-pending transaction or finish consuming a decided one using the lower-level
-recovery API. Automatic crash resumption and durable plan storage are not claimed.
+recovery API. Automatic crash resumption is not claimed for that direct path. The optional
+[durable request admission API](DURABLE_GRAPH_REQUESTS.md) persists a complete Plan
+and Begin atomically before prepare, permitting exact request-ID recovery.
 
 ## Property read dependencies and deletion
 

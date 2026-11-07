@@ -356,4 +356,6 @@ oracles on both smoke and 200,000-person fixtures.
 
 - Fixed-cohort read foundation: explicit immutable coordinator membership and empty-baseline participant certification, with bounded same-version materialized sessions. See [contract and remaining boundaries](CERTIFIED_COHORT_READS.md). Remote graph GlobalCommittedSnapshot remains Unsupported.
 
-- Managed graph/v2 write/read slice: complete source/reverse transaction plans, property read-dependency guards, edge deletion and certified snapshot reads for deterministic one-partition-per-shard cohorts. Vertex deletion/cascades, durable plan storage, general routing manifests and remote Global admission remain pending. See [contract](MANAGED_GRAPH_TRANSACTIONS.md).
+- Managed graph/v2 write/read slice: complete source/reverse transaction plans, property read-dependency guards, edge deletion and certified snapshot reads for deterministic one-partition-per-shard cohorts. Vertex deletion/cascades, general routing manifests and remote Global admission remain pending. Durable request admission is described below. See [contract](MANAGED_GRAPH_TRANSACTIONS.md).
+
+- Durable request admission foundation: atomically retain external-ID/canonical-command/complete-Plan/Begin with resolution reservation and exact restart recovery. The typed managed network gateway and server-side same-version session registry remain the next integration step.

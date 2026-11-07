@@ -780,3 +780,202 @@ async fn same_shard_self_loop_mutations_and_tombstone_identity_survive_reopen() 
         cluster.in_group(shard).shutdown(node).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_request_recovers_exact_plan_after_partial_prepare_and_restart() {
+    let cluster = Cluster::new();
+    let cdir = tempfile::tempdir().unwrap();
+    let adir = tempfile::tempdir().unwrap();
+    let bdir = tempfile::tempdir().unwrap();
+    let c = initialize(
+        cluster
+            .in_group(9)
+            .start_durable(1, cdir.path())
+            .await
+            .unwrap(),
+        9,
+    )
+    .await;
+    let a = initialize(
+        cluster
+            .in_group(7)
+            .start_durable(1, adir.path())
+            .await
+            .unwrap(),
+        7,
+    )
+    .await;
+    let b = initialize(
+        cluster
+            .in_group(8)
+            .start_durable(1, bdir.path())
+            .await
+            .unwrap(),
+        8,
+    )
+    .await;
+    let graph = self::graph(&c, &a, &b);
+    vertex(&graph, 7, 1).await;
+    vertex(&graph, 8, 1).await;
+    let e = edge(7, 8, 80);
+    let view = snapshot(&graph).await;
+    let one = view.prepare_edge(&e).unwrap();
+    let two = view.prepare_edge(&e).unwrap();
+    assert_ne!(one.id(), two.id());
+    let external = [81; 16];
+    let request = b"v1/create-edge/7:1/8:1/80/reports_to".to_vec();
+    let (x, y) = tokio::join!(
+        graph.admit_request(external, request.clone(), &one),
+        graph.admit_request(external, request.clone(), &two)
+    );
+    let winner = x.unwrap();
+    assert_eq!(
+        winner.durable_bytes().unwrap(),
+        y.unwrap().durable_bytes().unwrap()
+    );
+    let winner_id = winner.id();
+    assert_eq!(
+        c.state_machine
+            .coordinator_journal(9, 1, [9; 16])
+            .await
+            .unwrap()
+            .transaction_count(),
+        3
+    );
+    let part = &winner.parts[0];
+    participant_driver::prepare(
+        &c,
+        &a,
+        authority(),
+        1,
+        part.descriptor.clone(),
+        part.request.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        graph.recover_request(external, b"different").await,
+        Err(Error::Identity)
+    ));
+    drop(winner);
+    drop(one);
+    drop(two);
+    drop(view);
+    drop(graph);
+    for (node, shard) in [(&a, 7), (&b, 8), (&c, 9)] {
+        cluster.in_group(shard).shutdown(node).await;
+    }
+    drop(a);
+    drop(b);
+    drop(c);
+    let c = cluster
+        .in_group(9)
+        .start_durable(1, cdir.path())
+        .await
+        .unwrap();
+    let a = cluster
+        .in_group(7)
+        .start_durable(1, adir.path())
+        .await
+        .unwrap();
+    let b = cluster
+        .in_group(8)
+        .start_durable(1, bdir.path())
+        .await
+        .unwrap();
+    for node in [&a, &b, &c] {
+        node.raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "restarted")
+            .await
+            .unwrap();
+    }
+    let graph = self::graph(&c, &a, &b);
+    let recovered = graph
+        .recover_request(external, &request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id(), winner_id);
+    let original = recovered.durable_bytes().unwrap();
+    assert!(matches!(
+        graph.execute(&recovered).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    // Model a lost final response: recover by external ID and retry, with no
+    // candidate generation or new snapshot/identity.
+    let again = graph
+        .recover_request(external, &request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.durable_bytes().unwrap(), original);
+    assert!(matches!(
+        graph.execute(&again).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    assert_eq!(snapshot(&graph).await.edge(e.identity()).unwrap(), Some(e));
+    assert_eq!(
+        c.state_machine
+            .coordinator_journal(9, 1, [9; 16])
+            .await
+            .unwrap()
+            .transaction_count(),
+        3
+    );
+    for (node, shard) in [(&a, 7), (&b, 8), (&c, 9)] {
+        cluster.in_group(shard).shutdown(node).await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_plan_never_refreshes_a_stale_validation_sequence() {
+    let cluster = Cluster::new();
+    let c = start(&cluster, 9).await;
+    let a = start(&cluster, 7).await;
+    let b = start(&cluster, 8).await;
+    let graph = self::graph(&c, &a, &b);
+    let view = snapshot(&graph).await;
+    let stale = view.prepare_vertex(7, &Vertex::new(1)).unwrap();
+    let later = view.prepare_vertex(7, &Vertex::new(2)).unwrap();
+    assert!(matches!(
+        graph.execute(&later).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    let admitted = graph
+        .admit_request([90; 16], b"create vertex 7:1".to_vec(), &stale)
+        .await
+        .unwrap();
+    let recovered = graph
+        .recover_request([90; 16], b"create vertex 7:1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recovered.durable_bytes().unwrap(),
+        admitted.durable_bytes().unwrap()
+    );
+    assert!(matches!(
+        graph.execute(&recovered).await,
+        Err(Error::Application(D1Error::Conflict { .. }))
+    ));
+    graph.abort(&recovered).await.unwrap();
+    graph.execute(&later).await.unwrap();
+    let now = snapshot(&graph).await;
+    assert!(now
+        .vertex(VertexRef {
+            partition: 7,
+            id: 1
+        })
+        .unwrap()
+        .is_none());
+    assert!(now
+        .vertex(VertexRef {
+            partition: 7,
+            id: 2
+        })
+        .unwrap()
+        .is_some());
+    for node in [&a, &b, &c] {
+        node.raft.shutdown().await.unwrap();
+    }
+}

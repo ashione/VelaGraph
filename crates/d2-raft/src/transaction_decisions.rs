@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_TRANSACTIONS: usize = 1024;
 pub const MAX_PARTICIPANTS: usize = 64;
 pub const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
+pub const MAX_REQUESTS: usize = 256;
+pub const MAX_REQUEST_EVENT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +70,15 @@ pub enum Decision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Command {
+    /// Atomically bind an external request to its exact durable payload and
+    /// create the transaction, including reservation for its final decision.
+    AdmitRequest {
+        id: [u8; 16],
+        request: Vec<u8>,
+        payload: Vec<u8>,
+        transaction_id: [u8; 16],
+        participants: Vec<Participant>,
+    },
     BindCohort {
         cohort: Cohort,
     },
@@ -98,6 +111,14 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRecord {
+    pub id: [u8; 16],
+    pub request: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub transaction_id: [u8; 16],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub id: [u8; 16],
     pub ordinal: u64,
@@ -116,6 +137,7 @@ pub struct Journal {
     transactions: Vec<Transaction>,
     reserved_bytes: usize,
     cohort: Option<Cohort>,
+    requests: Vec<RequestRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,7 +151,7 @@ struct Encoding {
 impl From<Journal> for Encoding {
     fn from(journal: Journal) -> Self {
         Self {
-            version: if journal.cohort.is_some() { 2 } else { 1 },
+            version: journal.encoding_version(),
             authority: journal.authority,
             events: journal.events,
         }
@@ -154,9 +176,23 @@ impl Journal {
             transactions: Vec::new(),
             reserved_bytes: 0,
             cohort: None,
+            requests: Vec::new(),
         };
         journal.reserved_bytes = journal.encode()?.len();
         Ok(journal)
+    }
+
+    fn encoding_version(&self) -> u32 {
+        if !self.requests.is_empty() {
+            3
+        } else if self.cohort.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+    pub fn request(&self, id: [u8; 16]) -> Option<&RequestRecord> {
+        self.requests.iter().find(|r| r.id == id)
     }
 
     pub fn cohort(&self) -> Option<&Cohort> {
@@ -227,7 +263,7 @@ impl Journal {
     // times the bounded participant/transaction lookup sizes, not journal bytes.
     fn append(&mut self, command: Command, limit: usize) -> Result<bool, Error> {
         let released = match &command {
-            Command::BindCohort { .. } | Command::Begin { .. } => 0,
+            Command::AdmitRequest { .. } | Command::BindCohort { .. } | Command::Begin { .. } => 0,
             Command::Prepared { .. } => Self::event_bytes(&command)? + 1,
             Command::Decide { id, .. } => self
                 .transaction(*id)
@@ -238,14 +274,18 @@ impl Journal {
         if !self.transition(&command)? {
             return Ok(false);
         }
+        let event_size = Self::event_bytes(&command)?;
+        if matches!(command, Command::AdmitRequest { .. }) && event_size > MAX_REQUEST_EVENT_BYTES {
+            return Err(Error::Capacity);
+        }
         let future = match &command {
             Command::Begin { id, .. } => Self::pending_bytes(self.transaction(*id).unwrap())?,
+            Command::AdmitRequest { transaction_id, .. } => {
+                Self::pending_bytes(self.transaction(*transaction_id).unwrap())?
+            }
             _ => 0,
         };
-        let size = self.reserved_bytes
-            + Self::event_bytes(&command)?
-            + usize::from(!self.events.is_empty())
-            + future;
+        let size = self.reserved_bytes + event_size + usize::from(!self.events.is_empty()) + future;
         self.reserved_bytes = size.checked_sub(released).ok_or(Error::InvalidJournal)?;
         if self.reserved_bytes > limit {
             return Err(Error::Capacity);
@@ -256,6 +296,60 @@ impl Journal {
 
     fn transition(&mut self, command: &Command) -> Result<bool, Error> {
         match command {
+            Command::AdmitRequest {
+                id,
+                request,
+                payload,
+                transaction_id,
+                participants,
+            } => {
+                if *id == [0; 16]
+                    || request.is_empty()
+                    || payload.is_empty()
+                    || request.len() > MAX_REQUEST_BYTES
+                    || payload.len() > MAX_REQUEST_PAYLOAD_BYTES
+                    || self.cohort.is_none()
+                {
+                    return Err(Error::InvalidIdentity);
+                }
+                if let Some(existing) = self.request(*id) {
+                    return if existing.request == *request {
+                        Ok(false)
+                    } else {
+                        Err(Error::IdentityConflict)
+                    };
+                }
+                let plan = crate::request_plans::Plan::decode(payload)?;
+                if plan.id != *transaction_id
+                    || plan.authority.mode != self.authority
+                    || Some(&plan.cohort) != self.cohort.as_ref()
+                    || plan.validation_version > self.resolved_prefix()
+                    || plan
+                        .parts
+                        .iter()
+                        .map(|p| p.descriptor.clone())
+                        .collect::<Vec<_>>()
+                        != *participants
+                {
+                    return Err(Error::IdentityConflict);
+                }
+                if self.requests.len() >= MAX_REQUESTS {
+                    return Err(Error::Capacity);
+                }
+                if self.transaction(*transaction_id).is_some() {
+                    return Err(Error::IdentityConflict);
+                }
+                self.transition(&Command::Begin {
+                    id: *transaction_id,
+                    participants: participants.clone(),
+                })?;
+                self.requests.push(RequestRecord {
+                    id: *id,
+                    request: request.clone(),
+                    payload: payload.clone(),
+                    transaction_id: *transaction_id,
+                });
+            }
             Command::BindCohort { cohort } => {
                 cohort.validate()?;
                 if let Some(existing) = &self.cohort {
@@ -358,7 +452,7 @@ impl Journal {
 
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(&Encoding {
-            version: if self.cohort.is_some() { 2 } else { 1 },
+            version: self.encoding_version(),
             authority: self.authority,
             events: self.events.clone(),
         })
@@ -376,7 +470,7 @@ impl Journal {
             return Err(Error::Capacity);
         }
         let encoded: Encoding = serde_json::from_slice(bytes).map_err(|_| Error::InvalidJournal)?;
-        if !matches!(encoded.version, 1 | 2)
+        if !matches!(encoded.version, 1..=3)
             || encoded.events.len() > MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2) + 1
         {
             return Err(Error::InvalidJournal);
@@ -387,7 +481,7 @@ impl Journal {
                 return Err(Error::InvalidJournal);
             }
         }
-        if encoded.version != if result.cohort.is_some() { 2 } else { 1 } {
+        if encoded.version != result.encoding_version() {
             return Err(Error::InvalidJournal);
         }
         Ok(result)
@@ -767,5 +861,203 @@ mod cohort_tests {
             );
             assert!(j.cohort().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    fn cohort() -> Cohort {
+        Cohort {
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: vec![Member {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+            }],
+        }
+    }
+    fn journal() -> Journal {
+        let mut j = Journal::new([9; 16]).unwrap();
+        j.apply(Command::BindCohort { cohort: cohort() }).unwrap();
+        j
+    }
+    fn descriptor() -> Participant {
+        Participant {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+            intent: [3; 32],
+        }
+    }
+    fn admit(id: u8, tx: u8) -> Command {
+        let p = descriptor();
+        let payload = crate::request_plans::Plan {
+            version: 1,
+            id: [tx; 16],
+            authority: crate::participant_writes::Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
+            cohort: cohort(),
+            validation_version: 0,
+            parts: vec![crate::request_plans::Part {
+                descriptor: p.clone(),
+                request: crate::D1WriteRequest {
+                    shard: 7,
+                    epoch: 1,
+                    request_id: [tx; 16],
+                    expected_sequence: Some(0),
+                    operations: vec![crate::WriteOp::put("x", "value")],
+                },
+            }],
+        }
+        .encode()
+        .unwrap();
+        Command::AdmitRequest {
+            id: [id; 16],
+            request: b"typed-request-v1".to_vec(),
+            payload,
+            transaction_id: [tx; 16],
+            participants: vec![p],
+        }
+    }
+    #[test]
+    fn duplicate_request_returns_first_plan_without_a_second_begin() {
+        let mut j = journal();
+        j.apply(admit(1, 2)).unwrap();
+        let original = j.encode().unwrap();
+        assert_eq!(
+            original,
+            include_bytes!("../tests/fixtures/request-journal-v3.json")
+        );
+        assert_eq!(
+            j.request([1; 16]).unwrap().payload,
+            include_bytes!("../tests/fixtures/request-plan-v1.json")
+        );
+        j.apply(admit(1, 3)).unwrap();
+        assert_eq!(j.encode().unwrap(), original);
+        assert_eq!(j.transaction_count(), 1);
+        assert!(j.transaction([3; 16]).is_none());
+        assert_eq!(j.request([1; 16]).unwrap().transaction_id, [2; 16]);
+        let mut different = admit(1, 3);
+        if let Command::AdmitRequest { request, .. } = &mut different {
+            request.push(1);
+        }
+        assert_eq!(j.apply(different), Err(Error::IdentityConflict));
+        assert_eq!(j.encode().unwrap(), original);
+        assert_eq!(j.apply(admit(4, 2)), Err(Error::IdentityConflict));
+        assert_eq!(Journal::decode(&original).unwrap(), j);
+        let mut encoding: Encoding = serde_json::from_slice(&original).unwrap();
+        assert_eq!(encoding.version, 3);
+        encoding.events.push(admit(1, 3));
+        assert_eq!(
+            Journal::decode(&serde_json::to_vec(&encoding).unwrap()),
+            Err(Error::InvalidJournal)
+        );
+        encoding.events.pop();
+        encoding.version = 2;
+        assert_eq!(
+            Journal::decode(&serde_json::to_vec(&encoding).unwrap()),
+            Err(Error::InvalidJournal)
+        );
+    }
+    #[test]
+    fn admitted_plan_binds_all_execution_identity_and_reserves_resolution() {
+        let original = journal();
+        let command = admit(1, 2);
+        let mut admitted = original.clone();
+        admitted.apply(command.clone()).unwrap();
+        let exact = admitted.reserved_size().unwrap();
+        let mut candidate = original.clone();
+        assert!(candidate.append(command.clone(), exact).unwrap());
+        let mut candidate = original.clone();
+        assert_eq!(
+            candidate.append(command.clone(), exact - 1),
+            Err(Error::Capacity)
+        );
+        admitted
+            .append(
+                Command::Prepared {
+                    id: [2; 16],
+                    participant: descriptor(),
+                },
+                exact,
+            )
+            .unwrap();
+        admitted
+            .append(
+                Command::Decide {
+                    id: [2; 16],
+                    decision: Decision::Commit,
+                },
+                exact,
+            )
+            .unwrap();
+        assert!(admitted.encode().unwrap().len() <= exact);
+        assert_eq!(
+            Journal::decode(&admitted.encode().unwrap()).unwrap(),
+            admitted
+        );
+        for field in ["id", "mode", "cas", "version", "duplicate", "authority"] {
+            let mut bad = command.clone();
+            if let Command::AdmitRequest { payload, .. } = &mut bad {
+                let mut plan: serde_json::Value = serde_json::from_slice(payload).unwrap();
+                match field {
+                    "id" => plan["parts"][0]["request"]["request_id"][0] = 99.into(),
+                    "mode" => plan["parts"][0]["descriptor"]["mode"][0] = 99.into(),
+                    "cas" => {
+                        plan["parts"][0]["request"]["expected_sequence"] = serde_json::Value::Null
+                    }
+                    "version" => plan["validation_version"] = 99.into(),
+                    "duplicate" => {
+                        let part = plan["parts"][0].clone();
+                        plan["parts"].as_array_mut().unwrap().push(part);
+                    }
+                    _ => plan["authority"]["mode"][0] = 99.into(),
+                }
+                *payload = serde_json::to_vec(&plan).unwrap();
+            }
+            let mut j = original.clone();
+            assert!(j.apply(bad).is_err(), "{field}");
+            assert_eq!(j, original);
+        }
+        let mut unbound = Journal::new([9; 16]).unwrap();
+        assert!(unbound.apply(command).is_err());
+    }
+    #[test]
+    fn request_capacity_is_bounded_but_existing_identity_remains_retryable() {
+        let mut j = journal();
+        for i in 0..MAX_REQUESTS {
+            let mut command = admit(1, 2);
+            let id = (i as u128 + 1).to_le_bytes();
+            let tx = (i as u128 + 1000).to_le_bytes();
+            if let Command::AdmitRequest {
+                id: external,
+                transaction_id,
+                payload,
+                ..
+            } = &mut command
+            {
+                *external = id;
+                *transaction_id = tx;
+                let mut p = crate::request_plans::Plan::decode(payload).unwrap();
+                p.id = tx;
+                p.parts[0].request.request_id = tx;
+                *payload = p.encode().unwrap();
+            }
+            j.apply(command).unwrap();
+        }
+        let original = j.clone();
+        assert_eq!(j.apply(admit(255, 9)), Err(Error::Capacity));
+        assert_eq!(j, original);
+        // Existing request ID=1 reuses the stored plan even with another proposed plan.
+        let mut retry = admit(1, 2);
+        if let Command::AdmitRequest { id, .. } = &mut retry {
+            *id = 1u128.to_le_bytes();
+        }
+        j.apply(retry).unwrap();
+        assert_eq!(j, original);
     }
 }

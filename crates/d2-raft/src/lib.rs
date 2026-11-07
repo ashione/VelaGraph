@@ -19,6 +19,7 @@ mod network;
 mod node;
 pub mod participant_driver;
 pub mod participant_writes;
+pub mod request_plans;
 mod state_machine;
 pub mod tcp;
 pub mod transaction_decisions;
