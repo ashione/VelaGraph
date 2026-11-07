@@ -333,3 +333,13 @@ one CAS batch. IDs are never reused. Reads validate visible residual indexes and
 charge tombstone candidates before skipping them. Recovery and GC are unsupported.
 See [deletion contract and versioned format](EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion)
 for upgrade restrictions, bounds and attempt-local retry outcomes.
+
+## Experimental server-coordinated observed traversal
+
+The separately typed [distributed query API](DISTRIBUTED_QUERY.md) accepts an
+explicit V(ids) start, up to three out steps (the official parser hop limit),
+ordered has/hasLabel/limit, terminal path/count and values followed by
+limit/count. It uses this official parser and strict value semantics, but an
+independently documented static-catalog scope and conservative cumulative
+resource budget. It is always Unverified and does not expand v1 completeness or
+cross-partition guarantees.

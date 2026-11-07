@@ -137,3 +137,7 @@ shard mismatch, request/response limits and execution work limits. Unit tests
 cover output validation, encoded limits, immutable/expired reads, oversized
 response prefixes, and admission retained after waiter cancellation. This is
 functional evidence, not crash/failover, latency or throughput benchmarking.
+
+The separately opt-in [distributed observed query slice](DISTRIBUTED_QUERY.md)
+adds its own coordinator and fragment-session protocol. It does not widen this
+single-partition RPC or change its validation and consistency contract.

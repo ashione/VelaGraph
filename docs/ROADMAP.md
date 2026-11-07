@@ -270,3 +270,13 @@ Vertex deletion explicitly returns Unsupported because observed adjacency and
 non-global snapshot vectors cannot prove complete absence or fence remote source
 writes. No cascade or unsafe isolated-vertex exception is supplied.
 See [vertex mutation contract](EXPERIMENTAL_CROSS_EDGES.md#additive-vertex-property-mutation).
+
+### Bounded observed server coordination experiment
+
+The [bounded multi-hop server coordinator](DISTRIBUTED_QUERY.md) is an additive
+partial D5 experiment: immutable startup placement, fixed data-local sessions
+and typed lookup/adjacency/filter/projection fragments avoid whole-shard network
+downloads. Up to three outgoing hops share the original sessions, deadline and
+cumulative budget, including cycles and shard revisits. Online catalog
+acquisition, broader traversal planning, complete adjacency, global snapshot
+isolation, retries/failover and production security remain unfinished.
