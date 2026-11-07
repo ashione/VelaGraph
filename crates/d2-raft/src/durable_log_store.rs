@@ -20,6 +20,10 @@ use tokio::sync::Mutex;
 use crate::blocking::blocking_section;
 use crate::types::{NodeId, TypeConfig};
 
+// Soft encoded-byte cap: an oversized first entry remains indivisible.
+const CATCHUP_MAX_ENTRIES: usize = 256;
+const CATCHUP_MAX_BYTES: usize = 1024 * 1024;
+
 const LOG_PREFIX: &[u8] = b"raft/log/";
 const LOG_PREFIX_END: &[u8] = b"raft/log0";
 const VOTE_KEY: &[u8] = b"raft/vote";
@@ -112,6 +116,55 @@ impl DurableLogStoreInner {
         }
     }
 
+    /// Copy one bounded prefix under the lock, but leave JSON decoding to the
+    /// caller after unlocking. Raw iteration avoids copying a rejected next value.
+    fn read_catchup_bytes(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Vec<u8>>, StorageError<NodeId>> {
+        let mut entries = Vec::new();
+        if start >= end {
+            return Ok(entries);
+        }
+        let mut bytes = 0_usize;
+        let mut iter = self.db.raw_iterator();
+        let end_key = log_key(end);
+        iter.seek(log_key(start));
+        while iter.valid() {
+            let key = iter.key().expect("valid iterator has key");
+            if key >= end_key.as_slice() {
+                break;
+            }
+            let Some(index) = log_index(key) else {
+                if !key.starts_with(LOG_PREFIX) {
+                    break;
+                }
+                return Err(read_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid Raft log key",
+                )));
+            };
+            if index >= end {
+                break;
+            }
+            let value = iter.value().expect("valid iterator has value");
+            // Always make progress with the first complete available entry.
+            // Subtraction avoids overflow, even for an oversized stored value.
+            if !entries.is_empty() && value.len() > CATCHUP_MAX_BYTES - bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(value.len());
+            entries.push(value.to_vec());
+            if entries.len() == CATCHUP_MAX_ENTRIES || bytes >= CATCHUP_MAX_BYTES {
+                break;
+            }
+            iter.next();
+        }
+        iter.status().map_err(read_error)?;
+        Ok(entries)
+    }
+
     fn read_entries<RB: RangeBounds<u64>>(
         &self,
         range: RB,
@@ -166,6 +219,25 @@ impl RaftLogReader<TypeConfig> for DurableLogStore {
     ) -> Result<Vec<<TypeConfig as RaftTypeConfig>::Entry>, StorageError<NodeId>> {
         let inner = self.inner.lock().await;
         blocking_section(|| inner.read_entries(range))
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<<TypeConfig as RaftTypeConfig>::Entry>, StorageError<NodeId>> {
+        let encoded = {
+            let inner = self.inner.lock().await;
+            blocking_section(|| inner.read_catchup_bytes(start, end))?
+        };
+        // Entries are owned, immutable copies of the selected log prefix. The
+        // snapshot boundary is the locked read above; decoding needs no lock.
+        blocking_section(|| {
+            encoded
+                .into_iter()
+                .map(|value| serde_json::from_slice(&value).map_err(read_error))
+                .collect()
+        })
     }
 }
 
@@ -321,5 +393,158 @@ mod tests {
         inner.db.delete(log_key(4)).unwrap();
         assert_eq!(inner.read_entries(..).unwrap().len(), 4);
         assert_eq!(inner.read_entries(..=2).unwrap().len(), 2);
+    }
+
+    fn blank(index: u64) -> openraft::Entry<TypeConfig> {
+        openraft::Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: openraft::EntryPayload::Blank,
+        }
+    }
+
+    async fn put_entry(store: &DurableLogStore, index: u64, bytes: &[u8]) {
+        store
+            .inner
+            .lock()
+            .await
+            .db
+            .put(log_key(index), bytes)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn catchup_range_boundaries_and_unrestricted_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(directory.path()).unwrap();
+        for index in [0, 1, 2, u64::MAX - 1, u64::MAX] {
+            put_entry(&store, index, &serde_json::to_vec(&blank(index)).unwrap()).await;
+        }
+        for (start, end, expected) in [
+            (0, 3, vec![0, 1, 2]),
+            (1, 2, vec![1]),
+            (2, 2, vec![]),
+            (3, 1, vec![]),
+            (u64::MAX - 1, u64::MAX, vec![u64::MAX - 1]),
+            (u64::MAX, u64::MAX, vec![]),
+        ] {
+            let entries = store.limited_get_log_entries(start, end).await.unwrap();
+            assert_eq!(
+                entries.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(store.try_get_log_entries(..).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn catchup_byte_cap_exact_boundary_and_oversized_entry_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(directory.path()).unwrap();
+        for index in 0..3 {
+            let mut encoded = serde_json::to_vec(&blank(index)).unwrap();
+            encoded.resize(CATCHUP_MAX_BYTES / 2, b' ');
+            put_entry(&store, index, &encoded).await;
+        }
+        assert_eq!(store.limited_get_log_entries(0, 3).await.unwrap().len(), 2);
+        // A malformed next entry is never decoded after an exact-full batch.
+        put_entry(&store, 2, b"invalid").await;
+        assert_eq!(store.limited_get_log_entries(0, 3).await.unwrap().len(), 2);
+        assert!(store.limited_get_log_entries(2, 3).await.is_err());
+        assert!(store.try_get_log_entries(0..3).await.is_err());
+        // One legal complete entry can exceed the soft encoded-byte cap. It
+        // must survive intact, never be split, dropped or returned as empty.
+        let mut large = blank(0);
+        large.payload = openraft::EntryPayload::Normal(crate::LogCommand::put(
+            b"large",
+            vec![255; CATCHUP_MAX_BYTES + 1],
+        ));
+        let encoded = serde_json::to_vec(&large).unwrap();
+        assert!(encoded.len() > CATCHUP_MAX_BYTES);
+        put_entry(&store, 0, &encoded).await;
+        let entries = store.limited_get_log_entries(0, 3).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(serde_json::to_vec(&entries[0]).unwrap(), encoded);
+        // Stop before copying/decoding a next entry that would exceed the cap.
+        let mut first = serde_json::to_vec(&blank(0)).unwrap();
+        first.resize(CATCHUP_MAX_BYTES / 2 + 1, b' ');
+        put_entry(&store, 0, &first).await;
+        assert_eq!(store.limited_get_log_entries(0, 2).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn catchup_small_entry_backlog_batches_and_reopens_without_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(directory.path()).unwrap();
+        let total = CATCHUP_MAX_ENTRIES * 3 + 7;
+        for index in 0..total as u64 {
+            put_entry(&store, index, &serde_json::to_vec(&blank(index)).unwrap()).await;
+        }
+        drop(store);
+        let mut store = DurableLogStore::open(directory.path()).unwrap();
+        let mut start = 0;
+        let mut batches = Vec::new();
+        while start < total as u64 {
+            let entries = store
+                .limited_get_log_entries(start, total as u64)
+                .await
+                .unwrap();
+            assert!(!entries.is_empty());
+            for (offset, entry) in entries.iter().enumerate() {
+                assert_eq!(entry.log_id.index, start + offset as u64);
+            }
+            batches.push(entries.len());
+            start += entries.len() as u64;
+        }
+        assert_eq!(
+            batches,
+            vec![
+                CATCHUP_MAX_ENTRIES,
+                CATCHUP_MAX_ENTRIES,
+                CATCHUP_MAX_ENTRIES,
+                7
+            ]
+        );
+        assert_eq!(store.try_get_log_entries(..).await.unwrap().len(), total);
+    }
+
+    #[tokio::test]
+    async fn catchup_owned_prefix_survives_later_log_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(directory.path()).unwrap();
+        let encoded = serde_json::to_vec(&blank(1)).unwrap();
+        put_entry(&store, 1, &encoded).await;
+        let copied = store.inner.lock().await.read_catchup_bytes(1, 2).unwrap();
+        put_entry(&store, 1, b"invalid replacement").await;
+        assert_eq!(copied, vec![encoded]);
+        let entry: openraft::Entry<TypeConfig> = serde_json::from_slice(&copied[0]).unwrap();
+        assert_eq!(entry.log_id.index, 1);
+    }
+
+    #[tokio::test]
+    async fn catchup_malformed_log_key_fails_instead_of_unbounded_skipping() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(directory.path()).unwrap();
+        let mut invalid_key = log_key(0);
+        invalid_key.push(0);
+        store
+            .inner
+            .lock()
+            .await
+            .db
+            .put(invalid_key, b"invalid")
+            .unwrap();
+        assert!(store.limited_get_log_entries(0, 1).await.is_err());
+        let encoded = serde_json::to_vec(&blank(1)).unwrap();
+        put_entry(&store, 1, &encoded).await;
+        let mut outside = log_key(2);
+        outside.push(0);
+        store
+            .inner
+            .lock()
+            .await
+            .db
+            .put(outside, b"invalid")
+            .unwrap();
+        assert_eq!(store.limited_get_log_entries(1, 2).await.unwrap().len(), 1);
     }
 }
