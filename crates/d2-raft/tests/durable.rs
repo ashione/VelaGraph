@@ -128,3 +128,94 @@ async fn log_metadata_survives_reopen() -> anyhow::Result<()> {
     assert_eq!(state.last_log_id, Some(log_id));
     Ok(())
 }
+
+// Exercise actual Raft catch-up after a follower restarts with an old durable
+// log. The in-process transport isolates log-reader behavior from TCP framing;
+// large TCP workload evidence is recorded separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_follower_catches_up_multiple_bounded_log_batches() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(60), async {
+        let cluster = Cluster::new();
+        let dirs = (0..3)
+            .map(|_| tempfile::tempdir())
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut nodes = Vec::new();
+        for (index, dir) in dirs.iter().enumerate() {
+            nodes.push(cluster.start_durable(index as u64 + 1, dir.path()).await?);
+        }
+        initialize_cluster(
+            &nodes[0].raft,
+            nodes
+                .iter()
+                .map(|n| (n.id, format!("node-{}", n.id)))
+                .collect(),
+        )
+        .await?;
+        let leader = cluster.wait_for_leader(&nodes, 10_000).await?;
+        let stopped_index = nodes.iter().position(|n| n.id != leader).unwrap();
+        let stopped = nodes.remove(stopped_index);
+        let stopped_id = stopped.id;
+        cluster.shutdown(&stopped).await;
+        drop(stopped);
+        let leader_node = nodes.iter().find(|n| n.id == leader).unwrap();
+        // More than two 256-entry batches, plus payloads that force the byte
+        // cap to bind before the entry cap. Keep the normal election settings.
+        for index in 0..600 {
+            write(leader_node, &format!("small-{index}"), "value").await?;
+        }
+        let value = "x".repeat(100 * 1024);
+        for index in 0..12 {
+            write(leader_node, &format!("large-{index}"), &value).await?;
+        }
+        let applied = leader_node
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .unwrap()
+            .index;
+        assert!(leader_node.raft.metrics().borrow().snapshot.is_none());
+        let follower = cluster
+            .start_durable(stopped_id, dirs[stopped_id as usize - 1].path())
+            .await?;
+        cluster.wait_for_applied(&follower, applied, 10_000).await?;
+        for index in 0..600 {
+            assert_eq!(
+                follower
+                    .state_machine
+                    .get(&format!("small-{index}"))
+                    .await
+                    .as_deref(),
+                Some("value")
+            );
+        }
+        for index in 0..12 {
+            assert_eq!(
+                follower
+                    .state_machine
+                    .get(&format!("large-{index}"))
+                    .await
+                    .as_deref(),
+                Some(value.as_str())
+            );
+        }
+        assert!(follower.raft.metrics().borrow().snapshot.is_none());
+        // Ensure the converged follower is durable, not just live state.
+        cluster.shutdown(&follower).await;
+        drop(follower);
+        let follower = cluster
+            .start_durable(stopped_id, dirs[stopped_id as usize - 1].path())
+            .await?;
+        cluster.wait_for_applied(&follower, applied, 10_000).await?;
+        assert_eq!(
+            follower.state_machine.get("large-11").await.as_deref(),
+            Some(value.as_str())
+        );
+        cluster.shutdown(&follower).await;
+        for node in &nodes {
+            cluster.shutdown(node).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?
+}
