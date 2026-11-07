@@ -790,6 +790,18 @@ fn blocking_json<T>(work: impl FnOnce() -> T) -> T {
     }
 }
 
+// Tiny frames have a fixed, conservative CPU-input bound. Avoid handing off a
+// runtime worker for these short parses; larger frames retain the blocking
+// boundary. This is a byte threshold, independent of protocol or graph shape.
+const INLINE_JSON_BYTES: usize = 4096;
+fn decode_frame_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, serde_json::Error> {
+    if bytes.len() <= INLINE_JSON_BYTES {
+        serde_json::from_slice(bytes)
+    } else {
+        blocking_json(|| serde_json::from_slice(bytes))
+    }
+}
+
 async fn write_frame<T: Serialize>(
     stream: &mut TcpStream,
     value: &T,
@@ -849,13 +861,17 @@ async fn read_frame_limited<T: DeserializeOwned>(
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
-    let result =
-        blocking_json(|| serde_json::from_slice(&bytes)).map_err(|_| RemoteError::Protocol);
+    let result = decode_frame_json(&bytes).map_err(|_| RemoteError::Protocol);
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
     result
 }
+
+#[cfg(test)]
+mod frame_decode_tests;
+#[cfg(test)]
+mod frame_scheduler_probe;
 
 #[cfg(test)]
 mod tests {
@@ -1179,6 +1195,45 @@ mod transport_boundary_tests {
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
     }
+    #[test]
+    fn frame_decode_matches_json_across_inline_boundary() {
+        for n in [
+            0,
+            1,
+            INLINE_JSON_BYTES - 3,
+            INLINE_JSON_BYTES - 2,
+            INLINE_JSON_BYTES - 1,
+            INLINE_JSON_BYTES,
+            INLINE_JSON_BYTES + 1,
+            8192,
+        ] {
+            let text = "x".repeat(n);
+            let bytes = serde_json::to_vec(&text).unwrap();
+            assert_eq!(decode_frame_json::<String>(&bytes).unwrap(), text);
+            let mut corrupt = bytes.clone();
+            corrupt.push(b'!');
+            assert!(decode_frame_json::<String>(&corrupt).is_err());
+        }
+        for value in [
+            serde_json::json!({"s":"\u{0000}\n雪🚀".repeat(1024)}),
+            serde_json::json!([null, true, i64::MIN, u64::MAX, 0.125]),
+        ] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                decode_frame_json::<serde_json::Value>(&bytes).unwrap(),
+                value
+            );
+        }
+        for invalid in [b"".as_slice(), b"null trailing", b"[", b"\xff"] {
+            assert!(decode_frame_json::<serde_json::Value>(invalid).is_err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_decode_matches_json_in_multithread_runtime() {
+        frame_decode_matches_json_across_inline_boundary();
+    }
+
     #[test]
     fn no_runtime_fallback() {
         assert_eq!(blocking_json(|| 7), 7);

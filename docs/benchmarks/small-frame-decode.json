@@ -1,0 +1,1050 @@
+{
+  "sources": {
+    "baseline_commit": "040c72560843eaa0354e83674de6f6e10e343488",
+    "production_identical_main": "4eb93ee49073595b341a3ab2fb586c5cedf2a574",
+    "measured_candidate_commit": "c651cad94cc4f66d0a2054c79ac61e322e846635",
+    "measured_candidate_tree": "2c85ce8fc38ec465d2909cc0403597fdf484a484",
+    "later_integration_base": "3e5508b46e60db725b00234e14c808a460c411a4",
+    "later_integration_is_not_this_timing_measurement": true,
+    "driver_sha256": "e57fe01dcd4dcd731cb5b761820cab9000cb1994ea201fce7a37161537ae6312",
+    "fixture_manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e",
+    "subsequent_integration_base": "d2a1c7e3068b830114f161e13462cd098f6172c0"
+  },
+  "physical_hosts": 1,
+  "data_shards": 3,
+  "instrumented": false,
+  "samples_per_variant": 12,
+  "fresh_process_runs_per_variant": 4,
+  "passes": [
+    {
+      "order": [
+        "baseline-first",
+        "candidate-first",
+        "candidate-second",
+        "baseline-second"
+      ],
+      "primary_seconds": {
+        "baseline": {
+          "samples": [
+            4.380039567,
+            5.138933718,
+            5.086241062,
+            4.852089759,
+            4.606980974,
+            5.024138628
+          ],
+          "median": 4.938114193500001,
+          "min": 4.380039567,
+          "max": 5.138933718
+        },
+        "candidate": {
+          "samples": [
+            4.560336218,
+            4.405488005,
+            4.063600677,
+            4.575969855,
+            4.670217551,
+            4.632898727
+          ],
+          "median": 4.5681530365,
+          "min": 4.063600677,
+          "max": 4.670217551
+        }
+      },
+      "median_reduction_percent": 7.491952241343014
+    },
+    {
+      "order": [
+        "candidate-third",
+        "baseline-third",
+        "baseline-fourth",
+        "candidate-fourth"
+      ],
+      "primary_seconds": {
+        "baseline": {
+          "samples": [
+            4.917241717,
+            4.681653207,
+            5.094726309,
+            4.882226876,
+            4.970622955,
+            5.008341256
+          ],
+          "median": 4.943932336,
+          "min": 4.681653207,
+          "max": 5.094726309
+        },
+        "candidate": {
+          "samples": [
+            4.334422747,
+            4.38042189,
+            4.634363055,
+            4.498552097,
+            4.53482605,
+            4.445141097
+          ],
+          "median": 4.471846597,
+          "min": 4.334422747,
+          "max": 4.634363055
+        }
+      },
+      "median_reduction_percent": 9.548790454967094
+    }
+  ],
+  "groups": {
+    "baseline-first": [
+      {
+        "sample": 0,
+        "seconds": 4.380039567,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 5.138933718,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 5.086241062,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "candidate-first": [
+      {
+        "sample": 0,
+        "seconds": 4.560336218,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.405488005,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 4.063600677,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "candidate-second": [
+      {
+        "sample": 0,
+        "seconds": 4.575969855,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.670217551,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 4.632898727,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "baseline-second": [
+      {
+        "sample": 0,
+        "seconds": 4.852089759,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.606980974,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 5.024138628,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "candidate-third": [
+      {
+        "sample": 0,
+        "seconds": 4.334422747,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.38042189,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 4.634363055,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "baseline-third": [
+      {
+        "sample": 0,
+        "seconds": 4.917241717,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.681653207,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 5.094726309,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "baseline-fourth": [
+      {
+        "sample": 0,
+        "seconds": 4.882226876,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.970622955,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 5.008341256,
+        "count": 199999,
+        "requests": 1564,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ],
+    "candidate-fourth": [
+      {
+        "sample": 0,
+        "seconds": 4.498552097,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 1,
+        "seconds": 4.53482605,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      },
+      {
+        "sample": 2,
+        "seconds": 4.445141097,
+        "count": 199999,
+        "requests": 1565,
+        "replay_verified": true,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    ]
+  },
+  "combined": {
+    "primary_seconds": {
+      "baseline": {
+        "samples": [
+          4.380039567,
+          5.138933718,
+          5.086241062,
+          4.852089759,
+          4.606980974,
+          5.024138628,
+          4.917241717,
+          4.681653207,
+          5.094726309,
+          4.882226876,
+          4.970622955,
+          5.008341256
+        ],
+        "median": 4.943932336,
+        "min": 4.380039567,
+        "max": 5.138933718
+      },
+      "candidate": {
+        "samples": [
+          4.560336218,
+          4.405488005,
+          4.063600677,
+          4.575969855,
+          4.670217551,
+          4.632898727,
+          4.334422747,
+          4.38042189,
+          4.634363055,
+          4.498552097,
+          4.53482605,
+          4.445141097
+        ],
+        "median": 4.5166890735,
+        "min": 4.063600677,
+        "max": 4.670217551
+      }
+    },
+    "median_reduction_percent": 8.641770021587114
+  },
+  "raw_sha256": {
+    "baseline-first": "5fbc8d308cc2fc0bbbadcbcd72befac737bbdd23c4188afd9728a659f54902e9",
+    "candidate-first": "e87540e06ffc945ade490ea6ffd25cc77181bfdadc96ed3f2fa82d7c4b57f95c",
+    "candidate-second": "37d5fe0ab9cd250482da035cf2e004cfe8bc4fb3b7ea12e6cb8466264977ecd0",
+    "baseline-second": "24353db13bb30869571738504f1698a7708d9ef683d803ceda2d1e8bee9052f2",
+    "candidate-third": "0bed816a7c3e77c37860284ca13c08f3cb47866a8edfa37cf91d7e281aea38b4",
+    "baseline-third": "5205b7283fa76a890c8c483210675c602c95d41c9ff97769657256b9ec9dbca8",
+    "baseline-fourth": "b424270ebeada6a122601c3411ea001429d9f4436531bb39d5d44c9695c6b887",
+    "candidate-fourth": "f78b08bfd8858474cd6b21d8c5cc822b104bc0ba8ef0fe07957ee19f1cd3eefa"
+  },
+  "host": {
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "machine": "x86_64",
+    "logical_cpus": 9,
+    "affinity_cpus": 9,
+    "physical_hosts": 1,
+    "tokio_workers_per_process": 2,
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor"
+  },
+  "binary_sha256": {
+    "candidate-runner": "33d76c5bc8cb5e76299404b28a5eb3ddcfa120f6ad0256e1ee0378d5caac9140",
+    "baseline-node": "39e50d7da5818b104ac58d7ab090b4471d2d802f13f5d130f28acbb5185ccb36",
+    "candidate-node": "aa8d8b4d2b0ca57d9847e768005256b967ed1a6ec542ef5889c9727abbbd044f",
+    "baseline-runner": "5d5f326781c0f02242ebafc9cf236098f3ce65f06116aceb2d91236bd52aa004"
+  },
+  "metric": "Start plus Advance until complete count; excludes import/replay/cancel",
+  "caveats": [
+    "single cloud host, fixed workload",
+    "12 samples but four fresh process runs per variant",
+    "overlapping ranges, not universal speedup or multi-machine SLA"
+  ]
+}
