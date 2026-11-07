@@ -396,6 +396,12 @@ fn application_error(
         | D1Error::CapacityConflict { .. } => {
             StorageNodeError::InvalidArgument("invalid D1 request".into())
         }
+        D1Error::CoordinatorOnly
+        | D1Error::CoordinatorNotEnabled
+        | D1Error::CoordinatorRequiresEmptyShard
+        | D1Error::CoordinatorRejected(_) => {
+            StorageNodeError::Unsupported("coordinator D1 role boundary".into())
+        }
         D1Error::ManagedWriteRequired
         | D1Error::ManagedWritesNotEnabled
         | D1Error::UnverifiedWriteHistory => {

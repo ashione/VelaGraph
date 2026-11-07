@@ -18,6 +18,7 @@ mod network;
 mod node;
 mod state_machine;
 pub mod tcp;
+pub mod transaction_decisions;
 mod types;
 
 pub use d1::{
