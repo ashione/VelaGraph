@@ -624,6 +624,7 @@ impl Job {
             connections.clear();
         }
         let execution = Execution {
+            scan_cost: Cost::default(),
             catalog: &self.catalog,
             sessions: self.sessions.clone(),
             end: Instant::now() + Duration::from_millis(200),

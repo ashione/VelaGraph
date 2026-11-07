@@ -334,7 +334,9 @@ fn validate_request(request: &DistributedRequest) -> Result<(), RemoteError> {
 fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     let query = GremlinQuery::parse(&request.text).map_err(query::graph_error)?;
     if scan::is_global(&query) {
-        scan::steps(&query)?;
+        if scan::join_at(&query)?.is_none() {
+            scan::steps(&query)?;
+        }
         return Ok(query);
     }
     if !matches!(query.start(), GremlinStart::Vertices(ids) if !ids.is_empty()) {
@@ -412,6 +414,7 @@ struct Execution<'a> {
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     end: Instant,
     cost: Cost,
+    scan_cost: Cost,
     ceiling: Cost,
 }
 impl Execution<'_> {
@@ -438,22 +441,27 @@ impl Execution<'_> {
             .ok_or(QueryFailure::Unavailable)?
             .1
             .clone();
+        let (cost, ceiling) = if matches!(fragment, Fragment::Scan(_)) {
+            (&mut self.scan_cost, scan::SCAN_CEILING)
+        } else {
+            (&mut self.cost, self.ceiling)
+        };
         // Charge request encoding and transport work before allocating/sending.
-        self.cost.charge(512, 1, self.ceiling)?;
+        cost.charge(512, 1, ceiling)?;
         let request = FragmentRequest {
             descriptor: descriptor.clone(),
             fragment,
             remaining: Cost {
-                bytes: self.ceiling.bytes.saturating_sub(self.cost.bytes),
-                work: self.ceiling.work.saturating_sub(self.cost.work),
+                bytes: ceiling.bytes.saturating_sub(cost.bytes),
+                work: ceiling.work.saturating_sub(cost.work),
             },
         };
         let encoded = serde_json::to_vec(&request).map_err(|_| QueryFailure::InvalidArgument)?;
-        self.cost.charge(encoded.len() * 2, 0, self.ceiling)?;
+        cost.charge(encoded.len() * 2, 0, ceiling)?;
         let request = FragmentRequest {
             remaining: Cost {
-                bytes: self.ceiling.bytes.saturating_sub(self.cost.bytes),
-                work: self.ceiling.work.saturating_sub(self.cost.work),
+                bytes: ceiling.bytes.saturating_sub(cost.bytes),
+                work: ceiling.work.saturating_sub(cost.work),
             },
             ..request
         };
@@ -487,8 +495,7 @@ impl Execution<'_> {
         if output.descriptor != descriptor {
             return Err(QueryFailure::IncompleteOrCorrupt);
         }
-        self.cost
-            .charge(output.cost.bytes, output.cost.work, self.ceiling)?;
+        cost.charge(output.cost.bytes, output.cost.work, ceiling)?;
         Ok(output.value)
     }
     async fn boolean(&mut self, fragment: Fragment) -> Result<bool, QueryFailure> {
@@ -606,10 +613,29 @@ impl Execution<'_> {
         query: &GremlinQuery,
     ) -> DistributedResponse {
         self.route(request.start_partition)?;
-        if scan::is_global(query) {
+        let join = scan::join_at(query)?;
+        if scan::is_global(query) && join.is_none() {
             return self.run_scan(query).await;
         }
         let mut rows = Vec::new();
+        if let Some(at) = join {
+            for row in self.scan_rows(query, Some(at)).await? {
+                let QueryRow::Element(QualifiedElement::Vertex { partition, id }) = row else {
+                    return Err(QueryFailure::IncompleteOrCorrupt);
+                };
+                let vertex = VertexId { partition, id };
+                push(
+                    &mut rows,
+                    Traverser {
+                        vertex,
+                        path: vec![vertex.element()],
+                        value: None,
+                    },
+                    &mut self.cost,
+                )?;
+            }
+        }
+        let traversal_steps = &query.steps()[join.unwrap_or(0)..];
         let GremlinStart::Vertices(ids) = query.start() else {
             return Err(QueryFailure::Unsupported);
         };
@@ -634,7 +660,7 @@ impl Execution<'_> {
                 )?;
             }
         }
-        for step in query.steps() {
+        for step in traversal_steps {
             check(self.end)?;
             match step {
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
@@ -716,7 +742,8 @@ impl Execution<'_> {
             query.steps().last(),
             Some(Step::Existing(GremlinStep::Path))
         );
-        if !count
+        if !scan::is_global(query)
+            && !count
             && !query
                 .steps()
                 .iter()
@@ -795,10 +822,10 @@ async fn execute(
     let query = plan(&request)?;
     let mut execution = Execution {
         catalog,
-        ceiling: if scan::is_global(&query) {
-            scan::SCAN_CEILING
-        } else {
-            CEILING
+        ceiling: CEILING,
+        scan_cost: Cost {
+            bytes: 4096,
+            work: 0,
         },
         sessions: BTreeMap::new(),
         end,
@@ -815,7 +842,11 @@ async fn execute(
                 continue;
             }
             check(end)?;
-            execution.cost.charge(1024, 1, execution.ceiling)?;
+            if scan::is_global(&query) {
+                execution.scan_cost.charge(1024, 1, scan::SCAN_CEILING)?;
+            } else {
+                execution.cost.charge(1024, 1, execution.ceiling)?;
+            }
             let remaining = end.saturating_duration_since(Instant::now());
             let reply = rpc(
                 route.endpoint,
@@ -1073,7 +1104,10 @@ fn validate_output(
     };
     let directions = hierarchy::path_directions(&query);
     let hops = directions.iter().map(Vec::len).max().unwrap_or(0);
-    if scan::is_global(&query) && !count {
+    let joined = scan::join_at(&query)
+        .map_err(|_| RemoteError::Protocol)?
+        .is_some();
+    if scan::is_global(&query) && !joined && !count {
         let keys = output
             .rows
             .iter()
@@ -1100,7 +1134,7 @@ fn validate_output(
     let out = hops != 0 || scan::is_global(&query);
     let valid_vertex = |v: &QualifiedElement| matches!(v, QualifiedElement::Vertex { partition, .. } if out || *partition == request.start_partition);
     if count {
-        return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= if scan::is_global(&query) { scan::SCAN_CEILING.work as u64 } else { MAX_ROWS as u64 })
+        return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= if scan::is_global(&query) && !joined { scan::SCAN_CEILING.work as u64 } else { MAX_ROWS as u64 })
         {
             Ok(())
         } else {

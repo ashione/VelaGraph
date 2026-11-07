@@ -2,6 +2,8 @@
 use serde_json::{json, Value};
 #[path = "batch_relationships.rs"]
 mod batch_relationships;
+#[path = "global_relationships.rs"]
+mod global_relationships;
 #[path = "sync_projection.rs"]
 mod sync_projection;
 pub struct Edge {
@@ -633,6 +635,7 @@ impl Model {
         }
         q.extend(batch_relationships::queries(self));
         q.extend(sync_projection::queries(self));
+        q.extend(global_relationships::queries(self));
         q
     }
 }
@@ -659,7 +662,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 90);
+    assert_eq!(q.len(), 102);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     assert!(
         get("unique_colleague_count")["expected"]["count"]

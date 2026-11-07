@@ -360,7 +360,11 @@ ordered has/hasLabel/limit and terminal count on the v2 vertex namespace. Its
 stable order is (partition ID, local ID), distinct from the older client global
 scan order. It uses data-local pages and fixed per-shard sessions, explicit
 scan budgets and Unverified results, never a global atomic snapshot claim.
-Global adjacency/projections/E/path/dedup remain unsupported in this slice.
+The bounded [global scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md)
+extends this with an ordered scan-filter/limit prefix then out/in, filters,
+limit, dedup and terminal count/selected valueMap. It preserves separate scan
+and traversal budgets on the same sessions. Joined results have no implicit
+100-row truncation. Global E/path/repeat and no-hop map/dedup remain Unsupported.
 
 ### Experimental bounded repeat AST
 
@@ -413,18 +417,19 @@ The explicit result-job slice additionally admits terminal standard
 `valueMap('key',...)` with 1–8 distinct keys. It preserves qualified-vertex
 provenance and standard singleton-list property-map semantics, including missing
 versus Null. The local/v1 and legacy observed execution paths reject this step;
-the explicit-start distributed synchronous path is specified below. The job
+the distributed synchronous path is specified below. The job
 mode has an explicit separate bounded projection phase; it does not enlarge existing count or ID-only
 budgets. See [property pages](HIERARCHY_PROPERTY_PAGES.md).
 
 ### Distributed synchronous selected-property maps
 
-The isolated explicit-start server coordinator supports terminal
+The isolated server coordinator supports terminal
 `valueMap('key', ...)` after its supported vertex traversals, filters, `dedup()`
 and limits. This is not a new v1/local query feature. One to eight distinct,
 nonempty UTF-8 keys of at most 64 bytes are required; `valueMap()` (all
-properties), tokens, maps followed by another step, scalar-to-map and global
-`V()` maps remain explicitly unsupported or invalid. Admission occurs before
+properties), tokens, maps followed by another step, scalar-to-map and no-hop global
+`V()` maps remain explicitly unsupported or invalid. Global maps after the
+explicitly supported scan-to-out/in composition are allowed. Admission occurs before
 reading even an empty stream.
 
 Each result has qualified vertex provenance and a canonical property map whose
@@ -432,8 +437,8 @@ values are singleton lists. Missing properties are omitted, explicit Null is
 `[Null]`, and a vertex with no requested properties yields an empty map. Vertex
 stream order and duplicate multiplicity are preserved. Upstream traversal and
 integrity checks run before projection; no property failure returns a partial
-success. The usual default 100-result cap applies before property loading when
-there is no explicit limit. Selected maps are bounded to 2 KiB of tagged flat
+success. For explicit-ID starts the usual default 100-result cap applies before property
+loading when there is no explicit limit. Joined global starts have no implicit cap. Selected maps are bounded to 2 KiB of tagged flat
 property JSON per vertex, matching the hierarchy map cap.
 
 This path uses the existing fixed per-shard sessions and unchanged synchronous
