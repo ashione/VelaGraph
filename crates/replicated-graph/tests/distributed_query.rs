@@ -42,6 +42,8 @@ use tokio::{
 mod byte_batches;
 #[path = "distributed_query/corehr.rs"]
 mod corehr;
+#[path = "distributed_query/dynamic_consistency.rs"]
+mod dynamic_consistency;
 #[path = "distributed_query/global_join.rs"]
 mod global_join;
 #[path = "distributed_query/jobs.rs"]
@@ -457,6 +459,7 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
 // even if a future implementation accidentally adds a fallback.
 #[derive(Default)]
 struct FragmentGate {
+    pause_open: AtomicBool,
     pause: AtomicBool,
     entered: Notify,
     resume: Notify,
@@ -518,6 +521,10 @@ impl AuditProxy {
                             let operation = &value["operation"];
                             if operation.get("OpenQuery").is_some() {
                                 o.fetch_add(1, Ordering::SeqCst);
+                                if gate.pause_open.swap(false, Ordering::SeqCst) {
+                                    gate.entered.notify_one();
+                                    gate.resume.notified().await;
+                                }
                             }
                             if ["Snapshot", "SnapshotPage"]
                                 .iter()
