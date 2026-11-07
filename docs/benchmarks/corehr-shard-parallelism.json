@@ -1,0 +1,251 @@
+{
+  "baseline_commit": "05d6631a3cc9a711e7119390b607d79b78f82725",
+  "baseline_tree": "80423bedc15839c82aad1244bda4b84aa5715ef3",
+  "method": {
+    "order": [
+      "baseline-first",
+      "parallel-first",
+      "parallel-second",
+      "baseline-second"
+    ],
+    "samples_per_version": 6,
+    "build_profile": "release",
+    "coordinator": "embedded in matching release driver",
+    "driver_source_sha256": "e57fe01dcd4dcd731cb5b761820cab9000cb1994ea201fce7a37161537ae6312",
+    "tokio_workers": 2,
+    "fresh_database_per_process": true,
+    "same_driver_source": true,
+    "same_fixture": true,
+    "single_machine": true,
+    "data_shards": 3,
+    "replicas_per_data_shard": 1,
+    "profile_instrumentation": false,
+    "query": "g.V(1).repeat(__.in('reports_to')).emit().times(32).count()",
+    "expected_count": 199999,
+    "counts_snapshots_replay_verified": true
+  },
+  "fixture": {
+    "people": 200000,
+    "departments": 5000,
+    "edges": 454998,
+    "cross_partition_edges": 303483,
+    "all_kv_rows_verified": 1569994,
+    "manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e"
+  },
+  "comparison": {
+    "baseline": {
+      "seconds": [
+        7.910998126,
+        7.147000907,
+        6.700717641,
+        6.38061506,
+        6.569412013,
+        6.482345393
+      ],
+      "median_seconds": 6.635064827,
+      "requests": [
+        1565,
+        1565,
+        1564,
+        1565,
+        1565,
+        1565
+      ]
+    },
+    "parallel": {
+      "seconds": [
+        5.537898536,
+        5.479027679,
+        5.483781145,
+        6.071165016,
+        5.730735964,
+        5.416283303
+      ],
+      "median_seconds": 5.5108398405,
+      "requests": [
+        1565,
+        1565,
+        1565,
+        1565,
+        1565,
+        1564
+      ]
+    },
+    "improvement_percent": 16.94369257592183
+  },
+  "binary_sha256": {
+    "baseline-node": "e15ac78340335cba78a15868b1a6e01d9a4d43a30b7f7f1f580bd84ab272b452",
+    "baseline-runner": "f08d0e7fde53c051873a0c76cc636a25234f641f23ca446969c4d45dd93f7504",
+    "parallel-node": "b80320375e250201c7bbda1e66d62058fbaba9e26b54e0ddb6101b7cdf9a9d4a",
+    "parallel-runner": "a64828dd96a6c87f2128b4308a81be1ddc738c86d32155d280f5d40c963d0008"
+  },
+  "candidate_source_sha256": {
+    "crates/replicated-graph/src/remote.rs": "f249ad942e9e4512fff24ce18f12cee4ef910eb4dc6e3abac7a08523f7cec0a5",
+    "crates/replicated-graph/src/remote/distributed/jobs.rs": "6175fbabb49552417b97c9f100f4085174be78559e23e12032f768d3d1d43f55",
+    "crates/replicated-graph/src/remote/distributed/jobs/parallel.rs": "b59cc48758ce49fc4cab7aa236c2239ed256cfd62181c3f412adc382668de464",
+    "crates/replicated-graph/src/remote/distributed/sessions.rs": "01a6a9585034b8113e1a46564a4440a9273090900090b840dc4b00b8978557b4"
+  },
+  "full_matrix": {
+    "ceo_emit32": {
+      "seconds": [
+        5.804176717,
+        5.40965605,
+        5.567297695
+      ],
+      "median_seconds": 5.567297695,
+      "requests": [
+        1565,
+        1565,
+        1564
+      ],
+      "count": 199999,
+      "expected_rejection": null
+    },
+    "ceo_emit32_dedup": {
+      "seconds": [
+        6.209893821,
+        6.438818413,
+        6.947272483
+      ],
+      "median_seconds": 6.438818413,
+      "requests": [
+        1670,
+        1671,
+        1670
+      ],
+      "count": 199999,
+      "expected_rejection": null
+    },
+    "ceo_exact32": {
+      "seconds": [
+        5.049008475,
+        5.465725387,
+        4.980155362
+      ],
+      "median_seconds": 5.049008475,
+      "requests": [
+        1565,
+        1565,
+        1564
+      ],
+      "count": 0,
+      "expected_rejection": null
+    },
+    "ceo_exact6": {
+      "seconds": [
+        2.870131035,
+        2.9190029280000003,
+        2.781568647
+      ],
+      "median_seconds": 2.870131035,
+      "requests": [
+        295,
+        295,
+        295
+      ],
+      "count": 162551,
+      "expected_rejection": null
+    },
+    "department_emit32": {
+      "seconds": [
+        2.578808038,
+        2.583209202,
+        2.703748505
+      ],
+      "median_seconds": 2.583209202,
+      "requests": [
+        53,
+        51,
+        53
+      ],
+      "count": 4999,
+      "expected_rejection": null
+    },
+    "department_emit32_dedup": {
+      "seconds": [
+        2.430891657,
+        2.462471649,
+        2.5539409749999997
+      ],
+      "median_seconds": 2.462471649,
+      "requests": [
+        54,
+        56,
+        56
+      ],
+      "count": 4999,
+      "expected_rejection": null
+    },
+    "department_exact6": {
+      "seconds": [
+        2.30724644,
+        2.25429458,
+        2.701243955
+      ],
+      "median_seconds": 2.30724644,
+      "requests": [
+        42,
+        42,
+        46
+      ],
+      "count": 1094,
+      "expected_rejection": null
+    },
+    "duplicate_ceo_emit32": {
+      "seconds": [
+        5.123474709,
+        5.313088288,
+        5.84912424
+      ],
+      "median_seconds": 5.313088288,
+      "requests": [
+        1564,
+        1565,
+        1565
+      ],
+      "count": 399998,
+      "expected_rejection": null
+    },
+    "duplicate_ceo_emit32_dedup": {
+      "seconds": [
+        6.75611162,
+        5.658700982,
+        5.567311091
+      ],
+      "median_seconds": 5.658700982,
+      "requests": [
+        1670,
+        1671,
+        1670
+      ],
+      "count": 199999,
+      "expected_rejection": null
+    }
+  },
+  "full_run_seconds": 142.89931599899137,
+  "validation": {
+    "library_tests_passed": 103,
+    "distributed_process_tests_passed": 2,
+    "remote_process_tests_passed": 1,
+    "clippy_all_targets": true,
+    "full_matrix_cases": 9,
+    "full_matrix_samples_per_case": 3,
+    "additional_probes": 2,
+    "fixed_snapshot_sequence_replay_cancel_and_no_partial_count": true
+  },
+  "raw_evidence_sha256": {
+    "baseline-final-first": "2a2a1a9de45453e76266c4534d11cfc895d2f0496ee439689aac33c131e1bc4e",
+    "parallel-final-first": "c314e9d7bc0ef610157d0c67c3811f2e5266ccd5f60ab778df2c7fef24ac1523",
+    "parallel-final-second": "38019d4145c85ccb238228a1bf3bfd477674d1f4d3ee1853de151592df3cf59a",
+    "baseline-final-second": "b5e209dc57576d96e93afc9ead9d465339e660eeb358cf42e1b14afe868520f0",
+    "parallel-full": "1c59a82c27233a741a4ac9ff8b28f07c1ff475dd57ac7b56d2928e896beb9f28"
+  },
+  "excluded_setup_attempt": "Old embedded coordinator plus new nodes failed at hierarchy-open before any candidate timing; excluded. Final runs use matching coordinator and nodes.",
+  "limitations": [
+    "Six samples per version are regression evidence, not a performance SLA.",
+    "Single-machine three-shard fixture, not a multi-host or HA benchmark.",
+    "Fixture import is not production graph-write throughput.",
+    "Existing RPC admission and deadline limits still apply.",
+    "Micro-pages can remain shard-local because frontier order is partition-first."
+  ]
+}
