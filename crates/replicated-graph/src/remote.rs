@@ -1,6 +1,7 @@
 //! Bounded plaintext TCP D1 transport for trusted development networks only.
 //! No authentication, TLS, forwarding, retry, or remote administration is provided.
-//! Each connection carries exactly one request and one response.
+//! Ordinary connections carry one request/response. Opt-in hierarchy channels
+//! reuse a bounded, sequential connection tied to one fixed query session.
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use d2_raft::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, StateMachine, TypeConfig};
@@ -110,6 +111,10 @@ enum Operation {
         shard: u64,
     },
     QueryFragment(distributed::FragmentRequest),
+    OpenHierarchyChannel {
+        version: u32,
+        request: distributed::FragmentRequest,
+    },
     CloseQuery {
         descriptor: distributed::Descriptor,
     },
@@ -216,6 +221,26 @@ impl GraphService {
                             Ok(Ok(request)) => request,
                             _ => return,
                         };
+                    let request = match request {
+                        Request {
+                            version: VERSION,
+                            identity: Some(expected),
+                            operation: Operation::OpenHierarchyChannel { version, request },
+                        } if expected == identity => {
+                            let _ = distributed::channel::serve(
+                                socket,
+                                state,
+                                query_sessions,
+                                (identity, shard),
+                                version,
+                                request,
+                                (end, deadline),
+                            )
+                            .await;
+                            return;
+                        }
+                        request => request,
+                    };
                     // A query's shorter budget also governs response encoding and
                     // sending; it cannot regain the longer connection deadline.
                     let end = match &request.operation {
@@ -315,6 +340,7 @@ async fn execute(
         return Err(RemoteError::InvalidArgument);
     }
     match request.operation {
+        Operation::OpenHierarchyChannel { .. } => Err(RemoteError::InvalidArgument),
         Operation::OpenQuery {
             shard: requested,
             timeout_millis,
@@ -680,6 +706,7 @@ async fn rpc(
         Operation::Query(_)
             | Operation::OpenQuery { .. }
             | Operation::OpenHierarchyQuery { .. }
+            | Operation::OpenHierarchyChannel { .. }
             | Operation::QueryFragment(_)
             | Operation::CloseQuery { .. }
     ) {

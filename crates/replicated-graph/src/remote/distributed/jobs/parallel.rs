@@ -63,7 +63,7 @@ fn reservation(batch: &Batch, row_bytes: usize, descriptor: &Descriptor) -> Opti
     let encoded = serde_json::to_vec(&request).ok()?;
     cost.bytes = cost
         .bytes
-        .checked_add(512)?
+        .checked_add(channel::TRANSPORT_BYTES)?
         .checked_add(encoded.len().checked_mul(2)?)?;
     cost.work = cost.work.checked_add(1)?;
     Some(cost)
@@ -76,6 +76,57 @@ fn fits(used: Cost, extra: Cost, remaining: Cost) -> bool {
             .work
             .checked_add(extra.work)
             .is_some_and(|n| n <= remaining.work)
+}
+
+// Validate the returned leaf semantics before any socket can be reused by a
+// later wave. Caller-level weighted merging remains separate and unchanged.
+fn validate_leaves(expected: &[Fragment], values: &[FragmentValue]) -> Result<(), QueryFailure> {
+    if expected.len() != values.len() {
+        return Err(QueryFailure::IncompleteOrCorrupt);
+    }
+    let mut entries = 0usize;
+    for (fragment, value) in expected.iter().zip(values) {
+        let valid = match (fragment, value) {
+            (Fragment::Exists(_), FragmentValue::Bool(_)) => true,
+            (Fragment::VerifyReverse(_), FragmentValue::Bool(true)) => true,
+            (Fragment::In(_), FragmentValue::Incoming(edges)) => {
+                entries += edges.len();
+                edges.len() <= 1000
+                    && edges.iter().all(|e| e.label.len() <= 64)
+                    && !edges
+                        .windows(2)
+                        .any(|w| (w[0].id, w[0].partition) >= (w[1].id, w[1].partition))
+            }
+            (Fragment::Out(vertex), FragmentValue::Edges(edges)) => {
+                entries += edges.len();
+                edges.len() <= 1000
+                    && edges
+                        .iter()
+                        .all(|e| e.from == *vertex && e.label.len() <= 64)
+                    && !edges.windows(2).any(|w| w[0].id >= w[1].id)
+            }
+            (
+                Fragment::ResolveIncoming {
+                    target,
+                    edge: observed,
+                },
+                FragmentValue::Edge(edge),
+            ) => {
+                edge.to == *target
+                    && edge.id == observed.id
+                    && edge.from.partition == observed.partition
+                    && edge.label == observed.label
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(QueryFailure::IncompleteOrCorrupt);
+        }
+        if entries > MAX_PAGE_EDGES {
+            return Err(QueryFailure::ResourceExhausted);
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn run(
@@ -127,6 +178,11 @@ pub(super) async fn run(
         wave.reverse();
         let mut futures = Vec::new();
         for (batch, bound) in wave {
+            let enabled = job.connections.is_some();
+            let mut connection = job
+                .connections
+                .as_mut()
+                .and_then(|connections| connections.remove(&batch.shard));
             let catalog = &job.catalog;
             let sessions = job.sessions.clone();
             futures.push(Box::pin(async move {
@@ -137,8 +193,21 @@ pub(super) async fn run(
                     cost: Cost::default(),
                     ceiling: bound,
                 };
-                let value = execution.fragment(batch.fragment).await;
-                (batch.indices, execution.cost, value)
+                let expected = match &batch.fragment {
+                    Fragment::HierarchyBatch { fragments, .. } => fragments.clone(),
+                    _ => unreachable!("job batches are typed"),
+                };
+                let value = execution
+                    .fragment_transport(batch.fragment, enabled.then_some(&mut connection))
+                    .await;
+                (
+                    batch.indices,
+                    execution.cost,
+                    value,
+                    batch.shard,
+                    connection,
+                    expected,
+                )
             }));
         }
         let mut replies: Vec<_> = (0..futures.len()).map(|_| None).collect();
@@ -165,7 +234,7 @@ pub(super) async fn run(
         drop(futures);
         let mut accepted = Vec::new();
         for reply in replies {
-            let (indices, cost, result) = reply.unwrap();
+            let (indices, cost, result, shard, connection, expected) = reply.unwrap();
             job.charge(cost.bytes, cost.work)?;
             let FragmentValue::HierarchyBatch(values) = result? else {
                 return Err(QueryFailure::IncompleteOrCorrupt);
@@ -173,9 +242,13 @@ pub(super) async fn run(
             if values.len() != indices.len() {
                 return Err(QueryFailure::IncompleteOrCorrupt);
             }
-            accepted.push((indices, values));
+            validate_leaves(&expected, &values)?;
+            accepted.push((indices, values, shard, connection));
         }
-        for (indices, values) in accepted {
+        for (indices, values, shard, connection) in accepted {
+            if let (Some(cache), Some(connection)) = (&mut job.connections, connection) {
+                cache.insert(shard, connection);
+            }
             for (index, value) in indices.into_iter().zip(values) {
                 outputs[index] = Some(value);
             }
@@ -240,6 +313,7 @@ mod tests {
             catalog: Arc::new(StaticCatalog { partitions: routes }),
             sessions,
             row_bounds: BTreeMap::from([(1, 256), (2, 256), (3, 256)]),
+            connections: None,
             expires: Instant::now() + Duration::from_secs(5),
             cost: Cost::default(),
             plan: parse("g.V(1).repeat(__.out()).times(1).count()").unwrap(),

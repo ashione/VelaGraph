@@ -1,0 +1,265 @@
+{
+  "baseline_commit": "52a214b9546828dc11151464fc1f6ab8089bd68d",
+  "baseline_tree": "e42e38c352623922541b566cf620fd77d3bf9f43",
+  "method": {
+    "order": [
+      "baseline-final-first",
+      "channel-final-first",
+      "channel-final-second",
+      "baseline-final-second"
+    ],
+    "samples_per_version": 6,
+    "build_profile": "release",
+    "coordinator": "embedded in matching release driver",
+    "driver_source_sha256": "e57fe01dcd4dcd731cb5b761820cab9000cb1994ea201fce7a37161537ae6312",
+    "tokio_workers": 2,
+    "fresh_database_per_process": true,
+    "same_driver_source": true,
+    "same_fixture": true,
+    "single_machine": true,
+    "data_shards": 3,
+    "replicas_per_data_shard": 1,
+    "profile_instrumentation": false,
+    "query": "g.V(1).repeat(__.in('reports_to')).emit().times(32).count()",
+    "expected_count": 199999,
+    "counts_snapshots_replay_verified": true
+  },
+  "fixture": {
+    "people": 200000,
+    "departments": 5000,
+    "edges": 454998,
+    "cross_partition_edges": 303483,
+    "all_kv_rows_verified": 1569994,
+    "manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e"
+  },
+  "comparison": {
+    "samples": {
+      "baseline": [
+        5.565001195,
+        5.535859823,
+        5.824000983,
+        5.674106107,
+        5.341367959,
+        5.376059896
+      ],
+      "channel": [
+        4.53685661,
+        4.610759171,
+        4.589258665,
+        4.780833344,
+        4.510612449,
+        4.853424817
+      ]
+    },
+    "medians": {
+      "baseline": 5.550430509,
+      "channel": 4.600008918
+    },
+    "improvement_percent": 17.12338510425263
+  },
+  "binary_sha256": {
+    "baseline-node": "b80320375e250201c7bbda1e66d62058fbaba9e26b54e0ddb6101b7cdf9a9d4a",
+    "baseline-runner": "a64828dd96a6c87f2128b4308a81be1ddc738c86d32155d280f5d40c963d0008",
+    "channel-node": "40a0bdc5cc6c616a1514bc45641e4c76cc914ef757a4d4092d6506a5d4a45e81",
+    "channel-runner": "f05adfcdb6f6d045754dceb802197f2e975cf01a13f700979752a1881f80cd03"
+  },
+  "candidate_source_sha256": {
+    "crates/replicated-graph/src/remote.rs": "900eeeb55232daa21c759af60d6e4e5fdecc119e78c79765469c34e9ae55122c",
+    "crates/replicated-graph/src/remote/distributed/jobs.rs": "40f4e6493e5d76291206166f6ea5c828147bf80c73594d42fe535c6bbf9aebc6",
+    "crates/replicated-graph/src/remote/distributed/jobs/parallel.rs": "d22a12c084a628cb807c8cec324067f447b4f796b0806a673249f1845c3149f0",
+    "crates/replicated-graph/src/remote/distributed/mod.rs": "c902780bece878a7209967730f9c800c49ad4860fd55f5cea522b8e9a9da5a7d",
+    "crates/replicated-graph/src/remote/distributed/sessions.rs": "edf8bb55153af83c137e9ccfcb31938c7b3440591613e570d83b98911be1b2b9",
+    "crates/replicated-graph/tests/distributed_query.rs": "7185b4a65de5ba6c62037625fee5dc1ef53ecaa58fbe5c501dead64d7d4a9ffc",
+    "crates/replicated-graph/src/remote/distributed/channel.rs": "0f308ff10c614652d1d24ba13e4b1296f62678a839411c11c02c161ae58a11be"
+  },
+  "full_matrix": {
+    "ceo_emit32": {
+      "seconds": [
+        4.745938123,
+        4.452838248,
+        4.572858712
+      ],
+      "median_seconds": 4.572858712,
+      "requests": [
+        1564,
+        1565,
+        1565
+      ],
+      "count": 199999,
+      "expected_rejection": null
+    },
+    "ceo_emit32_dedup": {
+      "seconds": [
+        5.145910644,
+        5.236847175,
+        4.902786614
+      ],
+      "median_seconds": 5.145910644,
+      "requests": [
+        1671,
+        1671,
+        1671
+      ],
+      "count": 199999,
+      "expected_rejection": null
+    },
+    "ceo_exact32": {
+      "seconds": [
+        4.526787137,
+        4.466014763,
+        5.347754248
+      ],
+      "median_seconds": 4.526787137,
+      "requests": [
+        1565,
+        1564,
+        1565
+      ],
+      "count": 0,
+      "expected_rejection": null
+    },
+    "ceo_exact6": {
+      "seconds": [
+        2.473140564,
+        2.600255325,
+        2.57233374
+      ],
+      "median_seconds": 2.57233374,
+      "requests": [
+        294,
+        295,
+        294
+      ],
+      "count": 162551,
+      "expected_rejection": null
+    },
+    "department_emit32": {
+      "seconds": [
+        2.468889111,
+        2.340302658,
+        2.420932398
+      ],
+      "median_seconds": 2.420932398,
+      "requests": [
+        50,
+        49,
+        50
+      ],
+      "count": 4999,
+      "expected_rejection": null
+    },
+    "department_emit32_dedup": {
+      "seconds": [
+        2.57105848,
+        2.310383327,
+        2.421792811
+      ],
+      "median_seconds": 2.421792811,
+      "requests": [
+        55,
+        54,
+        54
+      ],
+      "count": 4999,
+      "expected_rejection": null
+    },
+    "department_exact6": {
+      "seconds": [
+        2.299618136,
+        2.178244954,
+        2.274135303
+      ],
+      "median_seconds": 2.274135303,
+      "requests": [
+        41,
+        41,
+        41
+      ],
+      "count": 1094,
+      "expected_rejection": null
+    },
+    "duplicate_ceo_emit32": {
+      "seconds": [
+        5.04929596,
+        4.998449464,
+        4.878909185
+      ],
+      "median_seconds": 4.998449464,
+      "requests": [
+        1565,
+        1565,
+        1565
+      ],
+      "count": 399998,
+      "expected_rejection": null
+    },
+    "duplicate_ceo_emit32_dedup": {
+      "seconds": [
+        5.517326522,
+        5.147502576,
+        4.997034459
+      ],
+      "median_seconds": 5.147502576,
+      "requests": [
+        1671,
+        1671,
+        1671
+      ],
+      "count": 199999,
+      "expected_rejection": null
+    }
+  },
+  "full_run_seconds": 127.59783973199956,
+  "validation": {
+    "library_tests_passed": 113,
+    "distributed_process_tests_passed": 2,
+    "remote_process_tests_passed": 1,
+    "clippy_all_targets": true,
+    "full_matrix_cases": 9,
+    "full_matrix_samples_per_case": 3,
+    "additional_probes": 2,
+    "fixed_snapshot_sequence_replay_cancel_and_no_partial_count": true
+  },
+  "raw_evidence_sha256": {
+    "baseline-final-first": "0bbe0a735eb1534e203dc67010b9117a4755578016837bd373b2ceb489e9e0a4",
+    "channel-final-first": "6cdbb26323c066ee5bb5786a07eb90de50cf88dd6dba8f3dc580988f101c0424",
+    "channel-final-second": "cb93f0e06fa0101cecd4dbe91ec163802e736f17e6ad768d50e12e6e58f15641",
+    "baseline-final-second": "31ce6d9bcff0c9a44f21b9a915ba0b56088c02862825065ac0f3d6669f27529a",
+    "channel-full": "343a04deaeb9beee71dada65331e1ff733b9d51e52dafe2392fe243d31190835"
+  },
+  "accounting": {
+    "fixed_transport_bytes": 512,
+    "maximum_tested_envelope_bytes_two_copies": 504,
+    "budget_caps_changed": false
+  },
+  "profile": {
+    "separate_instrumented_build": true,
+    "rpc_calls_per_ceo_query": 17213,
+    "summed_connect_seconds": [
+      0.963930387,
+      0.974441756,
+      1.018893726
+    ],
+    "summed_write_seconds": [
+      0.53079612,
+      0.541593646,
+      0.569167652
+    ],
+    "summed_read_server_decode_seconds": [
+      4.466928169,
+      4.467613044,
+      4.842566472
+    ],
+    "warning": "Concurrent phase sums overlap, not wall-time savings or pure network/CPU attribution."
+  },
+  "limitations": [
+    "Six samples per version are regression evidence, not a performance SLA.",
+    "Single-machine three-shard fixture, not a multi-host or HA benchmark.",
+    "Fixture import is not production graph-write throughput.",
+    "Existing RPC admission and deadline limits still apply.",
+    "Micro-pages can remain shard-local because frontier order is partition-first.",
+    "Connection reuse, compact envelopes and TCP_NODELAY are evaluated together, not isolated causal effects.",
+    "This wire extension requires coordinated upgrades. New clients fail closed against older servers.",
+    "Full RemoteService shutdown and exhausted cache-permit fallback are not directly covered by new tests; existing lifecycle/admission mechanisms remain."
+  ]
+}
