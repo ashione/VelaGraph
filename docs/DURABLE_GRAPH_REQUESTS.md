@@ -76,8 +76,10 @@ bounds are not a substitute for the separate gateway request/response frame boun
 
 There is no eviction or ID reuse. Capacity exhaustion rejects new identities without
 removing older records, while existing valid retries and already-reserved transaction
-resolution remain available. Request payloads travel with the retained coordinator
-journal and participant observations; this is bounded functional storage, not a
-performance claim. No credentials, signing keys or authentication protocol is added.
+resolution remain available. Request payloads remain in the retained coordinator
+journal and participant advance observations. The [A1 read path](TERMINAL_PREFIX_EVIDENCE.md) separately
+compares exact terminal-prefix projections without those archives. Storage and
+write recovery are still bounded functional implementations, not a performance
+claim. No credentials, signing keys or authentication protocol is added.
 The trusted coordinator/application boundary remains explicit, and all remote graph
 GlobalCommittedSnapshot admission is still Unsupported.

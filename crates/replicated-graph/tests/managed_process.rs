@@ -1288,3 +1288,85 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     assert_eq!(replay.total, 4);
     Ok((old, next))
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::Result<()> {
+    let coordinator = Process::start(9).await?;
+    let a = Process::start(7).await?;
+    let b = Process::start(8).await?;
+    let g = Gateway::bind_remote(
+        RemoteConfig {
+            coordinator: coordinator.client()?,
+            binding: binding(),
+            members: vec![a.client()?, b.client()?],
+        },
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
+    committed(call(&g, Operation::Submit(create(1, 7))).await?);
+    committed(call(&g, Operation::Submit(create(2, 8))).await?);
+    let c = coordinator.client()?;
+    let before = NodeRef::Remote(&c).terminal(&authority(), 1, 2).await?;
+    let barrier = tokio::sync::Barrier::new(2);
+    let writes = async {
+        barrier.wait().await;
+        for id in 3..=6 {
+            let write = Write {
+                external_id: [id; 16],
+                mutation: Mutation::PatchVertex {
+                    vertex: Entity {
+                        partition: 7,
+                        id: 1,
+                    },
+                    patch: Patch {
+                        set: BTreeMap::from([("marker".into(), Value::Integer(id as i64))]),
+                        remove: BTreeSet::new(),
+                    },
+                },
+            };
+            assert_eq!(
+                committed(call(&g, Operation::Submit(write)).await?).1,
+                id as u64
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let reads = async {
+        barrier.wait().await;
+        for _ in 0..6 {
+            let old = open(&g, Some(2)).await?;
+            assert_eq!(old.version, 2);
+            assert_eq!(read(&g, &old, 7, "g.V(1)").await?, vec![vertex(7)]);
+            assert!(read(&g, &old, 7, "g.V(1).values('marker')")
+                .await?
+                .is_empty());
+            call(&g, Operation::Close { session: old }).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let (writes, reads) = tokio::join!(writes, reads);
+    writes?;
+    reads?;
+    assert_eq!(
+        NodeRef::Remote(&c).terminal(&authority(), 1, 2).await?,
+        before
+    );
+    let latest = open(&g, None).await?;
+    assert_eq!(latest.version, 6);
+    assert_eq!(
+        read(&g, &latest, 7, "g.V(1).values('marker')").await?,
+        vec![QueryRow::Value {
+            source: Some(QualifiedElement::Vertex {
+                partition: 7,
+                id: 1
+            }),
+            value: Value::Integer(6)
+        }]
+    );
+    call(&g, Operation::Close { session: latest }).await?;
+    eprintln!("concurrent exact-prefix captures: 6 fixed V2 acquisitions, 4 new commits, final V6; child PIDs {:?}",
+        [coordinator.child.id(), a.child.id(), b.child.id()]);
+    g.shutdown().await;
+    Ok(())
+}

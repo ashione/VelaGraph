@@ -23,6 +23,7 @@ pub mod participant_writes;
 pub mod request_plans;
 mod state_machine;
 pub mod tcp;
+pub mod terminal_prefix;
 pub mod transaction_decisions;
 mod types;
 pub mod versioned_reads;

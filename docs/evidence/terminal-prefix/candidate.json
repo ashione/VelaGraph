@@ -1,0 +1,133 @@
+{
+  "capture_samples": [
+    {
+      "bytes": 140,
+      "capture_ms": 8.624692,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.049895,
+      "repeat": 1,
+      "replay_operations": 1,
+      "rows": 1,
+      "verified_vertices": 1,
+      "version": 1
+    },
+    {
+      "bytes": 17921,
+      "capture_ms": 41.451517,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.409716,
+      "repeat": 1,
+      "replay_operations": 128,
+      "rows": 128,
+      "verified_vertices": 128,
+      "version": 128
+    },
+    {
+      "bytes": 20741,
+      "capture_ms": 48.148125,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.038097,
+      "repeat": 1,
+      "replay_operations": 148,
+      "rows": 148,
+      "verified_vertices": 148,
+      "version": 148
+    },
+    {
+      "bytes": 140,
+      "capture_ms": 11.750255,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.034892,
+      "repeat": 2,
+      "replay_operations": 1,
+      "rows": 1,
+      "verified_vertices": 1,
+      "version": 1
+    },
+    {
+      "bytes": 17921,
+      "capture_ms": 40.899923,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.034091,
+      "repeat": 2,
+      "replay_operations": 128,
+      "rows": 128,
+      "verified_vertices": 128,
+      "version": 128
+    },
+    {
+      "bytes": 20741,
+      "capture_ms": 48.774416,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.035133,
+      "repeat": 2,
+      "replay_operations": 148,
+      "rows": 148,
+      "verified_vertices": 148,
+      "version": 148
+    },
+    {
+      "bytes": 140,
+      "capture_ms": 8.751567,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.032959,
+      "repeat": 3,
+      "replay_operations": 1,
+      "rows": 1,
+      "verified_vertices": 1,
+      "version": 1
+    },
+    {
+      "bytes": 17921,
+      "capture_ms": 41.783196000000004,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.031847999999999994,
+      "repeat": 3,
+      "replay_operations": 128,
+      "rows": 128,
+      "verified_vertices": 128,
+      "version": 128
+    },
+    {
+      "bytes": 20741,
+      "capture_ms": 50.154135000000004,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.035163,
+      "repeat": 3,
+      "replay_operations": 148,
+      "rows": 148,
+      "verified_vertices": 148,
+      "version": 148
+    }
+  ],
+  "common_version": 148,
+  "explicit_v149_error": "Snapshot(Application(VisibilityNotApplied))",
+  "fixture": "independent regular-file /tmp copies; original DBs never opened",
+  "id1_retry_ms": 706.259038,
+  "journal_and_exact_retained_plan_unchanged": true,
+  "journal_samples": [
+    {
+      "journal_encode_ms": 35.468523000000005,
+      "journal_encoded_bytes": 1004638,
+      "journal_transfer_decode_ms": 231.327469,
+      "repeat": 1
+    },
+    {
+      "journal_encode_ms": 42.932263,
+      "journal_encoded_bytes": 1004638,
+      "journal_transfer_decode_ms": 238.633062,
+      "repeat": 2
+    },
+    {
+      "journal_encode_ms": 35.326319000000005,
+      "journal_encoded_bytes": 1004638,
+      "journal_transfer_decode_ms": 263.784018,
+      "repeat": 3
+    }
+  ],
+  "label": "candidate",
+  "new_external_ids_submitted": 0,
+  "processes": 5,
+  "profile": "debug, jobs=1, incremental=0",
+  "terminal_transactions": 149
+}
