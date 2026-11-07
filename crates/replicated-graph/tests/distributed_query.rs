@@ -757,6 +757,18 @@ async fn scenario() -> anyhow::Result<()> {
         ap.opened.load(Ordering::SeqCst) + bp.opened.load(Ordering::SeqCst),
         opened
     );
+    assert_eq!(
+        rows(endpoint, "g.V(1,1).dedup().out().dedup().path()").await?,
+        expected[..3]
+    );
+    assert_eq!(
+        rows(endpoint, "g.V(1).out().out().dedup().count()").await?,
+        vec![QueryRow::Count(1)]
+    );
+    assert_eq!(
+        rows(endpoint, "g.V(1).out().out().dedup().out().count()").await?,
+        vec![QueryRow::Count(4)]
+    );
     let mut twice = expected.clone();
     twice.extend(expected);
     assert_eq!(rows(endpoint, "g.V(1,1).out('knows').path()").await?, twice);
@@ -945,7 +957,11 @@ async fn scenario() -> anyhow::Result<()> {
         ]
     );
     for id in [40, 41, 43, 44] {
-        for suffix in ["in().count()", "in('filtered-out').limit(1).count()"] {
+        for suffix in [
+            "in().count()",
+            "in('filtered-out').limit(1).count()",
+            "in().dedup().count()",
+        ] {
             let result = distributed::query(
                 endpoint,
                 DistributedRequest {
@@ -963,7 +979,12 @@ async fn scenario() -> anyhow::Result<()> {
             );
         }
     }
-    for suffix in ["count()", "limit(1).count()"] {
+    for suffix in [
+        "count()",
+        "limit(1).count()",
+        "dedup().count()",
+        "dedup().limit(1).count()",
+    ] {
         let result = distributed::query(
             endpoint,
             DistributedRequest {
@@ -1065,7 +1086,12 @@ async fn scenario() -> anyhow::Result<()> {
     // Every shard spends the same cumulative allowance. A later limit/count
     // must not turn an excessive earlier expansion into a successful prefix.
     let repeated = std::iter::repeat_n("7", 30).collect::<Vec<_>>().join(",");
-    for suffix in ["count()", "limit(1).count()"] {
+    for suffix in [
+        "count()",
+        "limit(1).count()",
+        "dedup().count()",
+        "dedup().limit(1).count()",
+    ] {
         let exhausted = distributed::query(
             endpoint,
             DistributedRequest {

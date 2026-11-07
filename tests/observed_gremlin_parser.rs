@@ -149,3 +149,24 @@ fn observed_existing_steps_preserve_v0_ast() {
         );
     }
 }
+
+#[test]
+fn server_dedup_is_additive_and_only_accepts_no_arguments() {
+    assert_eq!(
+        ObservedGremlinQuery::parse("g.V(1).dedup()")
+            .unwrap()
+            .steps(),
+        &[ObservedGremlinStep::Dedup]
+    );
+    assert!(GremlinQuery::parse("g.V(1).dedup()").is_err());
+    for text in [
+        "g.V(1).dedup('x')",
+        "g.V(1).dedup(local)",
+        "g.V(1).dedup(global)",
+        "g.V(1).dedup().by('x')",
+        "g.V(1).path().dedup()",
+        "g.V(1).count().dedup()",
+    ] {
+        assert!(ObservedGremlinQuery::parse(text).is_err(), "{text}");
+    }
+}
