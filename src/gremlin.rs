@@ -86,6 +86,7 @@ const RULE_METHOD_OUTE: usize = 118;
 const RULE_METHOD_OUTV: usize = 119;
 const RULE_METHOD_BOTH: usize = 44;
 const RULE_METHOD_COUNT: usize = 59;
+const RULE_METHOD_DEDUP: usize = 63;
 const RULE_METHOD_HAS: usize = 79;
 const RULE_METHOD_HAS_LABEL: usize = 82;
 const RULE_METHOD_ID: usize = 85;
@@ -134,6 +135,8 @@ pub struct GremlinQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObservedGremlinStep {
     Existing(GremlinStep),
+    /// Vertex identity deduplication, currently executed only by the server coordinator.
+    Dedup,
     OutE(Option<String>),
     InE(Option<String>),
     BothE(Option<String>),
@@ -912,6 +915,10 @@ fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {
         .ok_or_else(|| Error::UnsupportedGremlinStep(node.text()))?;
     let (name, args) = method_parts(specific)?;
     match rule_index(specific).expect("specific rule has an index") {
+        RULE_METHOD_DEDUP => {
+            require_no_args(&name, &args)?;
+            Ok(ObservedGremlinStep::Dedup)
+        }
         RULE_METHOD_OUTE => Ok(ObservedGremlinStep::OutE(parse_optional_label(
             &name, &args,
         )?)),

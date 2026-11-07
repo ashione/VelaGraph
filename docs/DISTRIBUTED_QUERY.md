@@ -16,7 +16,7 @@ change its routes; this prototype is not online migration or automatic discovery
 
 The client sends `DistributedRequest { start_partition, text, timeout_millis }`.
 The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` / `in()`
-steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limit`, terminal `path` or
+steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limit`, vertex-identity `dedup()`, terminal `path` or
 `count`, and `values(key)` followed only by `limit`/`count`. Unsupported start and
 step forms fail explicitly through the official parser. No global V/E scan,
 `both()`, mutation, alternate query dialect or textual
@@ -27,7 +27,8 @@ Examples:
 - `g.V(1).out('knows').path()`
 - `g.V(1).in('reports_to').path()`
 - `g.V(205000).in('member_of').has('active',true).limit(100)`
-- `g.V(20).out('member_of').in('member_of').count()`
+- `g.V(20).out('member_of').in('member_of').count()` (membership bag count)
+- `g.V(20).out('member_of').in('member_of').dedup().count()` (distinct people)
 - `g.V(1).out('knows').out('returns').out('knows').path()`
 - `g.V(1).out('knows').has('active',true).limit(2).count()`
 - `g.V(1).out('knows').values('name')`
@@ -109,7 +110,8 @@ shard on its data node: this is not a zero-copy storage claim.
 Input order and bag multiplicity are preserved. Expansion is ordered per input
 by edge ID and source partition. An edge's qualified partition is its source
 partition, including when the traversal has moved to its target partition.
-Parallel edges and duplicate input IDs are not globally deduplicated. Paths
+Parallel edges and duplicate input IDs retain multiplicity unless an explicit
+`dedup()` step is applied. Paths
 retain qualified vertex and edge identities at every hop, so equal local IDs in
 different partitions remain distinct. Cycles and revisiting a shard are allowed:
 each hop uses the original retained session, never a newly acquired snapshot.
@@ -240,3 +242,30 @@ starts, parallel memberships, mixed out/in colleague bag counts and qualified
 paths. Equal local edge IDs in different source partitions check incoming
 secondary ordering. This CI-scale fixture is not the 200,000-person capacity
 benchmark, production HR data, recursive Gremlin or an HA/performance guarantee.
+
+## Bounded vertex deduplication
+
+`dedup()` operates left to right on the current vertex stream, comparing the
+exact `(partition, vertex_id)` pair. It retains the first traverser, including
+its full path, and preserves first-occurrence order. A same-numbered ID in a
+different partition is a different vertex. Later expansion may introduce new
+duplicates; another explicit `dedup()` is needed to reduce those. `limit()` before
+and after deduplication can therefore produce different results. A terminal
+`count()` counts the resulting stream, not the implicit default 100-row output
+cap. This is vertex identity deduplication, not `simplePath()` cycle prevention.
+
+Only the no-argument vertex form is supported. Scalar `values(...).dedup()`,
+path deduplication, label arguments, scopes, `by()` modulators, and edge-stream
+deduplication fail explicitly, including on empty streams. The official parser
+exposes this as an additive `ObservedGremlinStep`; the legacy v0 parser and the
+client-side observed executor do not gain execution support in this increment.
+
+All preceding expansion, corruption checks, and cost charges finish before
+this step. A later `dedup().limit(1).count()` cannot rescue an over-budget
+expansion or hide corrupt adjacency. Each input lookup consumes work;
+each unique identity reserves a conservative 128-byte tree-node allowance
+before insertion, and retained output rows are charged by the ordinary row
+allocator. The set is bounded by the existing row, byte, work and deadline
+budgets, which are cumulative and never refunded. No shard RPC, new session,
+retry, or snapshot acquisition is introduced by deduplication. Snapshot-vector
+and `Unverified` completeness boundaries remain unchanged.

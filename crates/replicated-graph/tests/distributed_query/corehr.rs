@@ -226,6 +226,74 @@ async fn corehr_incoming_matches_ordered_bag_oracle_across_three_processes() -> 
                 vec![QueryRow::Count(0)],
             ),
         ];
+        // Independently reduce model paths by qualified endpoint, keeping the
+        // first path. Parallel/multiple memberships make bag and set counts differ.
+        let unique = |paths: Paths| {
+            let mut seen = std::collections::BTreeSet::new();
+            paths
+                .into_iter()
+                .filter(|path| {
+                    let QualifiedElement::Vertex { partition, id } = path.last().unwrap() else {
+                        panic!()
+                    };
+                    seen.insert((*partition, *id))
+                })
+                .collect::<Paths>()
+        };
+        let colleagues = hop(hop(starts(&[20]), "member_of", false), "member_of", true);
+        let distinct = unique(colleagues.clone());
+        assert!(distinct.len() < colleagues.len());
+        cases.push((
+            20,
+            "g.V(20).out('member_of').in('member_of').dedup().count()",
+            vec![QueryRow::Count(distinct.len() as u64)],
+        ));
+        cases.push((
+            20,
+            "g.V(20).out('member_of').in('member_of').dedup().path()",
+            distinct.clone().into_iter().map(QueryRow::Path).collect(),
+        ));
+        cases.push((
+            20,
+            "g.V(20).out('member_of').in('member_of').dedup().in('reports_to').count()",
+            vec![QueryRow::Count(
+                hop(distinct.clone(), "reports_to", true).len() as u64,
+            )],
+        ));
+        cases.push((
+            201,
+            "g.V(201).in('member_of').dedup().has('active',true).count()",
+            vec![QueryRow::Count(
+                unique(members.clone())
+                    .iter()
+                    .filter(|p| active(end_id(p)))
+                    .count() as u64,
+            )],
+        ));
+        let mut limited = colleagues.clone();
+        limited.truncate(4);
+        cases.push((
+            20,
+            "g.V(20).out('member_of').in('member_of').limit(4).dedup()",
+            vertices(unique(limited)),
+        ));
+        let mut limited = distinct;
+        limited.truncate(4);
+        cases.push((
+            20,
+            "g.V(20).out('member_of').in('member_of').dedup().limit(4)",
+            vertices(limited),
+        ));
+        cases.push((
+            20,
+            "g.V(20,20).dedup().dedup().count()",
+            vec![QueryRow::Count(1)],
+        ));
+        cases.push((
+            200,
+            "g.V(200).in('reports_to').dedup().count()",
+            vec![QueryRow::Count(0)],
+        ));
         let mut first = reports.clone();
         first.truncate(4);
         let selected = first

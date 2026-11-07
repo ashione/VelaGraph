@@ -280,3 +280,8 @@ downloads. Up to three incoming/outgoing hops share the original sessions, deadl
 cumulative budget, including cycles and shard revisits. Online catalog
 acquisition, broader traversal planning, complete adjacency, global snapshot
 isolation, retries/failover and production security remain unfinished.
+The experimental server coordinator additionally supports bounded vertex
+`dedup()` for distinct-person CoreHR counts after incoming/outgoing joins.
+Identity is partition-qualified, order/path follow the first occurrence, and
+upstream corruption/work cannot be bypassed. This does not add global scans,
+scalar deduplication, pagination, native recursive traversal or global snapshots.

@@ -343,3 +343,12 @@ limit/count. It uses this official parser and strict value semantics, but an
 independently documented static-catalog scope and conservative cumulative
 resource budget. It is always Unverified and does not expand v1 completeness or
 cross-partition guarantees.
+### Experimental server-coordinator vertex deduplication
+
+The separately bounded [server-coordinated subset](DISTRIBUTED_QUERY.md) accepts
+standard no-argument `dedup()` on vertex streams. It compares partition-qualified
+identity, retains the first traverser/path in input order, and permits subsequent
+vertex steps or terminal `count()`. Scalar/path/edge deduplication, scopes,
+arguments and `by()` are explicitly unsupported. This additive observed AST step
+does not enlarge the v0 subset table or client-side observed executor. All
+upstream validation and cumulative resource limits still apply before dedup.

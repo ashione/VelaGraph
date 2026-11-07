@@ -2,8 +2,11 @@
 //! No snapshot downloads, retries, global consistency, or completeness claim.
 use super::*;
 use query::{QualifiedElement, QueryCompleteness, QueryFailure, QueryRow, QueryStamp};
-use rocksdb_sql_table::{GremlinQuery, GremlinStart, GremlinStep, Value};
-use std::collections::BTreeMap;
+use rocksdb_sql_table::{
+    GremlinStart, GremlinStep, ObservedGremlinQuery as GremlinQuery, ObservedGremlinStep as Step,
+    Value,
+};
+use std::collections::{BTreeMap, BTreeSet};
 mod sessions;
 pub(super) use sessions::Sessions;
 
@@ -276,16 +279,26 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     }
     let mut scalar = false;
     for (index, step) in query.steps().iter().enumerate() {
-        if scalar && !matches!(step, GremlinStep::Limit(_) | GremlinStep::Count) {
+        if scalar
+            && !matches!(
+                step,
+                Step::Existing(GremlinStep::Limit(_)) | Step::Existing(GremlinStep::Count)
+            )
+        {
             return Err(QueryFailure::Unsupported);
         }
         match step {
             // The official parser bounds the complete traversal to three edge
             // steps. All hops share this execution's sessions, deadline and cost.
-            GremlinStep::Out(_) | GremlinStep::In(_) => {}
-            GremlinStep::Has { .. } | GremlinStep::HasLabel(_) | GremlinStep::Limit(_) => {}
-            GremlinStep::Values(_) => scalar = true,
-            GremlinStep::Path | GremlinStep::Count if index + 1 == query.steps().len() => {}
+            Step::Existing(GremlinStep::Out(_))
+            | Step::Existing(GremlinStep::In(_))
+            | Step::Dedup => {}
+            Step::Existing(GremlinStep::Has { .. })
+            | Step::Existing(GremlinStep::HasLabel(_))
+            | Step::Existing(GremlinStep::Limit(_)) => {}
+            Step::Existing(GremlinStep::Values(_)) => scalar = true,
+            Step::Existing(GremlinStep::Path) | Step::Existing(GremlinStep::Count)
+                if index + 1 == query.steps().len() => {}
             _ => return Err(QueryFailure::Unsupported),
         }
     }
@@ -303,6 +316,28 @@ fn push(rows: &mut Vec<Traverser>, row: Traverser, cost: &mut Cost) -> Result<()
     cost.charge(256 + row.path.len() * 32, 1, CEILING)?;
     rows.push(row);
     Ok(())
+}
+fn dedup_vertices(
+    rows: Vec<Traverser>,
+    cost: &mut Cost,
+    end: Instant,
+) -> Result<Vec<Traverser>, QueryFailure> {
+    // All upstream rows have already been validated and charged.
+    // Reserve a conservative tree-node cost before each insertion;
+    // charge every input lookup even for duplicates. Never reset cost.
+    let mut seen = BTreeSet::new();
+    let mut next = Vec::new();
+    for row in rows {
+        check(end)?;
+        cost.charge(0, 1, CEILING)?;
+        let identity = (row.vertex.partition, row.vertex.id);
+        if !seen.contains(&identity) {
+            cost.charge(128, 0, CEILING)?;
+            seen.insert(identity);
+            push(&mut next, row, cost)?;
+        }
+    }
+    Ok(next)
 }
 struct Execution<'a> {
     catalog: &'a StaticCatalog,
@@ -424,7 +459,8 @@ impl Execution<'_> {
             return Err(QueryFailure::Unsupported);
         };
         for id in ids {
-            if matches!(query.steps().first(), Some(GremlinStep::Limit(n)) if rows.len() >= *n) {
+            if matches!(query.steps().first(), Some(Step::Existing(GremlinStep::Limit(n))) if rows.len() >= *n)
+            {
                 break;
             }
             let vertex = VertexId {
@@ -446,9 +482,13 @@ impl Execution<'_> {
         for step in query.steps() {
             check(self.end)?;
             match step {
-                GremlinStep::Limit(n) => rows.truncate(*n),
-                GremlinStep::Out(label) | GremlinStep::In(label) => {
-                    let incoming = matches!(step, GremlinStep::In(_));
+                Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
+                Step::Dedup => {
+                    rows = dedup_vertices(rows, &mut self.cost, self.end)?;
+                }
+                Step::Existing(GremlinStep::Out(label))
+                | Step::Existing(GremlinStep::In(label)) => {
+                    let incoming = matches!(step, Step::Existing(GremlinStep::In(_)));
                     let mut next = Vec::new();
                     for row in rows {
                         let edges = if incoming {
@@ -503,16 +543,17 @@ impl Execution<'_> {
                     }
                     rows = next;
                 }
-                GremlinStep::Has { .. } | GremlinStep::HasLabel(_) => {
+                Step::Existing(GremlinStep::Has { .. })
+                | Step::Existing(GremlinStep::HasLabel(_)) => {
                     let mut next = Vec::new();
                     for row in rows {
                         let fragment = match step {
-                            GremlinStep::Has { key, value } => Fragment::Has {
+                            Step::Existing(GremlinStep::Has { key, value }) => Fragment::Has {
                                 vertex: row.vertex,
                                 key: key.clone(),
                                 value: value.clone(),
                             },
-                            GremlinStep::HasLabel(labels) => Fragment::HasLabel {
+                            Step::Existing(GremlinStep::HasLabel(labels)) => Fragment::HasLabel {
                                 vertex: row.vertex,
                                 labels: labels.clone(),
                             },
@@ -524,7 +565,7 @@ impl Execution<'_> {
                     }
                     rows = next;
                 }
-                GremlinStep::Values(key) => {
+                Step::Existing(GremlinStep::Values(key)) => {
                     let mut next = Vec::new();
                     for mut row in rows {
                         let FragmentValue::Value(value) = self
@@ -544,17 +585,23 @@ impl Execution<'_> {
                     }
                     rows = next;
                 }
-                GremlinStep::Path | GremlinStep::Count => {}
+                Step::Existing(GremlinStep::Path) | Step::Existing(GremlinStep::Count) => {}
                 _ => return Err(QueryFailure::Unsupported),
             }
         }
-        let count = matches!(query.steps().last(), Some(GremlinStep::Count));
-        let path = matches!(query.steps().last(), Some(GremlinStep::Path));
+        let count = matches!(
+            query.steps().last(),
+            Some(Step::Existing(GremlinStep::Count))
+        );
+        let path = matches!(
+            query.steps().last(),
+            Some(Step::Existing(GremlinStep::Path))
+        );
         if !count
             && !query
                 .steps()
                 .iter()
-                .any(|s| matches!(s, GremlinStep::Limit(_)))
+                .any(|s| matches!(s, Step::Existing(GremlinStep::Limit(_))))
         {
             rows.truncate(100);
         }
@@ -840,18 +887,24 @@ fn validate_output(
         return Err(RemoteError::Protocol);
     }
     let query = plan(request).map_err(|_| RemoteError::Protocol)?;
-    let count = matches!(query.steps().last(), Some(GremlinStep::Count));
-    let path = matches!(query.steps().last(), Some(GremlinStep::Path));
+    let count = matches!(
+        query.steps().last(),
+        Some(Step::Existing(GremlinStep::Count))
+    );
+    let path = matches!(
+        query.steps().last(),
+        Some(Step::Existing(GremlinStep::Path))
+    );
     let scalar = query
         .steps()
         .iter()
-        .any(|s| matches!(s, GremlinStep::Values(_)));
+        .any(|s| matches!(s, Step::Existing(GremlinStep::Values(_))));
     let directions: Vec<_> = query
         .steps()
         .iter()
         .filter_map(|s| match s {
-            GremlinStep::Out(_) => Some(false),
-            GremlinStep::In(_) => Some(true),
+            Step::Existing(GremlinStep::Out(_)) => Some(false),
+            Step::Existing(GremlinStep::In(_)) => Some(true),
             _ => None,
         })
         .collect();
@@ -947,6 +1000,12 @@ mod tests {
             "g.V(999).both()",
             "g.V(999).values('a').has('a')",
             "g.V(999).id()",
+            "g.V(999).values('a').dedup()",
+            "g.V(999).path().dedup()",
+            "g.V(999).dedup('label')",
+            "g.V(999).dedup().by('name')",
+            "g.V(999).dedup(local)",
+            "g.V(999).outE().dedup()",
         ] {
             assert!(plan(&request(text)).is_err(), "{text}");
         }
@@ -955,6 +1014,8 @@ mod tests {
             "g.V(1).out().out().out().path()",
             "g.V(1).in().out().in().path()",
             "g.V(999).limit(1).count()",
+            "g.V(1,1).dedup().in().dedup().path()",
+            "g.V(1).out().in().dedup().count()",
             "g.V(1).has('a',true).out().limit(1).values('a').count()",
         ] {
             assert!(plan(&request(text)).is_ok(), "{text}");
@@ -1016,6 +1077,58 @@ mod tests {
         }
         output.rows = vec![QueryRow::Path(path)];
         assert!(validate_output(&output, &request("g.V(1).out().out().path()")).is_err());
+    }
+
+    #[test]
+    fn dedup_uses_qualified_identity_first_path_and_cumulative_budget() {
+        let row = |partition, id, via| Traverser {
+            vertex: VertexId { partition, id },
+            path: vec![QualifiedElement::Vertex {
+                partition: via,
+                id: 99,
+            }],
+            value: None,
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut cost = Cost::default();
+        let result = dedup_vertices(
+            vec![row(2, 1, 3), row(1, 1, 4), row(2, 1, 5)],
+            &mut cost,
+            end,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].vertex,
+            VertexId {
+                partition: 2,
+                id: 1
+            }
+        );
+        assert_eq!(
+            result[1].vertex,
+            VertexId {
+                partition: 1,
+                id: 1
+            }
+        );
+        assert_eq!(result[0].path, row(2, 1, 3).path);
+        for (bytes, work) in [(MAX_BYTES - 127, 0), (0, MAX_WORK)] {
+            let mut cost = Cost::default();
+            cost.charge(bytes, work, CEILING).unwrap();
+            assert!(matches!(
+                dedup_vertices(vec![row(1, 1, 1)], &mut cost, end),
+                Err(QueryFailure::ResourceExhausted)
+            ));
+        }
+        assert!(matches!(
+            dedup_vertices(
+                vec![row(1, 1, 1)],
+                &mut Cost::default(),
+                Instant::now() - Duration::from_millis(1)
+            ),
+            Err(QueryFailure::Timeout)
+        ));
     }
 
     #[test]
