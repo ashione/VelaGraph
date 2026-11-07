@@ -355,3 +355,5 @@ adds batch-person, batch-department, active-members and distinct-colleague map
 oracles on both smoke and 200,000-person fixtures.
 
 - Fixed-cohort read foundation: explicit immutable coordinator membership and empty-baseline participant certification, with bounded same-version materialized sessions. See [contract and remaining boundaries](CERTIFIED_COHORT_READS.md). Remote graph GlobalCommittedSnapshot remains Unsupported.
+
+- Managed graph/v2 create/read slice: complete source/reverse transaction plans and certified snapshot reads for deterministic one-partition-per-shard cohorts. Updates/deletes, durable plan storage, general routing manifests and remote Global admission remain pending. See [contract](MANAGED_GRAPH_TRANSACTIONS.md).
