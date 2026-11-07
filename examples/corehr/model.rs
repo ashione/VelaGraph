@@ -1,5 +1,7 @@
 //! Deterministic synthetic CoreHR ground truth. No database reads in this oracle.
 use serde_json::{json, Value};
+#[path = "batch_relationships.rs"]
+mod batch_relationships;
 pub struct Edge {
     pub from: u64,
     pub to: u64,
@@ -627,6 +629,7 @@ impl Model {
                 case["server_supported"] = json!(true);
             }
         }
+        q.extend(batch_relationships::queries(self));
         q
     }
 }
@@ -653,7 +656,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 78);
+    assert_eq!(q.len(), 85);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     assert!(
         get("unique_colleague_count")["expected"]["count"]
