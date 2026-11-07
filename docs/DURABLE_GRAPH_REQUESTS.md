@@ -83,3 +83,10 @@ write recovery are still bounded functional implementations, not a performance
 claim. No credentials, signing keys or authentication protocol is added.
 The trusted coordinator/application boundary remains explicit, and all remote graph
 GlobalCommittedSnapshot admission is still Unsupported.
+
+The additive [A2.1 durable index](DURABLE_REQUEST_INDEX.md) provides leader-barrier
+point recovery and original-Plan admission readback without transferring the full
+Journal. Disk metadata v8 atomically retains a derived exact request index beside
+the unchanged authoritative archive; internal managed RPC is v3. Legacy v5
+migrates on successful apply, logical snapshots rebuild the index atomically,
+and damaged indexed state fails closed. All limits above remain unchanged.

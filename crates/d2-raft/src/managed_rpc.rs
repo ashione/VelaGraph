@@ -4,6 +4,7 @@
 //! outcomes and never authorize abort, identity replacement, or fallback reads.
 use crate::cohort_reads::VisibilityInfo;
 use crate::participant_writes::{Authority, Status};
+use crate::request_index::RequestLookup;
 use crate::terminal_prefix::TerminalPrefix;
 use crate::transaction_decisions::{Cohort, Command, Journal, Participant};
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
@@ -22,7 +23,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const CONCURRENCY: usize = 4;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -108,6 +109,11 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    LookupRequest {
+        authority: Authority,
+        epoch: u64,
+        id: [u8; 16],
+    },
     Summary {
         authority: Authority,
         epoch: u64,
@@ -154,6 +160,7 @@ enum Operation {
 impl Operation {
     fn tag(&self) -> u8 {
         match self {
+            Self::LookupRequest { .. } => 10,
             Self::Journal { .. } => 1,
             Self::Command { .. } => 2,
             Self::Visibility { .. } => 3,
@@ -178,6 +185,7 @@ struct Reply {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Value {
+    Request(RequestLookup),
     Journal(Journal),
     Unit,
     Visibility(VisibilityInfo),
@@ -364,6 +372,9 @@ impl Client {
         };
         let valid = match operation {
             Operation::Journal { authority, epoch }
+            | Operation::LookupRequest {
+                authority, epoch, ..
+            }
             | Operation::Summary { authority, epoch }
             | Operation::Terminal {
                 authority, epoch, ..
@@ -485,6 +496,34 @@ impl NodeRef<'_> {
             return Err(Error::Unavailable);
         }
         result
+    }
+    /// Leader-barrier point recovery of an original durable admission and current transaction.
+    pub async fn request(
+        self,
+        authority: &Authority,
+        epoch: u64,
+        id: [u8; 16],
+    ) -> Result<RequestLookup, Error> {
+        if id == [0; 16] {
+            return Err(Error::Identity);
+        }
+        match self
+            .call(|| Operation::LookupRequest {
+                authority: authority.clone(),
+                epoch,
+                id,
+            })
+            .await?
+        {
+            Value::Request(value) => {
+                check_request(&value, authority, epoch, id)?;
+                if matches!(self, Self::Remote(c) if c.identity.cohort != value.cohort) {
+                    return Err(Error::Identity);
+                }
+                Ok(value)
+            }
+            _ => Err(Error::Protocol),
+        }
     }
     pub async fn journal(self, authority: &Authority, epoch: u64) -> Result<Journal, Error> {
         match self
@@ -794,6 +833,18 @@ fn check_summary(
     }
     Ok(())
 }
+fn check_request(
+    value: &RequestLookup,
+    authority: &Authority,
+    epoch: u64,
+    id: [u8; 16],
+) -> Result<(), Error> {
+    if value.authority != *authority || value.cohort.coordinator_epoch != epoch || value.id != id {
+        return Err(Error::Identity);
+    }
+    value.validate().map_err(|_| Error::Protocol)
+}
+
 fn evidence<'a>(authority: &Authority, journal: &'a Journal) -> Result<&'a Cohort, Error> {
     let cohort = journal.cohort().ok_or(Error::Identity)?;
     if journal.authority() != authority.mode || cohort.coordinator_shard != authority.shard {
@@ -952,6 +1003,27 @@ async fn execute(
                 return Err(Error::Identity);
             }
             Ok(Value::Evidence(proof))
+        }
+        Operation::LookupRequest {
+            authority,
+            epoch,
+            id,
+        } => {
+            let value = node
+                .state_machine
+                .coordinator_request(authority.shard, epoch, authority.mode, id)
+                .await
+                .map_err(Error::Application)?;
+            check_request(&value, &authority, epoch, id)?;
+            if pinned.is_some_and(|p| {
+                p.role != Role::Coordinator
+                    || p.authority != authority
+                    || p.target.epoch != epoch
+                    || p.cohort != value.cohort
+            }) {
+                return Err(Error::Identity);
+            }
+            Ok(Value::Request(value))
         }
         Operation::Journal { authority, epoch } => Ok(Value::Journal(
             checked_journal(node, pinned, &authority, epoch).await?,
@@ -1299,7 +1371,7 @@ mod tests {
     }
     #[tokio::test]
     async fn forged_replies_and_slow_input_fail_closed() {
-        for wrong in 0..4 {
+        for wrong in 0..5 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Client::new(
                 listener.local_addr().unwrap(),
@@ -1321,7 +1393,8 @@ mod tests {
                     0 => reply.identity.group += 1,
                     1 => reply.nonce += 1,
                     2 => reply.operation += 1,
-                    _ => reply.version += 1,
+                    3 => reply.version += 1,
+                    _ => reply.version = 2,
                 }
                 send(&mut stream, &encode(reply).await.unwrap())
                     .await
@@ -1517,6 +1590,214 @@ mod tests {
                 .unwrap();
         });
         (client, peer)
+    }
+    fn request_lookup() -> RequestLookup {
+        let journal =
+            Journal::decode(include_bytes!("../tests/fixtures/request-journal-v3.json")).unwrap();
+        RequestLookup {
+            authority: identity().authority,
+            cohort: identity().cohort,
+            resolved_prefix: journal.resolved_prefix(),
+            id: [1; 16],
+            record: Some(crate::request_index::RecoveredRequest {
+                record: journal.request([1; 16]).unwrap().clone(),
+                transaction: journal.transaction([2; 16]).unwrap().clone(),
+            }),
+        }
+    }
+    async fn fake_request_json(value: serde_json::Value) -> (Client, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(
+            listener.local_addr().unwrap(),
+            identity(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Request = receive(&mut stream).await.unwrap();
+            assert!(matches!(
+                request.operation,
+                Operation::LookupRequest { id: [1, ..], .. }
+            ));
+            let reply = serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "operation": request.operation.tag(),
+                "identity": request.identity,
+                "nonce": request.nonce,
+                "result": {"Ok": {"Request": value}},
+            });
+            send(&mut stream, &encode(reply).await.unwrap())
+                .await
+                .unwrap();
+        });
+        (client, peer)
+    }
+    #[tokio::test]
+    async fn point_request_rejects_invalid_outbound_identity_without_connecting() {
+        let mut participant = identity();
+        participant.role = Role::Participant;
+        participant.target = Target {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+        };
+        for (pinned, authority, epoch, id) in [
+            (identity(), identity().authority, 1, [0; 16]),
+            (identity(), identity().authority, 2, [1; 16]),
+            (
+                identity(),
+                Authority {
+                    shard: 9,
+                    mode: [8; 16],
+                },
+                1,
+                [1; 16],
+            ),
+            (participant, identity().authority, 1, [1; 16]),
+        ] {
+            let client = Client::new(
+                "127.0.0.1:1".parse().unwrap(),
+                pinned,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .request(&authority, epoch, id)
+                    .await,
+                Err(Error::Identity)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn point_request_returns_exact_record_or_absence_without_journal() {
+        for present in [true, false] {
+            let mut lookup = request_lookup();
+            if !present {
+                lookup.record = None;
+            }
+            let (client, peer) = fake_request_json(serde_json::to_value(&lookup).unwrap()).await;
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .request(&identity().authority, 1, [1; 16])
+                    .await
+                    .unwrap(),
+                lookup
+            );
+            peer.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn point_request_rejects_substituted_and_malformed_evidence() {
+        for fault in 0..25 {
+            let mut value = serde_json::to_value(request_lookup()).unwrap();
+            match fault {
+                0 => value["id"] = serde_json::json!(vec![2; 16]),
+                1 => value["authority"]["shard"] = 8.into(),
+                2 => value["cohort"]["coordinator_epoch"] = 2.into(),
+                3 => value["cohort"]["members"][0]["epoch"] = 2.into(),
+                4 => value["record"]["record"]["id"] = serde_json::json!(vec![2; 16]),
+                5 => value["record"]["record"]["transaction_id"] = serde_json::json!(vec![3; 16]),
+                6 => value["record"]["transaction"]["id"] = serde_json::json!(vec![3; 16]),
+                7 => {
+                    value["record"]["transaction"]["participants"][0]["intent"] =
+                        serde_json::json!(vec![5; 32])
+                }
+                8 => value["record"]["transaction"]["prepared"] = serde_json::json!([]),
+                9 => value["record"]["record"]["payload"] = serde_json::json!([0]),
+                10..=12 => {
+                    let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
+                        "../tests/fixtures/request-plan-v1.json"
+                    ))
+                    .unwrap();
+                    match fault {
+                        10 => plan["version"] = 2.into(),
+                        11 => plan["id"] = serde_json::json!(vec![3; 16]),
+                        _ => plan["extra"] = true.into(),
+                    }
+                    value["record"]["record"]["payload"] =
+                        serde_json::json!(serde_json::to_vec(&plan).unwrap());
+                }
+                13 => value["extra"] = true.into(),
+                14 => value["record"]["extra"] = true.into(),
+                15 => value["record"]["record"]["extra"] = true.into(),
+                16 => value["record"]["transaction"]["extra"] = true.into(),
+                17 => {
+                    value["record"]["record"]["request"] = serde_json::json!(vec![
+                        1;
+                        crate::transaction_decisions::MAX_REQUEST_BYTES
+                            + 1
+                    ])
+                }
+                18 => {
+                    value["record"]["record"]["payload"] = serde_json::json!(vec![
+                        1;
+                        crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES
+                            + 1
+                    ])
+                }
+                19 => value["record"]["transaction"]["ordinal"] = 0.into(),
+                20 => {
+                    value["resolved_prefix"] =
+                        (crate::transaction_decisions::MAX_TRANSACTIONS as u64 + 1).into()
+                }
+                21 => {
+                    value["record"] = serde_json::Value::Null;
+                    value["cohort"]["members"][0]["epoch"] = 2.into();
+                }
+                22 => value["authority"]["mode"] = serde_json::json!(vec![8; 16]),
+                23 => {
+                    let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
+                        "../tests/fixtures/request-plan-v1.json"
+                    ))
+                    .unwrap();
+                    plan["validation_version"] = 1.into();
+                    value["record"]["record"]["payload"] =
+                        serde_json::json!(serde_json::to_vec(&plan).unwrap());
+                }
+                _ => {
+                    // A terminal transaction may be behind the current watermark,
+                    // but its original admission cut must precede its own ordinal.
+                    let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
+                        "../tests/fixtures/request-plan-v1.json"
+                    ))
+                    .unwrap();
+                    plan["validation_version"] = 128.into();
+                    value["resolved_prefix"] = 128.into();
+                    value["record"]["transaction"]["ordinal"] = 1.into();
+                    value["record"]["transaction"]["decision"] = serde_json::json!("Abort");
+                    value["record"]["record"]["payload"] =
+                        serde_json::json!(serde_json::to_vec(&plan).unwrap());
+                }
+            }
+            let (client, peer) = fake_request_json(value).await;
+            assert!(
+                matches!(
+                    NodeRef::Remote(&client)
+                        .request(&identity().authority, 1, [1; 16])
+                        .await,
+                    Err(Error::Identity | Error::Protocol)
+                ),
+                "fault {fault}"
+            );
+            peer.await.unwrap();
+        }
+    }
+    #[test]
+    fn point_request_nested_duplicate_fields_are_rejected() {
+        let found = request_lookup().record.unwrap();
+        let record = serde_json::to_string(&found.record).unwrap();
+        let duplicate = record.replacen("\"request\":", "\"request\":[],\"request\":", 1);
+        assert!(
+            serde_json::from_str::<crate::transaction_decisions::RequestRecord>(&duplicate)
+                .is_err()
+        );
+        let tx = serde_json::to_string(&found.transaction).unwrap();
+        let duplicate = tx.replacen("\"ordinal\":", "\"ordinal\":1,\"ordinal\":", 1);
+        assert!(
+            serde_json::from_str::<crate::transaction_decisions::Transaction>(&duplicate).is_err()
+        );
     }
     fn terminal_journal(tx: u8) -> Journal {
         let mut journal = Journal::new(identity().authority.mode).unwrap();
@@ -1903,7 +2184,7 @@ mod tests {
         send(
             &mut legacy,
             &encode_sync(&Request {
-                version: 1,
+                version: 2,
                 identity: identity(),
                 nonce: 1,
                 operation: Operation::Journal {

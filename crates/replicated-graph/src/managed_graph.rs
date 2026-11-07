@@ -1,6 +1,7 @@
 //! Opt-in trusted local/remote graph/v2 transactions over an empty fixed cohort.
 //! No remote Global Gremlin admission. Plans are immutable in-memory retry values.
 use d2_raft::participant_writes::Authority;
+use d2_raft::request_index::RequestLookup;
 use d2_raft::transaction_decisions::{Cohort, Command, Decision, Journal, Participant};
 use d2_raft::{
     cohort_reads,
@@ -434,29 +435,29 @@ impl<'a> GraphCohort<'a> {
     /// canonical application command bytes; never replace a mismatched request.
     pub async fn recover_request(&self, id: [u8; 16], request: &[u8]) -> Result<Option<Plan>> {
         tokio::time::timeout(Duration::from_secs(30), async {
-            let journal = self.journal().await?;
-            self.recover_from(&journal, id, request)
+            let lookup = self
+                .coordinator
+                .request(&self.authority, self.epoch, id)
+                .await?;
+            self.recover_from(&lookup, request)
         })
         .await
         .map_err(|_| Error::Uncertain)?
     }
-    fn recover_from(
-        &self,
-        journal: &Journal,
-        id: [u8; 16],
-        request: &[u8],
-    ) -> Result<Option<Plan>> {
-        let Some(record) = journal.request(id) else {
+    fn recover_from(&self, lookup: &RequestLookup, request: &[u8]) -> Result<Option<Plan>> {
+        self.check_cohort(&lookup.cohort)?;
+        let Some(recovered) = &lookup.record else {
             return Ok(None);
         };
+        let record = &recovered.record;
         if record.request != request {
             return Err(Error::Identity);
         }
         let plan = Plan::from_durable(&record.payload)?;
-        self.check_plan(&plan, journal)?;
-        let tx = journal
-            .transaction(record.transaction_id)
-            .ok_or(Error::Identity)?;
+        if plan.authority != self.authority || plan.cohort != lookup.cohort {
+            return Err(Error::Identity);
+        }
+        let tx = &recovered.transaction;
         if record.transaction_id != plan.id
             || tx.participants
                 != plan
@@ -478,12 +479,24 @@ impl<'a> GraphCohort<'a> {
         candidate: &Plan,
     ) -> Result<Plan> {
         tokio::time::timeout(Duration::from_secs(30), async {
-            let journal = self.journal().await?;
-            self.check_plan(candidate, &journal)?;
-            if let Some(existing) = self.recover_from(&journal, id, &request)? {
+            let summary = self
+                .coordinator
+                .summary(&self.authority, self.epoch)
+                .await?;
+            self.check_cohort(&summary.cohort)?;
+            if candidate.authority != self.authority || candidate.cohort != summary.cohort {
+                return Err(Error::Identity);
+            }
+            let lookup = self
+                .coordinator
+                .request(&self.authority, self.epoch, id)
+                .await?;
+            if let Some(existing) = self.recover_from(&lookup, &request)? {
                 return Ok(existing);
             }
             let payload = candidate.durable_bytes()?;
+            // The command path still validates the full journal on the server.
+            // Point recovery does not change bounded execution or admission caps.
             let result = self
                 .command(Command::AdmitRequest {
                     id,
@@ -497,8 +510,11 @@ impl<'a> GraphCohort<'a> {
                         .collect(),
                 })
                 .await;
-            let journal = self.journal().await?;
-            if let Some(existing) = self.recover_from(&journal, id, &request)? {
+            let lookup = self
+                .coordinator
+                .request(&self.authority, self.epoch, id)
+                .await?;
+            if let Some(existing) = self.recover_from(&lookup, &request)? {
                 return Ok(existing);
             }
             result?;
@@ -520,14 +536,16 @@ impl<'a> GraphCohort<'a> {
             .map_err(Error::from)
     }
     fn check_plan(&self, plan: &Plan, journal: &Journal) -> Result<()> {
-        if self.authority != plan.authority
-            || journal.cohort() != Some(&plan.cohort)
-            || plan.cohort.coordinator_epoch != self.epoch
-            || self.members.len() != plan.cohort.members.len()
-        {
+        if self.authority != plan.authority || journal.cohort() != Some(&plan.cohort) {
             return Err(Error::Identity);
         }
-        for ((_, target), member) in self.members.iter().zip(&plan.cohort.members) {
+        self.check_cohort(&plan.cohort)
+    }
+    fn check_cohort(&self, cohort: &Cohort) -> Result<()> {
+        if cohort.coordinator_epoch != self.epoch || self.members.len() != cohort.members.len() {
+            return Err(Error::Identity);
+        }
+        for ((_, target), member) in self.members.iter().zip(&cohort.members) {
             if (target.shard, target.epoch, target.mode)
                 != (member.shard, member.epoch, member.mode)
             {

@@ -688,4 +688,10 @@ Managed fixed-cohort reads now use [exact segmented terminal-prefix evidence](do
 at the chosen V rather than transferring the original request/Plan archive. This
 keeps old-V evidence independent of later archive growth without changing durable
 retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
-boundary. Internal managed peers require protocol v2; evidence remains O(V).
+boundary. Internal managed peers now require protocol v3; evidence remains O(V).
+
+[A2.1 durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) now returns
+one exact original external-ID/Plan binding without transferring the full Journal.
+The derived index shares the admission/applied-marker sync batch and is rebuilt
+atomically on snapshot install. All 256-request, 1,024-transaction and 16 MiB
+Journal limits remain; this does not provide unlimited write lifetime or GC.
