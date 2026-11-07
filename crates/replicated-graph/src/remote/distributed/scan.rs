@@ -57,6 +57,7 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
             Step::Existing(GremlinStep::Has { .. })
                 | Step::Existing(GremlinStep::HasLabel(_))
                 | Step::Existing(GremlinStep::Limit(_))
+                | Step::Dedup
         ) {
             return Err(QueryFailure::Unsupported);
         }
@@ -82,6 +83,9 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
 fn filter_steps(steps: &[Step]) -> Result<Vec<ScanStep>, QueryFailure> {
     steps
         .iter()
+        // Global scan roots are unique qualified vertices. Prefix identity
+        // dedup is exact; never apply this elimination after expansion.
+        .filter(|step| !matches!(step, Step::Dedup))
         .map(|step| match step {
             Step::Existing(GremlinStep::Has { key, value }) => Ok(ScanStep::Has {
                 key: key.clone(),
@@ -314,15 +318,14 @@ mod tests {
             })
             .is_ok());
         }
+        let q = GremlinQuery::parse("g.V().dedup().limit(129).dedup().out().count()").unwrap();
+        let prefix = filter_steps(&q.steps()[..join_at(&q).unwrap().unwrap()]).unwrap();
+        assert!(matches!(prefix.as_slice(), [ScanStep::Limit(129)]));
         let q = GremlinQuery::parse("g.V().out()").unwrap();
         assert!(filter_steps(&q.steps()[..join_at(&q).unwrap().unwrap()])
             .unwrap()
             .is_empty());
-        for text in [
-            "g.V().dedup().out()",
-            "g.V().out().values('x')",
-            "g.V().out().path()",
-        ] {
+        for text in ["g.V().out().values('x')", "g.V().out().path()"] {
             let q = GremlinQuery::parse(text).unwrap();
             assert!(join_at(&q).is_err(), "{text}");
         }

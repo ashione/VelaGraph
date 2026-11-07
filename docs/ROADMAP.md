@@ -407,3 +407,9 @@ Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
 同号 ID；投影复用扫描的固定分片会话，不重新打开快照。默认100、显式limit
 位置、扫描/投影预算及整项失败不变。独立小图 oracle 与 CoreHR 场景覆盖该
 组合；仍为 Unverified，不代表全局事务或任意 Gremlin 组合完成。
+
+### Global scan prefix identity dedup
+
+通用全局筛选现在允许首个 out/in/repeat 前的顶点 dedup，与扫描已有唯一
+(partition,id) 身份等价；后续边遍历和 repeat 的 bag 重数不受影响。独立小图
+与 CoreHR 验证前缀/后缀去重、limit 原位置和汇合计数，不扩大预算或一致性声明。

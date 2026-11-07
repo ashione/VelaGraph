@@ -271,6 +271,37 @@ fn export(model: &Model, missing: Option<bool>) -> anyhow::Result<Vec<Export>> {
 fn cases() -> Vec<Vec<Op>> {
     use Op::*;
     let mut cases = vec![
+        vec![Dedup, Hop(false, Some("many")), Count],
+        vec![Dedup, Hop(false, Some("many")), Dedup, Count],
+        vec![Label("node"), Dedup, Limit(7), Hop(true, Some("a")), Map],
+        vec![
+            Limit(7),
+            Dedup,
+            Has("active", Some(Value::Boolean(true))),
+            Hop(false, None),
+            Count,
+        ],
+        vec![
+            Has("active", Some(Value::Boolean(true))),
+            Dedup,
+            Limit(7),
+            Hop(false, None),
+            Count,
+        ],
+        vec![Dedup, Limit(129), Dedup, Hop(false, None), Count],
+        vec![
+            Label("node"),
+            Dedup,
+            Repeat(false, Some("a"), 3, true),
+            Count,
+        ],
+        vec![
+            Label("node"),
+            Dedup,
+            Repeat(false, Some("a"), 3, true),
+            Dedup,
+            Count,
+        ],
         vec![Map],
         vec![Dedup, Map],
         vec![Dedup, Limit(129), Map],
@@ -432,6 +463,23 @@ async fn global_join_matches_independent_seeded_ordered_oracle() -> anyhow::Resu
     for seed in [1, 42] {
         let model = model(seed);
         ensure!(oracle(&model, &[Op::Hop(false, Some("many"))]).len() == 101);
+        ensure!(
+            oracle(
+                &model,
+                &[Op::Dedup, Op::Hop(false, Some("many")), Op::Count]
+            ) == vec![QueryRow::Count(101)]
+        );
+        ensure!(
+            oracle(
+                &model,
+                &[
+                    Op::Dedup,
+                    Op::Hop(false, Some("many")),
+                    Op::Dedup,
+                    Op::Count
+                ]
+            ) == vec![QueryRow::Count(1)]
+        );
         let copy = model.clone();
         let exports = run_blocking(move || export(&copy, None)).await??;
         let mut groups = Vec::new();

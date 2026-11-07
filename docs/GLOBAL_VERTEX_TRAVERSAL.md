@@ -8,7 +8,7 @@ adjacency or repeat step. There is no schema-, label-, population- or answer-spe
 ## Supported pipeline
 
 - Start: `g.V()` over the immutable startup catalog.
-- Scan prefix: any supported `has`, `hasLabel` and `limit`, in their original order.
+- Scan prefix: any supported `has`, `hasLabel`, vertex `dedup` and `limit`, in their original order.
 - Traversal suffix: `out`/`in` (up to three total), `has`, `hasLabel`, `limit`,
   vertex-identity `dedup`, and optionally terminal `count` or selected `valueMap`.
 - One native `repeat(single out/in).times(1..32)` with optional post-emit is
@@ -96,3 +96,10 @@ server matrix must pass strict independent validators for this extension. On the
 legacy client is explicitly rejected at its existing snapshot capacity before
 running queries; this is not a successful full-scale legacy-client run. Full
 CoreHR CI on the final commit is required alongside normal tests and review.
+
+Global scan prefixes may include vertex `dedup()` before the first out/in/repeat.
+The scan already emits unique (partition,id) identities, so prefix dedup preserves
+its ordered roots exactly and limits keep their positions. This does not dedup
+subsequent traversers: parallel edges, convergence and repeat emission preserve
+bag multiplicity unless a separate downstream dedup is explicitly present.
+No extra scan, budget, refresh or default truncation is introduced.

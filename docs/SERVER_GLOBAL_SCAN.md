@@ -15,7 +15,7 @@ Examples:
 - `g.V().limit(80).hasLabel('person').count()`
 
 A bounded [scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md) additionally
-allows a filter/limit prefix followed by out/in, filters, dedup, limit and terminal
+allows a filter/limit/vertex-dedup prefix followed by out/in, filters, dedup, limit and terminal
 count or selected valueMap. Global E scans, path, ordering/modulators, recursive
 traversal and user-visible pagination remain Unsupported. A no-hop global scan additionally accepts vertex `dedup()` between its
 filters/limits and terminal selected-key `valueMap('key',...)`. Scan identities
@@ -24,7 +24,7 @@ merge equal local IDs from distinct partitions. Projection returns singleton-lis
 property maps with missing keys omitted, in unchanged scan order; it reads only
 the selected vertices from the same retained sessions. Projection after an edge
 hop continues to use the existing traversal path. Empty/all-key valueMap, map
-post-processing, scalar dedup and dedup before a subsequent hop remain Unsupported.
+post-processing, scalar dedup remain Unsupported.
 No-hop projection retains the existing default final limit of 100 when no limit
 is explicit, the 1,000-row cap, the scan budget, and a separate existing 64 MiB
 traversal/projection budget for projection fragments and retained maps. Final
@@ -116,3 +116,10 @@ filter/limit placement, empty filters and ordinary explicit-ID regressions.
 Unit tests cover bounded continuation, first-row byte failure, exhausted work,
 corruption before filtering, plan exclusions and qualified output validation.
 Large-scale results are reported separately for their exact tested candidate.
+
+Global scan prefixes may include vertex `dedup()` before the first out/in/repeat.
+The scan already emits unique (partition,id) identities, so prefix dedup preserves
+its ordered roots exactly and limits keep their positions. This does not dedup
+subsequent traversers: parallel edges, convergence and repeat emission preserve
+bag multiplicity unless a separate downstream dedup is explicitly present.
+No extra scan, budget, refresh or default truncation is introduced.
