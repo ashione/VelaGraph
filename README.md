@@ -21,6 +21,11 @@ automatic failover, online migration, and production transport security remain
 unfinished. The goal is a distributed graph database; this is not yet a
 production-ready one.
 
+The additive [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md)
+lets applications require a global committed snapshot without silently falling
+back: that requirement currently fails with Unsupported, including for jobs.
+It does not yet implement global MVCC or cross-shard transactions.
+
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.
 

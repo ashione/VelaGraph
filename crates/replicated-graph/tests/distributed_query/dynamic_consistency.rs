@@ -100,12 +100,40 @@ async fn scenario() -> anyhow::Result<()> {
     // A is frozen before B's OpenQuery reaches its node. Sequential acknowledged
     // writes have real states (0,0), (1,0), (1,1), never (0,1).
     bp.gate.pause_open.store(true, Ordering::SeqCst);
-    let mixed = tokio::spawn(rows(endpoint, BOTH));
+    let mixed = tokio::spawn(async move {
+        distributed::consistency::query_with_consistency(
+            endpoint,
+            DistributedRequest {
+                start_partition: 0,
+                text: BOTH.into(),
+                timeout_millis: 5000,
+            },
+            distributed::consistency::ReadConsistency::IndependentShardSnapshots,
+            BUDGET,
+        )
+        .await
+    });
     timeout(Duration::from_secs(3), bp.gate.entered.notified()).await?;
+    // While a weaker query has frozen only A, strict admission must reject
+    // rather than join that incomplete cut or wait for all writes to stop.
+    assert!(matches!(
+        distributed::consistency::query_with_consistency(
+            endpoint,
+            DistributedRequest {
+                start_partition: 0,
+                text: BOTH.into(),
+                timeout_millis: 5000
+            },
+            distributed::consistency::ReadConsistency::GlobalCommittedSnapshot,
+            BUDGET,
+        )
+        .await?,
+        Err(QueryFailure::Unsupported)
+    ));
     update(&a, 1).await?;
     update(&b, 1).await?;
     bp.gate.resume.notify_one();
-    let observed = mixed.await??;
+    let observed = mixed.await???.rows;
     assert_eq!(observed, vec![projected(0, 0), projected(1, 1)]);
     for (av, bv) in [(0, 0), (1, 0), (1, 1)] {
         assert_ne!(observed, vec![projected(0, av), projected(1, bv)]);

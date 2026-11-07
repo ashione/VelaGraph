@@ -8,6 +8,7 @@ use rocksdb_sql_table::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 pub(in crate::remote) mod channel;
+pub mod consistency;
 mod hierarchy;
 pub mod jobs;
 mod projection;
@@ -975,6 +976,7 @@ impl CoordinatorService {
                         enum IncomingRequest {
                             Query(DistributedRequest),
                             Job(jobs::Envelope),
+                            Consistent(consistency::Envelope),
                         }
                         let request: IncomingRequest = read_frame_limited(
                             &mut socket,
@@ -991,8 +993,20 @@ impl CoordinatorService {
                                 )
                             }
                             IncomingRequest::Job(_) => end,
+                            IncomingRequest::Consistent(envelope) => {
+                                envelope.consistency_request.deadline(end)?
+                            }
                         };
                         let bytes = match request {
+                            IncomingRequest::Consistent(envelope) => {
+                                consistency::handle(
+                                    catalog,
+                                    &jobs,
+                                    envelope.consistency_request,
+                                    end,
+                                )
+                                .await
+                            }
                             IncomingRequest::Query(request) => {
                                 bounded_encode(&execute(&catalog, request, end).await, end)
                             }
