@@ -168,6 +168,8 @@ def validate(records, manifest, jobs=False):
                 require(stage in ('begin', 'progress'), 'progress after terminal or cleanup')
                 require(type(row.get('complete')) is bool and type(row.get('sequence')) is int,
                         'invalid progress types')
+                require(type(row.get('count')) is int if row['complete'] else row.get('count') is None,
+                        'invalid progress count')
                 stage = 'terminal' if row['complete'] else 'progress'
             elif event == 'job_cleanup':
                 require(stage == 'terminal', 'cleanup before terminal progress')

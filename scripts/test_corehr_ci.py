@@ -204,6 +204,10 @@ class EvidenceTests(unittest.TestCase):
             next(r for r in rows if r['event'] == event)[field] = value
             with self.subTest(event=event, field=field), self.assertRaises(ValueError):
                 validate(rows, self.manifest, jobs=True)
+        rows = copy.deepcopy(records)
+        next(r for r in rows if r['event'] == 'job_progress' and r['complete'])['count'] = 199999.0
+        with self.assertRaises(ValueError):
+            validate(rows, self.manifest, jobs=True)
         # Mutate every record of sample zero together so grouping still agrees.
         rows = copy.deepcopy(records)
         for row in rows:
