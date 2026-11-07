@@ -123,7 +123,7 @@ The new API has its own budgets, not a claim that every old query cap is unchang
   not a process-RSS ceiling. Unemitted start identities are also retained and count
   toward the cap in compact mode. No full paths are stored.
 - At most eight sequential micro-pages per request, each advancing at most 16
-  vertices; 128 leaves per batched shard RPC,
+  vertices; at most 128 leaves per batched shard RPC,
   and 16,384 observed edges retained for one step. Sixteen vertices at the
   existing 1,000-neighbor cap fit this entry bound even before label filtering.
   Existing 16 KiB serialized-fragment and
@@ -208,3 +208,24 @@ The same explicit job endpoint additionally supports independently executed
 [ordered vertex result pages](HIERARCHY_RESULT_PAGES.md). Their Preparing progress
 is not a result page; their ordered traversal never expands count weights into
 an invented row order. Existing count operations and budgets are unchanged.
+
+### Encoded-byte batch admission
+
+Every hierarchy batch is also split by its actual compact tagged-JSON fragment
+size, including the partition field, array commas, escaped text and integer
+widths. A packet may contain fewer than 128 leaves even when all graph records
+are legal. The existing 16 KiB fragment limit is not raised. A single leaf that
+cannot fit is an explicit resource error; it is not truncated or split into a
+different operation.
+
+Packing preserves original leaf indices, so shard grouping and multiple packets
+cannot reorder, drop or deduplicate results. All pending packets are admitted
+before sending any of them, and every response still undergoes the existing
+length, identity and corruption validation. A later invalid reverse/canonical
+entry invalidates the whole operation, not only its packet.
+
+The bounded counting pass charges its measured bytes and one unit of work per
+measured envelope/leaf to the existing job or projection-stage budget. Ordinary
+RPC encoding and transport remain charged by the existing execution path. There
+is no new per-packet allowance, retry, lease extension, observation limit, schema
+rule or CoreHR-specific execution path. See [validation](HIERARCHY_BATCH_BYTES.md).
