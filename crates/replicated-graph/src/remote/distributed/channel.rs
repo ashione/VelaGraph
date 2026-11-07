@@ -208,8 +208,7 @@ async fn next_frame(
             .read_exact(&mut bytes)
             .await
             .map_err(|_| RemoteError::Unavailable)?;
-        let frame: Frame =
-            blocking_json(|| serde_json::from_slice(&bytes)).map_err(|_| RemoteError::Protocol)?;
+        let frame: Frame = decode_frame_json(&bytes).map_err(|_| RemoteError::Protocol)?;
         if Instant::now() >= end {
             return Err(RemoteError::Timeout { request_id: None });
         }
