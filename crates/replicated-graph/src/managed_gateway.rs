@@ -1,4 +1,4 @@
-//! Experimental plaintext TCP over trusted, owned in-process Raft handles.
+//! Experimental plaintext TCP over trusted, pinned local or remote Raft nodes.
 //! Standard Gremlin text reads and typed managed writes do not enable the older
 //! remote Global Gremlin API, authenticated access, multi-host Raft placement,
 //! discovery, or a durable read lease.
@@ -6,6 +6,7 @@ use crate::managed_graph::{self, GraphCohort, GraphSnapshot, Outcome, Plan};
 use crate::remote::query::{QueryCompleteness, QueryFailure, QueryRow};
 use d2_raft::{
     cohort_reads,
+    managed_rpc::{Client, NodeRef},
     participant_writes::Authority,
     transaction_decisions::Cohort,
     versioned_reads::{ReadLimit, Target},
@@ -355,26 +356,71 @@ pub struct Config {
     pub binding: Binding,
     pub members: Vec<Arc<NodeHandle>>,
 }
-impl Config {
+/// Fixed internal RPC endpoints for nodes in separate trusted processes.
+/// This changes placement only, not the external gateway wire or command identity.
+pub struct RemoteConfig {
+    pub coordinator: Client,
+    pub binding: Binding,
+    pub members: Vec<Client>,
+}
+enum OwnedNode {
+    Local(Arc<NodeHandle>),
+    Remote(Client),
+}
+impl OwnedNode {
+    fn reference(&self) -> NodeRef<'_> {
+        match self {
+            Self::Local(node) => NodeRef::Local(node),
+            Self::Remote(client) => NodeRef::Remote(client),
+        }
+    }
+}
+struct OwnedConfig {
+    coordinator: OwnedNode,
+    binding: Binding,
+    members: Vec<OwnedNode>,
+}
+impl From<Config> for OwnedConfig {
+    fn from(config: Config) -> Self {
+        Self {
+            coordinator: OwnedNode::Local(config.coordinator),
+            binding: config.binding,
+            members: config.members.into_iter().map(OwnedNode::Local).collect(),
+        }
+    }
+}
+impl From<RemoteConfig> for OwnedConfig {
+    fn from(config: RemoteConfig) -> Self {
+        Self {
+            coordinator: OwnedNode::Remote(config.coordinator),
+            binding: config.binding,
+            members: config.members.into_iter().map(OwnedNode::Remote).collect(),
+        }
+    }
+}
+impl OwnedConfig {
+    fn endpoints(&self) -> Vec<(NodeRef<'_>, Target)> {
+        self.members
+            .iter()
+            .zip(&self.binding.cohort.members)
+            .map(|(node, m)| {
+                (
+                    node.reference(),
+                    Target {
+                        shard: m.shard,
+                        epoch: m.epoch,
+                        mode: m.mode,
+                    },
+                )
+            })
+            .collect()
+    }
     fn graph(&self) -> GraphCohort<'_> {
-        GraphCohort::new(
-            &self.coordinator,
+        GraphCohort::from_endpoints(
+            self.coordinator.reference(),
             self.binding.authority.clone(),
             self.binding.cohort.coordinator_epoch,
-            self.members
-                .iter()
-                .zip(&self.binding.cohort.members)
-                .map(|(n, m)| {
-                    (
-                        n.as_ref(),
-                        Target {
-                            shard: m.shard,
-                            epoch: m.epoch,
-                            mode: m.mode,
-                        },
-                    )
-                })
-                .collect(),
+            self.endpoints(),
         )
     }
     fn validate(&self) -> Result<()> {
@@ -404,7 +450,7 @@ struct Retained {
     _memory: OwnedSemaphorePermit,
 }
 struct State {
-    config: Config,
+    config: OwnedConfig,
     incarnation: [u8; 16],
     sessions: Mutex<BTreeMap<[u8; 32], Arc<Retained>>>,
     memory: Arc<Semaphore>,
@@ -445,25 +491,11 @@ impl State {
             .try_acquire_owned()
             .map_err(|_| Error::Capacity)?;
         let expires = Instant::now() + ttl;
-        let captured = cohort_reads::acquire(
-            &self.config.coordinator,
+        let captured = cohort_reads::acquire_endpoints(
+            self.config.coordinator.reference(),
             self.config.binding.authority.clone(),
             self.config.binding.cohort.coordinator_epoch,
-            self.config
-                .members
-                .iter()
-                .zip(&self.config.binding.cohort.members)
-                .map(|(n, m)| {
-                    (
-                        n.as_ref(),
-                        Target {
-                            shard: m.shard,
-                            epoch: m.epoch,
-                            mode: m.mode,
-                        },
-                    )
-                })
-                .collect(),
+            self.config.endpoints(),
             version,
             ReadLimit {
                 rows: 10000,
@@ -639,6 +671,21 @@ pub struct Gateway {
 }
 impl Gateway {
     pub async fn bind(config: Config, bind: SocketAddr, deadline: Duration) -> Result<Self> {
+        Self::bind_config(config.into(), bind, deadline).await
+    }
+    /// Serve the unchanged graph protocol over fixed trusted internal endpoints.
+    pub async fn bind_remote(
+        config: RemoteConfig,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<Self> {
+        Self::bind_config(config.into(), bind, deadline).await
+    }
+    async fn bind_config(
+        config: OwnedConfig,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<Self> {
         check_deadline(deadline)?;
         config.validate()?;
         let state = Arc::new(State {

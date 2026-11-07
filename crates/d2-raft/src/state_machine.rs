@@ -691,6 +691,20 @@ impl StateMachine {
         version: u64,
         journal: &crate::transaction_decisions::Journal,
     ) -> Result<(), D1Error> {
+        self.participant_prefix_evidence(shard, epoch, mode_id, version, journal)
+            .await
+            .map(|_| ())
+    }
+
+    /// Same-lock retained participant history for trusted remote certification.
+    pub async fn participant_prefix_evidence(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        version: u64,
+        journal: &crate::transaction_decisions::Journal,
+    ) -> Result<crate::transaction_decisions::Journal, D1Error> {
         let state = self.state.read().await;
         let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
@@ -711,7 +725,7 @@ impl StateMachine {
         {
             return Err(D1Error::VisibilityHistory);
         }
-        Ok(())
+        Ok(visibility.journal.clone())
     }
 
     /// Same-lock proof that the retained local cut equals a trusted coordinator
@@ -726,6 +740,30 @@ impl StateMachine {
         limit: crate::versioned_reads::ReadLimit,
         journal: &crate::transaction_decisions::Journal,
     ) -> Result<crate::versioned_reads::ReadSnapshot, D1Error> {
+        self.certified_participant_read_with_evidence(
+            shard, epoch, mode_id, version, limit, journal,
+        )
+        .await
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Capture the snapshot and its retained terminal evidence under the same lock.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn certified_participant_read_with_evidence(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        version: u64,
+        limit: crate::versioned_reads::ReadLimit,
+        journal: &crate::transaction_decisions::Journal,
+    ) -> Result<
+        (
+            crate::versioned_reads::ReadSnapshot,
+            crate::transaction_decisions::Journal,
+        ),
+        D1Error,
+    > {
         let state = self.state.read().await;
         let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
@@ -746,7 +784,8 @@ impl StateMachine {
         {
             return Err(D1Error::VisibilityHistory);
         }
-        d1.read_at(version, limit)
+        let snapshot = d1.read_at(version, limit)?;
+        Ok((snapshot, visibility.journal.clone()))
     }
 
     /// Local diagnostic participant status. Establish a leader read barrier

@@ -191,6 +191,11 @@ impl Journal {
             1
         }
     }
+    /// Find the durable external request binding for a transaction identity.
+    pub fn request_for_transaction(&self, id: [u8; 16]) -> Option<&RequestRecord> {
+        self.requests.iter().find(|r| r.transaction_id == id)
+    }
+
     pub fn request(&self, id: [u8; 16]) -> Option<&RequestRecord> {
         self.requests.iter().find(|r| r.id == id)
     }

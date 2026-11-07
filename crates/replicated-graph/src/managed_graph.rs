@@ -1,10 +1,11 @@
-//! Opt-in trusted in-process graph/v2 transactions over an empty fixed cohort.
+//! Opt-in trusted local/remote graph/v2 transactions over an empty fixed cohort.
 //! No remote Global Gremlin admission. Plans are immutable in-memory retry values.
 use d2_raft::participant_writes::Authority;
 use d2_raft::transaction_decisions::{Cohort, Command, Decision, Journal, Participant};
 use d2_raft::{
-    cohort_reads, participant_driver, versioned_reads, D1Command, D1Error, D1WriteRequest,
-    LogCommand, NodeHandle,
+    cohort_reads,
+    managed_rpc::{self, NodeRef},
+    versioned_reads, D1Error, D1WriteRequest, NodeHandle,
 };
 use rocksdb_sql_table::experimental_graph::{
     AppendOnlyStore, CrossEdge, EdgeRecord, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
@@ -33,6 +34,16 @@ pub enum Error {
 impl From<cohort_reads::Error> for Error {
     fn from(e: cohort_reads::Error) -> Self {
         Self::Snapshot(e)
+    }
+}
+impl From<managed_rpc::Error> for Error {
+    fn from(error: managed_rpc::Error) -> Self {
+        match error {
+            managed_rpc::Error::Application(e) => Self::Application(e),
+            managed_rpc::Error::Identity | managed_rpc::Error::Protocol => Self::Identity,
+            managed_rpc::Error::Capacity => Self::Capacity,
+            managed_rpc::Error::Unavailable => Self::Uncertain,
+        }
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -357,10 +368,10 @@ impl GraphSnapshot {
 
 /// Explicit fixed handle set; no discovery, ownership migration, or failover.
 pub struct GraphCohort<'a> {
-    coordinator: &'a NodeHandle,
+    coordinator: NodeRef<'a>,
     authority: Authority,
     epoch: u64,
-    members: Vec<(&'a NodeHandle, versioned_reads::Target)>,
+    members: Vec<(NodeRef<'a>, versioned_reads::Target)>,
 }
 impl<'a> GraphCohort<'a> {
     pub fn new(
@@ -368,6 +379,23 @@ impl<'a> GraphCohort<'a> {
         authority: Authority,
         epoch: u64,
         members: Vec<(&'a NodeHandle, versioned_reads::Target)>,
+    ) -> Self {
+        Self::from_endpoints(
+            NodeRef::Local(coordinator),
+            authority,
+            epoch,
+            members
+                .into_iter()
+                .map(|(n, t)| (NodeRef::Local(n), t))
+                .collect(),
+        )
+    }
+    /// Pin fixed trusted endpoints; no discovery or automatic retry/failover.
+    pub fn from_endpoints(
+        coordinator: NodeRef<'a>,
+        authority: Authority,
+        epoch: u64,
+        members: Vec<(NodeRef<'a>, versioned_reads::Target)>,
     ) -> Self {
         Self {
             coordinator,
@@ -382,7 +410,7 @@ impl<'a> GraphCohort<'a> {
         limit: versioned_reads::ReadLimit,
         lifetime: Duration,
     ) -> Result<GraphSnapshot> {
-        let session = cohort_reads::acquire(
+        let session = cohort_reads::acquire_endpoints(
             self.coordinator,
             self.authority.clone(),
             self.epoch,
@@ -473,32 +501,15 @@ impl<'a> GraphCohort<'a> {
     }
     async fn journal(&self) -> Result<Journal> {
         self.coordinator
-            .raft
-            .ensure_linearizable()
+            .journal(&self.authority, self.epoch)
             .await
-            .map_err(|_| Error::Uncertain)?;
-        self.coordinator
-            .state_machine
-            .coordinator_journal(self.authority.shard, self.epoch, self.authority.mode)
-            .await
-            .map_err(Error::Application)
+            .map_err(Error::from)
     }
     async fn command(&self, command: Command) -> Result<()> {
         self.coordinator
-            .raft
-            .client_write(LogCommand::D1V1(D1Command::Coordinator {
-                shard: self.authority.shard,
-                epoch: self.epoch,
-                mode_id: self.authority.mode,
-                command,
-            }))
+            .command(&self.authority, self.epoch, command)
             .await
-            .map_err(|_| Error::Uncertain)?
-            .data
-            .d1
-            .ok_or(Error::Uncertain)?
-            .map_err(Error::Application)?;
-        Ok(())
+            .map_err(Error::from)
     }
     fn check_plan(&self, plan: &Plan, journal: &Journal) -> Result<()> {
         if self.authority != plan.authority
@@ -541,20 +552,7 @@ impl<'a> GraphCohort<'a> {
         let visible = matches!(
             tokio::time::timeout(Duration::from_secs(5), async {
                 for (node, target) in &self.members {
-                    node.raft
-                        .ensure_linearizable()
-                        .await
-                        .map_err(|_| Error::Uncertain)?;
-                    node.state_machine
-                        .participant_prefix_applied(
-                            target.shard,
-                            target.epoch,
-                            target.mode,
-                            ordinal,
-                            &journal,
-                        )
-                        .await
-                        .map_err(Error::Application)?;
+                    node.prefix(target, ordinal, &journal).await?;
                 }
                 Ok::<(), Error>(())
             })
@@ -616,15 +614,7 @@ impl<'a> GraphCohort<'a> {
                 .iter()
                 .any(|p| p.descriptor.shard == target.shard)
         }) {
-            node.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|_| Error::Uncertain)?;
-            let info = node
-                .state_machine
-                .participant_visibility_info(target.shard, target.epoch, target.mode)
-                .await
-                .map_err(Error::Application)?;
+            let info = node.visibility(target).await?;
             if info.authority != plan.authority
                 || info.cohort.as_ref() != Some(&plan.cohort)
                 || info.baseline_sequence != 0
@@ -650,26 +640,34 @@ impl<'a> GraphCohort<'a> {
                     .find(|(_, t)| t.shard == part.descriptor.shard)
                     .ok_or(Error::Identity)?
                     .0;
-                if let Err(error) = participant_driver::prepare(
-                    self.coordinator,
-                    node,
-                    self.authority.clone(),
-                    self.epoch,
-                    part.descriptor.clone(),
-                    part.request.clone(),
-                )
-                .await
-                {
+                let prepared = async {
+                    let evidence = self.journal().await?;
+                    let status = node
+                        .prepare(
+                            &self.authority,
+                            &part.descriptor,
+                            part.request.clone(),
+                            &evidence,
+                        )
+                        .await?;
+                    if status != d2_raft::participant_writes::Status::Prepared {
+                        return Err(Error::Uncertain);
+                    }
+                    self.command(Command::Prepared {
+                        id: plan.id,
+                        participant: part.descriptor.clone(),
+                    })
+                    .await
+                }
+                .await;
+                if let Err(error) = prepared {
                     // No implicit abort on a timeout or a rejected Prepare. The
                     // caller can resolve/retry or explicitly abort this plan.
                     let latest = self.journal().await?;
                     if let Some(decision) = latest.transaction(plan.id).and_then(|t| t.decision) {
                         return Ok((tx.ordinal, decision));
                     }
-                    return Err(match error {
-                        participant_driver::Error::Application(e) => Error::Application(e),
-                        _ => Error::Uncertain,
-                    });
+                    return Err(error);
                 }
             }
         }
@@ -696,15 +694,7 @@ impl<'a> GraphCohort<'a> {
         let journal = self.journal().await?;
         self.check_plan(plan, &journal)?;
         for (node, target) in &self.members {
-            node.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|_| Error::Uncertain)?;
-            let info = node
-                .state_machine
-                .participant_visibility_info(target.shard, target.epoch, target.mode)
-                .await
-                .map_err(Error::Application)?;
+            let info = node.visibility(target).await?;
             if info.authority != plan.authority
                 || info.cohort.as_ref() != Some(&plan.cohort)
                 || info.baseline_sequence != 0
@@ -713,31 +703,15 @@ impl<'a> GraphCohort<'a> {
             }
             let mut applied = info.applied_prefix;
             while applied < ordinal {
-                applied = versioned_reads::advance(
-                    self.coordinator,
-                    node,
-                    plan.authority.clone(),
-                    self.epoch,
-                    target.clone(),
-                    applied + 1,
-                )
-                .await
-                .map_err(|_| Error::Uncertain)?;
+                let next = node
+                    .advance(&plan.authority, target, applied + 1, &journal)
+                    .await?;
+                if next <= applied || next > journal.resolved_prefix() {
+                    return Err(Error::Identity);
+                }
+                applied = next;
             }
-            node.raft
-                .ensure_linearizable()
-                .await
-                .map_err(|_| Error::Uncertain)?;
-            node.state_machine
-                .participant_prefix_applied(
-                    target.shard,
-                    target.epoch,
-                    target.mode,
-                    ordinal,
-                    &journal,
-                )
-                .await
-                .map_err(Error::Application)?;
+            node.prefix(target, ordinal, &journal).await?;
         }
         Ok(())
     }

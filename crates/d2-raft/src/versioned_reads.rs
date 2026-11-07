@@ -361,7 +361,8 @@ impl D1State {
 }
 
 /// Explicit fixed participant identity. No catalog discovery or failover.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Target {
     pub shard: u64,
     pub epoch: u64,
