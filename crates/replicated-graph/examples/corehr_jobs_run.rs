@@ -107,14 +107,34 @@ fn job_cases(people: u64, departments: u64) -> Vec<JobCase> {
             error: None,
         });
     }
-    let exceeds = dedup_key_lower_bound(people) > 250000;
-    cases.push(JobCase {
-        name: "ceo_emit32_dedup",
-        partition: 2,
-        query: "g.V(1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(),
-        count: (!exceeds).then_some(people - 1),
-        error: exceeds.then_some(QueryFailure::ResourceExhausted),
-    });
+    for (name, start, query, count) in [
+        (
+            "ceo_emit32_dedup",
+            1,
+            "g.V(1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(),
+            people - 1,
+        ),
+        (
+            "duplicate_ceo_emit32_dedup",
+            1,
+            "g.V(1,1).repeat(__.in('reports_to')).emit().times(32).dedup().count()".into(),
+            people - 1,
+        ),
+        (
+            "department_emit32_dedup",
+            department,
+            format!("g.V({department}).repeat(__.in('parent_department')).emit().times(32).dedup().count()"),
+            departments - 1,
+        ),
+    ] {
+        cases.push(JobCase {
+            name,
+            partition: 1 + (start % 3) as u32,
+            query,
+            count: Some(count),
+            error: None,
+        });
+    }
     cases
 }
 async fn execute_job(
@@ -277,9 +297,12 @@ fn count_job_oracles_follow_breadth_first_tree_formulas() {
     assert_eq!(dedup_key_lower_bound(200000), 362550);
     assert!(dedup_key_lower_bound(2000) < 250000);
     let c = job_cases(200000, 5000);
-    assert_eq!(c.len(), 7);
+    assert_eq!(c.len(), 9);
     assert_eq!(c[3].count, Some(399998));
-    assert_eq!(c[6].error, Some(QueryFailure::ResourceExhausted));
+    assert_eq!(c[6].count, Some(199999));
+    assert_eq!(c[7].count, Some(199999));
+    assert_eq!(c[8].count, Some(4999));
+    assert!(c.iter().all(|c| c.error.is_none()));
 }
 
 const BUDGET: Duration = Duration::from_secs(60);
@@ -710,7 +733,7 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var_os("COREHR_JOBS_MATRIX").is_some() {
         println!(
             "{}",
-            json!({"event":"job_matrix_begin","samples":3,"fixed_lease_seconds":120,"request_max_seconds":5,"work_cap":8000000,"logical_bytes_cap":1073741824u64,"combined_key_cap":250000,"ceo_dedup_key_lower_bound":dedup_key_lower_bound(people)})
+            json!({"event":"job_matrix_begin","samples":3,"fixed_lease_seconds":120,"request_max_seconds":5,"work_cap":8000000,"logical_bytes_cap":1073741824u64,"retained_key_cap":250000,"legacy_combined_key_lower_bound":dedup_key_lower_bound(people),"dedup_representation":"shared_qualified_identity"})
         );
         let result=async {
             for query in ["g.V(1).repeat(__.in('reports_to')).emit().times(32).count()","g.V(1).repeat(__.in('reports_to')).emit().times(32).limit(1)"] {

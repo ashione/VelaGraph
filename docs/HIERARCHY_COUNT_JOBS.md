@@ -50,6 +50,17 @@ Exact mode counts the frontier at the requested depth; dead ends vanish. Emit
 counts depths 1 through n, excluding starts. Terminal dedup counts distinct
 qualified vertices in the final frontier or the full emitted stream, respectively.
 There is no per-level dedup of traversal weights and no implicit visited set.
+
+Emit plus terminal dedup uses one identity table: each qualified vertex owns two
+alternating depth-weight slots and an emitted flag. Current and next-depth weights
+remain separate even on self-cycles. The emitted flag only controls the final
+unique count; it never suppresses traversal at later depths. Reusing the same
+identity entry avoids storing that vertex independently in frontier, next frontier,
+and seen containers. A bounded ordered cursor scans at most 128 identity entries
+per Advance and expands at most 16 active vertices. Inactive seen-only entries
+also incur scan work and may require progress requests that
+expand no vertices. No full-table reset is hidden at a depth transition. Other
+count modes keep their existing weighted-frontier representation.
 Count is order-insensitive; this representation is not used to promise ordered
 vertex or path pagination. Future pagination needs its own explicitly specified
 ordering and continuation contract.
@@ -64,8 +75,13 @@ The new API has its own budgets, not a claim that every old query cap is unchang
   have independently fixed 120-second leases from acquisition. Neither is renewed;
   the earlier coordinator expiry governs the job. Acquisition and each Advance
   remain bounded by a five-second request deadline.
-- At most 250,000 combined frontier/next-frontier/seen keys (a conservative
-  32 MiB tree-node allowance), plus bounded page buffers. No full paths are stored.
+- At most 250,000 retained identity entries. Emit plus terminal dedup shares one
+  entry across its current/next weights and emitted flag; other modes count their
+  combined frontier/next-frontier keys. The limit is unchanged, not multiplied by
+  the number of roles a shared entry serves. A conservative 128-byte logical
+  allowance per allocated tree entry remains, plus bounded page buffers. This is
+  not a process-RSS ceiling. Unemitted start identities are also retained and count
+  toward the cap in compact mode. No full paths are stored.
 - At most 16 vertices advanced per request, 128 leaves per batched shard RPC,
   and 16,384 observed edges retained for one step. Sixteen vertices at the
   existing 1,000-neighbor cap fit this entry bound even before label filtering.
