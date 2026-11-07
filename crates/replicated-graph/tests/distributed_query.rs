@@ -46,6 +46,8 @@ mod jobs;
 mod projected_pages;
 #[path = "distributed_query/result_pages.rs"]
 mod result_pages;
+#[path = "distributed_query/sync_projection.rs"]
+mod sync_projection;
 static PROCESS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const BUDGET: Duration = Duration::from_secs(20);
 struct Process(Child);
@@ -762,6 +764,9 @@ async fn scenario() -> anyhow::Result<()> {
     projected_pages::check(endpoint)
         .await
         .context("projected page checks")?;
+    sync_projection::check(endpoint)
+        .await
+        .context("synchronous projection checks")?;
     let before = bp.bytes.load(Ordering::SeqCst);
     let opened_a = ap.opened.load(Ordering::SeqCst);
     let opened_b = bp.opened.load(Ordering::SeqCst);

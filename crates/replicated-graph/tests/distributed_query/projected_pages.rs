@@ -152,19 +152,27 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
         Err(QueryFailure::Unavailable)
     ));
     ensure!(result_pages::start(endpoint, text, 129).await.is_err());
-    ensure!(matches!(
-        distributed::query(
-            endpoint,
-            DistributedRequest {
-                start_partition: 0,
-                text: text.into(),
-                timeout_millis: 5000
-            },
-            BUDGET
-        )
-        .await?,
-        Err(QueryFailure::Unsupported)
-    ));
+    // The additive synchronous subset must agree with the existing job result.
+    let synchronous = distributed::query(
+        endpoint,
+        DistributedRequest {
+            start_partition: 0,
+            text: text.into(),
+            timeout_millis: 5000,
+        },
+        BUDGET,
+    )
+    .await??;
+    ensure!(
+        synchronous.rows
+            == vec![
+                QueryRow::PropertyMap {
+                    source: expected.source,
+                    properties: expected.properties,
+                };
+                4
+            ]
+    );
     Ok(())
 }
 pub(super) async fn fixed_snapshot(endpoint: SocketAddr, group: &Group) -> anyhow::Result<()> {

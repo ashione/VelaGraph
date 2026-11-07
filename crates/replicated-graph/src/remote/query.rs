@@ -42,6 +42,12 @@ pub enum QueryRow {
     Element(QualifiedElement),
     Path(Vec<QualifiedElement>),
     Count(u64),
+    /// Selected vertex properties, each represented as a Gremlin singleton list.
+    /// Only the distributed explicit-start terminal valueMap surface emits this.
+    PropertyMap {
+        source: QualifiedElement,
+        properties: std::collections::BTreeMap<String, Vec<Value>>,
+    },
     /// V1's existing scalar result has no provenance. V2 always supplies it.
     Value {
         source: Option<QualifiedElement>,
@@ -167,6 +173,7 @@ fn validate_output(
                 !path.is_empty() && path.len() <= 33 && path.iter().all(valid_element)
             }
             QueryRow::Count(_) => true,
+            QueryRow::PropertyMap { .. } => false,
             QueryRow::Value { source, value } => {
                 source.as_ref().is_none_or(valid_element)
                     && source.is_some() == (output.mode == QueryMode::V2Observed)

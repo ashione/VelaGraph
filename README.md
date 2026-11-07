@@ -625,3 +625,9 @@ legacy single-Snapshot RPC is unchanged. See [paged remote snapshots](docs/REMOT
 The experimental coordinator also supports [ordered hierarchy result pages](docs/HIERARCHY_RESULT_PAGES.md): explicit finite Gremlin repeat jobs evaluate against fixed shard snapshots before returning actual qualified-vertex pages. Preparation progress is separate from results, and count jobs retain their existing limits.
 
 [Fixed-snapshot property pages](docs/HIERARCHY_PROPERTY_PAGES.md) extend prepared hierarchy jobs with terminal standard valueMap projections. Property selection is declared before preparation; no fresh reads are attached to an already closed Ready snapshot.
+
+The bounded explicit-ID server path also supports terminal selected-property
+`valueMap`, so ordinary person/department joins can return several fields per
+vertex in one query. See [the map contract](docs/QUERY_SPEC.md#distributed-synchronous-selected-property-maps).
+It keeps the existing synchronous budgets and per-shard snapshot limits; this
+does not add global joins or general Gremlin support.
