@@ -953,7 +953,7 @@ fn validate_stamps(
     }
     Ok(())
 }
-fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError> {
+pub(super) fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError> {
     match (output, request) {
         (
             Output::ProjectedPage {
