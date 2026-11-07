@@ -60,10 +60,19 @@ def validate_snapshots(snapshots, shards):
 
 
 def validate(records, manifest, jobs=False):
-    require(bool(records), 'empty output')
+    require(isinstance(records, list) and bool(records), 'empty output')
+    require(all(isinstance(r, dict) and isinstance(r.get('event'), str) for r in records),
+            'invalid evidence record')
+    common = {'capacity_before', 'explicit_capacity_upgrade', 'loaded_shard', 'load',
+              'capacity_after', 'all_kv_verified', 'client_session', 'client_query', 'resources'}
+    allowed = common | ({'job_matrix_begin', 'synchronous_guard', 'job_cancel_probe',
+                         'job_begin', 'job_progress', 'job_cleanup', 'job_outcome',
+                         'job_matrix_complete'} if jobs else {'server_query', 'application_chain'})
+    require(all(r['event'] in allowed for r in records), 'unexpected or failure event')
+    require(sum(r['event'] == 'resources' for r in records) == 1, 'duplicate terminal record')
     end = records[-1]
     require(end.get('event') == 'resources' and end.get('complete') is True
-            and end.get('query_failures') == 0, 'missing successful terminal record')
+            and type(end.get('query_failures')) is int and end['query_failures'] == 0, 'missing successful terminal record')
     require(not any(r['event'] in ('job_failure', 'matrix_failure') for r in records),
             'job failure in output')
     expected_shards = fixture_shards(manifest)
@@ -76,8 +85,21 @@ def validate(records, manifest, jobs=False):
                 'invalid or duplicate verified shard')
         actual_shards[shard] = count
     require(actual_shards == expected_shards, 'incomplete per-shard fixture verification')
+    # Fixture verification must precede every query, not merely occur somewhere.
+    verified_so_far = set()
+    for row in records:
+        if row['event'] == 'all_kv_verified':
+            verified_so_far.add(row['shard'])
+        elif row['event'] in {'server_query', 'application_chain', 'job_begin',
+                               'job_progress', 'job_cleanup', 'job_outcome'}:
+            require(verified_so_far == set(expected_shards), 'query precedes fixture verification')
     if not jobs:
-        cases = {c['name']: c for c in manifest['queries']}
+        queries = manifest.get('queries')
+        require(isinstance(queries, list) and bool(queries)
+                and all(isinstance(c, dict) and isinstance(c.get('name'), str) for c in queries),
+                'invalid query manifest')
+        cases = {c['name']: c for c in queries}
+        require(len(cases) == len(queries), 'duplicate manifest query')
         actual = [r for r in records if r['event'] == 'server_query']
         require(collections.Counter(r['name'] for r in actual) == collections.Counter(cases.keys()),
                 'missing or duplicated representative query')
@@ -119,6 +141,7 @@ def validate(records, manifest, jobs=False):
             == collections.Counter(['department_emit32', 'ceo_emit32_dedup'])
             and all(r['sample'] == 0 for r in probes) and len(outcomes) == 29, 'missing probes')
     for r in outcomes:
+        require(type(r.get('count')) is int and type(r.get('sample')) is int, 'invalid job integer')
         require(r.get('correct') is True and r.get('count') == expected[r['name']]
                 and r.get('replay_verified') is True and r.get('partial_count_returned') is False,
                 'wrong hierarchy oracle or replay')
@@ -127,6 +150,32 @@ def validate(records, manifest, jobs=False):
         if r['event'] in ('job_begin', 'job_progress', 'job_cleanup', 'job_outcome'):
             groups[(r['name'], r['phase'], r['sample'])].append(r)
     require(len(groups) == len(outcomes), 'incomplete extra job')
+    active = None
+    stage = None
+    for row in records:
+        event = row['event']
+        if event not in {'job_begin', 'job_progress', 'job_cleanup', 'job_outcome'}:
+            require(active is None, 'non-job event interrupts active job')
+            continue
+        key = (row['name'], row['phase'], row['sample'])
+        require(type(row['sample']) is int, 'invalid job sample')
+        if event == 'job_begin':
+            require(active is None, 'overlapping job begin')
+            active, stage = key, 'begin'
+        else:
+            require(active == key, 'job event without matching begin')
+            if event == 'job_progress':
+                require(stage in ('begin', 'progress'), 'progress after terminal or cleanup')
+                require(type(row.get('complete')) is bool and type(row.get('sequence')) is int,
+                        'invalid progress types')
+                stage = 'terminal' if row['complete'] else 'progress'
+            elif event == 'job_cleanup':
+                require(stage == 'terminal', 'cleanup before terminal progress')
+                stage = 'cleanup'
+            else:
+                require(stage == 'cleanup', 'outcome before cleanup')
+                active, stage = None, None
+    require(active is None, 'unfinished active job')
     for rows in groups.values():
         require(sum(r['event'] == 'job_begin' for r in rows) == 1
                 and sum(r['event'] == 'job_outcome' for r in rows) == 1, 'missing job boundaries')
@@ -142,7 +191,7 @@ def validate(records, manifest, jobs=False):
         validate_snapshots(outcome.get('fixed_snapshots'), expected_shards)
         require(outcome['fixed_snapshots'] == progress[0]['snapshots'], 'outcome snapshot changed')
         cleanup = [r for r in rows if r['event'] == 'job_cleanup']
-        require(len(cleanup) == 1 and cleanup[0]['cancelled'] and cleanup[0]['advance_unavailable'],
+        require(len(cleanup) == 1 and cleanup[0]['cancelled'] is True and cleanup[0]['advance_unavailable'] is True,
                 'cleanup failed')
     require(sum(r['event'] == 'synchronous_guard' and r.get('expected_rejection') == 'ResourceExhausted'
                 for r in records) == 2, 'missing unchanged synchronous guards')

@@ -143,6 +143,80 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing or duplicate hierarchy samples'):
             validate(rows, self.manifest, jobs=True)
 
+    def test_reject_unknown_failure_and_duplicate_terminal_events(self):
+        for jobs in (False, True):
+            records = self.job_records() if jobs else self.records
+            for extra in ({'event': 'unexpected_failure'}, {'event': 'matrix_failure'}, records[-1]):
+                rows = records[:-1] + [extra] + records[-1:]
+                with self.subTest(jobs=jobs, event=extra['event']), self.assertRaises(ValueError):
+                    validate(rows, self.manifest, jobs=jobs)
+
+    def test_reject_wrong_terminal_scalar_type(self):
+        for value in (False, 0.0, '0', None):
+            rows = copy.deepcopy(self.records)
+            rows[-1]['query_failures'] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate(rows, self.manifest)
+
+    def test_reject_duplicate_manifest_case(self):
+        self.manifest['queries'].append(copy.deepcopy(self.manifest['queries'][0]))
+        with self.assertRaises(ValueError):
+            validate(self.records, self.manifest)
+
+    def test_reject_query_before_fixture_verification(self):
+        for jobs in (False, True):
+            records = self.job_records() if jobs else self.records
+            rows = records[3:4] + records[:3] + records[4:]
+            with self.subTest(jobs=jobs), self.assertRaises(ValueError):
+                validate(rows, self.manifest, jobs=jobs)
+
+    def test_reject_lifecycle_permutations_for_every_sample(self):
+        records = self.job_records()
+        begins = [i for i, row in enumerate(records) if row['event'] == 'job_begin']
+        # Every one of the 27 matrix samples and both probes must follow:
+        # begin -> nonterminal progress -> terminal progress -> cleanup -> outcome.
+        for start in begins:
+            for left, right in ((0, 1), (0, 4), (2, 3), (3, 4)):
+                rows = copy.deepcopy(records)
+                rows[start + left], rows[start + right] = rows[start + right], rows[start + left]
+                with self.subTest(start=start, swap=(left, right)), self.assertRaises(ValueError):
+                    validate(rows, self.manifest, jobs=True)
+
+    def test_reject_overlapping_or_interrupted_jobs(self):
+        records = self.job_records()
+        rows = copy.deepcopy(records)
+        rows[4], rows[8] = rows[8], rows[4]
+        with self.assertRaises(ValueError):
+            validate(rows, self.manifest, jobs=True)
+        rows = records[:4] + [{'event': 'load'}] + records[4:]
+        with self.assertRaises(ValueError):
+            validate(rows, self.manifest, jobs=True)
+
+    def test_reject_truthy_cleanup_and_numeric_booleans(self):
+        records = self.job_records()
+        mutations = [('job_cleanup', 'cancelled', 1),
+                     ('job_cleanup', 'advance_unavailable', 'true'),
+                     ('job_progress', 'complete', 0),
+                     ('job_progress', 'sequence', False),
+                     ('job_outcome', 'count', 199999.0)]
+        for event, field, value in mutations:
+            rows = copy.deepcopy(records)
+            next(r for r in rows if r['event'] == event)[field] = value
+            with self.subTest(event=event, field=field), self.assertRaises(ValueError):
+                validate(rows, self.manifest, jobs=True)
+        # Mutate every record of sample zero together so grouping still agrees.
+        rows = copy.deepcopy(records)
+        for row in rows:
+            if row.get('sample') == 0:
+                row['sample'] = False
+        with self.assertRaises(ValueError):
+            validate(rows, self.manifest, jobs=True)
+
+    def test_reject_malformed_evidence_records(self):
+        for bad in (None, 3, [], {}, {'event': 1}):
+            with self.subTest(record=bad), self.assertRaises(ValueError):
+                validate([bad] + self.records, self.manifest)
+
 
 if __name__ == '__main__':
     unittest.main()
