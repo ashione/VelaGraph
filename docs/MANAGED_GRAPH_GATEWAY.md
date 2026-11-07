@@ -32,7 +32,8 @@ reply. Protocol v1 requests specify an unpredictable per-call nonce, exact
 expected authority/cohort/mapping, and one typed operation. Unknown struct or
 enum fields, unsupported versions, and malformed values fail closed. Clients
 validate echoed binding, nonce, operation identity, session token and version
-before accepting any response. There is no transparent retry or cursor protocol.
+before accepting any response. There is no transparent retry. The additive
+TraversePage operation below has a separate immutable-result cursor protocol.
 
 Submit accepts a nonzero external 128-bit request ID and one of:
 
@@ -109,8 +110,8 @@ QueryData retains Unverified completeness because arbitrary trusted low-level
 writes can omit adjacency entries. This is separate from fixed-version consistency
 and never turns weak/current reads into certified sessions. Client checks of query
 echoes, row shape and qualified identity are not authentication or proof of a
-malicious peer's data. No global scan, cursor, partial page or weak-read fallback
-is exposed.
+malicious peer's data. This original Read operation exposes no global scan or
+page cursor. No operation permits a weak-read fallback.
 
 Tokens combine a random 128-bit gateway incarnation and a random 256-bit session
 identity. Each request includes the exact descriptor and V. Close, TTL expiry or
@@ -133,10 +134,11 @@ already received cannot be revoked.
   per process. Excess server connections are closed. Blocking work retains its
   permit even if the awaiting handler times out.
 - At most four materialized snapshots, including write-preparation captures and
-  sessions still retained by active workers. Each reserves 4 MiB, conservatively
-  charging the session and GraphSnapshot's two copied maps (2 MiB payload each).
-  Aggregate reserved copied payload is at most 16 MiB. Four open sessions can
-  temporarily prevent a new write's validation capture until one closes/expires;
+  sessions still retained by active workers. Each reserves 4 MiB for the session
+  and GraphSnapshot's two copied maps (2 MiB payload each), plus 4 MiB for the
+  additive immutable result/cursor slot and bounded scratch. Aggregate reserved
+  logical storage is at most 32 MiB (16 MiB of it is snapshot copied payload).
+  Four open sessions can temporarily prevent a new write's validation capture until one closes/expires;
   already admitted retries, Status and Abort do not require a new capture.
 - Each capture also caps aggregate rows at 10,000 and replay work at 100,000
   operations. Map/allocator metadata, bounded retained journals, per-connection
@@ -183,3 +185,12 @@ role and complete cohort identity and returns participant-retained terminal-pref
 evidence for same-V captures. See [transport contract](REMOTE_MANAGED_TRANSPORT.md)
 for bounds, trust assumptions and real independent-process validation. Earlier
 "in-process handles" statements describe the original local placement only.
+
+## Additive fixed-version traversal and paging
+
+`Traverse` and `TraversePage` now share the existing bounded routing-v3 executor
+through a private GraphSnapshot provider. All scans, hops, projections and page
+replays use the retained session V. The original smaller `Read` operation and
+write identity protocol remain unchanged. Complete-result pagination is separately
+bounded, query-bound and replayable; it is not incremental hierarchy-job paging.
+See [the full contract](MANAGED_FIXED_TRAVERSALS.md).

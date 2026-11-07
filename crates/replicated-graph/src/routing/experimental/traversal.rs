@@ -1,6 +1,7 @@
 //! Bounded, explicitly incomplete observations using the existing Gremlin parser.
 use super::*;
 mod edges;
+pub(crate) use edges::{validate_steps as validate_traversal, TraversalRead};
 pub use edges::{ObservedElementRef, ObservedRowV3, ObservedTraversalV3};
 use rocksdb_sql_table::{GremlinQuery, GremlinStart, GremlinStep, Value};
 

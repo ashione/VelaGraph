@@ -507,3 +507,23 @@ and encoding/sending share at most five seconds, shortened by the connection
 budget and session expiry. Expired or closed sessions fail even for an empty
 query result. The wider managed gateway lifetime/recovery and memory exclusions
 are specified in [MANAGED_GRAPH_GATEWAY.md](MANAGED_GRAPH_GATEWAY.md).
+
+### Additive managed fixed-version Traverse and TraversePage
+
+The separate `Traverse` and `TraversePage` operations now reuse the routing-v3
+executor over the session's certified GraphSnapshot instead of extending the
+small `Read` operation above. They accept V/E explicit starts or full-cohort
+scans, out/in/both, outE/inE/bothE, inV/outV/bothV, has/hasLabel, values/label,
+limit, terminal path/count. The official parser and whole-stream-type validation
+run before even empty input. Repeated traversers, qualified edge/vertex paths,
+parallel edges and deterministic `(ID, partition)` ordering preserve existing
+v3 semantics. Repeat/dedup/valueMap/id and other unsupported steps reject.
+
+Every primitive uses the same V. Pagination fully evaluates and bounds the
+result, then validates all page envelopes before emitting the first page. One
+immutable result per session has exact query/page-size binding and replayable
+random continuation tokens; continuation cannot refresh V or extend TTL. The
+old `Read` subset, observed routing metadata and unrestricted remote
+GlobalCommittedSnapshot Unsupported behavior are unchanged. See
+[managed traversal and paging contract](MANAGED_FIXED_TRAVERSALS.md) for complete
+ordering, limits, trust, retained-result accounting and compatibility details.

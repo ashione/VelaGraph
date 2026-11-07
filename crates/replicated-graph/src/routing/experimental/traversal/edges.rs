@@ -82,7 +82,9 @@ fn start_row(element: ObservedElementRef) -> ElementRow {
 }
 /// Validate stream types before acquisition, including empty streams. No runtime
 /// row can turn an invalid vertex/edge transition into an apparent success.
-fn validate_steps(query: &rocksdb_sql_table::ObservedGremlinQuery) -> ExperimentalResult<()> {
+pub(crate) fn validate_steps(
+    query: &rocksdb_sql_table::ObservedGremlinQuery,
+) -> ExperimentalResult<()> {
     use rocksdb_sql_table::ObservedGremlinStep as Step;
     let mut edge_stream = matches!(query.start(), GremlinStart::Edges(_));
     let mut scalar = false;
@@ -151,21 +153,32 @@ fn validate_steps(query: &rocksdb_sql_table::ObservedGremlinQuery) -> Experiment
     }
     Ok(())
 }
-impl ExperimentalReadSession {
-    /// Executes V/E starts, vertex adjacency, edge adjacency and edge endpoints
-    /// against the original frozen session. Qualified bag rows and paths preserve
-    /// input order; adjacency is ordered by (edge ID, source partition). BothE
-    /// emits a self-loop once; bothV emits source then target, even for a loop.
-    /// All observations remain Unverified, with one shared budget and deadline.
-    pub fn observed_gremlin_v3(
+/// Private execution-only read boundary. Providers own their consistency proof;
+/// the shared executor returns rows, never a snapshot/certification envelope.
+pub(crate) trait TraversalRead {
+    type Node: StorageNode;
+    fn check(&self) -> ExperimentalResult<()>;
+    fn partitions(&self) -> Vec<u32>;
+    fn metadata_bytes(&self) -> usize;
+    fn store(&self, partition: u32) -> ExperimentalResult<AppendOnlyStore<Self::Node>>;
+    fn get_vertex(&self, vertex: VertexRef) -> ExperimentalResult<Option<Vertex>>;
+    fn get_edge(&self, edge: EdgeRef) -> ExperimentalResult<Option<CrossEdge>>;
+    fn verified_edge_record(&self, edge: EdgeRef) -> ExperimentalResult<Option<EdgeRecord>>;
+    fn observed_adjacency(
+        &self,
+        vertex: VertexRef,
+        direction: Direction,
+    ) -> ExperimentalResult<Vec<CrossEdge>>;
+
+    fn execute_traversal(
         &self,
         start_partition: u32,
         text: &str,
-    ) -> ExperimentalResult<ObservedTraversalV3> {
+    ) -> ExperimentalResult<Vec<ObservedRowV3>> {
         use rocksdb_sql_table::{ObservedGremlinQuery, ObservedGremlinStep as Step};
-        self.op.check(None)?;
+        self.check()?;
         let query = ObservedGremlinQuery::parse(text).map_err(ExperimentalRouteError::Query)?;
-        self.op.check(None)?;
+        self.check()?;
         validate_steps(&query)?;
         let (edge_start, ids) = match query.start() {
             GremlinStart::Edges(ids) => (true, ids),
@@ -184,7 +197,7 @@ impl ExperimentalReadSession {
             _ => None,
         };
         for id in ids {
-            self.op.check(None)?;
+            self.check()?;
             if leading.is_some_and(|n| rows.len() >= n) {
                 break;
             }
@@ -213,12 +226,12 @@ impl ExperimentalReadSession {
             push_element(&mut rows, start_row(element), &mut work)?;
         }
         if ids.is_empty() {
-            for partition in self.placements.keys() {
-                let store = self.store(*partition)?;
+            for partition in self.partitions() {
+                let store = self.store(partition)?;
                 let mut after = None;
                 let mut acquired = 0usize;
                 loop {
-                    self.op.check(None)?;
+                    self.check()?;
                     let remaining = leading.map_or(128, |n| n.saturating_sub(acquired).min(128));
                     if remaining == 0 {
                         break;
@@ -228,7 +241,7 @@ impl ExperimentalReadSession {
                         let page = store.edge_record_page(after, scan_limit)?;
                         work.charge(page.raw_bytes + page.records.len() * 128)?;
                         for candidate in page.records {
-                            self.op.check(None)?;
+                            self.check()?;
                             work.visit()?;
                             work.edge(candidate.edge())?;
                             let r = candidate.identity();
@@ -258,11 +271,11 @@ impl ExperimentalReadSession {
                         let page = store.vertex_page(after, scan_limit)?;
                         work.charge(page.raw_bytes + page.vertices.len() * 128)?;
                         for vertex in page.vertices {
-                            self.op.check(None)?;
+                            self.check()?;
                             work.visit()?;
                             work.vertex(&vertex)?;
                             let r = VertexRef {
-                                partition: *partition,
+                                partition,
                                 id: vertex.id,
                             };
                             push_element(
@@ -286,7 +299,7 @@ impl ExperimentalReadSession {
             rows.sort_unstable_by_key(|r| r.element.order());
         }
         for step in query.steps() {
-            self.op.check(None)?;
+            self.check()?;
             match step {
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
                 Step::Existing(GremlinStep::Path | GremlinStep::Count) => {}
@@ -304,7 +317,7 @@ impl ExperimentalReadSession {
                     };
                     let mut next = Vec::new();
                     for row in rows {
-                        self.op.check(None)?;
+                        self.check()?;
                         let ObservedElementRef::Vertex(vertex) = row.element else {
                             unreachable!("validated vertex stream")
                         };
@@ -312,8 +325,8 @@ impl ExperimentalReadSession {
                         for direction in dirs {
                             work.visit()?;
                             let observed = self.observed_adjacency(vertex, *direction)?;
-                            for edge in observed.edges {
-                                self.op.check(None)?;
+                            for edge in observed {
+                                self.check()?;
                                 work.visit()?;
                                 work.edge(&edge)?;
                                 if label.as_ref().is_some_and(|label| label != &edge.label) {
@@ -330,7 +343,7 @@ impl ExperimentalReadSession {
                             }
                         }
                         for ((id, partition), target) in ordered {
-                            self.op.check(None)?;
+                            self.check()?;
                             let edge = EdgeRef { partition, id };
                             let mut path = row.path.clone();
                             path.push(ObservedPathElement::Edge(edge));
@@ -356,7 +369,7 @@ impl ExperimentalReadSession {
                 Step::InV | Step::OutV | Step::BothV => {
                     let mut next = Vec::new();
                     for row in rows {
-                        self.op.check(None)?;
+                        self.check()?;
                         work.visit()?;
                         let ObservedElementRef::Edge(r) = row.element else {
                             unreachable!("validated edge stream")
@@ -369,7 +382,7 @@ impl ExperimentalReadSession {
                             _ => &[edge.from, edge.to],
                         };
                         for vertex in endpoints {
-                            self.op.check(None)?;
+                            self.check()?;
                             let mut path = row.path.clone();
                             path.push(ObservedPathElement::Vertex(*vertex));
                             push_element(
@@ -393,7 +406,7 @@ impl ExperimentalReadSession {
                 ) => {
                     let mut next = Vec::new();
                     for mut row in rows {
-                        self.op.check(None)?;
+                        self.check()?;
                         work.visit()?;
                         let (labels, mut properties) = match row.element {
                             ObservedElementRef::Edge(r) => {
@@ -462,7 +475,7 @@ impl ExperimentalReadSession {
         {
             rows.truncate(100);
         }
-        work.charge(rows.len() * 128 + self.snapshots.len() * 64)?;
+        work.charge(rows.len() * 128 + self.metadata_bytes())?;
         let rows = if count {
             vec![ObservedRowV3::Count(rows.len() as u64)]
         } else {
@@ -484,7 +497,52 @@ impl ExperimentalReadSession {
                 })
                 .collect()
         };
-        self.op.check(None)?;
+        self.check()?;
+        Ok(rows)
+    }
+}
+
+impl TraversalRead for ExperimentalReadSession {
+    type Node = PinnedNode;
+    fn check(&self) -> ExperimentalResult<()> {
+        self.op.check(None).map_err(Into::into)
+    }
+    fn partitions(&self) -> Vec<u32> {
+        self.placements.keys().copied().collect()
+    }
+    fn metadata_bytes(&self) -> usize {
+        self.snapshots.len() * 64
+    }
+    fn store(&self, partition: u32) -> ExperimentalResult<AppendOnlyStore<Self::Node>> {
+        ExperimentalReadSession::store(self, partition)
+    }
+    fn get_vertex(&self, vertex: VertexRef) -> ExperimentalResult<Option<Vertex>> {
+        ExperimentalReadSession::get_vertex(self, vertex)
+    }
+    fn get_edge(&self, edge: EdgeRef) -> ExperimentalResult<Option<CrossEdge>> {
+        ExperimentalReadSession::get_edge(self, edge)
+    }
+    fn verified_edge_record(&self, edge: EdgeRef) -> ExperimentalResult<Option<EdgeRecord>> {
+        ExperimentalReadSession::verified_edge_record(self, edge)
+    }
+    fn observed_adjacency(
+        &self,
+        vertex: VertexRef,
+        direction: Direction,
+    ) -> ExperimentalResult<Vec<CrossEdge>> {
+        ExperimentalReadSession::observed_adjacency(self, vertex, direction).map(|a| a.edges)
+    }
+}
+
+impl ExperimentalReadSession {
+    /// Existing observed API and metadata remain weak per-shard observations.
+    /// Shared row execution does not relabel or certify this session.
+    pub fn observed_gremlin_v3(
+        &self,
+        start_partition: u32,
+        text: &str,
+    ) -> ExperimentalResult<ObservedTraversalV3> {
+        let rows = self.execute_traversal(start_partition, text)?;
         Ok(ObservedTraversalV3 {
             rows,
             completeness: AdjacencyCompleteness::Unverified,

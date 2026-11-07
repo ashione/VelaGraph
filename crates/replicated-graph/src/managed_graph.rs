@@ -149,7 +149,10 @@ impl GraphSnapshot {
     pub fn version(&self) -> Result<u64> {
         Ok(self.session.version()?)
     }
-    fn store(&self, partition: u32) -> Result<AppendOnlyStore<crate::remote::query::FrozenNode>> {
+    pub(crate) fn store(
+        &self,
+        partition: u32,
+    ) -> Result<AppendOnlyStore<crate::remote::query::FrozenNode>> {
         self.session.version()?;
         let view = self
             .views
@@ -171,21 +174,26 @@ impl GraphSnapshot {
         Ok(value)
     }
     pub fn edge(&self, edge: EdgeRef) -> Result<Option<CrossEdge>> {
+        Ok(match self.verified_edge_record(edge)? {
+            Some(EdgeRecord::Live(e)) => Some(e),
+            Some(EdgeRecord::Deleted(_)) | None => None,
+        })
+    }
+    pub(crate) fn partitions(&self) -> Vec<u32> {
+        // Constructor already rejects shard IDs outside the partition domain.
+        self.views.keys().map(|shard| *shard as u32).collect()
+    }
+    pub(crate) fn verified_edge_record(&self, edge: EdgeRef) -> Result<Option<EdgeRecord>> {
         let record = self.store(edge.partition)?.get_edge_record(edge.id)?;
-        let value = match record {
-            Some(EdgeRecord::Live(e)) => {
-                self.store(e.to.partition)?.verify_reverse(&e)?;
-                Some(e)
-            }
+        match &record {
+            Some(EdgeRecord::Live(e)) => self.store(e.to.partition)?.verify_reverse(e)?,
             Some(EdgeRecord::Deleted(t)) => {
-                self.store(t.edge.to.partition)?
-                    .verify_deleted_reverse(&t)?;
-                None
+                self.store(t.edge.to.partition)?.verify_deleted_reverse(t)?;
             }
-            None => None,
-        };
+            None => {}
+        }
         self.version()?;
-        Ok(value)
+        Ok(record)
     }
     /// Index-observed adjacency, checked against both endpoints and edge halves
     /// at this common version. Not a certificate against out-of-band KV writes.

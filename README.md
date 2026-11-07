@@ -39,6 +39,13 @@ now consume contiguous applied decision prefixes and replay retained history for
 one requested version; a lagging shard refuses that version. Global query admission
 and certification of a common initial baseline remain unfinished.
 
+The restricted managed gateway additionally offers [fixed-version traversals and
+complete-result pages](docs/MANAGED_FIXED_TRAVERSALS.md), reusing the bounded
+routing-v3 Gremlin executor over one certified cohort snapshot. This does not
+enable the unrestricted GlobalCommittedSnapshot API or certify arbitrary writers,
+nonempty baselines or dynamic routing. The new managed-path validation uses small
+cross-process personnel graphs, not the full-scale CoreHR fixture.
+
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.
 

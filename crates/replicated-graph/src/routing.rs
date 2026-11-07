@@ -617,7 +617,7 @@ impl RoutedPreparedMutation {
 }
 
 #[derive(Clone)]
-struct PinnedNode {
+pub(crate) struct PinnedNode {
     adapter: Adapter,
     view: ReadView,
     op: Arc<Operation>,

@@ -597,7 +597,7 @@ async fn session_budgets_expiry_malformed_fields_and_oversized_frames() {
         .await,
         Err(Error::SessionUnavailable)
     );
-    assert_eq!(g.retained_payload_charge(), 3 * SNAPSHOT_CHARGE);
+    assert_eq!(g.retained_payload_charge(), 3 * SESSION_CHARGE);
     let mut wrong = bound();
     wrong.cohort.members[0].epoch += 1;
     assert_eq!(
@@ -1256,7 +1256,7 @@ async fn reset_open_connection_releases_undelivered_session_over_real_tcp() {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while g.retained_payload_charge() != SNAPSHOT_CHARGE {
+            while g.retained_payload_charge() != SESSION_CHARGE {
                 tokio::task::yield_now().await;
             }
         })
@@ -1646,3 +1646,6 @@ async fn legacy_typed_read_wire_is_rejected_instead_of_translated() {
     g.shutdown().await;
     f.stop().await;
 }
+
+#[path = "managed_gateway_traversal_tests.rs"]
+mod traversal_tests;

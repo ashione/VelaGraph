@@ -345,6 +345,7 @@ impl From<WireElement> for QualifiedElement {
 #[serde(deny_unknown_fields)]
 enum WireRow {
     Element(WireElement),
+    Path(Vec<WireElement>),
     Value {
         source: Option<WireElement>,
         value: Value,
@@ -358,6 +359,9 @@ pub(super) fn strict_rows<'de, D: serde::Deserializer<'de>>(
         rows.into_iter()
             .map(|row| match row {
                 WireRow::Element(element) => QueryRow::Element(element.into()),
+                WireRow::Path(elements) => {
+                    QueryRow::Path(elements.into_iter().map(Into::into).collect())
+                }
                 WireRow::Value { source, value } => QueryRow::Value {
                     source: source.map(Into::into),
                     value,
@@ -365,5 +369,316 @@ pub(super) fn strict_rows<'de, D: serde::Deserializer<'de>>(
                 WireRow::Count(n) => QueryRow::Count(n),
             })
             .collect()
+    })
+}
+
+// The managed provider is private and contains no mutable route/catalog handle.
+// Its stores and cross-edge validation all derive from this one proven session.
+struct FixedRead<'a> {
+    snapshot: &'a GraphSnapshot,
+    end: Instant,
+}
+use crate::routing::experimental::{
+    ExperimentalResult, ExperimentalRouteError, ObservedElementRef, ObservedPathElement,
+    ObservedRowV3, TraversalRead,
+};
+use rocksdb_sql_table::experimental_graph::{AppendOnlyStore, EdgeRecord, ExperimentalError};
+fn provider_error(cause: managed_graph::Error) -> ExperimentalRouteError {
+    use rocksdb_sql_table::StorageNodeError;
+    match cause {
+        managed_graph::Error::Graph(e) => ExperimentalRouteError::Graph(e),
+        managed_graph::Error::Storage(e) => e.into(),
+        managed_graph::Error::Capacity => {
+            StorageNodeError::ResourceExhausted("fixed read".into()).into()
+        }
+        managed_graph::Error::Identity => {
+            ExperimentalRouteError::Unsupported("partition outside fixed cohort")
+        }
+        managed_graph::Error::Snapshot(cohort_reads::Error::Expired) => {
+            StorageNodeError::Timeout { request_id: None }.into()
+        }
+        _ => StorageNodeError::Unavailable("fixed session unavailable".into()).into(),
+    }
+}
+fn traversal_error(cause: ExperimentalRouteError) -> Error {
+    use crate::routing::RouteError;
+    error(match cause {
+        ExperimentalRouteError::Query(e) => crate::remote::query::graph_error(e),
+        ExperimentalRouteError::Unsupported(_) => QueryFailure::Unsupported,
+        ExperimentalRouteError::Route(RouteError::Storage(e))
+        | ExperimentalRouteError::Graph(ExperimentalError::Storage(e)) => {
+            crate::remote::query::storage_error(e)
+        }
+        ExperimentalRouteError::Graph(ExperimentalError::Invalid(_)) => {
+            QueryFailure::InvalidArgument
+        }
+        ExperimentalRouteError::Graph(_) => QueryFailure::IncompleteOrCorrupt,
+        _ => QueryFailure::Unavailable,
+    })
+}
+impl TraversalRead for FixedRead<'_> {
+    type Node = crate::remote::query::FrozenNode;
+    fn check(&self) -> ExperimentalResult<()> {
+        if Instant::now() >= self.end {
+            return Err(rocksdb_sql_table::StorageNodeError::Timeout { request_id: None }.into());
+        }
+        self.snapshot.version().map_err(provider_error)?;
+        Ok(())
+    }
+    fn partitions(&self) -> Vec<u32> {
+        self.snapshot.partitions()
+    }
+    fn metadata_bytes(&self) -> usize {
+        self.snapshot.partitions().len() * 64
+    }
+    fn store(&self, partition: u32) -> ExperimentalResult<AppendOnlyStore<Self::Node>> {
+        self.check()?;
+        self.snapshot.store(partition).map_err(provider_error)
+    }
+    fn get_vertex(&self, vertex: VertexRef) -> ExperimentalResult<Option<Vertex>> {
+        self.check()?;
+        self.snapshot.vertex(vertex).map_err(provider_error)
+    }
+    fn get_edge(&self, edge: EdgeRef) -> ExperimentalResult<Option<CrossEdge>> {
+        self.check()?;
+        self.snapshot.edge(edge).map_err(provider_error)
+    }
+    fn verified_edge_record(&self, edge: EdgeRef) -> ExperimentalResult<Option<EdgeRecord>> {
+        self.check()?;
+        self.snapshot
+            .verified_edge_record(edge)
+            .map_err(provider_error)
+    }
+    fn observed_adjacency(
+        &self,
+        vertex: VertexRef,
+        direction: Direction,
+    ) -> ExperimentalResult<Vec<CrossEdge>> {
+        self.check()?;
+        self.snapshot
+            .observed_adjacency(vertex, direction)
+            .map_err(provider_error)
+    }
+}
+fn qualified(element: ObservedElementRef) -> QualifiedElement {
+    match element {
+        ObservedElementRef::Vertex(v) => QualifiedElement::Vertex {
+            partition: v.partition,
+            id: v.id,
+        },
+        ObservedElementRef::Edge(e) => QualifiedElement::Edge {
+            partition: e.partition,
+            id: e.id,
+        },
+    }
+}
+pub(super) fn execute_traversal(
+    snapshot: &GraphSnapshot,
+    query: &Query,
+    end: Instant,
+) -> Result<QueryData> {
+    let rows = FixedRead { snapshot, end }
+        .execute_traversal(query.partition, &query.text)
+        .map_err(traversal_error)?;
+    let data = QueryData {
+        rows: rows
+            .into_iter()
+            .map(|row| match row {
+                ObservedRowV3::Vertex(v) => {
+                    QueryRow::Element(qualified(ObservedElementRef::Vertex(v)))
+                }
+                ObservedRowV3::Edge(e) => QueryRow::Element(qualified(ObservedElementRef::Edge(e))),
+                ObservedRowV3::Count(n) => QueryRow::Count(n),
+                ObservedRowV3::Value { source, value } => QueryRow::Value {
+                    source: Some(qualified(source)),
+                    value,
+                },
+                ObservedRowV3::Path(elements) => QueryRow::Path(
+                    elements
+                        .into_iter()
+                        .map(|e| match e {
+                            ObservedPathElement::Vertex(v) => {
+                                qualified(ObservedElementRef::Vertex(v))
+                            }
+                            ObservedPathElement::Edge(e) => qualified(ObservedElementRef::Edge(e)),
+                        })
+                        .collect(),
+                ),
+            })
+            .collect(),
+        completeness: QueryCompleteness::Unverified,
+    };
+    // Full result admission happens before any page can be emitted. Paging has
+    // separate complete-envelope admission, including echoes and tokens.
+    encode(&data, MAX_RESPONSE_BYTES)?;
+    snapshot.version()?;
+    before_deadline(end)?;
+    Ok(data)
+}
+// Upper bounds follow the admitted AST's order. A limit before expansion does
+// not incorrectly cap the final stream; both directions can contribute 2,000
+// adjacency candidates per input before the common 10,000-row ceiling.
+fn traversal_maximum(query: &ObservedGremlinQuery) -> usize {
+    use rocksdb_sql_table::ObservedGremlinStep as Step;
+    let ids = match query.start() {
+        GremlinStart::Vertices(ids) | GremlinStart::Edges(ids) => ids,
+    };
+    let mut maximum = if ids.is_empty() { 10_000 } else { ids.len() };
+    for step in query.steps() {
+        let factor = match step {
+            Step::BothE(_) | Step::Existing(GremlinStep::Both(_)) => 2000,
+            Step::OutE(_)
+            | Step::InE(_)
+            | Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_)) => 1000,
+            Step::BothV => 2,
+            Step::Existing(GremlinStep::Limit(n)) => {
+                maximum = maximum.min(*n);
+                1
+            }
+            _ => 1,
+        };
+        maximum = maximum.saturating_mul(factor).min(10_000);
+    }
+    maximum
+}
+pub(super) fn valid_traversal_total(query: &Query, total: u32) -> bool {
+    let Ok(parsed) = ObservedGremlinQuery::parse(&query.text) else {
+        return false;
+    };
+    if crate::routing::experimental::validate_traversal(&parsed).is_err() {
+        return false;
+    }
+    if matches!(
+        parsed.steps().last(),
+        Some(ObservedGremlinStep::Existing(GremlinStep::Count))
+    ) {
+        return total == 1;
+    }
+    let explicit = parsed
+        .steps()
+        .iter()
+        .any(|s| matches!(s, ObservedGremlinStep::Existing(GremlinStep::Limit(_))));
+    let maximum = traversal_maximum(&parsed);
+    total as usize
+        <= if explicit {
+            maximum
+        } else {
+            maximum.min(DEFAULT_GREMLIN_LIMIT)
+        }
+}
+/// Checks shapes/provenance in whole results or page slices. Bag duplicates are
+/// legal; this cannot authenticate a trusted peer or prove graph completeness.
+pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &Binding) -> bool {
+    use rocksdb_sql_table::ObservedGremlinStep as Step;
+    let member = |partition: u32| {
+        binding
+            .cohort
+            .members
+            .iter()
+            .any(|m| m.shard == u64::from(partition))
+    };
+    if !member(query.partition) || data.completeness != QueryCompleteness::Unverified {
+        return false;
+    }
+    let Ok(parsed) = ObservedGremlinQuery::parse(&query.text) else {
+        return false;
+    };
+    if crate::routing::experimental::validate_traversal(&parsed).is_err() {
+        return false;
+    }
+    let (mut edge, ids) = match parsed.start() {
+        GremlinStart::Vertices(ids) => (false, ids),
+        GremlinStart::Edges(ids) => (true, ids),
+    };
+    let mut shape = vec![edge];
+    let mut owners: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut scalar = false;
+    let mut label = false;
+    let mut count = false;
+    let mut path = false;
+    for step in parsed.steps() {
+        match step {
+            Step::OutE(_) | Step::InE(_) | Step::BothE(_) => {
+                if matches!(step, Step::OutE(_)) {
+                    owners.push((shape.len(), vec![shape.len() - 1]));
+                }
+                edge = true;
+                shape.push(true);
+            }
+            Step::InV | Step::OutV | Step::BothV => {
+                if matches!(step, Step::OutV) {
+                    owners.push((shape.len() - 1, vec![shape.len()]));
+                }
+                edge = false;
+                shape.push(false);
+            }
+            Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Both(_)) => {
+                let endpoints = match step {
+                    Step::Existing(GremlinStep::Out(_)) => vec![shape.len() - 1],
+                    Step::Existing(GremlinStep::In(_)) => vec![shape.len() + 1],
+                    _ => vec![shape.len() - 1, shape.len() + 1],
+                };
+                owners.push((shape.len(), endpoints));
+                shape.extend([true, false]);
+            }
+            Step::Existing(GremlinStep::Values(_)) => scalar = true,
+            Step::Existing(GremlinStep::Label) => {
+                scalar = true;
+                label = true;
+            }
+            Step::Existing(GremlinStep::Count) => count = true,
+            Step::Existing(GremlinStep::Path) => path = true,
+            _ => {}
+        }
+    }
+    if count {
+        return matches!(data.rows.as_slice(), [QueryRow::Count(n)] if *n <= traversal_maximum(&parsed) as u64);
+    }
+    if !valid_traversal_total(query, data.rows.len() as u32) {
+        return false;
+    }
+    let valid_element = |element: &QualifiedElement, expected_edge: bool| match element {
+        QualifiedElement::Vertex { partition, .. } => !expected_edge && member(*partition),
+        QualifiedElement::Edge { partition, .. } => expected_edge && member(*partition),
+    };
+    let valid_start = |element: &QualifiedElement| {
+        let (partition, id) = match element {
+            QualifiedElement::Vertex { partition, id }
+            | QualifiedElement::Edge { partition, id } => (*partition, *id),
+        };
+        ids.is_empty() || (partition == query.partition && ids.contains(&id))
+    };
+    let partition = |element: &QualifiedElement| match element {
+        QualifiedElement::Vertex { partition, .. } | QualifiedElement::Edge { partition, .. } => {
+            *partition
+        }
+    };
+    data.rows.iter().all(|row| match row {
+        QueryRow::Element(e) if !scalar && !path => {
+            valid_element(e, edge) && (shape.len() != 1 || valid_start(e))
+        }
+        QueryRow::Value {
+            source: Some(e),
+            value,
+        } if scalar => {
+            valid_element(e, edge)
+                && (shape.len() != 1 || valid_start(e))
+                && !matches!(value, Value::Real(v) if !v.is_finite())
+                && (!label || matches!(value, Value::Text(_)))
+        }
+        QueryRow::Path(elements) if path => {
+            elements.len() == shape.len()
+                && elements
+                    .iter()
+                    .zip(&shape)
+                    .all(|(e, edge)| valid_element(e, *edge))
+                && elements.first().is_some_and(valid_start)
+                && owners.iter().all(|(edge, vertices)| {
+                    vertices
+                        .iter()
+                        .any(|v| partition(&elements[*edge]) == partition(&elements[*v]))
+                })
+        }
+        _ => false,
     })
 }
