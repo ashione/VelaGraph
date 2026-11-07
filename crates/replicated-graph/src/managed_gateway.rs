@@ -17,8 +17,11 @@ use rocksdb_sql_table::{
     Value, Vertex,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[path = "managed_gateway_pages.rs"]
+mod pages;
 #[path = "managed_gateway_query.rs"]
 mod query;
+pub use pages::{PageCursor, QueryPage, MAX_PAGE_SIZE};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -40,7 +43,11 @@ pub const MAX_SESSIONS: usize = 4;
 /// Every materialization reserves both retained payload copies, including write
 /// preparation snapshots and expired sessions still held by an active worker.
 pub const SNAPSHOT_CHARGE: usize = 4 * 1024 * 1024;
-pub const MAX_RETAINED_BYTES: usize = MAX_SESSIONS * SNAPSHOT_CHARGE;
+/// Logical reservation for one immutable result, its bounded cursor registry,
+/// query identity, and transient page/encoding copies. This is not an RSS bound.
+pub const RESULT_CHARGE: usize = 4 * 1024 * 1024;
+pub const SESSION_CHARGE: usize = SNAPSHOT_CHARGE + RESULT_CHARGE;
+pub const MAX_RETAINED_BYTES: usize = MAX_SESSIONS * SESSION_CHARGE;
 pub const MAX_TTL: Duration = Duration::from_secs(60);
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
 const VERSION: u32 = 1;
@@ -255,7 +262,8 @@ pub struct Session {
     pub token: [u8; 32],
     pub version: u64,
 }
-/// Standard Gremlin text; partition only locates the explicit V/E start.
+/// Standard Gremlin text; partition locates explicit V/E starts. Traverse scans
+/// use the complete fixed cohort, while still requiring a member partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -276,6 +284,18 @@ pub enum Operation {
     Read {
         session: Session,
         query: Query,
+    },
+    /// Bounded traversal over exactly the retained session snapshot.
+    Traverse {
+        session: Session,
+        query: Query,
+    },
+    /// Replayable pages of one fully materialized bounded traversal.
+    TraversePage {
+        session: Session,
+        query: Query,
+        cursor: Option<PageCursor>,
+        page_size: u16,
     },
     Close {
         session: Session,
@@ -329,6 +349,18 @@ pub enum Reply {
         session: Session,
         query: Query,
         data: QueryData,
+    },
+    Traverse {
+        session: Session,
+        query: Query,
+        data: QueryData,
+    },
+    TraversePage {
+        session: Session,
+        query: Query,
+        cursor: Option<PageCursor>,
+        page_size: u16,
+        page: QueryPage,
     },
     Close(Session),
 }
@@ -448,6 +480,8 @@ struct Retained {
     snapshot: GraphSnapshot,
     expires: Instant,
     _memory: OwnedSemaphorePermit,
+    result: Mutex<Option<pages::Materialized>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 struct State {
     config: OwnedConfig,
@@ -525,6 +559,8 @@ impl State {
                 snapshot,
                 expires,
                 _memory: memory,
+                result: Mutex::new(None),
+                closed: std::sync::atomic::AtomicBool::new(false),
             }))
         })
         .await
@@ -653,8 +689,37 @@ impl State {
                 .await
                 .map_err(|_| Error::Unknown)?
             }
+            operation @ (Operation::Traverse { .. } | Operation::TraversePage { .. }) => {
+                let (session, query, cursor, page_size) = match operation {
+                    Operation::Traverse { session, query } => (session, query, None, None),
+                    Operation::TraversePage {
+                        session,
+                        query,
+                        cursor,
+                        page_size,
+                    } => (session, query, cursor, Some(page_size)),
+                    _ => unreachable!(),
+                };
+                let retained = self.get(&session)?;
+                let binding = self.config.binding.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _work = work;
+                    pages::execute(
+                        &retained,
+                        session,
+                        query,
+                        (cursor, page_size),
+                        &binding,
+                        end,
+                    )
+                })
+                .await
+                .map_err(|_| Error::Unknown)?
+            }
             Operation::Close { session } => {
-                self.get(&session)?;
+                self.get(&session)?
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
                 self.sessions.lock().unwrap().remove(&session.token);
                 Ok(Reply::Close(session))
             }
@@ -758,9 +823,10 @@ impl Gateway {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
-    /// Conservative reserved payload, including both copies and active captures.
+    /// Conservative logical reservation for snapshots, bounded result/cursor
+    /// storage, scratch copies and active captures; not an allocator/RSS bound.
     pub fn retained_payload_charge(&self) -> usize {
-        (MAX_SESSIONS - self.state.memory.available_permits()) * SNAPSHOT_CHARGE
+        (MAX_SESSIONS - self.state.memory.available_permits()) * SESSION_CHARGE
     }
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
@@ -795,7 +861,10 @@ async fn serve(
     end: Instant,
 ) -> Result<()> {
     let request: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await?;
-    let end = if matches!(request.operation, Operation::Read { .. }) {
+    let end = if matches!(
+        request.operation,
+        Operation::Read { .. } | Operation::Traverse { .. } | Operation::TraversePage { .. }
+    ) {
         end.min(Instant::now() + rocksdb_sql_table::GREMLIN_DEADLINE)
     } else {
         end
@@ -824,7 +893,12 @@ async fn serve(
         result,
     };
     let expiry = match &response.result {
-        Ok(Reply::OpenSession(s) | Reply::Read { session: s, .. }) => Some(state.get(s)?.expires),
+        Ok(
+            Reply::OpenSession(s)
+            | Reply::Read { session: s, .. }
+            | Reply::Traverse { session: s, .. }
+            | Reply::TraversePage { session: s, .. },
+        ) => Some(state.get(s)?.expires),
         _ => None,
     };
     let (bytes, success) = tokio::task::spawn_blocking(move || {
@@ -949,6 +1023,41 @@ fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
                 data,
             },
         ) => session == s && query == q && query::valid_output(query, data, &request.binding),
+        (
+            Operation::Traverse { session, query },
+            Reply::Traverse {
+                session: s,
+                query: q,
+                data,
+            },
+        ) => {
+            session == s
+                && query == q
+                && query::valid_traversal_output(query, data, &request.binding)
+                && data.rows.len() <= pages::MAX_ROWS
+                && encode(data, pages::MAX_RESULT_BYTES).is_ok()
+        }
+        (
+            Operation::TraversePage {
+                session,
+                query,
+                cursor,
+                page_size,
+            },
+            Reply::TraversePage {
+                session: s,
+                query: q,
+                cursor: c,
+                page_size: size,
+                page,
+            },
+        ) => {
+            session == s
+                && query == q
+                && cursor == c
+                && page_size == size
+                && pages::valid_page(query, cursor.as_ref(), *page_size, page, &request.binding)
+        }
         (Operation::Close { session }, Reply::Close(s)) => session == s,
         _ => false,
     };

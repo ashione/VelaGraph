@@ -380,3 +380,14 @@ evidence. Real child-process tests cover partial publication and persistent
 restart recovery. This is a trusted plaintext, static-placement single-replica
 validation slice, not multi-machine/HA evidence, auth/TLS, old remote Global
 query admission or D4/D5 completion. See [contract](REMOTE_MANAGED_TRANSPORT.md).
+
+### Managed fixed-version traversal and pages
+
+The existing bounded routing-v3 executor now has a private read-provider seam.
+Managed Traverse/TraversePage execute against one certified cohort GraphSnapshot
+and preserve V across complete-result pages, while the legacy provider retains
+its weak observed metadata. Small independent-process fixtures exercise cyclic
+reporting, multiple department membership and concurrent mutation counterexamples.
+Data-local fragment/hierarchy job integration, larger managed bounds and full-scale
+CoreHR CI on this new path remain future work. See
+[contract](MANAGED_FIXED_TRAVERSALS.md); no unrestricted Global admission is enabled.

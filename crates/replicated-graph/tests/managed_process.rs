@@ -10,13 +10,17 @@ use d2_raft::{
 };
 use replicated_graph::{
     managed_gateway::{
-        self as gateway, Binding, EdgeData, Gateway, Mapping, Mutation, Operation, Query,
-        RemoteConfig, Reply, Session, VertexData, Write, WriteStatus,
+        self as gateway, Binding, EdgeData, Entity, Gateway, Mapping, Mutation, Operation,
+        PageCursor, Patch, Query, QueryPage, RemoteConfig, Reply, Session, VertexData, Write,
+        WriteStatus,
     },
     managed_graph::GraphCohort,
     remote::query::{QualifiedElement, QueryCompleteness, QueryRow},
 };
-use rocksdb_sql_table::experimental_graph::{CrossEdge, VertexRef};
+use rocksdb_sql_table::{
+    experimental_graph::{CrossEdge, VertexRef},
+    Value,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -381,7 +385,7 @@ async fn rejects_wrong_identity(process: &Process) -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_managed_processes_partial_commit_and_durable_recovery() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(150), scenario()).await?
+    tokio::time::timeout(Duration::from_secs(240), scenario()).await?
 }
 async fn scenario() -> anyhow::Result<()> {
     let mut coordinator = Process::start(9).await?;
@@ -547,6 +551,13 @@ async fn scenario() -> anyhow::Result<()> {
     )
     .await
     .is_err());
+    assert!(traverse(&g, &old, 7, "g.V(1).out('knows').path()")
+        .await?
+        .is_empty());
+    let partial_page = page(&g, &old, 7, "g.V(1).out('knows').path()", None, 1).await?;
+    assert!(partial_page.data.rows.is_empty());
+    assert_eq!(partial_page.total, 0);
+    assert!(partial_page.next.is_none());
     let common = open(&g, None).await?;
     assert_eq!(common.version, old.version);
     assert!(read(&g, &common, 7, "g.V(1).outE('knows')")
@@ -782,6 +793,498 @@ async fn scenario() -> anyhow::Result<()> {
     assert_eq!(final_journal.request(write.external_id), Some(&record));
     call(&g, Operation::Close { session: fresh }).await?;
     call(&g, Operation::Close { session: old }).await?;
+    let (stale_session, stale_cursor) = fixed_version_traversal_scenario(&g).await?;
     g.shutdown().await;
+    b.stop()?;
+    coordinator.stop()?;
+    b.reopen().await?;
+    coordinator.reopen().await?;
+    // A new gateway incarnation cannot revive old sessions or page tokens,
+    // although all durable graph writes and their caller-supplied IDs survive.
+    let reopened = Gateway::bind_remote(
+        RemoteConfig {
+            coordinator: c_client,
+            binding: binding(),
+            members: vec![a_client, b_client],
+        },
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
+    assert!(page(
+        &reopened,
+        &stale_session,
+        7,
+        "g.V(101).out('reports').out('reports').out('reports').path()",
+        Some(stale_cursor),
+        1
+    )
+    .await
+    .is_err());
+    assert!(traverse(&reopened, &stale_session, 7, "g.V(101)")
+        .await
+        .is_err());
+    let recovered_session = open(&reopened, None).await?;
+    assert_eq!(
+        traverse(
+            &reopened,
+            &recovered_session,
+            7,
+            "g.V(101).out('reports').values('name')"
+        )
+        .await?,
+        vec![value(8, 101, "Robert")]
+    );
+    assert_eq!(
+        traverse(&reopened, &recovered_session, 8, "g.V(103).values('name')").await?,
+        vec![value(8, 103, "Cara")]
+    );
+    call(
+        &reopened,
+        Operation::Close {
+            session: recovered_session,
+        },
+    )
+    .await?;
+    reopened.shutdown().await;
     Ok(())
+}
+
+async fn traverse(
+    g: &Gateway,
+    session: &Session,
+    partition: u32,
+    text: &str,
+) -> anyhow::Result<Vec<QueryRow>> {
+    let query = Query {
+        partition,
+        text: text.into(),
+    };
+    match call(
+        g,
+        Operation::Traverse {
+            session: session.clone(),
+            query: query.clone(),
+        },
+    )
+    .await?
+    {
+        Reply::Traverse {
+            session: returned,
+            query: echoed,
+            data,
+        } => {
+            assert_eq!(returned, *session);
+            assert_eq!(echoed, query);
+            assert_eq!(data.completeness, QueryCompleteness::Unverified);
+            Ok(data.rows)
+        }
+        other => anyhow::bail!("expected traversal: {other:?}"),
+    }
+}
+async fn page(
+    g: &Gateway,
+    session: &Session,
+    partition: u32,
+    text: &str,
+    cursor: Option<PageCursor>,
+    page_size: u16,
+) -> anyhow::Result<QueryPage> {
+    let query = Query {
+        partition,
+        text: text.into(),
+    };
+    match call(
+        g,
+        Operation::TraversePage {
+            session: session.clone(),
+            query: query.clone(),
+            cursor: cursor.clone(),
+            page_size,
+        },
+    )
+    .await?
+    {
+        Reply::TraversePage {
+            session: returned,
+            query: echoed,
+            cursor: returned_cursor,
+            page_size: returned_size,
+            page,
+        } => {
+            assert_eq!(returned, *session);
+            assert_eq!(echoed, query);
+            assert_eq!(returned_cursor, cursor);
+            assert_eq!(returned_size, page_size);
+            assert_eq!(page.data.completeness, QueryCompleteness::Unverified);
+            Ok(page)
+        }
+        other => anyhow::bail!("expected page: {other:?}"),
+    }
+}
+fn element(partition: u32, id: u64) -> QualifiedElement {
+    QualifiedElement::Vertex { partition, id }
+}
+fn row(partition: u32, id: u64) -> QueryRow {
+    QueryRow::Element(element(partition, id))
+}
+fn value(partition: u32, id: u64, text: &str) -> QueryRow {
+    QueryRow::Value {
+        source: Some(element(partition, id)),
+        value: Value::Text(text.into()),
+    }
+}
+fn person_write(external: u8, partition: u32, id: u64, label: &str, name: &str) -> Write {
+    Write {
+        external_id: [external; 16],
+        mutation: Mutation::CreateVertex {
+            partition,
+            vertex: VertexData {
+                id,
+                labels: vec![label.into()],
+                properties: BTreeMap::from([("name".into(), Value::Text(name.into()))]),
+            },
+        },
+    }
+}
+fn relation_write(external: u8, id: u64, from: (u32, u64), to: (u32, u64), label: &str) -> Write {
+    Write {
+        external_id: [external; 16],
+        mutation: Mutation::CreateEdge {
+            edge: EdgeData {
+                id,
+                from: Entity {
+                    partition: from.0,
+                    id: from.1,
+                },
+                to: Entity {
+                    partition: to.0,
+                    id: to.1,
+                },
+                label: label.into(),
+                properties: BTreeMap::new(),
+            },
+        },
+    }
+}
+
+/// Small generic personnel graph, not a large CoreHR benchmark. Edge identity is
+/// source-qualified: both partitions own edge 101 and vertex 101. Parallel
+/// reporting edges must retain bag multiplicity even on repeated cyclic paths.
+async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Session, PageCursor)> {
+    let fixture = vec![
+        person_write(20, 7, 101, "person", "Alice"),
+        person_write(21, 8, 101, "person", "Bob"),
+        person_write(22, 7, 102, "department", "Engineering"),
+        person_write(23, 8, 102, "department", "Research"),
+        relation_write(24, 101, (7, 101), (8, 101), "reports"),
+        relation_write(25, 102, (7, 101), (8, 101), "reports"),
+        relation_write(26, 101, (8, 101), (7, 101), "reports"),
+        relation_write(27, 103, (7, 101), (7, 102), "member"),
+        relation_write(28, 104, (7, 101), (8, 102), "member"),
+        relation_write(29, 102, (8, 101), (8, 102), "member"),
+    ];
+    for write in fixture {
+        committed(call(g, Operation::Submit(write)).await?);
+    }
+    let old = open(g, None).await?;
+    // Expansion is in edge-ID order. Each hop records its canonical edge,
+    // so the two independent choices of parallel edge yield distinct paths.
+    let paths: Vec<_> = [101, 102]
+        .into_iter()
+        .flat_map(|first_edge| {
+            [101, 102].into_iter().map(move |last_edge| {
+                QueryRow::Path(vec![
+                    element(7, 101),
+                    QualifiedElement::Edge {
+                        partition: 7,
+                        id: first_edge,
+                    },
+                    element(8, 101),
+                    QualifiedElement::Edge {
+                        partition: 8,
+                        id: 101,
+                    },
+                    element(7, 101),
+                    QualifiedElement::Edge {
+                        partition: 7,
+                        id: last_edge,
+                    },
+                    element(8, 101),
+                ])
+            })
+        })
+        .collect();
+    let path_query = "g.V(101).out('reports').out('reports').out('reports').path()";
+    // Reference expectations are fixture-derived, not obtained from the query
+    // engine under test. In particular, no dedup is allowed on the four paths.
+    let expectations = vec![
+        (7, path_query, paths.clone()),
+        (
+            7,
+            "g.V(101).out('reports').out('reports').out('reports').count()",
+            vec![QueryRow::Count(4)],
+        ),
+        (
+            7,
+            "g.V(101).out('reports').has('name','Bob').values('name')",
+            vec![value(8, 101, "Bob"); 2],
+        ),
+        (
+            7,
+            "g.V(101).out('member').hasLabel('department').values('name')",
+            vec![value(7, 102, "Engineering"), value(8, 102, "Research")],
+        ),
+        (
+            8,
+            "g.V(102).in('member').hasLabel('person').count()",
+            vec![QueryRow::Count(2)],
+        ),
+        (
+            7,
+            "g.V(101).both('reports').count()",
+            vec![QueryRow::Count(3)],
+        ),
+        (7, "g.V(101).outE('reports').inV()", vec![row(8, 101); 2]),
+        (8, "g.V(101).inE('reports').outV()", vec![row(7, 101); 2]),
+        (7, "g.E(101).bothV()", vec![row(7, 101), row(8, 101)]),
+        (8, "g.E(101).bothV()", vec![row(8, 101), row(7, 101)]),
+        (
+            7,
+            "g.V(101).bothE('reports').count()",
+            vec![QueryRow::Count(3)],
+        ),
+        (
+            7,
+            "g.V().hasLabel('department').values('name')",
+            vec![value(7, 102, "Engineering"), value(8, 102, "Research")],
+        ),
+        (
+            7,
+            "g.E().hasLabel('reports').count()",
+            vec![QueryRow::Count(3)],
+        ),
+        (7, "g.V(101).out('reports').limit(1)", vec![row(8, 101)]),
+        (8, "g.V(101).label()", vec![value(8, 101, "person")]),
+        (8, "g.V(103)", vec![]),
+    ];
+    for (partition, query, expected) in &expectations {
+        assert_eq!(
+            traverse(g, &old, *partition, query).await?,
+            *expected,
+            "{query}"
+        );
+    }
+    let first = page(g, &old, 7, path_query, None, 1).await?;
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.total, 4);
+    assert_eq!(first.data.rows, paths[..1]);
+    let next = first
+        .next
+        .clone()
+        .context("four-row page has continuation")?;
+    for (query, size) in [
+        ("g.V(101).count()", 1),
+        (path_query, 2),
+        (path_query, 0),
+        (path_query, 1001),
+    ] {
+        assert!(call(
+            g,
+            Operation::TraversePage {
+                session: old.clone(),
+                query: Query {
+                    partition: 7,
+                    text: query.into()
+                },
+                cursor: Some(next.clone()),
+                page_size: size
+            }
+        )
+        .await
+        .is_err());
+    }
+    let mut altered_token = next.clone();
+    altered_token.token[0] ^= 1;
+    assert!(page(g, &old, 7, path_query, Some(altered_token), 1)
+        .await
+        .is_err());
+    assert!(page(g, &old, 8, path_query, Some(next.clone()), 1)
+        .await
+        .is_err());
+    let mut wrong_version = old.clone();
+    wrong_version.version += 1;
+    assert!(
+        page(g, &wrong_version, 7, path_query, Some(next.clone()), 1)
+            .await
+            .is_err()
+    );
+    let another = open(g, Some(old.version)).await?;
+    assert!(page(g, &another, 7, path_query, Some(next.clone()), 1)
+        .await
+        .is_err());
+    call(g, Operation::Close { session: another }).await?;
+    for unsupported in [
+        "g.V(101).id()",
+        "g.V(101).dedup()",
+        "g.V(101).valueMap('name')",
+        "g.V(101).repeat(out()).times(2)",
+        "g.V(101).out().out().out().out()",
+    ] {
+        assert!(
+            traverse(g, &old, 7, unsupported).await.is_err(),
+            "accepted {unsupported}"
+        );
+    }
+    let writes = vec![
+        person_write(30, 8, 103, "person", "Cara"),
+        Write {
+            external_id: [31; 16],
+            mutation: Mutation::PatchVertex {
+                vertex: Entity {
+                    partition: 8,
+                    id: 101,
+                },
+                patch: Patch {
+                    set: BTreeMap::from([("name".into(), Value::Text("Robert".into()))]),
+                    remove: BTreeSet::new(),
+                },
+            },
+        },
+        Write {
+            external_id: [32; 16],
+            mutation: Mutation::DeleteEdge {
+                edge: Entity {
+                    partition: 7,
+                    id: 102,
+                },
+            },
+        },
+        relation_write(33, 103, (8, 103), (7, 102), "member"),
+    ];
+    // Rendezvous makes each committed write and each read phase explicit. The
+    // writer cannot race ahead of the reader; no sleep or scheduler luck is used.
+    let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel(1);
+    let address = g.local_addr();
+    let writer_session = old.clone();
+    let writer_paths = paths.clone();
+    let writer = tokio::spawn(async move {
+        for write in writes {
+            go_rx.recv().await.context("reader released writer")?;
+            // Poll Submit concurrently with sequential Traverse and page TCP
+            // calls. Same-session queries intentionally never overlap because
+            // their admission uses try_lock. Every write/read interleaving
+            // must still return the same retained old V.
+            let query = Query {
+                partition: 7,
+                text: path_query.into(),
+            };
+            let (result, (traversal, paged)) = tokio::join!(
+                gateway::request(address, binding(), Operation::Submit(write), BUDGET),
+                async {
+                    let traversal = gateway::request(
+                        address,
+                        binding(),
+                        Operation::Traverse {
+                            session: writer_session.clone(),
+                            query: query.clone(),
+                        },
+                        BUDGET,
+                    )
+                    .await;
+                    let paged = gateway::request(
+                        address,
+                        binding(),
+                        Operation::TraversePage {
+                            session: writer_session.clone(),
+                            query,
+                            cursor: None,
+                            page_size: 1,
+                        },
+                        BUDGET,
+                    )
+                    .await;
+                    (traversal, paged)
+                },
+            );
+            match traversal? {
+                Reply::Traverse { session, data, .. } => {
+                    assert_eq!(session, writer_session);
+                    assert_eq!(data.rows, writer_paths);
+                }
+                other => anyhow::bail!("concurrent traversal: {other:?}"),
+            }
+            match paged? {
+                Reply::TraversePage { session, page, .. } => {
+                    assert_eq!(session, writer_session);
+                    assert_eq!(page.total, 4);
+                    assert_eq!(page.offset, 0);
+                    assert_eq!(page.data.rows, writer_paths[..1]);
+                }
+                other => anyhow::bail!("concurrent page: {other:?}"),
+            }
+            done_tx
+                .send(result)
+                .await
+                .map_err(|_| anyhow!("reader stopped"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut cursor = first.next;
+    let mut collected = first.data.rows;
+    let mut last_version = old.version;
+    for phase in 0..4 {
+        go_tx.send(()).await?;
+        let (_, version) = committed(done_rx.recv().await.context("writer result")??);
+        assert!(version > last_version);
+        last_version = version;
+        for (partition, query, expected) in &expectations {
+            assert_eq!(
+                traverse(g, &old, *partition, query).await?,
+                *expected,
+                "phase {phase}: {query}"
+            );
+        }
+        if let Some(token) = cursor.take() {
+            let next_page = page(g, &old, 7, path_query, Some(token.clone()), 1).await?;
+            assert_eq!(
+                next_page,
+                page(g, &old, 7, path_query, Some(token), 1).await?,
+                "continuation replay is immutable"
+            );
+            assert_eq!(next_page.offset as usize, collected.len());
+            assert_eq!(next_page.total, 4);
+            collected.extend(next_page.data.rows);
+            cursor = next_page.next;
+        }
+        let fresh = open(g, Some(version)).await?;
+        assert_eq!(
+            traverse(g, &fresh, 8, "g.V(103).values('name')").await?,
+            vec![value(8, 103, "Cara")]
+        );
+        let name = if phase == 0 { "Bob" } else { "Robert" };
+        let multiplicity = if phase < 2 { 2 } else { 1 };
+        assert_eq!(
+            traverse(g, &fresh, 7, "g.V(101).out('reports').values('name')").await?,
+            vec![value(8, 101, name); multiplicity]
+        );
+        assert_eq!(
+            traverse(g, &fresh, 7, path_query).await?.len(),
+            multiplicity * multiplicity
+        );
+        assert_eq!(
+            traverse(g, &fresh, 7, "g.V(102).in('member').count()").await?,
+            vec![QueryRow::Count(if phase == 3 { 2 } else { 1 })]
+        );
+        call(g, Operation::Close { session: fresh }).await?;
+    }
+    writer.await??;
+    assert_eq!(collected, paths);
+    assert!(cursor.is_none());
+    // Even after every mutation, starting and replaying the first page is exact.
+    let replay = page(g, &old, 7, path_query, None, 1).await?;
+    assert_eq!(replay.data.rows, collected[..1]);
+    assert_eq!(replay.total, 4);
+    Ok((old, next))
 }

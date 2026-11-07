@@ -5,6 +5,7 @@ use rocksdb_sql_table::experimental_graph::{
     AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRecord, EdgeRef,
     ExperimentalError, PreparedBatch, VertexPropertyPatch, VertexRef,
 };
+pub(crate) use traversal::{validate_traversal, TraversalRead};
 pub use traversal::{
     ObservedElementRef, ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3,
     ObservedTraversal, ObservedTraversalV2, ObservedTraversalV3,
