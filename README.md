@@ -1,18 +1,28 @@
-# rocksdb-sql-table
+# RocksDB-backed Distributed Property Graph (Experimental)
 
-An embeddable **RocksDB storage kernel** with two front ends: a strict SQL table
-engine and a **property-graph engine**. It is a self-contained implementation
-(not a SQL layer over SQLite): catalogs, indexes, rows, graph records, and
-adjacency all live in RocksDB key spaces.
+An experimental **distributed property-graph engine** built on a RocksDB storage
+kernel, with a bounded standard Gremlin subset and a separate SQL table engine.
+The repository combines local graph storage and single-partition transactions
+with Raft-backed storage nodes, static remote routing, and bounded cross-shard
+query coordination. Catalogs, indexes, rows, graph records, and adjacency live in
+RocksDB key spaces; the SQL engine is not a layer over SQLite.
 
-The long-term target is a **distributed property-graph and table kernel**, not a
-SQL-only database. The graph path is being completed first — snapshot reads,
-single-partition write transactions, and process-crash recovery — followed by
-Raft replication (D2) and cross-shard coordination (D4). An in-process
-three-node graph-record replication prototype now exists; the full GraphEngine,
-static remote routing and bounded global Gremlin scans are available; cross-shard
-transactions and edge traversal are not implemented. This README states
-those boundaries so prototype behavior is not mistaken for the final design.
+Current graph work focuses on the CoreHR scenario: 200,000 people, 5,000
+departments, reporting hierarchies, and membership in multiple departments.
+The [full-scale CI scenario](.github/workflows/corehr.yml) exercises supported
+queries, hierarchy counts, and ordered vertex-identity result pages against
+generated reference data. This is functional validation on same-host independent
+processes, not a multi-machine performance or availability claim.
+
+Cross-shard graph operations remain an **opt-in experiment**: staged writes are
+not atomic across shards, and query results carry per-shard snapshots and
+Unverified completeness, not a globally atomic snapshot. Cross-shard transactions,
+automatic failover, online migration, and production transport security remain
+unfinished. The goal is a distributed graph database; this is not yet a
+production-ready one.
+
+The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
+remain unchanged.
 
 The SQL subset is intentionally small and strict: create/drop tables, create/drop
 indexes, insert, update, delete, and single-table `SELECT` with filtering,
@@ -24,7 +34,7 @@ ordering, pagination, `DISTINCT`, `GROUP BY`, `HAVING`, and
 | Track | Current state |
 | --- | --- |
 | Graph kernel | Property records, adjacency indexes, bounded traversal and standard Gremlin v0 are implemented. K3a snapshot read views, K3b single-partition write transactions, and K3c process-crash recovery are implemented. |
-| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; `crates/replicated-graph` now connects `GraphRecordStore` to actual Raft through a bounded in-process D1 adapter, leader read barriers and retained prepared mutations for exact retries ([contract](docs/REPLICATED_GRAPH.md)). A separate [development-only TCP adapter](docs/REMOTE_GRAPH.md) now adds explicitly selected remote replicas and client-side Gremlin; a bounded [D3a static catalog](docs/D3_STATIC_CATALOG.md) now persists immutable placement in a dedicated metadata group, with quorum reads and conditional registration. Its fixed-candidate resolver pins read sessions and exact retry identities, with both in-process and [static remote](docs/REMOTE_ROUTING.md) endpoints; [bounded global V/E scans](docs/GLOBAL_SCAN.md) now merge partition-qualified results with ordered has/hasLabel filters, values/label projections and global limit/count, while migration, transport security, cross-partition edge traversal and transactions remain unsupported. |
+| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; `crates/replicated-graph` now connects `GraphRecordStore` to actual Raft through a bounded in-process D1 adapter, leader read barriers and retained prepared mutations for exact retries ([contract](docs/REPLICATED_GRAPH.md)). A separate [development-only TCP adapter](docs/REMOTE_GRAPH.md) now adds explicitly selected remote replicas and client-side Gremlin; a bounded [D3a static catalog](docs/D3_STATIC_CATALOG.md) now persists immutable placement in a dedicated metadata group, with quorum reads and conditional registration. Its fixed-candidate resolver pins read sessions and exact retry identities, with both in-process and [static remote](docs/REMOTE_ROUTING.md) endpoints; [bounded global V/E scans](docs/GLOBAL_SCAN.md) now merge partition-qualified results with ordered has/hasLabel filters, values/label projections and global limit/count, while migration, transport security and cross-partition transactions remain unsupported. Cross-shard edge traversal is available only through the separate opt-in observed-query experiment below. |
 | SQL engine | The documented SQL subset is supported; it remains autocommit per statement and does not participate in graph transactions. |
 
 An explicit [single-partition server query experiment](docs/REMOTE_QUERY.md) now
@@ -42,7 +52,7 @@ discovery, and still returns Unverified observations. Its separately bounded
 bounded native counts over a fixed snapshot vector without retaining full paths.
 It has a separate finite lease and explicit budgets; terminal emitted dedup shares
 identity state across traversal depths without suppressing cycles or increasing
-the identity cap. It does not provide vertex/path pagination. A separate [global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
+the identity cap. Count jobs do not return rows; separate [ordered hierarchy result jobs](docs/HIERARCHY_RESULT_PAGES.md) provide qualified vertex-identity pages, not property or path pages. A separate [global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
 filters/limit/count without downloading the graph to the coordinator.
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
