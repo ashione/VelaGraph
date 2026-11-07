@@ -392,6 +392,14 @@ Data-local fragment/hierarchy job integration, larger managed bounds and full-sc
 CoreHR CI on this new path remain future work. See
 [contract](MANAGED_FIXED_TRAVERSALS.md); no unrestricted Global admission is enabled.
 
+### Exact terminal read evidence
+
+Managed fixed-cohort acquisition now fixes V using bounded metadata and compares
+versioned exact terminal-prefix segments, excluding archived external requests and
+Plans. Old-V evidence is independent of later writes; latest-V evidence remains
+O(V). Durable archive, prepare/advance, retention limits and the older Global
+Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
+
 ### Global scan selected properties and identity dedup
 
 无跳 `g.V()` 现在支持过滤/limit 间的顶点身份 `dedup()` 以及终端指定字段

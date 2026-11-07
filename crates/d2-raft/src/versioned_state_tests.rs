@@ -655,7 +655,7 @@ async fn bound_empty_baseline_reopens_and_rejects_conflicting_terminal_prefix() 
     commit(&mut j, 2, &[7]);
     apply(&mut sm, &mut i, advance(7, 1, &j)).await.unwrap();
     drop(sm);
-    let sm = StateMachine::open(dir.path()).unwrap();
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
     let limit = ReadLimit {
         rows: 10,
         bytes: 1000,
@@ -665,11 +665,48 @@ async fn bound_empty_baseline_reopens_and_rejects_conflicting_terminal_prefix() 
         .certified_participant_read(7, 1, [7; 16], 1, limit.clone(), &j)
         .await
         .unwrap();
+    let proof = j.terminal_prefix(1).unwrap();
+    let (projected_view, retained) = sm
+        .certified_terminal_read(7, 1, [7; 16], limit.clone(), &proof)
+        .await
+        .unwrap();
+    assert_eq!(projected_view, view);
+    assert_eq!(retained, proof);
+    let image = sm.build_snapshot().await.unwrap();
+    let mut restored = Arc::new(StateMachine::default());
+    restored
+        .install_snapshot(&image.meta, image.snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .certified_terminal_read(7, 1, [7; 16], limit.clone(), &proof)
+            .await
+            .unwrap(),
+        (view.clone(), proof.clone())
+    );
+    assert_eq!(
+        sm.participant_terminal_prefix(7, 1, [7; 16], &proof)
+            .await
+            .unwrap(),
+        proof
+    );
     assert_eq!(view.baseline_sequence, 0);
     assert_eq!(view.cohort, j.cohort().cloned());
     let mut fork = bound_journal();
     begin(&mut fork, 3, &[7]);
     commit(&mut fork, 3, &[7]);
+    assert_eq!(
+        sm.certified_terminal_read(
+            7,
+            1,
+            [7; 16],
+            limit.clone(),
+            &fork.terminal_prefix(1).unwrap()
+        )
+        .await,
+        Err(D1Error::VisibilityHistory)
+    );
     assert_eq!(
         sm.certified_participant_read(7, 1, [7; 16], 1, limit, &fork)
             .await,

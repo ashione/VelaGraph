@@ -788,6 +788,51 @@ impl StateMachine {
         Ok((snapshot, visibility.journal.clone()))
     }
 
+    /// Same-lock exact terminal evidence without copying request/Plan archives.
+    pub async fn participant_terminal_prefix(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        expected: &crate::terminal_prefix::TerminalPrefix,
+    ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        d1.certified_terminal_prefix(expected)
+    }
+
+    /// Both returned rows and evidence come from the same participant state lock.
+    /// This local helper still requires a leader barrier and complete-cohort checks.
+    pub async fn certified_terminal_read(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        limit: crate::versioned_reads::ReadLimit,
+        expected: &crate::terminal_prefix::TerminalPrefix,
+    ) -> Result<
+        (
+            crate::versioned_reads::ReadSnapshot,
+            crate::terminal_prefix::TerminalPrefix,
+        ),
+        D1Error,
+    > {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let retained = d1.certified_terminal_prefix(expected)?;
+        Ok((d1.read_at(expected.version(), limit)?, retained))
+    }
+
     /// Local diagnostic participant status. Establish a leader read barrier
     /// before using this for distributed recovery; Unknown never means Aborted.
     pub async fn participant_status(
@@ -840,6 +885,63 @@ impl StateMachine {
             return Err(D1Error::ManagedModeConflict);
         }
         d1.coordinator.clone().ok_or(D1Error::CoordinatorNotEnabled)
+    }
+
+    /// Bounded coordinator metadata only: no request or Plan archive clone.
+    /// Distributed callers must establish a leader barrier before sampling.
+    pub async fn coordinator_summary(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<crate::managed_rpc::CoordinatorSummary, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let journal = d1
+            .coordinator
+            .as_ref()
+            .ok_or(D1Error::CoordinatorNotEnabled)?;
+        Ok(crate::managed_rpc::CoordinatorSummary {
+            authority: crate::participant_writes::Authority {
+                shard,
+                mode: journal.authority(),
+            },
+            cohort: journal
+                .cohort()
+                .cloned()
+                .ok_or(D1Error::VisibilityHistory)?,
+            resolved_prefix: journal.resolved_prefix(),
+        })
+    }
+
+    /// Project only the requested terminal cut from the replay-validated state.
+    /// Later admitted request/Plan bytes are never copied by this read path.
+    pub async fn coordinator_terminal_prefix(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        version: u64,
+    ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let journal = d1
+            .coordinator
+            .as_ref()
+            .ok_or(D1Error::CoordinatorNotEnabled)?;
+        journal
+            .terminal_prefix(version)
+            .map_err(|_| D1Error::VisibilityUnresolved)
     }
 
     /// Local diagnostic metadata, not a linearizable distributed read.

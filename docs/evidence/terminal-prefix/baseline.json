@@ -1,0 +1,133 @@
+{
+  "capture_samples": [
+    {
+      "bytes": 140,
+      "capture_ms": 1543.327361,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.058628,
+      "repeat": 1,
+      "replay_operations": 1,
+      "rows": 1,
+      "verified_vertices": 1,
+      "version": 1
+    },
+    {
+      "bytes": 17921,
+      "capture_ms": 1587.768074,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.035003,
+      "repeat": 1,
+      "replay_operations": 128,
+      "rows": 128,
+      "verified_vertices": 128,
+      "version": 128
+    },
+    {
+      "bytes": 20741,
+      "capture_ms": 1579.2776210000002,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.035363,
+      "repeat": 1,
+      "replay_operations": 148,
+      "rows": 148,
+      "verified_vertices": 148,
+      "version": 148
+    },
+    {
+      "bytes": 140,
+      "capture_ms": 1571.7806570000002,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.033851,
+      "repeat": 2,
+      "replay_operations": 1,
+      "rows": 1,
+      "verified_vertices": 1,
+      "version": 1
+    },
+    {
+      "bytes": 17921,
+      "capture_ms": 1557.180833,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.035914,
+      "repeat": 2,
+      "replay_operations": 128,
+      "rows": 128,
+      "verified_vertices": 128,
+      "version": 128
+    },
+    {
+      "bytes": 20741,
+      "capture_ms": 1528.5907160000002,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 1.207676,
+      "repeat": 2,
+      "replay_operations": 148,
+      "rows": 148,
+      "verified_vertices": 148,
+      "version": 148
+    },
+    {
+      "bytes": 140,
+      "capture_ms": 1688.204195,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.034071,
+      "repeat": 3,
+      "replay_operations": 1,
+      "rows": 1,
+      "verified_vertices": 1,
+      "version": 1
+    },
+    {
+      "bytes": 17921,
+      "capture_ms": 1516.017585,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.049985,
+      "repeat": 3,
+      "replay_operations": 128,
+      "rows": 128,
+      "verified_vertices": 128,
+      "version": 128
+    },
+    {
+      "bytes": 20741,
+      "capture_ms": 1521.291088,
+      "next_vertex_absent": true,
+      "prepare_vertex_ms": 0.035153000000000004,
+      "repeat": 3,
+      "replay_operations": 148,
+      "rows": 148,
+      "verified_vertices": 148,
+      "version": 148
+    }
+  ],
+  "common_version": 148,
+  "explicit_v149_error": "Snapshot(Application(VisibilityNotApplied))",
+  "fixture": "independent regular-file /tmp copies; original DBs never opened",
+  "id1_retry_ms": 2016.788634,
+  "journal_and_exact_retained_plan_unchanged": true,
+  "journal_samples": [
+    {
+      "journal_encode_ms": 31.845437999999998,
+      "journal_encoded_bytes": 1004638,
+      "journal_transfer_decode_ms": 227.991624,
+      "repeat": 1
+    },
+    {
+      "journal_encode_ms": 32.184818,
+      "journal_encoded_bytes": 1004638,
+      "journal_transfer_decode_ms": 227.16149099999998,
+      "repeat": 2
+    },
+    {
+      "journal_encode_ms": 32.548986,
+      "journal_encoded_bytes": 1004638,
+      "journal_transfer_decode_ms": 225.092617,
+      "repeat": 3
+    }
+  ],
+  "label": "baseline",
+  "new_external_ids_submitted": 0,
+  "processes": 5,
+  "profile": "debug, jobs=1, incremental=0",
+  "terminal_transactions": 149
+}

@@ -152,8 +152,17 @@ pub async fn acquire_endpoints(
         }
     };
     let result = tokio::time::timeout(lifetime.min(MAX_ACQUIRE_TIME), async {
-        let journal = coordinator.journal(&authority, coordinator_epoch).await?;
-        let cohort = journal.cohort().cloned().ok_or(Error::UnboundCohort)?;
+        let summary = coordinator
+            .summary(&authority, coordinator_epoch)
+            .await
+            .map_err(|e| {
+                if e == managed_rpc::Error::Application(D1Error::VisibilityHistory) {
+                    Error::UnboundCohort
+                } else {
+                    Error::from(e)
+                }
+            })?;
+        let cohort = summary.cohort;
         if cohort.coordinator_shard != authority.shard
             || cohort.coordinator_epoch != coordinator_epoch
             || members.len() != cohort.members.len()
@@ -168,7 +177,7 @@ pub async fn acquire_endpoints(
                 return Err(Error::Identity);
             }
         }
-        let mut common = journal.resolved_prefix();
+        let mut common = summary.resolved_prefix;
         for (node, target) in &members {
             check_deadline()?;
             let info = node.visibility(target).await?;
@@ -181,8 +190,15 @@ pub async fn acquire_endpoints(
             common = common.min(info.applied_prefix);
         }
         let version = version.unwrap_or(common);
-        if version > journal.resolved_prefix() {
+        if version > summary.resolved_prefix {
             return Err(Error::Unresolved);
+        }
+        check_deadline()?;
+        let proof = coordinator
+            .terminal(&authority, coordinator_epoch, version)
+            .await?;
+        if proof.cohort() != &cohort {
+            return Err(Error::Identity);
         }
         let mut snapshots = BTreeMap::new();
         let mut rows = 0usize;
@@ -199,7 +215,7 @@ pub async fn acquire_endpoints(
             if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
                 return Err(Error::Capacity);
             }
-            let snapshot = node.read(&target, version, remaining, &journal).await?;
+            let snapshot = node.read_terminal(&target, remaining, &proof).await?;
             check_deadline()?;
             if snapshot.shard != target.shard
                 || snapshot.epoch != target.epoch

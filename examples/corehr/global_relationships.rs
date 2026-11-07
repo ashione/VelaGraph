@@ -224,7 +224,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         ),
     ] {
         cases.push(json!({"name":name,"partition":1,"query":query,"expect_error":true,
-            "client_expect_unsupported":true,"server_supported":false,"server_expected_error":"Unsupported"}));
+            "client_expect_unsupported":name != "global_scan_reject_scalar_dedup","server_supported":false,"server_expected_error":"Unsupported"}));
     }
     cases
 }
@@ -236,6 +236,11 @@ fn global_relationship_oracles_are_nonvacuous() {
         let q = queries(&m);
         let get = |name: &str| q.iter().find(|r| r["name"] == name).unwrap();
         assert_eq!(q.len(), 22);
+        assert_eq!(get("global_scan_reject_scalar_dedup")["expect_error"], true);
+        assert_eq!(
+            get("global_scan_reject_scalar_dedup")["client_expect_unsupported"],
+            false
+        );
         assert!(
             get("global_repeat_named_ancestors")["expected"]["vertices"]
                 .as_array()

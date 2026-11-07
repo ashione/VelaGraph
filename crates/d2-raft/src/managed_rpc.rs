@@ -4,6 +4,7 @@
 //! outcomes and never authorize abort, identity replacement, or fallback reads.
 use crate::cohort_reads::VisibilityInfo;
 use crate::participant_writes::{Authority, Status};
+use crate::terminal_prefix::TerminalPrefix;
 use crate::transaction_decisions::{Cohort, Command, Journal, Participant};
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
 use crate::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, NodeHandle};
@@ -21,6 +22,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const PROTOCOL_VERSION: u32 = 2;
 const CONCURRENCY: usize = 4;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,6 +88,15 @@ impl Identity {
     }
 }
 
+/// Leader-observed coordinator metadata, not itself a read certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorSummary {
+    pub authority: Authority,
+    pub cohort: Cohort,
+    pub resolved_prefix: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -97,6 +108,15 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    Summary {
+        authority: Authority,
+        epoch: u64,
+    },
+    Terminal {
+        authority: Authority,
+        epoch: u64,
+        version: u64,
+    },
     Journal {
         authority: Authority,
         epoch: u64,
@@ -123,14 +143,12 @@ enum Operation {
     },
     Prefix {
         target: Target,
-        version: u64,
-        journal: Journal,
+        proof: TerminalPrefix,
     },
     Read {
         target: Target,
-        version: u64,
         limit: ReadLimit,
-        journal: Journal,
+        proof: TerminalPrefix,
     },
 }
 impl Operation {
@@ -143,6 +161,8 @@ impl Operation {
             Self::Advance { .. } => 5,
             Self::Prefix { .. } => 6,
             Self::Read { .. } => 7,
+            Self::Summary { .. } => 8,
+            Self::Terminal { .. } => 9,
         }
     }
 }
@@ -163,8 +183,9 @@ enum Value {
     Visibility(VisibilityInfo),
     Status(Status),
     Prefix(u64),
-    Evidence(Journal),
-    Snapshot(Snapshot, Journal),
+    Summary(CoordinatorSummary),
+    Evidence(TerminalPrefix),
+    Snapshot(Snapshot, TerminalPrefix),
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -343,6 +364,10 @@ impl Client {
         };
         let valid = match operation {
             Operation::Journal { authority, epoch }
+            | Operation::Summary { authority, epoch }
+            | Operation::Terminal {
+                authority, epoch, ..
+            }
             | Operation::Command {
                 authority, epoch, ..
             } => {
@@ -372,12 +397,11 @@ impl Client {
                 journal,
                 ..
             } => participant(target) && self.identity.authority == *authority && history(journal),
-            Operation::Prefix {
-                target, journal, ..
+            Operation::Prefix { target, proof } | Operation::Read { target, proof, .. } => {
+                participant(target)
+                    && proof.authority() == self.identity.authority.mode
+                    && proof.cohort() == &self.identity.cohort
             }
-            | Operation::Read {
-                target, journal, ..
-            } => participant(target) && history(journal),
         };
         if valid {
             Ok(())
@@ -401,7 +425,7 @@ impl Client {
                 .map_err(|_| Error::Capacity)?;
             let operation_tag = operation.tag();
             let bytes = encode(Request {
-                version: 1,
+                version: PROTOCOL_VERSION,
                 identity: self.identity.clone(),
                 nonce,
                 operation,
@@ -418,7 +442,7 @@ impl Client {
             }
             send(&mut stream, &bytes).await?;
             let reply: Reply = receive(&mut stream).await?;
-            if reply.version != 1
+            if reply.version != PROTOCOL_VERSION
                 || reply.operation != operation_tag
                 || reply.identity != self.identity
                 || reply.nonce != nonce
@@ -483,6 +507,58 @@ impl NodeRef<'_> {
                     return Err(Error::Identity);
                 }
                 Ok(v)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Observe only bounded membership/watermark metadata before selecting V.
+    pub async fn summary(
+        self,
+        authority: &Authority,
+        epoch: u64,
+    ) -> Result<CoordinatorSummary, Error> {
+        match self
+            .call(|| Operation::Summary {
+                authority: authority.clone(),
+                epoch,
+            })
+            .await?
+        {
+            Value::Summary(value) => {
+                check_summary(&value, authority, epoch)?;
+                if matches!(self, Self::Remote(c) if c.identity.cohort != value.cohort) {
+                    return Err(Error::Identity);
+                }
+                Ok(value)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Fetch exactly 1..=V after V is fixed. No full Journal is transferred.
+    pub async fn terminal(
+        self,
+        authority: &Authority,
+        epoch: u64,
+        version: u64,
+    ) -> Result<TerminalPrefix, Error> {
+        match self
+            .call(|| Operation::Terminal {
+                authority: authority.clone(),
+                epoch,
+                version,
+            })
+            .await?
+        {
+            Value::Evidence(proof) => {
+                if proof.authority() != authority.mode
+                    || proof.version() != version
+                    || proof.cohort().coordinator_shard != authority.shard
+                    || proof.cohort().coordinator_epoch != epoch
+                    || matches!(self, Self::Remote(c) if c.identity.cohort != *proof.cohort())
+                {
+                    return Err(Error::Identity);
+                }
+                Ok(proof)
             }
             _ => Err(Error::Protocol),
         }
@@ -571,11 +647,23 @@ impl NodeRef<'_> {
             _ => Err(Error::Protocol),
         }
     }
+    /// Compatibility helper for callers already holding the durable archive.
+    /// Only the exact terminal projection crosses the transport.
     pub async fn prefix(
         self,
         target: &Target,
         version: u64,
         journal: &Journal,
+    ) -> Result<(), Error> {
+        let proof = journal
+            .terminal_prefix(version)
+            .map_err(|_| Error::Identity)?;
+        self.prefix_terminal(target, &proof).await
+    }
+    pub async fn prefix_terminal(
+        self,
+        target: &Target,
+        proof: &TerminalPrefix,
     ) -> Result<(), Error> {
         let timeout = match self {
             Self::Local(_) => LOCAL_TIMEOUT,
@@ -586,15 +674,14 @@ impl NodeRef<'_> {
             match self
                 .call(|| Operation::Prefix {
                     target: target.clone(),
-                    version,
-                    journal: journal.clone(),
+                    proof: proof.clone(),
                 })
                 .await?
             {
                 Value::Evidence(retained) => {
-                    let observed = journal.clone();
+                    let expected = proof.clone();
                     cpu(move || {
-                        if retained.same_terminal_prefix(&observed, version) {
+                        if retained == expected {
                             Ok(())
                         } else {
                             Err(Error::Identity)
@@ -612,6 +699,7 @@ impl NodeRef<'_> {
         }
         Ok(())
     }
+    /// Compatibility helper. Snapshot acquisition uses read_terminal directly.
     pub async fn read(
         self,
         target: &Target,
@@ -619,6 +707,18 @@ impl NodeRef<'_> {
         limit: ReadLimit,
         journal: &Journal,
     ) -> Result<ReadSnapshot, Error> {
+        let proof = journal
+            .terminal_prefix(version)
+            .map_err(|_| Error::Identity)?;
+        self.read_terminal(target, limit, &proof).await
+    }
+    pub async fn read_terminal(
+        self,
+        target: &Target,
+        limit: ReadLimit,
+        proof: &TerminalPrefix,
+    ) -> Result<ReadSnapshot, Error> {
+        let version = proof.version();
         let timeout = match self {
             Self::Local(_) => LOCAL_TIMEOUT,
             Self::Remote(c) => c.timeout,
@@ -629,9 +729,8 @@ impl NodeRef<'_> {
             match self
                 .call(|| Operation::Read {
                     target: target.clone(),
-                    version,
                     limit,
-                    journal: journal.clone(),
+                    proof: proof.clone(),
                 })
                 .await?
             {
@@ -640,11 +739,9 @@ impl NodeRef<'_> {
                         || v.epoch != target.epoch
                         || v.version != version
                         || v.baseline_sequence != 0
-                        || v.cohort.as_ref() != journal.cohort()
-                        || v.authority.mode != journal.authority()
-                        || journal
-                            .cohort()
-                            .is_none_or(|c| v.authority.shard != c.coordinator_shard)
+                        || v.cohort.as_ref() != Some(proof.cohort())
+                        || v.authority.mode != proof.authority()
+                        || v.authority.shard != proof.cohort().coordinator_shard
                         || v.applied_prefix < version
                     {
                         return Err(Error::Identity);
@@ -660,9 +757,9 @@ impl NodeRef<'_> {
                     {
                         return Err(Error::Capacity);
                     }
-                    let observed = journal.clone();
+                    let observed = proof.clone();
                     cpu(move || {
-                        if !retained.same_terminal_prefix(&observed, version) {
+                        if retained != observed {
                             return Err(Error::Identity);
                         }
                         v.into_read()
@@ -681,6 +778,22 @@ impl NodeRef<'_> {
     }
 }
 
+fn check_summary(
+    value: &CoordinatorSummary,
+    authority: &Authority,
+    epoch: u64,
+) -> Result<(), Error> {
+    if value.authority != *authority
+        || authority.mode == [0; 16]
+        || value.cohort.validate().is_err()
+        || value.cohort.coordinator_shard != authority.shard
+        || value.cohort.coordinator_epoch != epoch
+        || value.resolved_prefix > crate::transaction_decisions::MAX_TRANSACTIONS as u64
+    {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
 fn evidence<'a>(authority: &Authority, journal: &'a Journal) -> Result<&'a Cohort, Error> {
     let cohort = journal.cohort().ok_or(Error::Identity)?;
     if journal.authority() != authority.mode || cohort.coordinator_shard != authority.shard {
@@ -799,6 +912,47 @@ async fn execute(
         return Err(Error::Unavailable);
     }
     match op {
+        Operation::Summary { authority, epoch } => {
+            let value = node
+                .state_machine
+                .coordinator_summary(authority.shard, epoch, authority.mode)
+                .await
+                .map_err(Error::Application)?;
+            check_summary(&value, &authority, epoch)?;
+            if pinned.is_some_and(|p| {
+                p.role != Role::Coordinator
+                    || p.authority != authority
+                    || p.target.epoch != epoch
+                    || p.cohort != value.cohort
+            }) {
+                return Err(Error::Identity);
+            }
+            Ok(Value::Summary(value))
+        }
+        Operation::Terminal {
+            authority,
+            epoch,
+            version,
+        } => {
+            let proof = node
+                .state_machine
+                .coordinator_terminal_prefix(authority.shard, epoch, authority.mode, version)
+                .await
+                .map_err(Error::Application)?;
+            if proof.authority() != authority.mode
+                || proof.cohort().coordinator_shard != authority.shard
+                || proof.cohort().coordinator_epoch != epoch
+                || pinned.is_some_and(|p| {
+                    p.role != Role::Coordinator
+                        || p.authority != authority
+                        || p.target.epoch != epoch
+                        || &p.cohort != proof.cohort()
+                })
+            {
+                return Err(Error::Identity);
+            }
+            Ok(Value::Evidence(proof))
+        }
         Operation::Journal { authority, epoch } => Ok(Value::Journal(
             checked_journal(node, pinned, &authority, epoch).await?,
         )),
@@ -918,48 +1072,34 @@ async fn execute(
                 _ => Err(Error::Protocol),
             }
         }
-        Operation::Prefix {
-            target,
-            version,
-            journal,
-        } => {
+        Operation::Prefix { target, proof } => {
             let info = visibility(node, &target, pinned).await?;
-            if info.cohort.as_ref() != Some(evidence(&info.authority, &journal)?) {
+            if info.cohort.as_ref() != Some(proof.cohort())
+                || info.authority.mode != proof.authority()
+            {
                 return Err(Error::Identity);
             }
             let retained = node
                 .state_machine
-                .participant_prefix_evidence(
-                    target.shard,
-                    target.epoch,
-                    target.mode,
-                    version,
-                    &journal,
-                )
+                .participant_terminal_prefix(target.shard, target.epoch, target.mode, &proof)
                 .await
                 .map_err(Error::Application)?;
             Ok(Value::Evidence(retained))
         }
         Operation::Read {
             target,
-            version,
             limit,
-            journal,
+            proof,
         } => {
             let info = visibility(node, &target, pinned).await?;
-            if info.cohort.as_ref() != Some(evidence(&info.authority, &journal)?) {
+            if info.cohort.as_ref() != Some(proof.cohort())
+                || info.authority.mode != proof.authority()
+            {
                 return Err(Error::Identity);
             }
             let (snapshot, retained) = node
                 .state_machine
-                .certified_participant_read_with_evidence(
-                    target.shard,
-                    target.epoch,
-                    target.mode,
-                    version,
-                    limit,
-                    &journal,
-                )
+                .certified_terminal_read(target.shard, target.epoch, target.mode, limit, &proof)
                 .await
                 .map_err(Error::Application)?;
             Ok(Value::Snapshot(snapshot.into(), retained))
@@ -1024,11 +1164,11 @@ impl Server {
                             let _ = tokio::time::timeout_at(deadline, async {
                                 let request: Request = receive(&mut stream).await?;
                                 let operation = request.operation.tag();
-                                let result = if request.version != 1 { Err(Error::Protocol) } else if request.identity != identity { Err(Error::Identity) }
+                                let result = if request.version != PROTOCOL_VERSION { Err(Error::Protocol) } else if request.identity != identity { Err(Error::Identity) }
                                     else { dispatch(&node,Some(identity.clone()),request.operation,deadline).await };
-                                let bytes = match encode(Reply { version:1,operation,identity:identity.clone(),nonce:request.nonce,result }).await {
+                                let bytes = match encode(Reply { version:PROTOCOL_VERSION,operation,identity:identity.clone(),nonce:request.nonce,result }).await {
                                     Ok(bytes) => bytes,
-                                    Err(error) => encode(Reply { version:1,operation,identity,nonce:request.nonce,result:Err(error) }).await?,
+                                    Err(error) => encode(Reply { version:PROTOCOL_VERSION,operation,identity,nonce:request.nonce,result:Err(error) }).await?,
                                 };
                                 if tokio::time::Instant::now() >= deadline { return Err(Error::Unavailable); }
                                 send(&mut stream,&bytes).await
@@ -1171,7 +1311,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request: Request = receive(&mut stream).await.unwrap();
                 let mut reply = Reply {
-                    version: 1,
+                    version: PROTOCOL_VERSION,
                     operation: request.operation.tag(),
                     identity: request.identity,
                     nonce: request.nonce,
@@ -1267,7 +1407,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a.slots, &b.slots));
     }
     #[test]
-    fn journal_is_encoded_once_and_terminal_proofs_detect_other_histories() {
+    fn terminal_proof_is_encoded_once_and_detects_other_histories() {
         let id = identity();
         let mut observed = Journal::new(id.authority.mode).unwrap();
         observed
@@ -1310,8 +1450,8 @@ mod tests {
             })
             .unwrap();
         assert!(!observed.same_terminal_prefix(&other, 1));
-        let journal_bytes = observed.encode().unwrap();
-        let reply = encode_sync(&Value::Evidence(observed.clone())).unwrap();
+        let journal_bytes = serde_json::to_vec(&observed.terminal_prefix(1).unwrap()).unwrap();
+        let reply = encode_sync(&Value::Evidence(observed.terminal_prefix(1).unwrap())).unwrap();
         assert!(reply
             .windows(journal_bytes.len())
             .any(|window| window == journal_bytes));
@@ -1319,7 +1459,7 @@ mod tests {
         let Value::Evidence(decoded) = serde_json::from_slice::<Value>(&reply).unwrap() else {
             panic!("wrong reply");
         };
-        assert!(observed.same_terminal_prefix(&decoded, 1));
+        assert_eq!(observed.terminal_prefix(1).unwrap(), decoded);
     }
     #[tokio::test]
     async fn canceled_cpu_caller_retains_permit_until_work_finishes() {
@@ -1366,7 +1506,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request: Request = receive(&mut stream).await.unwrap();
             let reply = Reply {
-                version: 1,
+                version: PROTOCOL_VERSION,
                 operation: request.operation.tag(),
                 identity: request.identity,
                 nonce: request.nonce,
@@ -1445,8 +1585,11 @@ mod tests {
         ));
         peer.await.unwrap();
 
-        let (client, peer) =
-            fake_value(participant_id.clone(), Value::Evidence(terminal_journal(2))).await;
+        let (client, peer) = fake_value(
+            participant_id.clone(),
+            Value::Evidence(terminal_journal(2).terminal_prefix(1).unwrap()),
+        )
+        .await;
         assert!(matches!(
             NodeRef::Remote(&client).prefix(&target, 1, &observed).await,
             Err(Error::Identity)
@@ -1473,8 +1616,11 @@ mod tests {
                 3 => snapshot.entries[0].1 = vec![2; 10],
                 _ => snapshot.replay_operations = 2,
             }
-            let (client, peer) =
-                fake_value(participant_id.clone(), Value::Snapshot(snapshot, retained)).await;
+            let (client, peer) = fake_value(
+                participant_id.clone(),
+                Value::Snapshot(snapshot, retained.terminal_prefix(1).unwrap()),
+            )
+            .await;
             let result = NodeRef::Remote(&client)
                 .read(
                     &target,
@@ -1494,6 +1640,187 @@ mod tests {
             }
             peer.await.unwrap();
         }
+    }
+    #[tokio::test]
+    async fn acquisition_requests_only_summary_and_chosen_cut_not_full_archive() {
+        async fn sequence(id: Identity, values: Vec<Value>) -> (Client, JoinHandle<Vec<u8>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client =
+                Client::new(listener.local_addr().unwrap(), id, Duration::from_secs(2)).unwrap();
+            let server = tokio::spawn(async move {
+                let mut tags = Vec::new();
+                for value in values {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request: Request = receive(&mut stream).await.unwrap();
+                    tags.push(request.operation.tag());
+                    match &request.operation {
+                        Operation::Journal { .. } => panic!("acquisition fetched full archive"),
+                        Operation::Terminal { version, .. } => assert_eq!(*version, 1),
+                        Operation::Read { proof, .. } => assert_eq!(proof.version(), 1),
+                        _ => {}
+                    }
+                    let reply = Reply {
+                        version: PROTOCOL_VERSION,
+                        operation: request.operation.tag(),
+                        identity: request.identity,
+                        nonce: request.nonce,
+                        result: Ok(value),
+                    };
+                    send(&mut stream, &encode(reply).await.unwrap())
+                        .await
+                        .unwrap();
+                }
+                tags
+            });
+            (client, server)
+        }
+        let proof = terminal_journal(1).terminal_prefix(1).unwrap();
+        let (coordinator, coordinator_calls) = sequence(
+            identity(),
+            vec![
+                Value::Summary(CoordinatorSummary {
+                    authority: identity().authority,
+                    cohort: identity().cohort,
+                    resolved_prefix: 128,
+                }),
+                Value::Evidence(proof.clone()),
+            ],
+        )
+        .await;
+        let mut member = identity();
+        member.role = Role::Participant;
+        member.target = Target {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+        };
+        let (participant, participant_calls) = sequence(
+            member.clone(),
+            vec![
+                Value::Visibility(VisibilityInfo {
+                    authority: identity().authority,
+                    baseline_sequence: 0,
+                    cohort: Some(identity().cohort),
+                    applied_prefix: 128,
+                }),
+                Value::Snapshot(
+                    Snapshot {
+                        shard: 7,
+                        epoch: 1,
+                        authority: identity().authority,
+                        version: 1,
+                        baseline_sequence: 0,
+                        cohort: Some(identity().cohort),
+                        applied_prefix: 128,
+                        local_sequence: 0,
+                        replay_operations: 0,
+                        entries: vec![],
+                    },
+                    proof,
+                ),
+            ],
+        )
+        .await;
+        let session = crate::cohort_reads::acquire_endpoints(
+            NodeRef::Remote(&coordinator),
+            identity().authority,
+            1,
+            vec![(NodeRef::Remote(&participant), member.target)],
+            Some(1),
+            ReadLimit {
+                rows: 1,
+                bytes: 1,
+                operations: 1,
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.version(), Ok(1));
+        assert_eq!(coordinator_calls.await.unwrap(), vec![8, 9]);
+        assert_eq!(participant_calls.await.unwrap(), vec![3, 7]);
+    }
+    #[tokio::test]
+    async fn summary_and_terminal_reply_identity_and_version_are_not_certificates() {
+        for fault in 0..5 {
+            let mut summary = CoordinatorSummary {
+                authority: identity().authority,
+                cohort: identity().cohort,
+                resolved_prefix: 1,
+            };
+            match fault {
+                0 => summary.authority.mode = [8; 16],
+                1 => summary.cohort.coordinator_epoch = 2,
+                2 => summary.cohort.members[0].mode = [8; 16],
+                3 => summary.cohort.members.clear(),
+                _ => {
+                    summary.resolved_prefix =
+                        crate::transaction_decisions::MAX_TRANSACTIONS as u64 + 1
+                }
+            }
+            let (client, peer) = fake_value(identity(), Value::Summary(summary)).await;
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .summary(&identity().authority, 1)
+                    .await,
+                Err(Error::Identity)
+            );
+            peer.await.unwrap();
+        }
+        // A correctly framed proof for another cut (including V=0) is rejected.
+        for (requested, returned) in [(0, 1), (1, 0)] {
+            let (client, peer) = fake_value(
+                identity(),
+                Value::Evidence(terminal_journal(1).terminal_prefix(returned).unwrap()),
+            )
+            .await;
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .terminal(&identity().authority, 1, requested)
+                    .await,
+                Err(Error::Identity)
+            );
+            peer.await.unwrap();
+        }
+        // An empty proof still has a complete, exact authority/cohort binding.
+        let mut other_cohort = identity().cohort;
+        other_cohort.members[0].mode = [6; 16];
+        let mut other = Journal::new(identity().authority.mode).unwrap();
+        other
+            .apply(Command::BindCohort {
+                cohort: other_cohort,
+            })
+            .unwrap();
+        let (client, peer) = fake_value(
+            identity(),
+            Value::Evidence(other.terminal_prefix(0).unwrap()),
+        )
+        .await;
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .terminal(&identity().authority, 1, 0)
+                .await,
+            Err(Error::Identity)
+        );
+        peer.await.unwrap();
+        let mut wrong = Journal::new([8; 16]).unwrap();
+        wrong
+            .apply(Command::BindCohort {
+                cohort: identity().cohort,
+            })
+            .unwrap();
+        let (client, peer) = fake_value(
+            identity(),
+            Value::Evidence(wrong.terminal_prefix(0).unwrap()),
+        )
+        .await;
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .terminal(&identity().authority, 1, 0)
+                .await,
+            Err(Error::Identity)
+        );
+        peer.await.unwrap();
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_server_bounds_incomplete_input_and_remains_available() {
@@ -1570,6 +1897,27 @@ mod tests {
         )
         .await
         .unwrap();
+        // Previous wire peers fail closed. There is no automatic archive or
+        // weaker-read fallback even though durable journal formats are unchanged.
+        let mut legacy = TcpStream::connect(server.local_addr()).await.unwrap();
+        send(
+            &mut legacy,
+            &encode_sync(&Request {
+                version: 1,
+                identity: identity(),
+                nonce: 1,
+                operation: Operation::Journal {
+                    authority: identity().authority,
+                    epoch: 1,
+                },
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let reply: Reply = receive(&mut legacy).await.unwrap();
+        assert_eq!(reply.version, PROTOCOL_VERSION);
+        assert!(matches!(reply.result, Err(Error::Protocol)));
         let mut slow = TcpStream::connect(server.local_addr()).await.unwrap();
         slow.write_u32(100).await.unwrap();
         slow.write_all(b"{").await.unwrap();

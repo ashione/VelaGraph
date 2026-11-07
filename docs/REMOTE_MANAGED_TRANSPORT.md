@@ -38,18 +38,20 @@ not authentication, TLS, authorization or malicious-peer proof.
 
 `cohort_reads::acquire_endpoints` is the shared local/remote acquisition path. It:
 
-1. Captures the coordinator journal after a leader barrier.
+1. Captures bounded coordinator authority/cohort/resolved-prefix metadata after
+   a leader barrier.
 2. Verifies every configured member against the whole persisted sorted cohort.
 3. Reads each member's leader-observed visibility information and validates the
    authority, cohort and empty baseline. Without an explicit version it chooses
    min(coordinator resolved prefix, all member applied prefixes).
-4. Reads every member at exactly that V, using the same coordinator journal and
-   the remaining aggregate row/byte/replay budget. An explicit V is never lowered.
+4. Fetches the exact segmented terminal projection at the chosen V, then reads
+   every member at exactly V using that proof and the remaining aggregate
+   row/byte/replay budget. An explicit V is never lowered.
 5. Rechecks each returned shard, epoch, V, baseline, authority, cohort, applied
    watermark and payload budget. Remote prefix/read replies include the actual
-   participant-retained journal; the client compares its terminal prefix at V
-   against the original coordinator journal. The participant captures read rows
-   and its journal under the same state lock.
+   participant-retained terminal projection; the client compares it exactly
+   against the coordinator proof. The participant derives proof and captures rows
+   under the same state lock. Request/Plan archives never enter this read path.
 6. Constructs the private complete SnapshotSession only after all members pass.
 
 A readiness watermark is not a read certificate. A missing, lagging, mismatched,
@@ -121,3 +123,10 @@ These tests do not validate multi-host behavior, multi-replica consensus traffic
 network partitions, automatic failover, TLS/authentication, indexed MVCC,
 history reclamation, online placement changes or production scalability. The
 existing consensus transports and storage formats are not changed by this slice.
+
+## A1 evidence separation
+
+[Exact segmented terminal-prefix evidence](TERMINAL_PREFIX_EVIDENCE.md) defines the
+versioned proof, protocol-v2 fail-closed upgrade boundary, complete-prefix validation
+and unchanged durable recovery rules. Prepare and advance retain full Journals;
+read evidence remains O(V), with old-V bytes independent of later Plan archives.
