@@ -479,39 +479,62 @@ impl AuditProxy {
                 let gate = worker_gate.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let n = client.read_u32().await? as usize;
-                        ensure!(n <= remote::MAX_FRAME_BYTES);
-                        let mut data = vec![0; n];
-                        client.read_exact(&mut data).await?;
-                        let value: serde_json::Value = serde_json::from_slice(&data)?;
-                        let operation = &value["operation"];
-                        if operation.get("OpenQuery").is_some() {
-                            o.fetch_add(1, Ordering::SeqCst);
+                        let mut server: Option<TcpStream> = None;
+                        client.set_nodelay(true)?;
+                        let mut channel = false;
+                        loop {
+                            let n = match client.read_u32().await {
+                                Ok(n) => n as usize,
+                                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                    break
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
+                            ensure!(n <= remote::MAX_FRAME_BYTES);
+                            let mut data = vec![0; n];
+                            client.read_exact(&mut data).await?;
+                            let value: serde_json::Value = serde_json::from_slice(&data)?;
+                            let operation = &value["operation"];
+                            if operation.get("OpenQuery").is_some() {
+                                o.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if ["Snapshot", "SnapshotPage"]
+                                .iter()
+                                .any(|key| operation.get(key).is_some())
+                            {
+                                f.fetch_add(1, Ordering::SeqCst);
+                                anyhow::bail!("full-shard download forbidden");
+                            }
+                            channel |= operation.get("OpenHierarchyChannel").is_some();
+                            if (channel || operation.get("QueryFragment").is_some())
+                                && gate.pause.swap(false, Ordering::SeqCst)
+                            {
+                                gate.entered.notify_one();
+                                gate.resume.notified().await;
+                            }
+                            if server.is_none() {
+                                let stream = TcpStream::connect(target).await?;
+                                stream.set_nodelay(true)?;
+                                server = Some(stream);
+                            }
+                            let server = server.as_mut().unwrap();
+                            r.fetch_add(1, Ordering::SeqCst);
+                            server.write_u32(n as u32).await?;
+                            server.write_all(&data).await?;
+                            let n = server.read_u32().await? as usize;
+                            ensure!(n <= remote::MAX_FRAME_BYTES);
+                            let mut data = vec![0; n];
+                            server.read_exact(&mut data).await?;
+                            b.fetch_add(n + 4, Ordering::SeqCst);
+                            client.write_u32(n as u32).await?;
+                            client.write_all(&data).await?;
+                            if !channel
+                                || serde_json::from_slice::<serde_json::Value>(&data)?["retire"]
+                                    == true
+                            {
+                                break;
+                            }
                         }
-                        if ["Snapshot", "SnapshotPage"]
-                            .iter()
-                            .any(|key| operation.get(key).is_some())
-                        {
-                            f.fetch_add(1, Ordering::SeqCst);
-                            anyhow::bail!("full-shard download forbidden");
-                        }
-                        if operation.get("QueryFragment").is_some()
-                            && gate.pause.swap(false, Ordering::SeqCst)
-                        {
-                            gate.entered.notify_one();
-                            gate.resume.notified().await;
-                        }
-                        r.fetch_add(1, Ordering::SeqCst);
-                        let mut server = TcpStream::connect(target).await?;
-                        server.write_u32(n as u32).await?;
-                        server.write_all(&data).await?;
-                        let n = server.read_u32().await? as usize;
-                        ensure!(n <= remote::MAX_FRAME_BYTES);
-                        let mut data = vec![0; n];
-                        server.read_exact(&mut data).await?;
-                        b.fetch_add(n + 4, Ordering::SeqCst);
-                        client.write_u32(n as u32).await?;
-                        client.write_all(&data).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     .await;

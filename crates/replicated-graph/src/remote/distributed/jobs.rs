@@ -195,6 +195,7 @@ struct Job {
     catalog: Arc<StaticCatalog>,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     row_bounds: BTreeMap<u64, usize>,
+    connections: Option<BTreeMap<u64, channel::Connection>>,
     expires: Instant,
     cost: Cost,
     plan: Plan,
@@ -226,10 +227,17 @@ impl Jobs {
         }
     }
     pub(super) fn expire(&self) {
-        self.values
-            .lock()
-            .unwrap()
-            .retain(|_, v| Instant::now() < v.expires);
+        self.values.lock().unwrap().retain(|_, entry| {
+            if Instant::now() >= entry.expires {
+                return false;
+            }
+            if let Ok(mut job) = entry.job.try_lock() {
+                if let Some(connections) = &mut job.connections {
+                    connections.retain(|_, c| c.live());
+                }
+            }
+            true
+        });
     }
     pub(super) async fn handle(
         &self,
@@ -260,6 +268,7 @@ impl Jobs {
                     catalog,
                     sessions: BTreeMap::new(),
                     row_bounds: BTreeMap::new(),
+                    connections: Some(BTreeMap::new()),
                     expires,
                     cost: Cost::default(),
                     compact: (plan.emit && plan.dedup).then(Compact::default),
@@ -435,6 +444,9 @@ impl Job {
         check(end)
     }
     async fn close(&mut self) {
+        if let Some(connections) = &mut self.connections {
+            connections.clear();
+        }
         let execution = Execution {
             catalog: &self.catalog,
             sessions: self.sessions.clone(),
@@ -1074,6 +1086,7 @@ mod tests {
                         catalog: Arc::new(StaticCatalog { partitions: vec![] }),
                         sessions: BTreeMap::new(),
                         row_bounds: BTreeMap::new(),
+                        connections: None,
                         expires: Instant::now() + Duration::from_secs(1),
                         cost: Cost::default(),
                         compact: None,
@@ -1212,6 +1225,7 @@ mod tests {
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
+            connections: None,
             expires,
             cost: Cost::default(),
             compact: None,
@@ -1517,6 +1531,7 @@ mod tests {
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
+            connections: None,
             expires,
             cost: Cost::default(),
             compact: None,

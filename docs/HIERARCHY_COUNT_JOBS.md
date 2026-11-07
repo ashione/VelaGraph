@@ -163,3 +163,43 @@ Micro-page coalescing reduces client polling round trips. Within each page,
 independent shard RPCs now use the bounded waves described above; weighted
 frontier aggregation remains at the coordinator. No shard-local subtree
 aggregation is implemented.
+
+## Bounded hierarchy transport channels
+
+Hierarchy count jobs reuse sequential TCP channels for batches on the same
+retained shard session. The first `OpenHierarchyChannel` operation includes the
+first fragment; later frames carry an increasing sequence and a relative timeout.
+Every response acknowledges that sequence and the exact original descriptor.
+Only hierarchy batches are accepted. Ordinary one-shot operations are unchanged.
+
+This wire extension requires coordinated node/coordinator upgrades. New clients
+fail closed against older servers; they do not retransmit an ambiguous operation
+or silently reopen a snapshot. Old one-shot clients remain supported by new
+servers. This is still plaintext transport for trusted development networks.
+
+At most eight cached or in-flight channel sockets exist per coordinator process.
+This eight-socket limit applies only to reused channels, not all sockets.
+One-shot fallback retains the existing per-RPC client admission limit; each
+server retains its separate 16-connection/handler admission limit.
+When no slot is available, transport selection uses the original one-shot RPC
+before attempting network I/O. Each job caches at most one socket per shard.
+Sockets retire after 1,024 operations or 60 seconds, never beyond the original
+session lease; idle limits are four seconds at the client and five at the server.
+Retirement reconnects only between acknowledged operations using the same
+session descriptor. It does not renew that session or change snapshots.
+
+Each operation retains the configured service deadline (at most five seconds).
+For subsequent frames, the first header byte starts one absolute deadline for
+header, body, decoding, graph work and response; neither a partial frame nor
+another frame extends it. Invalid sequence, version, descriptor, shape, cost,
+EOF or timeout terminates the operation without retry. Cancellation drops socket
+ownership and permits. Already-started blocking storage work cannot be stopped
+by dropping an async future, but no partial result is published or resumable.
+
+The original 512-byte fixed transport charge and all work/byte caps are unchanged.
+The compact reply envelope fits that allowance, including both copies of request
+and response framing (an executable maximal-width serialization test verifies
+this). Existing disjoint shard reservations remain unchanged. Actual costs from
+successful waves are settled before reuse; failed jobs terminate rather than
+providing a complete recoverable cost ledger. Every leaf response is validated
+before any connection in its wave is returned to the cache.

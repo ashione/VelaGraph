@@ -7,6 +7,7 @@ use rocksdb_sql_table::{
     Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
+pub(in crate::remote) mod channel;
 mod hierarchy;
 pub mod jobs;
 mod scan;
@@ -403,6 +404,13 @@ impl Execution<'_> {
             .ok_or(QueryFailure::UnsupportedScope)
     }
     async fn fragment(&mut self, fragment: Fragment) -> Result<FragmentValue, QueryFailure> {
+        self.fragment_transport(fragment, None).await
+    }
+    async fn fragment_transport(
+        &mut self,
+        fragment: Fragment,
+        connection: Option<&mut Option<channel::Connection>>,
+    ) -> Result<FragmentValue, QueryFailure> {
         check(self.end)?;
         let route = self.route(fragment.partition())?.clone();
         let descriptor = self
@@ -430,14 +438,27 @@ impl Execution<'_> {
             },
             ..request
         };
-        let reply = rpc(
-            route.endpoint,
-            Some(route.identity),
-            Operation::QueryFragment(request),
-            self.end.saturating_duration_since(Instant::now()),
-            None,
-        )
-        .await
+        let reply = if let Some(slot) = connection {
+            let (reply, returned) = channel::call(
+                route.endpoint,
+                route.identity,
+                request,
+                self.end,
+                slot.take(),
+            )
+            .await;
+            *slot = returned;
+            reply
+        } else {
+            rpc(
+                route.endpoint,
+                Some(route.identity),
+                Operation::QueryFragment(request),
+                self.end.saturating_duration_since(Instant::now()),
+                None,
+            )
+            .await
+        }
         .map_err(remote_failure)?;
         check(self.end)?;
         let Reply::QueryFragment(response) = reply else {
