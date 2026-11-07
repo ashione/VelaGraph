@@ -236,6 +236,15 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(event=event, replacement=bad), self.assertRaises(ValueError):
                 validate(rows, self.manifest, jobs=jobs)
 
+    def test_reject_premature_matrix_completion(self):
+        records = self.job_records()
+        completion = next(r for r in records if r['event'] == 'job_matrix_complete')
+        remaining = [r for r in records if r is not completion]
+        for index in (0, 3, 8, len(remaining) - 2):
+            rows = remaining[:index] + [completion] + remaining[index:]
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                validate(rows, self.manifest, jobs=True)
+
 
 if __name__ == '__main__':
     unittest.main()

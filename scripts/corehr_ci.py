@@ -205,7 +205,8 @@ def validate(records, manifest, jobs=False):
             and cancellations[0].get('advance_unavailable') is True, 'missing active cancellation')
     validate_snapshots(cancellations[0].get('fixed_snapshots'), expected_shards)
     completions = [r for r in records if r['event'] == 'job_matrix_complete']
-    require(len(completions) == 1 and completions[0].get('complete') is True,
+    require(len(completions) == 1 and completions[0].get('complete') is True
+            and records[-2] is completions[0],
             'missing, duplicate or failed matrix completion')
     return {'resources': end, 'cases': {name: {
         'count': expected[name],
