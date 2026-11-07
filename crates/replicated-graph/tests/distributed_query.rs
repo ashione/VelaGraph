@@ -38,6 +38,9 @@ use tokio::{
     sync::Notify,
     time::{sleep, timeout},
 };
+#[path = "distributed_query/corehr.rs"]
+mod corehr;
+static PROCESS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const BUDGET: Duration = Duration::from_secs(20);
 struct Process(Child);
 impl Drop for Process {
@@ -205,10 +208,10 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
     let b = Shared(Arc::new(LocalStorageNode::open(b_dir.path(), 130)?));
     let source = AppendOnlyStore::new(a.clone(), 120, 0);
     let target = AppendOnlyStore::new(b.clone(), 130, 1);
-    for id in [1, 7, 8, 9] {
+    for id in [1, 7, 8, 9, 10, 40, 41, 42, 43, 44, 45] {
         source.prepare_vertex(&Vertex::new(id))?.submit(&a)?;
     }
-    for id in [1, 2, 3, 8] {
+    for id in [1, 2, 3, 8, 10, 40, 41, 42, 43, 44, 45] {
         let mut v = Vertex::new(id);
         v.labels.push("person".into());
         v.properties
@@ -284,6 +287,29 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
         properties: BTreeMap::new(),
     };
     target.prepare_source(&incomplete_second)?.submit(&b)?;
+    // Reverse-only observation must fail source validation even when a later
+    // incoming label/limit would discard it.
+    let reverse_only = CrossEdge {
+        id: 802,
+        ..first.clone()
+    };
+    target.prepare_reverse(&reverse_only)?.submit(&b)?;
+    let deleted = CrossEdge {
+        id: 803,
+        from: VertexRef {
+            partition: 1,
+            id: 10,
+        },
+        to: VertexRef {
+            partition: 0,
+            id: 10,
+        },
+        label: "deleted".into(),
+        properties: BTreeMap::new(),
+    };
+    target.prepare_source(&deleted)?.submit(&b)?;
+    source.prepare_reverse(&deleted)?.submit(&a)?;
+    target.prepare_source_delete(&deleted)?.submit(&b)?;
     // Deliberately incomplete append; a query of this start must fail closed.
     let broken = CrossEdge {
         id: 900,
@@ -299,6 +325,62 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
         properties: BTreeMap::new(),
     };
     source.prepare_source(&broken)?.submit(&a)?;
+    // Independent audit fixtures: same edge ID across owners, self-loop,
+    // and separately corrupted reverse references/source endpoint.
+    for from in [
+        VertexRef {
+            partition: 0,
+            id: 9,
+        },
+        VertexRef {
+            partition: 1,
+            id: 8,
+        },
+    ] {
+        let edge = CrossEdge {
+            id: 5000,
+            from,
+            to: VertexRef {
+                partition: 0,
+                id: 9,
+            },
+            label: "audit".into(),
+            properties: BTreeMap::new(),
+        };
+        if from.partition == 0 {
+            source.prepare_source(&edge)?.submit(&a)?;
+        } else {
+            target.prepare_source(&edge)?.submit(&b)?;
+        }
+        source.prepare_reverse(&edge)?.submit(&a)?;
+    }
+    for (id, to, from) in [(6000, 40, 8), (6001, 42, 8), (6002, 43, 8), (6003, 44, 45)] {
+        let edge = CrossEdge {
+            id,
+            from: VertexRef {
+                partition: 1,
+                id: from,
+            },
+            to: VertexRef {
+                partition: 0,
+                id: to,
+            },
+            label: "audit".into(),
+            properties: BTreeMap::new(),
+        };
+        target.prepare_source(&edge)?.submit(&b)?;
+        let mut reverse = edge.clone();
+        if id == 6000 {
+            reverse.label = "wrong".into();
+        }
+        if id == 6001 {
+            reverse.to.id = 41;
+        }
+        if id == 6002 {
+            reverse.from.partition = 0;
+        }
+        source.prepare_reverse(&reverse)?.submit(&a)?;
+    }
     // Unrelated payload is never needed by the selected traversal.
     for id in 100..148 {
         let mut v = Vertex::new(id);
@@ -306,7 +388,15 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
             .insert("payload".into(), Value::Text("x".repeat(64 * 1024)));
         target.prepare_vertex(&v)?.submit(&b)?;
     }
-    Ok((a.admin().export()?, b.admin().export()?))
+    let mut damaged = b.admin().export()?;
+    let mut missing = b"graph/v2/p/".to_vec();
+    missing.extend(1u32.to_be_bytes());
+    missing.extend(b"/vertex/");
+    missing.extend(45u64.to_be_bytes());
+    let before = damaged.entries.len();
+    damaged.entries.retain(|e| e.key != missing);
+    assert_eq!(damaged.entries.len(), before - 1);
+    Ok((a.admin().export()?, damaged))
 }
 
 // Record each data-node operation on the wire. Reject full-snapshot downloads
@@ -478,6 +568,14 @@ fn legacy_oracle(
         "g.V(1,999,1).out().out().out().count()",
         "g.V(1).out().has('missing').out().out().count()",
         "g.V(1).out().out().out().hasLabel('person').path()",
+        "g.V(1).in('returns').path()",
+        "g.V(1,1).in().path()",
+        "g.V(1).in().out().in().path()",
+        "g.V(1).in().has('active',true).values('name')",
+        "g.V(1).in().limit(1).out().count()",
+        "g.V(1).in().in().count()",
+        "g.V(1).in().in().limit(1).in().path()",
+        "g.V(999).in().count()",
     ] {
         let observed = session.observed_gremlin_v3(0, text)?;
         let rows = observed
@@ -556,6 +654,7 @@ async fn rows(endpoint: SocketAddr, text: &str) -> anyhow::Result<Vec<QueryRow>>
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_query_crosses_real_shards_without_snapshot_downloads() -> anyhow::Result<()> {
+    let _serial = PROCESS_TESTS.lock().await;
     timeout(Duration::from_secs(180), scenario()).await?
 }
 async fn scenario() -> anyhow::Result<()> {
@@ -782,11 +881,106 @@ async fn scenario() -> anyhow::Result<()> {
         rows(endpoint, "g.V(8).out().hasLabel('missing').out().count()").await?,
         vec![QueryRow::Count(0)]
     );
+    assert_eq!(
+        rows(endpoint, "g.V(1).in('returns').path()").await?,
+        vec![
+            QueryRow::Path(vec![
+                vertex(0, 1),
+                QualifiedElement::Edge {
+                    partition: 1,
+                    id: 20
+                },
+                vertex(1, 1)
+            ]),
+            QueryRow::Path(vec![
+                vertex(0, 1),
+                QualifiedElement::Edge {
+                    partition: 1,
+                    id: 30
+                },
+                vertex(1, 3)
+            ]),
+        ]
+    );
+    for text in [
+        "g.V(8).out().in().count()",
+        "g.V(8).out().in('different').limit(1).count()",
+        "g.V(10).in().count()",
+        "g.V(10).in('different').count()",
+    ] {
+        assert_eq!(
+            distributed::query(
+                endpoint,
+                DistributedRequest {
+                    start_partition: 0,
+                    text: text.into(),
+                    timeout_millis: 5000,
+                },
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::IncompleteOrCorrupt),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        rows(endpoint, "g.V(9).in().path()").await?,
+        vec![
+            QueryRow::Path(vec![
+                vertex(0, 9),
+                QualifiedElement::Edge {
+                    partition: 0,
+                    id: 5000
+                },
+                vertex(0, 9)
+            ]),
+            QueryRow::Path(vec![
+                vertex(0, 9),
+                QualifiedElement::Edge {
+                    partition: 1,
+                    id: 5000
+                },
+                vertex(1, 8)
+            ]),
+        ]
+    );
+    for id in [40, 41, 43, 44] {
+        for suffix in ["in().count()", "in('filtered-out').limit(1).count()"] {
+            let result = distributed::query(
+                endpoint,
+                DistributedRequest {
+                    start_partition: 0,
+                    text: format!("g.V({id}).{suffix}"),
+                    timeout_millis: 5000,
+                },
+                BUDGET,
+            )
+            .await?;
+            assert_eq!(
+                result,
+                Err(QueryFailure::IncompleteOrCorrupt),
+                "id={id}, suffix={suffix}"
+            );
+        }
+    }
+    for suffix in ["count()", "limit(1).count()"] {
+        let result = distributed::query(
+            endpoint,
+            DistributedRequest {
+                start_partition: 0,
+                text: format!("g.V(7).out().in().{suffix}"),
+                timeout_millis: 5000,
+            },
+            BUDGET,
+        )
+        .await?;
+        assert_eq!(result, Err(QueryFailure::ResourceExhausted), "{suffix}");
+    }
     // Both snapshots have been acquired when the first fragment is dispatched.
     // Change target data while that fragment is paused; the running query must
     // read its original target session, and a subsequent query must see the write.
     ap.gate.pause.store(true, Ordering::SeqCst);
-    let pinned = tokio::spawn(rows(endpoint, "g.V(1).out().out().out().values('name')"));
+    let pinned = tokio::spawn(rows(endpoint, "g.V(1).in().out().in().values('name')"));
     timeout(Duration::from_secs(3), ap.gate.entered.notified()).await?;
     let changed = run_blocking(|| -> anyhow::Result<Export> {
         let dir = tempfile::tempdir()?;
@@ -830,7 +1024,7 @@ async fn scenario() -> anyhow::Result<()> {
             value: Value::Text("person-1".into())
         }
     );
-    let fresh = rows(endpoint, "g.V(1).out().out().out().values('name')").await?;
+    let fresh = rows(endpoint, "g.V(1).in().out().in().values('name')").await?;
     assert_eq!(
         fresh[0],
         QueryRow::Value {

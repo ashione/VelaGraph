@@ -116,9 +116,21 @@ struct EdgeHop {
     label: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingEdge {
+    id: u64,
+    partition: u32,
+    label: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Fragment {
     Exists(VertexId),
     Out(VertexId),
+    In(VertexId),
+    ResolveIncoming {
+        target: VertexId,
+        edge: IncomingEdge,
+    },
     VerifyReverse(EdgeHop),
     Has {
         vertex: VertexId,
@@ -137,7 +149,13 @@ enum Fragment {
 impl Fragment {
     fn validate(&self) -> Result<(), RemoteError> {
         let bytes = match self {
-            Self::Exists(_) | Self::Out(_) => 0,
+            Self::Exists(_) | Self::Out(_) | Self::In(_) => 0,
+            Self::ResolveIncoming { edge, .. } => {
+                if edge.label.len() > 64 {
+                    return Err(RemoteError::InvalidArgument);
+                }
+                edge.label.len()
+            }
             Self::VerifyReverse(edge) => {
                 if edge.label.len() > 64 {
                     return Err(RemoteError::InvalidArgument);
@@ -163,7 +181,8 @@ impl Fragment {
     }
     fn partition(&self) -> u32 {
         match self {
-            Self::Exists(v) | Self::Out(v) => v.partition,
+            Self::Exists(v) | Self::Out(v) | Self::In(v) => v.partition,
+            Self::ResolveIncoming { edge, .. } => edge.partition,
             Self::VerifyReverse(e) => e.to.partition,
             Self::Has { vertex, .. }
             | Self::HasLabel { vertex, .. }
@@ -214,6 +233,8 @@ pub(super) struct FragmentRequest {
 enum FragmentValue {
     Bool(bool),
     Edges(Vec<EdgeHop>),
+    Incoming(Vec<IncomingEdge>),
+    Edge(EdgeHop),
     Value(Option<Value>),
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -261,7 +282,7 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
         match step {
             // The official parser bounds the complete traversal to three edge
             // steps. All hops share this execution's sessions, deadline and cost.
-            GremlinStep::Out(_) => {}
+            GremlinStep::Out(_) | GremlinStep::In(_) => {}
             GremlinStep::Has { .. } | GremlinStep::HasLabel(_) | GremlinStep::Limit(_) => {}
             GremlinStep::Values(_) => scalar = true,
             GremlinStep::Path | GremlinStep::Count if index + 1 == query.steps().len() => {}
@@ -346,6 +367,52 @@ impl Execution<'_> {
             _ => Err(QueryFailure::IncompleteOrCorrupt),
         }
     }
+    async fn incoming(
+        &mut self,
+        target: VertexId,
+        label: Option<&str>,
+    ) -> Result<Vec<EdgeHop>, QueryFailure> {
+        let FragmentValue::Incoming(entries) = self.fragment(Fragment::In(target)).await? else {
+            return Err(QueryFailure::IncompleteOrCorrupt);
+        };
+        if entries.len() > 1000
+            || entries
+                .windows(2)
+                .any(|w| (w[0].id, w[0].partition) >= (w[1].id, w[1].partition))
+        {
+            return Err(QueryFailure::IncompleteOrCorrupt);
+        }
+        let mut edges = Vec::new();
+        for entry in entries {
+            let FragmentValue::Edge(edge) = self
+                .fragment(Fragment::ResolveIncoming {
+                    target,
+                    edge: entry.clone(),
+                })
+                .await?
+            else {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            };
+            if edge.id != entry.id
+                || edge.from.partition != entry.partition
+                || edge.to != target
+                || edge.label != entry.label
+            {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            }
+            // The target scan verified this exact reverse entry and endpoint;
+            // source resolution verified the canonical edge, outgoing index and
+            // source endpoint. Both are fixed sessions. Filter only after all
+            // those checks, without another identical target verification RPC.
+            if label.is_some_and(|label| label != edge.label) {
+                continue;
+            }
+            self.cost.charge(256 + edge.label.len(), 1, CEILING)?;
+            edges.push(edge);
+        }
+        Ok(edges)
+    }
+
     async fn run(
         &mut self,
         request: &DistributedRequest,
@@ -380,13 +447,19 @@ impl Execution<'_> {
             check(self.end)?;
             match step {
                 GremlinStep::Limit(n) => rows.truncate(*n),
-                GremlinStep::Out(label) => {
+                GremlinStep::Out(label) | GremlinStep::In(label) => {
+                    let incoming = matches!(step, GremlinStep::In(_));
                     let mut next = Vec::new();
                     for row in rows {
-                        let FragmentValue::Edges(edges) =
-                            self.fragment(Fragment::Out(row.vertex)).await?
-                        else {
-                            return Err(QueryFailure::IncompleteOrCorrupt);
+                        let edges = if incoming {
+                            self.incoming(row.vertex, label.as_deref()).await?
+                        } else {
+                            let FragmentValue::Edges(edges) =
+                                self.fragment(Fragment::Out(row.vertex)).await?
+                            else {
+                                return Err(QueryFailure::IncompleteOrCorrupt);
+                            };
+                            edges
                         };
                         if edges.len() > 1000
                             || edges.windows(2).any(|w| {
@@ -396,11 +469,14 @@ impl Execution<'_> {
                             return Err(QueryFailure::IncompleteOrCorrupt);
                         }
                         for edge in edges {
-                            if edge.from != row.vertex {
+                            if (if incoming { edge.to } else { edge.from }) != row.vertex {
                                 return Err(QueryFailure::IncompleteOrCorrupt);
                             }
-                            // Verify every observed edge, even if the label subsequently drops it.
-                            if !self.boolean(Fragment::VerifyReverse(edge.clone())).await? {
+                            // Incoming validation already checked both sides before
+                            // filtering. Outgoing expansion still needs target verification.
+                            if !incoming
+                                && !self.boolean(Fragment::VerifyReverse(edge.clone())).await?
+                            {
                                 return Err(QueryFailure::IncompleteOrCorrupt);
                             }
                             if label.as_ref().is_some_and(|l| l != &edge.label) {
@@ -412,11 +488,12 @@ impl Execution<'_> {
                                 partition: edge.from.partition,
                                 id: edge.id,
                             });
-                            path.push(edge.to.element());
+                            let vertex = if incoming { edge.from } else { edge.to };
+                            path.push(vertex.element());
                             push(
                                 &mut next,
                                 Traverser {
-                                    vertex: edge.to,
+                                    vertex,
                                     path,
                                     value: None,
                                 },
@@ -769,11 +846,16 @@ fn validate_output(
         .steps()
         .iter()
         .any(|s| matches!(s, GremlinStep::Values(_)));
-    let hops = query
+    let directions: Vec<_> = query
         .steps()
         .iter()
-        .filter(|s| matches!(s, GremlinStep::Out(_)))
-        .count();
+        .filter_map(|s| match s {
+            GremlinStep::Out(_) => Some(false),
+            GremlinStep::In(_) => Some(true),
+            _ => None,
+        })
+        .collect();
+    let hops = directions.len();
     let out = hops != 0;
     let valid_vertex = |v: &QualifiedElement| matches!(v, QualifiedElement::Vertex { partition, .. } if out || *partition == request.start_partition);
     if count {
@@ -789,11 +871,11 @@ fn validate_output(
             QueryRow::Path(p) if path => {
                 p.len() == 1 + 2 * hops
                     && matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
-                    && p.windows(3).step_by(2).all(|hop| {
+                    && p.windows(3).step_by(2).zip(&directions).all(|(hop, incoming)| {
                         matches!(hop,
                             [QualifiedElement::Vertex { partition: source, .. },
                              QualifiedElement::Edge { partition: owner, .. },
-                             QualifiedElement::Vertex { .. }] if source == owner)
+                             QualifiedElement::Vertex { partition: target, .. }] if owner == if *incoming { target } else { source })
                     })
             }
             QueryRow::Value {
@@ -862,7 +944,7 @@ mod tests {
         for text in [
             "g.V()",
             "g.E(1)",
-            "g.V(999).in()",
+            "g.V(999).both()",
             "g.V(999).values('a').has('a')",
             "g.V(999).id()",
         ] {
@@ -871,6 +953,7 @@ mod tests {
         for text in [
             "g.V(1,1).out('a').path()",
             "g.V(1).out().out().out().path()",
+            "g.V(1).in().out().in().path()",
             "g.V(999).limit(1).count()",
             "g.V(1).has('a',true).out().limit(1).values('a').count()",
         ] {
@@ -963,6 +1046,43 @@ mod tests {
             QueryFailure::ResourceExhausted
         );
     }
+    #[test]
+    fn client_validates_edge_owner_using_each_hop_direction() {
+        let v = |partition| QualifiedElement::Vertex { partition, id: 1 };
+        let e = |partition| QualifiedElement::Edge { partition, id: 1 };
+        let mut result = DistributedOutput {
+            completeness: QueryCompleteness::Unverified,
+            snapshots: vec![QueryStamp {
+                identity: RemoteIdentity { group: 1, node: 1 },
+                shard: 1,
+                epoch: 1,
+                sequence: 1,
+            }],
+            rows: vec![QueryRow::Path(vec![
+                v(1),
+                e(2),
+                v(2),
+                e(2),
+                v(3),
+                e(1),
+                v(1),
+            ])],
+        };
+        let req = request("g.V(1).in().out().in().path()");
+        validate_output(&result, &req).unwrap();
+        for slot in [1, 3, 5] {
+            let QueryRow::Path(original) = &result.rows[0] else {
+                panic!()
+            };
+            let mut bad = original.clone();
+            bad[slot] = e(99);
+            let good = std::mem::replace(&mut result.rows[0], QueryRow::Path(bad));
+            assert!(validate_output(&result, &req).is_err());
+            result.rows[0] = good;
+        }
+        assert!(plan(&request("g.V(999).in().out().in().out().count()")).is_err());
+    }
+
     #[test]
     fn client_rejects_wrong_qualified_paths_and_result_shapes() {
         let stamp = QueryStamp {
