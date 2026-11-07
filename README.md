@@ -32,10 +32,11 @@ executes v1 and observed v2 Gremlin on one pinned server snapshot, returning
 qualified results instead of transferring the whole shard. Existing client-side
 query APIs remain unchanged; v2 results are still Unverified.
 
-A separate [bounded distributed observed query experiment](docs/DISTRIBUTED_QUERY.md)
-now coordinates explicit vertex starts and one outgoing hop across fixed data
-shards on server-retained snapshots. It uses a caller-maintained static catalog,
-not live metadata discovery, and still returns Unverified observations.
+A separate [bounded distributed observed query
+experiment](docs/DISTRIBUTED_QUERY.md) now coordinates explicit vertex starts
+and up to three outgoing hops across fixed data shards on server-retained
+snapshots. It uses a caller-maintained static catalog, not live metadata
+discovery, and still returns Unverified observations.
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
 the transaction/recovery contract is in [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md);

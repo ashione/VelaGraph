@@ -253,19 +253,15 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     if !matches!(query.start(), GremlinStart::Vertices(ids) if !ids.is_empty()) {
         return Err(QueryFailure::Unsupported);
     }
-    let mut outs = 0;
     let mut scalar = false;
     for (index, step) in query.steps().iter().enumerate() {
         if scalar && !matches!(step, GremlinStep::Limit(_) | GremlinStep::Count) {
             return Err(QueryFailure::Unsupported);
         }
         match step {
-            GremlinStep::Out(_) => {
-                outs += 1;
-                if outs > 1 {
-                    return Err(QueryFailure::Unsupported);
-                }
-            }
+            // The official parser bounds the complete traversal to three edge
+            // steps. All hops share this execution's sessions, deadline and cost.
+            GremlinStep::Out(_) => {}
             GremlinStep::Has { .. } | GremlinStep::HasLabel(_) | GremlinStep::Limit(_) => {}
             GremlinStep::Values(_) => scalar = true,
             GremlinStep::Path | GremlinStep::Count if index + 1 == query.steps().len() => {}
@@ -773,10 +769,12 @@ fn validate_output(
         .steps()
         .iter()
         .any(|s| matches!(s, GremlinStep::Values(_)));
-    let out = query
+    let hops = query
         .steps()
         .iter()
-        .any(|s| matches!(s, GremlinStep::Out(_)));
+        .filter(|s| matches!(s, GremlinStep::Out(_)))
+        .count();
+    let out = hops != 0;
     let valid_vertex = |v: &QualifiedElement| matches!(v, QualifiedElement::Vertex { partition, .. } if out || *partition == request.start_partition);
     if count {
         return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= MAX_ROWS as u64) {
@@ -788,19 +786,16 @@ fn validate_output(
     for row in &output.rows {
         let valid = match row {
             QueryRow::Element(v) => !path && !scalar && valid_vertex(v),
-            QueryRow::Path(p) if path => match p.as_slice() {
-                [QualifiedElement::Vertex { partition, .. }] => {
-                    !out && *partition == request.start_partition
-                }
-                [QualifiedElement::Vertex {
-                    partition: source, ..
-                }, QualifiedElement::Edge {
-                    partition: owner, ..
-                }, QualifiedElement::Vertex { .. }] => {
-                    out && *source == request.start_partition && owner == source
-                }
-                _ => false,
-            },
+            QueryRow::Path(p) if path => {
+                p.len() == 1 + 2 * hops
+                    && matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
+                    && p.windows(3).step_by(2).all(|hop| {
+                        matches!(hop,
+                            [QualifiedElement::Vertex { partition: source, .. },
+                             QualifiedElement::Edge { partition: owner, .. },
+                             QualifiedElement::Vertex { .. }] if source == owner)
+                    })
+            }
             QueryRow::Value {
                 source: Some(source),
                 value,
@@ -867,7 +862,6 @@ mod tests {
         for text in [
             "g.V()",
             "g.E(1)",
-            "g.V(999).out().out()",
             "g.V(999).in()",
             "g.V(999).values('a').has('a')",
             "g.V(999).id()",
@@ -876,12 +870,71 @@ mod tests {
         }
         for text in [
             "g.V(1,1).out('a').path()",
+            "g.V(1).out().out().out().path()",
             "g.V(999).limit(1).count()",
             "g.V(1).has('a',true).out().limit(1).values('a').count()",
         ] {
             assert!(plan(&request(text)).is_ok(), "{text}");
         }
     }
+    #[test]
+    fn hop_admission_is_bounded_even_for_empty_or_limited_queries() {
+        for text in [
+            "g.V(999).out().out().out().out().count()",
+            "g.V(1).limit(1).out().out().out().out()",
+        ] {
+            assert_eq!(
+                plan(&request(text)).unwrap_err(),
+                QueryFailure::ResourceExhausted
+            );
+        }
+    }
+
+    #[test]
+    fn client_validates_every_hop_and_exact_path_length() {
+        let vertex = |partition| QualifiedElement::Vertex { partition, id: 1 };
+        let edge = |partition| QualifiedElement::Edge { partition, id: 1 };
+        let path = vec![
+            vertex(1),
+            edge(1),
+            vertex(2),
+            edge(2),
+            vertex(1),
+            edge(1),
+            vertex(2),
+        ];
+        let mut output = DistributedOutput {
+            completeness: QueryCompleteness::Unverified,
+            snapshots: vec![QueryStamp {
+                identity: RemoteIdentity { group: 1, node: 1 },
+                shard: 7,
+                epoch: 1,
+                sequence: 1,
+            }],
+            rows: vec![QueryRow::Path(path.clone())],
+        };
+        let req = request("g.V(1).out().out().out().path()");
+        validate_output(&output, &req).unwrap();
+        for index in 0..path.len() {
+            let mut bad = path.clone();
+            bad[index] = if index % 2 == 0 { edge(1) } else { vertex(1) };
+            output.rows = vec![QueryRow::Path(bad)];
+            assert!(validate_output(&output, &req).is_err());
+        }
+        for index in [1, 3, 5] {
+            let mut bad = path.clone();
+            bad[index] = edge(99);
+            output.rows = vec![QueryRow::Path(bad)];
+            assert!(validate_output(&output, &req).is_err());
+        }
+        for length in 0..path.len() {
+            output.rows = vec![QueryRow::Path(path[..length].to_vec())];
+            assert!(validate_output(&output, &req).is_err());
+        }
+        output.rows = vec![QueryRow::Path(path)];
+        assert!(validate_output(&output, &request("g.V(1).out().out().path()")).is_err());
+    }
+
     #[test]
     fn global_budget_is_cumulative_and_never_refunded_by_limit_or_count() {
         let mut cost = Cost::default();
