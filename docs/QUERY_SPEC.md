@@ -361,7 +361,7 @@ stable order is (partition ID, local ID), distinct from the older client global
 scan order. It uses data-local pages and fixed per-shard sessions, explicit
 scan budgets and Unverified results, never a global atomic snapshot claim.
 The bounded [global scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md)
-extends this with an ordered scan-filter/limit prefix then out/in, filters,
+extends this with an ordered scan-filter/dedup/limit prefix then out/in, filters,
 limit, dedup and terminal count/selected valueMap. It preserves separate scan
 and traversal budgets on the same sessions. Joined results have no implicit
 100-row truncation. Global E/path/values remain Unsupported. No-hop map/dedup follow the server global scan contract below. One bounded
@@ -540,3 +540,10 @@ singleton lists. Empty/all-key maps, map post-processing and scalar dedup remain
 unsupported. Existing scan output limits and separately accounted synchronous
 projection budgets apply. See SERVER_GLOBAL_SCAN.md. This does not change the
 Unverified consistency contract or enable hierarchy-job global starts.
+
+Global scan prefixes may include vertex `dedup()` before the first out/in/repeat.
+The scan already emits unique (partition,id) identities, so prefix dedup preserves
+its ordered roots exactly and limits keep their positions. This does not dedup
+subsequent traversers: parallel edges, convergence and repeat emission preserve
+bag multiplicity unless a separate downstream dedup is explicitly present.
+No extra scan, budget, refresh or default truncation is introduced.

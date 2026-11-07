@@ -662,7 +662,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 112);
+    assert_eq!(q.len(), 113);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     assert!(
         get("unique_colleague_count")["expected"]["count"]

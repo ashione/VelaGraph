@@ -73,6 +73,9 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
     };
     let server = m.hop(&selected(true), "reports_to", true);
     let client = m.hop(&selected(false), "reports_to", true);
+    add("global_prefix_dedup_manager_bag_count",
+        "g.V().hasLabel('person').has('active',true).has('country','CN').dedup().limit(12).out('reports_to').count()".into(),
+        json!({"count":server.len()}), None);
     let prefix = "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).out('reports_to')";
     add(
         "global_join_filtered_manager_rows",
@@ -235,7 +238,7 @@ fn global_relationship_oracles_are_nonvacuous() {
         let m = Model::new(people, departments);
         let q = queries(&m);
         let get = |name: &str| q.iter().find(|r| r["name"] == name).unwrap();
-        assert_eq!(q.len(), 22);
+        assert_eq!(q.len(), 23);
         assert_eq!(get("global_scan_reject_scalar_dedup")["expect_error"], true);
         assert_eq!(
             get("global_scan_reject_scalar_dedup")["client_expect_unsupported"],
@@ -307,7 +310,7 @@ fn global_relationship_oracles_are_nonvacuous() {
         }
         assert_eq!(
             q.iter().filter(|r| r["server_supported"] == true).count(),
-            20
+            21
         );
     }
 }

@@ -416,3 +416,9 @@ Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
 上限以及完整历史，不代表无限写入、GC、MVCC 或大规模动态一致查询完成。
 将来解除上限前，全部 cohort 成员（含非参与者）的决定消费容量预留必须有证明。
 见[契约](DURABLE_REQUEST_INDEX.md)。
+
+### Global scan prefix identity dedup
+
+通用全局筛选现在允许首个 out/in/repeat 前的顶点 dedup，与扫描已有唯一
+(partition,id) 身份等价；后续边遍历和 repeat 的 bag 重数不受影响。独立小图
+与 CoreHR 验证前缀/后缀去重、limit 原位置和汇合计数，不扩大预算或一致性声明。

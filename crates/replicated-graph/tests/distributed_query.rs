@@ -1025,7 +1025,7 @@ async fn scenario() -> anyhow::Result<()> {
         vec![QueryRow::Count(0)]
     );
     for text in [
-        "g.V().dedup().out().count()",
+        "g.V().values('x').dedup().out().count()",
         "g.E(1).count()",
         "g.V(999).values('name').out()",
     ] {
