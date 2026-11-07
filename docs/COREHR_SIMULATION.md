@@ -71,17 +71,23 @@ mean Gremlin supports continuation tokens or offset pagination.
 
 This integrated harness additionally includes the incoming-query implementation
 from the separately reviewed incoming-query candidate; its exact production-file hashes are recorded with the
-experiment. See `COREHR_INCOMING_RESULTS.md` for integrated measurements and
+experiment. See `COREHR_DEDUP_RESULTS.md` for the later server-only unique-membership
+validation, `COREHR_INCOMING_RESULTS.md` for incoming-query measurements, and
 `COREHR_RESULTS.md` for the earlier outgoing-only baseline.
 
 At full scale the broad client session is expected to reject its **200,000 KV /
 16 MiB aggregate snapshot limit**. Storage snapshots separately cap each shard
 at 1,000,000 KV / 64 MiB. The server distributed executor supports explicit starts
 and up to three mixed **outgoing/incoming** hops with filters, projections,
-count and limit. Global starts remain unsupported. The full run checks
+count, limit and server-only vertex `dedup()`. Global starts remain unsupported. The full run checks
 managers, direct reports, department descendants/members and mixed-direction
 joins against the same oracle. Recursive repeat, offset pagination, ordering,
-predicates, deduplication and global counts must reject explicitly.
+predicates and global counts must reject explicitly. The extended matrix contains
+40 cases: 35 server-supported cases and five explicit rejections. Nine cases
+exercise deduplication, unique counts, first retained paths, repeated starts,
+empty streams and the non-commutative order of limit/dedup. These nine cases
+still explicitly reject client-side execution; support is not inferred across
+execution paths. Full-list and path cases use an explicit 1,000-row limit.
 
 Full manager and department ancestor chains additionally run as explicitly
 bounded application loops of single-hop queries (64-hop ceiling). They are not
@@ -99,7 +105,7 @@ compare its timings directly with the recorded release-node baseline.
 Report candidate revision, hardware and resource constraints alongside results.
 
 The fixture/harness itself changes no production code, grammar, format or
-resource cap. The separately reviewed two-file server incoming-query change is
-included in this integration. Do not infer universal query support from a passing
+resource cap. The separately reviewed incoming-query and server-only dedup
+implementations are included in the corresponding engine revisions. Do not infer universal query support from a passing
 simulation. A failure is actionable evidence, not a reason to raise limits or
 silently substitute a different query.

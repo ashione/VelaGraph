@@ -11,7 +11,9 @@ use replicated_graph::{
         RemoteIdentity,
     },
     routing::{
-        experimental::{AdjacencyCompleteness, ExperimentalRouteError, ObservedRowV3},
+        experimental::{
+            AdjacencyCompleteness, ExperimentalRouteError, ObservedPathElement, ObservedRowV3,
+        },
         RemoteReplica, RouteError, RouteResolver,
     },
     run_blocking,
@@ -131,6 +133,9 @@ fn summary(mut xs: Vec<f64>) -> Value {
     json!({"n":xs.len(),"p50_ms":xs[xs.len()/2],"p95_ms":xs[(xs.len()*95).div_ceil(100)-1],"min_ms":xs[0],"max_ms":xs[xs.len()-1]})
 }
 fn observed(rows: &[ObservedRowV3]) -> Value {
+    if matches!(rows.first(), Some(ObservedRowV3::Path(_))) {
+        return json!({"paths": rows.iter().map(|r| match r { ObservedRowV3::Path(p) => p.iter().map(|e| match e { ObservedPathElement::Vertex(v) => json!(["v",v.partition,v.id]), ObservedPathElement::Edge(e) => json!(["e",e.partition,e.id]) }).collect::<Vec<_>>(), _ => panic!("mixed path rows") }).collect::<Vec<_>>()});
+    }
     if matches!(rows.first(), Some(ObservedRowV3::Value { .. })) {
         return json!({"values": rows.iter().map(|r| if let ObservedRowV3::Value{value,..}=r {json!(value)} else {Value::Null}).collect::<Vec<_>>()});
     }
@@ -141,6 +146,9 @@ fn observed(rows: &[ObservedRowV3]) -> Value {
     json!({"vertices":rows.iter().map(|r|match r{ObservedRowV3::Vertex(v)=>json!([v.partition,v.id]),_=>json!(format!("{r:?}"))}).collect::<Vec<_>>()})
 }
 fn server_rows(rows: &[QueryRow]) -> Value {
+    if matches!(rows.first(), Some(QueryRow::Path(_))) {
+        return json!({"paths": rows.iter().map(|r| match r { QueryRow::Path(p) => p.iter().map(|e| match e { QualifiedElement::Vertex{partition,id} => json!(["v",partition,id]), QualifiedElement::Edge{partition,id} => json!(["e",partition,id]) }).collect::<Vec<_>>(), _ => panic!("mixed path rows") }).collect::<Vec<_>>()});
+    }
     if matches!(rows.first(), Some(QueryRow::Value { .. })) {
         return json!({"values": rows.iter().map(|r| if let QueryRow::Value{value,..}=r {json!(value)} else {Value::Null}).collect::<Vec<_>>()});
     }
@@ -389,7 +397,8 @@ async fn main() -> anyhow::Result<()> {
                 let query = c["query"].as_str().unwrap();
                 let t = Instant::now();
                 let result = s.observed_gremlin_v3(c["partition"].as_u64().unwrap() as u32, query);
-                let expect_error = c["expect_error"].as_bool() == Some(true);
+                let client_unsupported = c["client_expect_unsupported"].as_bool() == Some(true);
+                let expect_error = c["expect_error"].as_bool() == Some(true) || client_unsupported;
                 let report = match result {
                     Ok(output) => {
                         ensure!(!expect_error, "unexpected success {query}");
@@ -400,7 +409,8 @@ async fn main() -> anyhow::Result<()> {
                     },
                     Err(e) => {
                         ensure!(expect_error, "unexpected client error {query}: {e:?}");
-                        ensure!(matches!(&e,
+                        if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "dedup client must explicitly reject Unsupported: {e:?}"); }
+                        ensure!(client_unsupported || matches!(&e,
                             ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
                             | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
                             | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)
