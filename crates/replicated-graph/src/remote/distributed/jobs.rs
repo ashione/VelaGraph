@@ -84,12 +84,116 @@ fn parse(text: &str) -> Result<Plan, QueryFailure> {
         dedup,
     })
 }
+// Only emit().dedup().count() retains every emitted identity. Share its
+// membership and both depth bags, rather than charging the same key twice.
+// Alternating slots avoid an unbounded reset pass at depth transitions.
+const SCAN_ROWS: usize = 128;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IdentityState {
+    weights: [u64; 2],
+    seen: bool,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Compact {
+    identities: BTreeMap<VertexId, IdentityState>,
+    slot: usize,
+    cursor: Option<VertexId>,
+    current_keys: usize,
+    next_keys: usize,
+    next_mass: u64,
+    total: u64,
+}
+impl Compact {
+    fn seed(&mut self, vertex: VertexId, cost: &mut Cost) -> Result<(), QueryFailure> {
+        let old = self.identities.get(&vertex).copied().unwrap_or_default();
+        let additional = usize::from(!self.identities.contains_key(&vertex));
+        if self.identities.len() + additional > MAX_KEYS {
+            return Err(QueryFailure::ResourceExhausted);
+        }
+        let weight = checked(old.weights[self.slot], 1)?;
+        let mut charged = *cost;
+        charged.charge(128 * additional, 1, JOB_CEILING)?;
+        let state = self.identities.entry(vertex).or_default();
+        self.current_keys += usize::from(state.weights[self.slot] == 0);
+        state.weights[self.slot] = weight;
+        *cost = charged;
+        Ok(())
+    }
+    fn accept(
+        &mut self,
+        vertex: VertexId,
+        weight: u64,
+        cost: &mut Cost,
+    ) -> Result<(), QueryFailure> {
+        let old = self.identities.get(&vertex).copied().unwrap_or_default();
+        let additional = usize::from(!self.identities.contains_key(&vertex));
+        if self.identities.len() + additional > MAX_KEYS {
+            return Err(QueryFailure::ResourceExhausted);
+        }
+        let next = 1 - self.slot;
+        let weight_sum = checked(old.weights[next], weight)?;
+        let mass = checked(self.next_mass, weight)?;
+        let total = checked(self.total, u64::from(!old.seen))?;
+        let mut charged = *cost;
+        charged.charge(128 * additional, 1, JOB_CEILING)?;
+        let state = self.identities.entry(vertex).or_default();
+        self.next_keys += usize::from(state.weights[next] == 0 && weight_sum != 0);
+        state.weights[next] = weight_sum;
+        state.seen = true;
+        self.next_mass = mass;
+        self.total = total;
+        *cost = charged;
+        Ok(())
+    }
+    fn take(
+        &mut self,
+        cost: &mut Cost,
+        end: Instant,
+    ) -> Result<Vec<(VertexId, u64)>, QueryFailure> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let lower = self.cursor.map_or(Unbounded, Excluded);
+        let mut current = Vec::new();
+        let mut cursor = self.cursor;
+        let mut scanned = 0;
+        // Historical identities are bounded work too. New next-depth keys on
+        // either side of this cursor cannot enter the current bag.
+        for (vertex, state) in self.identities.range((lower, Unbounded)).take(SCAN_ROWS) {
+            check(end)?;
+            scanned += 1;
+            cursor = Some(*vertex);
+            if state.weights[self.slot] != 0 {
+                current.push((*vertex, state.weights[self.slot]));
+                if current.len() == ADVANCE_ROWS || current.len() == self.current_keys {
+                    break;
+                }
+            }
+        }
+        let mut charged = *cost;
+        charged.charge(0, scanned, JOB_CEILING)?;
+        for (vertex, _) in &current {
+            self.identities.get_mut(vertex).unwrap().weights[self.slot] = 0;
+        }
+        self.current_keys -= current.len();
+        self.cursor = cursor;
+        *cost = charged;
+        Ok(current)
+    }
+    fn next_depth(&mut self) {
+        debug_assert_eq!(self.current_keys, 0);
+        self.slot = 1 - self.slot;
+        self.cursor = None;
+        self.current_keys = self.next_keys;
+        self.next_keys = 0;
+        self.next_mass = 0;
+    }
+}
 struct Job {
     catalog: Arc<StaticCatalog>,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     expires: Instant,
     cost: Cost,
     plan: Plan,
+    compact: Option<Compact>,
     frontier: BTreeMap<VertexId, u64>,
     next: BTreeMap<VertexId, u64>,
     seen: BTreeSet<VertexId>,
@@ -152,6 +256,7 @@ impl Jobs {
                     sessions: BTreeMap::new(),
                     expires,
                     cost: Cost::default(),
+                    compact: (plan.emit && plan.dedup).then(Compact::default),
                     plan,
                     frontier: BTreeMap::new(),
                     next: BTreeMap::new(),
@@ -283,8 +388,12 @@ impl Job {
             return Err(QueryFailure::UnsupportedScope);
         }
         for id in self.plan.ids.clone() {
-            self.charge(128, 1)?;
-            add(&mut self.frontier, VertexId { partition, id }, 1)?;
+            if let Some(compact) = &mut self.compact {
+                compact.seed(VertexId { partition, id }, &mut self.cost)?;
+            } else {
+                self.charge(128, 1)?;
+                add(&mut self.frontier, VertexId { partition, id }, 1)?;
+            }
         }
         for route in self.catalog.partitions.clone() {
             if self.sessions.contains_key(&route.shard) {
@@ -377,7 +486,11 @@ impl Job {
         check(end)?;
         self.charge(256, 1)?;
         if !self.initialized {
-            let starts: Vec<_> = self.frontier.keys().copied().collect();
+            let starts: Vec<_> = if let Some(compact) = &self.compact {
+                compact.identities.keys().copied().collect()
+            } else {
+                self.frontier.keys().copied().collect()
+            };
             let values = self
                 .batch(starts.iter().copied().map(Fragment::Exists).collect(), end)
                 .await?;
@@ -385,21 +498,31 @@ impl Job {
                 match value {
                     FragmentValue::Bool(true) => {}
                     FragmentValue::Bool(false) => {
-                        self.frontier.remove(&vertex);
+                        if let Some(compact) = &mut self.compact {
+                            compact.identities.remove(&vertex);
+                            compact.current_keys -= 1;
+                        } else {
+                            self.frontier.remove(&vertex);
+                        }
                     }
                     _ => return Err(QueryFailure::IncompleteOrCorrupt),
                 }
             }
             self.initialized = true;
         }
-        let mut current = Vec::new();
-        for _ in 0..ADVANCE_ROWS {
-            if let Some(row) = self.frontier.pop_first() {
-                current.push(row);
-            } else {
-                break;
+        let current = if let Some(compact) = &mut self.compact {
+            compact.take(&mut self.cost, end)?
+        } else {
+            let mut current = Vec::new();
+            for _ in 0..ADVANCE_ROWS {
+                if let Some(row) = self.frontier.pop_first() {
+                    current.push(row);
+                } else {
+                    break;
+                }
             }
-        }
+            current
+        };
         let leaves = current
             .iter()
             .map(|(v, _)| {
@@ -480,7 +603,18 @@ impl Job {
                 self.accept(edge.to, weight, &edge.label)?;
             }
         }
-        if self.frontier.is_empty() {
+        if let Some(compact) = &mut self.compact {
+            if compact.current_keys == 0 {
+                self.depth += 1;
+                if self.depth == self.plan.times || compact.next_keys == 0 {
+                    self.completed = true;
+                    // Retained replay needs only total and snapshot stamps.
+                    self.compact = None;
+                } else {
+                    compact.next_depth();
+                }
+            }
+        } else if self.frontier.is_empty() {
             self.depth += 1;
             if self.depth == self.plan.times || self.next.is_empty() {
                 if !self.plan.emit {
@@ -508,6 +642,11 @@ impl Job {
             .as_ref()
             .is_some_and(|expected| expected != label)
         {
+            return Ok(());
+        }
+        if let Some(compact) = &mut self.compact {
+            compact.accept(vertex, weight, &mut self.cost)?;
+            self.total = compact.total;
             return Ok(());
         }
         let additional = usize::from(!self.next.contains_key(&vertex))
@@ -630,6 +769,187 @@ fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn vertex(id: usize) -> VertexId {
+        // Neighboring logical vertices deliberately share the numeric ID.
+        VertexId {
+            partition: (id % 2) as u32,
+            id: (id / 2) as u64,
+        }
+    }
+    #[test]
+    fn compact_depth_bags_match_explicit_paths_with_cycles_parallel_edges_and_reconvergence() {
+        for seed in 0..50usize {
+            let n = 23;
+            let edges: Vec<Vec<usize>> = (0..n)
+                .map(|v| vec![v, (v + seed + 1) % n, (v + seed + 1) % n, (v * 7 + 3) % n])
+                .collect();
+            let mut compact = Compact::default();
+            let mut cost = Cost::default();
+            let mut paths = vec![0, 0, 1];
+            let mut emitted = BTreeSet::new();
+            for v in &paths {
+                compact.seed(vertex(*v), &mut cost).unwrap();
+            }
+            for depth in 0..5 {
+                let old_paths = paths;
+                paths = old_paths.iter().flat_map(|v| edges[*v].clone()).collect();
+                emitted.extend(paths.iter().copied().map(vertex));
+                let end = Instant::now() + Duration::from_secs(30);
+                while compact.current_keys != 0 {
+                    let page = compact.take(&mut cost, end).unwrap();
+                    assert!(page.len() <= ADVANCE_ROWS);
+                    for (v, weight) in page {
+                        let index = v.id as usize * 2 + v.partition as usize;
+                        for target in &edges[index] {
+                            compact.accept(vertex(*target), weight, &mut cost).unwrap();
+                        }
+                    }
+                }
+                assert_eq!(
+                    compact.total,
+                    emitted.len() as u64,
+                    "seed {seed}, depth {depth}"
+                );
+                assert_eq!(compact.next_mass, paths.len() as u64);
+                compact.next_depth();
+                let mut oracle = BTreeMap::new();
+                for v in &paths {
+                    *oracle.entry(vertex(*v)).or_insert(0u64) += 1;
+                }
+                let actual: BTreeMap<_, _> = compact
+                    .identities
+                    .iter()
+                    .filter(|(_, state)| state.weights[compact.slot] != 0)
+                    .map(|(v, state)| (*v, state.weights[compact.slot]))
+                    .collect();
+                assert_eq!(actual, oracle);
+                assert_eq!(compact.current_keys, oracle.len());
+                assert!(compact
+                    .identities
+                    .values()
+                    .all(|s| s.weights[1 - compact.slot] == 0));
+            }
+        }
+    }
+    #[test]
+    fn compact_sparse_scan_is_incremental_metered_and_failure_atomic() {
+        let mut compact = Compact::default();
+        for id in 0..1000 {
+            compact.identities.insert(
+                VertexId { partition: 0, id },
+                IdentityState {
+                    seen: true,
+                    ..IdentityState::default()
+                },
+            );
+        }
+        let mut cost = Cost::default();
+        let last = VertexId {
+            partition: 0,
+            id: 999,
+        };
+        compact.seed(last, &mut cost).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        let work = cost.work;
+        assert!(compact.take(&mut cost, end).unwrap().is_empty());
+        assert_eq!(cost.work - work, SCAN_ROWS);
+        assert_eq!(compact.cursor.unwrap().id, SCAN_ROWS as u64 - 1);
+        assert_eq!(compact.current_keys, 1);
+        let before = compact.clone();
+        cost.work = JOB_CEILING.work;
+        let charged = cost;
+        assert_eq!(
+            compact.take(&mut cost, end),
+            Err(QueryFailure::ResourceExhausted)
+        );
+        assert_eq!(compact, before);
+        assert_eq!((cost.bytes, cost.work), (charged.bytes, charged.work));
+        cost.work = 0;
+        assert!(compact
+            .take(&mut cost, Instant::now() - Duration::from_secs(1))
+            .is_err());
+        assert_eq!(compact, before);
+        let mut rows = Vec::new();
+        while compact.current_keys != 0 {
+            rows.extend(compact.take(&mut cost, end).unwrap());
+        }
+        assert_eq!(rows, vec![(last, 1)]);
+        assert_eq!(cost.work, 1000 - SCAN_ROWS);
+        assert_eq!(compact.next_keys, 0);
+    }
+    #[test]
+    fn compact_identity_cap_shares_frontiers_and_seen_without_bypassing_mass_or_cost() {
+        // Includes conservative logical overhead for B-tree nodes and allocator.
+        assert!(std::mem::size_of::<(VertexId, IdentityState)>() * 2 <= 128);
+        let mut compact = Compact::default();
+        let mut cost = Cost::default();
+        for id in 0..MAX_KEYS {
+            compact.seed(vertex(id), &mut cost).unwrap();
+        }
+        // At exactly the key cap an existing current key can also be emitted
+        // into the next depth. No second allocation is charged.
+        let bytes = cost.bytes;
+        for id in 0..MAX_KEYS {
+            compact.accept(vertex(id), 1, &mut cost).unwrap();
+        }
+        assert_eq!(compact.total, MAX_KEYS as u64);
+        assert_eq!(compact.next_keys, MAX_KEYS);
+        let before_cap = compact.clone();
+        let charged_cap = cost;
+        assert_eq!(
+            compact.accept(vertex(MAX_KEYS), 1, &mut cost),
+            Err(QueryFailure::ResourceExhausted)
+        );
+        assert_eq!(compact, before_cap);
+        assert_eq!(
+            (cost.bytes, cost.work),
+            (charged_cap.bytes, charged_cap.work)
+        );
+        compact
+            .accept(vertex(0), MAX_MASS - MAX_KEYS as u64, &mut cost)
+            .unwrap();
+        assert_eq!(compact.identities.len(), MAX_KEYS);
+        assert_eq!(compact.next_keys, MAX_KEYS);
+        assert_eq!(cost.bytes, bytes);
+        let before = compact.clone();
+        let charged = cost;
+        for (v, weight) in [(vertex(MAX_KEYS), 1), (vertex(1), 1), (vertex(0), 1)] {
+            assert_eq!(
+                compact.accept(v, weight, &mut cost),
+                Err(QueryFailure::ResourceExhausted)
+            );
+            assert_eq!(compact, before);
+            assert_eq!((cost.bytes, cost.work), (charged.bytes, charged.work));
+        }
+        assert_eq!(
+            compact.seed(vertex(MAX_KEYS), &mut cost),
+            Err(QueryFailure::ResourceExhausted)
+        );
+        assert_eq!(compact, before);
+        // Budget failure must not insert an identity or increment totals.
+        for ceiling in [
+            Cost {
+                bytes: JOB_CEILING.bytes,
+                work: 0,
+            },
+            Cost {
+                bytes: 0,
+                work: JOB_CEILING.work,
+            },
+        ] {
+            let mut fresh = Compact::default();
+            let mut exhausted = ceiling;
+            assert_eq!(
+                fresh.accept(vertex(0), 1, &mut exhausted),
+                Err(QueryFailure::ResourceExhausted)
+            );
+            assert_eq!(fresh, Compact::default());
+            assert_eq!(
+                (exhausted.bytes, exhausted.work),
+                (ceiling.bytes, ceiling.work)
+            );
+        }
+    }
     #[test]
     fn advance_grain_fits_maximum_adjacencies_without_a_larger_page_budget() {
         // Regression for 125 hot departments, whose unrelated membership
@@ -729,6 +1049,7 @@ mod tests {
                         sessions: BTreeMap::new(),
                         expires: Instant::now() + Duration::from_secs(1),
                         cost: Cost::default(),
+                        compact: None,
                         plan,
                         frontier: BTreeMap::new(),
                         next: BTreeMap::new(),
@@ -862,6 +1183,7 @@ mod tests {
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             expires,
             cost: Cost::default(),
+            compact: None,
             plan: parse("g.V(1).repeat(__.out()).times(2).count()").unwrap(),
             frontier: BTreeMap::from([(
                 VertexId {

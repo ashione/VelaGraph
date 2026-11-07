@@ -40,8 +40,9 @@ shards on server-retained snapshots. It uses a caller-maintained static catalog,
 discovery, and still returns Unverified observations. Its separately bounded
 [incremental hierarchy count jobs](docs/HIERARCHY_COUNT_JOBS.md) API advances
 bounded native counts over a fixed snapshot vector without retaining full paths.
-It has a separate finite lease and explicit budgets; it does not provide
-vertex/path pagination. A separate [global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
+It has a separate finite lease and explicit budgets; terminal emitted dedup shares
+identity state across traversal depths without suppressing cycles or increasing
+the identity cap. It does not provide vertex/path pagination. A separate [global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
 filters/limit/count without downloading the graph to the coordinator.
 
 The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
