@@ -314,6 +314,7 @@ mod tests {
             sessions,
             row_bounds: BTreeMap::from([(1, 256), (2, 256), (3, 256)]),
             connections: None,
+            rows: None,
             expires: Instant::now() + Duration::from_secs(5),
             cost: Cost::default(),
             plan: parse("g.V(1).repeat(__.out()).times(1).count()").unwrap(),

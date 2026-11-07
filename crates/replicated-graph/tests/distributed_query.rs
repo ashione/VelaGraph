@@ -42,6 +42,8 @@ use tokio::{
 mod corehr;
 #[path = "distributed_query/jobs.rs"]
 mod jobs;
+#[path = "distributed_query/result_pages.rs"]
+mod result_pages;
 static PROCESS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const BUDGET: Duration = Duration::from_secs(20);
 struct Process(Child);
@@ -740,7 +742,10 @@ async fn scenario() -> anyhow::Result<()> {
     )
     .await?;
     let endpoint = service.local_addr();
-    jobs::check(endpoint).await?;
+    jobs::check(endpoint).await.context("count job checks")?;
+    result_pages::check(endpoint)
+        .await
+        .context("row page checks")?;
     let before = bp.bytes.load(Ordering::SeqCst);
     let opened_a = ap.opened.load(Ordering::SeqCst);
     let opened_b = bp.opened.load(Ordering::SeqCst);
@@ -874,7 +879,7 @@ async fn scenario() -> anyhow::Result<()> {
     }
     for text in [
         "g.V(8).repeat(__.out()).times(2).count()",
-        "g.V(9).repeat(__.out('filtered-out')).emit().times(2).limit(1).count()",
+        "g.V(9).repeat(__.out('unrelated')).emit().times(2).limit(1).count()",
     ] {
         assert_eq!(
             distributed::query(
@@ -1118,7 +1123,7 @@ async fn scenario() -> anyhow::Result<()> {
     for id in [40, 41, 43, 44] {
         for suffix in [
             "in().count()",
-            "in('filtered-out').limit(1).count()",
+            "in('unrelated').limit(1).count()",
             "in().dedup().count()",
         ] {
             let result = distributed::query(
@@ -1303,7 +1308,9 @@ async fn scenario() -> anyhow::Result<()> {
         0
     );
     assert!(ap.requests.load(Ordering::SeqCst) > 0 && bp.requests.load(Ordering::SeqCst) > 0);
-    jobs::fixed_snapshot(endpoint, &a).await?;
+    jobs::fixed_snapshot(endpoint, &a)
+        .await
+        .context("pinned job checks")?;
     b.process.0.kill()?;
     b.process.0.wait()?;
     let unavailable = distributed::query(
