@@ -134,6 +134,71 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
             Some(json!({"count":m.hop(&select(false),"member_of",true).len()})),
         );
     }
+    // Input-only breadth-first oracle, independent of the execution plan.
+    let repeat = |roots: &[u64], label: &str, outgoing: bool, depth: usize, emit: bool| {
+        let mut frontier = roots.to_vec();
+        let mut emitted = Vec::new();
+        for _ in 0..depth {
+            frontier = m.hop(&frontier, label, outgoing);
+            if emit {
+                emitted.extend(frontier.iter().copied());
+            }
+        }
+        if emit {
+            emitted
+        } else {
+            frontier
+        }
+    };
+    let start = m.people;
+    let prefix = format!("g.V().has('name','Employee-{start:06}').limit(1)");
+    let ancestors = repeat(&[start], "reports_to", true, 32, true);
+    add(
+        "global_repeat_named_ancestors",
+        format!("{prefix}.repeat(__.out('reports_to')).times(32).emit()"),
+        vertices(&ancestors),
+        None,
+    );
+    let filtered: Vec<_> = ancestors
+        .iter()
+        .copied()
+        .filter(|id| active(*id))
+        .take(3)
+        .collect();
+    add("global_repeat_filtered_ancestor_maps", format!("{prefix}.repeat(__.out('reports_to')).emit().times(32).has('active',true).limit(3).valueMap('name','active','missing')"), maps(m,&filtered), None);
+    let exact = repeat(&[start], "reports_to", true, 4, false);
+    add(
+        "global_repeat_exact_depth",
+        format!("{prefix}.repeat(__.out('reports_to')).times(4)"),
+        vertices(&exact),
+        None,
+    );
+    let descendants = repeat(&[1], "reports_to", false, 3, true);
+    add("global_repeat_named_descendant_count", "g.V().has('name','Employee-000001').limit(1).repeat(__.in('reports_to')).times(3).emit().count()".into(), json!({"count":descendants.len()}), None);
+    let roots = selected(true);
+    let shared = repeat(&roots, "reports_to", true, 4, true);
+    let prefix = "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).repeat(__.out('reports_to')).times(4).emit()";
+    add(
+        "global_repeat_multi_root_bag",
+        format!("{prefix}.count()"),
+        json!({"count":shared.len()}),
+        None,
+    );
+    add(
+        "global_repeat_multi_root_unique",
+        format!("{prefix}.dedup().count()"),
+        json!({"count":unique(shared).len()}),
+        None,
+    );
+    let departments = m.hop(&[20], "member_of", true);
+    let parents = unique(repeat(&departments, "parent_department", true, 4, true));
+    add("global_repeat_membership_then_department_hierarchy", "g.V().has('name','Employee-000020').limit(1).out('member_of').repeat(__.out('parent_department')).times(4).emit().dedup()".into(), vertices(&parents), None);
+    add(
+        "global_repeat_missing_root",
+        "g.V().has('name','NoSuchEmployee').repeat(__.out()).times(32).count()".into(),
+        json!({"count":0}),
+        None,
+    );
     for (name, query) in [
         (
             "global_join_reject_nohop_dedup",
@@ -156,7 +221,32 @@ fn global_relationship_oracles_are_nonvacuous() {
         let m = Model::new(people, departments);
         let q = queries(&m);
         let get = |name: &str| q.iter().find(|r| r["name"] == name).unwrap();
-        assert_eq!(q.len(), 12);
+        assert_eq!(q.len(), 20);
+        assert!(
+            get("global_repeat_named_ancestors")["expected"]["vertices"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 3
+        );
+        assert!(!get("global_repeat_exact_depth")["expected"]["vertices"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(
+            get("global_repeat_multi_root_bag")["expected"]["count"]
+                .as_u64()
+                .unwrap()
+                > get("global_repeat_multi_root_unique")["expected"]["count"]
+                    .as_u64()
+                    .unwrap()
+        );
+        assert!(
+            !get("global_repeat_membership_then_department_hierarchy")["expected"]["vertices"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             get("global_join_named_memberships")["expected"]["vertices"]
                 .as_array()
@@ -198,7 +288,7 @@ fn global_relationship_oracles_are_nonvacuous() {
         }
         assert_eq!(
             q.iter().filter(|r| r["server_supported"] == true).count(),
-            10
+            18
         );
     }
 }

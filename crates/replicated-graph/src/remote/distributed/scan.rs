@@ -34,7 +34,7 @@ pub(super) struct ScanResult {
 pub(super) fn is_global(query: &GremlinQuery) -> bool {
     matches!(query.start(), GremlinStart::Vertices(ids) if ids.is_empty())
 }
-// The first adjacency step separates storage-side scan filters from the bounded
+// The first adjacency or repeat step separates scan filters from the bounded
 // traversal. A preceding limit belongs to the scan, never to the final output.
 pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailure> {
     if !is_global(query) {
@@ -43,11 +43,14 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
     let Some(at) = query.steps().iter().position(|step| {
         matches!(
             step,
-            Step::Existing(GremlinStep::Out(_)) | Step::Existing(GremlinStep::In(_))
+            Step::Existing(GremlinStep::Out(_))
+                | Step::Existing(GremlinStep::In(_))
+                | Step::Repeat { .. }
         )
     }) else {
         return Ok(None);
     };
+    hierarchy::validate_depth(query)?;
     for step in &query.steps()[..at] {
         if !matches!(
             step,
@@ -65,7 +68,8 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
             | Step::Existing(GremlinStep::Has { .. })
             | Step::Existing(GremlinStep::HasLabel(_))
             | Step::Existing(GremlinStep::Limit(_))
-            | Step::Dedup => {}
+            | Step::Dedup
+            | Step::Repeat { .. } => {}
             Step::Existing(GremlinStep::Count) if index + 1 == query.steps().len() => {}
             Step::ValueMap(keys) if index + 1 == query.steps().len() => {
                 projection::validate_keys(keys)?
@@ -265,6 +269,8 @@ mod tests {
     fn joined_plan_preserves_prefix_and_has_no_implicit_limit() {
         for text in [
             "g.V().out().count()",
+            "g.V().out().repeat(__.in()).times(2)",
+            "g.V().has('x').repeat(__.out()).times(32).emit().count()",
             "g.V().has('x').limit(3).in('r').dedup().valueMap('other')",
             "g.V().limit(2).has('x').out().limit(1).in().count()",
         ] {
@@ -287,7 +293,6 @@ mod tests {
             "g.V().dedup().out()",
             "g.V().out().values('x')",
             "g.V().out().path()",
-            "g.V().out().repeat(__.in()).times(2)",
         ] {
             let q = GremlinQuery::parse(text).unwrap();
             assert!(join_at(&q).is_err(), "{text}");

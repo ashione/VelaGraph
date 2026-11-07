@@ -125,7 +125,6 @@ mod tests {
             "g.V(999).repeat(__.out()).times(0)",
             "g.V(999).repeat(__.out())",
             "g.V(999).values('x').repeat(__.out()).times(2)",
-            "g.V().repeat(__.out()).times(2)",
             "g.E(1).repeat(__.out()).times(2)",
         ] {
             assert!(plan(&req(text)).is_err(), "{text}");
@@ -142,6 +141,35 @@ mod tests {
         }
         assert!(plan(&req(
             "g.V(999).repeat(__.in()).emit().times(32).dedup().count()"
+        ))
+        .is_ok());
+    }
+    #[test]
+    fn global_repeat_validates_entire_shape_before_empty_scan() {
+        for text in [
+            "g.V().hasLabel('missing').repeat(__.out()).times(0)",
+            "g.V().hasLabel('missing').repeat(__.out()).times(2).repeat(__.in()).times(2)",
+            "g.V().hasLabel('missing').repeat(__.out()).times(2).path()",
+            "g.V().hasLabel('missing').repeat(__.out()).times(2).values('x')",
+        ] {
+            assert_eq!(
+                plan(&req(text)).unwrap_err(),
+                QueryFailure::Unsupported,
+                "{text}"
+            );
+        }
+        for text in [
+            "g.V().hasLabel('missing').repeat(__.out()).times(33)",
+            "g.V().hasLabel('missing').out().repeat(__.in()).times(32)",
+        ] {
+            assert_eq!(
+                plan(&req(text)).unwrap_err(),
+                QueryFailure::ResourceExhausted,
+                "{text}"
+            );
+        }
+        assert!(plan(&req(
+            "g.V().repeat(__.out()).times(32).emit().dedup().count()"
         ))
         .is_ok());
     }

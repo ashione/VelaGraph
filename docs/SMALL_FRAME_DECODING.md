@@ -32,7 +32,10 @@ Rust; PR82 added tests/documentation. Measured candidate commit:
 `2c85ce8fc38ec465d2909cc0403597fdf484a484`). Later integration onto main83
 `3e5508b46e60db725b00234e14c808a460c411a4` preserves the new consistency
 negotiation and is verified separately; these old-baseline timings are not
-presented as a new-main timing measurement.
+presented as a new-main timing measurement. The branch subsequently also
+integrates main84 `d2a1c7e3068b830114f161e13462cd098f6172c0`; its broader
+global-repeat functionality is preserved, and exact-head correctness CI is
+rerun. No new-main speed claim is inferred from the old measurements.
 
 Both variants use frozen release node/driver binaries, the same deterministic
 200,000-person/5,000-department fixture and two Tokio workers per process. Three

@@ -1,9 +1,9 @@
 # Bounded global vertex scan into traversal
 
 The experimental server coordinator accepts a global vertex-filter prefix and
-then up to three ordinary out/in steps, without downloading shard snapshots or
+then bounded out/in and repeat steps, without downloading shard snapshots or
 re-parsing rewritten query text. The official Gremlin AST is split at its first
-adjacency step. There is no schema-, label-, population- or answer-specific path.
+adjacency or repeat step. There is no schema-, label-, population- or answer-specific path.
 
 ## Supported pipeline
 
@@ -11,6 +11,9 @@ adjacency step. There is no schema-, label-, population- or answer-specific path
 - Scan prefix: any supported `has`, `hasLabel` and `limit`, in their original order.
 - Traversal suffix: `out`/`in` (up to three total), `has`, `hasLabel`, `limit`,
   vertex-identity `dedup`, and optionally terminal `count` or selected `valueMap`.
+- One native `repeat(single out/in).times(1..32)` with optional post-emit is
+  admitted, including before/after ordinary hops. Combined ordinary/repeated
+  depth is at most 32; the separate ordinary three-hop bound is unchanged.
 - A suffix ending in vertices returns qualified identities. `valueMap` keeps the
   existing 1–8 distinct keys, UTF-8 length and per-map byte bounds, missing/Null
   semantics, and singleton-list values.
@@ -21,8 +24,8 @@ Examples:
 - `g.V().has('name','Operations').in('member_of').has('active',true).limit(20).valueMap('name','country')`
 - `g.V().limit(4).has('active',true).out().in().dedup()`
 
-At least one out/in step is required for this additive surface. Global `E`,
-`repeat`, `path`, `values`, `both`, no-hop `dedup`/`valueMap`, and other unsupported
+At least one out/in or repeat step is required for this additive surface. Global `E`,
+`path`, `values`, `both`, no-hop `dedup`/`valueMap`, and other unsupported
 steps fail explicitly. Existing scan-only and explicit-ID contracts stay intact.
 
 ## Order, multiplicity and completeness
@@ -34,6 +37,14 @@ seed stream is then passed to the existing bounded traversal in that order.
 Parallel edges and repeated destinations preserve their multiplicity until an
 explicit dedup. Dedup uses qualified identity and preserves first occurrence.
 Limits in the suffix act at their exact original positions.
+
+Repeat follows the existing native breadth-first semantics: exact depth returns
+only the final frontier; post-emit returns each depth in order, excluding initial
+roots. Cycles, converging paths and parallel edges retain multiplicity. Terminal
+dedup does not prune later traversal. All depth and shape validation precedes
+scan acquisition even for empty roots. Nested/multiple repeats and
+conditional termination remain Unsupported. This synchronous extension does not
+add global roots to hierarchy jobs or paginated result APIs.
 
 Neither the joined scan prefix nor its final result has an implicit 100-row cap.
 A successful response is the complete requested bounded result, or the stream
@@ -74,10 +85,13 @@ from fixture inputs, including 101 returned identities/maps without an implicit
 cap. Missing reverse/canonical records remain whole-query failures, including
 when a later filter or limit would otherwise hide them.
 
-The CoreHR fixture now contains 102 cases, including 12 global-composition cases:
-10 successful shapes (seven samples each) and two expected Unsupported shapes.
+The CoreHR fixture now contains 110 cases, including 20 global-composition cases:
+18 successful shapes (seven samples each) and two expected Unsupported shapes.
+Eight repeat shapes cover named ancestors, selected ancestor properties, exact
+depth, descendants, overlapping roots with bag/dedup, a membership hop before
+department ancestors, and empty roots. These expectations use input edges only.
 The small 2,000-person/50-department matrix and 200,000-person/5,000-department
-server matrix passed strict independent validators. On the full fixture the
+server matrix must pass strict independent validators for this extension. On the full fixture the
 legacy client is explicitly rejected at its existing snapshot capacity before
 running queries; this is not a successful full-scale legacy-client run. Full
 CoreHR CI on the final commit is required alongside normal tests and review.

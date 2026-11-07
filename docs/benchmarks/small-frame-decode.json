@@ -7,7 +7,8 @@
     "later_integration_base": "3e5508b46e60db725b00234e14c808a460c411a4",
     "later_integration_is_not_this_timing_measurement": true,
     "driver_sha256": "e57fe01dcd4dcd731cb5b761820cab9000cb1994ea201fce7a37161537ae6312",
-    "fixture_manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e"
+    "fixture_manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e",
+    "subsequent_integration_base": "d2a1c7e3068b830114f161e13462cd098f6172c0"
   },
   "physical_hosts": 1,
   "data_shards": 3,
