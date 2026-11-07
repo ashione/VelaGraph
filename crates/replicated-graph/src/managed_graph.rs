@@ -59,6 +59,47 @@ pub struct Plan {
     parts: Vec<Part>,
 }
 impl Plan {
+    fn durable_bytes(&self) -> Result<Vec<u8>> {
+        d2_raft::request_plans::Plan {
+            version: 1,
+            id: self.id,
+            authority: self.authority.clone(),
+            cohort: self.cohort.clone(),
+            validation_version: self.version,
+            parts: self
+                .parts
+                .iter()
+                .map(|p| d2_raft::request_plans::Part {
+                    descriptor: p.descriptor.clone(),
+                    request: p.request.clone(),
+                })
+                .collect(),
+        }
+        .encode()
+        .map_err(|e| Error::Application(D1Error::CoordinatorRejected(e)))
+    }
+    // Graph semantics originate in a trusted admitted plan, not remote raw bytes.
+    fn from_durable(bytes: &[u8]) -> Result<Self> {
+        let plan = d2_raft::request_plans::Plan::decode(bytes)
+            .map_err(|e| Error::Application(D1Error::CoordinatorRejected(e)))?;
+        for member in &plan.cohort.members {
+            u32::try_from(member.shard).map_err(|_| Error::Identity)?;
+        }
+        Ok(Self {
+            id: plan.id,
+            authority: plan.authority,
+            cohort: plan.cohort,
+            version: plan.validation_version,
+            parts: plan
+                .parts
+                .into_iter()
+                .map(|p| Part {
+                    descriptor: p.descriptor,
+                    request: p.request,
+                })
+                .collect(),
+        })
+    }
     pub fn id(&self) -> [u8; 16] {
         self.id
     }
@@ -352,6 +393,83 @@ impl<'a> GraphCohort<'a> {
         )
         .await?;
         GraphSnapshot::from_session(session)
+    }
+    /// Recover the exact previously admitted plan. `request` must be the same
+    /// canonical application command bytes; never replace a mismatched request.
+    pub async fn recover_request(&self, id: [u8; 16], request: &[u8]) -> Result<Option<Plan>> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let journal = self.journal().await?;
+            self.recover_from(&journal, id, request)
+        })
+        .await
+        .map_err(|_| Error::Uncertain)?
+    }
+    fn recover_from(
+        &self,
+        journal: &Journal,
+        id: [u8; 16],
+        request: &[u8],
+    ) -> Result<Option<Plan>> {
+        let Some(record) = journal.request(id) else {
+            return Ok(None);
+        };
+        if record.request != request {
+            return Err(Error::Identity);
+        }
+        let plan = Plan::from_durable(&record.payload)?;
+        self.check_plan(&plan, journal)?;
+        let tx = journal
+            .transaction(record.transaction_id)
+            .ok_or(Error::Identity)?;
+        if record.transaction_id != plan.id
+            || tx.participants
+                != plan
+                    .parts
+                    .iter()
+                    .map(|p| p.descriptor.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(Error::Identity);
+        }
+        Ok(Some(plan))
+    }
+    /// Persist a request's first plan and Begin atomically before preparing any
+    /// participant. Concurrent identical requests always return the first plan.
+    pub async fn admit_request(
+        &self,
+        id: [u8; 16],
+        request: Vec<u8>,
+        candidate: &Plan,
+    ) -> Result<Plan> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let journal = self.journal().await?;
+            self.check_plan(candidate, &journal)?;
+            if let Some(existing) = self.recover_from(&journal, id, &request)? {
+                return Ok(existing);
+            }
+            let payload = candidate.durable_bytes()?;
+            let result = self
+                .command(Command::AdmitRequest {
+                    id,
+                    request: request.clone(),
+                    payload,
+                    transaction_id: candidate.id,
+                    participants: candidate
+                        .parts
+                        .iter()
+                        .map(|p| p.descriptor.clone())
+                        .collect(),
+                })
+                .await;
+            let journal = self.journal().await?;
+            if let Some(existing) = self.recover_from(&journal, id, &request)? {
+                return Ok(existing);
+            }
+            result?;
+            Err(Error::Uncertain)
+        })
+        .await
+        .map_err(|_| Error::Uncertain)?
     }
     async fn journal(&self) -> Result<Journal> {
         self.coordinator

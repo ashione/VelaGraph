@@ -770,3 +770,76 @@ async fn coordinator_binding_is_durable_and_cannot_be_removed_or_reowned_by_snap
         bound_journal()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn admitted_request_and_begin_share_sync_failure_and_recovery_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    let mut i = 0;
+    let payload = include_bytes!("../tests/fixtures/request-plan-v1.json").to_vec();
+    let plan = crate::request_plans::Plan::decode(&payload).unwrap();
+    for command in [
+        D1Command::Activate { shard: 9, epoch: 1 },
+        D1Command::EnableManagedWrites {
+            shard: 9,
+            epoch: 1,
+            expected_sequence: 0,
+            mode_id: [9; 16],
+        },
+        D1Command::EnableCoordinator {
+            shard: 9,
+            epoch: 1,
+            mode_id: [9; 16],
+        },
+        D1Command::Coordinator {
+            shard: 9,
+            epoch: 1,
+            mode_id: [9; 16],
+            command: Command::BindCohort {
+                cohort: plan.cohort.clone(),
+            },
+        },
+    ] {
+        apply(&mut sm, &mut i, command).await.unwrap();
+    }
+    let old = sm.build_snapshot().await.unwrap();
+    let command = D1Command::Coordinator {
+        shard: 9,
+        epoch: 1,
+        mode_id: [9; 16],
+        command: Command::AdmitRequest {
+            id: [1; 16],
+            request: b"typed-request-v1".to_vec(),
+            payload: payload.clone(),
+            transaction_id: plan.id,
+            participants: plan.parts.iter().map(|p| p.descriptor.clone()).collect(),
+        },
+    };
+    sm.storage
+        .as_ref()
+        .unwrap()
+        .fail_next_write
+        .store(true, Ordering::Relaxed);
+    assert!(sm.apply([entry(i + 1, command.clone())]).await.is_err());
+    let journal = sm.coordinator_journal(9, 1, [9; 16]).await.unwrap();
+    assert!(journal.request([1; 16]).is_none());
+    assert_eq!(journal.transaction_count(), 0);
+    drop(sm);
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    assert_eq!(
+        sm.coordinator_journal(9, 1, [9; 16])
+            .await
+            .unwrap()
+            .transaction_count(),
+        0
+    );
+    apply(&mut sm, &mut i, command).await.unwrap();
+    let mut meta = old.meta;
+    meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 100));
+    assert!(sm.install_snapshot(&meta, old.snapshot).await.is_err());
+    drop(sm);
+    let sm = StateMachine::open(dir.path()).unwrap();
+    let journal = sm.coordinator_journal(9, 1, [9; 16]).await.unwrap();
+    assert_eq!(journal.transaction_count(), 1);
+    assert_eq!(journal.request([1; 16]).unwrap().payload, payload);
+}
