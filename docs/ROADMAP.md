@@ -407,3 +407,12 @@ Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
 同号 ID；投影复用扫描的固定分片会话，不重新打开快照。默认100、显式limit
 位置、扫描/投影预算及整项失败不变。独立小图 oracle 与 CoreHR 场景覆盖该
 组合；仍为 Unverified，不代表全局事务或任意 Gremlin 组合完成。
+
+### Durable request point recovery (A2.1)
+
+外部请求 ID/原 Plan 增加同库派生索引，恢复与 admission 回读只取单个绑定，
+索引、Journal、applied marker 同批持久化；旧 v5 原子迁移到 v8，snapshot
+原子重建索引，内部 RPC 升至 v3。仍保留 256 请求、1024 事务、16 MiB Journal
+上限以及完整历史，不代表无限写入、GC、MVCC 或大规模动态一致查询完成。
+将来解除上限前，全部 cohort 成员（含非参与者）的决定消费容量预留必须有证明。
+见[契约](DURABLE_REQUEST_INDEX.md)。

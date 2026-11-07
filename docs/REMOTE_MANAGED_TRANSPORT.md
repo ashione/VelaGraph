@@ -130,3 +130,14 @@ existing consensus transports and storage formats are not changed by this slice.
 versioned proof, protocol-v2 fail-closed upgrade boundary, complete-prefix validation
 and unchanged durable recovery rules. Prepare and advance retain full Journals;
 read evidence remains O(V), with old-V bytes independent of later Plan archives.
+
+## A2.1 request point recovery
+
+[The durable derived request index](DURABLE_REQUEST_INDEX.md) adds LookupRequest
+and advances internal RPC to version 3. Recovery and admission winner readback
+return only one exact original binding and its same-lock transaction state after
+a leader barrier. Internal versions 1/2 fail closed; the external managed graph
+protocol and A1 proof format are unchanged. Coordinator disk metadata v8 migrates
+legacy v5 atomically and snapshots rebuild its derived index. Full Journals remain
+in command validation, execute/status, prepare/advance and authoritative storage.
+The 256-request, 1,024-transaction and 16 MiB Journal caps are unchanged.

@@ -95,7 +95,7 @@ fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
             version: u32,
             state: &'a D1State,
         }
-        return serde_json::to_vec(&Metadata { version: 5, state });
+        return serde_json::to_vec(&Metadata { version: 8, state });
     }
     if let Some(managed) = &state.managed {
         return serde_json::to_vec(&D1MetadataV4 {
@@ -284,6 +284,8 @@ fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<DecodedSnapshot> {
 struct StateMachineStorage {
     db: DB,
     legacy_d1: AtomicBool,
+    request_indexed: AtomicBool,
+    request_manifest: std::sync::Mutex<Option<Vec<u8>>>,
     #[cfg(test)]
     fail_next_write: AtomicBool,
 }
@@ -375,6 +377,8 @@ impl StateMachine {
         let storage = Arc::new(StateMachineStorage {
             db,
             legacy_d1: AtomicBool::new(false),
+            request_indexed: AtomicBool::new(false),
+            request_manifest: Default::default(),
             #[cfg(test)]
             fail_next_write: AtomicBool::new(false),
         });
@@ -437,7 +441,7 @@ impl StateMachine {
                     state.managed = Some(meta.managed);
                     d1 = Some(state);
                 }
-                5 => {
+                5 | 8 => {
                     #[derive(Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct Metadata {
@@ -446,9 +450,12 @@ impl StateMachine {
                     }
                     let meta: Metadata = serde_json::from_slice(&bytes)?;
                     anyhow::ensure!(
-                        meta.version == 5 && meta.state.coordinator.is_some(),
+                        matches!(meta.version, 5 | 8) && meta.state.coordinator.is_some(),
                         "invalid coordinator metadata"
                     );
+                    storage
+                        .request_indexed
+                        .store(meta.version == 8, Ordering::Relaxed);
                     d1 = Some(meta.state);
                 }
                 6 => {
@@ -523,6 +530,14 @@ impl StateMachine {
             d1.is_none() || last_applied_log.is_some(),
             "D1 state is missing its applied marker"
         );
+        crate::request_index::validate(
+            &storage.db,
+            d1.as_ref(),
+            last_applied_log,
+            storage.request_indexed.load(Ordering::Relaxed),
+        )?;
+        *storage.request_manifest.lock().unwrap() =
+            storage.db.get(crate::request_index::MANIFEST_KEY)?;
         let last_membership = match storage.db.get(MEMBERSHIP_KEY)? {
             Some(value) => serde_json::from_slice(&value)?,
             None => StoredMembership::default(),
@@ -887,6 +902,40 @@ impl StateMachine {
         d1.coordinator.clone().ok_or(D1Error::CoordinatorNotEnabled)
     }
 
+    /// Local point recovery; distributed callers must first establish a leader barrier.
+    /// Disk index and original transaction are sampled under the same state lock.
+    pub async fn coordinator_request(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        id: [u8; 16],
+    ) -> Result<crate::request_index::RequestLookup, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let db = self
+            .storage
+            .as_ref()
+            .filter(|s| s.request_indexed.load(Ordering::Relaxed));
+        blocking_section(|| {
+            if let Some(storage) = db {
+                let manifest = storage
+                    .request_manifest
+                    .lock()
+                    .map_err(|_| D1Error::RequestIndexUnavailable)?;
+                let manifest = manifest.as_deref().ok_or(D1Error::RequestIndexHistory)?;
+                crate::request_index::lookup(d1, id, Some((&storage.db, manifest)))
+            } else {
+                crate::request_index::lookup(d1, id, None)
+            }
+        })
+    }
+
     /// Bounded coordinator metadata only: no request or Plan archive clone.
     /// Distributed callers must establish a leader barrier before sampling.
     pub async fn coordinator_summary(
@@ -1102,6 +1151,21 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             }
 
             if let Some(storage) = &self.storage {
+                // Only explicit snapshot replacement may rebuild a damaged
+                // derived manifest; ordinary apply must not conceal corruption.
+                let expected = storage.request_manifest.lock().unwrap();
+                if storage
+                    .db
+                    .get(crate::request_index::MANIFEST_KEY)
+                    .map_err(write_error)?
+                    .as_deref()
+                    != expected.as_deref()
+                {
+                    return Err(write_error(std::io::Error::other(
+                        "request manifest changed",
+                    )));
+                }
+                drop(expected);
                 let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
                 let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
                 if let Some(d1) = &next.d1 {
@@ -1115,10 +1179,24 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 } else {
                     batch.delete(D1_KEY);
                 }
+                let request_manifest = crate::request_index::stage(
+                    &mut batch,
+                    sm.d1.as_ref(),
+                    next.d1.as_ref(),
+                    next.last_applied_log,
+                    storage.request_indexed.load(Ordering::Relaxed),
+                    false,
+                )
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
                 batch.put(APPLIED_KEY, applied);
                 batch.put(MEMBERSHIP_KEY, membership);
                 storage.write_sync(batch)?;
                 storage.legacy_d1.store(false, Ordering::Relaxed);
+                *storage.request_manifest.lock().unwrap() = request_manifest;
+                storage.request_indexed.store(
+                    next.d1.as_ref().is_some_and(|s| s.coordinator.is_some()),
+                    Ordering::Relaxed,
+                );
             }
             #[cfg(test)]
             if let Some(gate) = self.apply_publish_gate.lock().unwrap().take() {
@@ -1309,11 +1387,25 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             } else {
                 batch.delete(D1_KEY);
             }
+            let request_manifest = crate::request_index::stage(
+                &mut batch,
+                sm.d1.as_ref(),
+                next.d1.as_ref(),
+                next.last_applied_log,
+                storage.request_indexed.load(Ordering::Relaxed),
+                true,
+            )
+            .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
             put_snapshot(&mut batch, &stored)?;
             storage.write_sync(batch)?;
             storage.legacy_d1.store(false, Ordering::Relaxed);
+            *storage.request_manifest.lock().unwrap() = request_manifest;
+            storage.request_indexed.store(
+                next.d1.as_ref().is_some_and(|s| s.coordinator.is_some()),
+                Ordering::Relaxed,
+            );
         }
 
         #[cfg(test)]
@@ -2793,3 +2885,7 @@ mod participant_state_tests;
 #[cfg(test)]
 #[path = "versioned_state_tests.rs"]
 mod versioned_state_tests;
+
+#[cfg(test)]
+#[path = "request_index_tests.rs"]
+mod request_index_tests;

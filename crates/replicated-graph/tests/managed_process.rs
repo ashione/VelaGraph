@@ -598,6 +598,16 @@ async fn scenario() -> anyhow::Result<()> {
     );
     let recovered = c.journal(&authority(), 1).await?;
     assert_eq!(recovered.request(write.external_id), Some(&record));
+    let point = c.request(&authority(), 1, write.external_id).await?;
+    assert_eq!(point.resolved_prefix, recovered.resolved_prefix());
+    let point = point
+        .record
+        .context("point recovery after coordinator restart")?;
+    assert_eq!(point.record, record);
+    assert_eq!(
+        Some(&point.transaction),
+        recovered.transaction(record.transaction_id)
+    );
     assert_eq!(recovered.transaction_count(), 3);
     assert_eq!(call(&g, Operation::Status(write.clone())).await?, partial);
     let (completed, ()) = tokio::join!(call(&g, Operation::Submit(write.clone())), async {

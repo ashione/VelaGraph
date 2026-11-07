@@ -80,14 +80,19 @@ Reopen and snapshot-install tests compare newly derived evidence and historical 
 Whole-directory rollback still cannot be detected without an independent durable
 anchor; this slice does not add one.
 
-Internal managed RPC envelopes now require **protocol version 2**. New Summary and
-Terminal operations and Prefix/Read proof payloads use the checked schema above.
+Internal managed RPC envelopes introduced **protocol version 2** for Summary and
+Terminal operations. Prefix/Read proof payloads use the checked schema above.
 Version-1 clients/servers are not interoperable; version mismatch or unknown
 operations/payloads fail closed, with no automatic full-journal or weaker fallback.
 Deploy compatible peers together. Durable disk formats and the external managed
 Gremlin protocol are unchanged. Explicit legacy local Journal-taking Rust helpers
 remain compatible, but the new acquisition path does not call them or fetch and
 then discard a full Journal.
+
+The later [A2.1 point-recovery index](DURABLE_REQUEST_INDEX.md) advances internal
+managed RPC to version 3 and coordinator disk metadata to version 8. Terminal
+proof encoding and these read semantics are unchanged; version-1/2 RPC peers are
+now rejected rather than used as a fallback.
 
 These checks detect mismatched trusted-peer evidence. The channel remains plaintext
 and unauthenticated; a malicious server can fabricate both rows and evidence. This
