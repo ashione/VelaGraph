@@ -623,3 +623,5 @@ trusted plaintext experiment, not lazy remote reads or failover support. The
 legacy single-Snapshot RPC is unchanged. See [paged remote snapshots](docs/REMOTE_GRAPH.md#snapshot-consistency-and-limits).
 
 The experimental coordinator also supports [ordered hierarchy result pages](docs/HIERARCHY_RESULT_PAGES.md): explicit finite Gremlin repeat jobs evaluate against fixed shard snapshots before returning actual qualified-vertex pages. Preparation progress is separate from results, and count jobs retain their existing limits.
+
+[Fixed-snapshot property pages](docs/HIERARCHY_PROPERTY_PAGES.md) extend prepared hierarchy jobs with terminal standard valueMap projections. Property selection is declared before preparation; no fresh reads are attached to an already closed Ready snapshot.

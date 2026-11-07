@@ -1,0 +1,2566 @@
+{
+  "base_head": "de0ba5563c2c1ebb96f16759ab4d7235876cc809",
+  "purpose": "Fixed-snapshot bounded standard valueMap on hierarchy result jobs; correctness and bounded resource verification, not a load benchmark",
+  "contract": {
+    "traversal_bytes": 1073741824,
+    "traversal_work": 8000000,
+    "projection_bytes": 805306368,
+    "projection_work": 2000000,
+    "node_cumulative_bytes_unchanged": 1073741824,
+    "node_cumulative_work_unchanged": 8000000,
+    "max_results": 250000,
+    "max_retained_encoded_maps_bytes": 67108864,
+    "max_map_encoded_bytes": 2048,
+    "max_projected_page_rows": 128
+  },
+  "runs": {
+    "final-full": {
+      "result": {
+        "cases": {
+          "ceo_all": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_all",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 200,
+            "preparation_advances": 1564,
+            "preparation_seconds": 5.130618321,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 1.453916,
+              "min_ms": 0.8285849999999999,
+              "n": 200,
+              "p50_ms": 0.9225369999999999,
+              "p95_ms": 1.222658
+            },
+            "result_variant": "Page",
+            "seconds": 5.416005071,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 199999,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "duplicate_manager": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "duplicate_manager",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 10,
+            "preparation_advances": 74,
+            "preparation_seconds": 0.774354096,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 1.045792,
+              "min_ms": 0.582726,
+              "n": 10,
+              "p50_ms": 0.956459,
+              "p95_ms": 1.045792
+            },
+            "result_variant": "Page",
+            "seconds": 0.792901355,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 9360,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "duplicate_manager_dedup": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "duplicate_manager_dedup",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 997,
+            "pages": 5,
+            "preparation_advances": 74,
+            "preparation_seconds": 0.729736305,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 1.116169,
+              "min_ms": 0.6976089999999999,
+              "n": 5,
+              "p50_ms": 0.8781699999999999,
+              "p95_ms": 1.116169
+            },
+            "result_variant": "Page",
+            "seconds": 0.741781006,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 4680,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ceo_exact6": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_exact6",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 163,
+            "preparation_advances": 294,
+            "preparation_seconds": 2.542242849,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 1.925936,
+              "min_ms": 0.596727,
+              "n": 163,
+              "p50_ms": 0.983308,
+              "p95_ms": 1.163149
+            },
+            "result_variant": "Page",
+            "seconds": 2.785482442,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 162551,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ceo_exact32_empty": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_exact32_empty",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 1,
+            "preparation_advances": 1564,
+            "preparation_seconds": 5.004464649,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.17967,
+              "min_ms": 0.17967,
+              "n": 1,
+              "p50_ms": 0.17967,
+              "p95_ms": 0.17967
+            },
+            "result_variant": "Page",
+            "seconds": 5.005013725,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 0,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "direct_reports_page1": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "direct_reports_page1",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 8,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.532319545,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.19392199999999998,
+              "min_ms": 0.07221899999999999,
+              "n": 8,
+              "p50_ms": 0.082273,
+              "p95_ms": 0.19392199999999998
+            },
+            "result_variant": "Page",
+            "seconds": 0.5335867,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 8,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ordered_roots": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "ordered_roots",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 7,
+            "pages": 31,
+            "preparation_advances": 2,
+            "preparation_seconds": 0.571187206,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.371539,
+              "min_ms": 0.077527,
+              "n": 31,
+              "p50_ms": 0.099159,
+              "p95_ms": 0.326571
+            },
+            "result_variant": "Page",
+            "seconds": 0.576115166,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 216,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "departments": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "departments",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 137,
+            "pages": 37,
+            "preparation_advances": 46,
+            "preparation_seconds": 1.966862705,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.35292100000000004,
+              "min_ms": 0.142454,
+              "n": 37,
+              "p50_ms": 0.20658100000000001,
+              "p95_ms": 0.325144
+            },
+            "result_variant": "Page",
+            "seconds": 1.97838052,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 4999,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "department_exact6": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "department_exact6",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 137,
+            "pages": 8,
+            "preparation_advances": 39,
+            "preparation_seconds": 1.854967366,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.368554,
+              "min_ms": 0.214783,
+              "n": 8,
+              "p50_ms": 0.24401699999999998,
+              "p95_ms": 0.368554
+            },
+            "result_variant": "Page",
+            "seconds": 1.858971057,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 1094,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "duplicate_ceo_rejected": {
+            "before_ready": true,
+            "event": "result_rejection",
+            "expected_rejection": "ResourceExhausted",
+            "name": "duplicate_ceo_rejected",
+            "oracle_rows": 399998,
+            "rows_exposed": 0,
+            "seconds": 2.771636404
+          },
+          "ceo_all_dedup": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_all_dedup",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 200,
+            "preparation_advances": 1564,
+            "preparation_seconds": 5.049519141,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 1.386314,
+              "min_ms": 0.8018259999999999,
+              "n": 200,
+              "p50_ms": 0.9163370000000001,
+              "p95_ms": 1.072042
+            },
+            "result_variant": "Page",
+            "seconds": 5.33244791,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 199999,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "projected_ceo_all": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_ceo_all",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 1563,
+            "preparation_advances": 1759,
+            "preparation_seconds": 6.145865362,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 7.750134,
+              "min_ms": 0.452691,
+              "n": 1563,
+              "p50_ms": 0.733363,
+              "p95_ms": 0.891421
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 7.893606811,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 199999,
+            "verified_property_entries": 599997,
+            "verified_property_maps": 199999
+          },
+          "projected_ceo_all_dedup": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_ceo_all_dedup",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 1563,
+            "preparation_advances": 1759,
+            "preparation_seconds": 6.383143619,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 2.0058860000000003,
+              "min_ms": 0.5136719999999999,
+              "n": 1563,
+              "p50_ms": 0.7154550000000001,
+              "p95_ms": 0.850008
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 8.083710423,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 199999,
+            "verified_property_entries": 599997,
+            "verified_property_maps": 199999
+          },
+          "projected_duplicate_manager": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_duplicate_manager",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 74,
+            "preparation_advances": 84,
+            "preparation_seconds": 0.699108028,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 0.9848610000000001,
+              "min_ms": 0.288384,
+              "n": 74,
+              "p50_ms": 0.709727,
+              "p95_ms": 0.883359
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.781597487,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 9360,
+            "verified_property_entries": 28080,
+            "verified_property_maps": 9360
+          },
+          "projected_departments_missing_property": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_departments_missing_property",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 40,
+            "preparation_advances": 54,
+            "preparation_seconds": 2.213231568,
+            "projection_keys": [
+              "name",
+              "active",
+              "country",
+              "multi_department"
+            ],
+            "read_latency": {
+              "max_ms": 0.845572,
+              "min_ms": 0.25172900000000004,
+              "n": 40,
+              "p50_ms": 0.705821,
+              "p95_ms": 0.8012349999999999
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 2.258232866,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 4999,
+            "verified_ordered_identities": 4999,
+            "verified_property_entries": 14997,
+            "verified_property_maps": 4999
+          },
+          "projected_missing_key_empty_maps": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_missing_key_empty_maps",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 8,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.407824014,
+            "projection_keys": [
+              "not_present"
+            ],
+            "read_latency": {
+              "max_ms": 0.297707,
+              "min_ms": 0.08701099999999999,
+              "n": 8,
+              "p50_ms": 0.1261,
+              "p95_ms": 0.297707
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.409847196,
+            "verified_empty_property_maps": 8,
+            "verified_missing_property_keys": 8,
+            "verified_ordered_identities": 8,
+            "verified_property_entries": 0,
+            "verified_property_maps": 8
+          },
+          "projected_direct_reports_page1": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_direct_reports_page1",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 8,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.486805693,
+            "projection_keys": [
+              "name",
+              "active",
+              "country",
+              "multi_department"
+            ],
+            "read_latency": {
+              "max_ms": 0.270126,
+              "min_ms": 0.147121,
+              "n": 8,
+              "p50_ms": 0.18693099999999999,
+              "p95_ms": 0.270126
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.489099633,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 8,
+            "verified_property_entries": 32,
+            "verified_property_maps": 8
+          },
+          "projected_empty": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 105,
+                "shard": 3
+              }
+            ],
+            "name": "projected_empty",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 1,
+            "preparation_advances": 1563,
+            "preparation_seconds": 4.958339886,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 0.19908900000000002,
+              "min_ms": 0.19908900000000002,
+              "n": 1,
+              "p50_ms": 0.19908900000000002,
+              "p95_ms": 0.19908900000000002
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 4.959030194,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 0,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          }
+        },
+        "case_count": 18,
+        "full_fixture": true,
+        "ceo_ordered_rows": 199999,
+        "ceo_dedup_ordered_rows": 199999,
+        "projected_ceo_property_maps": 199999,
+        "projected_ceo_dedup_property_maps": 199999,
+        "terminal": {
+          "cases": 18,
+          "correct": true,
+          "departments": 5000,
+          "event": "result_matrix_complete",
+          "full_fixture": true,
+          "oracle": "input relationship list and fixture property formulas; every ordered qualified identity and projected value",
+          "people": 200000
+        }
+      },
+      "raw_sha256": "5470b0a3d249b0343a94e50650b1065f1a83f952df50b88b0bbefd1ae86d2c05",
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 67.26740461500594,
+        "sampling_interval_seconds": 0.1,
+        "samples": 664,
+        "process_tree_sampled_rss_peak_bytes": 3049893888,
+        "per_process": {
+          "6": {
+            "role": "runner_and_coordinator",
+            "sampled_rss_peak_bytes": 331476992,
+            "vmhwm_peak_bytes": 331476992
+          },
+          "9": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 868282368,
+            "vmhwm_peak_bytes": 868282368
+          },
+          "46": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 887271424,
+            "vmhwm_peak_bytes": 887271424
+          },
+          "83": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 962863104,
+            "vmhwm_peak_bytes": 962863104
+          }
+        },
+        "memory_interpretation": "Sum of concurrently sampled process RSS, which may double-count shared pages; VmHWM is each process separate peak, not simultaneous aggregate. Includes import, oracle, evaluation and delivery; not isolated query memory.",
+        "binary_sha256": {
+          "projection-runner": "dd4f3b6124d005d75b539ac93e1017dbadc4ab5a5231301af0495244aa247a42",
+          "projection-node": "7c932903d364408ec9249a2ab082aad3fa12bce23198e6de9fda74b52694296a"
+        },
+        "profile": "release",
+        "fixture_manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e"
+      }
+    },
+    "final-smoke": {
+      "result": {
+        "cases": {
+          "ceo_all": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_all",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 2,
+            "preparation_advances": 16,
+            "preparation_seconds": 0.057708987,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.80497,
+              "min_ms": 0.801415,
+              "n": 2,
+              "p50_ms": 0.80497,
+              "p95_ms": 0.80497
+            },
+            "result_variant": "Page",
+            "seconds": 0.066797573,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 1999,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "duplicate_manager": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "duplicate_manager",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 1,
+            "preparation_advances": 2,
+            "preparation_seconds": 0.010203638,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.205169,
+              "min_ms": 0.205169,
+              "n": 1,
+              "p50_ms": 0.205169,
+              "p95_ms": 0.205169
+            },
+            "result_variant": "Page",
+            "seconds": 0.011410063,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 144,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "duplicate_manager_dedup": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "duplicate_manager_dedup",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 997,
+            "pages": 1,
+            "preparation_advances": 2,
+            "preparation_seconds": 0.010819309,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.157547,
+              "min_ms": 0.157547,
+              "n": 1,
+              "p50_ms": 0.157547,
+              "p95_ms": 0.157547
+            },
+            "result_variant": "Page",
+            "seconds": 0.011737791,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 72,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ceo_exact6": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_exact6",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 1,
+            "preparation_advances": 16,
+            "preparation_seconds": 0.048133709,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.10187399999999999,
+              "min_ms": 0.10187399999999999,
+              "n": 1,
+              "p50_ms": 0.10187399999999999,
+              "p95_ms": 0.10187399999999999
+            },
+            "result_variant": "Page",
+            "seconds": 0.048538397,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 0,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ceo_exact32_empty": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_exact32_empty",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 1,
+            "preparation_advances": 16,
+            "preparation_seconds": 0.06137894,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.121633,
+              "min_ms": 0.121633,
+              "n": 1,
+              "p50_ms": 0.121633,
+              "p95_ms": 0.121633
+            },
+            "result_variant": "Page",
+            "seconds": 0.061853864,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 0,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "direct_reports_page1": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "direct_reports_page1",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 8,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.007138705,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.23818799999999998,
+              "min_ms": 0.079329,
+              "n": 8,
+              "p50_ms": 0.09464299999999999,
+              "p95_ms": 0.23818799999999998
+            },
+            "result_variant": "Page",
+            "seconds": 0.008508875,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 8,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ordered_roots": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "ordered_roots",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 7,
+            "pages": 31,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.008691965,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.299801,
+              "min_ms": 0.07965,
+              "n": 31,
+              "p50_ms": 0.10694100000000001,
+              "p95_ms": 0.224708
+            },
+            "result_variant": "Page",
+            "seconds": 0.013200685,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 216,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "departments": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "departments",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 137,
+            "pages": 1,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.019245299,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.195223,
+              "min_ms": 0.195223,
+              "n": 1,
+              "p50_ms": 0.195223,
+              "p95_ms": 0.195223
+            },
+            "result_variant": "Page",
+            "seconds": 0.020133334,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 49,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "department_exact6": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "department_exact6",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 137,
+            "pages": 1,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.024234751,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.11734599999999999,
+              "min_ms": 0.11734599999999999,
+              "n": 1,
+              "p50_ms": 0.11734599999999999,
+              "p95_ms": 0.11734599999999999
+            },
+            "result_variant": "Page",
+            "seconds": 0.024697457,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 0,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "duplicate_ceo_rejected": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "duplicate_ceo_rejected",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 4,
+            "preparation_advances": 32,
+            "preparation_seconds": 0.108477522,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.913484,
+              "min_ms": 0.806843,
+              "n": 4,
+              "p50_ms": 0.821295,
+              "p95_ms": 0.913484
+            },
+            "result_variant": "Page",
+            "seconds": 0.118334234,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 3998,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "ceo_all_dedup": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "ceo_all_dedup",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1000,
+            "pages": 2,
+            "preparation_advances": 16,
+            "preparation_seconds": 0.050652606,
+            "projection_keys": null,
+            "read_latency": {
+              "max_ms": 0.948947,
+              "min_ms": 0.8392620000000001,
+              "n": 2,
+              "p50_ms": 0.948947,
+              "p95_ms": 0.948947
+            },
+            "result_variant": "Page",
+            "seconds": 0.059169934,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 1999,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          },
+          "projected_ceo_all": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_ceo_all",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 16,
+            "preparation_advances": 18,
+            "preparation_seconds": 0.064237333,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 0.902317,
+              "min_ms": 0.455024,
+              "n": 16,
+              "p50_ms": 0.67157,
+              "p95_ms": 0.902317
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.083861893,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 1999,
+            "verified_property_entries": 5997,
+            "verified_property_maps": 1999
+          },
+          "projected_ceo_all_dedup": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_ceo_all_dedup",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 16,
+            "preparation_advances": 18,
+            "preparation_seconds": 0.064142922,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 0.728456,
+              "min_ms": 0.46548,
+              "n": 16,
+              "p50_ms": 0.670569,
+              "p95_ms": 0.728456
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.083372548,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 1999,
+            "verified_property_entries": 5997,
+            "verified_property_maps": 1999
+          },
+          "projected_duplicate_manager": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_duplicate_manager",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 2,
+            "preparation_advances": 2,
+            "preparation_seconds": 0.010877676,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 0.587013,
+              "min_ms": 0.215114,
+              "n": 2,
+              "p50_ms": 0.587013,
+              "p95_ms": 0.587013
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.015031733,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 144,
+            "verified_property_entries": 432,
+            "verified_property_maps": 144
+          },
+          "projected_departments_missing_property": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_departments_missing_property",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 1,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.019916563,
+            "projection_keys": [
+              "name",
+              "active",
+              "country",
+              "multi_department"
+            ],
+            "read_latency": {
+              "max_ms": 0.454614,
+              "min_ms": 0.454614,
+              "n": 1,
+              "p50_ms": 0.454614,
+              "p95_ms": 0.454614
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.021991494,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 49,
+            "verified_ordered_identities": 49,
+            "verified_property_entries": 147,
+            "verified_property_maps": 49
+          },
+          "projected_missing_key_empty_maps": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_missing_key_empty_maps",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 8,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.005478649,
+            "projection_keys": [
+              "not_present"
+            ],
+            "read_latency": {
+              "max_ms": 0.155914,
+              "min_ms": 0.078268,
+              "n": 8,
+              "p50_ms": 0.117316,
+              "p95_ms": 0.155914
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.006868468,
+            "verified_empty_property_maps": 8,
+            "verified_missing_property_keys": 8,
+            "verified_ordered_identities": 8,
+            "verified_property_entries": 0,
+            "verified_property_maps": 8
+          },
+          "projected_direct_reports_page1": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_direct_reports_page1",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 1,
+            "pages": 8,
+            "preparation_advances": 1,
+            "preparation_seconds": 0.005776787,
+            "projection_keys": [
+              "name",
+              "active",
+              "country",
+              "multi_department"
+            ],
+            "read_latency": {
+              "max_ms": 0.147862,
+              "min_ms": 0.086079,
+              "n": 8,
+              "p50_ms": 0.09471199999999999,
+              "p95_ms": 0.147862
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.0071421,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 8,
+            "verified_property_entries": 32,
+            "verified_property_maps": 8
+          },
+          "projected_empty": {
+            "correct": true,
+            "event": "result_outcome",
+            "fixed_snapshots": [
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 1,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 1
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 2,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 2
+              },
+              {
+                "epoch": 1,
+                "identity": {
+                  "group": 3,
+                  "node": 1
+                },
+                "sequence": 2,
+                "shard": 3
+              }
+            ],
+            "name": "projected_empty",
+            "old_and_arbitrary_page_replay": true,
+            "oracle": "input relationship BFS plus fixture property formulas; not count/progress or result-derived values",
+            "page_size": 128,
+            "pages": 1,
+            "preparation_advances": 17,
+            "preparation_seconds": 0.052522177,
+            "projection_keys": [
+              "name",
+              "active",
+              "country"
+            ],
+            "read_latency": {
+              "max_ms": 0.147532,
+              "min_ms": 0.147532,
+              "n": 1,
+              "p50_ms": 0.147532,
+              "p95_ms": 0.147532
+            },
+            "result_variant": "ProjectedPage",
+            "seconds": 0.052967436,
+            "verified_empty_property_maps": 0,
+            "verified_missing_property_keys": 0,
+            "verified_ordered_identities": 0,
+            "verified_property_entries": 0,
+            "verified_property_maps": 0
+          }
+        },
+        "case_count": 18,
+        "full_fixture": false,
+        "ceo_ordered_rows": 1999,
+        "ceo_dedup_ordered_rows": 1999,
+        "projected_ceo_property_maps": 1999,
+        "projected_ceo_dedup_property_maps": 1999,
+        "terminal": {
+          "cases": 18,
+          "correct": true,
+          "departments": 50,
+          "event": "result_matrix_complete",
+          "full_fixture": false,
+          "oracle": "input relationship list and fixture property formulas; every ordered qualified identity and projected value",
+          "people": 2000
+        }
+      },
+      "raw_sha256": "046e472859163f79bfd5694eb699207d0a7753dc901e89edf2bc4b7ae56c4fa3",
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 1.2149690340011148,
+        "sampling_interval_seconds": 0.1,
+        "samples": 12,
+        "process_tree_sampled_rss_peak_bytes": 136966144,
+        "per_process": {
+          "7": {
+            "role": "runner_and_coordinator",
+            "sampled_rss_peak_bytes": 41746432,
+            "vmhwm_peak_bytes": 41746432
+          },
+          "10": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 33075200,
+            "vmhwm_peak_bytes": 33075200
+          },
+          "47": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 31207424,
+            "vmhwm_peak_bytes": 31207424
+          },
+          "84": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 30937088,
+            "vmhwm_peak_bytes": 30937088
+          }
+        },
+        "memory_interpretation": "Sum of concurrently sampled process RSS, which may double-count shared pages; VmHWM is each process separate peak, not simultaneous aggregate. Includes import, oracle, evaluation and delivery; not isolated query memory.",
+        "binary_sha256": {
+          "projection-runner": "dd4f3b6124d005d75b539ac93e1017dbadc4ab5a5231301af0495244aa247a42",
+          "projection-node": "7c932903d364408ec9249a2ab082aad3fa12bce23198e6de9fda74b52694296a"
+        },
+        "profile": "release",
+        "fixture_manifest_sha256": "e2e8c2285010a2cd733c1651c471e9a4397afb5d18a0b33b391841aa22275219"
+      }
+    },
+    "final-count": {
+      "result": {
+        "resources": {
+          "complete": true,
+          "database_bytes": 830783660,
+          "event": "resources",
+          "nodes": [
+            {
+              "group": 0,
+              "memory": [
+                "VmHWM:\t   16336 kB",
+                "VmRSS:\t   16336 kB"
+              ]
+            },
+            {
+              "group": 1,
+              "memory": [
+                "VmHWM:\t  849628 kB",
+                "VmRSS:\t  849628 kB"
+              ]
+            },
+            {
+              "group": 2,
+              "memory": [
+                "VmHWM:\t  866952 kB",
+                "VmRSS:\t  866952 kB"
+              ]
+            },
+            {
+              "group": 3,
+              "memory": [
+                "VmHWM:\t  940760 kB",
+                "VmRSS:\t  940760 kB"
+              ]
+            }
+          ],
+          "query_failures": 0,
+          "runner": [
+            "VmHWM:\t  271304 kB",
+            "VmRSS:\t  271304 kB"
+          ]
+        },
+        "cases": {
+          "ceo_emit32": {
+            "count": 199999,
+            "seconds": [
+              4.696314769,
+              4.703376731,
+              4.568720976
+            ],
+            "median_seconds": 4.696314769,
+            "requests": [
+              1564,
+              1565,
+              1565
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 377.838793,
+                "min_ms": 1.015627,
+                "n": 1564,
+                "p50_ms": 1.5929,
+                "p95_ms": 10.136302
+              },
+              {
+                "max_ms": 397.790682,
+                "min_ms": 1.101837,
+                "n": 1565,
+                "p50_ms": 1.5284980000000001,
+                "p95_ms": 10.193979
+              },
+              {
+                "max_ms": 337.548327,
+                "min_ms": 1.099543,
+                "n": 1565,
+                "p50_ms": 1.50955,
+                "p95_ms": 10.101399
+              }
+            ]
+          },
+          "ceo_exact6": {
+            "count": 162551,
+            "seconds": [
+              2.521870562,
+              2.406617588,
+              2.374627889
+            ],
+            "median_seconds": 2.406617588,
+            "requests": [
+              295,
+              295,
+              294
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 313.222465,
+                "min_ms": 1.188207,
+                "n": 295,
+                "p50_ms": 9.015085000000001,
+                "p95_ms": 12.241693
+              },
+              {
+                "max_ms": 307.235076,
+                "min_ms": 0.946764,
+                "n": 295,
+                "p50_ms": 8.819592,
+                "p95_ms": 11.248375
+              },
+              {
+                "max_ms": 304.17024799999996,
+                "min_ms": 1.099623,
+                "n": 294,
+                "p50_ms": 8.721525000000002,
+                "p95_ms": 11.477988999999999
+              }
+            ]
+          },
+          "ceo_exact32": {
+            "count": 0,
+            "seconds": [
+              4.433983842,
+              4.473383298,
+              4.597748195
+            ],
+            "median_seconds": 4.473383298,
+            "requests": [
+              1565,
+              1565,
+              1565
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 308.56167,
+                "min_ms": 1.027916,
+                "n": 1565,
+                "p50_ms": 1.495709,
+                "p95_ms": 9.614297
+              },
+              {
+                "max_ms": 422.79427000000004,
+                "min_ms": 1.018742,
+                "n": 1565,
+                "p50_ms": 1.371653,
+                "p95_ms": 9.880237
+              },
+              {
+                "max_ms": 520.0595470000001,
+                "min_ms": 1.035657,
+                "n": 1565,
+                "p50_ms": 1.475949,
+                "p95_ms": 9.722449
+              }
+            ]
+          },
+          "duplicate_ceo_emit32": {
+            "count": 399998,
+            "seconds": [
+              4.198805826,
+              4.332927462,
+              4.360855003
+            ],
+            "median_seconds": 4.332927462,
+            "requests": [
+              1565,
+              1565,
+              1565
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 305.876271,
+                "min_ms": 0.9322010000000001,
+                "n": 1565,
+                "p50_ms": 1.391182,
+                "p95_ms": 9.353465
+              },
+              {
+                "max_ms": 312.553947,
+                "min_ms": 1.019794,
+                "n": 1565,
+                "p50_ms": 1.440426,
+                "p95_ms": 9.403611
+              },
+              {
+                "max_ms": 341.99241800000004,
+                "min_ms": 0.9113399999999999,
+                "n": 1565,
+                "p50_ms": 1.40282,
+                "p95_ms": 9.90887
+              }
+            ]
+          },
+          "department_emit32": {
+            "count": 4999,
+            "seconds": [
+              2.244186596,
+              2.321565522,
+              2.165229038
+            ],
+            "median_seconds": 2.244186596,
+            "requests": [
+              49,
+              51,
+              49
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 365.59098,
+                "min_ms": 20.675459,
+                "n": 49,
+                "p50_ms": 35.276105,
+                "p95_ms": 63.724889000000005
+              },
+              {
+                "max_ms": 310.947137,
+                "min_ms": 21.351162,
+                "n": 51,
+                "p50_ms": 39.03673,
+                "p95_ms": 66.05852700000001
+              },
+              {
+                "max_ms": 306.065713,
+                "min_ms": 20.374387000000002,
+                "n": 49,
+                "p50_ms": 31.591976000000003,
+                "p95_ms": 64.30264199999999
+              }
+            ]
+          },
+          "department_exact6": {
+            "count": 1094,
+            "seconds": [
+              1.857229413,
+              1.8835121240000001,
+              1.9648571989999999
+            ],
+            "median_seconds": 1.8835121240000001,
+            "requests": [
+              39,
+              39,
+              39
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 351.817059,
+                "min_ms": 21.576174,
+                "n": 39,
+                "p50_ms": 39.748270000000005,
+                "p95_ms": 60.42137
+              },
+              {
+                "max_ms": 328.65211999999997,
+                "min_ms": 20.053529,
+                "n": 39,
+                "p50_ms": 43.49203,
+                "p95_ms": 82.38303900000001
+              },
+              {
+                "max_ms": 313.901339,
+                "min_ms": 20.786026,
+                "n": 39,
+                "p50_ms": 39.793988,
+                "p95_ms": 69.402141
+              }
+            ]
+          },
+          "ceo_emit32_dedup": {
+            "count": 199999,
+            "seconds": [
+              4.551095818,
+              4.417294721,
+              4.482177744
+            ],
+            "median_seconds": 4.482177744,
+            "requests": [
+              1671,
+              1671,
+              1671
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 313.089718,
+                "min_ms": 0.12445699999999998,
+                "n": 1671,
+                "p50_ms": 1.507617,
+                "p95_ms": 9.878945
+              },
+              {
+                "max_ms": 338.13760199999996,
+                "min_ms": 0.12658,
+                "n": 1671,
+                "p50_ms": 1.4311180000000001,
+                "p95_ms": 9.646455
+              },
+              {
+                "max_ms": 297.350505,
+                "min_ms": 0.13750700000000002,
+                "n": 1671,
+                "p50_ms": 1.531193,
+                "p95_ms": 9.106403
+              }
+            ]
+          },
+          "duplicate_ceo_emit32_dedup": {
+            "count": 199999,
+            "seconds": [
+              4.725446577,
+              4.2087721160000005,
+              4.317695867
+            ],
+            "median_seconds": 4.317695867,
+            "requests": [
+              1671,
+              1671,
+              1671
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 335.729977,
+                "min_ms": 0.141613,
+                "n": 1671,
+                "p50_ms": 1.512054,
+                "p95_ms": 10.274611
+              },
+              {
+                "max_ms": 319.016435,
+                "min_ms": 0.125389,
+                "n": 1671,
+                "p50_ms": 1.420787,
+                "p95_ms": 9.168136
+              },
+              {
+                "max_ms": 301.775179,
+                "min_ms": 0.11950899999999999,
+                "n": 1671,
+                "p50_ms": 1.453866,
+                "p95_ms": 9.462508
+              }
+            ]
+          },
+          "department_emit32_dedup": {
+            "count": 4999,
+            "seconds": [
+              2.117862627,
+              2.150129356,
+              2.424129547
+            ],
+            "median_seconds": 2.150129356,
+            "requests": [
+              52,
+              53,
+              55
+            ],
+            "rpc_latency": [
+              {
+                "max_ms": 325.90888,
+                "min_ms": 0.210897,
+                "n": 52,
+                "p50_ms": 28.392192,
+                "p95_ms": 67.052056
+              },
+              {
+                "max_ms": 335.737948,
+                "min_ms": 0.226551,
+                "n": 53,
+                "p50_ms": 29.337465,
+                "p95_ms": 62.203916
+              },
+              {
+                "max_ms": 334.152534,
+                "min_ms": 0.28744200000000003,
+                "n": 55,
+                "p50_ms": 31.968255,
+                "p95_ms": 68.68521700000001
+              }
+            ]
+          }
+        }
+      },
+      "raw_sha256": "b9ec80150a258b7c200721397303113af8c5e83acee02993f89e0c60e9806100",
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 117.680824569994,
+        "sampling_interval_seconds": 0.1,
+        "samples": 1161,
+        "process_tree_sampled_rss_peak_bytes": 3015651328,
+        "per_process": {
+          "135": {
+            "role": "runner_and_coordinator",
+            "sampled_rss_peak_bytes": 277815296,
+            "vmhwm_peak_bytes": 277815296
+          },
+          "138": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 16793600,
+            "vmhwm_peak_bytes": 16793600
+          },
+          "176": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 870019072,
+            "vmhwm_peak_bytes": 870019072
+          },
+          "214": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 887758848,
+            "vmhwm_peak_bytes": 887758848
+          },
+          "252": {
+            "role": "node",
+            "sampled_rss_peak_bytes": 963338240,
+            "vmhwm_peak_bytes": 963338240
+          }
+        },
+        "memory_interpretation": "Sum of concurrently sampled process RSS, which may double-count shared pages; VmHWM is each process separate peak, not simultaneous aggregate. Includes import, oracle, evaluation and delivery; not isolated query memory.",
+        "binary_sha256": {
+          "count-runner": "98e2393547e3685e36ec808b5863aabd3a8204be4796299ed8762832277db9dc",
+          "projection-node": "7c932903d364408ec9249a2ab082aad3fa12bce23198e6de9fda74b52694296a"
+        },
+        "profile": "release",
+        "fixture_manifest_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e"
+      }
+    }
+  },
+  "diagnostic": {
+    "purpose": "Separately instrumented allowance sizing, not final production run",
+    "ceo_projection_bytes": 578743999,
+    "dedup_projection_bytes": 578706487,
+    "projection_work": 1610934,
+    "production_change": "New projection phase explicitly 768 MiB / 2M; existing traversal and node cumulative ceilings unchanged",
+    "failed_initial_allowance_bytes": 536870912
+  },
+  "local_checks": {
+    "library_tests": 127,
+    "result_oracle_tests": 6,
+    "real_distributed_process_tests": 2,
+    "python_validator_tests": 34,
+    "clippy_all_targets": "passed"
+  },
+  "limitations": [
+    "Single run per result case; timing is not a production latency SLO or fair A/B claim",
+    "RSS is entire run process tree including import, oracle and all cases; shared pages may be counted more than once",
+    "Independent fixed shard snapshots are not a globally atomic snapshot",
+    "Existing remote_query leader-election fixture flake previously retried; not fixed by this change"
+  ]
+}

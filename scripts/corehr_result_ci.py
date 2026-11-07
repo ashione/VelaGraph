@@ -7,8 +7,8 @@ checks its attestations and complete case coverage, not raw rows absent from log
 import math
 
 
-MATRIX_ORACLE = 'input relationship list; every qualified identity in ordered BFS'
-ROW_ORACLE = 'input relationship BFS; not count/progress'
+MATRIX_ORACLE = 'input relationship list and fixture property formulas; every ordered qualified identity and projected value'
+ROW_ORACLE = 'input relationship BFS plus fixture property formulas; not count/progress or result-derived values'
 
 
 def require(condition, message):
@@ -61,7 +61,28 @@ def expected_cases(people, departments):
         query = "g.V({}).repeat(__.in('{}')){}.times({}){}".format(
             ','.join(map(str, roots)), label, '.emit()' if emit else '', depth,
             '.dedup()' if dedup else '')
-        result[name] = {'query': query, 'page_size': size, 'count': count}
+        result[name] = {'query': query, 'page_size': size, 'count': count, 'projection_keys': None,
+                        'property_entries': 0, 'missing_property_keys': 0, 'empty_property_maps': 0}
+    projection_specs = [
+        ('projected_ceo_all', 'ceo_all', 128, ['name', 'active', 'country'], 3, 0),
+        ('projected_ceo_all_dedup', 'ceo_all_dedup', 128, ['name', 'active', 'country'], 3, 0),
+        ('projected_duplicate_manager', 'duplicate_manager', 128, ['name', 'active', 'country'], 3, 0),
+        ('projected_departments_missing_property', 'departments', 128,
+         ['name', 'active', 'country', 'multi_department'], 3, 1),
+        ('projected_missing_key_empty_maps', 'direct_reports_page1', 1, ['not_present'], 0, 1),
+        ('projected_direct_reports_page1', 'direct_reports_page1', 1,
+         ['name', 'active', 'country', 'multi_department'], 4, 0),
+        ('projected_empty', 'ceo_exact32_empty', 128, ['name', 'active', 'country'], 3, 0),
+    ]
+    for name, source, size, keys, present, missing in projection_specs:
+        base = result[source]
+        count = base['count']
+        result[name] = {
+            'query': base['query'] + '.valueMap({})'.format(','.join("'{}'".format(k) for k in keys)),
+            'page_size': size, 'count': count, 'projection_keys': keys,
+            'property_entries': count * present, 'missing_property_keys': count * missing,
+            'empty_property_maps': count if present == 0 else 0,
+        }
     return result
 
 
@@ -107,7 +128,7 @@ def validate(records, manifest):
     end = records[-1]
     require(end.get('event') == 'result_matrix_complete' and end.get('correct') is True,
             'missing successful terminal result')
-    require(type(end.get('cases')) is int and end['cases'] == 11
+    require(type(end.get('cases')) is int and end['cases'] == 18
             and type(end.get('people')) is int and end['people'] == people
             and type(end.get('departments')) is int and end['departments'] == departments
             and end.get('full_fixture') is full and end.get('oracle') == MATRIX_ORACLE,
@@ -160,6 +181,17 @@ def validate(records, manifest):
                     and integer(row.get('page_size'), 1) and row['page_size'] == case['page_size']
                     and integer(row.get('pages'), 1) and row['pages'] == pages,
                     'wrong ordered row count/page count/page size')
+            projected = case['projection_keys'] is not None
+            require('projection_keys' in row and row['projection_keys'] == case['projection_keys']
+                    and row.get('result_variant') == ('ProjectedPage' if projected else 'Page'),
+                    'wrong or missing projection keys/result variant')
+            for field, wanted in (
+                    ('verified_property_maps', case['count'] if projected else 0),
+                    ('verified_property_entries', case['property_entries']),
+                    ('verified_missing_property_keys', case['missing_property_keys']),
+                    ('verified_empty_property_maps', case['empty_property_maps'])):
+                require(integer(row.get(field)) and row[field] == wanted,
+                        'wrong or missing actual projection attestation: ' + field)
             require(row.get('old_and_arbitrary_page_replay') is True and row.get('oracle') == ROW_ORACLE,
                     'missing ordered-oracle/replay attestation')
             current = snapshots(row.get('fixed_snapshots'))
@@ -184,4 +216,6 @@ def validate(records, manifest):
     return {'cases': finished, 'case_count': len(finished), 'full_fixture': full,
             'ceo_ordered_rows': finished['ceo_all']['verified_ordered_identities'],
             'ceo_dedup_ordered_rows': finished['ceo_all_dedup']['verified_ordered_identities'],
+            'projected_ceo_property_maps': finished['projected_ceo_all']['verified_property_maps'],
+            'projected_ceo_dedup_property_maps': finished['projected_ceo_all_dedup']['verified_property_maps'],
             'terminal': end}

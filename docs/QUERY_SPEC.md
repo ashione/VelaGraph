@@ -408,3 +408,10 @@ validation. This does not change synchronous result limits or add Gremlin syntax
 See [ordered hierarchy result pages](HIERARCHY_RESULT_PAGES.md) for exact ordering,
 materialization limits, fixed snapshots, preparation versus result delivery,
 immutable offset cursors and failure semantics.
+
+The explicit result-job slice additionally admits terminal standard
+`valueMap('key',...)` with 1–8 distinct keys. It preserves qualified-vertex
+provenance and standard singleton-list property-map semantics, including missing
+versus Null. Ordinary execution rejects this step. The new mode has an explicit
+separate bounded projection phase; it does not enlarge existing count or ID-only
+budgets. See [property pages](HIERARCHY_PROPERTY_PAGES.md).

@@ -31,12 +31,22 @@ pub(super) struct Rows {
     pub(super) complete: bool,
     pub(super) results: Vec<VertexId>,
     pub(super) page_size: usize,
+    traversal_finished: bool,
+    pub(super) projection: Vec<String>,
+    pub(super) projected: Vec<BTreeMap<String, Value>>,
+    retained_projection_bytes: usize,
 }
 
 impl Rows {
     pub(super) fn new(plan: &Plan, partition: u32, page_size: usize) -> Result<Self, QueryFailure> {
         if !(1..=MAX_RESULT_PAGE_ROWS).contains(&page_size) || plan.ids.is_empty() {
             return Err(QueryFailure::InvalidArgument);
+        }
+        if !plan.projection.is_empty() {
+            projection::validate_keys(&plan.projection)?;
+            if page_size > projection::MAX_PAGE_ROWS {
+                return Err(QueryFailure::InvalidArgument);
+            }
         }
         // Starts are read from the plan only inside a charged, bounded advance.
         Ok(Self {
@@ -51,6 +61,10 @@ impl Rows {
             complete: false,
             results: Vec::new(),
             page_size,
+            traversal_finished: false,
+            projection: plan.projection.clone(),
+            projected: Vec::new(),
+            retained_projection_bytes: 0,
         })
     }
 
@@ -114,7 +128,8 @@ impl Rows {
         }
         self.depth += 1;
         if self.depth == plan.times || self.next.is_empty() {
-            self.complete = true;
+            self.traversal_finished = true;
+            self.complete = self.projection.is_empty();
             self.seen.clear();
         } else {
             self.frontier = std::mem::take(&mut self.next);
@@ -133,14 +148,19 @@ impl Rows {
         if self.complete {
             return Ok(());
         }
+        if self.traversal_finished {
+            return self.project(job, end).await;
+        }
         job.charge(256, 1)?;
         if !self.delivery_reserved {
             // Pay once for bounded reusable page scratch, not once per result
             // or replay. Read is immutable and performs no new graph work.
-            job.charge(
-                DELIVERY_ENVELOPE_BYTES + self.page_size * DELIVERY_ROW_BYTES,
-                1,
-            )?;
+            if self.projection.is_empty() {
+                job.charge(
+                    DELIVERY_ENVELOPE_BYTES + self.page_size * DELIVERY_ROW_BYTES,
+                    1,
+                )?;
+            }
             self.delivery_reserved = true;
         }
         if !self.initialized {
@@ -173,7 +193,8 @@ impl Rows {
             self.start_cursor = stop;
             self.initialized = stop == job.plan.ids.len();
             if self.initialized && self.frontier.is_empty() {
-                self.complete = true;
+                self.traversal_finished = true;
+                self.complete = self.projection.is_empty();
             }
             return check(end);
         }
@@ -272,6 +293,64 @@ impl Rows {
         self.finish_depth(&job.plan);
         check(end)
     }
+    async fn project(&mut self, job: &mut Job, end: Instant) -> Result<(), QueryFailure> {
+        check(end)?;
+        if self.projection.is_empty() {
+            return Err(QueryFailure::InvalidArgument);
+        }
+        if job.completed_traversal_cost.is_none() {
+            // This is an explicit new phase with its own allowance, not a reset
+            // of the original traversal or any data-session cumulative meter.
+            job.completed_traversal_cost = Some(job.cost);
+            job.cost = Cost::default();
+            // Two typed and encoded buffers with geometric-growth allowance.
+            // Per row: map <=2048 tagged bytes, <=8 nodes/keys, source metadata.
+            job.charge(4096 + self.page_size * 32768, 1)?;
+        }
+        job.charge(256, 1)?;
+        let start = self.projected.len();
+        let stop = (start + projection::batch_rows(&self.projection)?).min(self.results.len());
+        job.charge(
+            (stop - start)
+                * (128
+                    + self.projection.len() * 64
+                    + self.projection.iter().map(String::len).sum::<usize>() * 2),
+            stop - start,
+        )?;
+        let fragments = self.results[start..stop]
+            .iter()
+            .map(|vertex| Fragment::Project {
+                vertex: *vertex,
+                keys: self.projection.clone(),
+            })
+            .collect();
+        let values = job.batch(fragments, end).await?;
+        if values.len() != stop - start {
+            return Err(QueryFailure::IncompleteOrCorrupt);
+        }
+        for (expected, value) in self.results[start..stop].iter().zip(values) {
+            check(end)?;
+            let FragmentValue::Projected { vertex, properties } = value else {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            };
+            if vertex != *expected || properties.keys().any(|k| !self.projection.contains(k)) {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            }
+            let size = projection::properties_bytes(&properties)?;
+            let retained = self
+                .retained_projection_bytes
+                .checked_add(size)
+                .filter(|n| *n <= projection::MAX_RETAINED_BYTES)
+                .ok_or(QueryFailure::ResourceExhausted)?;
+            job.charge(64 + properties.len() * 128 + size * 2, 1)?;
+            self.projected.push(properties);
+            self.retained_projection_bytes = retained;
+        }
+        if stop == self.results.len() {
+            self.complete = true;
+        }
+        check(end)
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +369,7 @@ mod tests {
             times: 3,
             emit,
             dedup,
+            projection: Vec::new(),
         }
     }
 
@@ -449,5 +529,124 @@ mod tests {
             DELIVERY_ENVELOPE_BYTES + MAX_RESULT_PAGE_ROWS * DELIVERY_ROW_BYTES,
             516_096
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_phase_tests {
+    use super::*;
+    async fn fixture() -> (Rows, Job) {
+        let plan = parse_mode("g.V(1).repeat(__.out()).times(1).valueMap('name')", true).unwrap();
+        let mut rows = Rows::new(&plan, 0, 128).unwrap();
+        rows.traversal_finished = true;
+        let job = Job {
+            catalog: Arc::new(StaticCatalog { partitions: vec![] }),
+            sessions: BTreeMap::new(),
+            row_bounds: BTreeMap::new(),
+            connections: None,
+            rows: None,
+            expires: Instant::now() + Duration::from_secs(5),
+            cost: Cost {
+                bytes: JOB_CEILING.bytes - 1,
+                work: JOB_CEILING.work - 1,
+            },
+            completed_traversal_cost: None,
+            plan,
+            compact: None,
+            frontier: BTreeMap::new(),
+            next: BTreeMap::new(),
+            seen: BTreeSet::new(),
+            depth: 0,
+            total: 0,
+            next_mass: 0,
+            initialized: true,
+            sequence: 0,
+            last: None,
+            completed: false,
+            _permit: None,
+            _retained: RETAINED_SLOTS.acquire().await.unwrap(),
+        };
+        (rows, job)
+    }
+    #[tokio::test]
+    async fn projection_has_explicit_separate_allowance_and_cannot_reset_exhausted_stage() {
+        let (mut rows, mut job) = fixture().await;
+        let old = job.cost;
+        rows.project(&mut job, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(rows.complete);
+        let saved = job.completed_traversal_cost.unwrap();
+        assert_eq!((saved.bytes, saved.work), (old.bytes, old.work));
+        assert!(job.cost.bytes < projection::STAGE_CEILING.bytes);
+        assert!(
+            saved.bytes + job.cost.bytes <= JOB_CEILING.bytes + projection::STAGE_CEILING.bytes
+        );
+        rows.complete = false;
+        job.cost = projection::STAGE_CEILING;
+        assert_eq!(
+            rows.project(&mut job, Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(QueryFailure::ResourceExhausted)
+        );
+        assert!(!rows.complete);
+        assert_eq!(job.completed_traversal_cost.unwrap().bytes, old.bytes);
+    }
+    #[tokio::test]
+    async fn expired_projection_does_not_start_or_renew_phase() {
+        let (mut rows, mut job) = fixture().await;
+        let old = job.cost;
+        assert_eq!(
+            rows.project(&mut job, Instant::now() - Duration::from_millis(1))
+                .await,
+            Err(QueryFailure::Timeout)
+        );
+        assert!(job.completed_traversal_cost.is_none() && !rows.complete);
+        assert_eq!((job.cost.bytes, job.cost.work), (old.bytes, old.work));
+    }
+    #[test]
+    fn maximal_projected_rows_and_pages_fit_fixed_delivery_bounds() {
+        let mut map = BTreeMap::from([("name".into(), Value::Text(String::new()))]);
+        let overhead = serde_json::to_vec(&map).unwrap().len();
+        map.insert(
+            "name".into(),
+            Value::Text("x".repeat(projection::MAX_MAP_BYTES - overhead)),
+        );
+        assert_eq!(
+            projection::properties_bytes(&map).unwrap(),
+            projection::MAX_MAP_BYTES
+        );
+        let row = ProjectedRow {
+            source: QualifiedElement::Vertex {
+                partition: u32::MAX,
+                id: u64::MAX,
+            },
+            properties: map.into_iter().map(|(k, v)| (k, vec![v])).collect(),
+        };
+        assert!(serde_json::to_vec(&row).unwrap().len() <= 4096);
+        let snapshots = (1..=8)
+            .map(|shard| QueryStamp {
+                identity: RemoteIdentity {
+                    group: u64::MAX,
+                    node: u64::MAX,
+                },
+                shard,
+                epoch: u64::MAX,
+                sequence: u64::MAX,
+            })
+            .collect();
+        let page = Output::ProjectedPage {
+            token: [255; 16],
+            cursor: 250000,
+            next_cursor: Some(250128),
+            done: false,
+            rows: vec![row; projection::MAX_PAGE_ROWS],
+            completeness: QueryCompleteness::Unverified,
+            snapshots,
+        };
+        assert!(
+            serde_json::to_vec(&page).unwrap().len() <= 4096 + 4096 * projection::MAX_PAGE_ROWS
+        );
+        const { assert!(4096 + 4096 * projection::MAX_PAGE_ROWS < MAX_WIRE) };
     }
 }

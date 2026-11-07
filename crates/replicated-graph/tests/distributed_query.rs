@@ -42,6 +42,8 @@ use tokio::{
 mod corehr;
 #[path = "distributed_query/jobs.rs"]
 mod jobs;
+#[path = "distributed_query/projected_pages.rs"]
+mod projected_pages;
 #[path = "distributed_query/result_pages.rs"]
 mod result_pages;
 static PROCESS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -213,7 +215,18 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
     let source = AppendOnlyStore::new(a.clone(), 120, 0);
     let target = AppendOnlyStore::new(b.clone(), 130, 1);
     for id in [1, 7, 8, 9, 10, 11, 12, 40, 41, 42, 43, 44, 45] {
-        source.prepare_vertex(&Vertex::new(id))?.submit(&a)?;
+        let mut v = Vertex::new(id);
+        if id == 11 {
+            v.properties = BTreeMap::from([
+                ("nullable".into(), Value::Null),
+                ("unicode".into(), Value::Text("姓名\n\"".into())),
+                ("signed".into(), Value::Integer(i64::MIN)),
+                ("real".into(), Value::Real(0.5)),
+                ("enabled".into(), Value::Boolean(true)),
+                ("large".into(), Value::Text("x".repeat(3000))),
+            ]);
+        }
+        source.prepare_vertex(&v)?.submit(&a)?;
     }
     for id in [1, 2, 3, 8, 10, 12, 40, 41, 42, 43, 44, 45] {
         let mut v = Vertex::new(id);
@@ -746,6 +759,9 @@ async fn scenario() -> anyhow::Result<()> {
     result_pages::check(endpoint)
         .await
         .context("row page checks")?;
+    projected_pages::check(endpoint)
+        .await
+        .context("projected page checks")?;
     let before = bp.bytes.load(Ordering::SeqCst);
     let opened_a = ap.opened.load(Ordering::SeqCst);
     let opened_b = bp.opened.load(Ordering::SeqCst);
@@ -1311,6 +1327,9 @@ async fn scenario() -> anyhow::Result<()> {
     jobs::fixed_snapshot(endpoint, &a)
         .await
         .context("pinned job checks")?;
+    projected_pages::fixed_snapshot(endpoint, &a)
+        .await
+        .context("projected fixed snapshot")?;
     b.process.0.kill()?;
     b.process.0.wait()?;
     let unavailable = distributed::query(

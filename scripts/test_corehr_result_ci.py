@@ -22,13 +22,19 @@ def evidence(full=True):
         pages = max(1, (case['count'] + case['page_size'] - 1) // case['page_size'])
         rows.append({'event': 'result_outcome', 'name': name, 'correct': True,
                      'verified_ordered_identities': case['count'], 'pages': pages,
+                     'projection_keys': case['projection_keys'],
+                     'result_variant': 'ProjectedPage' if case['projection_keys'] is not None else 'Page',
+                     'verified_property_maps': case['count'] if case['projection_keys'] is not None else 0,
+                     'verified_property_entries': case['property_entries'],
+                     'verified_missing_property_keys': case['missing_property_keys'],
+                     'verified_empty_property_maps': case['empty_property_maps'],
                      'page_size': case['page_size'], 'preparation_advances': 2,
                      'preparation_seconds': 1.0, 'seconds': 2.0,
                      'fixed_snapshots': copy.deepcopy(stamps),
                      'old_and_arbitrary_page_replay': True, 'oracle': ROW_ORACLE,
                      'read_latency': {'n': pages, 'min_ms': 0.1, 'p50_ms': 0.2,
                                       'p95_ms': 0.3, 'max_ms': 0.4}})
-    rows.append({'event': 'result_matrix_complete', 'correct': True, 'cases': 11,
+    rows.append({'event': 'result_matrix_complete', 'correct': True, 'cases': 18,
                  'people': people, 'departments': departments, 'full_fixture': full,
                  'oracle': MATRIX_ORACLE})
     return rows, manifest
@@ -39,10 +45,12 @@ class ResultEvidenceTests(unittest.TestCase):
         for full, count in ((True, 199999), (False, 1999)):
             rows, manifest = evidence(full)
             result = validate(rows, manifest)
-            self.assertEqual(result['case_count'], 11)
+            self.assertEqual(result['case_count'], 18)
             self.assertEqual(result['ceo_ordered_rows'], count)
             self.assertEqual(result['ceo_dedup_ordered_rows'], count)
             self.assertEqual(result['full_fixture'], full)
+            self.assertEqual(result['projected_ceo_property_maps'], count)
+            self.assertEqual(result['projected_ceo_dedup_property_maps'], count)
 
     def test_independent_expected_counts(self):
         cases = expected_cases(200000, 5000)
@@ -51,6 +59,94 @@ class ResultEvidenceTests(unittest.TestCase):
         self.assertEqual(cases['ordered_roots']['count'], 216)
         self.assertEqual(cases['duplicate_ceo_rejected']['count'], 399998)
         self.assertEqual(expected_cases(2000, 50)['ceo_exact6']['count'], 0)
+
+    def test_projection_expected_shapes_and_counts(self):
+        cases = expected_cases(200000, 5000)
+        self.assertEqual(len(cases), 18)
+        self.assertEqual(sum(c['projection_keys'] is None for c in cases.values()), 11)
+        for name in ('projected_ceo_all', 'projected_ceo_all_dedup'):
+            case = cases[name]
+            self.assertEqual(case['count'], 199999)
+            self.assertEqual(case['page_size'], 128)
+            self.assertEqual(case['property_entries'], 599997)
+            self.assertEqual(case['projection_keys'], ['name', 'active', 'country'])
+            self.assertTrue(case['query'].endswith(".valueMap('name','active','country')"))
+        self.assertIn(".dedup().valueMap(", cases['projected_ceo_all_dedup']['query'])
+        self.assertEqual(cases['projected_duplicate_manager']['count'], cases['duplicate_manager']['count'])
+        departments = cases['projected_departments_missing_property']
+        self.assertEqual(departments['count'], 4999)
+        self.assertEqual(departments['missing_property_keys'], 4999)
+        self.assertEqual(departments['property_entries'], 14997)
+        self.assertEqual(departments['empty_property_maps'], 0)
+        missing = cases['projected_missing_key_empty_maps']
+        self.assertEqual(missing['count'], 8)
+        self.assertEqual(missing['missing_property_keys'], 8)
+        self.assertEqual(missing['empty_property_maps'], 8)
+        self.assertEqual(missing['property_entries'], 0)
+        self.assertEqual(cases['projected_direct_reports_page1']['property_entries'], 32)
+        self.assertEqual(cases['projected_empty']['count'], 0)
+
+    def test_projection_attestations_fail_closed_for_every_case(self):
+        rows, manifest = evidence()
+        for name, case in expected_cases(200000, 5000).items():
+            if case['projection_keys'] is None:
+                continue
+            original = next(r for r in rows if r.get('name') == name and r['event'] == 'result_outcome')
+            for key in original:
+                mutated = copy.deepcopy(rows)
+                outcome = next(r for r in mutated if r.get('name') == name and r['event'] == 'result_outcome')
+                del outcome[key]
+                with self.subTest(name=name, missing=key), self.assertRaises(ValueError):
+                    validate(mutated, manifest)
+            mutations = [
+                ('result_variant', 'Page'), ('result_variant', 'Progress'),
+                ('projection_keys', None), ('projection_keys', []),
+                ('projection_keys', ['department_id', 'status']),
+                ('verified_ordered_identities', case['count'] + 1),
+                ('page_size', 1000), ('pages', 0), ('correct', False),
+                ('old_and_arbitrary_page_replay', False),
+            ]
+            for field in ('verified_property_maps', 'verified_property_entries',
+                          'verified_missing_property_keys', 'verified_empty_property_maps'):
+                mutations.extend((field, value) for value in (True, -1, original[field] + 1))
+            for key, value in mutations:
+                mutated = copy.deepcopy(rows)
+                outcome = next(r for r in mutated if r.get('name') == name and r['event'] == 'result_outcome')
+                outcome[key] = value
+                with self.subTest(name=name, key=key, value=value), self.assertRaises(ValueError):
+                    validate(mutated, manifest)
+
+    def test_projection_query_cannot_be_id_count_or_different_properties(self):
+        rows, manifest = evidence()
+        for name, case in expected_cases(200000, 5000).items():
+            if case['projection_keys'] is None:
+                continue
+            prefix = case['query'].split('.valueMap(')[0]
+            for query in (prefix, prefix + '.count()', prefix + ".valueMap('status')"):
+                mutated = copy.deepcopy(rows)
+                begin = next(r for r in mutated if r.get('name') == name and r['event'] == 'result_begin')
+                begin['query'] = query
+                with self.subTest(name=name, query=query), self.assertRaises(ValueError):
+                    validate(mutated, manifest)
+
+    def test_projection_duplicate_begin_and_outcome_for_every_case(self):
+        rows, manifest = evidence()
+        for name, case in expected_cases(200000, 5000).items():
+            if case['projection_keys'] is None:
+                continue
+            for event in ('result_begin', 'result_outcome'):
+                index = next(i for i, r in enumerate(rows) if r.get('name') == name and r['event'] == event)
+                with self.subTest(name=name, event=event), self.assertRaises(ValueError):
+                    validate(rows[:index] + [rows[index]] + rows[index:], manifest)
+
+    def test_id_cases_cannot_claim_projected_results(self):
+        rows, manifest = evidence()
+        for key, value in (('result_variant', 'ProjectedPage'), ('verified_property_maps', 199999),
+                           ('projection_keys', ['name', 'active', 'country'])):
+            mutated = copy.deepcopy(rows)
+            next(r for r in mutated if r['event'] == 'result_outcome')[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate(mutated, manifest)
 
     def test_missing_each_case(self):
         rows, manifest = evidence()
