@@ -15,16 +15,19 @@ not report or imply a metadata sequence. Restart/reconfigure the service to
 change its routes; this prototype is not online migration or automatic discovery.
 
 The client sends `DistributedRequest { start_partition, text, timeout_millis }`.
-The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` or
-`out(label)` steps, order-preserving `hasLabel`, `has`, `limit`, terminal `path` or
+The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` / `in()`
+steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limit`, terminal `path` or
 `count`, and `values(key)` followed only by `limit`/`count`. Unsupported start and
 step forms fail explicitly through the official parser. No global V/E scan,
-incoming traversal, mutation, alternate query dialect or textual
+`both()`, mutation, alternate query dialect or textual
 query rewriting is provided by this slice.
 
 Examples:
 
 - `g.V(1).out('knows').path()`
+- `g.V(1).in('reports_to').path()`
+- `g.V(205000).in('member_of').has('active',true).limit(100)`
+- `g.V(20).out('member_of').in('member_of').count()`
 - `g.V(1).out('knows').out('returns').out('knows').path()`
 - `g.V(1).out('knows').has('active',true).limit(2).count()`
 - `g.V(1).out('knows').values('name')`
@@ -110,7 +113,7 @@ Parallel edges and duplicate input IDs are not globally deduplicated. Paths
 retain qualified vertex and edge identities at every hop, so equal local IDs in
 different partitions remain distinct. Cycles and revisiting a shard are allowed:
 each hop uses the original retained session, never a newly acquired snapshot.
-The official parser rejects more than three outgoing hops before any session is
+The official parser rejects more than three combined incoming/outgoing hops before any session is
 opened, even for a missing start or a preceding `limit(1)`.
 
 Limits execute in their original positions. In particular,
@@ -122,6 +125,21 @@ source. Terminal count is global and retains multiplicity. The ordinary default
 count, after required execution and validation. It is never applied separately
 by each shard.
 
+Incoming traversal reads the target reverse index, resolves each qualified edge
+at its canonical source shard, and checks source record/outgoing index/endpoint
+and target reverse index/endpoint against their original retained sessions.
+Outgoing traversal checks the same endpoints from the opposite direction.
+The incoming target scan already verifies the exact reverse entry and target
+endpoint; source resolution matches its ID, owner, label and target. Because
+both sessions are fixed, incoming execution does not repeat that same target
+verification RPC. Nonmatching labels are discarded only after this validation,
+not by skipping unrelated observed edges.
+Edge IDs are source-partition qualified; incoming paths retain that source
+owner even though the path walks from target to source. Both directions order
+observed edges per input by `(edge ID, source partition)`, not by adjacent vertex
+ID, and preserve bag multiplicity. All observations are validated before label
+filters, even when a later filter or limit would discard them. A source tombstone
+with an observed reverse index is an incomplete deletion and fails the query.
 Canonical source state and the target reverse index/endpoint are checked against
 their respective fixed sessions. An incomplete append, inconsistent edge or
 missing endpoint is an error, not an empty result or silently omitted path.
@@ -170,6 +188,13 @@ Logical accounting is not a total process-RSS bound. Snapshot payloads retained
 on data nodes, parser/native-call allocations, allocator overhead and bounded
 transport buffers have their separately stated limits. Native snapshot creation,
 decoding and allocation are not preemptible simply because the deadline passed.
+Incoming resolution adds bounded per-edge source RPC work under the same
+shared budget, so high fan-in may fail with ResourceExhausted even when a later
+limit/count would produce a small result. The existing 1,000-entry adjacency
+scan cap is not paging and does not return a successful prefix. All participating
+coordinator/data binaries must support the new incoming fragments; older peers
+fail rather than falling back to snapshot downloads.
+
 The implementation is a trusted-network plaintext development experiment, not
 an authenticated or encrypted public query service.
 
@@ -207,3 +232,11 @@ expired/closed/forged session tokens, previous server incarnation and an actual
 state-machine epoch change. Reduced primitive scan allowances return errors,
 never successful prefixes. Client validation checks terminal result shapes,
 qualified path ownership and scalar provenance.
+
+The committed CoreHR regression uses 200 synthetic people and 25 departments
+across three real data processes. An input-model oracle verifies direct reports,
+two-hop reports/department descendants, filtered department members, duplicate
+starts, parallel memberships, mixed out/in colleague bag counts and qualified
+paths. Equal local edge IDs in different source partitions check incoming
+secondary ordering. This CI-scale fixture is not the 200,000-person capacity
+benchmark, production HR data, recursive Gremlin or an HA/performance guarantee.

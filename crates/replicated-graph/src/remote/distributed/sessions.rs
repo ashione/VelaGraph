@@ -282,6 +282,54 @@ fn run_fragment(
             }
             Ok(FragmentValue::Edges(edges))
         }
+        Fragment::In(v) => {
+            let entries = AppendOnlyStore::new(node.clone(), shard, v.partition)
+                .observed_index(v.id, Direction::In)
+                .map_err(graph_error)?;
+            let mut incoming = Vec::with_capacity(entries.len());
+            for entry in entries {
+                node.charge(256 + entry.label.len(), 1)
+                    .map_err(query::storage_error)?;
+                incoming.push(IncomingEdge {
+                    id: entry.edge.id,
+                    partition: entry.edge.partition,
+                    label: entry.label,
+                });
+            }
+            Ok(FragmentValue::Incoming(incoming))
+        }
+        Fragment::ResolveIncoming {
+            target,
+            edge: observed,
+        } => {
+            // Canonical source record validation also checks the outgoing index
+            // and source endpoint. A tombstone with an observed reverse index is
+            // an incomplete deletion, never an absent neighbor.
+            let store = AppendOnlyStore::new(node.clone(), shard, observed.partition);
+            let Some(EdgeRecord::Live(edge)) =
+                store.get_edge_record(observed.id).map_err(graph_error)?
+            else {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            };
+            if edge.to
+                != (VertexRef {
+                    partition: target.partition,
+                    id: target.id,
+                })
+                || edge.label != observed.label
+            {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            }
+            Ok(FragmentValue::Edge(EdgeHop {
+                id: edge.id,
+                from: VertexId {
+                    partition: edge.from.partition,
+                    id: edge.from.id,
+                },
+                to: target,
+                label: edge.label,
+            }))
+        }
         Fragment::VerifyReverse(e) => {
             let edge = CrossEdge {
                 id: e.id,

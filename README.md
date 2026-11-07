@@ -34,7 +34,7 @@ query APIs remain unchanged; v2 results are still Unverified.
 
 A separate [bounded distributed observed query
 experiment](docs/DISTRIBUTED_QUERY.md) now coordinates explicit vertex starts
-and up to three outgoing hops across fixed data shards on server-retained
+and up to three incoming/outgoing hops across fixed data shards on server-retained
 snapshots. It uses a caller-maintained static catalog, not live metadata
 discovery, and still returns Unverified observations.
 
