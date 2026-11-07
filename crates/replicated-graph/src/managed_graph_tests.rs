@@ -834,6 +834,20 @@ async fn admitted_request_recovers_exact_plan_after_partial_prepare_and_restart(
         y.unwrap().durable_bytes().unwrap()
     );
     let winner_id = winner.id();
+    let point = NodeRef::Local(&c)
+        .request(&authority(), 1, external)
+        .await
+        .unwrap();
+    let point = point.record.unwrap();
+    assert_eq!(point.record.request, request);
+    assert_eq!(point.record.payload, winner.durable_bytes().unwrap());
+    assert_eq!(point.transaction.id, winner_id);
+    assert_eq!(point.transaction.decision, None);
+    assert!(graph
+        .recover_request([82; 16], &request)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         c.state_machine
             .coordinator_journal(9, 1, [9; 16])
@@ -910,6 +924,14 @@ async fn admitted_request_recovers_exact_plan_after_partial_prepare_and_restart(
         .unwrap()
         .unwrap();
     assert_eq!(again.durable_bytes().unwrap(), original);
+    let point = NodeRef::Local(&c)
+        .request(&authority(), 1, external)
+        .await
+        .unwrap();
+    let point = point.record.unwrap();
+    assert_eq!(point.record.payload, original);
+    assert_eq!(point.transaction.id, winner_id);
+    assert_eq!(point.transaction.decision, Some(Decision::Commit));
     assert!(matches!(
         graph.execute(&again).await.unwrap(),
         Outcome::Committed { visible: true, .. }

@@ -110,7 +110,8 @@ pub enum Error {
     IncompatibleHistory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestRecord {
     pub id: [u8; 16],
     pub request: Vec<u8>,
@@ -118,7 +119,8 @@ pub struct RequestRecord {
     pub transaction_id: [u8; 16],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transaction {
     pub id: [u8; 16],
     pub ordinal: u64,
@@ -198,6 +200,10 @@ impl Journal {
 
     pub fn request(&self, id: [u8; 16]) -> Option<&RequestRecord> {
         self.requests.iter().find(|r| r.id == id)
+    }
+
+    pub(crate) fn requests(&self) -> &[RequestRecord] {
+        &self.requests
     }
 
     pub fn cohort(&self) -> Option<&Cohort> {

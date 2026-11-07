@@ -377,6 +377,12 @@ fn application_error(
     id: RequestId,
 ) -> StorageNodeError {
     match error {
+        D1Error::RequestIndexHistory => {
+            StorageNodeError::Corrupt("coordinator request index disagrees with history".into())
+        }
+        D1Error::RequestIndexUnavailable => {
+            StorageNodeError::Unavailable("coordinator request index unavailable".into())
+        }
         D1Error::Fenced { current, .. } => StorageNodeError::Fenced {
             shard,
             epoch,
@@ -473,6 +479,14 @@ mod tests {
 
     #[test]
     fn application_rejections_remain_typed() {
+        assert!(matches!(
+            application_error(D1Error::RequestIndexHistory, 7, 3, [1; 16]),
+            StorageNodeError::Corrupt(_)
+        ));
+        assert!(matches!(
+            application_error(D1Error::RequestIndexUnavailable, 7, 3, [1; 16]),
+            StorageNodeError::Unavailable(_)
+        ));
         assert!(matches!(
             application_error(
                 D1Error::Conflict {
