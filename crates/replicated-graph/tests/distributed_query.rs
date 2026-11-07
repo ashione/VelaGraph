@@ -40,6 +40,8 @@ use tokio::{
 };
 #[path = "distributed_query/corehr.rs"]
 mod corehr;
+#[path = "distributed_query/jobs.rs"]
+mod jobs;
 static PROCESS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const BUDGET: Duration = Duration::from_secs(20);
 struct Process(Child);
@@ -715,6 +717,7 @@ async fn scenario() -> anyhow::Result<()> {
     )
     .await?;
     let endpoint = service.local_addr();
+    jobs::check(endpoint).await?;
     let before = bp.bytes.load(Ordering::SeqCst);
     let opened_a = ap.opened.load(Ordering::SeqCst);
     let opened_b = bp.opened.load(Ordering::SeqCst);
@@ -1277,6 +1280,7 @@ async fn scenario() -> anyhow::Result<()> {
         0
     );
     assert!(ap.requests.load(Ordering::SeqCst) > 0 && bp.requests.load(Ordering::SeqCst) > 0);
+    jobs::fixed_snapshot(endpoint, &a).await?;
     b.process.0.kill()?;
     b.process.0.wait()?;
     let unavailable = distributed::query(

@@ -15,6 +15,7 @@ static FRAGMENT_SLOTS: Semaphore = Semaphore::const_new(8);
 
 struct Session {
     descriptor: Descriptor,
+    hierarchy: bool,
     node: query::FrozenNode,
     used: Mutex<Cost>,
     _slot: tokio::sync::SemaphorePermit<'static>,
@@ -47,6 +48,36 @@ impl Sessions {
         shard: u64,
         end: Instant,
     ) -> Result<Descriptor, RemoteError> {
+        self.open_with_lease(state, identity, shard, (end, end), false)
+            .await
+    }
+    pub(in crate::remote) async fn open_hierarchy(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        end: Instant,
+    ) -> Result<Descriptor, RemoteError> {
+        let now = Instant::now();
+        let end = end.min(now + Duration::from_millis(MAX_TIMEOUT));
+        let lease_end = now + Duration::from_millis(jobs::LEASE_MILLIS);
+        tokio::time::timeout_at(
+            end,
+            self.open_with_lease(state, identity, shard, (end, lease_end), true),
+        )
+        .await
+        .map_err(|_| RemoteError::Timeout { request_id: None })?
+    }
+    async fn open_with_lease(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        deadlines: (Instant, Instant),
+        hierarchy: bool,
+    ) -> Result<Descriptor, RemoteError> {
+        let (end, lease_end) = deadlines;
+        check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
         self.expire();
         let slot = SESSION_SLOTS
             .try_acquire()
@@ -82,9 +113,10 @@ impl Sessions {
         check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
         let session = Session {
             descriptor: descriptor.clone(),
+            hierarchy,
             node: query::FrozenNode {
                 view,
-                end: end.into_std(),
+                end: lease_end.into_std(),
             },
             used: Mutex::new(Cost::default()),
             _slot: slot,
@@ -145,6 +177,10 @@ impl Sessions {
     ) -> Result<Reply, RemoteError> {
         request.fragment.validate()?;
         let session = self.lookup(identity, shard, &request.descriptor)?;
+        let is_batch = matches!(request.fragment, Fragment::HierarchyBatch { .. });
+        if session.hierarchy != is_batch {
+            return Err(RemoteError::InvalidArgument);
+        }
         let current = state
             .d1_metadata()
             .await
@@ -152,7 +188,9 @@ impl Sessions {
         if (current.0, current.1) != (shard, session.descriptor.stamp.epoch) {
             return Err(RemoteError::SessionUnavailable);
         }
-        let budget = if matches!(request.fragment, Fragment::Scan(_)) {
+        let budget = if is_batch {
+            jobs::JOB_CEILING
+        } else if matches!(request.fragment, Fragment::Scan(_)) {
             scan::SCAN_CEILING
         } else {
             CEILING
@@ -164,6 +202,11 @@ impl Sessions {
             .try_acquire()
             .map_err(|_| RemoteError::ResourceExhausted)?;
         let end = end.min(Instant::from_std(session.node.end));
+        let end = if is_batch {
+            end.min(Instant::now() + Duration::from_secs(5))
+        } else {
+            end
+        };
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             // Try-lock prevents a forged concurrent client from blocking a worker indefinitely.
@@ -246,6 +289,29 @@ fn run_fragment(
     fragment: Fragment,
 ) -> Result<FragmentValue, QueryFailure> {
     match fragment {
+        Fragment::HierarchyBatch { fragments, .. } => {
+            // Validation bounds the batch and excludes nested batches. All leaves
+            // share this worker's meter and the session's cumulative allowance.
+            node.charge(fragments.len().saturating_mul(128), fragments.len())
+                .map_err(query::storage_error)?;
+            let mut values = Vec::with_capacity(fragments.len());
+            let mut entries = 0usize;
+            for fragment in fragments {
+                node.check_execution_context()
+                    .map_err(query::storage_error)?;
+                let value = run_fragment(node, shard, fragment)?;
+                entries += match &value {
+                    FragmentValue::Edges(e) => e.len(),
+                    FragmentValue::Incoming(e) => e.len(),
+                    _ => 1,
+                };
+                if entries > jobs::MAX_PAGE_EDGES {
+                    return Err(QueryFailure::ResourceExhausted);
+                }
+                values.push(value);
+            }
+            Ok(FragmentValue::HierarchyBatch(values))
+        }
         Fragment::Scan(request) => run_scan_fragment(node, shard, request).map(FragmentValue::Scan),
         Fragment::Exists(v) => Ok(FragmentValue::Bool(
             AppendOnlyStore::new(node.clone(), shard, v.partition)
@@ -722,6 +788,7 @@ mod lifetime_tests {
         };
         let session = Arc::new(Session {
             descriptor: descriptor.clone(),
+            hierarchy: false,
             node: query::FrozenNode {
                 view: ReadView::from_entries(7, 3, 9, BTreeMap::new()).unwrap(),
                 end: std::time::Instant::now() + Duration::from_secs(1),
@@ -755,6 +822,7 @@ mod lifetime_tests {
         assert!(weak.upgrade().is_none());
         let expired = Arc::new(Session {
             descriptor: descriptor.clone(),
+            hierarchy: false,
             node: query::FrozenNode {
                 view: ReadView::from_entries(7, 3, 9, BTreeMap::new()).unwrap(),
                 end: std::time::Instant::now() - Duration::from_millis(1),
@@ -793,6 +861,138 @@ mod epoch_tests {
             .unwrap()
             .as_ref()
             .unwrap();
+    }
+    #[tokio::test]
+    async fn hierarchy_lease_is_fixed_and_batches_share_cumulative_budget() {
+        let mut state = Arc::new(StateMachine::default());
+        apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
+        let identity = RemoteIdentity { group: 2, node: 1 };
+        let sessions = Sessions::new().unwrap();
+        let start = Instant::now();
+        let end = start + Duration::from_secs(3);
+        let descriptor = sessions
+            .open_hierarchy(&state, identity, 7, end)
+            .await
+            .unwrap();
+        let session = sessions.lookup(identity, 7, &descriptor).unwrap();
+        let lease_end = session.node.end;
+        assert!(lease_end >= (start + Duration::from_millis(jobs::LEASE_MILLIS)).into_std());
+        assert!(lease_end > end.into_std());
+        let leaf = Fragment::Exists(VertexId {
+            partition: 0,
+            id: 1,
+        });
+        let batch = Fragment::HierarchyBatch {
+            partition: 0,
+            fragments: vec![leaf.clone(), leaf.clone()],
+        };
+        let request = FragmentRequest {
+            descriptor: descriptor.clone(),
+            fragment: batch.clone(),
+            remaining: jobs::JOB_CEILING,
+        };
+        let mut previous_work = 0;
+        for _ in 0..2 {
+            let reply = sessions
+                .fragment(&state, identity, 7, request.clone(), end)
+                .await
+                .unwrap();
+            let Reply::QueryFragment(Ok(FragmentOutput {
+                value: FragmentValue::HierarchyBatch(values),
+                ..
+            })) = reply
+            else {
+                panic!("expected successful hierarchy batch");
+            };
+            assert_eq!(values.len(), 2);
+            assert!(values
+                .iter()
+                .all(|v| matches!(v, FragmentValue::Bool(false))));
+            let work = session.used.lock().unwrap().work;
+            assert!(work > previous_work);
+            previous_work = work;
+            assert_eq!(session.node.end, lease_end);
+        }
+        // Neither a different request kind nor a generous allowance can turn
+        // an ordinary token into a hierarchy token (or vice versa).
+        let ordinary = sessions.open(&state, identity, 7, end).await.unwrap();
+        assert_eq!(
+            sessions.lookup(identity, 7, &ordinary).unwrap().node.end,
+            end.into_std()
+        );
+        for request in [
+            FragmentRequest {
+                fragment: leaf,
+                ..request.clone()
+            },
+            FragmentRequest {
+                descriptor: ordinary.clone(),
+                ..request.clone()
+            },
+            FragmentRequest {
+                fragment: Fragment::HierarchyBatch {
+                    partition: 0,
+                    fragments: vec![],
+                },
+                ..request.clone()
+            },
+            FragmentRequest {
+                fragment: Fragment::HierarchyBatch {
+                    partition: 0,
+                    fragments: vec![batch],
+                },
+                ..request.clone()
+            },
+            FragmentRequest {
+                fragment: Fragment::HierarchyBatch {
+                    partition: 1,
+                    fragments: vec![Fragment::Exists(VertexId {
+                        partition: 0,
+                        id: 1,
+                    })],
+                },
+                ..request.clone()
+            },
+        ] {
+            assert!(matches!(
+                sessions.fragment(&state, identity, 7, request, end).await,
+                Err(RemoteError::InvalidArgument)
+            ));
+        }
+        // Exhaustion remains cumulative even if the caller resubmits the full allowance.
+        *session.used.lock().unwrap() = jobs::JOB_CEILING;
+        assert!(matches!(
+            sessions
+                .fragment(&state, identity, 7, request, end)
+                .await
+                .unwrap(),
+            Reply::QueryFragment(Err(QueryFailure::ResourceExhausted))
+        ));
+        assert_eq!(session.node.end, lease_end);
+        drop(session);
+        {
+            let mut values = sessions.values.lock().unwrap();
+            Arc::get_mut(values.get_mut(&descriptor.token).unwrap())
+                .unwrap()
+                .node
+                .end = std::time::Instant::now() - Duration::from_millis(1);
+        }
+        assert!(matches!(
+            sessions.lookup(identity, 7, &descriptor),
+            Err(RemoteError::SessionUnavailable)
+        ));
+        assert!(matches!(
+            sessions
+                .open_hierarchy(
+                    &state,
+                    identity,
+                    7,
+                    Instant::now() - Duration::from_millis(1)
+                )
+                .await,
+            Err(RemoteError::Timeout { .. })
+        ));
+        sessions.close(identity, 7, &ordinary).unwrap();
     }
     #[tokio::test]
     async fn fragment_lease_fencing_and_previous_incarnation_fail_closed() {

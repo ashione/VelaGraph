@@ -297,3 +297,8 @@ with `times(1..32)` and optional post-emit inside explicit-ID server queries.
 It preserves path bags, finite cycles, fixed snapshots and existing budgets.
 Arbitrary/unbounded recursion, nested repeats and global-start adjacency remain
 deferred; see `SERVER_HIERARCHY.md`.
+
+The next narrowly scoped API, `HIERARCHY_COUNT_JOBS.md`, provides incremental
+server-native counts with fixed leased views and weighted frontiers. Its separate
+work/memory/lease bounds are explicit; it does not widen synchronous queries or
+claim unlimited closures, arbitrary repeat bodies, or ordered row pagination.
