@@ -23,6 +23,8 @@
 
 参与者状态机已增加显式启用的 prepare/commit/abort 持久状态和可信进程内协调者转发：未决时保留条件写预约，读继续；已验证单片原子发布和旧快照稳定。它尚未接通远程 graph 写客户端、统一 MVCC 可见版本或 CoreHR 并发事务验收，跨片逐个发布仍可能被新查询看到混合状态；GlobalCommittedSnapshot 继续 Unsupported。见[参与者契约](PARTICIPANT_WRITES.md)。
 
+版本读取基础切片：显式versioned participant模式逐ordinal消费全部终态决定（含Abort/非参与），本片数据和水位同批持久化；read_at(v)仅在本片已应用到v时有界重放历史，落后分片拒绝新版，旧版本不随后续写改变。未做GC或丢弃历史；这不是已完成全局查询、统一baseline认证或高性能索引MVCC，Global仍Unsupported。见[版本水位契约](VERSIONED_PARTICIPANT_READS.md)。
+
 ### 已确认与待定
 
 | 项目 | 当前结论 | 状态 |

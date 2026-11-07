@@ -66,6 +66,17 @@ struct D1MetadataV4 {
 }
 
 fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
+    if state.visibility.is_some() {
+        #[derive(Serialize)]
+        struct Metadata {
+            version: u32,
+            state: D1State,
+        }
+        return serde_json::to_vec(&Metadata {
+            version: 7,
+            state: state.stage(),
+        });
+    }
     if state.participant.is_some() {
         #[derive(Serialize)]
         struct Metadata {
@@ -456,6 +467,22 @@ impl StateMachine {
                     );
                     d1 = Some(meta.state);
                 }
+                7 => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Metadata {
+                        version: u32,
+                        state: D1State,
+                    }
+                    let meta: Metadata = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        meta.version == 7
+                            && meta.state.visibility.is_some()
+                            && meta.state.dedup.is_empty(),
+                        "invalid visibility metadata"
+                    );
+                    d1 = Some(meta.state);
+                }
                 _ => anyhow::bail!("unsupported D1 disk version"),
             }
         }
@@ -607,6 +634,26 @@ impl StateMachine {
         }))
     }
 
+    /// Local historical capture. Distributed callers must establish a leader
+    /// barrier and verify authority/routing. This is not global admission.
+    pub async fn participant_read_at(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        version: u64,
+        limit: crate::versioned_reads::ReadLimit,
+    ) -> Result<crate::versioned_reads::ReadSnapshot, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        d1.read_at(version, limit)
+    }
+
     /// Local diagnostic participant status. Establish a leader read barrier
     /// before using this for distributed recovery; Unknown never means Aborted.
     pub async fn participant_status(
@@ -623,11 +670,20 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        Ok(d1
+        let participant = d1
             .participant
             .as_ref()
-            .ok_or(D1Error::ParticipantNotEnabled)?
-            .status(id))
+            .ok_or(D1Error::ParticipantNotEnabled)?;
+        if let Some(visibility) = &d1.visibility {
+            if visibility.journal.transaction(id).is_some_and(|tx| {
+                tx.ordinal <= visibility.applied
+                    && tx.decision == Some(crate::transaction_decisions::Decision::Abort)
+                    && tx.participants.iter().any(|p| p.shard == shard)
+            }) {
+                return Ok(crate::participant_writes::Status::Aborted);
+            }
+        }
+        Ok(participant.status(id))
     }
 
     /// Local decision status only. Distributed callers must establish a leader
@@ -946,6 +1002,33 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     .into());
                 }
             }
+            if let Some(visibility) = &current.visibility {
+                if incoming.epoch != current.epoch
+                    || !incoming
+                        .visibility
+                        .as_ref()
+                        .is_some_and(|next| visibility.validate_successor(next))
+                {
+                    return Err(StorageIOError::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(
+                            "snapshot regresses version history/watermark/epoch",
+                        ),
+                    )
+                    .into());
+                }
+            } else if incoming.visibility.is_some()
+                && current
+                    .participant
+                    .as_ref()
+                    .is_some_and(|p| !p.records.is_empty())
+            {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other("snapshot retroactively versions participant history"),
+                )
+                .into());
+            }
             if incoming.bytes_limit() < current.bytes_limit() {
                 return Err(StorageIOError::read_snapshot(
                     Some(meta.signature()),
@@ -1065,6 +1148,7 @@ impl ApplyDelta {
                 previous.managed = next.managed;
                 previous.coordinator = next.coordinator;
                 previous.participant = next.participant;
+                previous.visibility = next.visibility;
                 previous.epoch = next.epoch;
                 previous.sequence = next.sequence;
                 previous.dedup.append(&mut next.dedup);
@@ -1112,6 +1196,75 @@ fn apply_d1(
     command: D1Command,
 ) -> Result<D1Result, D1Error> {
     match command {
+        D1Command::EnableVersionedReads {
+            shard,
+            epoch,
+            mode_id,
+            journal,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            let participant = d1
+                .participant
+                .as_ref()
+                .ok_or(D1Error::ParticipantNotEnabled)?;
+            if journal.authority() != participant.authority.mode || journal.transaction_count() != 0
+            {
+                return Err(D1Error::VisibilityHistory);
+            }
+            if d1.visibility.is_none() {
+                if !participant.records.is_empty() {
+                    return Err(D1Error::VisibilityHistory);
+                }
+                d1.visibility = Some(crate::versioned_reads::State {
+                    baseline_sequence: d1.sequence,
+                    epoch: d1.epoch,
+                    applied: 0,
+                    journal,
+                    commits: Vec::new(),
+                });
+                d1.version = 6;
+            }
+            Ok(D1Result::Visibility {
+                applied_prefix: d1.visibility.as_ref().unwrap().applied,
+            })
+        }
+        D1Command::AdvanceVisibility {
+            authority,
+            shard,
+            epoch,
+            mode_id,
+            ordinal,
+            journal,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            if d1
+                .participant
+                .as_ref()
+                .is_none_or(|p| p.authority != authority)
+            {
+                return Err(D1Error::ParticipantAuthority);
+            }
+            // All fallible validation and resolution happen on an unpublished
+            // candidate; a rejected prefix cannot leave a partial terminal status.
+            let mut candidate = d1.clone();
+            let (result, request) =
+                candidate.advance_visibility(ordinal, journal, base.d1.as_ref())?;
+            *d1 = candidate;
+            if let Some(request) = request {
+                apply_operations(base, next, batch, request.operations);
+            }
+            Ok(result)
+        }
         D1Command::EnableParticipant {
             shard,
             epoch,
@@ -1161,6 +1314,9 @@ fn apply_d1(
             id,
             decision,
         } => {
+            if next.d1.as_ref().is_some_and(|d1| d1.visibility.is_some()) {
+                return Err(D1Error::VisibilityRequired);
+            }
             let (result, request) = next
                 .d1
                 .as_mut()
@@ -1249,6 +1405,9 @@ fn apply_d1(
         } => {
             let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
             d1.check_shard(shard)?;
+            if d1.visibility.is_some() && new_epoch != d1.epoch {
+                return Err(D1Error::VisibilityRequired);
+            }
             if d1.participant.as_ref().is_some_and(|s| s.pending()) && new_epoch != d1.epoch {
                 return Err(D1Error::ParticipantBusy);
             }
@@ -2382,3 +2541,7 @@ mod coordinator_tests {
 #[cfg(test)]
 #[path = "participant_state_tests.rs"]
 mod participant_state_tests;
+
+#[cfg(test)]
+#[path = "versioned_state_tests.rs"]
+mod versioned_state_tests;

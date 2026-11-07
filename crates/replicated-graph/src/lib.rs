@@ -396,6 +396,15 @@ fn application_error(
         | D1Error::CapacityConflict { .. } => {
             StorageNodeError::InvalidArgument("invalid D1 request".into())
         }
+        D1Error::VisibilityNotEnabled
+        | D1Error::VisibilityRequired
+        | D1Error::VisibilityHistory
+        | D1Error::VisibilityGap
+        | D1Error::VisibilityUnresolved
+        | D1Error::VisibilityNotApplied
+        | D1Error::VisibilityReadLimit => {
+            StorageNodeError::Unsupported("versioned participant boundary".into())
+        }
         D1Error::ParticipantOnly
         | D1Error::ParticipantNotEnabled
         | D1Error::ParticipantAuthority

@@ -201,7 +201,7 @@ impl State {
 }
 
 impl D1State {
-    fn check_participant(
+    pub(crate) fn check_participant(
         &self,
         authority: &Authority,
         descriptor: &Participant,
@@ -251,6 +251,23 @@ impl D1State {
                 return Err(D1Error::IdempotencyConflict);
             }
             return Ok(D1Result::Participant(record.status()));
+        }
+        if let Some(visibility) = &self.visibility {
+            if let Some(tx) = visibility.journal.transaction(request.request_id) {
+                if !tx.participants.contains(&descriptor) {
+                    return Err(D1Error::IdempotencyConflict);
+                }
+                if tx.ordinal <= visibility.applied {
+                    return if tx.decision == Some(Decision::Abort) {
+                        Ok(D1Result::Participant(Status::Aborted))
+                    } else {
+                        Err(D1Error::VisibilityHistory)
+                    };
+                }
+                if tx.decision.is_some() {
+                    return Err(D1Error::VisibilityUnresolved);
+                }
+            }
         }
         if state.pending() {
             return Err(D1Error::ParticipantBusy);

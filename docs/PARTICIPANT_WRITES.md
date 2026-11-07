@@ -90,6 +90,14 @@ decision. Full graph data still matches D1 history replay. Sync failures publish
 neither data nor status. Restoring an entire stale directory remains outside the
 supported recovery protocol; this does not add remote backup management.
 
+## Optional version-specific reads
+
+A separate [versioned participant mode](VERSIONED_PARTICIPANT_READS.md) fences
+legacy Resolve and publishes through contiguous applied coordinator ordinals.
+It provides bounded historical reads and uses the applied journal as the negative
+identity for unknown Abort, without extra tombstone quota. Participant-only mode
+retains the behavior described above. Global query admission is still absent.
+
 ## Verified boundary and next work
 
 Tests exercise pending reopen, commit sync failure, duplicate commits, opposing
