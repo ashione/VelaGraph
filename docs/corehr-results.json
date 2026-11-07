@@ -1,0 +1,1012 @@
+{
+  "measurement_kind": "outgoing_only_baseline",
+  "measurement_date": "2026-11-07",
+  "capacity_candidate": "31a56611bdfe6d269d7dcc6d15cb5032b7dd2bad",
+  "node_binary_sha256": "b1d248c03dbfcfe65d1fbd2794d368df935ee3a88e1b94ed8c32913bbc078752",
+  "node_profile": "release",
+  "harness_profile": "dev/unoptimized",
+  "superseded_for_query_coverage_by": "corehr-incoming-results.json",
+  "fixture": {
+    "cross_partition_edges": 303483,
+    "departments": 5000,
+    "edges": 454998,
+    "fixture_seconds": 9.759323958,
+    "multi_department_people": 40000,
+    "people": 200000,
+    "shards": [
+      {
+        "d1_accounted_estimate": 69161438,
+        "kv_rows": 523557,
+        "partition": 1,
+        "raw_bytes": 35640350
+      },
+      {
+        "d1_accounted_estimate": 69176495,
+        "kv_rows": 523688,
+        "partition": 2,
+        "raw_bytes": 35647023
+      },
+      {
+        "d1_accounted_estimate": 69069392,
+        "kv_rows": 522749,
+        "partition": 3,
+        "raw_bytes": 35600016
+      }
+    ],
+    "three_department_people": 10000,
+    "vertices": 205000
+  },
+  "events": {
+    "capacity_before": 3,
+    "explicit_capacity_upgrade": 3,
+    "loaded_shard": 3,
+    "load": 1,
+    "capacity_after": 3,
+    "all_kv_verified": 3,
+    "client_session": 1,
+    "server_query": 32,
+    "application_chain": 2,
+    "resources": 1
+  },
+  "load": {
+    "event": "load",
+    "kind": "offline-encoded fixture imported through Raft; not ordinary graph mutation throughput",
+    "kv_rows": 1569994,
+    "latency": {
+      "max_ms": 170.05556099999998,
+      "min_ms": 36.639363,
+      "n": 315,
+      "p50_ms": 58.462568,
+      "p95_ms": 119.97268199999999
+    },
+    "seconds": 21.508385606
+  },
+  "client_session": {
+    "error": "Route(Storage(ResourceExhausted(\"global scan fanout or aggregate snapshot limit exceeded\")))",
+    "event": "client_session",
+    "seconds": 7.67185287
+  },
+  "supported_cases": 15,
+  "supported_samples": 105,
+  "rejected_cases": 17,
+  "queries": [
+    {
+      "name": "manager_1",
+      "query": "g.V(1).out('reports_to')",
+      "latency": {
+        "max_ms": 573.486343,
+        "min_ms": 394.153407,
+        "n": 7,
+        "p50_ms": 412.093638,
+        "p95_ms": 573.486343
+      },
+      "result": {
+        "correct": true,
+        "rows": 0,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "direct_reports_1",
+      "query": "g.V(1).in('reports_to')",
+      "latency": {
+        "max_ms": 1.7214159999999998,
+        "min_ms": 1.7214159999999998,
+        "n": 1,
+        "p50_ms": 1.7214159999999998,
+        "p95_ms": 1.7214159999999998
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "departments_1",
+      "query": "g.V(1).out('member_of')",
+      "latency": {
+        "max_ms": 453.03523,
+        "min_ms": 372.631712,
+        "n": 7,
+        "p50_ms": 401.463879,
+        "p95_ms": 453.03523
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "manager_20",
+      "query": "g.V(20).out('reports_to')",
+      "latency": {
+        "max_ms": 454.87685700000003,
+        "min_ms": 344.260649,
+        "n": 7,
+        "p50_ms": 397.402561,
+        "p95_ms": 454.87685700000003
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "direct_reports_20",
+      "query": "g.V(20).in('reports_to')",
+      "latency": {
+        "max_ms": 1.933509,
+        "min_ms": 1.933509,
+        "n": 1,
+        "p50_ms": 1.933509,
+        "p95_ms": 1.933509
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "departments_20",
+      "query": "g.V(20).out('member_of')",
+      "latency": {
+        "max_ms": 419.771169,
+        "min_ms": 354.87794099999996,
+        "n": 7,
+        "p50_ms": 372.133529,
+        "p95_ms": 419.771169
+      },
+      "result": {
+        "correct": true,
+        "rows": 3,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "manager_100000",
+      "query": "g.V(100000).out('reports_to')",
+      "latency": {
+        "max_ms": 448.190882,
+        "min_ms": 378.311601,
+        "n": 7,
+        "p50_ms": 416.118337,
+        "p95_ms": 448.190882
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "direct_reports_100000",
+      "query": "g.V(100000).in('reports_to')",
+      "latency": {
+        "max_ms": 2.039188,
+        "min_ms": 2.039188,
+        "n": 1,
+        "p50_ms": 2.039188,
+        "p95_ms": 2.039188
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "departments_100000",
+      "query": "g.V(100000).out('member_of')",
+      "latency": {
+        "max_ms": 418.555529,
+        "min_ms": 378.58152099999995,
+        "n": 7,
+        "p50_ms": 386.779215,
+        "p95_ms": 418.555529
+      },
+      "result": {
+        "correct": true,
+        "rows": 3,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "manager_200000",
+      "query": "g.V(200000).out('reports_to')",
+      "latency": {
+        "max_ms": 464.209987,
+        "min_ms": 348.382889,
+        "n": 7,
+        "p50_ms": 382.588644,
+        "p95_ms": 464.209987
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "direct_reports_200000",
+      "query": "g.V(200000).in('reports_to')",
+      "latency": {
+        "max_ms": 2.146439,
+        "min_ms": 2.146439,
+        "n": 1,
+        "p50_ms": 2.146439,
+        "p95_ms": 2.146439
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "departments_200000",
+      "query": "g.V(200000).out('member_of')",
+      "latency": {
+        "max_ms": 479.712808,
+        "min_ms": 382.211637,
+        "n": 7,
+        "p50_ms": 389.935158,
+        "p95_ms": 479.712808
+      },
+      "result": {
+        "correct": true,
+        "rows": 3,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "manager_chain_three_hops",
+      "query": "g.V(200000).out('reports_to').out('reports_to').out('reports_to')",
+      "latency": {
+        "max_ms": 464.361478,
+        "min_ms": 372.558147,
+        "n": 7,
+        "p50_ms": 438.39151,
+        "p95_ms": 464.361478
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "reports_two_hops",
+      "query": "g.V(1).in('reports_to').in('reports_to')",
+      "latency": {
+        "max_ms": 3.5646839999999997,
+        "min_ms": 3.5646839999999997,
+        "n": 1,
+        "p50_ms": 3.5646839999999997,
+        "p95_ms": 3.5646839999999997
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "department_ancestors_three_hops",
+      "query": "g.V(205000).out('parent_department').out('parent_department').out('parent_department')",
+      "latency": {
+        "max_ms": 443.21840899999995,
+        "min_ms": 359.60255800000004,
+        "n": 7,
+        "p50_ms": 389.626701,
+        "p95_ms": 443.21840899999995
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "department_descendants_two_hops",
+      "query": "g.V(200002).in('parent_department').in('parent_department')",
+      "latency": {
+        "max_ms": 4.125107,
+        "min_ms": 4.125107,
+        "n": 1,
+        "p50_ms": 4.125107,
+        "p95_ms": 4.125107
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "department_members",
+      "query": "g.V(200002).in('member_of').limit(1000)",
+      "latency": {
+        "max_ms": 3.635225,
+        "min_ms": 3.635225,
+        "n": 1,
+        "p50_ms": 3.635225,
+        "p95_ms": 3.635225
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "active_department_members",
+      "query": "g.V(200002).in('member_of').has('active',true).limit(1000)",
+      "latency": {
+        "max_ms": 4.860434000000001,
+        "min_ms": 4.860434000000001,
+        "n": 1,
+        "p50_ms": 4.860434000000001,
+        "p95_ms": 4.860434000000001
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "colleagues_via_department",
+      "query": "g.V(20).out('member_of').in('member_of').limit(25)",
+      "latency": {
+        "max_ms": 2.9399640000000002,
+        "min_ms": 2.9399640000000002,
+        "n": 1,
+        "p50_ms": 2.9399640000000002,
+        "p95_ms": 2.9399640000000002
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "department_parent_join",
+      "query": "g.V(20).out('member_of').out('parent_department')",
+      "latency": {
+        "max_ms": 499.661815,
+        "min_ms": 384.151829,
+        "n": 7,
+        "p50_ms": 429.693642,
+        "p95_ms": 499.661815
+      },
+      "result": {
+        "correct": true,
+        "rows": 3,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "missing_person",
+      "query": "g.V(205001)",
+      "latency": {
+        "max_ms": 525.160493,
+        "min_ms": 367.65364999999997,
+        "n": 7,
+        "p50_ms": 383.11755800000003,
+        "p95_ms": 525.160493
+      },
+      "result": {
+        "correct": true,
+        "rows": 0,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "direct_report_count",
+      "query": "g.V(1).in('reports_to').count()",
+      "latency": {
+        "max_ms": 5.9256969999999995,
+        "min_ms": 5.9256969999999995,
+        "n": 1,
+        "p50_ms": 5.9256969999999995,
+        "p95_ms": 5.9256969999999995
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "filtered_join_count",
+      "query": "g.V(20).out('member_of').hasLabel('department').count()",
+      "latency": {
+        "max_ms": 482.970228,
+        "min_ms": 382.627566,
+        "n": 7,
+        "p50_ms": 412.508458,
+        "p95_ms": 482.970228
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "person_name_projection",
+      "query": "g.V(20).values('name')",
+      "latency": {
+        "max_ms": 407.701504,
+        "min_ms": 353.744917,
+        "n": 7,
+        "p50_ms": 388.68962,
+        "p95_ms": 407.701504
+      },
+      "result": {
+        "correct": true,
+        "rows": 1,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate_start_bag",
+      "query": "g.V(20,20).out('member_of')",
+      "latency": {
+        "max_ms": 440.052223,
+        "min_ms": 362.323387,
+        "n": 7,
+        "p50_ms": 399.945614,
+        "p95_ms": 440.052223
+      },
+      "result": {
+        "correct": true,
+        "rows": 6,
+        "snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "colleagues_bag_count",
+      "query": "g.V(20).out('member_of').in('member_of').count()",
+      "latency": {
+        "max_ms": 3.187536,
+        "min_ms": 3.187536,
+        "n": 1,
+        "p50_ms": 3.187536,
+        "p95_ms": 3.187536
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "recursive_repeat",
+      "query": "g.V(1).repeat(in('reports_to')).emit()",
+      "latency": {
+        "max_ms": 5.753236,
+        "min_ms": 5.753236,
+        "n": 1,
+        "p50_ms": 5.753236,
+        "p95_ms": 5.753236
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "offset_pagination",
+      "query": "g.V(1).in('reports_to').range(2,5)",
+      "latency": {
+        "max_ms": 2.637748,
+        "min_ms": 2.637748,
+        "n": 1,
+        "p50_ms": 2.637748,
+        "p95_ms": 2.637748
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "sort",
+      "query": "g.V(1).in('reports_to').order()",
+      "latency": {
+        "max_ms": 3.0360880000000003,
+        "min_ms": 3.0360880000000003,
+        "n": 1,
+        "p50_ms": 3.0360880000000003,
+        "p95_ms": 3.0360880000000003
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "predicate",
+      "query": "g.V(1).has('level',gt(2))",
+      "latency": {
+        "max_ms": 2.060289,
+        "min_ms": 2.060289,
+        "n": 1,
+        "p50_ms": 2.060289,
+        "p95_ms": 2.060289
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "dedup_join",
+      "query": "g.V(20).out('member_of').in('member_of').dedup()",
+      "latency": {
+        "max_ms": 2.730779,
+        "min_ms": 2.730779,
+        "n": 1,
+        "p50_ms": 2.730779,
+        "p95_ms": 2.730779
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    },
+    {
+      "name": "global_count",
+      "query": "g.V().count()",
+      "latency": {
+        "max_ms": 1.159635,
+        "min_ms": 1.159635,
+        "n": 1,
+        "p50_ms": 1.159635,
+        "p95_ms": 1.159635
+      },
+      "result": {
+        "expected_rejection": "Unsupported"
+      }
+    }
+  ],
+  "resources": {
+    "complete": true,
+    "database_bytes": 830778518,
+    "event": "resources",
+    "nodes": [
+      {
+        "group": 0,
+        "memory": [
+          "VmHWM:\t   16136 kB",
+          "VmRSS:\t   16136 kB"
+        ]
+      },
+      {
+        "group": 1,
+        "memory": [
+          "VmHWM:\t  846444 kB",
+          "VmRSS:\t  846444 kB"
+        ]
+      },
+      {
+        "group": 2,
+        "memory": [
+          "VmHWM:\t  771300 kB",
+          "VmRSS:\t  771300 kB"
+        ]
+      },
+      {
+        "group": 3,
+        "memory": [
+          "VmHWM:\t  754800 kB",
+          "VmRSS:\t  690028 kB"
+        ]
+      }
+    ],
+    "query_failures": 0,
+    "runner": [
+      "VmHWM:\t  257976 kB",
+      "VmRSS:\t  257976 kB"
+    ]
+  }
+}
