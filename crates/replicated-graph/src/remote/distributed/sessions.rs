@@ -13,6 +13,13 @@ static SESSION_SLOTS: Semaphore = Semaphore::const_new(8);
 static SESSION_BYTES: Semaphore = Semaphore::const_new(128 * 1024 * 1024);
 static FRAGMENT_SLOTS: Semaphore = Semaphore::const_new(8);
 
+// These unit fixtures share the real process-wide session/snapshot admission
+// pools. Serialize fixture lifetimes, not production operations: concurrent
+// acquisition behavior is still exercised explicitly inside the guarded tests.
+// A snapshot temporarily reserves 64 MiB before shrinking to its retained size.
+#[cfg(test)]
+static TEST_SESSION_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Session {
     descriptor: Descriptor,
     hierarchy: bool,
@@ -848,8 +855,9 @@ mod tests {
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
-    #[test]
-    fn token_bound_view_expires_closes_and_retains_admission_while_in_use() {
+    #[tokio::test]
+    async fn token_bound_view_expires_closes_and_retains_admission_while_in_use() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let sessions = Sessions::new().unwrap();
         let identity = RemoteIdentity { group: 2, node: 1 };
         let descriptor = Descriptor {
@@ -942,6 +950,7 @@ mod epoch_tests {
     }
     #[tokio::test]
     async fn scan_and_traversal_ledgers_are_separate_cumulative_and_share_one_lease() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let mut state = Arc::new(StateMachine::default());
         apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
         let identity = RemoteIdentity { group: 2, node: 1 };
@@ -1060,6 +1069,7 @@ mod epoch_tests {
     }
     #[tokio::test]
     async fn hierarchy_lease_is_fixed_and_batches_share_cumulative_budget() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let mut state = Arc::new(StateMachine::default());
         apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
         let identity = RemoteIdentity { group: 2, node: 1 };
@@ -1192,6 +1202,7 @@ mod epoch_tests {
     }
     #[tokio::test]
     async fn fragment_lease_fencing_and_previous_incarnation_fail_closed() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let mut state = Arc::new(StateMachine::default());
         apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
         let identity = RemoteIdentity { group: 2, node: 1 };
@@ -1253,6 +1264,7 @@ mod epoch_tests {
     }
     #[tokio::test]
     async fn hierarchy_six_leaf_actual_costs_fit_snapshot_reservations() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         // Build valid graph bytes off the async executor, using a disposable local DB.
         // Adapter exists only to let AppendOnlyStore share ownership of that DB.
         #[derive(Clone)]
@@ -1629,7 +1641,6 @@ mod channel_server_tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
 
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const IDENTITY: RemoteIdentity = RemoteIdentity { group: 2, node: 1 };
     const SHARD: u64 = 7;
     const OPERATION_LIMIT: Duration = Duration::from_secs(5);
@@ -1762,7 +1773,7 @@ mod channel_server_tests {
 
     #[tokio::test]
     async fn real_channel_retires_at_1024_and_reconnect_preserves_session_and_budget() {
-        let _serial = SERIAL.lock().await;
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;
@@ -1831,7 +1842,7 @@ mod channel_server_tests {
 
     #[tokio::test]
     async fn server_rejects_switch_to_another_valid_descriptor_without_executing_it() {
-        let _serial = SERIAL.lock().await;
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let (other, _) = sessions
             .open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT)
@@ -1857,7 +1868,7 @@ mod channel_server_tests {
 
     #[tokio::test]
     async fn aborting_real_idle_handler_closes_socket_without_reopening_session() {
-        let _serial = SERIAL.lock().await;
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;
