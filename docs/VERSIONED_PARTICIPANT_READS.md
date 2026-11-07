@@ -124,3 +124,5 @@ participant/catalog cohort, end-to-end remote protocol and managed graph writers
 query admission/pins across a single chosen version, wider concurrent workloads,
 and full CoreHR transaction/read verification. Existing full CoreHR CI is a
 regression gate, not proof that its graph APIs use these new participant methods.
+
+The optional [fixed-cohort session layer](CERTIFIED_COHORT_READS.md) adds persistent membership and empty-baseline certification. Existing unbound/nonempty modes cannot be automatically upgraded to that contract.

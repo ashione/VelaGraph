@@ -570,3 +570,203 @@ async fn future_observation_cannot_persist_an_incompatible_existing_intent() {
         .unwrap();
     assert_eq!(read(&fresh, 7, 0).await.unwrap().local_sequence, 1);
 }
+
+fn bound_journal() -> Journal {
+    use crate::transaction_decisions::{Cohort, Member};
+    let mut j = Journal::new([9; 16]).unwrap();
+    j.apply(Command::BindCohort {
+        cohort: Cohort {
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: vec![
+                Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                },
+                Member {
+                    shard: 8,
+                    epoch: 1,
+                    mode: [8; 16],
+                },
+            ],
+        },
+    })
+    .unwrap();
+    j
+}
+async fn setup_empty_bound(sm: &mut Arc<StateMachine>, shard: u64, journal: Journal) -> u64 {
+    let mut i = 0;
+    apply(sm, &mut i, D1Command::Activate { shard, epoch: 1 })
+        .await
+        .unwrap();
+    apply(
+        sm,
+        &mut i,
+        D1Command::EnableManagedWrites {
+            shard,
+            epoch: 1,
+            expected_sequence: 0,
+            mode_id: [shard as u8; 16],
+        },
+    )
+    .await
+    .unwrap();
+    apply(
+        sm,
+        &mut i,
+        D1Command::EnableParticipant {
+            shard,
+            epoch: 1,
+            mode_id: [shard as u8; 16],
+            authority: authority(),
+        },
+    )
+    .await
+    .unwrap();
+    apply(
+        sm,
+        &mut i,
+        D1Command::EnableVersionedReads {
+            shard,
+            epoch: 1,
+            mode_id: [shard as u8; 16],
+            journal,
+        },
+    )
+    .await
+    .unwrap();
+    i
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn bound_empty_baseline_reopens_and_rejects_conflicting_terminal_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    let mut j = bound_journal();
+    let mut i = setup_empty_bound(&mut sm, 7, j.clone()).await;
+    begin(&mut j, 2, &[7]);
+    apply(
+        &mut sm,
+        &mut i,
+        prepare(7, 2, 0, vec![WriteOp::put("x", "new")]),
+    )
+    .await
+    .unwrap();
+    commit(&mut j, 2, &[7]);
+    apply(&mut sm, &mut i, advance(7, 1, &j)).await.unwrap();
+    drop(sm);
+    let sm = StateMachine::open(dir.path()).unwrap();
+    let limit = ReadLimit {
+        rows: 10,
+        bytes: 1000,
+        operations: 100,
+    };
+    let view = sm
+        .certified_participant_read(7, 1, [7; 16], 1, limit.clone(), &j)
+        .await
+        .unwrap();
+    assert_eq!(view.baseline_sequence, 0);
+    assert_eq!(view.cohort, j.cohort().cloned());
+    let mut fork = bound_journal();
+    begin(&mut fork, 3, &[7]);
+    commit(&mut fork, 3, &[7]);
+    assert_eq!(
+        sm.certified_participant_read(7, 1, [7; 16], 1, limit, &fork)
+            .await,
+        Err(D1Error::VisibilityHistory)
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn old_versioned_modes_cannot_be_relabelled_as_certified_empty_baselines() {
+    for nonempty in [false, true] {
+        let mut sm = Arc::new(StateMachine::default());
+        let mut i = if nonempty {
+            setup(&mut sm, 7).await
+        } else {
+            setup_empty_bound(&mut sm, 7, Journal::new([9; 16]).unwrap()).await
+        };
+        assert_eq!(
+            apply(
+                &mut sm,
+                &mut i,
+                D1Command::EnableVersionedReads {
+                    shard: 7,
+                    epoch: 1,
+                    mode_id: [7; 16],
+                    journal: bound_journal()
+                }
+            )
+            .await,
+            Err(D1Error::VisibilityHistory)
+        );
+        let image = sm.build_snapshot().await.unwrap();
+        let mut forged: SnapshotV1 = serde_json::from_slice(image.snapshot.get_ref()).unwrap();
+        forged.d1.visibility.as_mut().unwrap().journal = bound_journal();
+        let mut meta = image.meta;
+        meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 100));
+        assert!(sm
+            .install_snapshot(
+                &meta,
+                Box::new(Cursor::new(serde_json::to_vec(&forged).unwrap()))
+            )
+            .await
+            .is_err());
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn coordinator_binding_is_durable_and_cannot_be_removed_or_reowned_by_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    let mut i = 0;
+    for command in [
+        D1Command::Activate { shard: 9, epoch: 1 },
+        D1Command::EnableManagedWrites {
+            shard: 9,
+            epoch: 1,
+            expected_sequence: 0,
+            mode_id: [9; 16],
+        },
+        D1Command::EnableCoordinator {
+            shard: 9,
+            epoch: 1,
+            mode_id: [9; 16],
+        },
+    ] {
+        apply(&mut sm, &mut i, command).await.unwrap();
+    }
+    let old = sm.build_snapshot().await.unwrap();
+    apply(
+        &mut sm,
+        &mut i,
+        D1Command::Coordinator {
+            shard: 9,
+            epoch: 1,
+            mode_id: [9; 16],
+            command: Command::BindCohort {
+                cohort: bound_journal().cohort().unwrap().clone(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mut meta = old.meta;
+    meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 100));
+    assert!(sm.install_snapshot(&meta, old.snapshot).await.is_err());
+    let image = sm.build_snapshot().await.unwrap();
+    let mut decoded: SnapshotV1 = serde_json::from_slice(image.snapshot.get_ref()).unwrap();
+    decoded.d1.epoch = 2;
+    let mut fresh = Arc::new(StateMachine::default());
+    assert!(fresh
+        .install_snapshot(
+            &image.meta,
+            Box::new(Cursor::new(serde_json::to_vec(&decoded).unwrap()))
+        )
+        .await
+        .is_err());
+    drop(sm);
+    let sm = StateMachine::open(dir.path()).unwrap();
+    assert_eq!(
+        sm.coordinator_journal(9, 1, [9; 16]).await.unwrap(),
+        bound_journal()
+    );
+}

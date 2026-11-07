@@ -11,6 +11,7 @@
 //! example (https://github.com/databendlabs/openraft); see NOTICE.
 
 mod blocking;
+pub mod cohort_reads;
 mod d1;
 mod durable_log_store;
 mod log_store;

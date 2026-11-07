@@ -353,3 +353,5 @@ semantics and bag order under the original synchronous budget. Global-start
 joins, arbitrary aggregations and general Gremlin remain deferred. CoreHR CI
 adds batch-person, batch-department, active-members and distinct-colleague map
 oracles on both smoke and 200,000-person fixtures.
+
+- Fixed-cohort read foundation: explicit immutable coordinator membership and empty-baseline participant certification, with bounded same-version materialized sessions. See [contract and remaining boundaries](CERTIFIED_COHORT_READS.md). Remote graph GlobalCommittedSnapshot remains Unsupported.
