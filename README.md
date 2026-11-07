@@ -683,3 +683,9 @@ matching retained terminal-prefix evidence. This trusted plaintext, fixed-endpoi
 slice does not enable the older remote GlobalCommittedSnapshot API or claim
 multi-machine validation, automatic failover, authentication/TLS or production
 D4/D5 completion.
+
+Managed fixed-cohort reads now use [exact segmented terminal-prefix evidence](docs/TERMINAL_PREFIX_EVIDENCE.md)
+at the chosen V rather than transferring the original request/Plan archive. This
+keeps old-V evidence independent of later archive growth without changing durable
+retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
+boundary. Internal managed peers require protocol v2; evidence remains O(V).

@@ -50,7 +50,7 @@ primitive does not solve those deployment threats.
 
 cohort_reads::acquire takes handles for the complete persisted member list in its
 canonical order. Missing, extra, duplicated, or mismatched identities fail. It
-observes the bound coordinator journal after a leader barrier and chooses one V,
+observes bounded bound-coordinator metadata after a leader barrier and chooses one V,
 either explicitly requested or the minimum of that resolved prefix and all
 leader-observed member applied prefixes. This selects one common safe watermark,
 not the newest coordinator decision that might still be unapplied. V cannot cross
@@ -88,7 +88,7 @@ Rows, live payload bytes and replay operations have aggregate budgets, capped at
 1,000,000 rows, 64 MiB and 4,000,000 operations. Each next shard receives the remaining
 budget before materialization. Intermediate replay state counts. Exhaustion fails
 closed even if a not-yet-read shard might turn out to be empty. Metadata, bounded
-journal observations and map allocation overhead are additional to the payload
+terminal-prefix evidence and map allocation overhead are additional to the payload
 budget. Failure drops all partial captures.
 
 This is a process-local materialized pin, not a restartable token, renewable lease,
@@ -102,3 +102,8 @@ Source history still has no GC. Admission rejects new work at the existing journ
 intent or dedup capacity rather than removing versions needed by a read. A future
 GC/migration design must introduce durable safe floors and real pin coordination
 before reclaiming historical source state.
+
+The current acquisition uses [versioned exact terminal-prefix evidence](TERMINAL_PREFIX_EVIDENCE.md)
+without transporting request/Plan archives. It first fixes V from summary/readiness,
+then obtains and compares the complete segmented projection at V on every member.
+Full durable journals, their recovery checks and all capture limits remain unchanged.

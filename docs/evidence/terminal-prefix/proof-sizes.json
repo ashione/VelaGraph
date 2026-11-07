@@ -1,0 +1,164 @@
+{
+  "full_journal": [
+    {
+      "decode_validate_replay_ms": 95.985149,
+      "encode_ms": 34.032398,
+      "encoded_bytes": 1004638,
+      "input_bytes": 1004638,
+      "repeat": 1
+    },
+    {
+      "decode_validate_replay_ms": 99.565451,
+      "encode_ms": 38.523084,
+      "encoded_bytes": 1004638,
+      "input_bytes": 1004638,
+      "repeat": 2
+    },
+    {
+      "decode_validate_replay_ms": 98.233334,
+      "encode_ms": 35.039153000000006,
+      "encoded_bytes": 1004638,
+      "input_bytes": 1004638,
+      "repeat": 3
+    }
+  ],
+  "scope": "offline exact deterministic projection, serde validation and structural equality; not authentication",
+  "source_journal": "/workspace/scratch/1462420af989/managed-corehr-scale/measurement-evidence/recovered-stopped-journal.json",
+  "terminal_prefix": [
+    {
+      "decode_validation_ms": 0.037286,
+      "encode_ms": 0.018558,
+      "encoded_bytes": 341,
+      "exact_equality_ms": 0.00019,
+      "projection_ms": 0.007351,
+      "repeat": 1,
+      "version": 0
+    },
+    {
+      "decode_validation_ms": 0.040551,
+      "encode_ms": 0.028353,
+      "encoded_bytes": 658,
+      "exact_equality_ms": 0.00026,
+      "projection_ms": 0.008032000000000001,
+      "repeat": 1,
+      "version": 1
+    },
+    {
+      "decode_validation_ms": 1.9406379999999999,
+      "encode_ms": 1.3559780000000001,
+      "encoded_bytes": 41612,
+      "exact_equality_ms": 0.0043560000000000005,
+      "projection_ms": 0.07299,
+      "repeat": 1,
+      "version": 128
+    },
+    {
+      "decode_validation_ms": 2.4611899999999998,
+      "encode_ms": 1.800146,
+      "encoded_bytes": 48073,
+      "exact_equality_ms": 0.004867,
+      "projection_ms": 0.14452700000000002,
+      "repeat": 1,
+      "version": 148
+    },
+    {
+      "decode_validation_ms": 2.3676,
+      "encode_ms": 1.973908,
+      "encoded_bytes": 48400,
+      "exact_equality_ms": 0.005278,
+      "projection_ms": 0.09221800000000001,
+      "repeat": 1,
+      "version": 149
+    },
+    {
+      "decode_validation_ms": 0.043406,
+      "encode_ms": 0.020821,
+      "encoded_bytes": 341,
+      "exact_equality_ms": 0.00023,
+      "projection_ms": 0.009875,
+      "repeat": 2,
+      "version": 0
+    },
+    {
+      "decode_validation_ms": 0.041162000000000004,
+      "encode_ms": 0.030316,
+      "encoded_bytes": 658,
+      "exact_equality_ms": 0.00032,
+      "projection_ms": 0.008623,
+      "repeat": 2,
+      "version": 1
+    },
+    {
+      "decode_validation_ms": 1.9430610000000001,
+      "encode_ms": 1.440305,
+      "encoded_bytes": 41612,
+      "exact_equality_ms": 0.004237,
+      "projection_ms": 0.079469,
+      "repeat": 2,
+      "version": 128
+    },
+    {
+      "decode_validation_ms": 4.36369,
+      "encode_ms": 1.539914,
+      "encoded_bytes": 48073,
+      "exact_equality_ms": 0.008293,
+      "projection_ms": 0.08708,
+      "repeat": 2,
+      "version": 148
+    },
+    {
+      "decode_validation_ms": 2.277234,
+      "encode_ms": 1.545954,
+      "encoded_bytes": 48400,
+      "exact_equality_ms": 0.005137999999999999,
+      "projection_ms": 0.119129,
+      "repeat": 2,
+      "version": 149
+    },
+    {
+      "decode_validation_ms": 0.035642999999999994,
+      "encode_ms": 0.018578,
+      "encoded_bytes": 341,
+      "exact_equality_ms": 0.00017999999999999998,
+      "projection_ms": 0.00673,
+      "repeat": 3,
+      "version": 0
+    },
+    {
+      "decode_validation_ms": 0.03935,
+      "encode_ms": 0.029474,
+      "encoded_bytes": 658,
+      "exact_equality_ms": 0.00029,
+      "projection_ms": 0.008232,
+      "repeat": 3,
+      "version": 1
+    },
+    {
+      "decode_validation_ms": 2.037112,
+      "encode_ms": 1.341998,
+      "encoded_bytes": 41612,
+      "exact_equality_ms": 0.005168000000000001,
+      "projection_ms": 0.07372000000000001,
+      "repeat": 3,
+      "version": 128
+    },
+    {
+      "decode_validation_ms": 2.177393,
+      "encode_ms": 1.525383,
+      "encoded_bytes": 48073,
+      "exact_equality_ms": 0.005679,
+      "projection_ms": 0.083335,
+      "repeat": 3,
+      "version": 148
+    },
+    {
+      "decode_validation_ms": 2.259196,
+      "encode_ms": 1.719134,
+      "encoded_bytes": 48400,
+      "exact_equality_ms": 0.004577,
+      "projection_ms": 0.0862,
+      "repeat": 3,
+      "version": 149
+    }
+  ]
+}

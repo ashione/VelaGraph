@@ -1,0 +1,81 @@
+{
+  "baseline_commit": "5778f255212bb8854dd2834168003201a136f789",
+  "baseline_tree": "92d571359650c4cff2bbd553139df080a65aa9a5",
+  "candidate_commit": "947c237afb22c7aaa3c0a3bcab107d5835165fc4",
+  "candidate_tree": "34758cafa84ef65bf86af2a171149a4b93cb743d",
+  "history_transactions": 149,
+  "common_version": 148,
+  "repeats": 3,
+  "capture": [
+    {
+      "version": 1,
+      "baseline_median_ms": 1571.7806570000002,
+      "candidate_median_ms": 8.751567,
+      "baseline_range_ms": [
+        1543.327361,
+        1688.204195
+      ],
+      "candidate_range_ms": [
+        8.624692,
+        11.750255
+      ],
+      "baseline_prepare_median_ms": 0.034071,
+      "candidate_prepare_median_ms": 0.034892,
+      "proof_encoded_bytes": 658,
+      "proof_projection_median_ms": 0.008232,
+      "proof_encode_median_ms": 0.029474,
+      "proof_decode_validation_median_ms": 0.040551,
+      "rows": 1,
+      "raw_bytes": 140,
+      "replay_operations": 1
+    },
+    {
+      "version": 128,
+      "baseline_median_ms": 1557.180833,
+      "candidate_median_ms": 41.451517,
+      "baseline_range_ms": [
+        1516.017585,
+        1587.768074
+      ],
+      "candidate_range_ms": [
+        40.899923,
+        41.783196000000004
+      ],
+      "baseline_prepare_median_ms": 0.035914,
+      "candidate_prepare_median_ms": 0.034091,
+      "proof_encoded_bytes": 41612,
+      "proof_projection_median_ms": 0.07372000000000001,
+      "proof_encode_median_ms": 1.3559780000000001,
+      "proof_decode_validation_median_ms": 1.9430610000000001,
+      "rows": 128,
+      "raw_bytes": 17921,
+      "replay_operations": 128
+    },
+    {
+      "version": 148,
+      "baseline_median_ms": 1528.5907160000002,
+      "candidate_median_ms": 48.774416,
+      "baseline_range_ms": [
+        1521.291088,
+        1579.2776210000002
+      ],
+      "candidate_range_ms": [
+        48.148125,
+        50.154135000000004
+      ],
+      "baseline_prepare_median_ms": 0.035363,
+      "candidate_prepare_median_ms": 0.035163,
+      "proof_encoded_bytes": 48073,
+      "proof_projection_median_ms": 0.08708,
+      "proof_encode_median_ms": 1.539914,
+      "proof_decode_validation_median_ms": 2.4611899999999998,
+      "rows": 148,
+      "raw_bytes": 20741,
+      "replay_operations": 148
+    }
+  ],
+  "full_journal_bytes": 1004638,
+  "scope": "same-host sequential warm debug comparison with 4 child processes and disposable regular-file tmpfs DB copies; not full scale or a production latency distribution",
+  "full_journal_decode_replay_median_ms": 98.233334,
+  "full_journal_encode_median_ms": 35.039153000000006
+}
