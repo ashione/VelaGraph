@@ -188,3 +188,16 @@ cryptographic protocol or authentication claim is introduced.
 [REMOTE_QUERY.md](REMOTE_QUERY.md) documents the explicit single-partition Query
 operation and CLI commands. Existing snapshot download APIs remain unchanged.
 This does not add cross-shard global consistency, retry, TLS or authentication.
+
+## JSON scheduling and cancellation
+
+On multithread Tokio runtimes, bounded frame encoding and decoding keep the
+caller's stack and admission permit while `block_in_place` lets Tokio replace the
+occupied worker. Current-thread runtimes keep the previous inline behavior.
+Encoding uses a fixed 8 KiB scratch buffer, flushes through the same bounded
+writer, and checks the original absolute deadline before sending any frame
+bytes. The extra scratch does not increase the accepted frame limit. Decoding
+retains its checks before and after parsing. Synchronous JSON work is not
+preemptible, but cancellation cannot detach it or release its admission early.
+This does not change election timeouts, request budgets, wire JSON, retries or
+identity checks, and does not guarantee availability under arbitrary CPU load.

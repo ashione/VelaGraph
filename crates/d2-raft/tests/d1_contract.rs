@@ -444,7 +444,7 @@ async fn corrupt_durable_metadata_fails_reopen() -> anyhow::Result<()> {
         } else {
             let mut value: serde_json::Value = serde_json::from_slice(&db.get(b"sm/d1")?.unwrap())?;
             if corruption == "version" {
-                value["version"] = 2.into();
+                value["version"] = 3.into();
             } else {
                 value["dedup"] = serde_json::json!([]);
             }

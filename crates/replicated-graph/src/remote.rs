@@ -710,18 +710,41 @@ impl io::Write for BoundedWriter {
         Ok(())
     }
 }
+// Preserve the caller's stack, deadline and permits while allowing the
+// multithread runtime to replace its worker during bounded JSON CPU work.
+fn blocking_json<T>(work: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        )
+    }) {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
 async fn write_frame<T: Serialize>(
     stream: &mut TcpStream,
     value: &T,
     end: Instant,
 ) -> Result<(), RemoteError> {
-    let mut buffer = BoundedWriter(Vec::new(), end);
-    serde_json::to_writer(&mut buffer, value).map_err(|_| {
-        if Instant::now() >= end {
-            RemoteError::Timeout { request_id: None }
-        } else {
-            RemoteError::ResourceExhausted
+    let buffer = blocking_json(|| {
+        let mut buffer = BoundedWriter(Vec::new(), end);
+        {
+            let mut buffered = io::BufWriter::with_capacity(8192, &mut buffer);
+            serde_json::to_writer(&mut buffered, value)
+                .and_then(|()| io::Write::flush(&mut buffered).map_err(serde_json::Error::io))
+                .map_err(|_| {
+                    if Instant::now() >= end {
+                        RemoteError::Timeout { request_id: None }
+                    } else {
+                        RemoteError::ResourceExhausted
+                    }
+                })?;
         }
+        Ok::<_, RemoteError>(buffer)
     })?;
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
@@ -761,7 +784,8 @@ async fn read_frame_limited<T: DeserializeOwned>(
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
-    let result = serde_json::from_slice(&bytes).map_err(|_| RemoteError::Protocol);
+    let result =
+        blocking_json(|| serde_json::from_slice(&bytes)).map_err(|_| RemoteError::Protocol);
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
@@ -1017,5 +1041,213 @@ mod tests {
         }
         service.shutdown().await;
         node.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod scheduling_regression {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn graph_frame_encoding_keeps_async_worker_available() {
+        struct GatedValue {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Serialize for GatedValue {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(serde::ser::Error::custom)?;
+                serializer.serialize_u64(42)
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let writer = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &GatedValue {
+                    entered: std::sync::Mutex::new(Some(entered)),
+                    release: std::sync::Mutex::new(receiver),
+                },
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        });
+        let releaser = tokio::spawn(async move {
+            ready.await.unwrap();
+            release.send(()).unwrap();
+        });
+        writer.await.unwrap().unwrap();
+        releaser.await.unwrap();
+        assert_eq!(
+            read_frame::<u64>(&mut client, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            42
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_boundary_tests {
+    use super::*;
+    async fn sockets() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+    #[test]
+    fn no_runtime_fallback() {
+        assert_eq!(blocking_json(|| 7), 7);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_compatibility_roundtrip() {
+        let (mut client, mut server) = sockets().await;
+        write_frame(&mut server, &42u64, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame::<u64>(&mut client, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap(),
+            42
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn exact_buffered_frame_cap_and_oversize_no_network_prefix() {
+        let (mut client, mut server) = sockets().await;
+        let payload = "x".repeat(MAX_FRAME_BYTES - 2);
+        let write = tokio::spawn(async move {
+            write_frame(
+                &mut server,
+                &payload,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+        });
+        let received = read_frame::<String>(&mut client, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(received.len(), MAX_FRAME_BYTES - 2);
+        write.await.unwrap().unwrap();
+        let (mut client, mut server) = sockets().await;
+        let result = write_frame(
+            &mut server,
+            &"x".repeat(MAX_FRAME_BYTES - 1),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
+        drop(server);
+        let mut byte = [0u8];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
+    struct LateEncode;
+    impl Serialize for LateEncode {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            std::thread::sleep(Duration::from_millis(30));
+            s.serialize_u64(42)
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_small_buffer_encode_sends_no_prefix() {
+        let (mut client, mut server) = sockets().await;
+        assert!(matches!(
+            write_frame(
+                &mut server,
+                &LateEncode,
+                Instant::now() + Duration::from_millis(5)
+            )
+            .await,
+            Err(RemoteError::Timeout { .. })
+        ));
+        drop(server);
+        let mut byte = [0u8];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
+    struct LateDecode;
+    impl<'de> serde::Deserialize<'de> for LateDecode {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let _ = <u64 as serde::Deserialize>::deserialize(d)?;
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(Self)
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_decode_deadline_rejects_late_success() {
+        let (mut client, mut server) = sockets().await;
+        write_frame(&mut server, &42u64, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_frame::<LateDecode>(&mut client, Instant::now() + Duration::from_millis(5)).await,
+            Err(RemoteError::Timeout { .. })
+        ));
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn aborted_encoding_keeps_original_admission_until_work_finishes() {
+        struct Gate {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Serialize for Gate {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .map_err(serde::ser::Error::custom)?;
+                s.serialize_u64(42)
+            }
+        }
+        let (_client, mut server) = sockets().await;
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            write_frame(
+                &mut server,
+                &Gate {
+                    entered: std::sync::Mutex::new(Some(entered)),
+                    release: std::sync::Mutex::new(rx),
+                },
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert_eq!(permits.available_permits(), 0);
+        assert!(permits.try_acquire().is_err());
+        release.send(()).unwrap();
+        let _ = task.await;
+        assert_eq!(permits.available_permits(), 1);
     }
 }

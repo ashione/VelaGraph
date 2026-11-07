@@ -80,7 +80,7 @@ pub enum D1Error {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DedupRecord {
     request: D1WriteRequest,
-    sequence: u64,
+    pub(crate) sequence: u64,
 }
 
 /// The format discriminator is mandatory, including in RocksDB metadata.
@@ -91,7 +91,7 @@ pub(crate) struct D1State {
     pub shard: u64,
     pub epoch: u64,
     pub sequence: u64,
-    dedup: Vec<DedupRecord>,
+    pub(crate) dedup: Vec<DedupRecord>,
 }
 
 impl D1State {
@@ -164,13 +164,35 @@ impl D1State {
         Ok(())
     }
 
+    /// Stage only metadata and new retry records; retained request bytes stay in
+    /// the published state until the synchronous batch succeeds.
+    pub(crate) fn stage(&self) -> Self {
+        Self {
+            version: self.version,
+            shard: self.shard,
+            epoch: self.epoch,
+            sequence: self.sequence,
+            dedup: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn write(&mut self, request: &D1WriteRequest) -> Result<D1Result, D1Error> {
+        self.write_with_history(request, None)
+    }
+
+    pub(crate) fn write_with_history(
+        &mut self,
+        request: &D1WriteRequest,
+        history: Option<&Self>,
+    ) -> Result<D1Result, D1Error> {
         self.check_shard(request.shard)?;
         self.check_epoch(request.epoch)?;
         let size = request.validate()?;
         if let Some(record) = self
             .dedup
             .iter()
+            .chain(history.into_iter().flat_map(|state| &state.dedup))
             .find(|r| r.request.request_id == request.request_id)
         {
             // Epoch fences before dedup, but a request id never gains a new identity
@@ -198,10 +220,15 @@ impl D1State {
             .sequence
             .checked_add(1)
             .ok_or(D1Error::SequenceOverflow)?;
-        let retained = self.dedup.iter().fold(0usize, |total, r| {
-            total.saturating_add(r.request.retained_size())
-        });
-        if self.dedup.len() >= MAX_DEDUP_REQUESTS || retained.saturating_add(size) > MAX_DEDUP_BYTES
+        let retained = self
+            .dedup
+            .iter()
+            .chain(history.into_iter().flat_map(|state| &state.dedup))
+            .fold(0usize, |total, r| {
+                total.saturating_add(r.request.retained_size())
+            });
+        if self.dedup.len() + history.map_or(0, |state| state.dedup.len()) >= MAX_DEDUP_REQUESTS
+            || retained.saturating_add(size) > MAX_DEDUP_BYTES
         {
             return Err(D1Error::DedupCapacity);
         }

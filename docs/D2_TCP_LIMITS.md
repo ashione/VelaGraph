@@ -113,3 +113,37 @@ normal committed write/read after a slow request expires. Existing D2
 multi-process, membership, failover, restart, snapshot and D1 rejection tests
 remain mandatory. These tests must fail, not skip, when a CI environment cannot
 provide the sockets they require.
+
+## Bounded durable-log catch-up reads
+
+The durable log reader's `limited_get_log_entries(start, end)` returns an
+ordered prefix of the exclusive range `[start, end)`, limited to 256 complete
+entries and 1 MiB of stored JSON bytes. Small entries remain batched rather
+than forcing one RPC per entry. A first available entry larger than 1 MiB is
+returned alone and intact so the soft byte allowance cannot prevent progress.
+An empty or reversed range returns no entries; index arithmetic does not add
+to `end` or overflow at `u64::MAX`. Normal unrestricted log reads are unchanged.
+
+The log mutex protects selection and copying of the prefix. JSON decoding then
+runs outside that mutex over owned bytes, so vote/append operations need not
+wait for the complete batch's decode. The raw RocksDB iterator inspects the
+next value's length before copying it and stops before copying a value that
+would exceed the allowance. This does not bound RocksDB's internal read/cache
+allocations or make native I/O preemptible. There can still be a large single
+entry, and decoding/encoding/sending/applying that entry may exceed an RPC
+budget. Transport framing, admission, timeouts and election settings are not
+changed, nor is the storage format.
+
+This bounds aggregate catch-up work, addressing a diagnosed large-backlog
+feedback loop. It is not a guarantee of failover/recovery latency or a complete
+solution to large-graph availability. Tests cover exact byte/count boundaries,
+oversized-entry progress, index extremes, corrupt selected data, immutable
+copied prefixes, reopen and small-entry batching. Large-entry and sustained
+replication results must be reported separately from these deterministic
+storage tests.
+
+The durable-cluster regression also stops one follower, commits 600 small
+entries plus twelve 100 KiB payload entries on the quorum, restarts the follower,
+checks all 612 values after catch-up without a snapshot, then reopens it again
+and checks persistent progress. This is real Raft with an in-process transport;
+it is not a TCP latency benchmark or arbitrary-backlog guarantee.
