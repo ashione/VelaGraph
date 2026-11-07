@@ -302,3 +302,8 @@ The next narrowly scoped API, `HIERARCHY_COUNT_JOBS.md`, provides incremental
 server-native counts with fixed leased views and weighted frontiers. Its separate
 work/memory/lease bounds are explicit; it does not widen synchronous queries or
 claim unlimited closures, arbitrary repeat bodies, or ordered row pagination.
+
+Emit plus terminal dedup now reuses a qualified identity entry for both depth
+weights and the emitted flag. This reduces duplicate state within the unchanged
+250,000-entry ceiling; cycles still propagate weighted bags and all resource
+limits remain enforced. Ordered result pagination remains a separate slice.

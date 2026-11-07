@@ -80,6 +80,22 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
             "g.V(12).repeat(__.in('hierarchy')).emit().times(32).dedup().count()",
             2,
         ),
+        (
+            "g.V(12,12).repeat(__.out('hierarchy')).emit().times(32).dedup().count()",
+            2,
+        ),
+        (
+            "g.V(12).repeat(__.out('hierarchy')).emit().times(1).dedup().count()",
+            1,
+        ),
+        (
+            "g.V(12).repeat(__.out('hierarchy')).emit().times(2).dedup().count()",
+            2,
+        ),
+        (
+            "g.V(999).repeat(__.out()).emit().times(32).dedup().count()",
+            0,
+        ),
         ("g.V(999).repeat(__.out()).times(32).count()", 0),
         (
             "g.V(1).repeat(__.out('missing')).emit().times(2).count()",
@@ -108,6 +124,8 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
     for text in [
         "g.V(10).repeat(__.in('filtered-out')).times(2).count()",
         "g.V(8).repeat(__.out('knows')).times(2).count()",
+        "g.V(10).repeat(__.in('filtered-out')).emit().times(2).dedup().count()",
+        "g.V(8).repeat(__.out('knows')).emit().times(2).dedup().count()",
     ] {
         let error = run(endpoint, text).await.unwrap_err();
         ensure!(
@@ -223,6 +241,20 @@ pub(super) async fn fixed_snapshot(endpoint: SocketAddr, group: &Group) -> anyho
             Some(QueryFailure::ResourceExhausted)
         ),
         "weighted path mass was not bounded: {error}"
+    );
+    // Even a one-identity dedup result cannot erase the path-mass ceiling.
+    let error = run(
+        endpoint,
+        "g.V(11).repeat(__.out('hierarchy')).emit().times(32).dedup().count()",
+    )
+    .await
+    .unwrap_err();
+    ensure!(
+        matches!(
+            error.downcast_ref::<QueryFailure>(),
+            Some(QueryFailure::ResourceExhausted)
+        ),
+        "compact dedup bypassed path mass: {error}"
     );
     Ok(())
 }
