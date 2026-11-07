@@ -302,7 +302,7 @@ fn global_relationship_oracles_are_nonvacuous() {
         }
         assert_eq!(
             q.iter().filter(|r| r["server_supported"] == true).count(),
-            18
+            20
         );
     }
 }
