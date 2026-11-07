@@ -75,6 +75,48 @@ impl Model {
             })
             .collect()
     }
+    // Relationship-list oracle only: no engine/parser/remote calls. Each path
+    // carries every qualified edge and vertex; emission appends whole layers.
+    fn native_paths(
+        &self,
+        ids: &[u64],
+        label: &str,
+        out: bool,
+        depth: usize,
+        emit: bool,
+    ) -> Vec<(u64, Vec<Value>)> {
+        let mut frontier: Vec<_> = ids
+            .iter()
+            .map(|id| (*id, vec![json!(["v", partition(*id), id])]))
+            .collect();
+        let mut emitted = Vec::new();
+        for _ in 0..depth {
+            let mut next = Vec::new();
+            for (id, path) in frontier {
+                for (idx, e) in self.edges.iter().enumerate().filter(|(_, e)| {
+                    e.label == label && if out { e.from == id } else { e.to == id }
+                }) {
+                    let dest = if out { e.to } else { e.from };
+                    let mut p = path.clone();
+                    p.push(json!(["e", partition(e.from), idx + 1]));
+                    p.push(json!(["v", partition(dest), dest]));
+                    next.push((dest, p));
+                }
+            }
+            if emit {
+                emitted.extend(next.iter().cloned());
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        if emit {
+            emitted
+        } else {
+            frontier
+        }
+    }
     pub fn queries(&self) -> Vec<Value> {
         let mut q = Vec::new();
         let mut add = |name: &str, start: u64, steps: &str, ids: Vec<u64>, server: bool| {
@@ -399,6 +441,163 @@ impl Model {
                 .take(1000)
                 .collect(),
         );
+        let mut native = |name: &str,
+                          start: u64,
+                          query: String,
+                          paths: Vec<(u64, Vec<Value>)>,
+                          shape: &str| {
+            let expected = match shape {
+                "count" => json!({"count":paths.len()}),
+                "path" => json!({"paths":paths.iter().map(|(_,p)|p).collect::<Vec<_>>()}),
+                _ => verts(&paths.iter().map(|(id, _)| *id).collect::<Vec<_>>()),
+            };
+            q.push(json!({"name":name,"partition":partition(start),"query":query,"expected":expected,"server_supported":true,"client_expect_unsupported":true}));
+        };
+        for (kind, start, label) in [
+            ("person", self.people, "reports_to"),
+            (
+                "department",
+                self.people + self.departments,
+                "parent_department",
+            ),
+        ] {
+            let ancestors = self.native_paths(&[start], label, true, 32, true);
+            let depth = ancestors.len();
+            assert!((1..=32).contains(&depth));
+            native(
+                &format!("native_{kind}_ancestors_emit32"),
+                start,
+                format!("g.V({start}).repeat(__.out('{label}')).emit().times(32).limit(1000)"),
+                ancestors.clone(),
+                "vertices",
+            );
+            native(
+                &format!("native_{kind}_ancestors_first_paths"),
+                start,
+                format!(
+                    "g.V({start}).repeat(__.out('{label}')).times(32).emit().limit(1000).path()"
+                ),
+                ancestors,
+                "path",
+            );
+            native(
+                &format!("native_{kind}_exact_root"),
+                start,
+                format!("g.V({start}).repeat(__.out('{label}')).times({depth})"),
+                self.native_paths(&[start], label, true, depth, false),
+                "vertices",
+            );
+            native(
+                &format!("native_{kind}_past_root"),
+                start,
+                format!(
+                    "g.V({start}).repeat(__.out('{label}')).times({})",
+                    depth + 1
+                ),
+                Vec::new(),
+                "vertices",
+            );
+            native(
+                &format!("native_{kind}_exact32_empty"),
+                start,
+                format!("g.V({start}).repeat(__.out('{label}')).times(32).count()"),
+                Vec::new(),
+                "count",
+            );
+        }
+        let descendants = self.native_paths(&[1], "reports_to", false, 2, false);
+        native(
+            "native_person_descendants_two",
+            1,
+            "g.V(1).repeat(__.in('reports_to')).times(2).limit(1000)".into(),
+            descendants,
+            "vertices",
+        );
+        let descendants = self.native_paths(&[1], "reports_to", false, 2, true);
+        native(
+            "native_person_descendants_emit_two",
+            1,
+            "g.V(1).repeat(__.in('reports_to')).emit().times(2).limit(1000)".into(),
+            descendants.clone(),
+            "vertices",
+        );
+        native(
+            "native_person_active_descendants_count",
+            1,
+            "g.V(1).repeat(__.in('reports_to')).emit().times(2).has('active',true).count()".into(),
+            descendants
+                .into_iter()
+                .filter(|(id, _)| active(*id))
+                .collect(),
+            "count",
+        );
+        native(
+            "native_person_descendants_emit_three_count",
+            1,
+            "g.V(1).repeat(__.in('reports_to')).times(3).emit().count()".into(),
+            self.native_paths(&[1], "reports_to", false, 3, true),
+            "count",
+        );
+        let d = self.people + 2;
+        native(
+            "native_department_descendants_two",
+            d,
+            format!("g.V({d}).repeat(__.in('parent_department')).times(2).limit(1000)"),
+            self.native_paths(&[d], "parent_department", false, 2, false),
+            "vertices",
+        );
+        native(
+            "native_department_descendants_emit_two_count",
+            d,
+            format!("g.V({d}).repeat(__.in('parent_department')).emit().times(2).count()"),
+            self.native_paths(&[d], "parent_department", false, 2, true),
+            "count",
+        );
+        let p = self.people;
+        let duplicates = self.native_paths(&[p, p], "reports_to", true, 32, true);
+        native(
+            "native_duplicate_ancestor_bag_count",
+            p,
+            format!("g.V({p},{p}).repeat(__.out('reports_to')).emit().times(32).count()"),
+            duplicates.clone(),
+            "count",
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        native("native_duplicate_ancestor_dedup_paths",p,format!("g.V({p},{p}).repeat(__.out('reports_to')).emit().times(32).dedup().limit(1000).path()"),duplicates.into_iter().filter(|(id,_)|seen.insert((partition(*id),*id))).collect(),"path");
+        for (name, query, error, client_direct) in [
+            (
+                "native_broad_descendants_budget",
+                "g.V(1).repeat(__.in('reports_to')).emit().times(32).count()",
+                "ResourceExhausted",
+                true,
+            ),
+            (
+                "native_broad_limit_cannot_rescue",
+                "g.V(1).repeat(__.in('reports_to')).emit().times(32).limit(1)",
+                "ResourceExhausted",
+                true,
+            ),
+            (
+                "native_zero_depth",
+                "g.V(1).repeat(__.out('reports_to')).times(0)",
+                "Unsupported",
+                false,
+            ),
+            (
+                "native_depth33",
+                "g.V(1).repeat(__.out('reports_to')).times(33)",
+                "ResourceExhausted",
+                false,
+            ),
+            (
+                "native_combined_depth33",
+                "g.V(1).out('reports_to').repeat(__.out('reports_to')).times(32)",
+                "ResourceExhausted",
+                true,
+            ),
+        ] {
+            q.push(json!({"name":name,"partition":partition(1),"query":query,"expect_error":true,"client_expect_unsupported":client_direct,"server_supported":false,"server_expected_error":error}));
+        }
         for case in &mut q {
             if case["name"] == "global_zero_limit_count" {
                 // Official parser accepts only limits 1..=1000. Internal
@@ -454,7 +653,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 55);
+    assert_eq!(q.len(), 78);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     assert!(
         get("unique_colleague_count")["expected"]["count"]
@@ -511,4 +710,49 @@ fn global_oracles_use_distinct_orders_and_real_properties() {
                 .unwrap(),
         m.people
     );
+}
+
+#[test]
+fn native_hierarchy_oracle_preserves_levels_and_paths() {
+    let m = Model::new(2000, 50);
+    let q = m.queries();
+    let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
+    assert_eq!(
+        get("native_person_ancestors_emit32")["partition"],
+        json!(partition(m.people))
+    );
+    assert_eq!(
+        get("native_person_descendants_two")["partition"],
+        json!(partition(1))
+    );
+    assert_eq!(
+        get("native_department_descendants_two")["partition"],
+        json!(partition(m.people + 2))
+    );
+    assert_eq!(
+        get("native_person_descendants_emit_three_count")["expected"]["count"],
+        json!(584)
+    );
+    assert_eq!(
+        get("native_person_descendants_two")["expected"]["vertices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    let a = get("native_person_ancestors_emit32")["expected"]["vertices"]
+        .as_array()
+        .unwrap();
+    assert!(a.len() > 3);
+    assert_eq!(
+        get("native_duplicate_ancestor_bag_count")["expected"]["count"],
+        json!(2 * a.len())
+    );
+    let paths = get("native_duplicate_ancestor_dedup_paths")["expected"]["paths"]
+        .as_array()
+        .unwrap();
+    assert_eq!(paths.len(), a.len());
+    for (i, p) in paths.iter().enumerate() {
+        assert_eq!(p.as_array().unwrap().len(), 1 + 2 * (i + 1));
+    }
 }

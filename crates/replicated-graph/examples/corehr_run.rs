@@ -410,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                     Err(e) => {
                         ensure!(expect_error, "unexpected client error {query}: {e:?}");
-                        if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "dedup client must explicitly reject Unsupported: {e:?}"); }
+                        if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "server-only client case must explicitly reject Unsupported: {e:?}"); }
                         ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
                             ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
                             | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
@@ -488,6 +488,8 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         let expected_error = if c["server_expected_error"] == "InvalidArgument" {
                             QueryFailure::InvalidArgument
+                        } else if c["server_expected_error"] == "ResourceExhausted" {
+                            QueryFailure::ResourceExhausted
                         } else {
                             QueryFailure::Unsupported
                         };

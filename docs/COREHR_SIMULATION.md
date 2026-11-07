@@ -71,7 +71,8 @@ mean Gremlin supports continuation tokens or offset pagination.
 
 This integrated harness additionally includes the incoming-query implementation
 from the separately reviewed incoming-query candidate; its exact production-file hashes are recorded with the
-experiment. See `COREHR_GLOBAL_RESULTS.md` for bounded global-scan validation,
+experiment. See `COREHR_HIERARCHY_RESULTS.md` for native bounded-repeat validation,
+`COREHR_GLOBAL_RESULTS.md` for bounded global-scan validation,
 `COREHR_DEDUP_RESULTS.md` for the later server-only unique-membership
 validation, `COREHR_INCOMING_RESULTS.md` for incoming-query measurements, and
 `COREHR_RESULTS.md` for the earlier outgoing-only baseline.
@@ -85,10 +86,13 @@ with server order (partition ID, local ID), distinct from the legacy client
 order (local ID, partition ID). Global adjacency and other global operators
 remain explicitly unsupported; see `SERVER_GLOBAL_SCAN.md`. The full run checks
 managers, direct reports, department descendants/members and mixed-direction
-joins against the same oracle. Recursive repeat, offset pagination, ordering
-and predicates must reject explicitly. The extended matrix contains 55 cases:
-50 server-supported cases, four Unsupported rejections and one InvalidArgument
-rejection for limit(0). Separate client/server oracle sequences cover global
+joins against the same oracle. Native single-adjacency repeat with times(1..32)
+and optional post-emit is checked against an independent breadth-first path
+oracle; it is separate from the application loops below. Unbounded repeat,
+offset pagination, ordering and predicate arguments still reject. The extended
+matrix contains 78 cases: 68 supported cases, five Unsupported, one
+InvalidArgument and four ResourceExhausted rejections. The broad descendant
+closure and its later-limit variant must fail the unchanged traversal budget. Separate client/server oracle sequences cover global
 counts, property/label filters, internal page and partition boundaries, and
 filter/limit placement. Nine cases
 exercise deduplication, unique counts, first retained paths, repeated starts,
@@ -112,8 +116,8 @@ compare its timings directly with the recorded release-node baseline.
 Report candidate revision, hardware and resource constraints alongside results.
 
 The fixture/harness itself changes no production code, grammar, format or
-resource cap. The separately reviewed incoming-query, server-only dedup
-and bounded global-scan implementations are included in the corresponding
-engine revisions. Do not infer universal query support from a passing
+resource cap. The separately reviewed incoming-query, server-only dedup,
+bounded global-scan and native hierarchy implementations are included in the
+corresponding engine revisions. Do not infer universal query support from a passing
 simulation. A failure is actionable evidence, not a reason to raise limits or
 silently substitute a different query.
