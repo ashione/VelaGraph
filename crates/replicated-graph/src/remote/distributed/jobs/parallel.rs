@@ -33,6 +33,10 @@ fn reservation(batch: &Batch, row_bytes: usize, descriptor: &Descriptor) -> Opti
     for f in fragments {
         let (bytes, work) = match f {
             Fragment::Exists(_) => (get, 1),
+            Fragment::Project { keys, .. } => (
+                get.checked_add(keys.len().checked_mul(128)?)?,
+                1usize.checked_add(keys.len())?,
+            ),
             Fragment::VerifyReverse(_) => (get.checked_mul(2)?, 2),
             Fragment::ResolveIncoming { .. } => (get.checked_mul(3)?, 3),
             Fragment::In(_) | Fragment::Out(_) => {
@@ -88,6 +92,18 @@ fn validate_leaves(expected: &[Fragment], values: &[FragmentValue]) -> Result<()
     for (fragment, value) in expected.iter().zip(values) {
         let valid = match (fragment, value) {
             (Fragment::Exists(_), FragmentValue::Bool(_)) => true,
+            (
+                Fragment::Project { vertex, keys },
+                FragmentValue::Projected {
+                    vertex: actual,
+                    properties,
+                },
+            ) => {
+                vertex == actual
+                    && projection::validate_keys(keys).is_ok()
+                    && properties.keys().all(|key| keys.contains(key))
+                    && projection::properties_bytes(properties).is_ok()
+            }
             (Fragment::VerifyReverse(_), FragmentValue::Bool(true)) => true,
             (Fragment::In(_), FragmentValue::Incoming(edges)) => {
                 entries += edges.len();
@@ -138,8 +154,8 @@ pub(super) async fn run(
     while !pending.is_empty() {
         check(end)?;
         let remaining = Cost {
-            bytes: JOB_CEILING.bytes.saturating_sub(job.cost.bytes),
-            work: JOB_CEILING.work.saturating_sub(job.cost.work),
+            bytes: job.ceiling().bytes.saturating_sub(job.cost.bytes),
+            work: job.ceiling().work.saturating_sub(job.cost.work),
         };
         let mut selected = Vec::new();
         let mut shards = BTreeSet::new();
@@ -317,6 +333,7 @@ mod tests {
             rows: None,
             expires: Instant::now() + Duration::from_secs(5),
             cost: Cost::default(),
+            completed_traversal_cost: None,
             plan: parse("g.V(1).repeat(__.out()).times(1).count()").unwrap(),
             compact: None,
             frontier: BTreeMap::new(),
@@ -570,6 +587,50 @@ mod tests {
         assert!(matches!(outputs[1], Some(FragmentValue::Bool(true))));
         assert!(matches!(outputs[2], Some(FragmentValue::Bool(false))));
     }
+    #[test]
+    fn projected_leaf_rejects_forged_identity_keys_and_values() {
+        let vertex = VertexId {
+            partition: 1,
+            id: 2,
+        };
+        let expected = [Fragment::Project {
+            vertex,
+            keys: vec!["name".into(), "null".into()],
+        }];
+        let check = |actual, properties| {
+            validate_leaves(
+                &expected,
+                &[FragmentValue::Projected {
+                    vertex: actual,
+                    properties,
+                }],
+            )
+        };
+        assert!(check(vertex, BTreeMap::new()).is_ok());
+        assert!(check(vertex, BTreeMap::from([("null".into(), Value::Null)])).is_ok());
+        assert!(check(
+            VertexId {
+                partition: 2,
+                id: 2
+            },
+            BTreeMap::new()
+        )
+        .is_err());
+        assert!(check(vertex, BTreeMap::from([("other".into(), Value::Null)])).is_err());
+        assert!(check(
+            vertex,
+            BTreeMap::from([("name".into(), Value::Text("x".repeat(2048)))])
+        )
+        .is_err());
+        assert!(check(
+            vertex,
+            BTreeMap::from([("name".into(), Value::Real(f64::NAN))])
+        )
+        .is_err());
+        assert!(validate_leaves(&expected, &[FragmentValue::Value(None)]).is_err());
+        assert!(validate_leaves(&expected, &[]).is_err());
+    }
+
     #[test]
     fn reservation_overflow_is_a_serial_fallback_not_a_small_grant() {
         let descriptor = Descriptor {

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(in crate::remote) mod channel;
 mod hierarchy;
 pub mod jobs;
+mod projection;
 mod scan;
 mod sessions;
 pub(super) use sessions::Sessions;
@@ -157,6 +158,10 @@ enum Fragment {
         vertex: VertexId,
         key: String,
     },
+    Project {
+        vertex: VertexId,
+        keys: Vec<String>,
+    },
 }
 impl Fragment {
     fn validate(&self) -> Result<(), RemoteError> {
@@ -176,6 +181,7 @@ impl Fragment {
                             | Self::In(_)
                             | Self::ResolveIncoming { .. }
                             | Self::VerifyReverse(_)
+                            | Self::Project { .. }
                     ) || fragment.partition() != *partition
                     {
                         return Err(RemoteError::InvalidArgument);
@@ -214,6 +220,10 @@ impl Fragment {
                 labels.iter().map(String::len).sum()
             }
             Self::Values { key, .. } => key.len(),
+            Self::Project { keys, .. } => {
+                projection::validate_keys(keys).map_err(|_| RemoteError::InvalidArgument)?;
+                keys.iter().map(String::len).sum()
+            }
         };
         if bytes > query::MAX_QUERY_TEXT_BYTES {
             return Err(RemoteError::ResourceExhausted);
@@ -229,7 +239,8 @@ impl Fragment {
             Self::VerifyReverse(e) => e.to.partition,
             Self::Has { vertex, .. }
             | Self::HasLabel { vertex, .. }
-            | Self::Values { vertex, .. } => vertex.partition,
+            | Self::Values { vertex, .. }
+            | Self::Project { vertex, .. } => vertex.partition,
         }
     }
 }
@@ -282,6 +293,10 @@ enum FragmentValue {
     Incoming(Vec<IncomingEdge>),
     Edge(EdgeHop),
     Value(Option<Value>),
+    Projected {
+        vertex: VertexId,
+        properties: BTreeMap<String, Value>,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -336,6 +351,7 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
             return Err(QueryFailure::Unsupported);
         }
         match step {
+            Step::ValueMap(_) => return Err(QueryFailure::Unsupported),
             // The official parser bounds the complete traversal to three edge
             // steps. All hops share this execution's sessions, deadline and cost.
             Step::Existing(GremlinStep::Out(_))
@@ -684,6 +700,7 @@ impl Execution<'_> {
                     }
                     rows = next;
                 }
+                Step::ValueMap(_) => return Err(QueryFailure::Unsupported),
                 Step::Existing(GremlinStep::Path) | Step::Existing(GremlinStep::Count) => {}
                 _ => return Err(QueryFailure::Unsupported),
             }

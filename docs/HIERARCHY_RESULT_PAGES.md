@@ -10,7 +10,9 @@ internal work pages or silently enlarge synchronous Gremlin query limits.
 only explicit `g.V(ids).repeat(single in/out).times(1..32)[.emit()][.dedup()]`.
 The existing two post-emit modulator orders and optional edge label are admitted
 through the official Gremlin AST. Bare traversal returns qualified vertex
-identities, not properties or complete vertex records. Count, path, limit,
+identities, not properties or complete vertex records. The optional terminal
+[valueMap extension](HIERARCHY_PROPERTY_PAGES.md) has a separate explicit
+projection-stage budget and returns ProjectedPage. Count, path, limit,
 filters, extra hops, global starts and arbitrary sorting are unsupported here.
 
 Start returns `Preparing { token, next_sequence: 0, ready: false, ... }`.

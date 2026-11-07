@@ -7,10 +7,10 @@ use replicated_graph::{
     remote::{
         self,
         distributed::{
-            jobs::{self, Output, Request},
+            jobs::{self, Output, ProjectedRow, Request},
             CoordinatorService, PartitionRoute, StaticCatalog,
         },
-        query::{QualifiedElement, QueryCompleteness, QueryFailure},
+        query::{QualifiedElement, QueryCompleteness, QueryFailure, QueryStamp},
         RemoteIdentity,
     },
     routing::RemoteReplica,
@@ -349,7 +349,8 @@ async fn main() -> anyhow::Result<()> {
         .as_u64()
         .context("departments missing")?;
     let input = model::Model::new(people, departments);
-    let cases = result_cases(people);
+    let mut cases = result_cases(people);
+    cases.extend(projection_cases(people));
     let result = async {
         for case in &cases {
             execute(service.local_addr(), &input, case).await?;
@@ -363,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
         json!({"event":"result_matrix_complete","correct":result.is_ok(),
         "cases":cases.len(), "people":people,"departments":departments,
         "full_fixture":people==200000 && departments==5000,
-        "oracle":"input relationship list; every qualified identity in ordered BFS"})
+        "oracle":"input relationship list and fixture property formulas; every ordered qualified identity and projected value"})
     );
     result
 }
@@ -376,6 +377,7 @@ struct Case {
     emit: bool,
     dedup: bool,
     page_size: usize,
+    projection: Option<Vec<&'static str>>,
 }
 fn result_cases(people: u64) -> Vec<Case> {
     let department = people + 1;
@@ -465,8 +467,186 @@ fn result_cases(people: u64) -> Vec<Case> {
         emit,
         dedup,
         page_size,
+        projection: None,
     })
     .collect()
+}
+
+// Deliberately keep the original eleven ID-only cases unchanged.
+fn projection_cases(people: u64) -> Vec<Case> {
+    let mut originals = result_cases(people);
+    let specs = [
+        (
+            0,
+            "projected_ceo_all",
+            128,
+            vec!["name", "active", "country"],
+        ),
+        (
+            10,
+            "projected_ceo_all_dedup",
+            128,
+            vec!["name", "active", "country"],
+        ),
+        (
+            1,
+            "projected_duplicate_manager",
+            128,
+            vec!["name", "active", "country"],
+        ),
+        (
+            7,
+            "projected_departments_missing_property",
+            128,
+            vec!["name", "active", "country", "multi_department"],
+        ),
+        (
+            5,
+            "projected_missing_key_empty_maps",
+            1,
+            vec!["not_present"],
+        ),
+        (
+            5,
+            "projected_direct_reports_page1",
+            1,
+            vec!["name", "active", "country", "multi_department"],
+        ),
+        (4, "projected_empty", 128, vec!["name", "active", "country"]),
+    ];
+    specs
+        .into_iter()
+        .map(|(i, name, page_size, keys)| {
+            let source = &mut originals[i];
+            Case {
+                name,
+                roots: source.roots.clone(),
+                label: source.label,
+                depth: source.depth,
+                emit: source.emit,
+                dedup: source.dedup,
+                page_size,
+                projection: Some(keys),
+            }
+        })
+        .collect()
+}
+
+// Expected properties come exclusively from the fixture's published formulas,
+// never from returned rows, storage reads, or engine projection code. Build only
+// a page at a time so this oracle does not retain 200k duplicated property maps.
+fn projected_oracle(
+    input: &model::Model,
+    identities: &[QualifiedElement],
+    keys: &[&str],
+) -> Vec<ProjectedRow> {
+    use rocksdb_sql_table::Value as PropertyValue;
+    identities
+        .iter()
+        .map(|source| {
+            let QualifiedElement::Vertex { partition, id } = source else {
+                panic!("fixture hierarchy oracle only contains vertices")
+            };
+            assert_eq!(*partition, model::partition(*id));
+            let mut properties = BTreeMap::new();
+            for key in keys {
+                let value = match *key {
+                    "name" => Some(PropertyValue::Text(format!(
+                        "{}-{id:06}",
+                        if *id <= input.people {
+                            "Employee"
+                        } else {
+                            "Department"
+                        }
+                    ))),
+                    "active" => Some(PropertyValue::Boolean(model::active(*id))),
+                    "country" => Some(PropertyValue::Text(
+                        ["CN", "US", "DE", "SG", "GB"]
+                            [(model::mix(*id ^ 0x434f554e545259) % 5) as usize]
+                            .into(),
+                    )),
+                    "multi_department" if *id <= input.people => {
+                        Some(PropertyValue::Boolean(id % 5 == 0))
+                    }
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    properties.insert((*key).to_string(), vec![value]);
+                }
+            }
+            ProjectedRow {
+                source: *source,
+                properties,
+            }
+        })
+        .collect()
+}
+
+type CheckedPage = (
+    [u8; 16],
+    usize,
+    Option<usize>,
+    bool,
+    Vec<QualifiedElement>,
+    QueryCompleteness,
+    Vec<QueryStamp>,
+);
+
+// Normalize only after checking the complete typed projection against an
+// independently generated expected page. The existing harness then checks all
+// cursor, identity, completeness, snapshot, replay, and cancellation invariants.
+fn checked_page(
+    output: Output,
+    input: &model::Model,
+    case: &Case,
+    expected: &[QualifiedElement],
+) -> anyhow::Result<CheckedPage> {
+    match output {
+        Output::Page {
+            token,
+            cursor,
+            next_cursor,
+            done,
+            rows,
+            completeness,
+            snapshots,
+        } if case.projection.is_none() => Ok((
+            token,
+            cursor,
+            next_cursor,
+            done,
+            rows,
+            completeness,
+            snapshots,
+        )),
+        Output::ProjectedPage {
+            token,
+            cursor,
+            next_cursor,
+            done,
+            rows,
+            completeness,
+            snapshots,
+        } if case.projection.is_some() => {
+            let wanted = projected_oracle(input, expected, case.projection.as_ref().unwrap());
+            ensure!(
+                rows == wanted,
+                "{}: full ordered property-map mismatch at cursor {}",
+                case.name,
+                cursor
+            );
+            Ok((
+                token,
+                cursor,
+                next_cursor,
+                done,
+                rows.into_iter().map(|r| r.source).collect(),
+                completeness,
+                snapshots,
+            ))
+        }
+        _ => anyhow::bail!("{}: wrong result-page shape", case.name),
+    }
 }
 
 // Index the input relationships once, in their fixture edge-ID order. This
@@ -512,7 +692,10 @@ async fn execute(
     case: &Case,
 ) -> anyhow::Result<()> {
     let expected = oracle(input, case);
-    if matches!(case.name, "ceo_all" | "ceo_all_dedup") {
+    if matches!(
+        case.name,
+        "ceo_all" | "ceo_all_dedup" | "projected_ceo_all" | "projected_ceo_all_dedup"
+    ) {
         ensure!(expected.len() == input.people as usize - 1);
         // Independent fixture sanity: this tree's BFS happens to be numeric order.
         for (row, id) in expected.iter().zip(2..=input.people) {
@@ -530,13 +713,22 @@ async fn execute(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let query = format!(
+    let mut query = format!(
         "g.V({roots}).repeat(__.in('{}')){}.times({}){}",
         case.label,
         if case.emit { ".emit()" } else { "" },
         case.depth,
         if case.dedup { ".dedup()" } else { "" }
     );
+    if let Some(keys) = &case.projection {
+        query.push_str(&format!(
+            ".valueMap({})",
+            keys.iter()
+                .map(|k| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     println!(
         "{}",
         json!({"event":"result_begin","name":case.name,"query":query,
@@ -606,6 +798,10 @@ async fn execute(
         let mut first_response = None;
         let mut last_response = None;
         let mut read_ms = Vec::new();
+        let mut property_maps = 0usize;
+        let mut property_entries = 0usize;
+        let mut missing_property_keys = 0usize;
+        let mut empty_property_maps = 0usize;
         loop {
             let tick = Instant::now();
             let output = jobs::request(
@@ -616,25 +812,25 @@ async fn execute(
             .await??;
             read_ms.push(tick.elapsed().as_secs_f64() * 1000.);
             let serialized = serde_json::to_value(&output)?;
-            let Output::Page {
-                token: t,
-                cursor: c,
-                next_cursor,
-                done,
-                rows,
-                completeness,
-                snapshots,
-            } = output
-            else {
-                anyhow::bail!("Read did not return Page")
-            };
+            if let Output::ProjectedPage { rows, .. } = &output {
+                let keys = case.projection.as_ref().context("unexpected projected page")?;
+                property_maps += rows.len();
+                for row in rows {
+                    property_entries += row.properties.len();
+                    empty_property_maps += usize::from(row.properties.is_empty());
+                    missing_property_keys += keys.iter()
+                        .filter(|key| !row.properties.contains_key(**key)).count();
+                }
+            }
+            let end = (cursor + case.page_size).min(expected.len());
+            let (t, c, next_cursor, done, rows, completeness, snapshots) =
+                checked_page(output, input, case, &expected[cursor..end])?;
             ensure!(
                 t == token
                     && c == cursor
                     && completeness == QueryCompleteness::Unverified
                     && snapshots == stamps
             );
-            let end = (cursor + case.page_size).min(expected.len());
             ensure!(
                 rows == expected[cursor..end],
                 "{}: ordered identity mismatch at cursor {}",
@@ -698,19 +894,9 @@ async fn execute(
             if offset == 0 {
                 ensure!(serde_json::to_value(&output)? == *first_response.as_ref().unwrap());
             }
-            let Output::Page {
-                token: t,
-                cursor: c,
-                rows,
-                completeness,
-                snapshots,
-                next_cursor,
-                done,
-            } = output
-            else {
-                anyhow::bail!("replay not Page")
-            };
             let end = (offset + case.page_size).min(expected.len());
+            let (t, c, next_cursor, done, rows, completeness, snapshots) =
+                checked_page(output, input, case, &expected[offset..end])?;
             ensure!(
                 t == token
                     && c == offset
@@ -726,11 +912,17 @@ async fn execute(
         println!(
             "{}",
             json!({"event":"result_outcome","name":case.name,"correct":true,
-            "verified_ordered_identities":actual.len(),"page_size":case.page_size,"pages":pages,
+            "verified_ordered_identities":actual.len(),
+            "verified_property_maps":property_maps,
+            "verified_property_entries":property_entries,
+            "verified_missing_property_keys":missing_property_keys,
+            "verified_empty_property_maps":empty_property_maps,
+            "result_variant":if case.projection.is_some() { "ProjectedPage" } else { "Page" },
+            "projection_keys":case.projection,"page_size":case.page_size,"pages":pages,
             "preparation_advances":sequence,"preparation_seconds":preparation_seconds,
             "seconds":start.elapsed().as_secs_f64(),"read_latency":summary(read_ms),
             "fixed_snapshots":stamps,"old_and_arbitrary_page_replay":true,
-            "oracle":"input relationship BFS; not count/progress"})
+            "oracle":"input relationship BFS plus fixture property formulas; not count/progress or result-derived values"})
         );
         Ok::<(), anyhow::Error>(())
     }
@@ -822,4 +1014,92 @@ fn independent_relationship_oracle_preserves_bfs_and_root_bags() {
     );
     assert_eq!(oracle(&input, &cases[7]).len(), 4999);
     assert_eq!(oracle(&input, &cases[8]).len(), 1094);
+}
+
+#[test]
+fn independent_projection_oracle_covers_full_fixture_and_missing_values() {
+    use rocksdb_sql_table::Value as PropertyValue;
+    let input = model::Model::new(200000, 5000);
+    let cases = projection_cases(input.people);
+    assert_eq!(cases.len(), 7);
+    let identities = oracle(&input, &cases[0]);
+    assert_eq!(identities.len(), 199999);
+    assert_eq!(oracle(&input, &cases[1]), identities);
+    let mut countries = BTreeSet::new();
+    let mut active_values = BTreeSet::new();
+    let mut checked = 0;
+    for expected_page in identities.chunks(128) {
+        let rows = projected_oracle(&input, expected_page, cases[0].projection.as_ref().unwrap());
+        assert_eq!(rows.len(), expected_page.len());
+        for (row, source) in rows.iter().zip(expected_page) {
+            assert_eq!(&row.source, source);
+            assert_eq!(row.properties.len(), 3);
+            assert!(row.properties.values().all(|values| values.len() == 1));
+            let [PropertyValue::Text(country)] = row.properties["country"].as_slice() else {
+                panic!("country must be a singleton text list")
+            };
+            countries.insert(country.clone());
+            let [PropertyValue::Boolean(active)] = row.properties["active"].as_slice() else {
+                panic!("active must be a singleton boolean list")
+            };
+            active_values.insert(*active);
+        }
+        checked += rows.len();
+    }
+    assert_eq!(checked, 199999);
+    assert_eq!(
+        countries,
+        ["CN", "DE", "GB", "SG", "US"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(active_values, [false, true].into_iter().collect());
+    let first = projected_oracle(&input, &identities[..1], &["name"]);
+    assert_eq!(
+        first[0].properties["name"],
+        vec![PropertyValue::Text("Employee-000002".into())]
+    );
+    let last = projected_oracle(&input, &identities[199998..], &["name"]);
+    assert_eq!(
+        last[0].properties["name"],
+        vec![PropertyValue::Text("Employee-200000".into())]
+    );
+
+    let duplicate_ids = oracle(&input, &cases[2]);
+    let duplicates = projected_oracle(
+        &input,
+        &duplicate_ids,
+        cases[2].projection.as_ref().unwrap(),
+    );
+    assert_eq!(&duplicates[..8], &duplicates[8..16]);
+    assert!(duplicates.len() > 128); // Duplicate-preserving map pages span boundaries.
+    let department_ids = oracle(&input, &cases[3]);
+    assert_eq!(department_ids.len(), 4999);
+    let departments = projected_oracle(
+        &input,
+        &department_ids,
+        cases[3].projection.as_ref().unwrap(),
+    );
+    assert!(departments
+        .iter()
+        .all(|row| row.properties.len() == 3 && !row.properties.contains_key("multi_department")));
+    assert_eq!(
+        departments[0].properties["name"],
+        vec![PropertyValue::Text("Department-200002".into())]
+    );
+    let missing_ids = oracle(&input, &cases[4]);
+    assert_eq!(missing_ids.len(), 8);
+    let missing = projected_oracle(&input, &missing_ids, cases[4].projection.as_ref().unwrap());
+    assert!(missing.iter().all(|row| row.properties.is_empty()));
+    let direct = projected_oracle(&input, &missing_ids, &["multi_department"]);
+    assert_eq!(
+        direct[0].properties["multi_department"],
+        vec![PropertyValue::Boolean(false)]
+    );
+    assert_eq!(
+        direct[3].properties["multi_department"],
+        vec![PropertyValue::Boolean(true)]
+    );
+    assert!(oracle(&input, &cases[6]).is_empty());
 }

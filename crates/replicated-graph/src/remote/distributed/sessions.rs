@@ -200,6 +200,9 @@ impl Sessions {
         end: Instant,
     ) -> Result<Reply, RemoteError> {
         request.fragment.validate()?;
+        if matches!(request.fragment, Fragment::Project { .. }) {
+            return Err(RemoteError::InvalidArgument);
+        }
         let session = self.lookup(identity, shard, &request.descriptor)?;
         let is_batch = matches!(request.fragment, Fragment::HierarchyBatch { .. });
         if session.hierarchy != is_batch {
@@ -471,6 +474,25 @@ fn run_fragment(
             Ok(FragmentValue::Bool(
                 v.labels.iter().any(|l| labels.contains(l)),
             ))
+        }
+        Fragment::Project { vertex: id, keys } => {
+            projection::validate_keys(&keys)?;
+            node.charge(128 * keys.len(), keys.len())
+                .map_err(query::storage_error)?;
+            let mut v = vertex(node, shard, id)?;
+            let mut properties = BTreeMap::new();
+            for key in keys {
+                node.check_execution_context()
+                    .map_err(query::storage_error)?;
+                if let Some(value) = v.properties.remove(&key) {
+                    properties.insert(key, value);
+                }
+            }
+            projection::properties_bytes(&properties)?;
+            Ok(FragmentValue::Projected {
+                vertex: id,
+                properties,
+            })
         }
         Fragment::Values { vertex: id, key } => {
             let mut v = vertex(node, shard, id)?;
@@ -1090,7 +1112,7 @@ mod epoch_tests {
         sessions.close(identity, 7, &descriptor).unwrap();
     }
     #[tokio::test]
-    async fn hierarchy_five_leaf_actual_costs_fit_snapshot_reservations() {
+    async fn hierarchy_six_leaf_actual_costs_fit_snapshot_reservations() {
         // Build valid graph bytes off the async executor, using a disposable local DB.
         // Adapter exists only to let AppendOnlyStore share ownership of that DB.
         #[derive(Clone)]
@@ -1136,6 +1158,10 @@ mod epoch_tests {
             node.admin().set_epoch(1).unwrap();
             let store = AppendOnlyStore::new(node.clone(), 7, 0);
             let mut source = Vertex::new(1);
+            source
+                .properties
+                .insert("姓名".into(), Value::Text("员工".into()));
+            source.properties.insert("null".into(), Value::Null);
             source.properties.insert(
                 "payload".into(),
                 rocksdb_sql_table::Value::Text("v".repeat(16 * 1024)),
@@ -1262,7 +1288,11 @@ mod epoch_tests {
                 },
             },
         ];
-        for (kind, leaf) in leaves.into_iter().enumerate() {
+        let leaves = leaves.into_iter().chain([Fragment::Project {
+            vertex: source,
+            keys: vec!["姓名".into(), "null".into(), "missing".into()],
+        }]);
+        for (kind, leaf) in leaves.enumerate() {
             let fragment = Fragment::HierarchyBatch {
                 partition: 0,
                 fragments: vec![leaf],
@@ -1315,9 +1345,49 @@ mod epoch_tests {
                 (FragmentValue::Incoming(edges), 1) => assert_eq!(edges.len(), 8),
                 (FragmentValue::Edges(edges), 2) => assert_eq!(edges.len(), 8),
                 (FragmentValue::Edge(edge), 4) => assert_eq!(edge.id, 10),
+                (FragmentValue::Projected { vertex, properties }, 5) => {
+                    assert_eq!(*vertex, source);
+                    assert_eq!(properties.len(), 2);
+                    assert_eq!(properties.get("姓名"), Some(&Value::Text("员工".into())));
+                    assert_eq!(properties.get("null"), Some(&Value::Null));
+                    assert!(!properties.contains_key("missing"));
+                    // One batch leaf + one worker dispatch + one vertex get +
+                    // one operation per selected key. No get per property.
+                    assert_eq!(output.cost.work, 6);
+                }
                 _ => panic!("wrong result for leaf {kind}"),
             }
         }
+        let meter = MeteredNode {
+            frozen: pinned.node.clone(),
+            cost: Arc::new(Mutex::new(Cost::default())),
+            ceiling: jobs::JOB_CEILING,
+        };
+        assert!(matches!(
+            run_fragment(
+                &meter,
+                7,
+                Fragment::Project {
+                    vertex: VertexId {
+                        partition: 0,
+                        id: 999
+                    },
+                    keys: vec!["name".into()],
+                }
+            ),
+            Err(QueryFailure::IncompleteOrCorrupt)
+        ));
+        assert!(matches!(
+            run_fragment(
+                &meter,
+                7,
+                Fragment::Project {
+                    vertex: source,
+                    keys: vec!["payload".into()],
+                }
+            ),
+            Err(QueryFailure::ResourceExhausted)
+        ));
         sessions.close(identity, 7, &descriptor).unwrap();
     }
 }

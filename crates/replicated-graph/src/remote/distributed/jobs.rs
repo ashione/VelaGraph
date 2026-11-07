@@ -49,6 +49,15 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Output {
+    ProjectedPage {
+        token: [u8; 16],
+        cursor: usize,
+        next_cursor: Option<usize>,
+        done: bool,
+        rows: Vec<ProjectedRow>,
+        completeness: QueryCompleteness,
+        snapshots: Vec<QueryStamp>,
+    },
     Preparing {
         token: [u8; 16],
         next_sequence: u64,
@@ -75,6 +84,13 @@ pub enum Output {
     },
     Cancelled,
 }
+/// Vertex identity is provenance; valueMap entries retain Gremlin singleton-list semantics.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedRow {
+    pub source: QualifiedElement,
+    pub properties: BTreeMap<String, Vec<Value>>,
+}
 pub type Response = Result<Output, QueryFailure>;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +105,7 @@ struct Plan {
     times: usize,
     emit: bool,
     dedup: bool,
+    projection: Vec<String>,
 }
 fn parse(text: &str) -> Result<Plan, QueryFailure> {
     parse_mode(text, false)
@@ -102,7 +119,11 @@ fn parse_mode(text: &str, rows: bool) -> Result<Plan, QueryFailure> {
     if ids.is_empty() {
         return Err(QueryFailure::Unsupported);
     }
-    let (repeat, dedup) = match query.steps() {
+    let (steps, projection) = match query.steps() {
+        [prefix @ .., Step::ValueMap(keys)] if rows => (prefix, keys.clone()),
+        steps => (steps, Vec::new()),
+    };
+    let (repeat, dedup) = match steps {
         [repeat] if rows => (repeat, false),
         [repeat, Step::Dedup] if rows => (repeat, true),
         [repeat, Step::Existing(GremlinStep::Count)] if !rows => (repeat, false),
@@ -125,6 +146,7 @@ fn parse_mode(text: &str, rows: bool) -> Result<Plan, QueryFailure> {
         times: *times,
         emit: *emit,
         dedup,
+        projection,
     })
 }
 // Only emit().dedup().count() retains every emitted identity. Share its
@@ -238,6 +260,7 @@ struct Job {
     rows: Option<rows::Rows>,
     expires: Instant,
     cost: Cost,
+    completed_traversal_cost: Option<Cost>,
     plan: Plan,
     compact: Option<Compact>,
     frontier: BTreeMap<VertexId, u64>,
@@ -328,6 +351,7 @@ impl Jobs {
                     rows: row_state,
                     expires,
                     cost: Cost::default(),
+                    completed_traversal_cost: None,
                     compact: (page_size.is_none() && plan.emit && plan.dedup)
                         .then(Compact::default),
                     plan,
@@ -444,6 +468,33 @@ impl Jobs {
                 let stop = cursor
                     .saturating_add(rows.page_size)
                     .min(rows.results.len());
+                if !rows.projection.is_empty() {
+                    if rows.projected.len() != rows.results.len() {
+                        return Err(QueryFailure::IncompleteOrCorrupt);
+                    }
+                    let projected = rows.results[cursor..stop]
+                        .iter()
+                        .zip(&rows.projected[cursor..stop])
+                        .map(|(vertex, properties)| ProjectedRow {
+                            source: vertex.element(),
+                            properties: properties
+                                .iter()
+                                .map(|(k, v)| (k.clone(), vec![v.clone()]))
+                                .collect(),
+                        })
+                        .collect();
+                    let output = Output::ProjectedPage {
+                        token,
+                        cursor,
+                        next_cursor: (stop < rows.results.len()).then_some(stop),
+                        done: stop == rows.results.len(),
+                        rows: projected,
+                        completeness: QueryCompleteness::Unverified,
+                        snapshots: job.snapshots(),
+                    };
+                    check(end.min(job.expires))?;
+                    return Ok(output);
+                }
                 let output = Output::Page {
                     token,
                     cursor,
@@ -478,8 +529,15 @@ impl Jobs {
     }
 }
 impl Job {
+    fn ceiling(&self) -> Cost {
+        if self.completed_traversal_cost.is_some() {
+            projection::STAGE_CEILING
+        } else {
+            JOB_CEILING
+        }
+    }
     fn charge(&mut self, bytes: usize, work: usize) -> Result<(), QueryFailure> {
-        self.cost.charge(bytes, work, JOB_CEILING)
+        self.cost.charge(bytes, work, self.ceiling())
     }
     fn snapshots(&self) -> Vec<QueryStamp> {
         self.sessions
@@ -897,6 +955,47 @@ fn validate_stamps(
 fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError> {
     match (output, request) {
         (
+            Output::ProjectedPage {
+                token,
+                cursor,
+                next_cursor,
+                done,
+                rows,
+                completeness,
+                snapshots,
+            },
+            Request::Read {
+                token: expected,
+                cursor: expected_cursor,
+            },
+        ) => {
+            validate_stamps(*completeness, snapshots)?;
+            if token != expected
+                || cursor != expected_cursor
+                || rows.len() > projection::MAX_PAGE_ROWS
+                || *done != next_cursor.is_none()
+                || (!done && (rows.is_empty() || cursor.checked_add(rows.len()) != *next_cursor))
+            {
+                return Err(RemoteError::Protocol);
+            }
+            for row in rows {
+                if !matches!(row.source, QualifiedElement::Vertex { .. })
+                    || row.properties.len() > 8
+                {
+                    return Err(RemoteError::Protocol);
+                }
+                let mut map = BTreeMap::new();
+                for (key, values) in &row.properties {
+                    if key.is_empty() || key.len() > 64 || values.len() != 1 {
+                        return Err(RemoteError::Protocol);
+                    }
+                    map.insert(key.clone(), values[0].clone());
+                }
+                projection::properties_bytes(&map).map_err(|_| RemoteError::Protocol)?;
+            }
+            Ok(())
+        }
+        (
             Output::Preparing {
                 token,
                 next_sequence,
@@ -1270,6 +1369,7 @@ mod tests {
                         times: 5,
                         emit,
                         dedup,
+                        projection: Vec::new(),
                     };
                     let permit = JOB_SLOTS.acquire().await.unwrap();
                     let mut job = Job {
@@ -1280,6 +1380,7 @@ mod tests {
                         rows: None,
                         expires: Instant::now() + Duration::from_secs(1),
                         cost: Cost::default(),
+                        completed_traversal_cost: None,
                         compact: None,
                         plan,
                         frontier: BTreeMap::new(),
@@ -1420,6 +1521,7 @@ mod tests {
             rows: None,
             expires,
             cost: Cost::default(),
+            completed_traversal_cost: None,
             compact: None,
             plan: parse("g.V(1).repeat(__.out()).times(1).count()").unwrap(),
             frontier: (0..17)
@@ -1727,6 +1829,7 @@ mod tests {
             rows: None,
             expires,
             cost: Cost::default(),
+            completed_traversal_cost: None,
             compact: None,
             plan: parse("g.V(1).repeat(__.out()).times(2).count()").unwrap(),
             frontier: BTreeMap::from([(

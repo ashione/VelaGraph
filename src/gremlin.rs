@@ -103,6 +103,7 @@ const RULE_METHOD_PATH: usize = 121;
 const RULE_METHOD_REPEAT: usize = 131;
 const RULE_METHOD_TIMES: usize = 148;
 const RULE_INTEGER_LITERAL: usize = 292;
+const RULE_METHOD_VALUE_MAP: usize = 160;
 const RULE_METHOD_VALUES: usize = 161;
 
 /// Where a traversal starts.
@@ -145,6 +146,8 @@ pub enum ObservedGremlinStep {
     Existing(GremlinStep),
     /// Vertex identity deduplication, currently executed only by the server coordinator.
     Dedup,
+    /// Selected vertex properties; executed only by prepared hierarchy result jobs.
+    ValueMap(Vec<String>),
     /// One incoming/outgoing vertex adjacency repeated a bounded number of times.
     /// `emit` is post-body only. Executed only by the server coordinator.
     Repeat {
@@ -174,7 +177,7 @@ impl ObservedGremlinQuery {
     /// Parse the v0 subset plus observed edge/endpoint, dedup and bounded repeat steps.
     /// Ordinary adjacency steps share a maximum of three. One repeat has a separate
     /// 32-iteration bound; server execution also bounds the combined depth. All
-    /// steps share structural admission. `path` and `count` must be terminal.
+    /// steps share structural admission. `path`, `count` and `valueMap` must be terminal.
     pub fn parse(input: &str) -> Result<Self> {
         parse_validated_query(input, true)
     }
@@ -336,6 +339,7 @@ fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQ
         matches!(
             step,
             ObservedGremlinStep::Existing(GremlinStep::Path | GremlinStep::Count)
+                | ObservedGremlinStep::ValueMap(_)
         ) && *index + 1 != steps.len()
     }) {
         return Err(Error::UnsupportedGremlinArgument(format!(
@@ -343,6 +347,7 @@ fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQ
             match &steps[index] {
                 ObservedGremlinStep::Existing(GremlinStep::Path) => "path",
                 ObservedGremlinStep::Existing(GremlinStep::Count) => "count",
+                ObservedGremlinStep::ValueMap(_) => "valueMap",
                 _ => unreachable!(),
             }
         )));
@@ -1089,6 +1094,27 @@ fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {
         .ok_or_else(|| Error::UnsupportedGremlinStep(node.text()))?;
     let (name, args) = method_parts(specific)?;
     match rule_index(specific).expect("specific rule has an index") {
+        RULE_METHOD_VALUE_MAP => {
+            if !(1..=8).contains(&args.len()) {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "valueMap requires between one and eight distinct property keys".into(),
+                ));
+            }
+            let mut keys = Vec::with_capacity(args.len());
+            for arg in &args {
+                let key = parse_text_literal(arg)?;
+                // Property names are not edge labels: Unicode is allowed. This
+                // is a projection admission bound, not a storage-format rule.
+                if key.is_empty() || key.len() > 64 || keys.contains(&key) {
+                    return Err(Error::UnsupportedGremlinArgument(
+                        "valueMap keys must be distinct, nonempty strings of at most 64 bytes"
+                            .into(),
+                    ));
+                }
+                keys.push(key);
+            }
+            Ok(ObservedGremlinStep::ValueMap(keys))
+        }
         RULE_METHOD_DEDUP => {
             require_no_args(&name, &args)?;
             Ok(ObservedGremlinStep::Dedup)
@@ -1809,5 +1835,79 @@ mod memory_overlap_tests {
             .unwrap();
         println!("g.V().count(): peak_accounted_bytes={}", budget.peak());
         assert_eq!(budget.used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod value_map_parser_tests {
+    use super::*;
+
+    #[test]
+    fn observed_value_map_uses_standard_terminal_syntax() {
+        for text in [
+            "g.V(1).valueMap('name','active')",
+            "g.V(1).repeat(__.in('reports_to')).emit().times(32).valueMap('name','active')",
+            "g.V(1).repeat(__.in('reports_to')).times(2).dedup().valueMap('姓名','country')",
+        ] {
+            let query = ObservedGremlinQuery::parse(text).unwrap();
+            assert!(
+                matches!(query.steps().last(), Some(ObservedGremlinStep::ValueMap(keys)) if keys.len() == 2)
+            );
+            assert!(matches!(
+                GremlinQuery::parse(text),
+                Err(Error::UnsupportedGremlinStep(_))
+            ));
+        }
+        let query = ObservedGremlinQuery::parse(r"g.V(1).valueMap('姓名','a,b','a\'b')").unwrap();
+        assert_eq!(
+            query.steps(),
+            &[ObservedGremlinStep::ValueMap(vec![
+                "姓名".into(),
+                "a,b".into(),
+                "a'b".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn observed_value_map_rejects_unsupported_forms() {
+        for text in [
+            "g.V(1).valueMap()",
+            "g.V(1).valueMap('')",
+            "g.V(1).valueMap('name','name')",
+            "g.V(1).valueMap('a','b','c','d','e','f','g','h','i')",
+            "g.V(1).valueMap(true,'name')",
+            "g.V(1).valueMap(false,'name')",
+            "g.V(1).valueMap(1)",
+            "g.V(1).valueMap(null)",
+            "g.V(1).valueMap('name').count()",
+            "g.V(1).valueMap('name').path()",
+            "g.V(1).valueMap('name').dedup()",
+            "g.V(1).valueMap('name').out()",
+            "g.V(1).valueMap('name').valueMap('active')",
+            "g.V(1).valueMap('name').by(__.unfold())",
+            "g.V(1).count().valueMap('name')",
+            "g.V(1).path().valueMap('name')",
+        ] {
+            assert!(
+                ObservedGremlinQuery::parse(text).is_err(),
+                "accepted {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_value_map_key_bounds_count_utf8_bytes() {
+        for key in ["a".repeat(64), "界".repeat(21)] {
+            let text = format!("g.V(1).valueMap('{key}')");
+            assert!(ObservedGremlinQuery::parse(&text).is_ok());
+        }
+        for key in ["a".repeat(65), "界".repeat(22)] {
+            let text = format!("g.V(1).valueMap('{key}')");
+            assert!(ObservedGremlinQuery::parse(&text).is_err());
+        }
+        assert!(
+            ObservedGremlinQuery::parse("g.V(1).valueMap('a','b','c','d','e','f','g','h')").is_ok()
+        );
     }
 }
