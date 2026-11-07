@@ -175,6 +175,11 @@ pub struct PreparedBatch {
     sequence: u64,
 }
 impl PreparedBatch {
+    /// Move the exact validated bytes and original CAS into a transaction
+    /// coordinator. This does not submit, refresh, or certify other participants.
+    pub fn into_conditional_request(self) -> (WriteRequest, u64) {
+        (self.request, self.sequence)
+    }
     pub fn request_id(&self) -> RequestId {
         self.request.request_id
     }

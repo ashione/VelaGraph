@@ -681,6 +681,39 @@ impl StateMachine {
         })
     }
 
+    /// Verify one retained terminal cut without materializing graph payloads.
+    /// Establish a leader barrier before using this as visibility evidence.
+    pub async fn participant_prefix_applied(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        version: u64,
+        journal: &crate::transaction_decisions::Journal,
+    ) -> Result<(), D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let visibility = d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?;
+        if version > visibility.applied {
+            return Err(D1Error::VisibilityNotApplied);
+        }
+        if journal.cohort().is_none()
+            || visibility.baseline_sequence != 0
+            || !visibility.journal.same_terminal_prefix(journal, version)
+        {
+            return Err(D1Error::VisibilityHistory);
+        }
+        Ok(())
+    }
+
     /// Same-lock proof that the retained local cut equals a trusted coordinator
     /// terminal prefix. Callers still need a leader barrier and a complete cohort.
     #[allow(clippy::too_many_arguments)]

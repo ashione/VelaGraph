@@ -50,6 +50,10 @@ impl SnapshotSession {
             Ok(())
         }
     }
+    pub fn expires_at(&self) -> Result<Instant, Error> {
+        self.live()?;
+        Ok(self.expires)
+    }
     pub fn version(&self) -> Result<u64, Error> {
         self.live()?;
         Ok(self.version)
