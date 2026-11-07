@@ -19,6 +19,8 @@
 
 动态一致性的首个接口切片：[显式读取一致性协商](QUERY_CONSISTENCY_NEGOTIATION.md)已支持请求全局已提交快照并在能力不足时拒绝，覆盖同步查询及长期 job，不静默降级。**全局快照本身仍未实现**，下一步是覆盖全部写入口的事务版本与 MVCC，而不是仅靠查询协调层打时间戳。
 
+协调决策账本的独立基础切片已实现：空受管分片可显式转为专用协调角色，持久化 Begin/Prepared/Commit/Abort 与未决空洞检查。它只记录决定，尚未连接数据分片 prepare、原子跨片数据发布或 MVCC；resolved prefix **不是可读全局版本**，严格全局查询仍 Unsupported。见[契约](TRANSACTION_DECISION_JOURNAL.md)。
+
 ### 已确认与待定
 
 | 项目 | 当前结论 | 状态 |

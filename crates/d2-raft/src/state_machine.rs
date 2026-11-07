@@ -66,6 +66,15 @@ struct D1MetadataV4 {
 }
 
 fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
+    if state.coordinator.is_some() {
+        // Dedicated format: old binaries must not ignore coordinator authority.
+        #[derive(Serialize)]
+        struct Metadata<'a> {
+            version: u32,
+            state: &'a D1State,
+        }
+        return serde_json::to_vec(&Metadata { version: 5, state });
+    }
     if let Some(managed) = &state.managed {
         return serde_json::to_vec(&D1MetadataV4 {
             version: 4,
@@ -406,6 +415,20 @@ impl StateMachine {
                     state.managed = Some(meta.managed);
                     d1 = Some(state);
                 }
+                5 => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Metadata {
+                        version: u32,
+                        state: D1State,
+                    }
+                    let meta: Metadata = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        meta.version == 5 && meta.state.coordinator.is_some(),
+                        "invalid coordinator metadata"
+                    );
+                    d1 = Some(meta.state);
+                }
                 _ => anyhow::bail!("unsupported D1 disk version"),
             }
         }
@@ -555,6 +578,28 @@ impl StateMachine {
             sequence: d1.sequence,
             entries: state.data.clone(),
         }))
+    }
+
+    /// Local decision status only. Distributed callers must establish a leader
+    /// read barrier first; absence never proves abort and is not a read version.
+    pub async fn coordinator_journal(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<crate::transaction_decisions::Journal, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1
+            .managed
+            .as_ref()
+            .is_none_or(|mode| mode.mode_id != mode_id)
+        {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        d1.coordinator.clone().ok_or(D1Error::CoordinatorNotEnabled)
     }
 
     /// Local diagnostic metadata, not a linearizable distributed read.
@@ -806,6 +851,26 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 )
                 .into());
             }
+            if incoming.coordinator.is_some() && current.sequence != 0 {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other("coordinator snapshot replaces nonempty data history"),
+                )
+                .into());
+            }
+            if let Some(journal) = &current.coordinator {
+                let valid = incoming
+                    .coordinator
+                    .as_ref()
+                    .is_some_and(|next| journal.validate_successor(next).is_ok());
+                if !valid {
+                    return Err(StorageIOError::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other("snapshot would rewrite coordinator history"),
+                    )
+                    .into());
+                }
+            }
             if incoming.bytes_limit() < current.bytes_limit() {
                 return Err(StorageIOError::read_snapshot(
                     Some(meta.signature()),
@@ -923,6 +988,7 @@ impl ApplyDelta {
                 previous.version = next.version;
                 previous.dedup_bytes_limit = next.dedup_bytes_limit;
                 previous.managed = next.managed;
+                previous.coordinator = next.coordinator;
                 previous.epoch = next.epoch;
                 previous.sequence = next.sequence;
                 previous.dedup.append(&mut next.dedup);
@@ -970,6 +1036,62 @@ fn apply_d1(
     command: D1Command,
 ) -> Result<D1Result, D1Error> {
     match command {
+        D1Command::EnableCoordinator {
+            shard,
+            epoch,
+            mode_id,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            let mode = d1
+                .managed
+                .as_ref()
+                .ok_or(D1Error::ManagedWritesNotEnabled)?;
+            if mode.mode_id != mode_id {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            if d1.sequence != 0 || next.data_len != 0 {
+                return Err(D1Error::CoordinatorRequiresEmptyShard);
+            }
+            if d1.coordinator.is_none() {
+                d1.coordinator = Some(
+                    crate::transaction_decisions::Journal::new(mode_id)
+                        .map_err(D1Error::CoordinatorRejected)?,
+                );
+                d1.version = 4;
+            }
+            Ok(D1Result::Coordinator {
+                resolved_prefix: d1.coordinator.as_ref().unwrap().resolved_prefix(),
+            })
+        }
+        D1Command::Coordinator {
+            shard,
+            epoch,
+            mode_id,
+            command,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1
+                .managed
+                .as_ref()
+                .is_none_or(|mode| mode.mode_id != mode_id)
+            {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            let journal = d1
+                .coordinator
+                .as_mut()
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            journal
+                .apply(command)
+                .map_err(D1Error::CoordinatorRejected)?;
+            Ok(D1Result::Coordinator {
+                resolved_prefix: journal.resolved_prefix(),
+            })
+        }
         D1Command::Activate { shard, epoch } => {
             if let Some(d1) = &next.d1 {
                 d1.check_shard(shard)?;
@@ -1920,3 +2042,198 @@ mod capacity_persistence_tests {
 #[cfg(test)]
 #[path = "managed_state_tests.rs"]
 mod managed_state_tests;
+
+#[cfg(test)]
+mod coordinator_tests {
+    use super::*;
+    use crate::transaction_decisions::{Command, Decision, Participant};
+    use openraft::CommittedLeaderId;
+
+    fn entry(index: u64, command: D1Command) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(LogCommand::D1V1(command)),
+        }
+    }
+    fn command(command: Command) -> D1Command {
+        D1Command::Coordinator {
+            shard: 7,
+            epoch: 3,
+            mode_id: [1; 16],
+            command,
+        }
+    }
+    fn begin() -> D1Command {
+        command(Command::Begin {
+            id: [2; 16],
+            participants: vec![Participant {
+                shard: 8,
+                epoch: 1,
+                mode: [3; 16],
+                intent: [4; 32],
+            }],
+        })
+    }
+    async fn setup(sm: &mut Arc<StateMachine>) {
+        let results = sm
+            .apply([
+                entry(1, D1Command::Activate { shard: 7, epoch: 3 }),
+                entry(
+                    2,
+                    D1Command::EnableManagedWrites {
+                        shard: 7,
+                        epoch: 3,
+                        expected_sequence: 0,
+                        mode_id: [1; 16],
+                    },
+                ),
+                entry(
+                    3,
+                    D1Command::EnableCoordinator {
+                        shard: 7,
+                        epoch: 3,
+                        mode_id: [1; 16],
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.d1.as_ref().unwrap().is_ok()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn coordinator_reopens_pending_decision_and_blocks_data_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        setup(&mut sm).await;
+        sm.apply([entry(4, begin())]).await.unwrap();
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        let snapshot = sm
+            .state
+            .read()
+            .await
+            .d1
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .clone()
+            .unwrap();
+        assert_eq!(snapshot.resolved_prefix(), 0);
+        assert_eq!(snapshot.transaction([2; 16]).unwrap().decision, None);
+        let request = crate::D1WriteRequest {
+            shard: 7,
+            epoch: 3,
+            request_id: [5; 16],
+            expected_sequence: Some(0),
+            operations: vec![WriteOp::put("bad", "data")],
+        };
+        let rejected = sm
+            .apply([entry(
+                5,
+                D1Command::ManagedWrite {
+                    mode_id: [1; 16],
+                    request,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(rejected[0].d1, Some(Err(D1Error::CoordinatorOnly)));
+        sm.apply([entry(
+            6,
+            command(Command::Decide {
+                id: [2; 16],
+                decision: Decision::Abort,
+            }),
+        )])
+        .await
+        .unwrap();
+        let image = sm.build_snapshot().await.unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut restored = Arc::new(StateMachine::open(target.path()).unwrap());
+        restored
+            .install_snapshot(&image.meta, image.snapshot)
+            .await
+            .unwrap();
+        drop(restored);
+        let restored = StateMachine::open(target.path()).unwrap();
+        let state = restored.state.read().await;
+        assert!(state.data.is_empty());
+        assert_eq!(
+            state
+                .d1
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .transaction([2; 16])
+                .unwrap()
+                .decision,
+            Some(Decision::Abort)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn coordinator_sync_failure_does_not_publish_or_forget_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        setup(&mut sm).await;
+        sm.apply([entry(4, begin())]).await.unwrap();
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm
+            .apply([entry(
+                5,
+                command(Command::Decide {
+                    id: [2; 16],
+                    decision: Decision::Abort
+                })
+            )])
+            .await
+            .is_err());
+        assert_eq!(sm.state.read().await.last_applied_log.unwrap().index, 4);
+        drop(sm);
+        let sm = StateMachine::open(dir.path()).unwrap();
+        assert_eq!(
+            sm.state
+                .read()
+                .await
+                .d1
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .transaction([2; 16])
+                .unwrap()
+                .decision,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn coordinator_snapshot_cannot_erase_history_even_with_newer_marker() {
+        let mut sm = Arc::new(StateMachine::default());
+        setup(&mut sm).await;
+        let mut old = sm.build_snapshot().await.unwrap();
+        sm.apply([entry(4, begin())]).await.unwrap();
+        old.meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 10));
+        assert!(sm.install_snapshot(&old.meta, old.snapshot).await.is_err());
+        assert!(sm
+            .state
+            .read()
+            .await
+            .d1
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .transaction([2; 16])
+            .is_some());
+    }
+}

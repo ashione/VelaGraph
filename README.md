@@ -28,7 +28,10 @@ It does not yet implement global MVCC or cross-shard transactions.
 An opt-in [managed shard write fence](docs/MANAGED_SHARD_WRITES.md) persists
 write-mode identity and rejects old raw writers after explicit activation. It
 adds shard-local atomic batch identities only; default graph APIs are unchanged
-and global transactions remain unimplemented.
+and global transactions remain unimplemented. A separate opt-in
+[coordinator decision ledger](docs/TRANSACTION_DECISION_JOURNAL.md) persists
+transaction decisions on a dedicated empty shard, but does not prepare/apply
+participant data or provide global read visibility.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.

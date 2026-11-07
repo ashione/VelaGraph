@@ -52,6 +52,18 @@ pub enum D1Command {
         new_bytes: usize,
     },
     Write(D1WriteRequest),
+    /// Irreversibly reserve an empty managed shard for coordinator decisions.
+    EnableCoordinator {
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    },
+    Coordinator {
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        command: crate::transaction_decisions::Command,
+    },
     /// Irreversible opt-in for this shard. This is not a global transaction mode.
     EnableManagedWrites {
         shard: u64,
@@ -74,6 +86,9 @@ pub enum D1WriteStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum D1Result {
+    Coordinator {
+        resolved_prefix: u64,
+    },
     Activated {
         shard: u64,
         epoch: u64,
@@ -123,6 +138,10 @@ pub enum D1Error {
     InvalidManagedMode,
     ManagedModeConflict,
     UnverifiedWriteHistory,
+    CoordinatorOnly,
+    CoordinatorNotEnabled,
+    CoordinatorRequiresEmptyShard,
+    CoordinatorRejected(crate::transaction_decisions::Error),
 }
 
 /// Persistent single-shard write fence. The ID is a protocol identity, not a secret.
@@ -156,6 +175,8 @@ pub(crate) struct D1State {
     pub(crate) dedup_bytes_limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) managed: Option<D1ManagedMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) coordinator: Option<crate::transaction_decisions::Journal>,
     pub shard: u64,
     pub epoch: u64,
     pub sequence: u64,
@@ -168,6 +189,7 @@ impl D1State {
             version: 1,
             dedup_bytes_limit: None,
             managed: None,
+            coordinator: None,
             shard,
             epoch,
             sequence: 0,
@@ -178,10 +200,16 @@ impl D1State {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
-                (self.version, self.dedup_bytes_limit, self.managed.is_some()),
-                (1, None, false)
-                    | (2, Some(EXTENDED_DEDUP_BYTES), false)
-                    | (3, None | Some(EXTENDED_DEDUP_BYTES), true)
+                (
+                    self.version,
+                    self.dedup_bytes_limit,
+                    self.managed.is_some(),
+                    self.coordinator.is_some()
+                ),
+                (1, None, false, false)
+                    | (2, Some(EXTENDED_DEDUP_BYTES), false, false)
+                    | (3, None | Some(EXTENDED_DEDUP_BYTES), true, false)
+                    | (4, None | Some(EXTENDED_DEDUP_BYTES), true, true)
             ),
             "unsupported D1 state version/capacity"
         );
@@ -193,6 +221,18 @@ impl D1State {
             anyhow::ensure!(
                 mode.mode_id != [0; 16] && mode.activated_sequence <= self.sequence,
                 "invalid managed mode"
+            );
+        }
+        if let Some(journal) = &self.coordinator {
+            anyhow::ensure!(
+                self.managed
+                    .as_ref()
+                    .is_some_and(|mode| mode.mode_id == journal.authority()),
+                "coordinator authority mismatch"
+            );
+            anyhow::ensure!(
+                self.sequence == 0 && self.dedup.is_empty(),
+                "coordinator contains data history"
             );
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -316,7 +356,13 @@ impl D1State {
             return Err(D1Error::InvalidDedupCapacity);
         }
         if new_bytes == EXTENDED_DEDUP_BYTES {
-            self.version = if self.managed.is_some() { 3 } else { 2 };
+            self.version = if self.coordinator.is_some() {
+                4
+            } else if self.managed.is_some() {
+                3
+            } else {
+                2
+            };
             self.dedup_bytes_limit = Some(new_bytes);
         }
         Ok(D1Result::DedupCapacity {
@@ -351,6 +397,7 @@ impl D1State {
             version: self.version,
             dedup_bytes_limit: self.dedup_bytes_limit,
             managed: self.managed.clone(),
+            coordinator: self.coordinator.clone(),
             shard: self.shard,
             epoch: self.epoch,
             sequence: self.sequence,
@@ -425,6 +472,9 @@ impl D1State {
             .ok_or(D1Error::ManagedWritesNotEnabled)?;
         if mode.mode_id != mode_id {
             return Err(D1Error::ManagedModeConflict);
+        }
+        if self.coordinator.is_some() {
+            return Err(D1Error::CoordinatorOnly);
         }
         // Activation does not erase historical retry identities. Never report a
         // pre-activation legacy write as a managed transaction's commit.
