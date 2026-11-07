@@ -358,4 +358,14 @@ oracles on both smoke and 200,000-person fixtures.
 
 - Managed graph/v2 write/read slice: complete source/reverse transaction plans, property read-dependency guards, edge deletion and certified snapshot reads for deterministic one-partition-per-shard cohorts. Vertex deletion/cascades, general routing manifests and remote Global admission remain pending. Durable request admission is described below. See [contract](MANAGED_GRAPH_TRANSACTIONS.md).
 
-- Durable request admission foundation: atomically retain external-ID/canonical-command/complete-Plan/Begin with resolution reservation and exact restart recovery. The typed managed network gateway and server-side same-version session registry remain the next integration step.
+- Durable request admission foundation: atomically retain external-ID/canonical-command/complete-Plan/Begin with resolution reservation and exact restart recovery. The restricted typed managed network gateway and server-side same-version session registry below use this foundation.
+
+### Restricted managed gateway slice
+
+A separate trusted-network managed TCP facade now connects durable external request
+admission/recovery to server-owned managed graph handles and expiring certified
+fixed-version standard Gremlin read sessions through the existing official parser.
+Typed reads remain private execution plumbing. Real loopback tests cover transaction retry, partial
+apply, restart, identity and resource failure paths. This is not multi-host Raft
+placement, auth/TLS, remote GlobalCommittedSnapshot Gremlin, indexed MVCC, GC or
+full D4/D5 production completion. See [gateway contract](MANAGED_GRAPH_GATEWAY.md).

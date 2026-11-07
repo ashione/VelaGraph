@@ -657,4 +657,13 @@ Experimental [fixed-cohort snapshot sessions](docs/CERTIFIED_COHORT_READS.md) ce
 
 Experimental [managed graph/v2 transactions](docs/MANAGED_GRAPH_TRANSACTIONS.md) now connect vertex/edge creates, property updates and edge deletion to fixed-cohort commits and same-version reads. This trusted in-process slice does not enable remote Global Gremlin.
 
-The optional [durable request admission foundation](docs/DURABLE_GRAPH_REQUESTS.md) binds external IDs to exact transaction plans before prepare. It is not yet a network gateway.
+The optional [durable request admission foundation](docs/DURABLE_GRAPH_REQUESTS.md) binds external IDs to exact transaction plans before prepare. The separate restricted TCP gateway below uses this foundation.
+
+### Experimental managed graph TCP gateway
+
+The separate `replicated_graph::managed_gateway` API exposes typed graph/v2
+mutations with durable external request IDs, read-only Status, explicit Abort,
+and fixed-version certified sessions with a small standard Gremlin point/adjacency
+subset over server-owned Raft handles. It is bounded plaintext for trusted networks, not multi-host Raft
+placement, authentication, remote Global Gremlin, indexed MVCC or production
+availability. See [the contract and limits](docs/MANAGED_GRAPH_GATEWAY.md).

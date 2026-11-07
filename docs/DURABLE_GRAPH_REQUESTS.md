@@ -1,7 +1,8 @@
 # Durable external request binding
 
-Status: prerequisite for the future managed graph network gateway. This slice adds
-an internal admission/recovery API, not TCP endpoints or remote Global Gremlin.
+Status: internal admission/recovery API used by the separate experimental
+[managed graph TCP gateway](MANAGED_GRAPH_GATEWAY.md). This journal API itself
+adds no TCP endpoints or remote Global Gremlin.
 
 ## One atomic admission
 
@@ -33,7 +34,7 @@ request bytes. GraphCohort::admit_request atomically admits a validated candidat
 and reads back the winning Plan. These are bounded internal APIs; remote clients
 must never be allowed to submit raw Plan bytes or arbitrary participant lists.
 
-A future gateway must parse a typed operation and produce a stable canonical byte
+A gateway must parse a typed operation and produce a stable canonical byte
 encoding that preserves operation kind, complete parameters and type distinctions
 (such as integer 1 versus real 1.0), and binds the mapping/cohort contract. This
 slice compares bytes exactly and does not claim that arbitrary caller-provided JSON
@@ -71,7 +72,7 @@ at 64 KiB, encoded Plan bytes at 256 KiB, and a fully JSON-encoded admission eve
 2 MiB. All events plus reserved resolution bytes must fit the existing 16 MiB
 journal budget. The real encoded size, including numeric byte-array expansion,
 counts; the per-record cap does not replace the shared journal cap. These internal
-bounds are not a substitute for request/response frame bounds in the future gateway.
+bounds are not a substitute for the separate gateway request/response frame bounds.
 
 There is no eviction or ID reuse. Capacity exhaustion rejects new identities without
 removing older records, while existing valid retries and already-reserved transaction

@@ -10,6 +10,7 @@
 //! No cross-host authentication or production availability guarantee is provided.
 mod adapter;
 pub mod catalog;
+pub mod managed_gateway;
 pub mod managed_graph;
 pub mod remote;
 pub mod remote_storage;
