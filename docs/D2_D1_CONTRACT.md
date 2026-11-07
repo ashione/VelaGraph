@@ -331,3 +331,12 @@ There is no in-place downgrade or lossless export-to-old-tier conversion tool.
 Retain a pre-expansion backup; restoring it loses subsequent commits unless a
 separately validated recovery procedure is developed. Preserve all replica
 databases and complete logical snapshots during upgrade and recovery.
+
+
+## Opt-in managed write prerequisite
+
+[Managed shard writes](MANAGED_SHARD_WRITES.md) adds explicit one-way write-mode
+activation, shard-local atomic batch identities and status, disk metadata v4 and
+logical state v3. Unmanaged defaults/encodings remain unchanged. Mode activation
+requires compatible participants and does not implement global transactions,
+MVCC, mixed-version upgrades or an online downgrade path.

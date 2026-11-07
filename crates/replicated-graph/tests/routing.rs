@@ -350,7 +350,7 @@ async fn apply_locked_timeout_exact_retry_and_conflict_do_not_add_sequences() ->
         let loser = prepare(&f.resolver, 1, 2, "conflicting").await?;
         assert_eq!(p.expected_sequence(), loser.expected_sequence());
         let i = leader(&f.a.nodes, None).await?;
-        let guard = f.a.nodes[i].state_machine.state.write().await;
+        let guard = f.a.nodes[i].state_machine.pause_state().await;
         let result = commit(&f.resolver, &p, Duration::from_millis(500)).await;
         assert!(matches!(result, Err(RouteError::Storage(StorageNodeError::Timeout { request_id: Some(id) })) if id == p.request_id()));
         drop(guard);
@@ -629,8 +629,8 @@ async fn independent_metadata_and_data_share_deadline() -> anyhow::Result<()> {
         let f = Fixture::new().await?;
         let mi = leader(&f.metadata.nodes, None).await?;
         let di = leader(&f.a.nodes, None).await?;
-        let mg = f.metadata.nodes[mi].state_machine.state.write().await;
-        let dg = f.a.nodes[di].state_machine.state.write().await;
+        let mg = f.metadata.nodes[mi].state_machine.pause_state().await;
+        let dg = f.a.nodes[di].state_machine.pause_state().await;
         let r = f.resolver.clone();
         let (ready, begun) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {

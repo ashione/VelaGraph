@@ -1,5 +1,6 @@
 //! Bounded plaintext TCP D1 transport for trusted development networks only.
-//! No authentication, TLS, forwarding, retry, or remote administration is provided.
+//! No authentication, TLS, forwarding or retry is provided. Managed write activation
+//! is an explicit irreversible protocol transition, not an authorization boundary.
 //! Ordinary connections carry one request/response. Opt-in hierarchy channels
 //! reuse a bounded, sequential connection tied to one fixed query session.
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
@@ -24,6 +25,7 @@ const VERSION: u32 = 1;
 /// Largest accepted client or server operation budget.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
 pub mod distributed;
+pub mod managed;
 mod paged;
 pub mod query;
 pub use paged::{
@@ -119,6 +121,7 @@ enum Operation {
         descriptor: distributed::Descriptor,
     },
     Write(D1WriteRequest),
+    Managed(managed::Request),
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +146,7 @@ enum Reply {
     QueryFragment(Result<distributed::FragmentOutput, query::QueryFailure>),
     CloseQuery,
     Write(D1Result),
+    Managed(managed::Output),
 }
 
 /// A separate graph port. Deadlines must be positive and at most 60 seconds. Dropping stops acceptance; in-flight work retains its
@@ -340,6 +344,9 @@ async fn execute(
         return Err(RemoteError::InvalidArgument);
     }
     match request.operation {
+        Operation::Managed(request) => managed::handle(raft, state, shard, request)
+            .await
+            .map(Reply::Managed),
         Operation::OpenHierarchyChannel { .. } => Err(RemoteError::InvalidArgument),
         Operation::OpenQuery {
             shard: requested,

@@ -49,7 +49,7 @@ async fn scenario() {
         .await
         .unwrap()
         .unwrap();
-    let guard = node.state_machine.state.write().await;
+    let guard = node.state_machine.pause_state().await;
     let g = graph.clone();
     let retry = p.clone();
     let result = run_blocking(move || g.commit_prepared(&retry))

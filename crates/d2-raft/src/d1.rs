@@ -52,6 +52,18 @@ pub enum D1Command {
         new_bytes: usize,
     },
     Write(D1WriteRequest),
+    /// Irreversible opt-in for this shard. This is not a global transaction mode.
+    EnableManagedWrites {
+        shard: u64,
+        epoch: u64,
+        expected_sequence: u64,
+        mode_id: [u8; 16],
+    },
+    /// One atomic shard-local transaction, identified by request.request_id.
+    ManagedWrite {
+        mode_id: [u8; 16],
+        request: D1WriteRequest,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +83,16 @@ pub enum D1Result {
     },
     DedupCapacity {
         bytes_limit: usize,
+    },
+    ManagedWritesEnabled {
+        mode_id: [u8; 16],
+        activated_sequence: u64,
+    },
+    ManagedWrite {
+        mode_id: [u8; 16],
+        sequence: u64,
+        status: D1WriteStatus,
+        applied_operations: usize,
     },
     Write {
         sequence: u64,
@@ -96,6 +118,26 @@ pub enum D1Error {
     LegacyDataPresent,
     LegacyWriteDisabled,
     InvalidEpoch,
+    ManagedWriteRequired,
+    ManagedWritesNotEnabled,
+    InvalidManagedMode,
+    ManagedModeConflict,
+    UnverifiedWriteHistory,
+}
+
+/// Persistent single-shard write fence. The ID is a protocol identity, not a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1ManagedMode {
+    pub mode_id: [u8; 16],
+    pub activated_sequence: u64,
+}
+
+/// Unknown never proves abort: an uncommitted Raft request may still apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum D1ManagedStatus {
+    Committed { sequence: u64 },
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +154,8 @@ pub(crate) struct D1State {
     pub(crate) version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dedup_bytes_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) managed: Option<D1ManagedMode>,
     pub shard: u64,
     pub epoch: u64,
     pub sequence: u64,
@@ -123,6 +167,7 @@ impl D1State {
         Self {
             version: 1,
             dedup_bytes_limit: None,
+            managed: None,
             shard,
             epoch,
             sequence: 0,
@@ -133,8 +178,10 @@ impl D1State {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
-                (self.version, self.dedup_bytes_limit),
-                (1, None) | (2, Some(EXTENDED_DEDUP_BYTES))
+                (self.version, self.dedup_bytes_limit, self.managed.is_some()),
+                (1, None, false)
+                    | (2, Some(EXTENDED_DEDUP_BYTES), false)
+                    | (3, None | Some(EXTENDED_DEDUP_BYTES), true)
             ),
             "unsupported D1 state version/capacity"
         );
@@ -142,8 +189,15 @@ impl D1State {
             self.dedup.len() <= MAX_DEDUP_REQUESTS,
             "D1 dedup capacity exceeded"
         );
+        if let Some(mode) = &self.managed {
+            anyhow::ensure!(
+                mode.mode_id != [0; 16] && mode.activated_sequence <= self.sequence,
+                "invalid managed mode"
+            );
+        }
         let mut ids = std::collections::BTreeSet::new();
         let mut previous = 0;
+        let mut previous_epoch = 0;
         let mut bytes = 0usize;
         for record in &self.dedup {
             anyhow::ensure!(
@@ -164,6 +218,18 @@ impl D1State {
                     .validate()
                     .map_err(|e| anyhow::anyhow!("invalid D1 request: {e:?}"))?,
             );
+            anyhow::ensure!(
+                record
+                    .request
+                    .expected_sequence
+                    .is_none_or(|expected| expected == record.sequence - 1),
+                "unreachable D1 CAS history"
+            );
+            anyhow::ensure!(
+                record.request.epoch >= previous_epoch,
+                "regressing D1 request epoch history"
+            );
+            previous_epoch = record.request.epoch;
             previous = record.sequence;
         }
         anyhow::ensure!(bytes <= self.bytes_limit(), "D1 dedup bytes exceeded");
@@ -173,6 +239,38 @@ impl D1State {
             "incomplete D1 dedup state"
         );
         Ok(())
+    }
+
+    pub(crate) fn replayed_data<'a>(
+        &'a self,
+        history: Option<&'a Self>,
+    ) -> std::collections::BTreeMap<&'a [u8], &'a [u8]> {
+        let mut data = std::collections::BTreeMap::new();
+        for record in history
+            .into_iter()
+            .flat_map(|s| &s.dedup)
+            .chain(&self.dedup)
+        {
+            for operation in &record.request.operations {
+                match operation {
+                    WriteOp::Put { key, value } => {
+                        data.insert(key.as_slice(), value.as_slice());
+                    }
+                    WriteOp::Delete { key } => {
+                        data.remove(key.as_slice());
+                    }
+                }
+            }
+        }
+        data
+    }
+
+    pub(crate) fn matches_data(&self, data: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>) -> bool {
+        let expected = self.replayed_data(None);
+        expected.len() == data.len()
+            && data
+                .iter()
+                .all(|(key, value)| expected.get(key.as_slice()).copied() == Some(value.as_slice()))
     }
 
     pub(crate) fn bytes_limit(&self) -> usize {
@@ -218,7 +316,7 @@ impl D1State {
             return Err(D1Error::InvalidDedupCapacity);
         }
         if new_bytes == EXTENDED_DEDUP_BYTES {
-            self.version = 2;
+            self.version = if self.managed.is_some() { 3 } else { 2 };
             self.dedup_bytes_limit = Some(new_bytes);
         }
         Ok(D1Result::DedupCapacity {
@@ -252,6 +350,7 @@ impl D1State {
         Self {
             version: self.version,
             dedup_bytes_limit: self.dedup_bytes_limit,
+            managed: self.managed.clone(),
             shard: self.shard,
             epoch: self.epoch,
             sequence: self.sequence,
@@ -271,6 +370,119 @@ impl D1State {
     ) -> Result<D1Result, D1Error> {
         self.check_shard(request.shard)?;
         self.check_epoch(request.epoch)?;
+        if self.managed.is_some() {
+            return Err(D1Error::ManagedWriteRequired);
+        }
+        self.write_inner(request, history)
+    }
+
+    pub(crate) fn enable_managed(
+        &mut self,
+        shard: u64,
+        epoch: u64,
+        expected_sequence: u64,
+        mode_id: [u8; 16],
+    ) -> Result<D1Result, D1Error> {
+        self.check_shard(shard)?;
+        self.check_epoch(epoch)?;
+        if mode_id == [0; 16] {
+            return Err(D1Error::InvalidManagedMode);
+        }
+        if let Some(mode) = &self.managed {
+            if mode.mode_id != mode_id || mode.activated_sequence != expected_sequence {
+                return Err(D1Error::ManagedModeConflict);
+            }
+        } else {
+            if self.sequence != expected_sequence {
+                return Err(D1Error::Conflict {
+                    expected: expected_sequence,
+                    current: self.sequence,
+                });
+            }
+            self.managed = Some(D1ManagedMode {
+                mode_id,
+                activated_sequence: expected_sequence,
+            });
+            self.version = 3;
+        }
+        Ok(D1Result::ManagedWritesEnabled {
+            mode_id,
+            activated_sequence: expected_sequence,
+        })
+    }
+
+    pub(crate) fn managed_write(
+        &mut self,
+        mode_id: [u8; 16],
+        request: &D1WriteRequest,
+        history: Option<&Self>,
+    ) -> Result<D1Result, D1Error> {
+        self.check_shard(request.shard)?;
+        self.check_epoch(request.epoch)?;
+        let mode = self
+            .managed
+            .as_ref()
+            .ok_or(D1Error::ManagedWritesNotEnabled)?;
+        if mode.mode_id != mode_id {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        // Activation does not erase historical retry identities. Never report a
+        // pre-activation legacy write as a managed transaction's commit.
+        if self
+            .dedup
+            .iter()
+            .chain(history.into_iter().flat_map(|s| &s.dedup))
+            .any(|r| {
+                r.request.request_id == request.request_id && r.sequence <= mode.activated_sequence
+            })
+        {
+            return Err(D1Error::IdempotencyConflict);
+        }
+        match self.write_inner(request, history)? {
+            D1Result::Write {
+                sequence,
+                status,
+                applied_operations,
+            } => Ok(D1Result::ManagedWrite {
+                mode_id,
+                sequence,
+                status,
+                applied_operations,
+            }),
+            _ => unreachable!("write_inner returns only Write"),
+        }
+    }
+
+    pub(crate) fn managed_status(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        request_id: [u8; 16],
+    ) -> Result<D1ManagedStatus, D1Error> {
+        self.check_shard(shard)?;
+        self.check_epoch(epoch)?;
+        let mode = self
+            .managed
+            .as_ref()
+            .ok_or(D1Error::ManagedWritesNotEnabled)?;
+        if mode.mode_id != mode_id {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        Ok(self
+            .dedup
+            .iter()
+            .find(|r| r.request.request_id == request_id && r.sequence > mode.activated_sequence)
+            .map_or(D1ManagedStatus::Unknown, |r| D1ManagedStatus::Committed {
+                sequence: r.sequence,
+            }))
+    }
+
+    fn write_inner(
+        &mut self,
+        request: &D1WriteRequest,
+        history: Option<&Self>,
+    ) -> Result<D1Result, D1Error> {
         let size = request.validate()?;
         if let Some(record) = self
             .dedup
@@ -574,5 +786,144 @@ mod capacity_tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    fn request(id: u8, expected: u64) -> D1WriteRequest {
+        D1WriteRequest {
+            shard: 7,
+            epoch: 3,
+            request_id: [id; 16],
+            expected_sequence: Some(expected),
+            operations: vec![WriteOp::Put {
+                key: vec![1],
+                value: vec![id],
+            }],
+        }
+    }
+    #[test]
+    fn managed_mode_is_explicit_fenced_and_preserves_historical_identities() {
+        let mut state = D1State::new(7, 3);
+        let mode = [9; 16];
+        assert_eq!(
+            state.managed_write(mode, &request(1, 0), None),
+            Err(D1Error::ManagedWritesNotEnabled)
+        );
+        state.write(&request(1, 0)).unwrap();
+        assert_eq!(
+            state.enable_managed(7, 3, 0, mode),
+            Err(D1Error::Conflict {
+                expected: 0,
+                current: 1
+            })
+        );
+        assert_eq!(
+            state.enable_managed(7, 3, 1, [0; 16]),
+            Err(D1Error::InvalidManagedMode)
+        );
+        state.enable_managed(7, 3, 1, mode).unwrap();
+        assert_eq!(
+            state.write(&request(1, 0)),
+            Err(D1Error::ManagedWriteRequired)
+        );
+        assert_eq!(
+            state.write(&request(2, 1)),
+            Err(D1Error::ManagedWriteRequired)
+        );
+        assert_eq!(
+            state.managed_write(mode, &request(1, 0), None),
+            Err(D1Error::IdempotencyConflict)
+        );
+        assert_eq!(
+            state.managed_write([8; 16], &request(2, 1), None),
+            Err(D1Error::ManagedModeConflict)
+        );
+        assert!(matches!(
+            state.managed_write(mode, &request(2, 1), None),
+            Ok(D1Result::ManagedWrite {
+                sequence: 2,
+                status: D1WriteStatus::Committed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            state.managed_write(mode, &request(2, 1), None),
+            Ok(D1Result::ManagedWrite {
+                sequence: 2,
+                status: D1WriteStatus::Duplicate,
+                ..
+            })
+        ));
+        let mut changed = request(2, 1);
+        changed.operations.clear();
+        assert_eq!(
+            state.managed_write(mode, &changed, None),
+            Err(D1Error::EmptyBatch)
+        );
+        changed.operations = vec![WriteOp::Delete { key: vec![1] }];
+        assert_eq!(
+            state.managed_write(mode, &changed, None),
+            Err(D1Error::IdempotencyConflict)
+        );
+        assert_eq!(
+            state.managed_status(7, 3, mode, [2; 16]),
+            Ok(D1ManagedStatus::Committed { sequence: 2 })
+        );
+        for id in [1, 3] {
+            assert_eq!(
+                state.managed_status(7, 3, mode, [id; 16]),
+                Ok(D1ManagedStatus::Unknown)
+            );
+        }
+        assert_eq!(
+            state.enable_managed(7, 3, 1, mode),
+            Ok(D1Result::ManagedWritesEnabled {
+                mode_id: mode,
+                activated_sequence: 1
+            })
+        );
+        assert_eq!(
+            state.enable_managed(7, 3, 2, mode),
+            Err(D1Error::ManagedModeConflict)
+        );
+        assert_eq!(
+            state.enable_managed(7, 3, 1, [8; 16]),
+            Err(D1Error::ManagedModeConflict)
+        );
+        state
+            .set_capacity(7, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES)
+            .unwrap();
+        assert_eq!(state.version, 3);
+        state.validate().unwrap();
+        let copy: D1State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        copy.validate().unwrap();
+        assert_eq!(copy, state);
+        for invalid in 0..4 {
+            let mut bad = copy.clone();
+            match invalid {
+                0 => bad.version = 2,
+                1 => bad.managed = None,
+                2 => bad.managed.as_mut().unwrap().mode_id = [0; 16],
+                _ => bad.managed.as_mut().unwrap().activated_sequence = bad.sequence + 1,
+            }
+            assert!(bad.validate().is_err());
+        }
+        let mut bad_cas = copy.clone();
+        bad_cas.dedup[1].request.expected_sequence = Some(0);
+        assert!(bad_cas.validate().is_err());
+        let mut bad_epoch = copy.clone();
+        bad_epoch.dedup[1].request.epoch = 2;
+        assert!(bad_epoch.validate().is_err());
+        state.epoch = 4;
+        assert_eq!(
+            state.write(&request(3, 2)),
+            Err(D1Error::Fenced {
+                requested: 3,
+                current: 4
+            })
+        );
     }
 }
