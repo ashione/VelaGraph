@@ -1,7 +1,8 @@
 # Transaction decision journal protocol prototype
 
-Status: **experimental Raft-backed decision ledger**, not integrated with data
-participant preparation, graph writers, or query admission.
+Status: **experimental Raft-backed decision ledger**. The opt-in
+[participant state and trusted in-process relay](PARTICIPANT_WRITES.md) now use
+its decisions; existing graph writers and global query admission are not wired.
 `GlobalCommittedSnapshot` remains Unsupported. Existing graph writes and reads
 are unchanged. This document is not a declaration that D4 is complete.
 
@@ -35,8 +36,9 @@ an old whole-directory rollback without an independent durable anchor.
 `resolved_prefix` includes both committed and aborted transactions and stops at
 an unresolved ordinal. **It is neither a committed-data watermark nor an MVCC
 read version**. A Commit event does not prove that data was applied on any shard.
-Prepared entries are currently only protocol inputs, not verified participant
-proofs. Exposing this module directly to untrusted callers would not create a
+Low-level Prepared entries remain trusted internal protocol inputs, not
+cryptographic participant proofs. The in-process participant relay only records
+them after the participant Raft group durably accepts the full intent. Exposing this module directly to untrusted callers would not create a
 correct distributed transaction system. Intent IDs are not authentication tokens.
 
 ## Role and format boundary

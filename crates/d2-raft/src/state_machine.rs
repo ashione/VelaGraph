@@ -66,6 +66,17 @@ struct D1MetadataV4 {
 }
 
 fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
+    if state.participant.is_some() {
+        #[derive(Serialize)]
+        struct Metadata {
+            version: u32,
+            state: D1State,
+        }
+        return serde_json::to_vec(&Metadata {
+            version: 6,
+            state: state.stage(),
+        });
+    }
     if state.coordinator.is_some() {
         // Dedicated format: old binaries must not ignore coordinator authority.
         #[derive(Serialize)]
@@ -429,6 +440,22 @@ impl StateMachine {
                     );
                     d1 = Some(meta.state);
                 }
+                6 => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Metadata {
+                        version: u32,
+                        state: D1State,
+                    }
+                    let meta: Metadata = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        meta.version == 6
+                            && meta.state.participant.is_some()
+                            && meta.state.dedup.is_empty(),
+                        "invalid participant metadata"
+                    );
+                    d1 = Some(meta.state);
+                }
                 _ => anyhow::bail!("unsupported D1 disk version"),
             }
         }
@@ -578,6 +605,29 @@ impl StateMachine {
             sequence: d1.sequence,
             entries: state.data.clone(),
         }))
+    }
+
+    /// Local diagnostic participant status. Establish a leader read barrier
+    /// before using this for distributed recovery; Unknown never means Aborted.
+    pub async fn participant_status(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        id: [u8; 16],
+    ) -> Result<crate::participant_writes::Status, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        Ok(d1
+            .participant
+            .as_ref()
+            .ok_or(D1Error::ParticipantNotEnabled)?
+            .status(id))
     }
 
     /// Local decision status only. Distributed callers must establish a leader
@@ -871,6 +921,31 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     .into());
                 }
             }
+            if current.participant.is_none()
+                && incoming
+                    .participant
+                    .as_ref()
+                    .is_some_and(|p| p.activated_sequence < current.sequence)
+            {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other("snapshot retroactively certifies participant writes"),
+                )
+                .into());
+            }
+            if let Some(participant) = &current.participant {
+                if !incoming
+                    .participant
+                    .as_ref()
+                    .is_some_and(|next| participant.validate_successor(next))
+                {
+                    return Err(StorageIOError::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other("snapshot would erase participant intent history"),
+                    )
+                    .into());
+                }
+            }
             if incoming.bytes_limit() < current.bytes_limit() {
                 return Err(StorageIOError::read_snapshot(
                     Some(meta.signature()),
@@ -989,6 +1064,7 @@ impl ApplyDelta {
                 previous.dedup_bytes_limit = next.dedup_bytes_limit;
                 previous.managed = next.managed;
                 previous.coordinator = next.coordinator;
+                previous.participant = next.participant;
                 previous.epoch = next.epoch;
                 previous.sequence = next.sequence;
                 previous.dedup.append(&mut next.dedup);
@@ -1036,6 +1112,65 @@ fn apply_d1(
     command: D1Command,
 ) -> Result<D1Result, D1Error> {
     match command {
+        D1Command::EnableParticipant {
+            shard,
+            epoch,
+            mode_id,
+            authority,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            if d1.coordinator.is_some() {
+                return Err(D1Error::CoordinatorOnly);
+            }
+            if authority.mode == [0; 16] || authority.shard == shard {
+                return Err(D1Error::ParticipantAuthority);
+            }
+            if let Some(current) = &d1.participant {
+                if current.authority != authority {
+                    return Err(D1Error::ParticipantAuthority);
+                }
+            } else {
+                d1.participant = Some(crate::participant_writes::State {
+                    authority,
+                    activated_sequence: d1.sequence,
+                    records: Vec::new(),
+                });
+                d1.version = 5;
+            }
+            Ok(D1Result::Participant(
+                crate::participant_writes::Status::Unknown,
+            ))
+        }
+        D1Command::PrepareParticipant {
+            authority,
+            participant,
+            request,
+        } => next
+            .d1
+            .as_mut()
+            .ok_or(D1Error::NotActivated)?
+            .prepare_participant(&authority, participant, request, base.d1.as_ref()),
+        D1Command::ResolveParticipant {
+            authority,
+            participant,
+            id,
+            decision,
+        } => {
+            let (result, request) = next
+                .d1
+                .as_mut()
+                .ok_or(D1Error::NotActivated)?
+                .resolve_participant(&authority, participant, id, decision, base.d1.as_ref())?;
+            if let Some(request) = request {
+                apply_operations(base, next, batch, request.operations);
+            }
+            Ok(result)
+        }
         D1Command::EnableCoordinator {
             shard,
             epoch,
@@ -1050,6 +1185,9 @@ fn apply_d1(
                 .ok_or(D1Error::ManagedWritesNotEnabled)?;
             if mode.mode_id != mode_id {
                 return Err(D1Error::ManagedModeConflict);
+            }
+            if d1.participant.is_some() {
+                return Err(D1Error::ParticipantOnly);
             }
             if d1.sequence != 0 || next.data_len != 0 {
                 return Err(D1Error::CoordinatorRequiresEmptyShard);
@@ -1111,6 +1249,9 @@ fn apply_d1(
         } => {
             let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
             d1.check_shard(shard)?;
+            if d1.participant.as_ref().is_some_and(|s| s.pending()) && new_epoch != d1.epoch {
+                return Err(D1Error::ParticipantBusy);
+            }
             if new_epoch < expected_epoch {
                 return Err(D1Error::InvalidEpoch);
             }
@@ -2237,3 +2378,7 @@ mod coordinator_tests {
             .is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "participant_state_tests.rs"]
+mod participant_state_tests;
