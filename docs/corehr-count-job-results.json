@@ -1,0 +1,506 @@
+{
+  "candidate_local": "63697b794cf8264c5277b24d77afdc38abd870a8",
+  "tree_prefix": "bee260ea",
+  "source_sha256": {
+    "README.md": "edf48a8318f639266245ffb3a3ba1a8305649341a7b0dce251ccf1e164cee617",
+    "crates/replicated-graph/src/bin/graph-coordinator.rs": "d3c62ff78edcfcac48f978bde153cf031b98d614dfc7a96feeaeeb73f8f45f6d",
+    "crates/replicated-graph/src/remote.rs": "65962edb35828cf0f323ab48c0f65f3df5cef3668dfc1deddb6671bceb77b648",
+    "crates/replicated-graph/src/remote/distributed/jobs.rs": "84a8cf353deac2c8afb01ba4d4674d240d997e63f1c023998434eb83133666b7",
+    "crates/replicated-graph/src/remote/distributed/mod.rs": "bda510ba3d0e9fb69396c055a657812eccef16c7e72b9043f8842da169f26057",
+    "crates/replicated-graph/src/remote/distributed/sessions.rs": "e80430d79233cf58d1bf712797dacfbd196eb4c422ece53c70c5cf9329c85573",
+    "crates/replicated-graph/tests/distributed_query.rs": "df71510b7d5e52d4252a9f1e8729cb96d32fffdf77f86519f84f0a0267421ad3",
+    "crates/replicated-graph/tests/distributed_query/jobs.rs": "d5e1268712431e1b47b6647c3a0a7fc6d92e01fc441881ceb293f77a83ac1a86",
+    "docs/DISTRIBUTED_QUERY.md": "4d4901e827b672a38c732197a706de7a0444b516abd93a871edd72e23aded032",
+    "docs/HIERARCHY_COUNT_JOBS.md": "c35f410d925b9d5bbdee10cab6fa7d84eb7bb038413bba55caaa8cee528a2067",
+    "docs/ROADMAP.md": "033dc9103254abc78506b0a3b445ee35fffe6386d522110057dbc018637014a7",
+    "crates/replicated-graph/examples/corehr_jobs_run.rs": "8f816039ff6cf955d11d22542b3b5d219887c4a2d436c31f678ad0b73cbfca5c"
+  },
+  "binary_sha256": {
+    "graph-node": "0afdfbe891b7cb6f235d4aeb0d0dd4b0cc7a90347b533ebc559c1632e39f1ccc",
+    "corehr_jobs_run": "8a2985e45b8e89fd0512fe8d1cfd1c0a411660196f86be27c5f5c4ee101e012c"
+  },
+  "results": {
+    "smoke": {
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 6.083796238992363,
+        "tokio_worker_threads": 2,
+        "fixture_readonly_source": "/workspace/scratch/1462420af989/corehr-hierarchy-evidence/smoke-fixture",
+        "stage": "formal_pr64_matrix"
+      },
+      "matrix": {
+        "ceo_emit32": {
+          "seconds": [
+            0.194961388,
+            0.195025424,
+            0.196354962
+          ],
+          "median_seconds": 0.195025424,
+          "requests": [
+            128,
+            128,
+            128
+          ],
+          "count": 1999,
+          "expected_rejection": null
+        },
+        "ceo_emit32_dedup": {
+          "seconds": [
+            0.214384336,
+            0.202138035,
+            0.195644765
+          ],
+          "median_seconds": 0.202138035,
+          "requests": [
+            128,
+            128,
+            128
+          ],
+          "count": 1999,
+          "expected_rejection": null
+        },
+        "ceo_exact32": {
+          "seconds": [
+            0.202517344,
+            0.196029964,
+            0.209412277
+          ],
+          "median_seconds": 0.202517344,
+          "requests": [
+            128,
+            128,
+            128
+          ],
+          "count": 0,
+          "expected_rejection": null
+        },
+        "ceo_exact6": {
+          "seconds": [
+            0.194289899,
+            0.198557867,
+            0.195182675
+          ],
+          "median_seconds": 0.195182675,
+          "requests": [
+            128,
+            128,
+            128
+          ],
+          "count": 0,
+          "expected_rejection": null
+        },
+        "department_emit32": {
+          "seconds": [
+            0.087583729,
+            0.080586256,
+            0.09185542
+          ],
+          "median_seconds": 0.087583729,
+          "requests": [
+            7,
+            7,
+            7
+          ],
+          "count": 49,
+          "expected_rejection": null
+        },
+        "department_exact6": {
+          "seconds": [
+            0.084323654,
+            0.081022983,
+            0.091089754
+          ],
+          "median_seconds": 0.084323654,
+          "requests": [
+            7,
+            7,
+            7
+          ],
+          "count": 0,
+          "expected_rejection": null
+        },
+        "duplicate_ceo_emit32": {
+          "seconds": [
+            0.204521778,
+            0.205490042,
+            0.212174049
+          ],
+          "median_seconds": 0.205490042,
+          "requests": [
+            128,
+            128,
+            128
+          ],
+          "count": 3998,
+          "expected_rejection": null
+        }
+      },
+      "probes": [
+        {
+          "correct": true,
+          "count": 49,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 2,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 2,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 2,
+              "shard": 3
+            }
+          ],
+          "name": "department_emit32",
+          "partial_count_returned": false,
+          "phase": "probe",
+          "replay_ms": 0.421954,
+          "replay_verified": true,
+          "requests": 7,
+          "rpc_latency": {
+            "max_ms": 19.586255,
+            "min_ms": 6.141159999999999,
+            "n": 7,
+            "p50_ms": 11.965582000000001,
+            "p95_ms": 19.586255
+          },
+          "sample": 0,
+          "seconds": 0.082764093
+        },
+        {
+          "correct": true,
+          "count": 1999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 2,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 2,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 2,
+              "shard": 3
+            }
+          ],
+          "name": "ceo_emit32_dedup",
+          "partial_count_returned": false,
+          "phase": "probe",
+          "replay_ms": 0.5569569999999999,
+          "replay_verified": true,
+          "requests": 128,
+          "rpc_latency": {
+            "max_ms": 7.529575,
+            "min_ms": 0.692731,
+            "n": 128,
+            "p50_ms": 0.857008,
+            "p95_ms": 4.993634999999999
+          },
+          "sample": 0,
+          "seconds": 0.203345422
+        }
+      ],
+      "resources": {
+        "complete": true,
+        "database_bytes": 8782211,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   16304 kB",
+              "VmRSS:\t   16304 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t   30524 kB",
+              "VmRSS:\t   30524 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t   30052 kB",
+              "VmRSS:\t   30052 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t   30544 kB",
+              "VmRSS:\t   30544 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t   43688 kB",
+          "VmRSS:\t   43688 kB"
+        ]
+      }
+    },
+    "full": {
+      "execution": {
+        "exit_code": 0,
+        "wall_seconds": 337.5184453420079,
+        "tokio_worker_threads": 2,
+        "fixture_readonly_source": "/workspace/scratch/1462420af989/corehr-hierarchy-evidence/full-fixture",
+        "stage": "formal_pr64_matrix"
+      },
+      "matrix": {
+        "ceo_emit32": {
+          "seconds": [
+            19.403485514,
+            19.028539888,
+            19.270009187
+          ],
+          "median_seconds": 19.270009187,
+          "requests": [
+            12503,
+            12503,
+            12503
+          ],
+          "count": 199999,
+          "expected_rejection": null
+        },
+        "ceo_emit32_dedup": {
+          "seconds": [
+            6.496972563,
+            6.225420214,
+            6.759650083
+          ],
+          "median_seconds": 6.496972563,
+          "requests": [
+            1321,
+            1321,
+            1321
+          ],
+          "count": null,
+          "expected_rejection": "ResourceExhausted"
+        },
+        "ceo_exact32": {
+          "seconds": [
+            18.910438317,
+            19.990982355,
+            19.400505028
+          ],
+          "median_seconds": 19.400505028,
+          "requests": [
+            12503,
+            12503,
+            12503
+          ],
+          "count": 0,
+          "expected_rejection": null
+        },
+        "ceo_exact6": {
+          "seconds": [
+            9.507432962,
+            9.368557505,
+            9.616016542
+          ],
+          "median_seconds": 9.507432962,
+          "requests": [
+            2343,
+            2343,
+            2343
+          ],
+          "count": 162551,
+          "expected_rejection": null
+        },
+        "department_emit32": {
+          "seconds": [
+            7.941856135,
+            7.9210617580000005,
+            7.784269182
+          ],
+          "median_seconds": 7.9210617580000005,
+          "requests": [
+            318,
+            318,
+            318
+          ],
+          "count": 4999,
+          "expected_rejection": null
+        },
+        "department_exact6": {
+          "seconds": [
+            6.977209515,
+            7.153157107,
+            7.278447407
+          ],
+          "median_seconds": 7.153157107,
+          "requests": [
+            249,
+            249,
+            249
+          ],
+          "count": 1094,
+          "expected_rejection": null
+        },
+        "duplicate_ceo_emit32": {
+          "seconds": [
+            18.708361968,
+            18.689929397,
+            19.097174449
+          ],
+          "median_seconds": 18.708361968,
+          "requests": [
+            12503,
+            12503,
+            12503
+          ],
+          "count": 399998,
+          "expected_rejection": null
+        }
+      },
+      "probes": [
+        {
+          "correct": true,
+          "count": 4999,
+          "event": "job_outcome",
+          "fixed_snapshots": [
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 1,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 1
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 2,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 2
+            },
+            {
+              "epoch": 1,
+              "identity": {
+                "group": 3,
+                "node": 1
+              },
+              "sequence": 105,
+              "shard": 3
+            }
+          ],
+          "name": "department_emit32",
+          "partial_count_returned": false,
+          "phase": "probe",
+          "replay_ms": 0.6282,
+          "replay_verified": true,
+          "requests": 318,
+          "rpc_latency": {
+            "max_ms": 456.495675,
+            "min_ms": 3.777349,
+            "n": 318,
+            "p50_ms": 14.625682,
+            "p95_ms": 85.041002
+          },
+          "sample": 0,
+          "seconds": 8.434022869
+        },
+        {
+          "event": "job_outcome",
+          "expected_rejection": "ResourceExhausted",
+          "name": "ceo_emit32_dedup",
+          "partial_count_returned": false,
+          "phase": "probe",
+          "requests": 1321,
+          "rpc_latency": {
+            "max_ms": 363.19318499999997,
+            "min_ms": 0.70217,
+            "n": 1321,
+            "p50_ms": 5.257887,
+            "p95_ms": 6.729017000000001
+          },
+          "sample": 0,
+          "seconds": 6.753072256
+        }
+      ],
+      "resources": {
+        "complete": true,
+        "database_bytes": 830783230,
+        "event": "resources",
+        "nodes": [
+          {
+            "group": 0,
+            "memory": [
+              "VmHWM:\t   16420 kB",
+              "VmRSS:\t   16420 kB"
+            ]
+          },
+          {
+            "group": 1,
+            "memory": [
+              "VmHWM:\t  849128 kB",
+              "VmRSS:\t  849128 kB"
+            ]
+          },
+          {
+            "group": 2,
+            "memory": [
+              "VmHWM:\t  868392 kB",
+              "VmRSS:\t  868392 kB"
+            ]
+          },
+          {
+            "group": 3,
+            "memory": [
+              "VmHWM:\t  848544 kB",
+              "VmRSS:\t  848544 kB"
+            ]
+          }
+        ],
+        "query_failures": 0,
+        "runner": [
+          "VmHWM:\t  245412 kB",
+          "VmRSS:\t  245412 kB"
+        ]
+      }
+    }
+  },
+  "candidate_head": "5e14a14b62c58f902bcc423df45f6f30f20bb9f8",
+  "candidate_tree": "bee260eac7ac3179c268d488328cfdd5c28dd5a3"
+}
