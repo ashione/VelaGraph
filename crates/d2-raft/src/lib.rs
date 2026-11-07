@@ -21,8 +21,8 @@ pub mod tcp;
 mod types;
 
 pub use d1::{
-    D1Command, D1Error, D1Result, D1WriteRequest, D1WriteStatus, MAX_BATCH_BYTES,
-    MAX_BATCH_OPERATIONS, MAX_DEDUP_BYTES, MAX_DEDUP_REQUESTS,
+    D1Capacity, D1Command, D1Error, D1Result, D1WriteRequest, D1WriteStatus, EXTENDED_DEDUP_BYTES,
+    MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_DEDUP_BYTES, MAX_DEDUP_REQUESTS,
 };
 pub use durable_log_store::DurableLogStore;
 pub use log_store::LogStore;

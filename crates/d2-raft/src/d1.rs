@@ -9,6 +9,17 @@ pub const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// No eviction: exhaustion rejects new requests, never silently loses retries.
 pub const MAX_DEDUP_REQUESTS: usize = 4_096;
 pub const MAX_DEDUP_BYTES: usize = 64 * 1024 * 1024;
+/// Explicit opt-in tier; never automatically raised and never pruned.
+pub const EXTENDED_DEDUP_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1Capacity {
+    pub bytes_limit: usize,
+    pub retained_bytes: usize,
+    pub retained_requests: usize,
+    pub max_requests: usize,
+    pub max_bytes: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +45,12 @@ pub enum D1Command {
         expected_epoch: u64,
         new_epoch: u64,
     },
+    SetDedupCapacity {
+        shard: u64,
+        epoch: u64,
+        expected_bytes: usize,
+        new_bytes: usize,
+    },
     Write(D1WriteRequest),
 }
 
@@ -51,6 +68,9 @@ pub enum D1Result {
     },
     Epoch {
         epoch: u64,
+    },
+    DedupCapacity {
+        bytes_limit: usize,
     },
     Write {
         sequence: u64,
@@ -71,6 +91,8 @@ pub enum D1Error {
     BatchTooLarge,
     SequenceOverflow,
     DedupCapacity,
+    InvalidDedupCapacity,
+    CapacityConflict { expected: usize, current: usize },
     LegacyDataPresent,
     LegacyWriteDisabled,
     InvalidEpoch,
@@ -87,7 +109,9 @@ pub(crate) struct DedupRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct D1State {
-    version: u32,
+    pub(crate) version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dedup_bytes_limit: Option<usize>,
     pub shard: u64,
     pub epoch: u64,
     pub sequence: u64,
@@ -98,6 +122,7 @@ impl D1State {
     pub fn new(shard: u64, epoch: u64) -> Self {
         Self {
             version: 1,
+            dedup_bytes_limit: None,
             shard,
             epoch,
             sequence: 0,
@@ -106,7 +131,13 @@ impl D1State {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.version == 1, "unsupported D1 state version");
+        anyhow::ensure!(
+            matches!(
+                (self.version, self.dedup_bytes_limit),
+                (1, None) | (2, Some(EXTENDED_DEDUP_BYTES))
+            ),
+            "unsupported D1 state version/capacity"
+        );
         anyhow::ensure!(
             self.dedup.len() <= MAX_DEDUP_REQUESTS,
             "D1 dedup capacity exceeded"
@@ -135,13 +166,64 @@ impl D1State {
             );
             previous = record.sequence;
         }
-        anyhow::ensure!(bytes <= MAX_DEDUP_BYTES, "D1 dedup bytes exceeded");
+        anyhow::ensure!(bytes <= self.bytes_limit(), "D1 dedup bytes exceeded");
         // This version never prunes dedup records. A missing record is corruption.
         anyhow::ensure!(
             self.sequence == self.dedup.len() as u64,
             "incomplete D1 dedup state"
         );
         Ok(())
+    }
+
+    pub(crate) fn bytes_limit(&self) -> usize {
+        self.dedup_bytes_limit.unwrap_or(MAX_DEDUP_BYTES)
+    }
+
+    pub(crate) fn capacity(&self) -> D1Capacity {
+        D1Capacity {
+            bytes_limit: self.bytes_limit(),
+            retained_bytes: self.dedup.iter().fold(0usize, |sum, record| {
+                sum.saturating_add(record.request.retained_size())
+            }),
+            retained_requests: self.dedup.len(),
+            max_requests: MAX_DEDUP_REQUESTS,
+            max_bytes: EXTENDED_DEDUP_BYTES,
+        }
+    }
+
+    pub(crate) fn set_capacity(
+        &mut self,
+        shard: u64,
+        epoch: u64,
+        expected_bytes: usize,
+        new_bytes: usize,
+    ) -> Result<D1Result, D1Error> {
+        self.check_shard(shard)?;
+        self.check_epoch(epoch)?;
+        if !matches!(expected_bytes, MAX_DEDUP_BYTES | EXTENDED_DEDUP_BYTES)
+            || !matches!(new_bytes, MAX_DEDUP_BYTES | EXTENDED_DEDUP_BYTES)
+            || new_bytes < expected_bytes
+        {
+            return Err(D1Error::InvalidDedupCapacity);
+        }
+        // Fencing precedes idempotence; an already reached target is safe.
+        let current = self.bytes_limit();
+        if current != new_bytes && current != expected_bytes {
+            return Err(D1Error::CapacityConflict {
+                expected: expected_bytes,
+                current,
+            });
+        }
+        if new_bytes < current {
+            return Err(D1Error::InvalidDedupCapacity);
+        }
+        if new_bytes == EXTENDED_DEDUP_BYTES {
+            self.version = 2;
+            self.dedup_bytes_limit = Some(new_bytes);
+        }
+        Ok(D1Result::DedupCapacity {
+            bytes_limit: new_bytes,
+        })
     }
 
     pub fn check_shard(&self, shard: u64) -> Result<(), D1Error> {
@@ -169,6 +251,7 @@ impl D1State {
     pub(crate) fn stage(&self) -> Self {
         Self {
             version: self.version,
+            dedup_bytes_limit: self.dedup_bytes_limit,
             shard: self.shard,
             epoch: self.epoch,
             sequence: self.sequence,
@@ -228,7 +311,7 @@ impl D1State {
                 total.saturating_add(r.request.retained_size())
             });
         if self.dedup.len() + history.map_or(0, |state| state.dedup.len()) >= MAX_DEDUP_REQUESTS
-            || retained.saturating_add(size) > MAX_DEDUP_BYTES
+            || retained.saturating_add(size) > self.bytes_limit()
         {
             return Err(D1Error::DedupCapacity);
         }
@@ -366,5 +449,130 @@ mod tests {
         assert_eq!(state.write(&request), Err(D1Error::DedupCapacity));
         assert_eq!(state, before);
         state.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    fn request(id: u128, bytes: usize) -> D1WriteRequest {
+        D1WriteRequest {
+            shard: 7,
+            epoch: 3,
+            request_id: id.to_be_bytes(),
+            expected_sequence: None,
+            operations: vec![WriteOp::put([], vec![0; bytes])],
+        }
+    }
+    #[test]
+    fn explicit_tiers_fence_compare_and_retry_without_reset() {
+        let mut state = D1State::new(7, 3);
+        state.write(&request(1, 0)).unwrap();
+        let before = state.clone();
+        for (shard, epoch, expected, new) in [
+            (8, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES),
+            (7, 2, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES),
+            (7, 3, 0, EXTENDED_DEDUP_BYTES),
+            (7, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES + 1),
+            (7, 3, EXTENDED_DEDUP_BYTES, EXTENDED_DEDUP_BYTES),
+        ] {
+            assert!(state.set_capacity(shard, epoch, expected, new).is_err());
+            assert_eq!(state, before);
+        }
+        let result = D1Result::DedupCapacity {
+            bytes_limit: EXTENDED_DEDUP_BYTES,
+        };
+        assert_eq!(
+            state.set_capacity(7, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES),
+            Ok(result.clone())
+        );
+        assert_eq!(
+            state.set_capacity(7, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES),
+            Ok(result)
+        );
+        assert_eq!(state.sequence, 1);
+        assert_eq!(state.dedup, before.dedup);
+        assert!(matches!(
+            state.write(&request(1, 0)),
+            Ok(D1Result::Write {
+                sequence: 1,
+                status: D1WriteStatus::Duplicate,
+                ..
+            })
+        ));
+        assert_eq!(
+            state.set_capacity(7, 3, EXTENDED_DEDUP_BYTES, MAX_DEDUP_BYTES),
+            Err(D1Error::InvalidDedupCapacity)
+        );
+        state.validate().unwrap();
+        let old = serde_json::to_string(&before).unwrap();
+        assert!(!old.contains("dedup_bytes_limit"));
+        let new = serde_json::to_string(&state).unwrap();
+        assert!(new.contains("\"version\":2"));
+        for invalid in [
+            new.replace("\"version\":2", "\"version\":1"),
+            new.replace(
+                &EXTENDED_DEDUP_BYTES.to_string(),
+                &(EXTENDED_DEDUP_BYTES + 1).to_string(),
+            ),
+        ] {
+            assert!(serde_json::from_str::<D1State>(&invalid)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+    }
+    #[test]
+    fn default_and_extended_byte_boundaries_preserve_exact_retries() {
+        let mut state = D1State::new(7, 3);
+        // Raw payload plus one operation/request overhead is exactly 16MiB.
+        let bytes = MAX_BATCH_BYTES - 192;
+        for id in 1..=4 {
+            state.write(&request(id, bytes)).unwrap();
+        }
+        assert_eq!(state.capacity().retained_bytes, MAX_DEDUP_BYTES);
+        assert_eq!(state.write(&request(5, 0)), Err(D1Error::DedupCapacity));
+        state
+            .set_capacity(7, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES)
+            .unwrap();
+        for id in 5..=8 {
+            state.write(&request(id, bytes)).unwrap();
+        }
+        assert_eq!(state.capacity().retained_bytes, EXTENDED_DEDUP_BYTES);
+        assert_eq!(state.write(&request(9, 0)), Err(D1Error::DedupCapacity));
+        assert!(matches!(
+            state.write(&request(1, bytes)),
+            Ok(D1Result::Write {
+                sequence: 1,
+                status: D1WriteStatus::Duplicate,
+                ..
+            })
+        ));
+        assert_eq!(state.sequence, 8);
+        state.validate().unwrap();
+    }
+    #[test]
+    fn extended_tier_does_not_raise_request_count_limit() {
+        let mut state = D1State::new(7, 3);
+        state
+            .set_capacity(7, 3, MAX_DEDUP_BYTES, EXTENDED_DEDUP_BYTES)
+            .unwrap();
+        for id in 1..=MAX_DEDUP_REQUESTS {
+            state.dedup.push(DedupRecord {
+                request: request(id as u128, 0),
+                sequence: id as u64,
+            });
+        }
+        state.sequence = MAX_DEDUP_REQUESTS as u64;
+        state.validate().unwrap();
+        assert_eq!(state.write(&request(9999, 0)), Err(D1Error::DedupCapacity));
+        assert!(matches!(
+            state.write(&request(1, 0)),
+            Ok(D1Result::Write {
+                sequence: 1,
+                status: D1WriteStatus::Duplicate,
+                ..
+            })
+        ));
     }
 }

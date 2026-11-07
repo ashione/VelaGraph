@@ -44,6 +44,29 @@ impl D1MetadataV2 {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1MetadataV3 {
+    version: u32,
+    shard: u64,
+    epoch: u64,
+    sequence: u64,
+    dedup_bytes_limit: usize,
+}
+
+fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
+    match state.dedup_bytes_limit {
+        None => serde_json::to_vec(&D1MetadataV2::of(state)),
+        Some(dedup_bytes_limit) => serde_json::to_vec(&D1MetadataV3 {
+            version: 3,
+            shard: state.shard,
+            epoch: state.epoch,
+            sequence: state.sequence,
+            dedup_bytes_limit,
+        }),
+    }
+}
+
 fn dedup_key(sequence: u64) -> Vec<u8> {
     let mut key = DEDUP_PREFIX.to_vec();
     key.extend_from_slice(&sequence.to_be_bytes());
@@ -64,11 +87,71 @@ const DATA_PREFIX_END: &[u8] = b"sm/data0";
 const APPLIED_KEY: &[u8] = b"sm/applied";
 const MEMBERSHIP_KEY: &[u8] = b"sm/membership";
 const SNAPSHOT_KEY: &[u8] = b"sm/snapshot";
+const SNAPSHOT_DATA_KEY: &[u8] = b"sm/snapshot-data";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredSnapshot {
     pub meta: SnapshotMeta<NodeId, BasicNode>,
     pub data: Vec<u8>,
+}
+
+/// Disk-only snapshot envelope. Logical snapshot/transport bytes stay unchanged.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSnapshotV2 {
+    version: u32,
+    meta: SnapshotMeta<NodeId, BasicNode>,
+    data_len: u64,
+}
+
+fn put_snapshot(
+    batch: &mut WriteBatch,
+    snapshot: &StoredSnapshot,
+) -> Result<(), StorageError<NodeId>> {
+    let header = StoredSnapshotV2 {
+        version: 2,
+        meta: snapshot.meta.clone(),
+        data_len: snapshot.data.len() as u64,
+    };
+    batch.put(
+        SNAPSHOT_KEY,
+        serde_json::to_vec(&header).map_err(write_error)?,
+    );
+    batch.put(SNAPSHOT_DATA_KEY, &snapshot.data);
+    Ok(())
+}
+
+fn load_snapshot(db: &DB) -> anyhow::Result<Option<StoredSnapshot>> {
+    let header = db.get(SNAPSHOT_KEY)?;
+    let payload = db.get(SNAPSHOT_DATA_KEY)?;
+    let Some(header) = header else {
+        anyhow::ensure!(payload.is_none(), "orphan snapshot payload");
+        return Ok(None);
+    };
+    #[derive(Deserialize)]
+    struct Version {
+        version: Option<u32>,
+    }
+    match serde_json::from_slice::<Version>(&header)?.version {
+        None => {
+            anyhow::ensure!(payload.is_none(), "legacy snapshot has separate payload");
+            Ok(Some(serde_json::from_slice(&header)?))
+        }
+        Some(2) => {
+            let header: StoredSnapshotV2 = serde_json::from_slice(&header)?;
+            let data = payload.ok_or_else(|| anyhow::anyhow!("snapshot payload missing"))?;
+            anyhow::ensure!(
+                header.data_len == data.len() as u64,
+                "snapshot payload length mismatch"
+            );
+            Ok(Some(StoredSnapshot {
+                meta: header.meta,
+                data,
+            }))
+        }
+        _ => anyhow::bail!("unsupported stored snapshot version"),
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -88,6 +171,26 @@ struct SnapshotV1 {
     d1: D1State,
 }
 
+// Borrow the locked state while preserving the exact sorted array wire format.
+struct SnapshotEntries<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
+impl Serialize for SnapshotEntries<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for pair in self.0.iter() {
+            sequence.serialize_element(&pair)?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedSnapshotV1<'a> {
+    version: u32,
+    entries: SnapshotEntries<'a>,
+    d1: &'a D1State,
+}
+
 struct DecodedSnapshot {
     data: BTreeMap<Vec<u8>, Vec<u8>>,
     d1: Option<D1State>,
@@ -95,14 +198,19 @@ struct DecodedSnapshot {
 
 // Legacy snapshots are arrays; D1 snapshots are a mandatory versioned object.
 fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<DecodedSnapshot> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
-    let (entries, d1) = if value.is_array() {
+    let first = bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    let (entries, d1) = if first == Some(b'[') {
         (
-            serde_json::from_value::<Vec<(Vec<u8>, Vec<u8>)>>(value)?,
+            serde_json::from_slice::<Vec<(Vec<u8>, Vec<u8>)>>(bytes)?,
             None,
         )
     } else {
-        let snapshot: SnapshotV1 = serde_json::from_value(value)?;
+        // Deserialize directly into typed byte vectors, not one Value per byte.
+        // This keeps strict fields/version checks and rejects duplicate fields.
+        let snapshot: SnapshotV1 = serde_json::from_slice(bytes)?;
         anyhow::ensure!(snapshot.version == 1, "unsupported snapshot version");
         snapshot.d1.validate()?;
         (snapshot.entries, Some(snapshot.d1))
@@ -178,6 +286,8 @@ pub struct StateMachine {
     storage: Option<Arc<StateMachineStorage>>,
     #[cfg(test)]
     apply_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
+    #[cfg(test)]
+    snapshot_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
 }
 
 impl StateMachine {
@@ -217,6 +327,28 @@ impl StateMachine {
                         "D1 dedup capacity exceeded"
                     );
                     let mut state = D1State::new(meta.shard, meta.epoch);
+                    state.sequence = meta.sequence;
+                    d1 = Some(state);
+                }
+                3 => {
+                    let meta: D1MetadataV3 = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        meta.dedup_bytes_limit == crate::EXTENDED_DEDUP_BYTES,
+                        "unsupported D1 capacity"
+                    );
+                    anyhow::ensure!(
+                        meta.sequence <= MAX_DEDUP_REQUESTS as u64,
+                        "D1 dedup capacity exceeded"
+                    );
+                    let mut state = D1State::new(meta.shard, meta.epoch);
+                    state
+                        .set_capacity(
+                            meta.shard,
+                            meta.epoch,
+                            crate::MAX_DEDUP_BYTES,
+                            meta.dedup_bytes_limit,
+                        )
+                        .map_err(|e| anyhow::anyhow!("invalid capacity: {e:?}"))?;
                     state.sequence = meta.sequence;
                     d1 = Some(state);
                 }
@@ -276,10 +408,7 @@ impl StateMachine {
             data.insert(key[DATA_PREFIX.len()..].to_vec(), value.to_vec());
         }
         drop(iter);
-        let current_snapshot: Option<StoredSnapshot> = match storage.db.get(SNAPSHOT_KEY)? {
-            Some(value) => Some(serde_json::from_slice(&value)?),
-            None => None,
-        };
+        let current_snapshot = load_snapshot(&storage.db)?;
 
         let snapshot_idx = current_snapshot
             .as_ref()
@@ -298,7 +427,18 @@ impl StateMachine {
             storage: Some(storage),
             #[cfg(test)]
             apply_publish_gate: Default::default(),
+            #[cfg(test)]
+            snapshot_publish_gate: Default::default(),
         })
+    }
+
+    /// Local capacity capture; remote callers must first establish a read barrier.
+    pub async fn d1_capacity(&self, shard: u64, epoch: u64) -> Result<crate::D1Capacity, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        Ok(d1.capacity())
     }
 
     /// Capture D1 metadata and bytes under one lock, checking bounds before cloning.
@@ -379,18 +519,13 @@ impl StateMachine {
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachine> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let sm = self.state.read().await;
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = sm
-            .data
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
         let data = match &sm.d1 {
-            Some(d1) => serde_json::to_vec(&SnapshotV1 {
+            Some(d1) => serde_json::to_vec(&BorrowedSnapshotV1 {
                 version: 1,
-                entries,
-                d1: d1.clone(),
+                entries: SnapshotEntries(&sm.data),
+                d1,
             }),
-            None => serde_json::to_vec(&entries),
+            None => serde_json::to_vec(&SnapshotEntries(&sm.data)),
         }
         .map_err(|e| StorageIOError::read_state_machine(&e))?;
         let last_applied_log = sm.last_applied_log;
@@ -413,10 +548,16 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachine> {
             data: data.clone(),
         };
         if let Some(storage) = &self.storage {
-            let value = serde_json::to_vec(&stored).map_err(write_error)?;
             let mut batch = WriteBatch::default();
-            batch.put(SNAPSHOT_KEY, value);
+            put_snapshot(&mut batch, &stored)?;
             storage.write_sync(batch)?;
+        }
+        #[cfg(test)]
+        if let Some(gate) = self.snapshot_publish_gate.lock().unwrap().take() {
+            let _ = gate.entered.send(());
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release snapshot publication");
         }
         *current = Some(stored);
         Ok(Snapshot {
@@ -488,10 +629,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
                 let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
                 if let Some(d1) = &next.d1 {
-                    batch.put(
-                        D1_KEY,
-                        serde_json::to_vec(&D1MetadataV2::of(d1)).map_err(write_error)?,
-                    );
+                    batch.put(D1_KEY, d1_metadata_bytes(d1).map_err(write_error)?);
                     if storage.legacy_d1.load(Ordering::Relaxed) {
                         if let Some(previous) = &sm.d1 {
                             put_dedup(&mut batch, &previous.dedup)?;
@@ -565,6 +703,13 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             .into());
         }
         if let (Some(current), Some(incoming)) = (&sm.d1, &d1) {
+            if incoming.bytes_limit() < current.bytes_limit() {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other("snapshot would reduce D1 capacity"),
+                )
+                .into());
+            }
             if current.shard != incoming.shard {
                 return Err(StorageIOError::read_snapshot(
                     Some(meta.signature()),
@@ -595,24 +740,27 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             }
             let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
             let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
-            let snapshot = serde_json::to_vec(&stored).map_err(write_error)?;
             batch.delete_range(DEDUP_PREFIX, DEDUP_PREFIX_END);
             if let Some(d1) = &next.d1 {
-                batch.put(
-                    D1_KEY,
-                    serde_json::to_vec(&D1MetadataV2::of(d1)).map_err(write_error)?,
-                );
+                batch.put(D1_KEY, d1_metadata_bytes(d1).map_err(write_error)?);
                 put_dedup(&mut batch, &d1.dedup)?;
             } else {
                 batch.delete(D1_KEY);
             }
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
-            batch.put(SNAPSHOT_KEY, snapshot);
+            put_snapshot(&mut batch, &stored)?;
             storage.write_sync(batch)?;
             storage.legacy_d1.store(false, Ordering::Relaxed);
         }
 
+        #[cfg(test)]
+        if let Some(gate) = self.snapshot_publish_gate.lock().unwrap().take() {
+            let _ = gate.entered.send(());
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release snapshot publication");
+        }
         *sm = next;
         *current = Some(stored);
         Ok(())
@@ -669,6 +817,8 @@ impl ApplyDelta {
         }
         if let Some(mut next) = self.d1 {
             if let Some(previous) = state.d1.as_mut() {
+                previous.version = next.version;
+                previous.dedup_bytes_limit = next.dedup_bytes_limit;
                 previous.epoch = next.epoch;
                 previous.sequence = next.sequence;
                 previous.dedup.append(&mut next.dedup);
@@ -745,6 +895,17 @@ fn apply_d1(
             d1.epoch = new_epoch;
             Ok(D1Result::Epoch { epoch: new_epoch })
         }
+        D1Command::SetDedupCapacity {
+            shard,
+            epoch,
+            expected_bytes,
+            new_bytes,
+        } => next.d1.as_mut().ok_or(D1Error::NotActivated)?.set_capacity(
+            shard,
+            epoch,
+            expected_bytes,
+            new_bytes,
+        ),
         D1Command::Write(request) => {
             let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
             let result = d1.write_with_history(&request, base.d1.as_ref())?;
@@ -1203,6 +1364,404 @@ mod incremental_apply_tests {
             assert!(
                 matches!(result.d1, Some(Ok(D1Result::Write { sequence, status: D1WriteStatus::Duplicate, .. })) if sequence == index as u64 + 1)
             );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_snapshot_is_byte_identical_to_owned_v1_and_legacy() {
+        let entries = BTreeMap::from([(vec![0, 255], vec![128, 1]), (vec![3], vec![])]);
+        let d1 = D1State::new(7, 3);
+        let owned = SnapshotV1 {
+            version: 1,
+            entries: entries.clone().into_iter().collect(),
+            d1: d1.clone(),
+        };
+        let borrowed = BorrowedSnapshotV1 {
+            version: 1,
+            entries: SnapshotEntries(&entries),
+            d1: &d1,
+        };
+        let old = serde_json::to_vec(&owned).unwrap();
+        assert_eq!(serde_json::to_vec(&borrowed).unwrap(), old);
+        let decoded = decode_snapshot(&old).unwrap();
+        assert_eq!(decoded.data, entries);
+        assert_eq!(decoded.d1, Some(d1));
+        let legacy = serde_json::to_vec(&owned.entries).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&SnapshotEntries(&entries)).unwrap(),
+            legacy
+        );
+        assert_eq!(decode_snapshot(&legacy).unwrap().data, entries);
+        let mut whitespace = b" \n\t\r".to_vec();
+        whitespace.extend_from_slice(&legacy);
+        assert_eq!(decode_snapshot(&whitespace).unwrap().data, entries);
+        assert!(decode_snapshot(&whitespace).unwrap().d1.is_none());
+    }
+
+    #[test]
+    fn typed_snapshot_rejects_malformed_and_duplicate_fields() {
+        for bad in ["", "null", "42", "{}", "[] []", "[[[256],[]]]", "[[[1.0],[]]]", "[[[1],[]],[[1],[2]]]", "{\"version\":1,\"version\":1,\"entries\":[],\"d1\":{\"version\":1,\"shard\":7,\"epoch\":1,\"sequence\":0,\"dedup\":[]}}", "{\"version\":2,\"entries\":[],\"d1\":{\"version\":1,\"shard\":7,\"epoch\":1,\"sequence\":0,\"dedup\":[]}}", "{\"version\":1,\"entries\":[],\"unknown\":0,\"d1\":{\"version\":1,\"shard\":7,\"epoch\":1,\"sequence\":0,\"dedup\":[]}}", "{\"version\":1,\"entries\":[],\"d1\":{\"version\":1,\"shard\":7,\"epoch\":1,\"sequence\":1,\"dedup\":[]}}"] {
+            assert!(decode_snapshot(bad.as_bytes()).is_err(), "accepted {bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod raw_snapshot_tests {
+    use super::*;
+    fn empty_snapshot() -> StoredSnapshot {
+        StoredSnapshot {
+            meta: SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::default(),
+                snapshot_id: "--1".into(),
+            },
+            data: b"[]".to_vec(),
+        }
+    }
+    fn crash_snapshot() -> (Vec<u8>, crate::D1WriteRequest) {
+        let request = crate::D1WriteRequest {
+            shard: 7,
+            epoch: 3,
+            request_id: [1; 16],
+            expected_sequence: Some(0),
+            operations: vec![WriteOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        let mut d1 = D1State::new(7, 3);
+        d1.write(&request).unwrap();
+        (
+            serde_json::to_vec(&SnapshotV1 {
+                version: 1,
+                entries: vec![(b"k".to_vec(), b"v".to_vec())],
+                d1,
+            })
+            .unwrap(),
+            request,
+        )
+    }
+    #[test]
+    fn raw_snapshot_envelopes_reject_orphan_mixed_missing_and_bad_lengths() -> anyhow::Result<()> {
+        for case in 0..9 {
+            let dir = tempfile::tempdir()?;
+            let db = DB::open_default(dir.path())?;
+            let old = empty_snapshot();
+            let header = StoredSnapshotV2 {
+                version: 2,
+                meta: old.meta.clone(),
+                data_len: 2,
+            };
+            match case {
+                0 => db.put(SNAPSHOT_DATA_KEY, b"[]")?,
+                1 => {
+                    db.put(SNAPSHOT_KEY, serde_json::to_vec(&old)?)?;
+                    db.put(SNAPSHOT_DATA_KEY, b"[]")?;
+                }
+                2 => db.put(SNAPSHOT_KEY, serde_json::to_vec(&header)?)?,
+                3 => {
+                    db.put(SNAPSHOT_KEY, serde_json::to_vec(&header)?)?;
+                    db.put(SNAPSHOT_DATA_KEY, b"[")?;
+                }
+                4 => {
+                    db.put(
+                        SNAPSHOT_KEY,
+                        serde_json::to_vec(&StoredSnapshotV2 {
+                            version: 3,
+                            ..header
+                        })?,
+                    )?;
+                    db.put(SNAPSHOT_DATA_KEY, b"[]")?;
+                }
+                6 => {
+                    let mut value = serde_json::to_value(&old)?;
+                    value["version"] = serde_json::Value::Null;
+                    db.put(SNAPSHOT_KEY, serde_json::to_vec(&value)?)?;
+                }
+                7 => {
+                    let mut value = serde_json::to_value(&old)?;
+                    value["extra"] = true.into();
+                    db.put(SNAPSHOT_KEY, serde_json::to_vec(&value)?)?;
+                }
+                8 => {
+                    let encoded = serde_json::to_string(&header)?.replacen(
+                        "\"version\":2",
+                        "\"version\":2,\"version\":2",
+                        1,
+                    );
+                    db.put(SNAPSHOT_KEY, encoded.as_bytes())?;
+                    db.put(SNAPSHOT_DATA_KEY, b"[]")?;
+                }
+                _ => {
+                    let mut value = serde_json::to_value(header)?;
+                    value["extra"] = true.into();
+                    db.put(SNAPSHOT_KEY, serde_json::to_vec(&value)?)?;
+                    db.put(SNAPSHOT_DATA_KEY, b"[]")?;
+                }
+            }
+            assert!(load_snapshot(&db).is_err(), "accepted case {case}");
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn legacy_empty_snapshot_migrates_only_after_successful_sync() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let old = empty_snapshot();
+        let bytes = serde_json::to_vec(&old)?;
+        {
+            let db = DB::open_default(dir.path())?;
+            db.put(SNAPSHOT_KEY, &bytes)?;
+        }
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        assert_eq!(
+            sm.storage.as_ref().unwrap().db.get(SNAPSHOT_KEY)?.unwrap(),
+            bytes
+        );
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm.build_snapshot().await.is_err());
+        assert_eq!(
+            sm.storage.as_ref().unwrap().db.get(SNAPSHOT_KEY)?.unwrap(),
+            bytes
+        );
+        assert!(sm
+            .storage
+            .as_ref()
+            .unwrap()
+            .db
+            .get(SNAPSHOT_DATA_KEY)?
+            .is_none());
+        assert_eq!(
+            sm.current_snapshot
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .meta
+                .snapshot_id,
+            old.meta.snapshot_id
+        );
+        let fresh = sm.build_snapshot().await?;
+        assert_eq!(fresh.snapshot.get_ref(), b"[]");
+        let disk = sm.storage.as_ref().unwrap().db.get(SNAPSHOT_KEY)?.unwrap();
+        assert!(
+            serde_json::from_slice::<StoredSnapshot>(&disk).is_err(),
+            "old decoder must fail closed"
+        );
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        assert_eq!(
+            sm.get_current_snapshot().await?.unwrap().snapshot.get_ref(),
+            b"[]"
+        );
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn snapshot_crash_child() -> anyhow::Result<()> {
+        let Some(path) = std::env::var_os("D2_SNAPSHOT_CRASH_DIRECTORY") else {
+            return Ok(());
+        };
+        let path = std::path::PathBuf::from(path);
+        let mut sm = Arc::new(StateMachine::open(path.join("state.db"))?);
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 7)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "1-7-1".into(),
+        };
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (_release, gate) = std::sync::mpsc::channel();
+        *sm.snapshot_publish_gate.lock().unwrap() = Some(ApplyPublishGate {
+            entered,
+            release: gate,
+        });
+        let writer = tokio::spawn(async move {
+            sm.install_snapshot(&meta, Box::new(Cursor::new(crash_snapshot().0)))
+                .await
+        });
+        ready.await?;
+        std::fs::write(path.join("synced"), b"ready")?;
+        writer.await??;
+        anyhow::bail!("parent must kill child after sync")
+    }
+    #[tokio::test]
+    async fn process_death_after_snapshot_sync_recovers_metadata_payload_and_state(
+    ) -> anyhow::Result<()> {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "state_machine::raw_snapshot_tests::snapshot_crash_child",
+                    "--nocapture",
+                ])
+                .env("D2_SNAPSHOT_CRASH_DIRECTORY", dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while !dir.path().join("synced").exists() {
+                anyhow::ensure!(child.0.try_wait()?.is_none(), "child exited before sync");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        child.0.kill()?;
+        child.0.wait()?;
+        let mut sm = Arc::new(StateMachine::open(dir.path().join("state.db"))?);
+        assert_eq!(sm.applied().await.unwrap().index, 7);
+        assert_eq!(sm.get_raw(b"k").await, Some(b"v".to_vec()));
+        let snapshot = sm.get_current_snapshot().await?.unwrap();
+        assert_eq!(snapshot.meta.last_log_id.unwrap().index, 7);
+        assert_eq!(snapshot.snapshot.get_ref(), &crash_snapshot().0);
+        assert_eq!(sm.d1_metadata().await, Some((7, 3, 1)));
+        let reply = sm
+            .apply([Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 8),
+                payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Write(
+                    crash_snapshot().1,
+                ))),
+            }])
+            .await?;
+        assert!(matches!(
+            reply[0].d1,
+            Some(Ok(D1Result::Write {
+                sequence: 1,
+                status: D1WriteStatus::Duplicate,
+                ..
+            }))
+        ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capacity_persistence_tests {
+    use super::*;
+    fn entry(index: u64, command: D1Command) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(LogCommand::D1V1(command)),
+        }
+    }
+    fn expand() -> D1Command {
+        D1Command::SetDedupCapacity {
+            shard: 7,
+            epoch: 3,
+            expected_bytes: crate::MAX_DEDUP_BYTES,
+            new_bytes: crate::EXTENDED_DEDUP_BYTES,
+        }
+    }
+    #[tokio::test]
+    async fn capacity_sync_failure_reopen_snapshot_and_retry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        let request = crate::D1WriteRequest {
+            shard: 7,
+            epoch: 3,
+            request_id: [1; 16],
+            expected_sequence: Some(0),
+            operations: vec![WriteOp::put(b"k", b"v")],
+        };
+        sm.apply([
+            entry(1, D1Command::Activate { shard: 7, epoch: 3 }),
+            entry(2, D1Command::Write(request.clone())),
+        ])
+        .await?;
+        // Reconstruct an actual v1 single-key fixture to exercise expansion
+        // together with lazy incremental-history migration in one sync batch.
+        let legacy = serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap())?;
+        let mut legacy_batch = WriteBatch::default();
+        legacy_batch.put(D1_KEY, legacy);
+        legacy_batch.delete_range(DEDUP_PREFIX, DEDUP_PREFIX_END);
+        sm.storage.as_ref().unwrap().write_sync(legacy_batch)?;
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        let old = sm.storage.as_ref().unwrap().db.get(D1_KEY)?.unwrap();
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm.apply([entry(3, expand())]).await.is_err());
+        assert_eq!(sm.storage.as_ref().unwrap().db.get(D1_KEY)?.unwrap(), old);
+        assert_eq!(
+            sm.d1_capacity(7, 3).await.unwrap().bytes_limit,
+            crate::MAX_DEDUP_BYTES
+        );
+        assert_eq!(sm.applied().await.unwrap().index, 2);
+        sm.apply([entry(3, expand()), entry(4, expand())]).await?;
+        assert_eq!(sm.d1_metadata().await, Some((7, 3, 1)));
+        assert_eq!(
+            sm.d1_capacity(7, 3).await.unwrap().bytes_limit,
+            crate::EXTENDED_DEDUP_BYTES
+        );
+        let header = sm.storage.as_ref().unwrap().db.get(D1_KEY)?.unwrap();
+        let parsed: D1MetadataV3 = serde_json::from_slice(&header)?;
+        assert_eq!(parsed.version, 3);
+        assert!(serde_json::from_slice::<D1MetadataV2>(&header).is_err());
+        let snapshot = sm.build_snapshot().await?;
+        let decoded: SnapshotV1 = serde_json::from_slice(snapshot.snapshot.get_ref())?;
+        assert_eq!(decoded.d1.version, 2);
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path())?);
+        assert_eq!(
+            sm.d1_capacity(7, 3).await.unwrap().bytes_limit,
+            crate::EXTENDED_DEDUP_BYTES
+        );
+        let mut old = Arc::new(StateMachine::default());
+        old.apply([entry(9, D1Command::Activate { shard: 7, epoch: 3 })])
+            .await?;
+        let downgrade = old.build_snapshot().await?;
+        assert!(sm
+            .install_snapshot(&downgrade.meta, downgrade.snapshot)
+            .await
+            .is_err());
+        assert_eq!(
+            sm.d1_capacity(7, 3).await.unwrap().bytes_limit,
+            crate::EXTENDED_DEDUP_BYTES
+        );
+        let target_dir = tempfile::tempdir()?;
+        let mut target = Arc::new(StateMachine::open(target_dir.path())?);
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await?;
+        drop(target);
+        let mut target = Arc::new(StateMachine::open(target_dir.path())?);
+        for node in [&mut sm, &mut target] {
+            assert_eq!(
+                node.d1_capacity(7, 3).await.unwrap().bytes_limit,
+                crate::EXTENDED_DEDUP_BYTES
+            );
+            let result = node
+                .apply([entry(5, D1Command::Write(request.clone()))])
+                .await?;
+            assert!(matches!(
+                result[0].d1,
+                Some(Ok(D1Result::Write {
+                    sequence: 1,
+                    status: D1WriteStatus::Duplicate,
+                    ..
+                }))
+            ));
         }
         Ok(())
     }

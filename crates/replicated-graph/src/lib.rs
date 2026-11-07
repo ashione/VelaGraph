@@ -389,7 +389,11 @@ fn application_error(
             StorageNodeError::ResourceExhausted("D1 write capacity exceeded".into())
         }
         D1Error::NotActivated => StorageNodeError::Unsupported("D1 is not activated".into()),
-        D1Error::WrongShard { .. } | D1Error::EmptyBatch | D1Error::InvalidEpoch => {
+        D1Error::WrongShard { .. }
+        | D1Error::EmptyBatch
+        | D1Error::InvalidEpoch
+        | D1Error::InvalidDedupCapacity
+        | D1Error::CapacityConflict { .. } => {
             StorageNodeError::InvalidArgument("invalid D1 request".into())
         }
         D1Error::LegacyDataPresent | D1Error::LegacyWriteDisabled => {

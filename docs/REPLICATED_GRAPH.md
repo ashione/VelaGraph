@@ -116,7 +116,8 @@ Convenience CRUD calls generate a new identity on each invocation and are not
 an unknown-outcome recovery API.
 
 The D2 hard limits remain unchanged: 10,000 operations / 16 MiB raw bytes per
-batch, 4,096 retained successful requests / 64 MiB accounted dedup budget, no
+batch, 4,096 retained successful requests / default 64 MiB accounted dedup budget
+(explicit fixed 128 MiB tier via the D2 administrator protocol), no
 eviction or reset. New writes fail closed when full; already retained retries
 still work. Do not bypass this limit with new adapters or epoch increments.
 

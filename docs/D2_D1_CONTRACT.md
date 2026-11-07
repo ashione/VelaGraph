@@ -85,8 +85,8 @@ the barrier, not separate metadata/data reads.
 ## Bounds and explicit prototype limitations
 
 A batch contains 1–10,000 operations and at most 16 MiB of key/value bytes.
-Dedup retains at most 4,096 successful requests and an accounting budget of
-64 MiB: raw key/value bytes + 64 bytes per operation + 128 bytes per request.
+Dedup retains at most 4,096 successful requests and a default accounting budget of
+64 MiB (an explicit 128 MiB tier is described below): raw key/value bytes + 64 bytes per operation + 128 bytes per request.
 This bounds retained work even for empty keys/values; it is **not** a bound on
 process RSS, JSON bytes or snapshot size. Invalid or oversized commands fail
 without reserving an id. Capacity is checked only after duplicate lookup, so
@@ -138,7 +138,8 @@ write, and the process-crash test kills after successful sync. Neither is a
 power-loss or filesystem-corruption proof.
 Subsequent applies persist only newly accepted records and small metadata;
 rejections and exact retries do not rewrite old request bytes. No records are
-pruned, hashed in place of exact identity, or granted extra capacity.
+pruned or hashed in place of exact identity. Incremental persistence itself does
+not grant extra capacity; the explicit administrative command below does.
 
 Apply keeps a changed-key overlay and a metadata/new-record overlay. Requests
 see both published and earlier-in-this-call retry history; ordered operations
@@ -220,3 +221,113 @@ network-response-loss simulator. Partition tests use the in-process drop policy;
 existing OS-process tests continue to cover the legacy transport. No result here
 claims graph-engine integration, multi-host security, automatic routing or
 cross-partition transactions.
+
+## Snapshot memory and disk envelope v2
+
+Logical snapshots keep their existing sorted legacy array or full D1 object
+bytes. Unexpanded D1 state retains its exact v1 encoding; expanded state uses
+the explicitly versioned D1 v2 payload described below. Building serializes borrowed state under the existing read lock rather
+than cloning the complete key/value map and retry history. Installing decodes
+straight into typed byte vectors instead of constructing a JSON `Value` for
+every byte. Version, unknown-field, D1 completeness/capacity and duplicate-key
+validation remain mandatory; duplicate JSON object fields are now rejected
+rather than silently taking the last field. Malformed input never publishes
+partial state.
+
+The persisted snapshot has a separate disk-only version. `sm/snapshot` now
+contains the strict JSON fields `version` (=2), `meta` (unchanged Openraft
+snapshot metadata), and `data_len` (the exact payload byte length).
+`sm/snapshot-data` contains the unmodified logical snapshot bytes, avoiding
+JSON-encoding those bytes a second time. Both keys are written in one sync
+WriteBatch. Snapshot installation includes them in the same batch as data,
+D1 metadata/retry records, membership and applied marker; publication occurs
+only after successful persistence, without an intervening await.
+
+The previous single-key `{meta,data}` JSON remains readable without mutation
+on open. The first successful snapshot build or install atomically replaces it
+with the new envelope and payload. Missing payload, orphan payload, a legacy
+envelope mixed with a separate payload, length mismatch, unknown versions and
+unknown v2 fields fail reopen. An empty graph has the logical payload `[]`, not
+an absent payload. This is not a checksum or arbitrary bit-corruption guarantee.
+
+Old binaries reject the v2 envelope because their required `data` field is
+absent. Upgrade all replicas before creating new snapshots. Do not open the new
+disk layout with an old binary. A rollback must export a complete old-compatible
+logical snapshot using the new binary and install it into a **fresh** old-format
+database, or restore a pre-upgrade backup with its associated data-loss caveat;
+copying the new RocksDB directory is not a downgrade. Logical byte compatibility
+alone does not guarantee an old binary has enough memory to restore a large
+snapshot. There is no automatic rollback or snapshot-export CLI in this change.
+Full logical snapshots, in-memory state and native RocksDB batch copies still
+have whole-state costs, so actual peak memory must be measured separately from
+request-accounting and frame limits.
+
+
+## Explicit bounded capacity tier
+
+This is an opt-in prototype capacity increase, not garbage collection or
+unlimited sustained throughput. Default behavior stays at 64 MiB and 4,096
+successful requests. `EXTENDED_DEDUP_BYTES` is a fixed 128 MiB hard maximum;
+only these two byte tiers are accepted. The request-count limit, per-write
+limits, query/session limits, Raft frame caps and timeouts do not change.
+Retained accounting is unchanged and is not RSS accounting.
+
+`SetDedupCapacity { shard, epoch, expected_bytes, new_bytes }` is a replicated
+D1 administrator command. It checks exact shard/epoch fencing before handling
+idempotence, rejects unknown tiers and decreases, and compare-and-sets the
+current budget. If the requested target is already current, the identical
+request succeeds again, even after a lost reply. It does not consume an
+application sequence or request identity. It persists the new capacity with
+the applied marker in the same sync batch and publishes only afterward.
+Other writes in the same apply call observe the newly committed tier.
+`InvalidDedupCapacity` and `CapacityConflict` are typed application failures;
+transport success alone is not administrative success.
+
+On the explicitly insecure development control port, after a linearizable
+read barrier, `D1Capacity` returns the current byte limit, retained accounted
+bytes and request count, and both fixed maxima. `D1SetCapacity` submits the
+command without retrying or selecting another leader. The operations helper
+prints the typed reply and exits nonzero for application rejection:
+
+```
+d2-ctl <leader-control-address> d1-capacity 7 3
+d2-ctl <leader-control-address> d1-set-capacity 7 3 67108864 134217728
+```
+
+Use an explicit operator decision after checking available RAM/disk and the
+reported usage. A new write rejected specifically with `DedupCapacity` did not
+reserve its identity: after successful expansion it may be resubmitted with
+the **same** complete request id, operations and condition. An uncertain write
+outcome still requires its original immutable retry, not a fresh id. Expansion
+never deletes earlier history, resets sequence, changes ownership epoch, or
+makes old ids reusable. Once 128 MiB or 4,096 requests fills, new writes still
+fail closed. There is no downgrade, pruning, automatic expansion or retention
+acknowledgement protocol.
+
+### Expanded persistence and rollout
+
+Upgrade **all replicas, administrative clients and recovery tooling** before
+using the new command. Mixed-version replication, version negotiation and
+rolling activation are not supported. Existing writer wire bytes happen to
+remain unchanged, but this is not a promise that old clients or binaries can
+participate safely in an expanded group.
+
+Unexpanded D1 state continues to serialize exactly as logical version 1, and
+its incremental disk header remains version 2. After opting in, logical D1
+state has `version:2` plus required `dedup_bytes_limit:134217728`; all prior
+request records and original sequences remain present. The outer logical
+snapshot envelope stays version 1. The expanded incremental disk header uses
+version 3 with fields `version,shard,epoch,sequence,dedup_bytes_limit`. Reopen
+and snapshot installation validate the exact version/tier combination, full
+history, both bounds and all previous invariants. Snapshot install cannot
+reduce an already-established capacity. Metadata-only expansion does not
+rewrite the retained retry records.
+
+Old binaries fail closed on expanded disk metadata, new command variants and
+expanded D1 snapshots. **An expanded snapshot is not an old-binary rollback
+format**, even if it currently contains less than 64 MiB. The logical snapshot
+interchange compatibility described above applies only to unexpanded D1 state.
+There is no in-place downgrade or lossless export-to-old-tier conversion tool.
+Retain a pre-expansion backup; restoring it loses subsequent commits unless a
+separately validated recovery procedure is developed. Preserve all replica
+databases and complete logical snapshots during upgrade and recovery.

@@ -406,6 +406,16 @@ pub async fn change_membership(raft: &Raft, ids: BTreeSet<NodeId>) -> anyhow::Re
 /// Driver commands used by the multi-process integration test and the node CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
+    D1Capacity {
+        shard: u64,
+        epoch: u64,
+    },
+    D1SetCapacity {
+        shard: u64,
+        epoch: u64,
+        expected_bytes: usize,
+        new_bytes: usize,
+    },
     Initialize {
         members: BTreeMap<NodeId, String>,
     },
@@ -442,6 +452,8 @@ pub struct NodeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
+    D1Capacity(Result<crate::D1Capacity, crate::D1Error>),
+    D1Admin(Result<crate::D1Result, crate::D1Error>),
     Ack,
     Index(u64),
     Value(Option<String>),
@@ -480,6 +492,32 @@ async fn handle_control_connection(
     drop(frame);
     let mut stream = reader.into_inner();
     let response = match request {
+        ControlRequest::D1Capacity { shard, epoch } => match raft.ensure_linearizable().await {
+            Ok(_) => ControlResponse::D1Capacity(state_machine.d1_capacity(shard, epoch).await),
+            Err(error) => ControlResponse::Err(error.to_string()),
+        },
+        ControlRequest::D1SetCapacity {
+            shard,
+            epoch,
+            expected_bytes,
+            new_bytes,
+        } => {
+            match raft
+                .client_write(LogCommand::D1V1(crate::D1Command::SetDedupCapacity {
+                    shard,
+                    epoch,
+                    expected_bytes,
+                    new_bytes,
+                }))
+                .await
+            {
+                Ok(reply) => match reply.data.d1 {
+                    Some(result) => ControlResponse::D1Admin(result),
+                    None => ControlResponse::Err("missing D1 capacity response".into()),
+                },
+                Err(error) => ControlResponse::Err(error.to_string()),
+            }
+        }
         ControlRequest::Initialize { members } => match initialize_cluster(&raft, members).await {
             Ok(()) => ControlResponse::Ack,
             Err(error) => ControlResponse::Err(error.to_string()),
