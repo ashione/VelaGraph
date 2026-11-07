@@ -1,6 +1,6 @@
 # CoreHR incremental hierarchy count validation
 
-This run tests PR64 fix head 5e14a14b62c58f902bcc423df45f6f30f20bb9f8, verified equivalent to tested local commit 63697b794cf8264c5277b24d77afdc38abd870a8 (tree bee260eac7ac3179c268d488328cfdd5c28dd5a3), not the earlier PR64 head. Exact source and executable hashes are in source-hashes.json and binaries.sha256. These are count jobs with Start/Advance/Cancel, not the existing synchronous query endpoint.
+This run tests PR64 fix head 5e14a14b62c58f902bcc423df45f6f30f20bb9f8, verified equivalent to tested local commit 63697b794cf8264c5277b24d77afdc38abd870a8 (tree bee260eac7ac3179c268d488328cfdd5c28dd5a3), not the earlier PR64 head. Exact source and executable hashes are included in the published `corehr-count-job-results.json` (`source_sha256` and `binary_sha256`). These are count jobs with Start/Advance/Cancel, not the existing synchronous query endpoint.
 
 The unchanged deterministic fixture has 200,000 people, 5,000 departments, 454,998 edges and 1,569,994 encoded KV records. Three independent data processes plus metadata run on the same cloud host, one replica per group, plaintext loopback. Every KV is compared before queries. Import uses offline prepared v2 records through D1/Raft, not a production mutation API. Snapshot completeness remains Unverified; this is neither a global atomic snapshot nor an HA benchmark.
 
@@ -18,7 +18,7 @@ The driver checks every progress sequence and all three fixed snapshot stamps, v
 
 ## Results
 
-See receipt.json for complete sample counts, exact timings, per-job request counts and resources after successful completion. RPC latency percentiles within a job are not job-latency percentiles. Three samples provide a narrow reproducibility check, not a production latency distribution. Release nodes and a development-profile driver run with TOKIO_WORKER_THREADS=2, without concurrent heavy workloads. Historical reports and timings are unchanged.
+See the published `corehr-count-job-results.json` for complete sample counts, exact timings, per-job request counts and resources after successful completion. RPC latency percentiles within a job are not job-latency percentiles. Three samples provide a narrow reproducibility check, not a production latency distribution. Release nodes and a development-profile driver run with TOKIO_WORKER_THREADS=2, without concurrent heavy workloads. Historical reports and timings are unchanged.
 
 Full run exited zero in 337.518 seconds; smoke exited zero in 6.084 seconds. All 1,569,994 full KV records were verified. The full matrix has 18 successful count samples and three expected dedup resource rejections; smoke has 21 successful samples. Two preliminary probes per fixture are reported separately. All snapshot, sequence, replay, cancellation and unchanged synchronous rejection checks passed.
 
