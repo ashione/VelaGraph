@@ -71,7 +71,8 @@ mean Gremlin supports continuation tokens or offset pagination.
 
 This integrated harness additionally includes the incoming-query implementation
 from the separately reviewed incoming-query candidate; its exact production-file hashes are recorded with the
-experiment. See `COREHR_DEDUP_RESULTS.md` for the later server-only unique-membership
+experiment. See `COREHR_GLOBAL_RESULTS.md` for bounded global-scan validation,
+`COREHR_DEDUP_RESULTS.md` for the later server-only unique-membership
 validation, `COREHR_INCOMING_RESULTS.md` for incoming-query measurements, and
 `COREHR_RESULTS.md` for the earlier outgoing-only baseline.
 
@@ -79,11 +80,17 @@ At full scale the broad client session is expected to reject its **200,000 KV /
 16 MiB aggregate snapshot limit**. Storage snapshots separately cap each shard
 at 1,000,000 KV / 64 MiB. The server distributed executor supports explicit starts
 and up to three mixed **outgoing/incoming** hops with filters, projections,
-count, limit and server-only vertex `dedup()`. Global starts remain unsupported. The full run checks
+count, limit and server-only vertex `dedup()`. Global vertex starts now have a separate bounded filter/limit/count scan,
+with server order (partition ID, local ID), distinct from the legacy client
+order (local ID, partition ID). Global adjacency and other global operators
+remain explicitly unsupported; see `SERVER_GLOBAL_SCAN.md`. The full run checks
 managers, direct reports, department descendants/members and mixed-direction
-joins against the same oracle. Recursive repeat, offset pagination, ordering,
-predicates and global counts must reject explicitly. The extended matrix contains
-40 cases: 35 server-supported cases and five explicit rejections. Nine cases
+joins against the same oracle. Recursive repeat, offset pagination, ordering
+and predicates must reject explicitly. The extended matrix contains 55 cases:
+50 server-supported cases, four Unsupported rejections and one InvalidArgument
+rejection for limit(0). Separate client/server oracle sequences cover global
+counts, property/label filters, internal page and partition boundaries, and
+filter/limit placement. Nine cases
 exercise deduplication, unique counts, first retained paths, repeated starts,
 empty streams and the non-commutative order of limit/dedup. These nine cases
 still explicitly reject client-side execution; support is not inferred across
@@ -105,7 +112,8 @@ compare its timings directly with the recorded release-node baseline.
 Report candidate revision, hardware and resource constraints alongside results.
 
 The fixture/harness itself changes no production code, grammar, format or
-resource cap. The separately reviewed incoming-query and server-only dedup
-implementations are included in the corresponding engine revisions. Do not infer universal query support from a passing
+resource cap. The separately reviewed incoming-query, server-only dedup
+and bounded global-scan implementations are included in the corresponding
+engine revisions. Do not infer universal query support from a passing
 simulation. A failure is actionable evidence, not a reason to raise limits or
 silently substitute a different query.
