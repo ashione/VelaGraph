@@ -611,3 +611,5 @@ sessions and bounded pages: up to 64 MiB / one million rows, with 2 MiB pages,
 shared admission, fixed TTL and strict full-result validation. This remains a
 trusted plaintext experiment, not lazy remote reads or failover support. The
 legacy single-Snapshot RPC is unchanged. See [paged remote snapshots](docs/REMOTE_GRAPH.md#snapshot-consistency-and-limits).
+
+The experimental coordinator also supports [ordered hierarchy result pages](docs/HIERARCHY_RESULT_PAGES.md): explicit finite Gremlin repeat jobs evaluate against fixed shard snapshots before returning actual qualified-vertex pages. Preparation progress is separate from results, and count jobs retain their existing limits.

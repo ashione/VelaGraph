@@ -122,9 +122,9 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
         ));
     }
     for text in [
-        "g.V(10).repeat(__.in('filtered-out')).times(2).count()",
+        "g.V(10).repeat(__.in('unrelated')).times(2).count()",
         "g.V(8).repeat(__.out('knows')).times(2).count()",
-        "g.V(10).repeat(__.in('filtered-out')).emit().times(2).dedup().count()",
+        "g.V(10).repeat(__.in('unrelated')).emit().times(2).dedup().count()",
         "g.V(8).repeat(__.out('knows')).emit().times(2).dedup().count()",
     ] {
         let error = run(endpoint, text).await.unwrap_err();
@@ -164,6 +164,8 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
 
 pub(super) async fn fixed_snapshot(endpoint: SocketAddr, group: &Group) -> anyhow::Result<()> {
     let text = "g.V(11).repeat(__.out('hierarchy')).times(2).count()";
+    let row_pending =
+        result_pages::start(endpoint, "g.V(11).repeat(__.out('hierarchy')).times(2)", 1).await?;
     let pending = send(
         endpoint,
         Request::Start {
@@ -224,6 +226,10 @@ pub(super) async fn fixed_snapshot(endpoint: SocketAddr, group: &Group) -> anyho
     ensure!(
         finish(endpoint, pending).await? == 1,
         "job refreshed a pinned snapshot"
+    );
+    ensure!(
+        result_pages::finish(endpoint, row_pending).await? == vec![vertex(0, 11)],
+        "row job refreshed snapshot"
     );
     ensure!(
         run(endpoint, text).await? == 4,

@@ -2,6 +2,7 @@
 use super::*;
 use std::sync::Mutex;
 mod parallel;
+mod rows;
 
 pub(super) const LEASE_MILLIS: u64 = 120_000;
 pub(super) const BATCH_ROWS: usize = 128;
@@ -24,13 +25,46 @@ static RETAINED_SLOTS: Semaphore = Semaphore::const_new(128);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
-    Start { start_partition: u32, text: String },
-    Advance { token: [u8; 16], sequence: u64 },
-    Cancel { token: [u8; 16] },
+    Start {
+        start_partition: u32,
+        text: String,
+    },
+    StartRows {
+        start_partition: u32,
+        text: String,
+        page_size: usize,
+    },
+    Read {
+        token: [u8; 16],
+        cursor: usize,
+    },
+    Advance {
+        token: [u8; 16],
+        sequence: u64,
+    },
+    Cancel {
+        token: [u8; 16],
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Output {
+    Preparing {
+        token: [u8; 16],
+        next_sequence: u64,
+        ready: bool,
+        completeness: QueryCompleteness,
+        snapshots: Vec<QueryStamp>,
+    },
+    Page {
+        token: [u8; 16],
+        cursor: usize,
+        next_cursor: Option<usize>,
+        done: bool,
+        rows: Vec<QualifiedElement>,
+        completeness: QueryCompleteness,
+        snapshots: Vec<QueryStamp>,
+    },
     Progress {
         token: [u8; 16],
         next_sequence: u64,
@@ -57,6 +91,9 @@ struct Plan {
     dedup: bool,
 }
 fn parse(text: &str) -> Result<Plan, QueryFailure> {
+    parse_mode(text, false)
+}
+fn parse_mode(text: &str, rows: bool) -> Result<Plan, QueryFailure> {
     let query = GremlinQuery::parse(text).map_err(query::graph_error)?;
     hierarchy::validate_depth(&query)?;
     let GremlinStart::Vertices(ids) = query.start() else {
@@ -66,8 +103,10 @@ fn parse(text: &str) -> Result<Plan, QueryFailure> {
         return Err(QueryFailure::Unsupported);
     }
     let (repeat, dedup) = match query.steps() {
-        [repeat, Step::Existing(GremlinStep::Count)] => (repeat, false),
-        [repeat, Step::Dedup, Step::Existing(GremlinStep::Count)] => (repeat, true),
+        [repeat] if rows => (repeat, false),
+        [repeat, Step::Dedup] if rows => (repeat, true),
+        [repeat, Step::Existing(GremlinStep::Count)] if !rows => (repeat, false),
+        [repeat, Step::Dedup, Step::Existing(GremlinStep::Count)] if !rows => (repeat, true),
         _ => return Err(QueryFailure::Unsupported),
     };
     let Step::Repeat {
@@ -196,6 +235,7 @@ struct Job {
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     row_bounds: BTreeMap<u64, usize>,
     connections: Option<BTreeMap<u64, channel::Connection>>,
+    rows: Option<rows::Rows>,
     expires: Instant,
     cost: Cost,
     plan: Plan,
@@ -246,15 +286,31 @@ impl Jobs {
         end: Instant,
     ) -> Response {
         self.expire();
+        let page_size = match &request {
+            Request::StartRows { page_size, .. } => Some(*page_size),
+            _ => None,
+        };
         match request {
             Request::Start {
                 start_partition,
                 text,
+            }
+            | Request::StartRows {
+                start_partition,
+                text,
+                ..
             } => {
                 if text.len() > query::MAX_QUERY_TEXT_BYTES {
                     return Err(QueryFailure::ResourceExhausted);
                 }
-                let plan = parse(&text)?;
+                let plan = if page_size.is_some() {
+                    parse_mode(&text, true)?
+                } else {
+                    parse(&text)?
+                };
+                let row_state = page_size
+                    .map(|n| rows::Rows::new(&plan, start_partition, n))
+                    .transpose()?;
                 let retained = RETAINED_SLOTS
                     .try_acquire()
                     .map_err(|_| QueryFailure::ResourceExhausted)?;
@@ -269,9 +325,11 @@ impl Jobs {
                     sessions: BTreeMap::new(),
                     row_bounds: BTreeMap::new(),
                     connections: Some(BTreeMap::new()),
+                    rows: row_state,
                     expires,
                     cost: Cost::default(),
-                    compact: (plan.emit && plan.dedup).then(Compact::default),
+                    compact: (page_size.is_none() && plan.emit && plan.dedup)
+                        .then(Compact::default),
                     plan,
                     frontier: BTreeMap::new(),
                     next: BTreeMap::new(),
@@ -290,6 +348,9 @@ impl Jobs {
                 if let Err(error) = result {
                     job.close().await;
                     return Err(error);
+                }
+                if job.rows.is_some() {
+                    job.frontier.clear();
                 }
                 let output = job.output(token);
                 let mut values = self.values.lock().unwrap();
@@ -335,7 +396,9 @@ impl Jobs {
                             .ok_or(QueryFailure::ResourceExhausted)?;
                         if job.completed {
                             job.close().await;
-                            job._permit.take();
+                            if job.rows.is_none() {
+                                job._permit.take();
+                            }
                         }
                         let output = job.output(token);
                         job.last = Some((sequence, output.clone()));
@@ -356,6 +419,45 @@ impl Jobs {
                         Err(error)
                     }
                 }
+            }
+            Request::Read { token, cursor } => {
+                let entry = self
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(&token)
+                    .map(|v| v.job.clone())
+                    .ok_or(QueryFailure::Unavailable)?;
+                let job = entry
+                    .try_lock()
+                    .map_err(|_| QueryFailure::ResourceExhausted)?;
+                check(end.min(job.expires))?;
+                let rows = job.rows.as_ref().ok_or(QueryFailure::InvalidArgument)?;
+                if !job.completed
+                    || !rows.complete
+                    || !cursor.is_multiple_of(rows.page_size)
+                    || cursor > rows.results.len()
+                    || (cursor == rows.results.len() && cursor != 0)
+                {
+                    return Err(QueryFailure::InvalidArgument);
+                }
+                let stop = cursor
+                    .saturating_add(rows.page_size)
+                    .min(rows.results.len());
+                let output = Output::Page {
+                    token,
+                    cursor,
+                    next_cursor: (stop < rows.results.len()).then_some(stop),
+                    done: stop == rows.results.len(),
+                    rows: rows.results[cursor..stop]
+                        .iter()
+                        .map(|v| v.element())
+                        .collect(),
+                    completeness: QueryCompleteness::Unverified,
+                    snapshots: job.snapshots(),
+                };
+                check(end.min(job.expires))?;
+                Ok(output)
             }
             Request::Cancel { token } => {
                 let entry = self
@@ -379,7 +481,22 @@ impl Job {
     fn charge(&mut self, bytes: usize, work: usize) -> Result<(), QueryFailure> {
         self.cost.charge(bytes, work, JOB_CEILING)
     }
+    fn snapshots(&self) -> Vec<QueryStamp> {
+        self.sessions
+            .values()
+            .map(|(_, d)| d.stamp.clone())
+            .collect()
+    }
     fn output(&self, token: [u8; 16]) -> Output {
+        if self.rows.is_some() {
+            return Output::Preparing {
+                token,
+                next_sequence: self.sequence,
+                ready: self.completed,
+                completeness: QueryCompleteness::Unverified,
+                snapshots: self.snapshots(),
+            };
+        }
         Output::Progress {
             token,
             next_sequence: self.sequence,
@@ -503,7 +620,14 @@ impl Job {
         // Budget and lease checks remain cumulative across every micro-page.
         let yield_at = (Instant::now() + ADVANCE_QUANTUM).min(end);
         for _ in 0..ADVANCE_PAGES {
-            self.advance_page(end).await?;
+            if let Some(mut rows) = self.rows.take() {
+                let result = rows.advance(self, end.min(self.expires)).await;
+                self.completed = rows.complete;
+                self.rows = Some(rows);
+                result?;
+            } else {
+                self.advance_page(end).await?;
+            }
             if self.completed || Instant::now() >= yield_at {
                 break;
             }
@@ -725,7 +849,8 @@ pub async fn request(
     request: Request,
     deadline: Duration,
 ) -> Result<Response, RemoteError> {
-    if matches!(&request, Request::Start {text,..} if text.len()>query::MAX_QUERY_TEXT_BYTES) {
+    if matches!(&request, Request::Start {text,..} | Request::StartRows {text,..} if text.len()>query::MAX_QUERY_TEXT_BYTES)
+    {
         return Err(RemoteError::ResourceExhausted);
     }
     let end = checked_deadline(deadline.min(Duration::from_millis(MAX_TIMEOUT)), None)?;
@@ -753,8 +878,73 @@ pub async fn request(
     .await
     .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }
+fn validate_stamps(
+    completeness: QueryCompleteness,
+    snapshots: &[QueryStamp],
+) -> Result<(), RemoteError> {
+    if completeness != QueryCompleteness::Unverified
+        || snapshots.is_empty()
+        || snapshots.len() > 8
+        || snapshots.windows(2).any(|w| w[0].shard >= w[1].shard)
+        || snapshots
+            .iter()
+            .any(|s| s.epoch == 0 || s.identity.node == 0)
+    {
+        return Err(RemoteError::Protocol);
+    }
+    Ok(())
+}
 fn validate_output(output: &Output, request: &Request) -> Result<(), RemoteError> {
     match (output, request) {
+        (
+            Output::Preparing {
+                token,
+                next_sequence,
+                ready,
+                completeness,
+                snapshots,
+            },
+            request,
+        ) => {
+            validate_stamps(*completeness, snapshots)?;
+            match request {
+                Request::StartRows { .. } if *next_sequence == 0 && !ready => Ok(()),
+                Request::Advance {
+                    token: expected,
+                    sequence,
+                } if token == expected && sequence.checked_add(1) == Some(*next_sequence) => Ok(()),
+                _ => Err(RemoteError::Protocol),
+            }
+        }
+        (
+            Output::Page {
+                token,
+                cursor,
+                next_cursor,
+                done,
+                rows,
+                completeness,
+                snapshots,
+            },
+            Request::Read {
+                token: expected,
+                cursor: expected_cursor,
+            },
+        ) => {
+            validate_stamps(*completeness, snapshots)?;
+            if token != expected
+                || cursor != expected_cursor
+                || rows.len() > 1000
+                || rows
+                    .iter()
+                    .any(|r| !matches!(r, QualifiedElement::Vertex { .. }))
+                || *done != next_cursor.is_none()
+                || (!done && (rows.is_empty() || cursor.checked_add(rows.len()) != *next_cursor))
+            {
+                return Err(RemoteError::Protocol);
+            }
+            Ok(())
+        }
         (Output::Cancelled, Request::Cancel { .. }) => Ok(()),
         (
             Output::Progress {
@@ -1087,6 +1277,7 @@ mod tests {
                         sessions: BTreeMap::new(),
                         row_bounds: BTreeMap::new(),
                         connections: None,
+                        rows: None,
                         expires: Instant::now() + Duration::from_secs(1),
                         cost: Cost::default(),
                         compact: None,
@@ -1226,6 +1417,7 @@ mod tests {
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
             connections: None,
+            rows: None,
             expires,
             cost: Cost::default(),
             compact: None,
@@ -1532,6 +1724,7 @@ mod tests {
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
             connections: None,
+            rows: None,
             expires,
             cost: Cost::default(),
             compact: None,

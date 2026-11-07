@@ -1,0 +1,567 @@
+{
+  "base_commit": "e7013dcc1ae0442485eb5cbbc5ec30936bbb29a4",
+  "base_tree": "1c3b6614f9ee2f33b27edca55d57f19d6bc4932c",
+  "method": {
+    "release": true,
+    "same_host_real_processes": true,
+    "shards": 3,
+    "replicas_per_shard": 1,
+    "tokio_workers_per_process": 2,
+    "samples_per_case": 1,
+    "oracle": "Independent ordered BFS over fixture input relationships; verifies every qualified identity, not count-only comparison",
+    "fixture_sha256": "8149fb921f0a2b8f73557a893a79a1b719c24de9c847ea93b0353b172a181e6e",
+    "people": 200000,
+    "departments": 5000
+  },
+  "binary_sha256": {
+    "results-node": "ebaa63c0fd112a864a21563c63fbda9df8456bcc0f589e92349381544c24249d",
+    "count-runner": "4e3053932a296c71ecf470e1b3a8546e92cad982f04fc4b1b4f0ed8488873bc9",
+    "results-runner": "731b8853b7da51196f5b111ad39363b665edf9a940d88f1fc451f47bdc51ce64"
+  },
+  "production_source_sha256": {
+    "crates/replicated-graph/src/remote/distributed/jobs.rs": "dca756f8fd3df40852ab21c29e8bf135d30ca54b6c5b224d9ffef1226455848f",
+    "crates/replicated-graph/src/remote/distributed/jobs/rows.rs": "96c535098930c74a95e103aff63c56e602c78680eba55e657a37c94c830667cb",
+    "crates/replicated-graph/src/remote/distributed/jobs/parallel.rs": "cc8f385d362bb14b3ffe9ef23d792704061092476d42b0773b3e6829e43e012e"
+  },
+  "verification": {
+    "cases": {
+      "ceo_all": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "ceo_all",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 1000,
+        "pages": 200,
+        "preparation_advances": 1563,
+        "preparation_seconds": 6.044985188,
+        "read_latency": {
+          "max_ms": 2.169061,
+          "min_ms": 0.880594,
+          "n": 200,
+          "p50_ms": 0.986413,
+          "p95_ms": 1.24309
+        },
+        "seconds": 6.360451085,
+        "verified_ordered_identities": 199999
+      },
+      "duplicate_manager": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "duplicate_manager",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 1000,
+        "pages": 10,
+        "preparation_advances": 74,
+        "preparation_seconds": 0.896832674,
+        "read_latency": {
+          "max_ms": 1.355397,
+          "min_ms": 0.535866,
+          "n": 10,
+          "p50_ms": 1.091722,
+          "p95_ms": 1.355397
+        },
+        "seconds": 0.918826866,
+        "verified_ordered_identities": 9360
+      },
+      "duplicate_manager_dedup": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "duplicate_manager_dedup",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 997,
+        "pages": 5,
+        "preparation_advances": 75,
+        "preparation_seconds": 0.848141914,
+        "read_latency": {
+          "max_ms": 1.0251819999999998,
+          "min_ms": 0.7814760000000001,
+          "n": 5,
+          "p50_ms": 0.9816969999999999,
+          "p95_ms": 1.0251819999999998
+        },
+        "seconds": 0.860318043,
+        "verified_ordered_identities": 4680
+      },
+      "ceo_exact6": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "ceo_exact6",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 1000,
+        "pages": 163,
+        "preparation_advances": 293,
+        "preparation_seconds": 2.658119825,
+        "read_latency": {
+          "max_ms": 2.81972,
+          "min_ms": 0.703017,
+          "n": 163,
+          "p50_ms": 1.0001140000000002,
+          "p95_ms": 1.2665440000000001
+        },
+        "seconds": 2.911134642,
+        "verified_ordered_identities": 162551
+      },
+      "ceo_exact32_empty": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "ceo_exact32_empty",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 1,
+        "pages": 1,
+        "preparation_advances": 1564,
+        "preparation_seconds": 5.067046589,
+        "read_latency": {
+          "max_ms": 0.152649,
+          "min_ms": 0.152649,
+          "n": 1,
+          "p50_ms": 0.152649,
+          "p95_ms": 0.152649
+        },
+        "seconds": 5.067476846,
+        "verified_ordered_identities": 0
+      },
+      "direct_reports_page1": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "direct_reports_page1",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 1,
+        "pages": 8,
+        "preparation_advances": 1,
+        "preparation_seconds": 0.435630646,
+        "read_latency": {
+          "max_ms": 0.306701,
+          "min_ms": 0.077506,
+          "n": 8,
+          "p50_ms": 0.135914,
+          "p95_ms": 0.306701
+        },
+        "seconds": 0.437304823,
+        "verified_ordered_identities": 8
+      },
+      "ordered_roots": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "ordered_roots",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 7,
+        "pages": 31,
+        "preparation_advances": 2,
+        "preparation_seconds": 0.438560244,
+        "read_latency": {
+          "max_ms": 0.20441700000000002,
+          "min_ms": 0.077116,
+          "n": 31,
+          "p50_ms": 0.098248,
+          "p95_ms": 0.185189
+        },
+        "seconds": 0.442701631,
+        "verified_ordered_identities": 216
+      },
+      "departments": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "departments",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 137,
+        "pages": 37,
+        "preparation_advances": 48,
+        "preparation_seconds": 2.2169213660000002,
+        "read_latency": {
+          "max_ms": 0.525941,
+          "min_ms": 0.13815799999999998,
+          "n": 37,
+          "p50_ms": 0.205288,
+          "p95_ms": 0.360002
+        },
+        "seconds": 2.229227474,
+        "verified_ordered_identities": 4999
+      },
+      "department_exact6": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "department_exact6",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 137,
+        "pages": 8,
+        "preparation_advances": 40,
+        "preparation_seconds": 2.063417759,
+        "read_latency": {
+          "max_ms": 0.472761,
+          "min_ms": 0.228183,
+          "n": 8,
+          "p50_ms": 0.304869,
+          "p95_ms": 0.472761
+        },
+        "seconds": 2.068018197,
+        "verified_ordered_identities": 1094
+      },
+      "duplicate_ceo_rejected": {
+        "before_ready": true,
+        "event": "result_rejection",
+        "expected_rejection": "ResourceExhausted",
+        "name": "duplicate_ceo_rejected",
+        "oracle_rows": 399998,
+        "rows_exposed": 0,
+        "seconds": 3.137800561
+      },
+      "ceo_all_dedup": {
+        "correct": true,
+        "event": "result_outcome",
+        "fixed_snapshots": [
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 1,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 1
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 2,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 2
+          },
+          {
+            "epoch": 1,
+            "identity": {
+              "group": 3,
+              "node": 1
+            },
+            "sequence": 105,
+            "shard": 3
+          }
+        ],
+        "name": "ceo_all_dedup",
+        "old_and_arbitrary_page_replay": true,
+        "oracle": "input relationship BFS; not count/progress",
+        "page_size": 1000,
+        "pages": 200,
+        "preparation_advances": 1564,
+        "preparation_seconds": 5.308649791,
+        "read_latency": {
+          "max_ms": 1.312629,
+          "min_ms": 0.830419,
+          "n": 200,
+          "p50_ms": 0.985662,
+          "p95_ms": 1.1257730000000001
+        },
+        "seconds": 5.603772537,
+        "verified_ordered_identities": 199999
+      }
+    },
+    "case_count": 11,
+    "full_fixture": true,
+    "ceo_ordered_rows": 199999,
+    "ceo_dedup_ordered_rows": 199999,
+    "terminal": {
+      "cases": 11,
+      "correct": true,
+      "departments": 5000,
+      "event": "result_matrix_complete",
+      "full_fixture": true,
+      "oracle": "input relationship list; every qualified identity in ordered BFS",
+      "people": 200000
+    }
+  },
+  "raw_log_sha256": "2f33d3d1a090fcfd9a3ea8f3a381a70e0ff63b9dd73798c696175862ddf5997e",
+  "bounds": {
+    "result_rows": 250000,
+    "combined_live_entries": 750000,
+    "logical_bytes": 1073741824,
+    "work": 8000000,
+    "shared_job_slots_retained_after_ready": 2,
+    "page_size_max": 1000,
+    "lease_millis": 120000
+  },
+  "local_tests": {
+    "library": 119,
+    "coordinator_cli": 5,
+    "example_and_oracle": 5,
+    "distributed_process": 2,
+    "remote_process": 1,
+    "python_validators": 29
+  },
+  "limitations": [
+    "Single sample per case is correctness evidence with observed timing, not an SLA or comparative benchmark.",
+    "Materializes finite result before first page; not provisional streaming.",
+    "Returns qualified vertex identities only, not properties or paths.",
+    "Fixed independently pinned shard vector is not globally atomic or a completeness proof.",
+    "No restart recovery; immutable result expires with original job lease."
+  ]
+}

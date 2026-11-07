@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Full-size synthetic CoreHR correctness gate; measurements are not SLAs."""
 import collections
+from corehr_result_ci import validate as validate_results
 import hashlib
 import json
 import os
@@ -167,7 +168,7 @@ def main():
     target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', 'target')).resolve() / 'release'
     binaries = {name: target / suffix for name, suffix in {
         'fixture': 'examples/corehr_fixture', 'queries': 'examples/corehr_run',
-        'jobs': 'examples/corehr_jobs_run', 'node': 'graph-node'}.items()}
+        'jobs': 'examples/corehr_jobs_run', 'results': 'examples/corehr_result_pages', 'node': 'graph-node'}.items()}
     metadata = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 'platform': platform.platform(), 'cpu_count': os.cpu_count(),
                 'github_event_name': os.environ.get('GITHUB_EVENT_NAME'),
@@ -205,16 +206,17 @@ def main():
                 and manifest['multi_department_people'] == people // 5
                 and manifest['three_department_people'] == people // 20
                 and manifest['cross_partition_edges'] > 0, 'wrong fixture relationships')
-        for kind in ('queries', 'jobs'):
+        for kind in ('queries', 'jobs', 'results'):
             name = f'{size}-{kind}'
             run(name, [binaries[kind], fixture, out / f'{name}-db', binaries['node']], kind == 'jobs')
-            results[name] = validate(read_records(out / f'{name}.jsonl'), manifest, kind == 'jobs')
+            records = read_records(out / f'{name}.jsonl')
+            results[name] = validate_results(records, manifest) if kind == 'results' else validate(records, manifest, kind == 'jobs')
     (out / 'summary.json').write_text(json.dumps(results, indent=2) + '\n')
     lines = ['# CoreHR correctness and measured performance', '',
              f"Revision: {metadata['revision']}", '',
              'Release fixture/harness/node; two Tokio workers; real loopback processes.',
              'Full fixture: 200,000 people, 5,000 departments, three data shards.',
-             'All fixture KV records, representative queries, and hierarchy counts passed.', '',
+             'All fixture KV records, representative queries, hierarchy counts, and ordered vertex result pages passed.', '',
              'Timing samples are observations, not performance SLAs or production p95 estimates.', '',
              '| Full hierarchy case | Count | Median seconds |', '| --- | ---: | ---: |']
     for name, row in results['full-jobs']['cases'].items():

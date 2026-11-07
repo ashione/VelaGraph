@@ -203,3 +203,8 @@ this). Existing disjoint shard reservations remain unchanged. Actual costs from
 successful waves are settled before reuse; failed jobs terminate rather than
 providing a complete recoverable cost ledger. Every leaf response is validated
 before any connection in its wave is returned to the cache.
+
+The same explicit job endpoint additionally supports independently executed
+[ordered vertex result pages](HIERARCHY_RESULT_PAGES.md). Their Preparing progress
+is not a result page; their ordered traversal never expands count weights into
+an invented row order. Existing count operations and budgets are unchanged.

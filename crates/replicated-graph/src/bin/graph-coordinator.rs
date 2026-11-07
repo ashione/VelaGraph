@@ -5,6 +5,8 @@
 //! serve --catalog FILE; query --partition N --query GREMLIN;
 //! hierarchy-start --partition N --query GREMLIN;
 //! hierarchy-advance --token HEX32 --sequence N; hierarchy-cancel --token HEX32.
+//! hierarchy-rows-start --partition N --query GREMLIN --page-size N;
+//! hierarchy-read --token HEX32 --cursor N (only after Preparing.ready).
 //! Job output is the serialized jobs::Output, including the token's 16 bytes.
 //! Encode those bytes as 32 hexadecimal digits for subsequent commands. Tokens
 //! are temporary bearer credentials: keep them private. Each invocation sends
@@ -31,7 +33,7 @@ struct Options {
 }
 
 const COMMANDS: &str =
-    "expected serve, query, hierarchy-start, hierarchy-advance, or hierarchy-cancel";
+    "expected serve, query, hierarchy-start, hierarchy-rows-start, hierarchy-read, hierarchy-advance, or hierarchy-cancel";
 
 fn parse_token(value: &str) -> anyhow::Result<[u8; 16]> {
     anyhow::ensure!(
@@ -49,6 +51,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     let command = args.next().context(COMMANDS)?;
     let (mut endpoint, mut catalog, mut partition, mut text) = (None, None, None, None);
     let (mut token, mut sequence) = (None, None);
+    let (mut page_size, mut cursor) = (None, None);
     let mut timeout_ms = 5000u64;
     let mut trusted = false;
     while let Some(arg) = args.next() {
@@ -82,6 +85,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
                         .parse::<u64>()?,
                 );
             }
+            "--page-size" => {
+                anyhow::ensure!(page_size.is_none(), "--page-size must not be repeated");
+                page_size = Some(
+                    args.next()
+                        .context("--page-size needs a value")?
+                        .parse::<usize>()?,
+                );
+            }
+            "--cursor" => {
+                anyhow::ensure!(cursor.is_none(), "--cursor must not be repeated");
+                cursor = Some(
+                    args.next()
+                        .context("--cursor needs a value")?
+                        .parse::<usize>()?,
+                );
+            }
             "--timeout-ms" => {
                 timeout_ms = args.next().context("--timeout-ms needs a value")?.parse()?
             }
@@ -96,6 +115,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
         (1..=5000).contains(&timeout_ms),
         "timeout must be 1..=5000 ms"
     );
+    anyhow::ensure!(
+        page_size.is_none() || command == "hierarchy-rows-start",
+        "--page-size only accepted by hierarchy-rows-start"
+    );
+    anyhow::ensure!(
+        cursor.is_none() || command == "hierarchy-read",
+        "--cursor only accepted by hierarchy-read"
+    );
     let endpoint = endpoint.context("--endpoint is required")?;
     let command = match command.as_str() {
         "serve" => {
@@ -107,7 +134,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
                 catalog: catalog.context("--catalog is required")?,
             }
         }
-        "query" | "hierarchy-start" => {
+        "query" | "hierarchy-start" | "hierarchy-rows-start" => {
             anyhow::ensure!(catalog.is_none(), "catalog is server-side configuration");
             anyhow::ensure!(
                 token.is_none() && sequence.is_none(),
@@ -117,6 +144,17 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
             let text = text.context("--query is required")?;
             if command == "query" {
                 Command::Query { partition, text }
+            } else if command == "hierarchy-rows-start" {
+                let page_size = page_size.context("--page-size is required")?;
+                anyhow::ensure!(
+                    (1..=1000).contains(&page_size),
+                    "page size must be 1..=1000"
+                );
+                Command::Job(Request::StartRows {
+                    start_partition: partition,
+                    text,
+                    page_size,
+                })
             } else {
                 Command::Job(Request::Start {
                     start_partition: partition,
@@ -124,7 +162,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
                 })
             }
         }
-        "hierarchy-advance" | "hierarchy-cancel" => {
+        "hierarchy-advance" | "hierarchy-cancel" | "hierarchy-read" => {
             anyhow::ensure!(
                 catalog.is_none() && partition.is_none() && text.is_none(),
                 "catalog, partition, and query flags are not accepted by continuation commands"
@@ -134,6 +172,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
                 Command::Job(Request::Advance {
                     token,
                     sequence: sequence.context("--sequence is required")?,
+                })
+            } else if command == "hierarchy-read" {
+                anyhow::ensure!(sequence.is_none(), "read does not accept --sequence");
+                Command::Job(Request::Read {
+                    token,
+                    cursor: cursor.context("--cursor is required")?,
                 })
             } else {
                 anyhow::ensure!(sequence.is_none(), "cancel does not accept --sequence");
@@ -342,6 +386,53 @@ mod tests {
             ["serve", "--allow-insecure-development", "--catalog", "x"]
                 .into_iter()
                 .map(str::to_owned)
+        )
+        .is_err());
+    }
+    #[test]
+    fn row_page_cli_requires_explicit_page_and_cursor_flags() {
+        assert!(matches!(
+            parse(
+                "hierarchy-rows-start",
+                &[
+                    "--partition",
+                    "0",
+                    "--query",
+                    "g.V(1).repeat(__.out()).times(2)",
+                    "--page-size",
+                    "1000"
+                ]
+            )
+            .unwrap()
+            .command,
+            Command::Job(Request::StartRows {
+                page_size: 1000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("hierarchy-read", &["--token", TOKEN, "--cursor", "0"])
+                .unwrap()
+                .command,
+            Command::Job(Request::Read { cursor: 0, .. })
+        ));
+        for flags in [
+            vec!["--token", TOKEN],
+            vec!["--token", TOKEN, "--cursor", "0", "--sequence", "0"],
+            vec!["--token", TOKEN, "--cursor", "0", "--page-size", "1"],
+        ] {
+            assert!(parse("hierarchy-read", &flags).is_err());
+        }
+        assert!(parse(
+            "hierarchy-rows-start",
+            &[
+                "--partition",
+                "0",
+                "--query",
+                "g.V(1).repeat(__.out()).times(2)",
+                "--page-size",
+                "1001"
+            ]
         )
         .is_err());
     }

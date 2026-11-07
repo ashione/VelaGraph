@@ -398,3 +398,13 @@ Unverified completeness; this does not implement general Gremlin loops.
 
 See [native execution semantics](SERVER_HIERARCHY.md) for ordered bags, cycles,
 emission, budgets and fixed-session consistency.
+
+## Explicit large hierarchy result jobs
+
+The separate asynchronous job API admits the existing finite single-adjacency
+repeat grammar without terminal count, optionally with terminal dedup, and
+returns ordered qualified vertex identities in result pages only after full
+validation. This does not change synchronous result limits or add Gremlin syntax.
+See [ordered hierarchy result pages](HIERARCHY_RESULT_PAGES.md) for exact ordering,
+materialization limits, fixed snapshots, preparation versus result delivery,
+immutable offset cursors and failure semantics.

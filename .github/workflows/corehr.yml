@@ -43,11 +43,11 @@ jobs:
           prefix-key: corehr-release-v1
           cache-on-failure: false
       - name: Test evidence validator
-        run: python3 -m unittest discover -s scripts -p test_corehr_ci.py
+        run: python3 -m unittest discover -s scripts -p 'test_corehr*ci.py'
       - name: Build release fixture, query harnesses and node
         run: |
           cargo build --release --locked --example corehr_fixture
-          cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --bin graph-node
+          cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --example corehr_result_pages --bin graph-node
       - name: Run complete CoreHR scenario
         run: python3 scripts/corehr_ci.py corehr-ci-results
       - name: Publish measured summary
