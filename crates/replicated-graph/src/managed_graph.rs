@@ -192,11 +192,56 @@ impl GraphSnapshot {
         };
         self.plan(batches)
     }
+    pub fn prepare_vertex_properties(
+        &self,
+        vertex: VertexRef,
+        patch: &rocksdb_sql_table::experimental_graph::VertexPropertyPatch,
+    ) -> Result<Plan> {
+        let current = self
+            .vertex(vertex)?
+            .ok_or(ExperimentalError::MissingEndpoint(vertex))?;
+        self.plan(vec![self
+            .store(vertex.partition)?
+            .prepare_vertex_properties(vertex, &current, patch)?])
+    }
+    pub fn prepare_edge_properties(
+        &self,
+        edge: EdgeRef,
+        patch: &rocksdb_sql_table::experimental_graph::EdgePropertyPatch,
+    ) -> Result<Plan> {
+        let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
+        let source = self
+            .store(edge.partition)?
+            .prepare_source_properties(&current, patch)?;
+        let guard = self
+            .store(current.to.partition)?
+            .prepare_reverse_guard(&current)?;
+        self.paired_plan(source, guard)
+    }
+    pub fn prepare_edge_delete(&self, edge: EdgeRef) -> Result<Plan> {
+        let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
+        let source = self
+            .store(edge.partition)?
+            .prepare_source_delete(&current)?;
+        let reverse = self
+            .store(current.to.partition)?
+            .prepare_reverse_delete(&current)?;
+        self.paired_plan(source, reverse)
+    }
+    fn paired_plan(&self, source: PreparedBatch, reverse: PreparedBatch) -> Result<Plan> {
+        let batches = if source.shard() == reverse.shard() {
+            vec![source.combine(reverse)?]
+        } else {
+            vec![source, reverse]
+        };
+        self.plan(batches)
+    }
     fn plan(&self, batches: Vec<PreparedBatch>) -> Result<Plan> {
         let cohort = self.session.cohort()?.clone();
         let authority = self.session.authority()?.clone();
-        let mut id = [0; 16];
-        getrandom::fill(&mut id).map_err(|_| Error::Uncertain)?;
+        // Preserve the source request identity, including delete tombstones.
+        // Select it before sorting participants, and retain it on every retry.
+        let id = batches.first().ok_or(Error::Identity)?.request_id();
         if id == [0; 16] {
             return Err(Error::Identity);
         }

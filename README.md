@@ -655,4 +655,4 @@ does not add global joins or general Gremlin support.
 
 Experimental [fixed-cohort snapshot sessions](docs/CERTIFIED_COHORT_READS.md) certify empty-baseline KV participants at one retained decision version. They do not enable the remote graph GlobalCommittedSnapshot API.
 
-Experimental [managed graph/v2 create transactions](docs/MANAGED_GRAPH_TRANSACTIONS.md) now connect vertex/edge plans to fixed-cohort commits and same-version reads. This trusted in-process slice does not enable remote Global Gremlin.
+Experimental [managed graph/v2 transactions](docs/MANAGED_GRAPH_TRANSACTIONS.md) now connect vertex/edge creates, property updates and edge deletion to fixed-cohort commits and same-version reads. This trusted in-process slice does not enable remote Global Gremlin.

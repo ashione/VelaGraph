@@ -1,6 +1,6 @@
-# Managed graph/v2 create transactions
+# Managed graph/v2 transactions
 
-Status: experimental trusted in-process end-to-end create/read slice over the
+Status: experimental trusted in-process end-to-end write/read slice over the
 fixed empty-baseline cohort. The existing remote GlobalCommittedSnapshot Gremlin
 interface remains Unsupported. This is not a production distributed graph API.
 
@@ -9,9 +9,10 @@ interface remains Unsupported. This is not a production distributed graph API.
 replicated_graph::managed_graph connects the existing graph/v2 codecs and
 validation to coordinator decisions, durable participant intents and certified
 cohort snapshots. It supports creating vertices and creating directed edges,
-including cross-shard edges, same-shard edges and self-loops. Reads expose vertices,
+including cross-shard edges, same-shard edges and self-loops. It also supports
+vertex property patches, edge property patches and edge deletion. Reads expose vertices,
 verified canonical edges and index-observed adjacency from one common version.
-Properties updates and deletion remain outside this managed surface for now.
+Vertex deletion, cascade operations and endpoint/label changes remain unsupported.
 
 The initial mapping is explicit and deterministic: partition as u64 equals shard.
 Every cohort shard must fit u32. No caller-supplied partition map can redirect an
@@ -30,7 +31,8 @@ structure, and this module does not prove adjacency completeness against them.
 
 prepare_vertex and prepare_edge perform no network writes. They validate existence
 and absence conditions on the certified view, then create a private immutable Plan
-with one random transaction ID, random per-shard intent identities, authority,
+with the original randomly generated source batch ID as its transaction ID, random
+per-shard intent identities, authority,
 cohort, validation version, ownership modes/epochs, original local CAS sequences and
 exact ordered operations. Cloning preserves the entire plan; preparing again is a
 new operation, not a retry. Intent IDs identify the plan and are not signatures.
@@ -47,6 +49,40 @@ prepared, the current journal cannot reconstruct the unprepared payload. Operato
 must inspect the durable coordinator/participant state and explicitly abort a
 still-pending transaction or finish consuming a decided one using the lower-level
 recovery API. Automatic crash resumption and durable plan storage are not claimed.
+
+## Property read dependencies and deletion
+
+An edge property update changes only the canonical source value, but its validity
+also depends on the target endpoint and reverse index. The plan therefore includes
+a target guard, prepared from the same certified version: validate both target
+records and write the original empty reverse-index value back unchanged under its
+original shard CAS. This is a real participant prepare/commit, not a fresh read in
+execute. It retains the existing durable lock and sequence/future-capacity admission.
+
+If any target write advanced its sequence after validation, the guard conflicts,
+even when the source is unchanged. If the guard prepares first, other target writes
+cannot pass that participant's pending intent. This conservative whole-shard guard
+prevents the validation dependency from changing between prepare and decision. It
+increments target sequence and consumes ordinary dedup/journal capacity despite
+leaving the graph value unchanged. It is not a zero-cost read lock.
+
+Vertex property patches preserve identity and labels and use the original vertex
+bytes and shard CAS. Edge patches preserve identity, endpoints, label and indexes;
+null/set/remove semantics reuse the existing generic graph/v2 patch validation.
+
+Deleting an edge prepares the permanent source tombstone and outgoing-index delete
+together with the target incoming-index delete. Both halves share one transaction.
+The global ID is selected from the original source batch before sorting members,
+so tombstone.operation_id equals the actual transaction/request ID even when the
+source shard sorts after the target. Same-shard edges and self-loops combine into
+one CAS while keeping all required operations. IDs remain permanently reserved;
+current reads hide a tombstone only after verifying its reverse index is gone.
+Old certified versions still retain the live edge and both historical indexes.
+
+A new property/delete plan prepared against an already deleted edge is rejected.
+A retained delete Plan remains idempotently retryable, including after reopen.
+Competing property/delete plans use the existing conflict/explicit-abort contract;
+no stale validation is refreshed silently and no vertex cascade is attempted.
 
 ## Decision and visibility are separate
 
