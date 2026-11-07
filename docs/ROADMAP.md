@@ -391,3 +391,11 @@ reporting, multiple department membership and concurrent mutation counterexample
 Data-local fragment/hierarchy job integration, larger managed bounds and full-scale
 CoreHR CI on this new path remain future work. See
 [contract](MANAGED_FIXED_TRAVERSALS.md); no unrestricted Global admission is enabled.
+
+### Global scan selected properties and identity dedup
+
+无跳 `g.V()` 现在支持过滤/limit 间的顶点身份 `dedup()` 以及终端指定字段
+`valueMap(...)`，与已有 scan-to-traversal 组合分开验收。去重保留不同分区的
+同号 ID；投影复用扫描的固定分片会话，不重新打开快照。默认100、显式limit
+位置、扫描/投影预算及整项失败不变。独立小图 oracle 与 CoreHR 场景覆盖该
+组合；仍为 Unverified，不代表全局事务或任意 Gremlin 组合完成。

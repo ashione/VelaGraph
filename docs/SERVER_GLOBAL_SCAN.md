@@ -17,8 +17,19 @@ Examples:
 A bounded [scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md) additionally
 allows a filter/limit prefix followed by out/in, filters, dedup, limit and terminal
 count or selected valueMap. Global E scans, path, ordering/modulators, recursive
-traversal and user-visible pagination remain Unsupported. A no-hop global
-valueMap/dedup remains Unsupported. Explicit-ID behavior is unchanged.
+traversal and user-visible pagination remain Unsupported. A no-hop global scan additionally accepts vertex `dedup()` between its
+filters/limits and terminal selected-key `valueMap('key',...)`. Scan identities
+are already unique by (partition,id), so dedup preserves each row and does not
+merge equal local IDs from distinct partitions. Projection returns singleton-list
+property maps with missing keys omitted, in unchanged scan order; it reads only
+the selected vertices from the same retained sessions. Projection after an edge
+hop continues to use the existing traversal path. Empty/all-key valueMap, map
+post-processing, scalar dedup and dedup before a subsequent hop remain Unsupported.
+No-hop projection retains the existing default final limit of 100 when no limit
+is explicit, the 1,000-row cap, the scan budget, and a separate existing 64 MiB
+traversal/projection budget for projection fragments and retained maps. Final
+encoded response copies are charged to the existing scan budget. It does not
+download whole-shard snapshots. Explicit-ID behavior is unchanged.
 All input is parsed with the official grammar; no rewriting or alternate syntax
 is used.
 

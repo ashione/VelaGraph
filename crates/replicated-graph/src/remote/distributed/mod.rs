@@ -1126,9 +1126,11 @@ fn validate_output(
             .rows
             .iter()
             .map(|row| match row {
-                QueryRow::Element(QualifiedElement::Vertex { partition, id }) => {
-                    Ok((*partition, *id))
-                }
+                QueryRow::Element(QualifiedElement::Vertex { partition, id })
+                | QueryRow::PropertyMap {
+                    source: QualifiedElement::Vertex { partition, id },
+                    ..
+                } => Ok((*partition, *id)),
                 _ => Err(RemoteError::Protocol),
             })
             .collect::<Result<Vec<_>, _>>()?;
