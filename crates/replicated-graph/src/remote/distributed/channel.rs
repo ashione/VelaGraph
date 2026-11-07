@@ -616,6 +616,38 @@ mod channel_tests {
         peer.await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_channel_types_strict_decode_at_byte_boundary() {
+        use crate::remote::frame_decode_tests::{invalid_objects, padded};
+        tokio::spawn(async {
+            let frame = Frame {
+                version: PROTOCOL,
+                sequence: 1,
+                timeout_millis: 1000,
+                request: request(),
+            };
+            let frame_bytes = serde_json::to_vec(&frame).unwrap();
+            let answer_bytes = serde_json::to_vec(&answer(1, false)).unwrap();
+            for size in [4095, 4096, 4097] {
+                let decoded: Frame = decode_frame_json(&padded(&frame_bytes, size)).unwrap();
+                assert_eq!(decoded.sequence, 1);
+                assert_eq!(decoded.request.descriptor, descriptor());
+                let decoded: Answer = decode_frame_json(&padded(&answer_bytes, size)).unwrap();
+                assert_eq!(decoded.sequence, 1);
+                assert!(!decoded.retire);
+                assert_eq!(decoded.output.unwrap().descriptor, descriptor());
+                for invalid in invalid_objects(&frame_bytes) {
+                    assert!(decode_frame_json::<Frame>(&padded(&invalid, size)).is_err());
+                }
+                for invalid in invalid_objects(&answer_bytes) {
+                    assert!(decode_frame_json::<Answer>(&padded(&invalid, size)).is_err());
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn actual_wire_wrappers_fit_fixed_transport_charge_with_two_copies() {
         assert_eq!(TRANSPORT_BYTES, 512);

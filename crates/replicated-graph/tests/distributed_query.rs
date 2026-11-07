@@ -40,6 +40,8 @@ use tokio::{
 };
 #[path = "distributed_query/byte_batches.rs"]
 mod byte_batches;
+#[path = "distributed_query/consistency.rs"]
+mod consistency;
 #[path = "distributed_query/corehr.rs"]
 mod corehr;
 #[path = "distributed_query/dynamic_consistency.rs"]

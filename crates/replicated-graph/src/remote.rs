@@ -862,6 +862,11 @@ async fn read_frame_limited<T: DeserializeOwned>(
 }
 
 #[cfg(test)]
+mod frame_decode_tests;
+#[cfg(test)]
+mod frame_scheduler_probe;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
