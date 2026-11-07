@@ -274,3 +274,11 @@ allocator. The set is bounded by the existing row, byte, work and deadline
 budgets, which are cumulative and never refunded. No shard RPC, new session,
 retry, or snapshot acquisition is introduced by deduplication. Snapshot-vector
 and `Unverified` completeness boundaries remain unchanged.
+
+## Incremental hierarchy counts
+
+[Hierarchy count jobs](HIERARCHY_COUNT_JOBS.md) use an explicit start/advance/cancel
+API on the coordinator endpoint. Only terminal count (optionally dedup) over a
+single bounded repeat is admitted. Progress is not a query result; complete
+counts retain the Unverified snapshot-vector boundary. The API has separate
+finite budgets and leases. Existing synchronous requests are unchanged.

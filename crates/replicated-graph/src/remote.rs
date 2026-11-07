@@ -106,6 +106,9 @@ enum Operation {
         shard: u64,
         timeout_millis: u64,
     },
+    OpenHierarchyQuery {
+        shard: u64,
+    },
     QueryFragment(distributed::FragmentRequest),
     CloseQuery {
         descriptor: distributed::Descriptor,
@@ -220,6 +223,9 @@ impl GraphService {
                         {
                             end.min(Instant::now() + Duration::from_millis(*timeout_millis))
                         }
+                        Operation::OpenHierarchyQuery { .. } => {
+                            end.min(Instant::now() + Duration::from_secs(5))
+                        }
                         _ => end,
                     };
                     // Dropping the waiting future at the deadline does not undo
@@ -320,6 +326,23 @@ async fn execute(
                 .open(&state, identity, shard, end)
                 .await
                 .map(Reply::OpenQuery)
+        }
+        Operation::OpenHierarchyQuery { shard: requested } => {
+            if requested != shard {
+                return Err(RemoteError::InvalidArgument);
+            }
+            let end = end.min(Instant::now() + Duration::from_secs(5));
+            tokio::time::timeout_at(end, async {
+                raft.ensure_linearizable()
+                    .await
+                    .map_err(|_| RemoteError::Unavailable)?;
+                query_sessions
+                    .open_hierarchy(&state, identity, shard, end)
+                    .await
+                    .map(Reply::OpenQuery)
+            })
+            .await
+            .map_err(|_| RemoteError::Timeout { request_id: None })?
         }
         Operation::QueryFragment(request) => {
             query_sessions
@@ -649,6 +672,7 @@ async fn rpc(
         &operation,
         Operation::Query(_)
             | Operation::OpenQuery { .. }
+            | Operation::OpenHierarchyQuery { .. }
             | Operation::QueryFragment(_)
             | Operation::CloseQuery { .. }
     ) {

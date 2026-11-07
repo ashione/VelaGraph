@@ -8,6 +8,7 @@ use rocksdb_sql_table::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 mod hierarchy;
+pub mod jobs;
 mod scan;
 mod sessions;
 pub(super) use sessions::Sessions;
@@ -98,7 +99,7 @@ pub(super) struct Descriptor {
     incarnation: [u8; 16],
     token: [u8; 16],
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VertexId {
     partition: u32,
@@ -129,6 +130,10 @@ struct IncomingEdge {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Fragment {
+    HierarchyBatch {
+        partition: u32,
+        fragments: Vec<Fragment>,
+    },
     Scan(scan::ScanRequest),
     Exists(VertexId),
     Out(VertexId),
@@ -155,6 +160,31 @@ enum Fragment {
 impl Fragment {
     fn validate(&self) -> Result<(), RemoteError> {
         let bytes = match self {
+            Self::HierarchyBatch {
+                partition,
+                fragments,
+            } => {
+                if fragments.is_empty() || fragments.len() > jobs::BATCH_ROWS {
+                    return Err(RemoteError::InvalidArgument);
+                }
+                for fragment in fragments {
+                    if !matches!(
+                        fragment,
+                        Self::Exists(_)
+                            | Self::Out(_)
+                            | Self::In(_)
+                            | Self::ResolveIncoming { .. }
+                            | Self::VerifyReverse(_)
+                    ) || fragment.partition() != *partition
+                    {
+                        return Err(RemoteError::InvalidArgument);
+                    }
+                    fragment.validate()?;
+                }
+                serde_json::to_vec(self)
+                    .map_err(|_| RemoteError::InvalidArgument)?
+                    .len()
+            }
             Self::Scan(request) => {
                 request.validate()?;
                 0
@@ -191,6 +221,7 @@ impl Fragment {
     }
     fn partition(&self) -> u32 {
         match self {
+            Self::HierarchyBatch { partition, .. } => *partition,
             Self::Scan(request) => request.partition,
             Self::Exists(v) | Self::Out(v) | Self::In(v) => v.partition,
             Self::ResolveIncoming { edge, .. } => edge.partition,
@@ -243,6 +274,7 @@ pub(super) struct FragmentRequest {
 }
 #[derive(Debug, Serialize, Deserialize)]
 enum FragmentValue {
+    HierarchyBatch(Vec<FragmentValue>),
     Scan(scan::ScanResult),
     Bool(bool),
     Edges(Vec<EdgeHop>),
@@ -826,11 +858,13 @@ impl CoordinatorService {
             .map_err(|_| RemoteError::Unavailable)?;
         let (stop, mut stopped) = watch::channel(false);
         let catalog = Arc::new(catalog);
+        let jobs = Arc::new(jobs::Jobs::new());
         let task = tokio::spawn(async move {
             let mut handlers = JoinSet::new();
+            let mut cleanup = tokio::time::interval(Duration::from_millis(100));
             let admission = Arc::new(Semaphore::new(2));
             loop {
-                let accepted = tokio::select! { _ = stopped.changed() => break, _ = handlers.join_next(), if !handlers.is_empty() => continue, value = listener.accept() => value };
+                let accepted = tokio::select! { _ = stopped.changed() => break, _ = cleanup.tick() => { jobs.expire(); continue; }, _ = handlers.join_next(), if !handlers.is_empty() => continue, value = listener.accept() => value };
                 let Ok((mut socket, _)) = accepted else {
                     break;
                 };
@@ -838,22 +872,44 @@ impl CoordinatorService {
                     continue;
                 };
                 let catalog = catalog.clone();
+                let jobs = jobs.clone();
+                jobs.expire();
                 handlers.spawn(async move {
                     let _permit = permit;
                     let end = Instant::now() + deadline.min(Duration::from_millis(MAX_TIMEOUT));
                     let work = async {
-                        let request: DistributedRequest = read_frame_limited(
+                        #[derive(Deserialize)]
+                        #[serde(untagged)]
+                        enum IncomingRequest {
+                            Query(DistributedRequest),
+                            Job(jobs::Envelope),
+                        }
+                        let request: IncomingRequest = read_frame_limited(
                             &mut socket,
                             end,
                             query::MAX_QUERY_TEXT_BYTES + 1024,
                         )
                         .await?;
-                        validate_request(&request)?;
-                        let end =
-                            end.min(Instant::now() + Duration::from_millis(request.timeout_millis));
-                        let response = execute(&catalog, request, end).await;
-                        let bytes = bounded_encode(&response, end)
-                            .map_err(|_| RemoteError::ResourceExhausted)?;
+                        // The shorter ordinary request deadline also governs sending.
+                        let end = match &request {
+                            IncomingRequest::Query(request) => {
+                                validate_request(request)?;
+                                end.min(
+                                    Instant::now() + Duration::from_millis(request.timeout_millis),
+                                )
+                            }
+                            IncomingRequest::Job(_) => end,
+                        };
+                        let bytes = match request {
+                            IncomingRequest::Query(request) => {
+                                bounded_encode(&execute(&catalog, request, end).await, end)
+                            }
+                            IncomingRequest::Job(envelope) => bounded_encode(
+                                &jobs.handle(catalog, envelope.hierarchy_job, end).await,
+                                end,
+                            ),
+                        }
+                        .map_err(|_| RemoteError::ResourceExhausted)?;
                         tokio::time::timeout_at(end, async {
                             socket.write_u32(bytes.len() as u32).await?;
                             socket.write_all(&bytes).await
