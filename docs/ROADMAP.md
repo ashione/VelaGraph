@@ -435,9 +435,20 @@ Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
 
 Managed catch-up transfers bounded raw-event suffixes at an exact fixed cut, then
 consumes retained decisions one ordinal at a time on every cohort member. RPC v4
-adds checked SHA-256 event cursors; full Journals and exact snapshots remain the
-authority, and all existing lifetime caps remain. Observed resolved decisions do
+adds checked SHA-256 event cursors; complete history and exact snapshots remain
+required, and all existing lifetime caps remain. Observed resolved decisions do
 not advance applied visibility. See [contract and upgrade boundaries](INCREMENTAL_DECISION_CONSUMPTION.md).
-Authoritative ledger segmentation and complete-cohort pre-admission capacity grants
-are still required before those caps can change; no performance experiment is part
+Lazy authoritative history/identity recovery and complete-cohort pre-admission
+capacity grants are still required before those caps can change; no performance experiment is part
 of this functional slice.
+
+### Authoritative event ledger with bounded lifetime
+
+[Raw event authority](AUTHORITATIVE_EVENT_LEDGER.md) replaces bound coordinator/member
+embedded archives with typed v11/v12 metadata and canonical original-Command
+segments. Open/apply/source reads reconstruct authority from those rows; one synced
+batch publishes the descriptor, new tail, data and indexes. Legacy migration and
+full logical snapshots remain atomic. This removes the live full-archive rewrite,
+not complete replay/memory/snapshot work or lifetime caps. Shared codec/replay
+replaces duplicated paths; full-cohort pre-admission capacity and lazy exact-ID
+recovery remain required before safely lifting limits.

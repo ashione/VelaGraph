@@ -1,5 +1,10 @@
 # Durable request point recovery (A2.1)
 
+Subsequent live-storage format: [authoritative event ledger](AUTHORITATIVE_EVENT_LEDGER.md)
+replaces embedded bound Journal disk headers with v11/v12 raw-event authority.
+The original slice below documents its historical formats; logical full-history
+retention, snapshots and all lifetime limits still apply.
+
 Status: an experimental derived coordinator index and bounded point-recovery
 operation. **The existing 256 external requests, 1,024 transactions and 16 MiB
 Journal admission budget remain unchanged.** This does not implement unlimited

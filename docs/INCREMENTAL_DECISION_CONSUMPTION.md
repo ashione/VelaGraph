@@ -1,5 +1,10 @@
 # Incremental decision-history consumption
 
+Subsequent live-storage format: [authoritative event ledger](AUTHORITATIVE_EVENT_LEDGER.md)
+replaces embedded bound Journal disk headers with v11/v12 raw-event authority.
+The original slice below documents its historical formats; logical full-history
+retention, snapshots and all lifetime limits still apply.
+
 Managed graph catch-up now transfers bounded event suffixes and consumes decisions
 from each member's retained history. It no longer carries the complete Journal in
 every `Advance` RPC or Raft command. This is an internal protocol change, not a

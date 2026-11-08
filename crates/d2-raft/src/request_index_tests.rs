@@ -140,10 +140,6 @@ async fn coordinator_v5_v9_and_logical_snapshot_golden() {
     let state = sm.state.read().await;
     let d1 = state.d1.as_ref().unwrap();
     assert_eq!(serde_json::to_string(d1).unwrap(), golden_state);
-    assert_eq!(
-        d1_metadata_bytes(d1).unwrap(),
-        format!("{{\"version\":9,\"state\":{golden_state}}}").as_bytes()
-    );
     #[derive(Serialize)]
     struct Legacy<'a> {
         version: u32,
@@ -156,6 +152,16 @@ async fn coordinator_v5_v9_and_logical_snapshot_golden() {
         })
         .unwrap(),
         format!("{{\"version\":5,\"state\":{golden_state}}}")
+    );
+    // v9 is a published migration input, no longer a bound-state writer.
+    let legacy = serde_json::to_string(&Legacy {
+        version: 9,
+        state: d1,
+    })
+    .unwrap();
+    assert_eq!(
+        legacy,
+        format!("{{\"version\":9,\"state\":{golden_state}}}")
     );
     drop(state);
     let snapshot = sm.build_snapshot().await.unwrap();
@@ -229,7 +235,7 @@ async fn index_admission_batch_retry_failure_and_reopen_are_atomic() {
                 .unwrap()
         )
         .unwrap()["version"],
-        9
+        11
     );
 }
 

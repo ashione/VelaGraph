@@ -194,15 +194,20 @@ fn fail_sync(sm: &StateMachine) {
         .fail_next_write
         .store(true, Ordering::Relaxed);
 }
-fn downgrade(sm: &StateMachine, member: bool) {
+async fn downgrade(sm: &StateMachine, member: bool) {
     let storage = sm.storage.as_ref().unwrap();
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&storage.db.get(D1_KEY).unwrap().unwrap()).unwrap();
-    metadata["version"] = if member { 7 } else { 8 }.into();
+    let state = sm.state.read().await;
+    // Construct an actual published legacy header, not a new header with a
+    // changed number. The fixture is reopened before any read or mutation.
+    let metadata = serde_json::json!({
+        "version": if member { 7 } else { 8 },
+        "state": state.d1.as_ref().unwrap().stage(),
+    });
     let mut batch = WriteBatch::default();
     batch.put(D1_KEY, serde_json::to_vec(&metadata).unwrap());
     batch.delete_range(PREFIX, PREFIX_END);
     batch.delete(MANIFEST_KEY);
+    batch.delete_range(event_ledger::PREFIX, b"sm/ledger0");
     storage.write_sync(batch).unwrap();
 }
 
@@ -462,7 +467,7 @@ async fn legacy_migration_partial_tail_and_snapshot_publish_are_atomic() {
             append(&mut sm, 1, 31).await;
         }
         let original = prefix(&sm, 31, member_mode).await;
-        downgrade(&sm, member_mode);
+        downgrade(&sm, member_mode).await;
         drop(sm);
         let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
         assert!(rows(&sm).is_empty());
@@ -556,9 +561,9 @@ async fn corrupt_partial_tail_cannot_be_repaired_by_an_ordinary_apply() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_rpc_terminal_and_certified_read_use_persisted_segments() {
+async fn real_rpc_source_and_certified_reads_use_persisted_segments() {
     use crate::managed_rpc::{Client, Error, Identity, NodeRef, Role, Server};
-    for member in [false, true] {
+    for (member, raw) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let cluster = crate::Cluster::new();
         let node = Arc::new(cluster.start_durable(1, dir.path()).await.unwrap());
@@ -626,6 +631,45 @@ async fn real_rpc_terminal_and_certified_read_use_persisted_segments() {
                 .unwrap();
         } else {
             assert_eq!(remote.terminal(&authority(), 1, 1).await.unwrap(), proof);
+        }
+        if raw {
+            let row = node
+                .state_machine
+                .storage
+                .as_ref()
+                .unwrap()
+                .db
+                .iterator(IteratorMode::From(event_ledger::PREFIX, Direction::Forward))
+                .next()
+                .unwrap()
+                .unwrap();
+            node.state_machine
+                .storage
+                .as_ref()
+                .unwrap()
+                .db
+                .delete(row.0)
+                .unwrap();
+            let expected = Error::Application(D1Error::VisibilityHistory);
+            if member {
+                assert_eq!(
+                    remote
+                        .history_status(&authority(), &target, &cohort())
+                        .await,
+                    Err(expected)
+                );
+            } else {
+                assert_eq!(remote.journal(&authority(), 1).await, Err(expected.clone()));
+                assert_eq!(
+                    remote
+                        .history_page(&authority(), 1, &journal(0).history_cursor().unwrap(), None)
+                        .await,
+                    Err(expected)
+                );
+            }
+            server.shutdown().await;
+            cluster.shutdown(&node).await;
+            continue;
         }
         let row = rows(&node.state_machine).remove(0);
         node.state_machine
@@ -742,7 +786,7 @@ async fn process_death_preserves_filled_tail_migration_member_and_snapshot() -> 
                 append(&mut sm, 1, 31).await;
             }
             if mode == "migration" {
-                downgrade(&sm, false);
+                downgrade(&sm, false).await;
             }
         }
         let mut child = Child(
@@ -772,6 +816,15 @@ async fn process_death_preserves_filled_tail_migration_member_and_snapshot() -> 
         child.0.kill()?;
         child.0.wait()?;
         let mut sm = Arc::new(StateMachine::open(&state_path)?);
+        let recovered = sm
+            .load_disk_state(&*sm.state.read().await)
+            .unwrap()
+            .unwrap();
+        let ledger = recovered.ledger.unwrap();
+        assert_eq!(ledger.journal, journal(33));
+        assert_eq!(ledger.descriptor.event_count, 67);
+        assert_eq!(ledger.descriptor.segment_count, 3);
+        assert_eq!(ledger.descriptor.applied, sm.applied().await);
         assert_eq!(rows(&sm).len(), 2);
         assert_eq!(manifest(&sm)["through"], 33);
         assert_eq!(
@@ -841,15 +894,12 @@ async fn exact_segment_key_row_manifest_and_bound_member_metadata_goldens() {
     setup(&mut member, true).await;
     let state = member.state.read().await;
     let d1 = state.d1.as_ref().unwrap();
-    // Explicit v10 gate around the unchanged complete logical state, unlike the
-    // original v7 unbound golden which remains valid and is still tested.
+    // v10 remains a readable full-state migration input; new bound writes
+    // use the journal-less v12 metadata covered by the codec goldens.
+    let legacy = serde_json::json!({"version":10,"state":d1.stage()});
     assert_eq!(
-        d1_metadata_bytes(d1).unwrap(),
-        format!(
-            "{{\"version\":10,\"state\":{}}}",
-            serde_json::to_string(&d1.stage()).unwrap()
-        )
-        .as_bytes()
+        legacy["state"]["visibility"]["journal"],
+        serde_json::to_value(&d1.visibility.as_ref().unwrap().journal).unwrap()
     );
     let member_domain = format!("{{\"role\":\"Member\",\"shard\":7,\"epoch\":1,\"mode\":[{sevens}],\"authority\":{{\"shard\":9,\"mode\":[{nines}]}},\"cohort\":{cohort}}}");
     let expected = format!("{{\"version\":1,\"domain\":{member_domain},\"through\":0,\"segments\":0,\"encoded_bytes\":0,\"applied\":{{\"leader_id\":{{\"term\":1,\"node_id\":1}},\"index\":4}}}}");
@@ -970,3 +1020,8 @@ async fn canonical_but_substituted_terminal_facts_fail_online_and_on_reopen() {
         assert!(StateMachine::open(dir.path()).is_err());
     }
 }
+
+// Share the fixed-cohort fixture and fault gates rather than duplicate a
+// second setup/command protocol in the authoritative ledger regression suite.
+#[path = "event_ledger_state_tests.rs"]
+mod event_ledger_state_tests;

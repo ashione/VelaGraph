@@ -377,6 +377,12 @@ fn application_error(
     id: RequestId,
 ) -> StorageNodeError {
     match error {
+        D1Error::EventLedgerHistory => {
+            StorageNodeError::Corrupt("event ledger history mismatch".into())
+        }
+        D1Error::EventLedgerUnavailable => {
+            StorageNodeError::Unavailable("event ledger unavailable".into())
+        }
         D1Error::DecisionIndexHistory => {
             StorageNodeError::Corrupt("decision index history mismatch".into())
         }
@@ -485,6 +491,14 @@ mod tests {
 
     #[test]
     fn application_rejections_remain_typed() {
+        assert!(matches!(
+            application_error(D1Error::EventLedgerHistory, 7, 3, [1; 16]),
+            StorageNodeError::Corrupt(_)
+        ));
+        assert!(matches!(
+            application_error(D1Error::EventLedgerUnavailable, 7, 3, [1; 16]),
+            StorageNodeError::Unavailable(_)
+        ));
         assert!(matches!(
             application_error(D1Error::DecisionIndexHistory, 7, 3, [1; 16]),
             StorageNodeError::Corrupt(_)

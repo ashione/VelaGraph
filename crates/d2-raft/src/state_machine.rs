@@ -22,113 +22,13 @@ const D1_KEY: &[u8] = b"sm/d1";
 const DEDUP_PREFIX: &[u8] = b"sm/dedup/";
 const DEDUP_PREFIX_END: &[u8] = b"sm/dedup0";
 
-// Disk-only v2. Logical snapshots retain their complete v1 D1 state. Old
-// binaries reject this header rather than silently losing retry identities.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct D1MetadataV2 {
-    version: u32,
-    shard: u64,
-    epoch: u64,
-    sequence: u64,
-}
-
-impl D1MetadataV2 {
-    fn of(state: &D1State) -> Self {
-        Self {
-            version: 2,
-            shard: state.shard,
-            epoch: state.epoch,
-            sequence: state.sequence,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct D1MetadataV3 {
-    version: u32,
-    shard: u64,
-    epoch: u64,
-    sequence: u64,
-    dedup_bytes_limit: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct D1MetadataV4 {
-    version: u32,
-    shard: u64,
-    epoch: u64,
-    sequence: u64,
-    dedup_bytes_limit: Option<usize>,
-    managed: crate::D1ManagedMode,
-}
-
-fn d1_metadata_bytes(state: &D1State) -> Result<Vec<u8>, serde_json::Error> {
-    if state.visibility.is_some() {
-        #[derive(Serialize)]
-        struct Metadata {
-            version: u32,
-            state: D1State,
-        }
-        return serde_json::to_vec(&Metadata {
-            version: if crate::decision_segments::enabled(state) {
-                10
-            } else {
-                7
-            },
-            state: state.stage(),
-        });
-    }
-    if state.participant.is_some() {
-        #[derive(Serialize)]
-        struct Metadata {
-            version: u32,
-            state: D1State,
-        }
-        return serde_json::to_vec(&Metadata {
-            version: 6,
-            state: state.stage(),
-        });
-    }
-    if state.coordinator.is_some() {
-        // Dedicated format: old binaries must not ignore coordinator authority.
-        #[derive(Serialize)]
-        struct Metadata<'a> {
-            version: u32,
-            state: &'a D1State,
-        }
-        return serde_json::to_vec(&Metadata {
-            version: if crate::decision_segments::enabled(state) {
-                9
-            } else {
-                8
-            },
-            state,
-        });
-    }
-    if let Some(managed) = &state.managed {
-        return serde_json::to_vec(&D1MetadataV4 {
-            version: 4,
-            shard: state.shard,
-            epoch: state.epoch,
-            sequence: state.sequence,
-            dedup_bytes_limit: state.dedup_bytes_limit,
-            managed: managed.clone(),
-        });
-    }
-    match state.dedup_bytes_limit {
-        None => serde_json::to_vec(&D1MetadataV2::of(state)),
-        Some(dedup_bytes_limit) => serde_json::to_vec(&D1MetadataV3 {
-            version: 3,
-            shard: state.shard,
-            epoch: state.epoch,
-            sequence: state.sequence,
-            dedup_bytes_limit,
-        }),
-    }
-}
+#[path = "event_ledger.rs"]
+mod event_ledger;
+#[path = "state_codec.rs"]
+mod state_codec;
+use state_codec::d1_metadata_bytes;
+#[cfg(test)]
+use state_codec::{D1MetadataV2, D1MetadataV3, D1MetadataV4};
 
 fn dedup_key(sequence: u64) -> Vec<u8> {
     let mut key = DEDUP_PREFIX.to_vec();
@@ -299,6 +199,7 @@ struct StateMachineStorage {
     decision_indexed: AtomicBool,
     decision_manifest: std::sync::Mutex<Option<Vec<u8>>>,
     request_manifest: std::sync::Mutex<Option<Vec<u8>>>,
+    metadata: std::sync::Mutex<Option<Vec<u8>>>,
     #[cfg(test)]
     fail_next_write: AtomicBool,
 }
@@ -322,6 +223,14 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     StorageIOError::write_state_machine(&error).into()
+}
+
+fn ledger_read_error(error: anyhow::Error) -> D1Error {
+    if error.is::<rocksdb::Error>() || error.is::<std::io::Error>() {
+        D1Error::EventLedgerUnavailable
+    } else {
+        D1Error::EventLedgerHistory
+    }
 }
 
 fn data_key(key: &[u8]) -> Vec<u8> {
@@ -394,134 +303,29 @@ impl StateMachine {
             decision_indexed: AtomicBool::new(false),
             decision_manifest: Default::default(),
             request_manifest: Default::default(),
+            metadata: Default::default(),
             #[cfg(test)]
             fail_next_write: AtomicBool::new(false),
         });
 
-        let mut d1 = None;
-        if let Some(bytes) = storage.db.get(D1_KEY)? {
-            // Inspect only the discriminator; deserialize directly from bytes so
-            // large legacy requests do not also become a serde_json::Value tree.
-            #[derive(Deserialize)]
-            struct Version {
-                version: u32,
-            }
-            match serde_json::from_slice::<Version>(&bytes)?.version {
-                1 => {
-                    d1 = Some(serde_json::from_slice::<D1State>(&bytes)?);
-                    storage.legacy_d1.store(true, Ordering::Relaxed);
-                }
-                2 => {
-                    let meta: D1MetadataV2 = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        meta.sequence <= MAX_DEDUP_REQUESTS as u64,
-                        "D1 dedup capacity exceeded"
-                    );
-                    let mut state = D1State::new(meta.shard, meta.epoch);
-                    state.sequence = meta.sequence;
-                    d1 = Some(state);
-                }
-                3 => {
-                    let meta: D1MetadataV3 = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        meta.dedup_bytes_limit == crate::EXTENDED_DEDUP_BYTES,
-                        "unsupported D1 capacity"
-                    );
-                    anyhow::ensure!(
-                        meta.sequence <= MAX_DEDUP_REQUESTS as u64,
-                        "D1 dedup capacity exceeded"
-                    );
-                    let mut state = D1State::new(meta.shard, meta.epoch);
-                    state
-                        .set_capacity(
-                            meta.shard,
-                            meta.epoch,
-                            crate::MAX_DEDUP_BYTES,
-                            meta.dedup_bytes_limit,
-                        )
-                        .map_err(|e| anyhow::anyhow!("invalid capacity: {e:?}"))?;
-                    state.sequence = meta.sequence;
-                    d1 = Some(state);
-                }
-                4 => {
-                    let meta: D1MetadataV4 = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        meta.sequence <= MAX_DEDUP_REQUESTS as u64,
-                        "D1 dedup capacity exceeded"
-                    );
-                    let mut state = D1State::new(meta.shard, meta.epoch);
-                    state.version = 3;
-                    state.sequence = meta.sequence;
-                    state.dedup_bytes_limit = meta.dedup_bytes_limit;
-                    state.managed = Some(meta.managed);
-                    d1 = Some(state);
-                }
-                5 | 8 | 9 => {
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct Metadata {
-                        version: u32,
-                        state: D1State,
-                    }
-                    let meta: Metadata = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        matches!(meta.version, 5 | 8 | 9) && meta.state.coordinator.is_some(),
-                        "invalid coordinator metadata"
-                    );
-                    storage
-                        .request_indexed
-                        .store(matches!(meta.version, 8 | 9), Ordering::Relaxed);
-                    anyhow::ensure!(
-                        meta.version != 9 || crate::decision_segments::enabled(&meta.state),
-                        "decision index requires bound coordinator"
-                    );
-                    storage
-                        .decision_indexed
-                        .store(meta.version == 9, Ordering::Relaxed);
-                    d1 = Some(meta.state);
-                }
-                6 => {
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct Metadata {
-                        version: u32,
-                        state: D1State,
-                    }
-                    let meta: Metadata = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        meta.version == 6
-                            && meta.state.participant.is_some()
-                            && meta.state.dedup.is_empty(),
-                        "invalid participant metadata"
-                    );
-                    d1 = Some(meta.state);
-                }
-                7 | 10 => {
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct Metadata {
-                        version: u32,
-                        state: D1State,
-                    }
-                    let meta: Metadata = serde_json::from_slice(&bytes)?;
-                    anyhow::ensure!(
-                        matches!(meta.version, 7 | 10)
-                            && meta.state.visibility.is_some()
-                            && meta.state.dedup.is_empty(),
-                        "invalid visibility metadata"
-                    );
-                    anyhow::ensure!(
-                        meta.version != 10 || crate::decision_segments::enabled(&meta.state),
-                        "decision index requires bound member"
-                    );
-                    storage
-                        .decision_indexed
-                        .store(meta.version == 10, Ordering::Relaxed);
-                    d1 = Some(meta.state);
-                }
-                _ => anyhow::bail!("unsupported D1 disk version"),
-            }
+        let last_applied_log: Option<LogId<NodeId>> = match storage.db.get(APPLIED_KEY)? {
+            Some(value) => serde_json::from_slice(&value)?,
+            None => None,
+        };
+        let loaded = state_codec::load(&storage.db, last_applied_log)?;
+        if let Some(loaded) = &loaded {
+            storage
+                .legacy_d1
+                .store(loaded.legacy_dedup, Ordering::Relaxed);
+            storage
+                .request_indexed
+                .store(loaded.request_indexed, Ordering::Relaxed);
+            storage
+                .decision_indexed
+                .store(loaded.decision_indexed, Ordering::Relaxed);
+            *storage.metadata.lock().unwrap() = Some(loaded.metadata_bytes.clone());
         }
+        let mut d1 = loaded.map(|loaded| loaded.state);
         for item in storage
             .db
             .iterator(IteratorMode::From(DEDUP_PREFIX, Direction::Forward))
@@ -551,10 +355,6 @@ impl StateMachine {
         if let Some(d1) = &d1 {
             d1.validate()?;
         }
-        let last_applied_log: Option<LogId<NodeId>> = match storage.db.get(APPLIED_KEY)? {
-            Some(value) => serde_json::from_slice(&value)?,
-            None => None,
-        };
         anyhow::ensure!(
             d1.is_none() || last_applied_log.is_some(),
             "D1 state is missing its applied marker"
@@ -684,6 +484,52 @@ impl StateMachine {
             sequence: d1.sequence,
             entries: state.data.clone(),
         }))
+    }
+
+    // The persistent codec is shared by open, apply and authority-source reads.
+    // Its new-format path replays only raw ledger rows. The cached state is an
+    // expected publication cut, never a repair source for a damaged disk ledger.
+    fn load_disk_state(
+        &self,
+        state: &StateMachineData,
+    ) -> anyhow::Result<Option<state_codec::LoadedState>> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let expected = storage
+            .metadata
+            .lock()
+            .map_err(|_| std::io::Error::other("state metadata lock unavailable"))?;
+        anyhow::ensure!(
+            storage.db.get(D1_KEY)?.as_deref() == expected.as_deref(),
+            "state metadata changed outside publication"
+        );
+        drop(expected);
+        let applied: Option<LogId<NodeId>> = match storage.db.get(APPLIED_KEY)? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => None,
+        };
+        anyhow::ensure!(
+            applied == state.last_applied_log,
+            "state applied marker changed"
+        );
+        let loaded = state_codec::load(&storage.db, applied)?;
+        match (&loaded, &state.d1) {
+            (Some(loaded), Some(current)) => {
+                let expected = if loaded.legacy_dedup {
+                    current.clone()
+                } else {
+                    current.stage()
+                };
+                anyhow::ensure!(
+                    loaded.state == expected,
+                    "durable state differs from published cut"
+                );
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("durable state role changed"),
+        }
+        Ok(loaded)
     }
 
     /// Local historical capture. Distributed callers must establish a leader
@@ -820,7 +666,13 @@ impl StateMachine {
         mode_id: [u8; 16],
     ) -> Result<(crate::transaction_decisions::HistoryCursor, u64), D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted
+            .as_ref()
+            .map(|loaded| &loaded.state)
+            .or(state.d1.as_ref())
+            .ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
         d1.check_epoch(epoch)?;
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
@@ -1030,7 +882,13 @@ impl StateMachine {
         mode_id: [u8; 16],
     ) -> Result<crate::transaction_decisions::Journal, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted
+            .as_ref()
+            .map(|loaded| &loaded.state)
+            .or(state.d1.as_ref())
+            .ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
         d1.check_epoch(epoch)?;
         if d1
@@ -1055,7 +913,13 @@ impl StateMachine {
         cut: Option<&crate::transaction_decisions::HistoryCursor>,
     ) -> Result<crate::transaction_decisions::HistoryPage, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted
+            .as_ref()
+            .map(|loaded| &loaded.state)
+            .or(state.d1.as_ref())
+            .ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
         d1.check_epoch(epoch)?;
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
@@ -1212,7 +1076,21 @@ impl StateMachine {
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachine> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let sm = self.state.read().await;
-        let data = match &sm.d1 {
+        let persisted = blocking_section(|| self.load_disk_state(&sm)).map_err(|e| {
+            StorageIOError::read_state_machine(&std::io::Error::other(e.to_string()))
+        })?;
+        let complete;
+        let snapshot_d1 = if let Some(loaded) = persisted {
+            let mut state = loaded.state;
+            if !loaded.legacy_dedup {
+                state.dedup = sm.d1.as_ref().unwrap().dedup.clone();
+            }
+            complete = Some(state);
+            &complete
+        } else {
+            &sm.d1
+        };
+        let data = match snapshot_d1 {
             Some(d1) => serde_json::to_vec(&BorrowedSnapshotV1 {
                 version: 1,
                 entries: SnapshotEntries(&sm.data),
@@ -1277,7 +1155,13 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     {
         let mut sm = self.state.write().await;
         blocking_section(|| {
+            let persisted = self
+                .load_disk_state(&sm)
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             let mut next = ApplyDelta::new(&sm);
+            if let Some(loaded) = &persisted {
+                next.d1 = Some(loaded.state.stage());
+            }
             let mut out = Vec::new();
             let mut batch = WriteBatch::default();
 
@@ -1353,8 +1237,22 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 }
                 let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
                 let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
+                let descriptor = event_ledger::stage(
+                    &mut batch,
+                    persisted.as_ref().and_then(|loaded| loaded.ledger.as_ref()),
+                    next.d1.as_ref(),
+                    next.last_applied_log,
+                    false,
+                )
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                let metadata = next
+                    .d1
+                    .as_ref()
+                    .map(|d1| d1_metadata_bytes(d1, descriptor.as_ref()))
+                    .transpose()
+                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
                 if let Some(d1) = &next.d1 {
-                    batch.put(D1_KEY, d1_metadata_bytes(d1).map_err(write_error)?);
+                    batch.put(D1_KEY, metadata.as_ref().unwrap());
                     if storage.legacy_d1.load(Ordering::Relaxed) {
                         if let Some(previous) = &sm.d1 {
                             put_dedup(&mut batch, &previous.dedup)?;
@@ -1385,6 +1283,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 batch.put(APPLIED_KEY, applied);
                 batch.put(MEMBERSHIP_KEY, membership);
                 storage.write_sync(batch)?;
+                *storage.metadata.lock().unwrap() = metadata;
                 storage.legacy_d1.store(false, Ordering::Relaxed);
                 *storage.request_manifest.lock().unwrap() = request_manifest;
                 *storage.decision_manifest.lock().unwrap() = decision_manifest;
@@ -1582,8 +1481,22 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
             let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
             batch.delete_range(DEDUP_PREFIX, DEDUP_PREFIX_END);
+            let descriptor = event_ledger::stage(
+                &mut batch,
+                None,
+                next.d1.as_ref(),
+                next.last_applied_log,
+                true,
+            )
+            .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+            let metadata = next
+                .d1
+                .as_ref()
+                .map(|d1| d1_metadata_bytes(d1, descriptor.as_ref()))
+                .transpose()
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             if let Some(d1) = &next.d1 {
-                batch.put(D1_KEY, d1_metadata_bytes(d1).map_err(write_error)?);
+                batch.put(D1_KEY, metadata.as_ref().unwrap());
                 put_dedup(&mut batch, &d1.dedup)?;
             } else {
                 batch.delete(D1_KEY);
@@ -1610,6 +1523,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             batch.put(MEMBERSHIP_KEY, membership);
             put_snapshot(&mut batch, &stored)?;
             storage.write_sync(batch)?;
+            *storage.metadata.lock().unwrap() = metadata;
             storage.legacy_d1.store(false, Ordering::Relaxed);
             *storage.request_manifest.lock().unwrap() = request_manifest;
             *storage.decision_manifest.lock().unwrap() = decision_manifest;

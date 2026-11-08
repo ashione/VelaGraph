@@ -446,7 +446,7 @@ async fn visibility_metadata_v7_golden() {
     let mut sm = Arc::new(StateMachine::default());
     setup(&mut sm, 7).await;
     let state = sm.state.read().await;
-    let bytes = d1_metadata_bytes(state.d1.as_ref().unwrap()).unwrap();
+    let bytes = d1_metadata_bytes(state.d1.as_ref().unwrap(), None).unwrap();
     let sevens = vec!["7"; 16].join(",");
     let nines = vec!["9"; 16].join(",");
     let expected=format!("{{\"version\":7,\"state\":{{\"version\":6,\"managed\":{{\"mode_id\":[{sevens}],\"activated_sequence\":1}},\"participant\":{{\"authority\":{{\"shard\":9,\"mode\":[{nines}]}},\"activated_sequence\":1,\"records\":[]}},\"visibility\":{{\"baseline_sequence\":1,\"epoch\":1,\"applied\":0,\"journal\":{{\"version\":1,\"authority\":[{nines}],\"events\":[]}},\"commits\":[]}},\"shard\":7,\"epoch\":1,\"sequence\":1,\"dedup\":[]}}}}");
