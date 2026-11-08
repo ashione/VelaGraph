@@ -67,6 +67,21 @@ impl TryFrom<CursorEncoding> for HistoryCursor {
     }
 }
 impl HistoryCursor {
+    /// Build the identity-bound empty cursor without constructing a Journal.
+    pub(crate) fn empty(authority: Authority, cohort: Cohort) -> Result<Self, Error> {
+        if authority.mode == [0; 16] || authority.shard != cohort.coordinator_shard {
+            return Err(Error::InvalidIdentity);
+        }
+        cohort.validate()?;
+        Ok(Self {
+            version: cohort.profile.history_version(),
+            root: identity_root(&authority, &cohort)?,
+            authority,
+            cohort,
+            event_count: 0,
+        })
+    }
+
     /// Validate the format and full identity, not the unavailable history bytes.
     /// The identity-bound empty root can be verified without any history.
     pub fn validate(&self) -> Result<(), Error> {
@@ -311,18 +326,16 @@ impl Journal {
             shard: cohort.coordinator_shard,
             mode: self.authority,
         };
-        cohort.validate()?;
-        let mut root = identity_root(&authority, cohort)?;
+        let empty = HistoryCursor::empty(authority, cohort.clone())?;
+        let mut root = empty.root;
         let count_usize = usize::try_from(count).map_err(|_| Error::InvalidJournal)?;
         for (index, event) in self.events.iter().take(count_usize).enumerate() {
             root = event_root(cohort.profile, root, index as u64 + 1, event)?;
         }
         Ok(HistoryCursor {
-            version: cohort.profile.history_version(),
-            authority,
-            cohort: cohort.clone(),
             event_count: count,
             root,
+            ..empty
         })
     }
 
@@ -428,6 +441,8 @@ impl Journal {
     /// and semantic rules. This does not discard later history in `self`.
     /// A zero cut returns an empty unbound journal, with no resolved ordinal.
     pub fn history_prefix(&self, cut: &HistoryCursor) -> Result<Self, Error> {
+        #[cfg(test)]
+        super::assert_full_journal_allowed();
         self.validate_history_cursor(cut)?;
         let mut prefix = Self::new(self.authority)?;
         for event in self

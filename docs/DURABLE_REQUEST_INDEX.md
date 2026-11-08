@@ -1,13 +1,36 @@
 # Durable request point recovery (A2.1)
 
-Subsequent live-storage format: [authoritative event ledger](AUTHORITATIVE_EVENT_LEDGER.md)
-replaces embedded bound Journal disk headers with v11/v12 raw-event authority.
-The original slice below documents its historical formats; logical full-history
-retention, snapshots and all lifetime limits still apply.
+Current storage contract: [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
+uses bound coordinator disk v15 with no duplicate request rows or manifest. Actual
+LookupRequest and HistoryPage read raw Commands through the strict loader's shared
+namespace walker. A private published cut connects the complete SHA-256 scan to
+previous strict semantic validation; neither a found ID nor absence permits an
+early successful return. Original Plan bytes and absolute admission ordinal remain
+exact, including partial prepares and decisions beyond an unresolved hole. Readers
+retain only their target/page, not an O(all IDs) collection; disk work remains
+O(total history).
 
-Status: an experimental derived coordinator index and bounded point-recovery
-operation. **The existing 256 external requests, 1,024 transactions and 16 MiB
-Journal admission budget remain unchanged.** This does not implement unlimited
+Normal migration fully validates an old index against strict-replayed history
+before deleting it in the same synced batch as disk v15 and the applied marker.
+Old v11/v13 and earlier published formats retain their actual legacy readers until
+that migration. Missing or changed legacy rows are errors, not a repair shortcut.
+Disk v15 open/read/apply/snapshot-build rejects all residual request rows/manifests;
+explicit validated snapshot installation may rebuild into v15 and clear them.
+The only remaining production request-index writer is the disk-v8 empty manifest
+for an unbound, request-free coordinator. The general row writer/manifest summation
+is test-only for actual legacy fixtures, while strict legacy readers/validators
+and the public RequestLookup response types remain.
+
+The original A2.1 sections below document historical indexed formats, not a live
+bound-writer alternative. Complete Journal residency in other paths, full snapshots,
+the 16 MiB budget and D1 limits remain. Both existing profiles, capacity grants and
+managed RPC v5 are unchanged by S1; it adds no directory, wire operation or dependency.
+Fresh-source validation is required before publication; prior A2.1 test results
+are not S1 acceptance evidence.
+
+Historical A2.1 status: an experimental derived coordinator index and bounded
+point-recovery operation. **Its legacy 256 external requests, 1,024 transactions
+and 16 MiB Journal admission budget remain unchanged.** This does not implement unlimited
 write lifetime, history checkpoints, retention/GC, indexed MVCC or large dynamic
 query capacity.
 

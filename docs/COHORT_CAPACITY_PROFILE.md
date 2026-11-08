@@ -116,7 +116,9 @@ The shared codec/replay implementation uses explicit profile gates:
 
 - Journal v4, history cursor/page v2 and TerminalPrefix v2 for the new profile.
 - Managed RPC v5, with no v4 fallback and no public query-format change.
-- Raw ledger/index format 2 and journal-less disk v13/v14.
+- Raw ledger/terminal-index format 2 and member disk v14. Bound coordinators now
+  write disk v15 under the [archive-reader contract](AUTHORITATIVE_EVENT_LEDGER.md);
+  former coordinator v13 remains an actual legacy migration input.
 - Member logical D1 version 7 carries its immutable activation nonce/LogId.
 - Legacy Journal v1/v2/v3, history/proof v1, raw/index format 1 and disk v11/v12
   retain their published count-bound meanings. Earlier published migration readers
@@ -128,8 +130,12 @@ binaries on every Raft replica and every managed endpoint before using new comma
 variants. An unchanged outer SnapshotV1 does not imply old binaries can replay new
 nested Journal/D1 formats or that rollback is supported.
 
-Typed metadata still contains no full Journal. Open/apply/history-source reads
-reconstruct raw Command authority before validating state. One synced batch commits
+Typed metadata still contains no full Journal. Open/apply and other full-history
+source paths reconstruct raw Command authority before validating state. Disk-v15
+coordinator LookupRequest/HistoryPage instead scan the complete raw namespace
+against a private, previously strict-validated published cut, retaining only the
+target/page. Their duplicate request index is retired after strict old-index
+validation in the atomic migration batch. One synced batch commits
 metadata, appended tail/new segments, indexes, graph state and the applied marker.
 Snapshot install checks exact local successor/profile/activation, then atomically
 rebuilds complete state. Missing, extra, mixed-version, malformed or corrupt rows
@@ -157,7 +163,8 @@ The implementation deliberately retains complete-memory Journal reconstruction,
 full replay on persistent apply, full logical snapshots and O(V) terminal proofs.
 The 16 MiB Journal budget is not a bound on total process/snapshot memory: D1,
 intents, graph data and JSON byte-array expansion are separate. No performance
-experiment, throughput claim or lazy archive recovery accompanies this change.
+experiment or throughput claim accompanies this change. S1's bounded coordinator
+readers do not remove the remaining full-archive residency or lifetime budget.
 Extending beyond the common lifetime byte budget still needs bounded live state,
 authoritative retained ID/Plan/ordinal recovery, and complete streamed checkpoint/
 snapshot closure across every member.

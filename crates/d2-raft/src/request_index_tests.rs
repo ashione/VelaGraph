@@ -123,6 +123,69 @@ fn index_rows(sm: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
         .filter(|(k, _)| k.starts_with(PREFIX))
         .collect()
 }
+// Exact published journal-less coordinator schema. Fixture rewrites change only
+// this typed version field and stage actual legacy rows from the frozen state.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyIndexHeader {
+    version: u32,
+    shard: u64,
+    epoch: u64,
+    sequence: u64,
+    dedup_bytes_limit: Option<usize>,
+    managed: crate::D1ManagedMode,
+    ledger: event_ledger::Descriptor,
+}
+fn assert_retired(sm: &StateMachine) {
+    assert!(index_rows(sm).is_empty());
+    let storage = sm.storage.as_ref().unwrap();
+    assert!(storage.db.get(MANIFEST_KEY).unwrap().is_none());
+    assert!(!storage.request_indexed.load(Ordering::Relaxed));
+    let header: LegacyIndexHeader =
+        serde_json::from_slice(&storage.db.get(D1_KEY).unwrap().unwrap()).unwrap();
+    assert_eq!(header.version, 15);
+}
+async fn indexed_legacy_fixture(path: &Path) {
+    let mut sm = Arc::new(StateMachine::open(path).unwrap());
+    setup(&mut sm).await;
+    sm.apply([entry(5, admit(900, 1))]).await.unwrap();
+    let state = sm.state.read().await;
+    let storage = sm.storage.as_ref().unwrap();
+    let bytes = storage.db.get(D1_KEY).unwrap().unwrap();
+    let mut header: LegacyIndexHeader = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(header.version, 15);
+    assert_eq!(serde_json::to_vec(&header).unwrap(), bytes);
+    header.version = 11;
+    let mut batch = WriteBatch::default();
+    crate::request_index::stage(
+        &mut batch,
+        None,
+        state.d1.as_ref(),
+        state.last_applied_log,
+        false,
+        true,
+    )
+    .unwrap();
+    batch.put(D1_KEY, serde_json::to_vec(&header).unwrap());
+    storage.write_sync(batch).unwrap();
+    crate::request_index::validate(&storage.db, state.d1.as_ref(), state.last_applied_log, true)
+        .unwrap();
+    assert_eq!(index_rows(&sm).len(), 1);
+    assert!(storage.db.get(MANIFEST_KEY).unwrap().is_some());
+    drop(state);
+    drop(sm);
+    let sm = StateMachine::open(path).unwrap();
+    assert!(sm
+        .storage
+        .as_ref()
+        .unwrap()
+        .request_indexed
+        .load(Ordering::Relaxed));
+    assert_eq!(
+        lookup(&sm, 900).await.record.unwrap().record.transaction_id,
+        id(1)
+    );
+}
 fn fail_sync(sm: &StateMachine) {
     sm.storage
         .as_ref()
@@ -195,7 +258,7 @@ async fn index_admission_batch_retry_failure_and_reopen_are_atomic() {
         .await
         .unwrap();
     assert!(results.iter().all(|r| r.d1.as_ref().unwrap().is_ok()));
-    assert_eq!(index_rows(&sm).len(), 2);
+    assert_retired(&sm);
     let original = lookup(&sm, 900).await.record.unwrap();
     assert_eq!(original.record.transaction_id, id(1));
     assert_eq!(original.transaction.ordinal, 1);
@@ -220,7 +283,7 @@ async fn index_admission_batch_retry_failure_and_reopen_are_atomic() {
     );
     assert!(result[1].d1.as_ref().unwrap().is_ok());
     assert_eq!(lookup(&sm, 900).await.record.unwrap(), original);
-    assert_eq!(index_rows(&sm).len(), 2);
+    assert_retired(&sm);
     drop(sm);
     let sm = StateMachine::open(dir.path()).unwrap();
     assert_eq!(lookup(&sm, 900).await.record.unwrap(), original);
@@ -236,7 +299,7 @@ async fn index_admission_batch_retry_failure_and_reopen_are_atomic() {
                 .unwrap()
         )
         .unwrap()["version"],
-        11
+        15
     );
 }
 
@@ -295,13 +358,7 @@ async fn legacy_migration_is_atomic_and_legacy_point_read_is_explicit() {
     drop(sm);
     let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
     sm.apply([entry(6, admit(900, 2))]).await.unwrap();
-    assert!(sm
-        .storage
-        .as_ref()
-        .unwrap()
-        .request_indexed
-        .load(Ordering::Relaxed));
-    assert_eq!(index_rows(&sm).len(), 1);
+    assert_retired(&sm);
     assert_eq!(lookup(&sm, 900).await, original);
     drop(sm);
     let sm = StateMachine::open(dir.path()).unwrap();
@@ -312,9 +369,14 @@ async fn legacy_migration_is_atomic_and_legacy_point_read_is_explicit() {
 async fn corrupt_missing_extra_or_rewritten_index_fails_closed() {
     for case in 0..12 {
         let dir = tempfile::tempdir().unwrap();
+        indexed_legacy_fixture(dir.path()).await;
         let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
-        setup(&mut sm).await;
-        sm.apply([entry(5, admit(900, 1))]).await.unwrap();
+        assert!(sm
+            .storage
+            .as_ref()
+            .unwrap()
+            .request_indexed
+            .load(Ordering::Relaxed));
         let (key, value) = index_rows(&sm).pop().unwrap();
         let db = &sm.storage.as_ref().unwrap().db;
         match case {
@@ -349,10 +411,12 @@ async fn corrupt_missing_extra_or_rewritten_index_fails_closed() {
                     .unwrap();
             }
             9 => {
-                let mut v: serde_json::Value =
+                let mut header: LegacyIndexHeader =
                     serde_json::from_slice(&db.get(D1_KEY).unwrap().unwrap()).unwrap();
-                v["version"] = 11.into();
-                db.put(D1_KEY, serde_json::to_vec(&v).unwrap()).unwrap();
+                // Actual disk13 requires the byte profile, unlike this disk11 fixture.
+                header.version = 13;
+                db.put(D1_KEY, serde_json::to_vec(&header).unwrap())
+                    .unwrap();
             }
             10 => {
                 db.put(&key, b"{\"version\":1,\"version\":1}").unwrap();
@@ -371,7 +435,8 @@ async fn corrupt_missing_extra_or_rewritten_index_fails_closed() {
                 "case {case}"
             );
         }
-        if matches!(case, 1 | 8) {
+        {
+            // Ordinary migration validates every legacy row, including extra rows.
             let before = disk(&sm);
             assert!(sm.apply([entry(6, admit(900, 2))]).await.is_err());
             assert_eq!(disk(&sm), before);
@@ -401,8 +466,9 @@ async fn snapshot_rebuild_replaces_index_atomically_and_rejects_history_loss() {
         .await
         .unwrap();
     // An orphan derived row is replaced only by an explicitly validated snapshot.
-    let (mut extra_key, extra_value) = index_rows(&target).pop().unwrap();
-    *extra_key.last_mut().unwrap() ^= 1;
+    assert_retired(&target);
+    let extra_key = [PREFIX, b"orphan"].concat();
+    let extra_value = b"{}";
     target
         .storage
         .as_ref()
@@ -420,7 +486,11 @@ async fn snapshot_rebuild_replaces_index_atomically_and_rejects_history_loss() {
         .await
         .is_err());
     assert_eq!(disk(&target), before);
-    assert_eq!(lookup(&target, 900).await, original);
+    // The valid resident state cannot hide a retired-namespace orphan.
+    assert!(target
+        .coordinator_request(7, 3, [1; 16], id(900))
+        .await
+        .is_err());
     target
         .install_snapshot(
             &image.meta,
@@ -428,7 +498,8 @@ async fn snapshot_rebuild_replaces_index_atomically_and_rejects_history_loss() {
         )
         .await
         .unwrap();
-    assert_eq!(index_rows(&target), index_rows(&source));
+    assert_retired(&target);
+    assert_retired(&source);
     let mut fake_newer = old.meta.clone();
     fake_newer.last_log_id = Some(LogId::new(CommittedLeaderId::new(2, 1), 100));
     let before = disk(&target);
@@ -508,7 +579,7 @@ async fn request_quota_does_not_expire_old_ids_or_reserved_resolution() {
     drop(sm);
     let sm = StateMachine::open(dir.path()).unwrap();
     assert_eq!(lookup(&sm, 1).await.record.unwrap(), after);
-    assert_eq!(index_rows(&sm).len(), 256);
+    assert_retired(&sm);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -578,7 +649,7 @@ async fn lost_ack_process_death_recovers_admission_migration_and_snapshot() -> a
         let dir = tempfile::tempdir()?;
         let state_path = dir.path().join("state.db");
         if mode == "migration" {
-            legacy_fixture(&state_path).await;
+            indexed_legacy_fixture(&state_path).await;
         } else if mode == "admission" {
             let mut sm = Arc::new(StateMachine::open(&state_path)?);
             setup(&mut sm).await;
@@ -610,19 +681,14 @@ async fn lost_ack_process_death_recovers_admission_migration_and_snapshot() -> a
         child.0.kill()?;
         child.0.wait()?;
         let mut sm = Arc::new(StateMachine::open(&state_path)?);
-        assert!(sm
-            .storage
-            .as_ref()
-            .unwrap()
-            .request_indexed
-            .load(Ordering::Relaxed));
+        assert_retired(&sm);
         let original = lookup(&sm, 900).await.record.unwrap();
         assert_eq!(original.record.transaction_id, id(1));
         assert_eq!(original.transaction.ordinal, 1);
-        assert_eq!(
-            index_rows(&sm).len(),
-            if mode == "migration" { 2 } else { 1 }
-        );
+        assert_retired(&sm);
+        if mode == "migration" {
+            assert!(lookup(&sm, 2).await.record.is_some());
+        }
         if mode == "snapshot" {
             assert!(sm.get_current_snapshot().await?.is_some());
         }
@@ -632,4 +698,56 @@ async fn lost_ack_process_death_recovers_admission_migration_and_snapshot() -> a
         assert_eq!(lookup(&sm, 900).await.record.unwrap(), original);
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn pre_index_legacy_and_fresh_coordinator_reject_orphans_before_publication() {
+    for legacy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        if legacy {
+            legacy_fixture(dir.path()).await;
+        }
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        let marker = sm.applied().await;
+        let key = b"sm/request/orphan";
+        sm.storage.as_ref().unwrap().db.put(key, b"bad").unwrap();
+        let before = disk(&sm);
+        let entries = if legacy {
+            vec![Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 6),
+                payload: EntryPayload::Blank,
+            }]
+        } else {
+            vec![
+                entry(1, D1Command::Activate { shard: 7, epoch: 3 }),
+                entry(
+                    2,
+                    D1Command::EnableManagedWrites {
+                        shard: 7,
+                        epoch: 3,
+                        expected_sequence: 0,
+                        mode_id: [1; 16],
+                    },
+                ),
+                entry(
+                    3,
+                    D1Command::EnableCoordinator {
+                        shard: 7,
+                        epoch: 3,
+                        mode_id: [1; 16],
+                    },
+                ),
+                entry(4, command(Command::BindCohort { cohort: cohort() })),
+            ]
+        };
+        assert!(sm.apply(entries.clone()).await.is_err());
+        assert_eq!(disk(&sm), before);
+        assert_eq!(sm.applied().await, marker);
+        sm.storage.as_ref().unwrap().db.delete(key).unwrap();
+        sm.apply(entries).await.unwrap();
+        assert_retired(&sm);
+        if legacy {
+            assert!(lookup(&sm, 900).await.record.is_some());
+        }
+    }
 }

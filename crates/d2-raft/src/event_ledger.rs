@@ -3,13 +3,15 @@
 //! The full namespace is closed: no derived index or archived snapshot is a fallback.
 use crate::d1::D1State;
 use crate::participant_writes::Authority;
+use crate::request_index::{RecoveredRequest, RequestLookup};
 use crate::transaction_decisions::{
-    CapacityProfile, Cohort, Command, HistoryCursor, Journal, MAX_HISTORY_PAGE_BYTES,
-    MAX_HISTORY_PAGE_EVENTS, MAX_JOURNAL_BYTES, MAX_REQUEST_EVENT_BYTES,
+    CapacityProfile, Cohort, Command, HistoryCursor, HistoryPage, Journal, RequestRecord,
+    Transaction, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_EVENTS, MAX_JOURNAL_BYTES,
+    MAX_REQUEST_EVENT_BYTES,
 };
-use crate::NodeId;
+use crate::{D1Error, NodeId};
 use openraft::LogId;
-use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
+use rocksdb::{Direction, IteratorMode, Snapshot, WriteBatch, DB};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub(super) const PREFIX: &[u8] = b"sm/ledger/";
@@ -91,14 +93,7 @@ impl Domain {
         key
     }
     fn zero_cursor(&self) -> anyhow::Result<HistoryCursor> {
-        let mut skeleton = journal(self.authority.mode)?;
-        replay(
-            &mut skeleton,
-            Command::BindCohort {
-                cohort: self.cohort.clone(),
-            },
-        )?;
-        skeleton.history_cursor_at(0).map_err(history_error)
+        HistoryCursor::empty(self.authority.clone(), self.cohort.clone()).map_err(history_error)
     }
 }
 
@@ -294,12 +289,15 @@ impl<'a> Staged<'a> {
     }
 }
 
-/// One RocksDB snapshot covers the marker and complete raw namespace scan.
-/// Every accepted row is immediately replayed; no full serialized Journal blob
-/// is built. Iterator work stops at the first violation of the derived bounds.
-pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
+/// One structural walker owns all raw namespace, canonical partition, and hash
+/// closure checks. Observers may collect semantic replay or one bounded result;
+/// neither can return a successful result before the entire scan closes.
+fn walk(
+    snapshot: &Snapshot<'_>,
+    descriptor: &Descriptor,
+    mut observe: impl FnMut(Command, &HistoryCursor, usize) -> anyhow::Result<()>,
+) -> anyhow::Result<Tail> {
     descriptor.validate()?;
-    let snapshot = db.snapshot();
     let applied: Option<LogId<NodeId>> = match snapshot.get(super::APPLIED_KEY)? {
         Some(bytes) => serde_json::from_slice(&bytes)?,
         None => None,
@@ -308,10 +306,10 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
         applied == descriptor.applied,
         "ledger applied marker mismatch"
     );
-    let mut journal = journal(descriptor.domain.authority.mode)?;
     let mut cursor = descriptor.domain.zero_cursor()?;
     let mut count = 0u64;
     let mut encoded_bytes = 0u64;
+    let mut canonical_bytes = 0usize;
     let mut tail: Option<Tail> = None;
     for item in snapshot.iterator(IteratorMode::From(PREFIX, Direction::Forward)) {
         let (key, value) = item?;
@@ -319,33 +317,48 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
             break;
         }
         anyhow::ensure!(count < descriptor.segment_count, "extra ledger row");
+        let first = cursor
+            .event_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("ledger event position overflow"))?;
         anyhow::ensure!(
-            key.as_ref() == descriptor.domain.key(cursor.event_count + 1),
+            key.as_ref() == descriptor.domain.key(first),
             "ledger key gap or foreign domain"
         );
+        let row_bytes = key
+            .len()
+            .checked_add(value.len())
+            .ok_or_else(|| anyhow::anyhow!("ledger row byte overflow"))?;
         encoded_bytes = encoded_bytes
-            .checked_add((key.len() + value.len()) as u64)
+            .checked_add(row_bytes as u64)
             .ok_or_else(|| anyhow::anyhow!("ledger byte total overflow"))?;
         anyhow::ensure!(
             encoded_bytes <= descriptor.encoded_bytes,
             "extra ledger bytes"
         );
         let row = Row::decode(&value)?;
+        let remaining = descriptor
+            .event_count
+            .checked_sub(cursor.event_count)
+            .ok_or_else(|| anyhow::anyhow!("extra ledger event"))?;
         anyhow::ensure!(
             row.domain == descriptor.domain
-                && row.first == cursor.event_count + 1
+                && row.first == first
                 && row.before_root == cursor.root
-                && row.events.len() as u64 <= descriptor.event_count - cursor.event_count,
+                && row.events.len() as u64 <= remaining,
             "ledger row header mismatch"
         );
-        let mut bytes = 0;
+        let mut bytes = 0usize;
         for event in &row.events {
-            bytes += event_size(event)?;
-            anyhow::ensure!(
-                bytes <= MAX_HISTORY_PAGE_BYTES,
-                "ledger event bytes exceed row bound"
-            );
+            bytes = bytes
+                .checked_add(event_size(event)?)
+                .filter(|bytes| *bytes <= MAX_HISTORY_PAGE_BYTES)
+                .ok_or_else(|| anyhow::anyhow!("ledger event bytes exceed row bound"))?;
         }
+        canonical_bytes = canonical_bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= MAX_JOURNAL_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("ledger canonical bytes exceed lifetime bound"))?;
         if let Some(previous) = &tail {
             anyhow::ensure!(
                 !fits(
@@ -356,35 +369,313 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
                 "noncanonical ledger partition"
             );
         }
-        let end = cursor.extend(&row.events).map_err(history_error)?;
-        anyhow::ensure!(end.root == row.after_root, "ledger row root mismatch");
         let row_count = row.events.len();
+        let before = cursor.clone();
         for event in row.events {
-            replay(&mut journal, event)?;
+            let size = event_size(&event)?;
+            cursor = cursor
+                .extend(std::slice::from_ref(&event))
+                .map_err(history_error)?;
+            observe(event, &cursor, size)?;
         }
+        anyhow::ensure!(cursor.root == row.after_root, "ledger row root mismatch");
         tail = Some(Tail {
             first: row.first,
-            before: cursor,
+            before,
             count: row_count,
             event_bytes: bytes,
-            encoded_bytes: (key.len() + value.len()) as u64,
+            encoded_bytes: row_bytes as u64,
         });
-        cursor = end;
-        count += 1;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("ledger row count overflow"))?;
     }
     anyhow::ensure!(
         count == descriptor.segment_count
             && encoded_bytes == descriptor.encoded_bytes
             && cursor.event_count == descriptor.event_count
-            && cursor.root == descriptor.head_root
-            && journal.cohort() == Some(&descriptor.domain.cohort),
+            && cursor.root == descriptor.head_root,
         "incomplete or substituted ledger history"
+    );
+    tail.ok_or_else(|| anyhow::anyhow!("missing cohort binding event"))
+}
+
+/// Strict cold/writer replay shares the raw walker, but still reconstructs and
+/// validates every semantic transition. A self-consistent forged descriptor is
+/// never a substitute for this validation and cannot mint a published cut.
+pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
+    #[cfg(test)]
+    crate::transaction_decisions::assert_full_journal_allowed();
+    let snapshot = db.snapshot();
+    let mut journal = journal(descriptor.domain.authority.mode)?;
+    let tail = walk(&snapshot, descriptor, |event, _, _| {
+        replay(&mut journal, event)
+    })?;
+    anyhow::ensure!(
+        journal.cohort() == Some(&descriptor.domain.cohort),
+        "ledger replay cohort mismatch"
     );
     Ok(Loaded {
         journal,
         descriptor: descriptor.clone(),
-        tail: tail.ok_or_else(|| anyhow::anyhow!("missing cohort binding event"))?,
+        tail,
     })
+}
+
+/// An integrity expectation minted from one strictly validated, published
+/// coordinator state. It contains no Journal or event/transaction collection,
+/// is not serializable, and has no descriptor-only or public constructor.
+/// SHA-256 equality proves integrity relative to this cut, not authentication.
+#[derive(Debug)]
+pub(super) struct PublishedArchiveCut {
+    descriptor: Descriptor,
+    metadata: Vec<u8>,
+    decision_manifest: Vec<u8>,
+    resolved_prefix: u64,
+}
+impl Loaded {
+    /// Caller must first complete typed metadata and derived namespace checks,
+    /// and publish this witness under the same state lock as that exact state.
+    pub(super) fn published_cut(
+        &self,
+        state: &D1State,
+        metadata: &[u8],
+        decision_manifest: &[u8],
+    ) -> anyhow::Result<PublishedArchiveCut> {
+        self.validate_hydrated_state(state)?;
+        let staged = Staged::new(state, self.descriptor.clone())?;
+        staged.published_cut(state, metadata, decision_manifest)
+    }
+}
+impl Staged<'_> {
+    /// Prepare alongside the exact raw/metadata/index/applied batch. The caller
+    /// may publish this value only after syncing that batch, under its state lock;
+    /// a failed write must discard it. All fallible work precedes disk commit.
+    pub(super) fn published_cut(
+        &self,
+        state: &D1State,
+        metadata: &[u8],
+        decision_manifest: &[u8],
+    ) -> anyhow::Result<PublishedArchiveCut> {
+        let descriptor = self.descriptor_for(state)?;
+        anyhow::ensure!(
+            descriptor.domain.role == Role::Coordinator,
+            "archive recovery cut requires a bound coordinator"
+        );
+        anyhow::ensure!(
+            super::state_codec::d1_metadata_bytes(state, Some(self))? == metadata,
+            "published archive metadata differs from staged state"
+        );
+        anyhow::ensure!(
+            crate::decision_segments::manifest_bytes(state, descriptor.applied)?
+                == decision_manifest,
+            "published archive decision manifest differs from staged state"
+        );
+        let journal = state
+            .coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing coordinator archive"))?;
+        Ok(PublishedArchiveCut {
+            descriptor: descriptor.clone(),
+            metadata: metadata.to_vec(),
+            decision_manifest: decision_manifest.to_vec(),
+            resolved_prefix: journal.resolved_prefix(),
+        })
+    }
+}
+impl PublishedArchiveCut {
+    fn snapshot<'a>(&self, db: &'a DB) -> Result<Snapshot<'a>, D1Error> {
+        let snapshot = db.snapshot();
+        if snapshot
+            .get(super::D1_KEY)
+            .map_err(|_| D1Error::EventLedgerUnavailable)?
+            .as_deref()
+            != Some(self.metadata.as_slice())
+        {
+            return Err(D1Error::EventLedgerHistory);
+        }
+        crate::request_index::reject_retired_snapshot(&snapshot).map_err(|error| {
+            if error.is::<rocksdb::Error>() {
+                D1Error::RequestIndexUnavailable
+            } else {
+                D1Error::RequestIndexHistory
+            }
+        })?;
+        Ok(snapshot)
+    }
+
+    fn head(&self) -> HistoryCursor {
+        HistoryCursor {
+            version: self.descriptor.domain.cohort.profile.history_version(),
+            authority: self.descriptor.domain.authority.clone(),
+            cohort: self.descriptor.domain.cohort.clone(),
+            event_count: self.descriptor.event_count,
+            root: self.descriptor.head_root,
+        }
+    }
+}
+
+/// Recover only one original external-ID binding and its exact transaction.
+/// The ordinal counts admissions (Begin/AdmitRequest), never binding/grant
+/// events. Full structural closure still checks every later raw row on absence,
+/// pending and terminal results, including decisions beyond an earlier hole.
+pub(super) fn lookup_request(
+    db: &DB,
+    cut: &PublishedArchiveCut,
+    id: [u8; 16],
+) -> Result<RequestLookup, D1Error> {
+    let snapshot = cut.snapshot(db)?;
+    let mut ordinal = 0u64;
+    let mut record: Option<RecoveredRequest> = None;
+    walk(&snapshot, &cut.descriptor, |event, _, _| {
+        if matches!(&event, Command::Begin { .. } | Command::AdmitRequest { .. }) {
+            ordinal = ordinal
+                .checked_add(1)
+                .filter(|n| *n <= cut.descriptor.domain.cohort.profile.max_transactions() as u64)
+                .ok_or_else(|| anyhow::anyhow!("archive transaction ordinal exceeds bound"))?;
+        }
+        match event {
+            Command::AdmitRequest {
+                id: event_id,
+                request,
+                payload,
+                transaction_id,
+                participants,
+            } if event_id == id => {
+                anyhow::ensure!(record.is_none(), "duplicate retained external request");
+                anyhow::ensure!(
+                    !request.is_empty()
+                        && request.len() <= crate::transaction_decisions::MAX_REQUEST_BYTES
+                        && !payload.is_empty()
+                        && payload.len() <= crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES,
+                    "retained request exceeds original bounds"
+                );
+                let prepared = vec![false; participants.len()];
+                record = Some(RecoveredRequest {
+                    record: RequestRecord {
+                        id,
+                        request,
+                        payload,
+                        transaction_id,
+                    },
+                    transaction: Transaction {
+                        id: transaction_id,
+                        ordinal,
+                        participants,
+                        prepared,
+                        decision: None,
+                    },
+                });
+            }
+            Command::Prepared { id, participant } => {
+                if let Some(found) = record.as_mut().filter(|found| found.transaction.id == id) {
+                    anyhow::ensure!(
+                        found
+                            .transaction
+                            .record_prepared(&participant)
+                            .map_err(history_error)?,
+                        "duplicate retained prepare"
+                    );
+                }
+            }
+            Command::Decide { id, decision } => {
+                if let Some(found) = record.as_mut().filter(|found| found.transaction.id == id) {
+                    anyhow::ensure!(
+                        found
+                            .transaction
+                            .record_decision(decision)
+                            .map_err(history_error)?,
+                        "duplicate retained decision"
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .map_err(super::ledger_read_error)?;
+    let result = RequestLookup {
+        authority: cut.descriptor.domain.authority.clone(),
+        cohort: cut.descriptor.domain.cohort.clone(),
+        resolved_prefix: cut.resolved_prefix,
+        id,
+        record,
+    };
+    result
+        .validate()
+        .map_err(|_| D1Error::RequestIndexHistory)?;
+    Ok(result)
+}
+
+/// Recover one unchanged bounded page while validating the entire published
+/// raw archive. Base and frozen-cut roots are checked at their absolute event
+/// positions, even when the page ends early or the archive has a later tail.
+pub(super) fn history_page(
+    db: &DB,
+    published: &PublishedArchiveCut,
+    base: &HistoryCursor,
+    requested_cut: Option<&HistoryCursor>,
+) -> Result<HistoryPage, D1Error> {
+    let domain = &published.descriptor.domain;
+    base.validate_identity(&domain.authority, &domain.cohort)
+        .map_err(|_| D1Error::VisibilityHistory)?;
+    let cut = requested_cut.cloned().unwrap_or_else(|| published.head());
+    cut.validate_identity(&domain.authority, &domain.cohort)
+        .map_err(|_| D1Error::VisibilityHistory)?;
+    if base.event_count > cut.event_count || cut.event_count > published.descriptor.event_count {
+        return Err(D1Error::VisibilityHistory);
+    }
+    let snapshot = published.snapshot(db)?;
+    if snapshot
+        .get(crate::decision_segments::MANIFEST_KEY)
+        .map_err(|_| D1Error::DecisionIndexUnavailable)?
+        .as_deref()
+        != Some(published.decision_manifest.as_slice())
+    {
+        return Err(D1Error::DecisionIndexHistory);
+    }
+    let mut base_seen = base.event_count == 0;
+    let mut cut_seen = cut.event_count == 0;
+    let mut end = base.clone();
+    let mut events = Vec::new();
+    let mut bytes = 0usize;
+    let mut page_full = false;
+    walk(&snapshot, &published.descriptor, |event, cursor, size| {
+        if cursor.event_count == base.event_count {
+            base_seen = cursor == base;
+        }
+        if cursor.event_count == cut.event_count {
+            cut_seen = cursor == &cut;
+        }
+        if cursor.event_count > base.event_count
+            && cursor.event_count <= cut.event_count
+            && !page_full
+        {
+            if fits(events.len(), bytes, size) {
+                bytes = bytes
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow::anyhow!("archive page byte overflow"))?;
+                events.push(event);
+                end = cursor.clone();
+            } else {
+                page_full = true;
+            }
+        }
+        Ok(())
+    })
+    .map_err(super::ledger_read_error)?;
+    if !base_seen || !cut_seen {
+        return Err(D1Error::VisibilityHistory);
+    }
+    let page = HistoryPage {
+        version: domain.cohort.profile.history_version(),
+        base: base.clone(),
+        end,
+        cut,
+        events,
+    };
+    page.validate().map_err(|_| D1Error::VisibilityHistory)?;
+    Ok(page)
 }
 
 pub(super) fn reject_orphans(db: &DB) -> anyhow::Result<()> {
@@ -682,6 +973,404 @@ mod tests {
             head_root: cursor.root,
             applied: None,
         }
+    }
+
+    fn archive_state(profile: CapacityProfile, requests: u8) -> D1State {
+        let original =
+            Journal::decode(include_bytes!("../tests/fixtures/request-journal-v3.json")).unwrap();
+        let template = crate::request_plans::Plan::decode(&original.requests()[0].payload).unwrap();
+        let mut cohort = cohort();
+        cohort.profile = profile;
+        cohort.members.push(Member {
+            shard: 8,
+            epoch: 1,
+            mode: [8; 16],
+        });
+        let mut journal = Journal::new([9; 16]).unwrap();
+        journal
+            .replay_event(Command::BindCohort {
+                cohort: cohort.clone(),
+            })
+            .unwrap();
+        if !profile.is_legacy() {
+            let grants = cohort
+                .members
+                .iter()
+                .map(|member| MemberCapacityGrant {
+                    member: member.clone(),
+                    activation: CapacityActivation {
+                        nonce: [3; 32],
+                        log_id: marker(1).unwrap(),
+                    },
+                })
+                .collect();
+            journal
+                .replay_event(Command::ConfirmCohortCapacity {
+                    cohort: cohort.clone(),
+                    grants,
+                })
+                .unwrap();
+        }
+        // An unresolved non-request transaction makes every later terminal
+        // request lie beyond a hole, while both kinds still consume ordinals.
+        journal.replay_event(begin(999)).unwrap();
+        for n in 1..=requests {
+            let mut plan = template.clone();
+            plan.id = [n; 16];
+            plan.cohort = cohort.clone();
+            plan.parts[0].request.request_id = plan.id;
+            let mut second = plan.parts[0].clone();
+            second.descriptor.shard = 8;
+            second.descriptor.mode = [8; 16];
+            second.request.shard = 8;
+            plan.parts.push(second);
+            let participants: Vec<_> = plan
+                .parts
+                .iter()
+                .map(|part| part.descriptor.clone())
+                .collect();
+            let event = Command::AdmitRequest {
+                id: [n + 64; 16],
+                request: vec![n],
+                payload: plan.encode().unwrap(),
+                transaction_id: plan.id,
+                participants: participants.clone(),
+            };
+            journal.replay_event(event.clone()).unwrap();
+            if n == 1 {
+                // A later losing Plan is ignored for an identical external
+                // request. Raw recovery must retain only the first Plan bytes.
+                let mut retry = event;
+                if let Command::AdmitRequest { payload, .. } = &mut retry {
+                    *payload = b"losing plan must not replace the original".to_vec();
+                }
+                journal.apply(retry).unwrap();
+            }
+            if n == 1 || n == 3 {
+                journal
+                    .replay_event(Command::Prepared {
+                        id: plan.id,
+                        participant: participants[0].clone(),
+                    })
+                    .unwrap();
+            }
+            if n == 1 {
+                journal
+                    .replay_event(Command::Prepared {
+                        id: plan.id,
+                        participant: participants[1].clone(),
+                    })
+                    .unwrap();
+                journal
+                    .replay_event(Command::Decide {
+                        id: plan.id,
+                        decision: Decision::Commit,
+                    })
+                    .unwrap();
+            } else if n != 3 && n != 4 {
+                journal
+                    .replay_event(Command::Decide {
+                        id: plan.id,
+                        decision: Decision::Abort,
+                    })
+                    .unwrap();
+            }
+            if n % 5 == 0 {
+                journal.replay_event(begin(1000 + u64::from(n))).unwrap();
+            }
+        }
+        state(journal)
+    }
+
+    fn persist_archive(
+        db: &DB,
+        state: &D1State,
+        applied: Option<LogId<NodeId>>,
+    ) -> PublishedArchiveCut {
+        let mut batch = WriteBatch::default();
+        let staged = stage(&mut batch, None, Some(state), applied, true)
+            .unwrap()
+            .unwrap();
+        let metadata = super::super::state_codec::d1_metadata_bytes(state, Some(&staged)).unwrap();
+        batch.put(super::super::D1_KEY, &metadata);
+        let manifest =
+            crate::decision_segments::stage(&mut batch, None, Some(state), applied, false, true)
+                .unwrap()
+                .unwrap();
+        batch.delete_range(
+            crate::request_index::PREFIX,
+            crate::request_index::PREFIX_END,
+        );
+        batch.delete(crate::request_index::MANIFEST_KEY);
+        batch.put(
+            super::super::APPLIED_KEY,
+            serde_json::to_vec(&applied).unwrap(),
+        );
+        let cut = staged.published_cut(state, &metadata, &manifest).unwrap();
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        db.write_opt(batch, &options).unwrap();
+        cut
+    }
+
+    #[test]
+    fn archive_readers_match_replay_after_every_journal_is_dropped() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let state = archive_state(profile, 36);
+            let journal = state.coordinator.as_ref().unwrap();
+            let expected: Vec<_> = [65, 66, 67, 68, 82, 100, 200]
+                .into_iter()
+                .map(|id| crate::request_index::lookup(&state, [id; 16], None).unwrap())
+                .collect();
+            assert_eq!(expected[0].record.as_ref().unwrap().transaction.ordinal, 2);
+            assert_eq!(
+                expected[0].record.as_ref().unwrap().transaction.decision,
+                Some(Decision::Commit)
+            );
+            assert_eq!(
+                expected[1].record.as_ref().unwrap().transaction.decision,
+                Some(Decision::Abort)
+            );
+            assert_eq!(
+                expected[2].record.as_ref().unwrap().transaction.prepared,
+                vec![true, false]
+            );
+            assert_eq!(
+                expected[3].record.as_ref().unwrap().transaction.prepared,
+                vec![false, false]
+            );
+            assert!(expected.last().unwrap().record.is_none());
+            assert!(expected.iter().all(|found| found.resolved_prefix == 0));
+            let mut pages = Vec::new();
+            for base in [0, 1, 31, 32, 33] {
+                for end in [base, 33, journal.events().len() as u64] {
+                    if end < base {
+                        continue;
+                    }
+                    let base = journal.history_cursor_at(base).unwrap();
+                    let old_cut = journal.history_cursor_at(end).unwrap();
+                    pages.push(journal.history_page(&base, Some(&old_cut)).unwrap());
+                }
+            }
+            let cut = persist_archive(&db, &state, marker(8));
+            let loaded = load(&db, &cut.descriptor).unwrap();
+            loaded.validate_hydrated_state(&state).unwrap();
+            crate::request_index::validate(&db, Some(&state), marker(8), false).unwrap();
+            crate::decision_segments::validate(&db, Some(&state), marker(8), true).unwrap();
+            let reopened = loaded
+                .published_cut(&state, &cut.metadata, &cut.decision_manifest)
+                .unwrap();
+            drop(loaded);
+            drop(state);
+            crate::transaction_decisions::without_full_journal(|| {
+                for expected in expected {
+                    assert_eq!(
+                        lookup_request(&db, &reopened, expected.id).unwrap(),
+                        expected
+                    );
+                }
+                for page in pages {
+                    assert_eq!(
+                        history_page(&db, &reopened, &page.base, Some(&page.cut)).unwrap(),
+                        page
+                    );
+                }
+                let zero = reopened.descriptor.domain.zero_cursor().unwrap();
+                let latest = history_page(&db, &reopened, &zero, None).unwrap();
+                assert_eq!(latest.events.len(), MAX_HISTORY_PAGE_EVENTS);
+                assert_eq!(latest.cut, reopened.head());
+                let mut foreign = latest.cut.clone();
+                foreign.root[0] ^= 1;
+                assert_eq!(
+                    history_page(&db, &reopened, &zero, Some(&foreign)),
+                    Err(D1Error::VisibilityHistory)
+                );
+                assert_eq!(
+                    history_page(&db, &reopened, &foreign, None),
+                    Err(D1Error::VisibilityHistory)
+                );
+                foreign = zero.clone();
+                foreign.cohort.coordinator_epoch += 1;
+                assert_eq!(
+                    history_page(&db, &reopened, &foreign, None),
+                    Err(D1Error::VisibilityHistory)
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn archive_page_obeys_byte_bound_without_full_history() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let mut journal = if profile.is_legacy() {
+                bound()
+            } else {
+                byte_history(0).coordinator.unwrap()
+            };
+            for n in 1..=6 {
+                let mut event = large_admit(n);
+                if let Command::AdmitRequest { payload, .. } = &mut event {
+                    let mut plan = crate::request_plans::Plan::decode(payload).unwrap();
+                    plan.cohort = journal.cohort().unwrap().clone();
+                    *payload = plan.encode().unwrap();
+                }
+                journal.replay_event(event).unwrap();
+            }
+            let zero = journal.history_cursor_at(0).unwrap();
+            let expected = journal.history_page(&zero, None).unwrap();
+            assert!(expected.events.len() < MAX_HISTORY_PAGE_EVENTS);
+            assert!(expected.end.event_count < expected.cut.event_count);
+            let state = state(journal);
+            let cut = persist_archive(&db, &state, marker(8));
+            drop(state);
+            crate::transaction_decisions::without_full_journal(|| {
+                assert_eq!(history_page(&db, &cut, &zero, None).unwrap(), expected);
+                let last = lookup_request(&db, &cut, id(106)).unwrap().record.unwrap();
+                assert_eq!(last.record.request.len(), MAX_REQUEST_BYTES);
+                assert!(last.record.payload.len() <= MAX_REQUEST_PAYLOAD_BYTES);
+            });
+        }
+    }
+
+    #[test]
+    fn archive_reads_check_corrupt_future_tails_and_exact_publication() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let state = archive_state(profile, 36);
+            let zero = state
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .history_cursor_at(0)
+                .unwrap();
+            let old_cut = state
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .history_cursor_at(3)
+                .unwrap();
+            for fault in 0..12 {
+                let cut = persist_archive(&db, &state, marker(8));
+                let original = rows(&db);
+                match fault {
+                    0 => db.delete(&original[0].0).unwrap(),
+                    1 => db.delete(&original[1].0).unwrap(),
+                    2 => db.delete(&original.last().unwrap().0).unwrap(),
+                    3 => db.put(&original.last().unwrap().0, b"{}").unwrap(),
+                    4 => db.put(b"sm/ledger/foreign", b"{}").unwrap(),
+                    5 => db
+                        .put(
+                            cut.descriptor.domain.key(cut.descriptor.event_count + 1),
+                            b"{}",
+                        )
+                        .unwrap(),
+                    6 => {
+                        let mut bytes = original.last().unwrap().1.clone();
+                        bytes.push(b' ');
+                        db.put(&original.last().unwrap().0, bytes).unwrap();
+                    }
+                    7 => db.put(super::super::D1_KEY, b"{}").unwrap(),
+                    8 => db
+                        .put(
+                            super::super::APPLIED_KEY,
+                            serde_json::to_vec(&Some(LogId::new(
+                                openraft::CommittedLeaderId::new(4, 4),
+                                8,
+                            )))
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    9 => db.put(crate::request_index::MANIFEST_KEY, b"{}").unwrap(),
+                    10 => db.put(b"sm/request/foreign", b"{}").unwrap(),
+                    11 => {
+                        // Internal row roots can be self-consistent without
+                        // matching the privately published final commitment.
+                        let mut row: Row =
+                            serde_json::from_slice(&original.last().unwrap().1).unwrap();
+                        if let Some(Command::Begin { id, .. }) = row.events.last_mut() {
+                            id[15] ^= 1;
+                        } else if let Some(Command::Decide { id, .. }) = row.events.last_mut() {
+                            id[15] ^= 1;
+                        } else {
+                            panic!("fixture tail changed");
+                        }
+                        let before = HistoryCursor {
+                            event_count: row.first - 1,
+                            root: row.before_root,
+                            ..zero.clone()
+                        };
+                        row.after_root = before.extend(&row.events).unwrap().root;
+                        db.put(
+                            &original.last().unwrap().0,
+                            serde_json::to_vec(&row).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                crate::transaction_decisions::without_full_journal(|| {
+                    assert!(
+                        lookup_request(&db, &cut, [65; 16]).is_err(),
+                        "found fault {fault}"
+                    );
+                    assert!(
+                        lookup_request(&db, &cut, [200; 16]).is_err(),
+                        "absent fault {fault}"
+                    );
+                    assert!(
+                        history_page(&db, &cut, &zero, Some(&old_cut)).is_err(),
+                        "page fault {fault}"
+                    );
+                });
+            }
+            let cut = persist_archive(&db, &state, marker(8));
+            db.delete(crate::decision_segments::MANIFEST_KEY).unwrap();
+            assert_eq!(
+                history_page(&db, &cut, &zero, None),
+                Err(D1Error::DecisionIndexHistory)
+            );
+            let next = persist_archive(&db, &state, marker(9));
+            assert!(lookup_request(&db, &cut, [65; 16]).is_err());
+            assert!(history_page(&db, &cut, &zero, None).is_err());
+            assert!(lookup_request(&db, &next, [65; 16]).is_ok());
+        }
+    }
+
+    #[test]
+    fn publication_cut_rejects_wrong_candidate_metadata_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let state = archive_state(CapacityProfile::LegacyCountV1, 4);
+        let cut = persist_archive(&db, &state, marker(8));
+        let loaded = load(&db, &cut.descriptor).unwrap();
+        let mut batch = WriteBatch::default();
+        let staged = stage(&mut batch, Some(&loaded), Some(&state), marker(8), false)
+            .unwrap()
+            .unwrap();
+        assert!(staged
+            .published_cut(&state.clone(), &cut.metadata, &cut.decision_manifest)
+            .is_err());
+        assert!(staged
+            .published_cut(&state, b"{}", &cut.decision_manifest)
+            .is_err());
+        assert!(staged.published_cut(&state, &cut.metadata, b"{}").is_err());
+        assert!(loaded
+            .published_cut(&state, b"{}", &cut.decision_manifest)
+            .is_err());
     }
 
     #[test]

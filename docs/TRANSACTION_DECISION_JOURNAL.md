@@ -6,6 +6,16 @@ its decisions; existing graph writers and global query admission are not wired.
 `GlobalCommittedSnapshot` remains Unsupported. Existing graph writes and reads
 are unchanged. This document is not a declaration that D4 is complete.
 
+Current storage/read extension: [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
+uses disk v15 for bound coordinators and retires their derived request index.
+LookupRequest and HistoryPage project bounded results from the complete raw
+namespace against a private, previously strict-validated published cut. Their
+reader helpers do not require a Journal; writer state, cold open, full snapshots
+and other protocol paths still do. Prepared/Decide checks are shared with strict
+Journal transitions. This changes neither decision semantics nor the 16 MiB
+budget. The [opt-in byte profile](COHORT_CAPACITY_PROFILE.md) replaces only legacy
+count quotas; the original prototype formats/limits below remain legacy contracts.
+
 The next atomicity layer needs a durable decision authority. A transaction ID,
 ordered participant set, each participant's shard/ownership epoch/managed mode,
 and immutable intent identity must be bound together before preparation. All

@@ -76,7 +76,7 @@ async fn journal_less_authority_and_multi_entry_overlay_keep_holes_and_old_versi
         0
     );
     let header = metadata(&sm);
-    assert_eq!(header["version"], 11);
+    assert_eq!(header["version"], 15);
     assert!(header.get("state").is_none() && header.get("coordinator").is_none());
     assert_eq!(header["ledger"]["event_count"], 64);
     assert_eq!(ledger_rows(&sm).len(), 2);
@@ -299,9 +299,22 @@ async fn published_v9_v10_migrate_atomically_and_reject_mixed_authorities() {
         let bytes = serde_json::to_vec(&serde_json::json!({"version":if member {10}else{9},
             "state":state.d1.as_ref().unwrap().stage()}))
         .unwrap();
+        let mut legacy_index = WriteBatch::default();
+        if !member {
+            crate::request_index::stage(
+                &mut legacy_index,
+                None,
+                state.d1.as_ref(),
+                state.last_applied_log,
+                false,
+                true,
+            )
+            .unwrap();
+        }
         drop(state);
         let db = &sm.storage.as_ref().unwrap().db;
-        db.put(D1_KEY, &bytes).unwrap();
+        legacy_index.put(D1_KEY, &bytes);
+        db.write(legacy_index).unwrap();
         drop(sm);
         assert!(StateMachine::open(dir.path()).is_err()); // dual authority
         {
@@ -323,7 +336,7 @@ async fn published_v9_v10_migrate_atomically_and_reject_mixed_authorities() {
         assert!(sm.apply([entry(index, command.clone())]).await.is_err());
         assert_eq!(disk(&sm), before);
         apply(&mut sm, vec![command]).await;
-        assert_eq!(metadata(&sm)["version"], if member { 12 } else { 11 });
+        assert_eq!(metadata(&sm)["version"], if member { 12 } else { 15 });
         assert_eq!(prefix(&sm, 1, member).await, old);
         assert_eq!(ledger_rows(&sm).len(), 1);
         drop(sm);

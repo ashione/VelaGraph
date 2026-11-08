@@ -179,9 +179,45 @@ pub struct Transaction {
     pub decision: Option<Decision>,
 }
 
+impl Transaction {
+    /// Shared transition rules for strict replay and one-transaction projection.
+    /// A false result is an exact retry, which raw retained history rejects.
+    pub(crate) fn record_prepared(&mut self, participant: &Participant) -> Result<bool, Error> {
+        let index = self
+            .participants
+            .iter()
+            .position(|p| p == participant)
+            .ok_or(Error::UnknownParticipant)?;
+        if self.prepared[index] {
+            return Ok(false);
+        }
+        if self.decision.is_some() {
+            return Err(Error::AlreadyDecided);
+        }
+        self.prepared[index] = true;
+        Ok(true)
+    }
+
+    pub(crate) fn record_decision(&mut self, decision: Decision) -> Result<bool, Error> {
+        if let Some(current) = self.decision {
+            return if current == decision {
+                Ok(false)
+            } else {
+                Err(Error::AlreadyDecided)
+            };
+        }
+        if decision == Decision::Commit && !self.prepared.iter().all(|p| *p) {
+            return Err(Error::NotPrepared);
+        }
+        self.decision = Some(decision);
+        Ok(true)
+    }
+}
+
 /// Immutable append-only history. The private state cannot be deserialized
 /// without replaying every transition. No timeout implicitly aborts a transaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(test), derive(Clone))]
 #[serde(try_from = "Encoding", into = "Encoding")]
 pub struct Journal {
     authority: [u8; 16],
@@ -193,6 +229,51 @@ pub struct Journal {
     cohort: Option<Box<Cohort>>,
     requests: Vec<RequestRecord>,
     capacity_grants: Option<Vec<MemberCapacityGrant>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_JOURNAL_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn assert_full_journal_allowed() {
+    FULL_JOURNAL_FORBIDDEN.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "bounded archive reader attempted full Journal access"
+        );
+    });
+}
+
+/// Test-only tripwire: selected readers run after all source Journals are
+/// dropped and must not construct, decode, clone or reconstruct a full prefix.
+#[cfg(test)]
+pub(crate) fn without_full_journal<T>(read: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FULL_JOURNAL_FORBIDDEN.with(|forbidden| forbidden.set(self.0));
+        }
+    }
+    let _reset = Reset(FULL_JOURNAL_FORBIDDEN.with(|forbidden| forbidden.replace(true)));
+    read()
+}
+
+#[cfg(test)]
+impl Clone for Journal {
+    fn clone(&self) -> Self {
+        assert_full_journal_allowed();
+        Self {
+            authority: self.authority,
+            events: self.events.clone(),
+            transactions: self.transactions.clone(),
+            reserved_bytes: self.reserved_bytes,
+            cohort: self.cohort.clone(),
+            requests: self.requests.clone(),
+            capacity_grants: self.capacity_grants.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -223,6 +304,8 @@ impl TryFrom<Encoding> for Journal {
 
 impl Journal {
     pub fn new(authority: [u8; 16]) -> Result<Self, Error> {
+        #[cfg(test)]
+        assert_full_journal_allowed();
         if authority == [0; 16] {
             return Err(Error::InvalidIdentity);
         }
@@ -562,18 +645,7 @@ impl Journal {
                     .iter_mut()
                     .find(|t| t.id == *id)
                     .ok_or(Error::UnknownTransaction)?;
-                let index = tx
-                    .participants
-                    .iter()
-                    .position(|p| p == participant)
-                    .ok_or(Error::UnknownParticipant)?;
-                if tx.prepared[index] {
-                    return Ok(false);
-                }
-                if tx.decision.is_some() {
-                    return Err(Error::AlreadyDecided);
-                }
-                tx.prepared[index] = true;
+                return tx.record_prepared(participant);
             }
             Command::Decide { id, decision } => {
                 let tx = self
@@ -581,17 +653,7 @@ impl Journal {
                     .iter_mut()
                     .find(|t| t.id == *id)
                     .ok_or(Error::UnknownTransaction)?;
-                if let Some(current) = tx.decision {
-                    return if current == *decision {
-                        Ok(false)
-                    } else {
-                        Err(Error::AlreadyDecided)
-                    };
-                }
-                if *decision == Decision::Commit && !tx.prepared.iter().all(|p| *p) {
-                    return Err(Error::NotPrepared);
-                }
-                tx.decision = Some(*decision);
+                return tx.record_decision(*decision);
             }
         }
         Ok(true)
@@ -625,6 +687,8 @@ impl Journal {
     /// Strict structural and semantic replay; serialized derived watermarks are
     /// intentionally absent. Bounded by input bytes and finite unique events.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        #[cfg(test)]
+        assert_full_journal_allowed();
         Self::decode_with_limit(bytes, MAX_JOURNAL_BYTES)
     }
 

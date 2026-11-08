@@ -179,6 +179,16 @@ impl Manifest {
     }
 }
 
+/// Canonical expected manifest for a strictly validated publication candidate.
+/// Shared with the small archive witness; it is not an additional disk format.
+pub(crate) fn manifest_bytes(
+    state: &D1State,
+    applied: Option<LogId<NodeId>>,
+) -> anyhow::Result<Vec<u8>> {
+    let view = View::of(state).ok_or_else(|| anyhow::anyhow!("missing decision state"))?;
+    Ok(serde_json::to_vec(&Manifest::of(&view, applied)?)?)
+}
+
 /// Full strict validation on reopen; a legacy format cannot carry orphan rows.
 pub(crate) fn validate(
     db: &DB,

@@ -1,5 +1,5 @@
-//! Exact derived coordinator request index and bounded point recovery evidence.
-//! The complete Journal remains authoritative; no identity/history is evicted.
+//! Bounded point recovery evidence and strict readers for retired request indexes.
+//! Bound coordinators write no duplicate index; original raw history is retained.
 use crate::d1::D1State;
 use crate::participant_writes::Authority;
 use crate::transaction_decisions::{
@@ -8,7 +8,7 @@ use crate::transaction_decisions::{
 };
 use crate::{D1Error, NodeId};
 use openraft::LogId;
-use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
+use rocksdb::{Direction, IteratorMode, Snapshot, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 
 /// One original binding and its transaction state from the same leader read.
@@ -171,8 +171,8 @@ impl Manifest {
     }
 }
 
-/// Reopen validates the entire derived range against strict-replayed authority.
-/// Legacy/noncoordinator formats must have no index or manifest at all.
+/// Validate the complete actual legacy index against strict-replayed authority.
+/// Disk-15 and noncoordinator formats must have no index or manifest at all.
 pub(crate) fn validate(
     db: &DB,
     state: Option<&D1State>,
@@ -227,8 +227,87 @@ pub(crate) fn validate(
     Ok(())
 }
 
-/// Append newly admitted rows only. The Journal remains the bounded source;
-/// counters are recomputed exactly rather than introducing another authority.
+/// Disk-15 has no duplicate request namespace, including malformed/foreign rows.
+/// Use the same snapshot as the raw reader so residue cannot cross read cuts.
+pub(crate) fn reject_retired_snapshot(snapshot: &Snapshot<'_>) -> anyhow::Result<()> {
+    // Inspect keys only: malformed retired values have no useful size bound and
+    // must not be copied into memory merely to discover that they are forbidden.
+    let mut rows = snapshot.raw_iterator();
+    rows.seek(MANIFEST_KEY);
+    rows.status()?;
+    anyhow::ensure!(
+        rows.key() != Some(MANIFEST_KEY),
+        "retired request manifest is present"
+    );
+    rows.seek(PREFIX);
+    rows.status()?;
+    anyhow::ensure!(
+        !rows.key().is_some_and(|key| key.starts_with(PREFIX)),
+        "retired request index is present"
+    );
+    Ok(())
+}
+
+pub(crate) fn reject_retired_namespace(db: &DB) -> anyhow::Result<()> {
+    reject_retired_snapshot(&db.snapshot())
+}
+
+/// The only production writer is the historical disk-8 empty manifest for a
+/// genuinely unbound coordinator. Bound/member states retire the whole range.
+/// Ordinary migration must validate the old index before calling this function;
+/// only an explicit validated snapshot install may repair corrupt legacy rows.
+/// Set `clear_existing` only for such replacement or a validated old index;
+/// ordinary unindexed D1/member writes must neither add tombstones nor repair
+/// unrelated orphan rows.
+pub(crate) fn stage_unbound_or_retire(
+    batch: &mut WriteBatch,
+    next: Option<&D1State>,
+    applied: Option<LogId<NodeId>>,
+    clear_existing: bool,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let unbound = next.filter(|state| {
+        state
+            .coordinator
+            .as_ref()
+            .is_some_and(|journal| journal.cohort().is_none())
+    });
+    let manifest = unbound
+        .map(|state| -> anyhow::Result<Vec<u8>> {
+            let journal = state.coordinator.as_ref().unwrap();
+            anyhow::ensure!(
+                journal.cohort().is_none()
+                    && journal.requests().is_empty()
+                    && journal.capacity_profile()
+                        == crate::capacity_policy::CapacityProfile::LegacyCountV1,
+                "empty request manifest requires an unbound request-free coordinator"
+            );
+            serde_json::to_vec(&Manifest {
+                version: 1,
+                authority: Authority {
+                    shard: state.shard,
+                    mode: journal.authority(),
+                },
+                epoch: state.epoch,
+                cohort: None,
+                requests: 0,
+                encoded_bytes: 0,
+                applied,
+            })
+            .map_err(Into::into)
+        })
+        .transpose()?;
+    if clear_existing {
+        batch.delete_range(PREFIX, PREFIX_END);
+        batch.delete(MANIFEST_KEY);
+    }
+    if let Some(manifest) = &manifest {
+        batch.put(MANIFEST_KEY, manifest);
+    }
+    Ok(manifest)
+}
+
+/// Actual published legacy fixture writer, never a production migration target.
+#[cfg(test)]
 pub(crate) fn stage(
     batch: &mut WriteBatch,
     before: Option<&D1State>,
@@ -380,6 +459,98 @@ mod tests {
         let mut state = D1State::new(cohort.coordinator_shard, cohort.coordinator_epoch);
         state.coordinator = Some(journal);
         state
+    }
+
+    #[test]
+    fn production_staging_retires_bound_index_and_preserves_only_unbound_empty_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let bound = byte_state();
+        let mut batch = WriteBatch::default();
+        stage(&mut batch, None, Some(&bound), None, false, true).unwrap();
+        db.write(batch).unwrap();
+        assert!(reject_retired_namespace(&db).is_err());
+        let old = db.snapshot();
+        let mut batch = WriteBatch::default();
+        assert!(
+            stage_unbound_or_retire(&mut batch, Some(&bound), None, true)
+                .unwrap()
+                .is_none()
+        );
+        db.write(batch).unwrap();
+        reject_retired_namespace(&db).unwrap();
+        assert!(reject_retired_snapshot(&old).is_err());
+        let mut unbound = D1State::new(7, 3);
+        let mut journal = Journal::new([1; 16]).unwrap();
+        journal
+            .replay_event(crate::transaction_decisions::Command::Begin {
+                id: [2; 16],
+                participants: vec![crate::transaction_decisions::Participant {
+                    shard: 9,
+                    epoch: 3,
+                    mode: [3; 16],
+                    intent: [4; 32],
+                }],
+            })
+            .unwrap();
+        unbound.coordinator = Some(journal);
+        let mut batch = WriteBatch::default();
+        let bytes = stage_unbound_or_retire(&mut batch, Some(&unbound), None, true)
+            .unwrap()
+            .unwrap();
+        db.write(batch).unwrap();
+        validate(&db, Some(&unbound), None, true).unwrap();
+        let manifest: Manifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.cohort, None);
+        assert_eq!(manifest.requests, 0);
+        assert_eq!(manifest.encoded_bytes, 0);
+        assert!(reject_retired_namespace(&db).is_err());
+        let mut batch = WriteBatch::default();
+        assert!(stage_unbound_or_retire(&mut batch, None, None, true)
+            .unwrap()
+            .is_none());
+        db.write(batch).unwrap();
+        reject_retired_namespace(&db).unwrap();
+    }
+
+    #[test]
+    fn ordinary_unindexed_staging_writes_nothing_and_does_not_repair_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        db.put(b"sm/request/orphan", b"bad").unwrap();
+        let sequence = db.latest_sequence_number();
+        for state in [None, Some(D1State::new(7, 3)), Some(byte_state())] {
+            let mut batch = WriteBatch::default();
+            assert!(
+                stage_unbound_or_retire(&mut batch, state.as_ref(), None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            db.write(batch).unwrap();
+            assert_eq!(db.latest_sequence_number(), sequence);
+            assert_eq!(
+                db.get(b"sm/request/orphan").unwrap().as_deref(),
+                Some(b"bad".as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn retired_namespace_checks_same_snapshot_and_every_reserved_key_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let empty = db.snapshot();
+        for key in [PREFIX, b"sm/request/foreign".as_slice(), MANIFEST_KEY] {
+            db.put(key, b"invalid").unwrap();
+            reject_retired_snapshot(&empty).unwrap();
+            assert!(reject_retired_namespace(&db).is_err());
+            db.delete(key).unwrap();
+            reject_retired_namespace(&db).unwrap();
+        }
+        // Neighboring namespaces are not retired request rows.
+        db.put(b"sm/request0", b"neighbor").unwrap();
+        reject_retired_namespace(&db).unwrap();
     }
 
     #[test]
