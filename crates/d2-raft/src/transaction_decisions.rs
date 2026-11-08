@@ -3,12 +3,19 @@
 //!
 //! A resolved decision prefix is NOT a readable data version. Prepared evidence
 //! must eventually come from a fenced participant protocol, not an arbitrary caller.
-use serde::{Deserialize, Serialize};
+use crate::capacity_policy::{
+    canonical_size, deserialize_bounded_vec, validate_grants, BYTE_MAX_HISTORY_EVENTS,
+};
+pub use crate::capacity_policy::{CapacityActivation, CapacityProfile, MemberCapacityGrant};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[path = "journal_history.rs"]
 mod history;
-pub(crate) use history::MAX_HISTORY_EVENTS;
 pub use history::{HistoryCursor, HistoryPage, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_EVENTS};
+
+#[cfg(test)]
+#[path = "capacity_proofs.rs"]
+mod capacity_proofs;
 
 pub const MAX_TRANSACTIONS: usize = 1024;
 pub const MAX_PARTICIPANTS: usize = 64;
@@ -18,6 +25,25 @@ pub const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_REQUESTS: usize = 256;
 pub const MAX_REQUEST_EVENT_BYTES: usize = 2 * 1024 * 1024;
 
+fn deserialize_members<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Member>, D::Error> {
+    deserialize_bounded_vec(d, MAX_PARTICIPANTS)
+}
+fn deserialize_grants<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<MemberCapacityGrant>, D::Error> {
+    deserialize_bounded_vec(d, MAX_PARTICIPANTS)
+}
+fn deserialize_journal_events<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Command>, D::Error> {
+    deserialize_bounded_vec(d, BYTE_MAX_HISTORY_EVENTS)
+}
+pub(crate) fn deserialize_participants<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<Participant>, D::Error> {
+    deserialize_bounded_vec(d, MAX_PARTICIPANTS)
+}
+pub(crate) fn deserialize_prepared<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<bool>, D::Error> {
+    deserialize_bounded_vec(d, MAX_PARTICIPANTS)
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Participant {
@@ -41,7 +67,14 @@ pub struct Member {
 pub struct Cohort {
     pub coordinator_shard: u64,
     pub coordinator_epoch: u64,
+    #[serde(deserialize_with = "deserialize_members")]
     pub members: Vec<Member>,
+    #[serde(
+        default,
+        skip_serializing_if = "CapacityProfile::is_legacy",
+        deserialize_with = "CapacityProfile::deserialize_cohort_tag"
+    )]
+    pub profile: CapacityProfile,
 }
 impl Cohort {
     pub fn contains(&self, participant: &Participant) -> bool {
@@ -82,13 +115,22 @@ pub enum Command {
         request: Vec<u8>,
         payload: Vec<u8>,
         transaction_id: [u8; 16],
+        #[serde(deserialize_with = "deserialize_participants")]
         participants: Vec<Participant>,
     },
     BindCohort {
         cohort: Cohort,
     },
+    /// Privileged coordinator proposal after every fixed member's durable grant
+    /// has been checked. Ordinary managed Command RPCs must reject this variant.
+    ConfirmCohortCapacity {
+        cohort: Cohort,
+        #[serde(deserialize_with = "deserialize_grants")]
+        grants: Vec<MemberCapacityGrant>,
+    },
     Begin {
         id: [u8; 16],
+        #[serde(deserialize_with = "deserialize_participants")]
         participants: Vec<Participant>,
     },
     Prepared {
@@ -111,6 +153,7 @@ pub enum Error {
     NotPrepared,
     AlreadyDecided,
     Capacity,
+    CapacityNotConfirmed,
     InvalidJournal,
     IncompatibleHistory,
 }
@@ -129,7 +172,9 @@ pub struct RequestRecord {
 pub struct Transaction {
     pub id: [u8; 16],
     pub ordinal: u64,
+    #[serde(deserialize_with = "deserialize_participants")]
     pub participants: Vec<Participant>,
+    #[serde(deserialize_with = "deserialize_prepared")]
     pub prepared: Vec<bool>,
     pub decision: Option<Decision>,
 }
@@ -143,8 +188,11 @@ pub struct Journal {
     events: Vec<Command>,
     transactions: Vec<Transaction>,
     reserved_bytes: usize,
-    cohort: Option<Cohort>,
+    // Keep the private binding out of every enclosing Raft command layout.
+    // Encoding remains the original event sequence, not this derived field.
+    cohort: Option<Box<Cohort>>,
     requests: Vec<RequestRecord>,
+    capacity_grants: Option<Vec<MemberCapacityGrant>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +200,7 @@ pub struct Journal {
 struct Encoding {
     version: u32,
     authority: [u8; 16],
+    #[serde(deserialize_with = "deserialize_journal_events")]
     events: Vec<Command>,
 }
 
@@ -184,13 +233,16 @@ impl Journal {
             reserved_bytes: 0,
             cohort: None,
             requests: Vec::new(),
+            capacity_grants: None,
         };
         journal.reserved_bytes = journal.encode()?.len();
         Ok(journal)
     }
 
     fn encoding_version(&self) -> u32 {
-        if !self.requests.is_empty() {
+        if self.capacity_profile() == CapacityProfile::ByteBound16MiBV1 {
+            4
+        } else if !self.requests.is_empty() {
             3
         } else if self.cohort.is_some() {
             2
@@ -231,7 +283,24 @@ impl Journal {
     }
 
     pub fn cohort(&self) -> Option<&Cohort> {
-        self.cohort.as_ref()
+        self.cohort.as_deref()
+    }
+
+    /// The immutable bound policy. Unbound journals retain legacy semantics.
+    pub fn capacity_profile(&self) -> CapacityProfile {
+        self.cohort
+            .as_ref()
+            .map_or(CapacityProfile::LegacyCountV1, |c| c.profile)
+    }
+
+    /// Complete original grant data reconstructed only by strict event replay.
+    pub fn capacity_grants(&self) -> Option<&[MemberCapacityGrant]> {
+        self.capacity_grants.as_deref()
+    }
+
+    /// Legacy journals need no grant; byte-bound journals need full confirmation.
+    pub fn capacity_ready(&self) -> bool {
+        self.capacity_profile().is_legacy() || self.capacity_grants.is_some()
     }
 
     pub fn transaction_count(&self) -> usize {
@@ -272,22 +341,25 @@ impl Journal {
     }
 
     fn event_bytes(command: &Command) -> Result<usize, Error> {
-        serde_json::to_vec(command)
-            .map(|bytes| bytes.len())
-            .map_err(|_| Error::InvalidJournal)
+        canonical_size(command, MAX_REQUEST_EVENT_BYTES)
     }
 
     fn pending_bytes(tx: &Transaction) -> Result<usize, Error> {
         let mut size = Self::event_bytes(&Command::Decide {
             id: tx.id,
             decision: Decision::Commit,
-        })? + 1;
+        })?
+        .checked_add(1)
+        .ok_or(Error::Capacity)?;
         for (participant, prepared) in tx.participants.iter().zip(&tx.prepared) {
             if !prepared {
-                size += Self::event_bytes(&Command::Prepared {
-                    id: tx.id,
-                    participant: participant.clone(),
-                })? + 1;
+                size = size
+                    .checked_add(Self::event_bytes(&Command::Prepared {
+                        id: tx.id,
+                        participant: participant.clone(),
+                    })?)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(Error::Capacity)?;
             }
         }
         Ok(size)
@@ -298,21 +370,24 @@ impl Journal {
     // times the bounded participant/transaction lookup sizes, not journal bytes.
     fn append(&mut self, command: Command, limit: usize) -> Result<bool, Error> {
         let released = match &command {
-            Command::AdmitRequest { .. } | Command::BindCohort { .. } | Command::Begin { .. } => 0,
-            Command::Prepared { .. } => Self::event_bytes(&command)? + 1,
+            Command::AdmitRequest { .. }
+            | Command::BindCohort { .. }
+            | Command::ConfirmCohortCapacity { .. }
+            | Command::Begin { .. } => 0,
+            Command::Prepared { .. } => Self::event_bytes(&command)?
+                .checked_add(1)
+                .ok_or(Error::Capacity)?,
             Command::Decide { id, .. } => self
                 .transaction(*id)
                 .map(Self::pending_bytes)
                 .transpose()?
                 .unwrap_or(0),
         };
+        let old_envelope = self.envelope_bytes()?;
         if !self.transition(&command)? {
             return Ok(false);
         }
         let event_size = Self::event_bytes(&command)?;
-        if matches!(command, Command::AdmitRequest { .. }) && event_size > MAX_REQUEST_EVENT_BYTES {
-            return Err(Error::Capacity);
-        }
         let future = match &command {
             Command::Begin { id, .. } => Self::pending_bytes(self.transaction(*id).unwrap())?,
             Command::AdmitRequest { transaction_id, .. } => {
@@ -320,8 +395,24 @@ impl Journal {
             }
             _ => 0,
         };
-        let size = self.reserved_bytes + event_size + usize::from(!self.events.is_empty()) + future;
-        self.reserved_bytes = size.checked_sub(released).ok_or(Error::InvalidJournal)?;
+        // Charge the actual versioned envelope too. Equal digit widths of
+        // today's versions are tested, never assumed by the reservation rule.
+        let new_envelope = self.envelope_bytes()?;
+        self.reserved_bytes = self
+            .reserved_bytes
+            .checked_sub(released)
+            .and_then(|n| n.checked_sub(old_envelope))
+            .and_then(|n| n.checked_add(new_envelope))
+            .and_then(|n| n.checked_add(event_size))
+            .and_then(|n| n.checked_add(usize::from(!self.events.is_empty())))
+            .and_then(|n| n.checked_add(future))
+            .ok_or(Error::Capacity)?;
+        if self.events.len()
+            >= usize::try_from(self.capacity_profile().max_history_events())
+                .map_err(|_| Error::Capacity)?
+        {
+            return Err(Error::Capacity);
+        }
         if self.reserved_bytes > limit {
             return Err(Error::Capacity);
         }
@@ -354,10 +445,13 @@ impl Journal {
                         Err(Error::IdentityConflict)
                     };
                 }
+                if !self.capacity_ready() {
+                    return Err(Error::CapacityNotConfirmed);
+                }
                 let plan = crate::request_plans::Plan::decode(payload)?;
                 if plan.id != *transaction_id
                     || plan.authority.mode != self.authority
-                    || Some(&plan.cohort) != self.cohort.as_ref()
+                    || Some(&plan.cohort) != self.cohort.as_deref()
                     || plan.validation_version > self.resolved_prefix()
                     || plan
                         .parts
@@ -368,7 +462,7 @@ impl Journal {
                 {
                     return Err(Error::IdentityConflict);
                 }
-                if self.requests.len() >= MAX_REQUESTS {
+                if self.requests.len() >= self.capacity_profile().max_requests() {
                     return Err(Error::Capacity);
                 }
                 if self.transaction(*transaction_id).is_some() {
@@ -387,7 +481,7 @@ impl Journal {
             }
             Command::BindCohort { cohort } => {
                 cohort.validate()?;
-                if let Some(existing) = &self.cohort {
+                if let Some(existing) = self.cohort.as_deref() {
                     return if existing == cohort {
                         Ok(false)
                     } else {
@@ -397,7 +491,24 @@ impl Journal {
                 if !self.events.is_empty() {
                     return Err(Error::IncompatibleHistory);
                 }
-                self.cohort = Some(cohort.clone());
+                self.cohort = Some(Box::new(cohort.clone()));
+            }
+            Command::ConfirmCohortCapacity { cohort, grants } => {
+                if self.cohort.as_deref() != Some(cohort) {
+                    return Err(Error::IdentityConflict);
+                }
+                validate_grants(cohort, grants)?;
+                if let Some(existing) = &self.capacity_grants {
+                    return if existing == grants {
+                        Ok(false)
+                    } else {
+                        Err(Error::IdentityConflict)
+                    };
+                }
+                if !self.transactions.is_empty() || !self.requests.is_empty() {
+                    return Err(Error::IncompatibleHistory);
+                }
+                self.capacity_grants = Some(grants.clone());
             }
             Command::Begin { id, participants } => {
                 if *id == [0; 16] {
@@ -428,12 +539,18 @@ impl Journal {
                         Err(Error::IdentityConflict)
                     };
                 }
-                if self.transactions.len() >= MAX_TRANSACTIONS {
+                if !self.capacity_ready() {
+                    return Err(Error::CapacityNotConfirmed);
+                }
+                if self.transactions.len() >= self.capacity_profile().max_transactions() {
                     return Err(Error::Capacity);
                 }
                 self.transactions.push(Transaction {
                     id: *id,
-                    ordinal: self.transactions.len() as u64 + 1,
+                    ordinal: u64::try_from(self.transactions.len())
+                        .ok()
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(Error::Capacity)?,
                     participants: participants.clone(),
                     prepared: vec![false; participants.len()],
                     decision: None,
@@ -485,6 +602,17 @@ impl Journal {
         Ok(self.reserved_bytes)
     }
 
+    fn envelope_bytes(&self) -> Result<usize, Error> {
+        canonical_size(
+            &Encoding {
+                version: self.encoding_version(),
+                authority: self.authority,
+                events: Vec::new(),
+            },
+            MAX_JOURNAL_BYTES,
+        )
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(&Encoding {
             version: self.encoding_version(),
@@ -505,8 +633,14 @@ impl Journal {
             return Err(Error::Capacity);
         }
         let encoded: Encoding = serde_json::from_slice(bytes).map_err(|_| Error::InvalidJournal)?;
-        if !matches!(encoded.version, 1..=3)
-            || encoded.events.len() > MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2) + 1
+        let profile = if encoded.version == 4 {
+            CapacityProfile::ByteBound16MiBV1
+        } else {
+            CapacityProfile::LegacyCountV1
+        };
+        if !matches!(encoded.version, 1..=4)
+            || u64::try_from(encoded.events.len()).map_err(|_| Error::InvalidJournal)?
+                > profile.max_history_events()
         {
             return Err(Error::InvalidJournal);
         }
@@ -767,6 +901,7 @@ mod cohort_tests {
     use super::*;
     fn binding() -> Cohort {
         Cohort {
+            profile: CapacityProfile::LegacyCountV1,
             coordinator_shard: 9,
             coordinator_epoch: 1,
             members: vec![Member {
@@ -902,6 +1037,7 @@ mod request_tests {
     use super::*;
     fn cohort() -> Cohort {
         Cohort {
+            profile: CapacityProfile::LegacyCountV1,
             coordinator_shard: 9,
             coordinator_epoch: 1,
             members: vec![Member {

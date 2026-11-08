@@ -26,6 +26,7 @@ fn command(command: Command) -> D1Command {
 }
 fn cohort() -> Cohort {
     Cohort {
+        profile: Default::default(),
         coordinator_shard: 7,
         coordinator_epoch: 3,
         members: vec![Member {

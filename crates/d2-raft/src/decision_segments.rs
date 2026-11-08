@@ -7,7 +7,7 @@ use crate::transaction_decisions::{Cohort, Journal};
 use crate::{D1Error, NodeId};
 use openraft::LogId;
 use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub(crate) const PREFIX: &[u8] = b"sm/decision/";
 pub(crate) const PREFIX_END: &[u8] = b"sm/decision0";
@@ -62,7 +62,7 @@ impl<'a> View<'a> {
     }
     fn key(&self, first: u64) -> Vec<u8> {
         let mut key = PREFIX.to_vec();
-        key.extend_from_slice(&1u32.to_be_bytes());
+        key.extend_from_slice(&self.domain.cohort.profile.storage_format().to_be_bytes());
         key.push(match self.domain.role {
             Role::Coordinator => 0,
             Role::Member => 1,
@@ -106,7 +106,7 @@ impl<'a> View<'a> {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Row {
-            version: 1,
+            version: self.domain.cohort.profile.storage_format(),
             domain: self.domain.clone(),
             first,
             records,
@@ -122,7 +122,11 @@ struct Row {
     version: u32,
     domain: Domain,
     first: u64,
+    #[serde(deserialize_with = "deserialize_records")]
     records: Vec<Terminal>,
+}
+fn deserialize_records<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Terminal>, D::Error> {
+    crate::capacity_policy::deserialize_bounded_vec(d, SEGMENT_TRANSACTIONS)
 }
 impl Row {
     fn bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -140,7 +144,7 @@ impl Row {
         );
         let row: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
-            row.version == 1 && row.bytes()? == bytes,
+            row.version == row.domain.cohort.profile.storage_format() && row.bytes()? == bytes,
             "noncanonical decision segment"
         );
         Ok(row)
@@ -165,7 +169,7 @@ impl Manifest {
                 .ok_or_else(|| anyhow::anyhow!("decision size overflow"))?;
         }
         Ok(Self {
-            version: 1,
+            version: view.domain.cohort.profile.storage_format(),
             domain: view.domain.clone(),
             through: view.through,
             segments: view.through.div_ceil(SEGMENT_TRANSACTIONS as u64),
@@ -289,7 +293,10 @@ fn checked_manifest(db: &DB, cached: &[u8], view: &View<'_>) -> Result<Manifest,
     }
     let manifest: Manifest =
         serde_json::from_slice(cached).map_err(|_| D1Error::DecisionIndexHistory)?;
-    if manifest.version != 1 || manifest.domain != view.domain || manifest.through != view.through {
+    if manifest.version != view.domain.cohort.profile.storage_format()
+        || manifest.domain != view.domain
+        || manifest.through != view.through
+    {
         return Err(D1Error::DecisionIndexHistory);
     }
     Ok(manifest)
@@ -365,70 +372,222 @@ mod tests {
     use super::*;
     use crate::transaction_decisions::{Decision, Member, Participant, MAX_PARTICIPANTS};
 
-    #[test]
-    fn maximum_width_schema_fits_segment_bound_without_a_new_quota() {
-        // Worst-width integer and byte encodings, maximum cohort/participants,
-        // all false bits (longer than true), and a full 32-record segment. This
-        // deliberately overestimates real ordinals, which remain capped at 1024.
+    fn byte_state(count: u64) -> D1State {
+        use crate::transaction_decisions::{
+            CapacityActivation, CapacityProfile, Command, MemberCapacityGrant,
+        };
         let cohort = Cohort {
-            coordinator_shard: 0,
-            coordinator_epoch: u64::MAX,
-            members: (0..MAX_PARTICIPANTS as u64)
-                .map(|n| Member {
-                    shard: u64::MAX - MAX_PARTICIPANTS as u64 + n,
-                    epoch: u64::MAX,
-                    mode: [255; 16],
-                })
-                .collect(),
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: vec![Member {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+            }],
+            profile: CapacityProfile::ByteBound16MiBV1,
         };
-        let domain = Domain {
-            role: Role::Coordinator,
-            shard: u64::MAX,
-            epoch: u64::MAX,
-            mode: [255; 16],
-            authority: Authority {
-                shard: u64::MAX,
-                mode: [255; 16],
-            },
-            cohort,
-        };
-        let participants: Vec<_> = domain
-            .cohort
-            .members
-            .iter()
-            .map(|m| Participant {
-                shard: m.shard,
-                epoch: m.epoch,
-                mode: m.mode,
-                intent: [255; 32],
+        let mut journal = Journal::new([9; 16]).unwrap();
+        journal
+            .replay_event(Command::BindCohort {
+                cohort: cohort.clone(),
             })
-            .collect();
-        let row = Row {
-            version: 1,
-            domain: domain.clone(),
-            first: u64::MAX,
-            records: (0..SEGMENT_TRANSACTIONS)
-                .map(|_| Terminal {
-                    id: [255; 16],
-                    ordinal: u64::MAX,
-                    participants: participants.clone(),
-                    prepared: vec![false; MAX_PARTICIPANTS],
+            .unwrap();
+        journal
+            .replay_event(Command::ConfirmCohortCapacity {
+                grants: vec![MemberCapacityGrant {
+                    member: cohort.members[0].clone(),
+                    activation: CapacityActivation {
+                        nonce: [3; 32],
+                        log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+                    },
+                }],
+                cohort,
+            })
+            .unwrap();
+        for n in 1..=count {
+            let mut id = [1; 16];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            journal
+                .replay_event(Command::Begin {
+                    id,
+                    participants: vec![Participant {
+                        shard: 7,
+                        epoch: 1,
+                        mode: [7; 16],
+                        intent: [8; 32],
+                    }],
+                })
+                .unwrap();
+            journal
+                .replay_event(Command::Decide {
+                    id,
                     decision: Decision::Abort,
                 })
-                .collect(),
+                .unwrap();
+        }
+        let mut state = D1State::new(9, 1);
+        state.version = 4;
+        state.managed = Some(crate::D1ManagedMode {
+            mode_id: [9; 16],
+            activated_sequence: 0,
+        });
+        state.coordinator = Some(journal);
+        state
+    }
+
+    #[test]
+    fn byte_profile_terminal_segments_reopen_preserve_old_cuts_and_reject_substitution() {
+        let state = byte_state(1025);
+        let view = View::of(&state).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = {
+            let db = DB::open_default(dir.path()).unwrap();
+            let mut batch = WriteBatch::default();
+            let manifest = stage(&mut batch, None, Some(&state), None, false, true)
+                .unwrap()
+                .unwrap();
+            db.write(batch).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Manifest>(&manifest)
+                    .unwrap()
+                    .version,
+                2
+            );
+            assert_eq!(&view.key(1)[PREFIX.len()..PREFIX.len() + 4], &[0, 0, 0, 2]);
+            manifest
         };
-        assert!(row.bytes().unwrap().len() < MAX_SEGMENT_BYTES);
-        let manifest = Manifest {
-            version: 1,
-            domain,
-            through: u64::MAX,
-            segments: u64::MAX,
-            encoded_bytes: u64::MAX,
-            applied: Some(LogId::new(
-                openraft::CommittedLeaderId::new(u64::MAX, u64::MAX),
-                u64::MAX,
-            )),
-        };
-        assert!(serde_json::to_vec(&manifest).unwrap().len() < MAX_MANIFEST_BYTES);
+        let db = DB::open_default(dir.path()).unwrap();
+        validate(&db, Some(&state), None, true).unwrap();
+        assert_eq!(frontier(&state, Some((&db, &manifest))).unwrap(), 1025);
+        for cut in [0, 1, 32, 256, 1024, 1025] {
+            assert_eq!(
+                prefix(&state, cut, Some((&db, &manifest))).unwrap(),
+                state
+                    .coordinator
+                    .as_ref()
+                    .unwrap()
+                    .terminal_prefix(cut)
+                    .unwrap()
+            );
+        }
+        for fault in 0..6 {
+            let mut batch = WriteBatch::default();
+            stage(&mut batch, None, Some(&state), None, false, true).unwrap();
+            db.write(batch).unwrap();
+            match fault {
+                0 => {
+                    db.delete(view.key(1025)).unwrap();
+                }
+                1 => {
+                    let mut row = view.row(1).unwrap();
+                    row.version = 1;
+                    db.put(view.key(1), row.bytes().unwrap()).unwrap();
+                }
+                2 => {
+                    let mut row = view.row(1).unwrap();
+                    row.domain.cohort.profile =
+                        crate::capacity_policy::CapacityProfile::LegacyCountV1;
+                    db.put(view.key(1), row.bytes().unwrap()).unwrap();
+                }
+                3 => {
+                    let mut key = view.key(1);
+                    key[PREFIX.len() + 3] = 1;
+                    db.put(key, view.row(1).unwrap().bytes().unwrap()).unwrap();
+                }
+                4 => {
+                    let mut bad: Manifest = serde_json::from_slice(&manifest).unwrap();
+                    bad.version = 1;
+                    db.put(MANIFEST_KEY, serde_json::to_vec(&bad).unwrap())
+                        .unwrap();
+                }
+                5 => {
+                    db.put(view.key(1057), b"{}").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate(&db, Some(&state), None, true).is_err(),
+                "fault {fault}"
+            );
+            if fault != 3 && fault != 5 {
+                assert!(
+                    prefix(&state, 1025, Some((&db, &manifest))).is_err(),
+                    "fault {fault}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_width_schema_fits_segment_bound_without_a_new_quota() {
+        for profile in [
+            crate::capacity_policy::CapacityProfile::LegacyCountV1,
+            crate::capacity_policy::CapacityProfile::ByteBound16MiBV1,
+        ] {
+            // Worst-width integer and byte encodings, maximum cohort/participants,
+            // all false bits (longer than true), and a full 32-record segment. This
+            // deliberately overestimates the profile-derived real ordinal ceiling.
+            let cohort = Cohort {
+                profile,
+                coordinator_shard: 0,
+                coordinator_epoch: u64::MAX,
+                members: (0..MAX_PARTICIPANTS as u64)
+                    .map(|n| Member {
+                        shard: u64::MAX - MAX_PARTICIPANTS as u64 + n,
+                        epoch: u64::MAX,
+                        mode: [255; 16],
+                    })
+                    .collect(),
+            };
+            let domain = Domain {
+                role: Role::Coordinator,
+                shard: u64::MAX,
+                epoch: u64::MAX,
+                mode: [255; 16],
+                authority: Authority {
+                    shard: u64::MAX,
+                    mode: [255; 16],
+                },
+                cohort,
+            };
+            let participants: Vec<_> = domain
+                .cohort
+                .members
+                .iter()
+                .map(|m| Participant {
+                    shard: m.shard,
+                    epoch: m.epoch,
+                    mode: m.mode,
+                    intent: [255; 32],
+                })
+                .collect();
+            let row = Row {
+                version: profile.storage_format(),
+                domain: domain.clone(),
+                first: u64::MAX,
+                records: (0..SEGMENT_TRANSACTIONS)
+                    .map(|_| Terminal {
+                        id: [255; 16],
+                        ordinal: u64::MAX,
+                        participants: participants.clone(),
+                        prepared: vec![false; MAX_PARTICIPANTS],
+                        decision: Decision::Abort,
+                    })
+                    .collect(),
+            };
+            assert!(row.bytes().unwrap().len() < MAX_SEGMENT_BYTES);
+            let manifest = Manifest {
+                version: profile.storage_format(),
+                domain,
+                through: u64::MAX,
+                segments: u64::MAX,
+                encoded_bytes: u64::MAX,
+                applied: Some(LogId::new(
+                    openraft::CommittedLeaderId::new(u64::MAX, u64::MAX),
+                    u64::MAX,
+                )),
+            };
+            assert!(serde_json::to_vec(&manifest).unwrap().len() < MAX_MANIFEST_BYTES);
+        }
     }
 }

@@ -4,24 +4,26 @@
 use crate::d1::D1State;
 use crate::participant_writes::Authority;
 use crate::transaction_decisions::{
-    Cohort, Command, HistoryCursor, Journal, MAX_HISTORY_EVENTS, MAX_HISTORY_PAGE_BYTES,
-    MAX_HISTORY_PAGE_EVENTS, MAX_JOURNAL_BYTES, MAX_PARTICIPANTS, MAX_REQUEST_EVENT_BYTES,
+    CapacityProfile, Cohort, Command, HistoryCursor, Journal, MAX_HISTORY_PAGE_BYTES,
+    MAX_HISTORY_PAGE_EVENTS, MAX_JOURNAL_BYTES, MAX_REQUEST_EVENT_BYTES,
 };
 use crate::NodeId;
 use openraft::LogId;
 use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
-use serde::{de, Deserialize, Deserializer, Serialize};
-use std::fmt;
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub(super) const PREFIX: &[u8] = b"sm/ledger/";
 const PREFIX_END: &[u8] = b"sm/ledger0";
-const VERSION: u32 = 1;
 // Every byte-full nonfinal row contains > (4 MiB - 2 MiB) event bytes;
 // every other nonfinal row contains 32 events. Both charge existing Journal
 // limits, not a new admission quota. The final +1 covers the unsealed tail.
-const MAX_SEGMENTS: u64 = MAX_HISTORY_EVENTS.div_ceil(MAX_HISTORY_PAGE_EVENTS as u64)
-    + (MAX_JOURNAL_BYTES / (MAX_HISTORY_PAGE_BYTES - MAX_REQUEST_EVENT_BYTES)) as u64
-    + 1;
+fn max_segments(profile: CapacityProfile) -> u64 {
+    profile
+        .max_history_events()
+        .div_ceil(MAX_HISTORY_PAGE_EVENTS as u64)
+        + (MAX_JOURNAL_BYTES / (MAX_HISTORY_PAGE_BYTES - MAX_REQUEST_EVENT_BYTES)) as u64
+        + 1
+}
 // Worst-width JSON: a Member is <= 160 bytes; 64 members plus commas
 // consume <= 10,304. The remaining domain fields are < 512, both root arrays
 // <= 258, row fields/32 event separators < 256, and a binary key < 128.
@@ -29,7 +31,9 @@ const MAX_SEGMENTS: u64 = MAX_HISTORY_EVENTS.div_ceil(MAX_HISTORY_PAGE_EVENTS as
 // Tests pin the actual maximum-width representation and all Command variants.
 const MAX_ROW_OVERHEAD: usize = 16 * 1024;
 const MAX_ROW_BYTES: usize = MAX_HISTORY_PAGE_BYTES + MAX_ROW_OVERHEAD;
-const MAX_ENCODED_BYTES: u64 = MAX_JOURNAL_BYTES as u64 + MAX_SEGMENTS * MAX_ROW_OVERHEAD as u64;
+fn max_encoded_bytes(profile: CapacityProfile) -> u64 {
+    MAX_JOURNAL_BYTES as u64 + max_segments(profile) * MAX_ROW_OVERHEAD as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Role {
@@ -44,7 +48,6 @@ pub(super) struct Domain {
     pub(super) epoch: u64,
     pub(super) mode: [u8; 16],
     pub(super) authority: Authority,
-    #[serde(deserialize_with = "deserialize_cohort")]
     pub(super) cohort: Cohort,
 }
 impl Domain {
@@ -73,7 +76,7 @@ impl Domain {
     }
     fn key(&self, first: u64) -> Vec<u8> {
         let mut key = PREFIX.to_vec();
-        key.extend_from_slice(&VERSION.to_be_bytes());
+        key.extend_from_slice(&self.cohort.profile.storage_format().to_be_bytes());
         key.push(match self.role {
             Role::Coordinator => 0,
             Role::Member => 1,
@@ -120,13 +123,14 @@ impl Descriptor {
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         self.domain.validate()?;
         anyhow::ensure!(
-            self.version == VERSION
-                && (1..=MAX_HISTORY_EVENTS).contains(&self.event_count)
-                && (1..=MAX_SEGMENTS).contains(&self.segment_count)
+            self.version == self.domain.cohort.profile.storage_format()
+                && (1..=self.domain.cohort.profile.max_history_events())
+                    .contains(&self.event_count)
+                && (1..=max_segments(self.domain.cohort.profile)).contains(&self.segment_count)
                 && self.segment_count <= self.event_count
                 && self.event_count <= self.segment_count * MAX_HISTORY_PAGE_EVENTS as u64
                 && self.encoded_bytes > 0
-                && self.encoded_bytes <= MAX_ENCODED_BYTES,
+                && self.encoded_bytes <= max_encoded_bytes(self.domain.cohort.profile),
             "invalid ledger descriptor bounds"
         );
         Ok(())
@@ -145,18 +149,6 @@ impl Descriptor {
                 && self.domain.mode == mode
                 && self.domain.role == role,
             "ledger descriptor disagrees with state identity"
-        );
-        Ok(())
-    }
-    pub(super) fn validate_state(&self, state: &D1State) -> anyhow::Result<()> {
-        self.validate()?;
-        let view = View::of(state).ok_or_else(|| anyhow::anyhow!("ledger state is not bound"))?;
-        let cursor = view.journal.history_cursor().map_err(history_error)?;
-        anyhow::ensure!(
-            self.domain == view.domain
-                && self.event_count == cursor.event_count
-                && self.head_root == cursor.root,
-            "ledger descriptor disagrees with hydrated state"
         );
         Ok(())
     }
@@ -205,71 +197,18 @@ impl Row {
         anyhow::ensure!(bytes.len() <= MAX_ROW_BYTES, "ledger row exceeds bound");
         let row: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
-            row.version == VERSION && !row.events.is_empty() && serde_json::to_vec(&row)? == bytes,
+            row.version == row.domain.cohort.profile.storage_format()
+                && !row.events.is_empty()
+                && serde_json::to_vec(&row)? == bytes,
             "noncanonical ledger row"
         );
         Ok(row)
     }
 }
-// Decode bounds are enforced before growing collection allocation, including
-// rejecting an extra element without ever materializing its Command/Member.
-fn bounded_vec<'de, D, T>(deserializer: D, maximum: usize) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Bounded<T>(usize, std::marker::PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Bounded<T> {
-        type Value = Vec<T>;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a bounded ledger sequence")
-        }
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
-            if seq.size_hint().is_some_and(|size| size > self.0) {
-                return Err(de::Error::custom("ledger sequence exceeds bound"));
-            }
-            let mut items = Vec::new();
-            while items.len() < self.0 {
-                let Some(item) = seq.next_element()? else {
-                    return Ok(items);
-                };
-                items.push(item);
-            }
-            struct Reject;
-            impl<'de> de::DeserializeSeed<'de> for Reject {
-                type Value = ();
-                fn deserialize<D: Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
-                    Err(de::Error::custom("ledger sequence exceeds bound"))
-                }
-            }
-            seq.next_element_seed(Reject)?;
-            Ok(items)
-        }
-    }
-    deserializer.deserialize_seq(Bounded::<T>(maximum, std::marker::PhantomData))
-}
+// Share the bounded decoder with Cohort and Journal rather than maintaining a
+// second collection decoder with subtly different excess-item behavior.
 fn deserialize_events<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Command>, D::Error> {
-    bounded_vec(d, MAX_HISTORY_PAGE_EVENTS)
-}
-fn deserialize_cohort<'de, D: Deserializer<'de>>(d: D) -> Result<Cohort, D::Error> {
-    use crate::transaction_decisions::Member;
-    fn members<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Member>, D::Error> {
-        bounded_vec(d, MAX_PARTICIPANTS)
-    }
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct BoundCohort {
-        coordinator_shard: u64,
-        coordinator_epoch: u64,
-        #[serde(deserialize_with = "members")]
-        members: Vec<Member>,
-    }
-    let c = BoundCohort::deserialize(d)?;
-    Ok(Cohort {
-        coordinator_shard: c.coordinator_shard,
-        coordinator_epoch: c.coordinator_epoch,
-        members: c.members,
-    })
+    crate::capacity_policy::deserialize_bounded_vec(d, MAX_HISTORY_PAGE_EVENTS)
 }
 fn history_error(error: crate::transaction_decisions::Error) -> anyhow::Error {
     anyhow::anyhow!("invalid ledger history: {error:?}")
@@ -298,10 +237,61 @@ struct Tail {
     event_bytes: usize,
     encoded_bytes: u64,
 }
+/// Raw authority validated by one load under the caller's state lock. Neither
+/// the reconstructed Journal nor its descriptor can be mutated through this proof.
 pub(super) struct Loaded {
-    pub(super) journal: Journal,
-    pub(super) descriptor: Descriptor,
+    journal: Journal,
+    descriptor: Descriptor,
     tail: Tail,
+}
+impl Loaded {
+    pub(super) fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    pub(super) fn descriptor(&self) -> &Descriptor {
+        &self.descriptor
+    }
+
+    /// Hydration must use the exact reconstructed Journal and complete domain.
+    /// The raw load already checked every event root and the full applied marker;
+    /// comparing the complete Journal also checks all replay-derived state.
+    pub(super) fn validate_hydrated_state(&self, state: &D1State) -> anyhow::Result<()> {
+        let descriptor = self.descriptor();
+        state.validate_capacity_activation(descriptor.applied)?;
+        let view = View::of(state).ok_or_else(|| anyhow::anyhow!("ledger state is not bound"))?;
+        anyhow::ensure!(
+            descriptor.domain == view.domain && self.journal() == view.journal,
+            "ledger authority disagrees with hydrated state"
+        );
+        Ok(())
+    }
+}
+
+/// A descriptor proven by staging this exact immutable candidate. This borrow
+/// is operation-local, never a deserialized token or a cache across state locks.
+pub(super) struct Staged<'a> {
+    candidate: &'a D1State,
+    descriptor: Descriptor,
+}
+impl<'a> Staged<'a> {
+    fn new(candidate: &'a D1State, descriptor: Descriptor) -> anyhow::Result<Self> {
+        descriptor.validate()?;
+        Ok(Self {
+            candidate,
+            descriptor,
+        })
+    }
+
+    /// Even an equal clone is not the candidate whose history was staged.
+    pub(super) fn descriptor_for(&self, state: &D1State) -> anyhow::Result<&Descriptor> {
+        anyhow::ensure!(
+            std::ptr::eq(self.candidate, state),
+            "ledger proof belongs to a different candidate"
+        );
+        state.validate_capacity_activation(self.descriptor.applied)?;
+        Ok(&self.descriptor)
+    }
 }
 
 /// One RocksDB snapshot covers the marker and complete raw namespace scan.
@@ -414,15 +404,18 @@ pub(super) fn reject_orphans(db: &DB) -> anyhow::Result<()> {
 /// Stage only a growing prior tail and new rows. The caller owns the atomic
 /// metadata/data/marker batch and must never commit it after any staging error.
 /// Explicit validated snapshot replacement alone can clear damaged raw rows.
-pub(super) fn stage(
+pub(super) fn stage<'a>(
     batch: &mut WriteBatch,
     before: Option<&Loaded>,
-    next: Option<&D1State>,
+    next: Option<&'a D1State>,
     applied: Option<LogId<NodeId>>,
     replace: bool,
-) -> anyhow::Result<Option<Descriptor>> {
-    let view = next.and_then(View::of);
-    let Some(view) = view else {
+) -> anyhow::Result<Option<Staged<'a>>> {
+    if let Some(state) = next {
+        state.validate_capacity_activation(applied)?;
+    }
+    let view = next.and_then(|state| View::of(state).map(|view| (state, view)));
+    let Some((candidate, view)) = view else {
         anyhow::ensure!(before.is_none(), "ledger authority cannot disappear");
         if replace {
             batch.delete_range(PREFIX, PREFIX_END);
@@ -457,10 +450,14 @@ pub(super) fn stage(
     let prior = before.filter(|_| !replace);
     if let Some(before) = prior {
         if before.journal.events().len() == view.journal.events().len() {
-            return Ok(Some(Descriptor {
-                applied,
-                ..before.descriptor.clone()
-            }));
+            return Staged::new(
+                candidate,
+                Descriptor {
+                    applied,
+                    ..before.descriptor.clone()
+                },
+            )
+            .map(Some);
         }
     }
     let (mut cursor, mut segment_count, mut encoded_bytes) = match prior {
@@ -477,7 +474,7 @@ pub(super) fn stage(
         let (end, event_bytes) = row_end(events, first)?;
         let after = cursor.extend(&events[first..end]).map_err(history_error)?;
         let row = Row {
-            version: VERSION,
+            version: view.domain.cohort.profile.storage_format(),
             domain: view.domain.clone(),
             first: first as u64 + 1,
             before_root: cursor.root,
@@ -503,7 +500,7 @@ pub(super) fn stage(
         cursor = after;
     }
     let descriptor = Descriptor {
-        version: VERSION,
+        version: view.domain.cohort.profile.storage_format(),
         domain: view.domain,
         event_count: cursor.event_count,
         segment_count,
@@ -511,8 +508,7 @@ pub(super) fn stage(
         head_root: cursor.root,
         applied,
     };
-    descriptor.validate()?;
-    Ok(Some(descriptor))
+    Staged::new(candidate, descriptor).map(Some)
 }
 fn row_end(events: &[Command], first: usize) -> anyhow::Result<(usize, usize)> {
     let mut end = first;
@@ -533,13 +529,14 @@ fn row_end(events: &[Command], first: usize) -> anyhow::Result<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::transaction_decisions::{
-        Decision, Member, Participant, MAX_REQUEST_BYTES, MAX_REQUEST_PAYLOAD_BYTES,
-        MAX_TRANSACTIONS,
+        CapacityActivation, Decision, Member, MemberCapacityGrant, Participant, MAX_PARTICIPANTS,
+        MAX_REQUEST_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MAX_TRANSACTIONS,
     };
     use rocksdb::WriteBatchIterator;
 
     fn cohort() -> Cohort {
         Cohort {
+            profile: CapacityProfile::LegacyCountV1,
             coordinator_shard: 9,
             coordinator_epoch: 1,
             members: vec![Member {
@@ -597,14 +594,41 @@ mod tests {
         }
         state(j)
     }
+    fn byte_history(count: u64) -> D1State {
+        let mut c = cohort();
+        c.profile = CapacityProfile::ByteBound16MiBV1;
+        let grants = c
+            .members
+            .iter()
+            .map(|member| MemberCapacityGrant {
+                member: member.clone(),
+                activation: CapacityActivation {
+                    nonce: [3; 32],
+                    log_id: marker(1).unwrap(),
+                },
+            })
+            .collect();
+        let mut j = Journal::new([9; 16]).unwrap();
+        j.replay_event(Command::BindCohort { cohort: c.clone() })
+            .unwrap();
+        // This is the existing privileged raw-log fixture boundary. Production
+        // confirmation must collect these generations from the actual members.
+        j.replay_event(Command::ConfirmCohortCapacity { cohort: c, grants })
+            .unwrap();
+        for n in 1..=count {
+            j.replay_event(begin(n)).unwrap();
+        }
+        state(j)
+    }
     fn marker(index: u64) -> Option<LogId<NodeId>> {
         Some(LogId::new(openraft::CommittedLeaderId::new(3, 4), index))
     }
     fn persist(db: &DB, state: &D1State, applied: Option<LogId<NodeId>>) -> Descriptor {
         let mut batch = WriteBatch::default();
-        let descriptor = stage(&mut batch, None, Some(state), applied, true)
+        let staged = stage(&mut batch, None, Some(state), applied, true)
             .unwrap()
             .unwrap();
+        let descriptor = staged.descriptor_for(state).unwrap().clone();
         batch.put(
             super::super::APPLIED_KEY,
             serde_json::to_vec(&applied).unwrap(),
@@ -633,7 +657,7 @@ mod tests {
         for &end in ends {
             let after = cursor.extend(&events[first..end]).unwrap();
             let row = Row {
-                version: VERSION,
+                version: domain.cohort.profile.storage_format(),
                 domain: domain.clone(),
                 first: first as u64 + 1,
                 before_root: cursor.root,
@@ -650,7 +674,7 @@ mod tests {
         batch.put(super::super::APPLIED_KEY, b"null");
         db.write(batch).unwrap();
         Descriptor {
-            version: VERSION,
+            version: domain.cohort.profile.storage_format(),
             domain,
             event_count: events.len() as u64,
             segment_count: ends.len() as u64,
@@ -688,7 +712,7 @@ mod tests {
         );
         let loaded = load(&db, &descriptor).unwrap();
         assert_eq!(loaded.journal, *bound_state.coordinator.as_ref().unwrap());
-        descriptor.validate_state(&bound_state).unwrap();
+        loaded.validate_hydrated_state(&bound_state).unwrap();
         let j =
             Journal::decode(include_bytes!("../tests/fixtures/request-journal-v3.json")).unwrap();
         let admitted = state(j.clone());
@@ -706,51 +730,120 @@ mod tests {
         assert_eq!(recovered.requests(), j.requests());
     }
     #[test]
-    fn namespace_closure_and_descriptor_source_headers_fail_closed() {
+    fn byte_profile_ledger_reopens_and_rejects_mixed_formats_and_missing_grant() {
         let dir = tempfile::tempdir().unwrap();
+        let state = byte_history(1025);
+        let descriptor = {
+            let db = DB::open_default(dir.path()).unwrap();
+            let descriptor = persist(&db, &state, marker(2048));
+            assert_eq!(descriptor.version, 2);
+            let hex: String = rows(&db)[0].0.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                hex,
+                include_str!("../tests/fixtures/event-ledger-coordinator-key-v1.hex")
+                    .trim()
+                    .replacen("00000001", "00000002", 1)
+            );
+            descriptor
+        };
         let db = DB::open_default(dir.path()).unwrap();
-        let state = history(65);
-        for fault in 0..15 {
-            let mut descriptor = persist(&db, &state, marker(8));
+        assert_eq!(
+            load(&db, &descriptor).unwrap().journal,
+            *state.coordinator.as_ref().unwrap()
+        );
+        let small = byte_history(33);
+        for fault in 0..7 {
+            let mut descriptor = persist(&db, &small, marker(64));
             let original = rows(&db);
             match fault {
-                0 => db.delete(&original[1].0).unwrap(),
-                1 => db.put(descriptor.domain.key(66), b"{}").unwrap(),
-                2 => db.put(b"sm/ledger/foreign", b"{}").unwrap(),
-                3 => db.put(&original[0].0, b"{}").unwrap(),
-                4 => {
+                0 => descriptor.version = 1,
+                1 => descriptor.domain.cohort.profile = CapacityProfile::LegacyCountV1,
+                2 => {
                     let mut row: Row = serde_json::from_slice(&original[0].1).unwrap();
-                    row.version += 1;
+                    row.version = 1;
                     db.put(&original[0].0, serde_json::to_vec(&row).unwrap())
                         .unwrap();
                 }
-                5 => {
-                    let mut bytes = original[0].1.clone();
-                    bytes.push(b' ');
-                    db.put(&original[0].0, bytes).unwrap();
+                3 => {
+                    let mut key = original[0].0.clone();
+                    key[PREFIX.len() + 3] = 1;
+                    db.put(key, &original[0].1).unwrap();
                 }
-                6 => descriptor.event_count += 1,
-                7 => descriptor.segment_count += 1,
-                8 => descriptor.encoded_bytes += 1,
-                9 => descriptor.head_root[0] ^= 1,
-                10 => descriptor.domain.cohort.members[0].mode[0] ^= 1,
-                11 => descriptor.domain.authority.mode[0] ^= 1,
-                12 => descriptor.domain.epoch += 1,
-                13 => descriptor.domain.role = Role::Member,
-                14 => {
-                    // Same index, different leader identity must not compare equal.
-                    descriptor.applied =
-                        Some(LogId::new(openraft::CommittedLeaderId::new(4, 4), 8));
+                4 => {
+                    db.delete(&original[1].0).unwrap();
+                }
+                5 => {
+                    db.put(descriptor.domain.key(100), b"{}").unwrap();
+                }
+                6 => {
+                    let mut row: Row = serde_json::from_slice(&original[0].1).unwrap();
+                    row.domain.cohort.profile = CapacityProfile::LegacyCountV1;
+                    db.put(&original[0].0, serde_json::to_vec(&row).unwrap())
+                        .unwrap();
                 }
                 _ => unreachable!(),
             }
             assert!(load(&db, &descriptor).is_err(), "fault {fault}");
         }
-        assert!(reject_orphans(&db).is_err());
-        let mut batch = WriteBatch::default();
-        stage(&mut batch, None, None, None, true).unwrap();
-        db.write(batch).unwrap();
-        reject_orphans(&db).unwrap();
+        let domain = View::of(&small).unwrap().domain;
+        let events = small.coordinator.as_ref().unwrap().events();
+        let ungranted = vec![events[0].clone(), events[2].clone(), events[1].clone()];
+        let descriptor = forge_domain(&db, domain, &ungranted, &[3]);
+        assert!(load(&db, &descriptor).is_err());
+        assert_eq!(max_segments(CapacityProfile::ByteBound16MiBV1), 7499);
+        assert_eq!(
+            max_encoded_bytes(CapacityProfile::ByteBound16MiBV1),
+            139_640_832
+        );
+    }
+
+    #[test]
+    fn namespace_closure_and_descriptor_source_headers_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        for state in [history(65), byte_history(63)] {
+            for fault in 0..15 {
+                let mut descriptor = persist(&db, &state, marker(8));
+                let original = rows(&db);
+                match fault {
+                    0 => db.delete(&original[1].0).unwrap(),
+                    1 => db.put(descriptor.domain.key(66), b"{}").unwrap(),
+                    2 => db.put(b"sm/ledger/foreign", b"{}").unwrap(),
+                    3 => db.put(&original[0].0, b"{}").unwrap(),
+                    4 => {
+                        let mut row: Row = serde_json::from_slice(&original[0].1).unwrap();
+                        row.version += 1;
+                        db.put(&original[0].0, serde_json::to_vec(&row).unwrap())
+                            .unwrap();
+                    }
+                    5 => {
+                        let mut bytes = original[0].1.clone();
+                        bytes.push(b' ');
+                        db.put(&original[0].0, bytes).unwrap();
+                    }
+                    6 => descriptor.event_count += 1,
+                    7 => descriptor.segment_count += 1,
+                    8 => descriptor.encoded_bytes += 1,
+                    9 => descriptor.head_root[0] ^= 1,
+                    10 => descriptor.domain.cohort.members[0].mode[0] ^= 1,
+                    11 => descriptor.domain.authority.mode[0] ^= 1,
+                    12 => descriptor.domain.epoch += 1,
+                    13 => descriptor.domain.role = Role::Member,
+                    14 => {
+                        // Same index, different leader identity must not compare equal.
+                        descriptor.applied =
+                            Some(LogId::new(openraft::CommittedLeaderId::new(4, 4), 8));
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(load(&db, &descriptor).is_err(), "fault {fault}");
+            }
+            assert!(reject_orphans(&db).is_err());
+            let mut batch = WriteBatch::default();
+            stage(&mut batch, None, None, None, true).unwrap();
+            db.write(batch).unwrap();
+            reject_orphans(&db).unwrap();
+        }
     }
 
     #[test]
@@ -804,49 +897,98 @@ mod tests {
     fn actual_staged_keys_never_rewrite_sealed_rows_or_unchanged_history() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
-        for (old, next, first) in [
-            (31, 32, Some(1)),
-            (32, 33, Some(33)),
-            (33, 34, Some(33)),
-            (65, 65, None),
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
         ] {
-            let old_state = history(old);
-            let descriptor = persist(&db, &old_state, marker(1));
-            let loaded = load(&db, &descriptor).unwrap();
-            let mut batch = WriteBatch::default();
-            let next_state = history(next);
-            let next_descriptor = stage(
-                &mut batch,
-                Some(&loaded),
-                Some(&next_state),
-                marker(2),
-                false,
-            )
-            .unwrap()
-            .unwrap();
-            let mut operations = Operations::default();
-            batch.iterate(&mut operations);
-            assert_eq!(
-                operations.puts,
-                first
-                    .into_iter()
-                    .map(|n| descriptor.domain.key(n))
-                    .collect::<Vec<_>>()
-            );
-            assert!(operations.deletes.is_empty());
-            batch.put(
-                super::super::APPLIED_KEY,
-                serde_json::to_vec(&marker(2)).unwrap(),
-            );
-            db.write(batch).unwrap();
-            assert_eq!(
-                load(&db, &next_descriptor).unwrap().journal,
-                *next_state.coordinator.as_ref().unwrap()
-            );
-            loaded
-                .journal
-                .validate_successor(next_state.coordinator.as_ref().unwrap())
+            let make_state = |count| {
+                if profile == CapacityProfile::LegacyCountV1 {
+                    history(count)
+                } else {
+                    byte_history(count - 2)
+                }
+            };
+            for (old, next, first) in [
+                (31, 32, Some(1)),
+                (32, 33, Some(33)),
+                (33, 34, Some(33)),
+                (65, 65, None),
+            ] {
+                let old_state = make_state(old);
+                let descriptor = persist(&db, &old_state, marker(1));
+                let loaded = load(&db, &descriptor).unwrap();
+                let mut batch = WriteBatch::default();
+                let next_state = make_state(next);
+                let staged = stage(
+                    &mut batch,
+                    Some(&loaded),
+                    Some(&next_state),
+                    marker(2),
+                    false,
+                )
+                .unwrap()
                 .unwrap();
+                let next_descriptor = staged.descriptor_for(&next_state).unwrap();
+                let mut operations = Operations::default();
+                batch.iterate(&mut operations);
+                assert_eq!(
+                    operations.puts,
+                    first
+                        .into_iter()
+                        .map(|n| descriptor.domain.key(n))
+                        .collect::<Vec<_>>()
+                );
+                assert!(operations.deletes.is_empty());
+                batch.put(
+                    super::super::APPLIED_KEY,
+                    serde_json::to_vec(&marker(2)).unwrap(),
+                );
+                db.write(batch).unwrap();
+                assert_eq!(
+                    load(&db, next_descriptor).unwrap().journal,
+                    *next_state.coordinator.as_ref().unwrap()
+                );
+                loaded
+                    .journal
+                    .validate_successor(next_state.coordinator.as_ref().unwrap())
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_length_and_replacement_staging_reject_foreign_or_regressed_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        for old in [history(2), byte_history(1)] {
+            let descriptor = persist(&db, &old, marker(1));
+            let loaded = load(&db, &descriptor).unwrap();
+            let mut prefix = journal(loaded.journal().authority()).unwrap();
+            let events = loaded.journal().events();
+            for event in &events[..events.len() - 1] {
+                replay(&mut prefix, event.clone()).unwrap();
+            }
+            let regressed = state(prefix.clone());
+            replay(&mut prefix, begin(2)).unwrap();
+            let substituted = state(prefix);
+            assert_eq!(
+                substituted.coordinator.as_ref().unwrap().events().len(),
+                events.len()
+            );
+            for candidate in [&regressed, &substituted] {
+                for replace in [false, true] {
+                    let mut batch = WriteBatch::default();
+                    assert!(stage(
+                        &mut batch,
+                        Some(&loaded),
+                        Some(candidate),
+                        marker(2),
+                        replace,
+                    )
+                    .is_err());
+                    assert!(batch.is_empty());
+                }
+            }
         }
     }
 
@@ -883,87 +1025,138 @@ mod tests {
 
     #[test]
     fn maximum_width_schema_and_events_fit_only_derived_bounds() {
-        let members: Vec<_> = (0..MAX_PARTICIPANTS as u64)
-            .map(|n| Member {
-                shard: u64::MAX - MAX_PARTICIPANTS as u64 + n,
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let members: Vec<_> = (0..MAX_PARTICIPANTS as u64)
+                .map(|n| Member {
+                    shard: u64::MAX - MAX_PARTICIPANTS as u64 + n,
+                    epoch: u64::MAX,
+                    mode: [255; 16],
+                })
+                .collect();
+            let domain = Domain {
+                role: Role::Coordinator,
+                shard: u64::MAX,
                 epoch: u64::MAX,
                 mode: [255; 16],
-            })
-            .collect();
-        let domain = Domain {
-            role: Role::Coordinator,
-            shard: u64::MAX,
-            epoch: u64::MAX,
-            mode: [255; 16],
-            authority: Authority {
-                shard: u64::MAX,
-                mode: [255; 16],
-            },
-            cohort: Cohort {
-                coordinator_shard: u64::MAX,
-                coordinator_epoch: u64::MAX,
-                members,
-            },
-        };
-        domain.validate().unwrap();
-        let participants: Vec<_> = domain
-            .cohort
-            .members
-            .iter()
-            .map(|m| Participant {
-                shard: m.shard,
-                epoch: m.epoch,
-                mode: m.mode,
-                intent: [255; 32],
-            })
-            .collect();
-        let events = vec![
-            Command::BindCohort {
-                cohort: domain.cohort.clone(),
-            },
-            Command::Begin {
-                id: [255; 16],
-                participants: participants.clone(),
-            },
-            Command::Prepared {
-                id: [255; 16],
-                participant: participants[0].clone(),
-            },
-            Command::Decide {
-                id: [255; 16],
-                decision: Decision::Commit,
-            },
-            Command::AdmitRequest {
-                id: [255; 16],
-                request: vec![255; MAX_REQUEST_BYTES],
-                payload: vec![255; MAX_REQUEST_PAYLOAD_BYTES],
-                transaction_id: [255; 16],
-                participants,
-            },
-        ];
-        for event in &events {
-            // This width upper bound deliberately ignores Plan validity: no
-            // valid event can require a wider integer, array, or payload.
-            assert!(event_size(event).unwrap() <= MAX_REQUEST_EVENT_BYTES);
+                authority: Authority {
+                    shard: u64::MAX,
+                    mode: [255; 16],
+                },
+                cohort: Cohort {
+                    profile,
+                    coordinator_shard: u64::MAX,
+                    coordinator_epoch: u64::MAX,
+                    members,
+                },
+            };
+            domain.validate().unwrap();
+            let participants: Vec<_> = domain
+                .cohort
+                .members
+                .iter()
+                .map(|m| Participant {
+                    shard: m.shard,
+                    epoch: m.epoch,
+                    mode: m.mode,
+                    intent: [255; 32],
+                })
+                .collect();
+            let mut events = vec![
+                Command::BindCohort {
+                    cohort: domain.cohort.clone(),
+                },
+                Command::Begin {
+                    id: [255; 16],
+                    participants: participants.clone(),
+                },
+                Command::Prepared {
+                    id: [255; 16],
+                    participant: participants[0].clone(),
+                },
+                Command::Decide {
+                    id: [255; 16],
+                    decision: Decision::Commit,
+                },
+                Command::AdmitRequest {
+                    id: [255; 16],
+                    request: vec![255; MAX_REQUEST_BYTES],
+                    payload: vec![255; MAX_REQUEST_PAYLOAD_BYTES],
+                    transaction_id: [255; 16],
+                    participants,
+                },
+            ];
+            if profile == CapacityProfile::ByteBound16MiBV1 {
+                events.push(Command::ConfirmCohortCapacity {
+                    cohort: domain.cohort.clone(),
+                    grants: domain
+                        .cohort
+                        .members
+                        .iter()
+                        .map(|member| MemberCapacityGrant {
+                            member: member.clone(),
+                            activation: CapacityActivation {
+                                nonce: [255; 32],
+                                log_id: LogId::new(
+                                    openraft::CommittedLeaderId::new(u64::MAX, u64::MAX),
+                                    u64::MAX,
+                                ),
+                            },
+                        })
+                        .collect(),
+                });
+            }
+            // Exercise the actual writer/loader with the widest legal binding and
+            // complete immutable grant, in addition to the conservative shape proof.
+            let mut journal = Journal::new(domain.authority.mode).unwrap();
+            journal.replay_event(events[0].clone()).unwrap();
+            if profile == CapacityProfile::ByteBound16MiBV1 {
+                journal
+                    .replay_event(events.last().unwrap().clone())
+                    .unwrap();
+            }
+            let mut widest = D1State::new(domain.shard, domain.epoch);
+            widest.version = 4;
+            widest.managed = Some(crate::D1ManagedMode {
+                mode_id: domain.mode,
+                activated_sequence: 0,
+            });
+            widest.coordinator = Some(journal);
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let descriptor = persist(&db, &widest, marker(u64::MAX));
+            assert_eq!(descriptor.version, profile.storage_format());
+            assert_eq!(
+                load(&db, &descriptor).unwrap().journal,
+                *widest.coordinator.as_ref().unwrap()
+            );
+            for event in &events {
+                // This width upper bound deliberately ignores Plan validity: no
+                // valid event can require a wider integer, array, or payload.
+                assert!(event_size(event).unwrap() <= MAX_REQUEST_EVENT_BYTES);
+            }
+            let row = Row {
+                version: domain.cohort.profile.storage_format(),
+                domain: domain.clone(),
+                first: u64::MAX,
+                before_root: [255; 32],
+                after_root: [255; 32],
+                events: vec![events[3].clone(); MAX_HISTORY_PAGE_EVENTS],
+            };
+            let command_bytes: usize = row.events.iter().map(|e| event_size(e).unwrap()).sum();
+            assert!(
+                domain.key(u64::MAX).len() + serde_json::to_vec(&row).unwrap().len()
+                    - command_bytes
+                    < MAX_ROW_OVERHEAD
+            );
+            assert_eq!(max_segments(CapacityProfile::LegacyCountV1), 2122);
+            assert_eq!(
+                max_encoded_bytes(CapacityProfile::LegacyCountV1),
+                MAX_JOURNAL_BYTES as u64 + 2122 * MAX_ROW_OVERHEAD as u64
+            );
         }
-        let row = Row {
-            version: VERSION,
-            domain: domain.clone(),
-            first: u64::MAX,
-            before_root: [255; 32],
-            after_root: [255; 32],
-            events: vec![events[3].clone(); MAX_HISTORY_PAGE_EVENTS],
-        };
-        let command_bytes: usize = row.events.iter().map(|e| event_size(e).unwrap()).sum();
-        assert!(
-            domain.key(u64::MAX).len() + serde_json::to_vec(&row).unwrap().len() - command_bytes
-                < MAX_ROW_OVERHEAD
-        );
-        assert_eq!(MAX_SEGMENTS, 2122);
-        assert_eq!(
-            MAX_ENCODED_BYTES,
-            MAX_JOURNAL_BYTES as u64 + 2122 * MAX_ROW_OVERHEAD as u64
-        );
     }
 
     // Geometry tests isolate canonical serialized lengths from semantic Plan
@@ -1020,12 +1213,13 @@ mod tests {
             .replay_event(decide(1, Decision::Abort))
             .unwrap();
         let mut batch = WriteBatch::default();
-        let descriptor = stage(&mut batch, Some(&loaded), Some(&next), None, false)
+        let staged = stage(&mut batch, Some(&loaded), Some(&next), None, false)
             .unwrap()
             .unwrap();
+        let descriptor = staged.descriptor_for(&next).unwrap();
         db.write(batch).unwrap();
         assert_eq!(
-            load(&db, &descriptor).unwrap().journal,
+            load(&db, descriptor).unwrap().journal,
             *next.coordinator.as_ref().unwrap()
         );
         let mut invalid = next.coordinator.as_ref().unwrap().events().to_vec();
@@ -1098,9 +1292,10 @@ mod tests {
             .replay_event(next_event)
             .unwrap();
         let mut batch = WriteBatch::default();
-        let descriptor = stage(&mut batch, Some(&before), Some(&next), None, false)
+        let staged = stage(&mut batch, Some(&before), Some(&next), None, false)
             .unwrap()
             .unwrap();
+        let descriptor = staged.descriptor_for(&next).unwrap();
         let mut operations = Operations::default();
         batch.iterate(&mut operations);
         assert_eq!(
@@ -1109,7 +1304,7 @@ mod tests {
         );
         db.write(batch).unwrap();
         assert_eq!(rows(&db)[0], old_row);
-        let loaded = load(&db, &descriptor).unwrap();
+        let loaded = load(&db, descriptor).unwrap();
         assert_eq!(loaded.journal, *next.coordinator.as_ref().unwrap());
         for request in before.journal.requests() {
             assert_eq!(loaded.journal.request(request.id), Some(request));
@@ -1177,12 +1372,13 @@ mod tests {
             .replay_event(decide(rejected - 1, Decision::Abort))
             .unwrap();
         let mut batch = WriteBatch::default();
-        let descriptor = stage(&mut batch, Some(&loaded), Some(&next), None, false)
+        let staged = stage(&mut batch, Some(&loaded), Some(&next), None, false)
             .unwrap()
             .unwrap();
+        let descriptor = staged.descriptor_for(&next).unwrap();
         db.write(batch).unwrap();
         assert_eq!(
-            load(&db, &descriptor).unwrap().journal,
+            load(&db, descriptor).unwrap().journal,
             *next.coordinator.as_ref().unwrap()
         );
         let mut impossible = accepted;

@@ -10,6 +10,7 @@ fn authority() -> Authority {
 }
 fn binding() -> Cohort {
     Cohort {
+        profile: Default::default(),
         coordinator_shard: 9,
         coordinator_epoch: 1,
         members: vec![
@@ -1095,7 +1096,7 @@ async fn history_peer(
             let mut bytes = vec![0; length];
             stream.read_exact(&mut bytes).await.unwrap();
             let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(request["version"], 4);
+            assert_eq!(request["version"], 5);
             assert!(request["operation"].get("Journal").is_none());
             assert!(request["operation"].get("Advance").is_none());
             assert_eq!(request["operation"], expected);
@@ -1119,7 +1120,7 @@ async fn history_peer(
                 other => panic!("unexpected catch-up operation {other}"),
             };
             let reply = serde_json::json!({
-                "version": 4, "operation": tag, "identity": request["identity"],
+                "version": 5, "operation": tag, "identity": request["identity"],
                 "nonce": request["nonce"], "result": result,
             });
             let bytes = serde_json::to_vec(&reply).unwrap();
@@ -1309,7 +1310,7 @@ async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
         (json!({"HistoryStatus": {"authority": authority(), "target": target(7), "cohort": binding()}}),
             Some(json!({"Ok": {"HistoryStatus": {"cursor": base, "applied_prefix": 0}}}))),
     ]).await;
-    // The second member is never contacted after the source rejects v4 paging.
+    // The second member is never contacted after the source rejects v5 paging.
     let graph = GraphCohort::from_endpoints(
         NodeRef::Remote(&coordinator),
         authority(),

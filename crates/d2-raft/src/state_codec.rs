@@ -2,8 +2,9 @@
 //!
 //! Bound-cohort headers contain metadata and one ledger descriptor, never a
 //! serialized Journal. Raw events must be replayed before constructing D1State.
-use super::event_ledger::{self, Descriptor, Role};
+use super::event_ledger::{self, Descriptor, Role, Staged};
 use super::{D1_KEY, MAX_DEDUP_REQUESTS};
+use crate::capacity_policy::{CapacityActivation, CapacityProfile};
 use crate::d1::D1State;
 use crate::{D1ManagedMode, NodeId};
 use openraft::LogId;
@@ -65,7 +66,7 @@ struct CoordinatorMetadata<M, L> {
     managed: M,
     ledger: L,
 }
-type D1MetadataV11 = CoordinatorMetadata<D1ManagedMode, Descriptor>;
+type CoordinatorHeader = CoordinatorMetadata<D1ManagedMode, Descriptor>;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +75,8 @@ struct VisibilityMetadata<C> {
     epoch: u64,
     applied: u64,
     commits: C,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activation: Option<CapacityActivation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,7 +93,7 @@ struct MemberMetadata<M, P, C, L> {
     visibility: VisibilityMetadata<C>,
     ledger: L,
 }
-type D1MetadataV12 = MemberMetadata<
+type MemberHeader = MemberMetadata<
     D1ManagedMode,
     crate::participant_writes::State,
     Vec<crate::versioned_reads::CommitVersion>,
@@ -167,6 +170,20 @@ fn validate_common(
     descriptor.validate_identity(shard, epoch, managed.mode_id, role)
 }
 
+fn validate_disk_profile(version: u32, role: Role, descriptor: &Descriptor) -> anyhow::Result<()> {
+    let expected = match (version, role) {
+        (11, Role::Coordinator) | (12, Role::Member) => CapacityProfile::LegacyCountV1,
+        (13, Role::Coordinator) | (14, Role::Member) => CapacityProfile::ByteBound16MiBV1,
+        _ => anyhow::bail!("invalid role for D1 disk version"),
+    };
+    anyhow::ensure!(
+        descriptor.domain.cohort.profile == expected
+            && descriptor.version == expected.storage_format(),
+        "ledger capacity profile disagrees with disk version"
+    );
+    Ok(())
+}
+
 /// Decode sm/d1 once, then replay its raw ledger before rehydrating logical
 /// state. The caller loads incremental retry records and performs complete D1
 /// validation afterwards, before validating any derived indexes.
@@ -185,7 +202,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
     let mut request_indexed = false;
     let mut decision_indexed = false;
     let mut ledger = None;
-    if !matches!(version, 11 | 12) {
+    if !matches!(version, 11..=14) {
         event_ledger::reject_orphans(db)?;
     }
     let state = match version {
@@ -277,8 +294,9 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             decision_indexed = meta.version == 10;
             meta.state
         }
-        11 => {
-            let meta: D1MetadataV11 = decode_new(&bytes)?;
+        11 | 13 => {
+            let meta: CoordinatorHeader = decode_new(&bytes)?;
+            validate_disk_profile(version, Role::Coordinator, &meta.ledger)?;
             validate_common(
                 meta.shard,
                 meta.epoch,
@@ -298,7 +316,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                 version: 4,
                 dedup_bytes_limit: meta.dedup_bytes_limit,
                 managed: Some(meta.managed),
-                coordinator: Some(loaded.journal.clone()),
+                coordinator: Some(loaded.journal().clone()),
                 participant: None,
                 visibility: None,
                 shard: meta.shard,
@@ -306,14 +324,19 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                 sequence: meta.sequence,
                 dedup: Vec::new(),
             };
-            loaded.descriptor.validate_state(&state)?;
+            loaded.validate_hydrated_state(&state)?;
             ledger = Some(loaded);
             request_indexed = true;
             decision_indexed = true;
             state
         }
-        12 => {
-            let meta: D1MetadataV12 = decode_new(&bytes)?;
+        12 | 14 => {
+            let meta: MemberHeader = decode_new(&bytes)?;
+            validate_disk_profile(version, Role::Member, &meta.ledger)?;
+            anyhow::ensure!(
+                meta.visibility.activation.is_some() == (version == 14),
+                "member activation disagrees with disk version"
+            );
             validate_common(
                 meta.shard,
                 meta.epoch,
@@ -329,7 +352,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             );
             let loaded = event_ledger::load(db, &meta.ledger)?;
             let state = D1State {
-                version: 6,
+                version: if version == 14 { 7 } else { 6 },
                 dedup_bytes_limit: meta.dedup_bytes_limit,
                 managed: Some(meta.managed),
                 coordinator: None,
@@ -338,21 +361,37 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                     baseline_sequence: meta.visibility.baseline_sequence,
                     epoch: meta.visibility.epoch,
                     applied: meta.visibility.applied,
-                    journal: loaded.journal.clone(),
+                    journal: loaded.journal().clone(),
                     commits: meta.visibility.commits,
+                    activation: meta.visibility.activation,
                 }),
                 shard: meta.shard,
                 epoch: meta.epoch,
                 sequence: meta.sequence,
                 dedup: Vec::new(),
             };
-            loaded.descriptor.validate_state(&state)?;
+            loaded.validate_hydrated_state(&state)?;
             ledger = Some(loaded);
             decision_indexed = true;
             state
         }
         _ => anyhow::bail!("unsupported D1 disk version"),
     };
+    if version <= 12 {
+        anyhow::ensure!(
+            state
+                .coordinator
+                .iter()
+                .chain(state.visibility.iter().map(|v| &v.journal))
+                .all(|j| j.capacity_profile() == CapacityProfile::LegacyCountV1)
+                && state
+                    .visibility
+                    .as_ref()
+                    .is_none_or(|v| v.activation.is_none()),
+            "legacy disk metadata cannot contain a new capacity profile or activation"
+        );
+    }
+    state.validate_capacity_activation(applied)?;
     Ok(Some(LoadedState {
         state,
         legacy_dedup,
@@ -367,7 +406,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
 /// A bound state can never silently fall back to an embedded archive writer.
 pub(super) fn d1_metadata_bytes(
     state: &D1State,
-    descriptor: Option<&Descriptor>,
+    staged: Option<&Staged<'_>>,
 ) -> anyhow::Result<Vec<u8>> {
     let bound = state
         .coordinator
@@ -380,11 +419,11 @@ pub(super) fn d1_metadata_bytes(
         )
         .any(|journal| journal.cohort().is_some());
     anyhow::ensure!(
-        bound == descriptor.is_some(),
+        bound == staged.is_some(),
         "D1 ledger descriptor required for bound state only"
     );
-    if let Some(descriptor) = descriptor {
-        descriptor.validate_state(state)?;
+    if let Some(staged) = staged {
+        let descriptor = staged.descriptor_for(state)?;
         let managed = state
             .managed
             .as_ref()
@@ -408,7 +447,10 @@ pub(super) fn d1_metadata_bytes(
                 Role::Coordinator,
             )?;
             return Ok(serde_json::to_vec(&CoordinatorMetadata {
-                version: 11,
+                version: match descriptor.domain.cohort.profile {
+                    CapacityProfile::LegacyCountV1 => 11,
+                    CapacityProfile::ByteBound16MiBV1 => 13,
+                },
                 shard: state.shard,
                 epoch: state.epoch,
                 sequence: state.sequence,
@@ -425,7 +467,14 @@ pub(super) fn d1_metadata_bytes(
             .participant
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("ledger member lacks participant state"))?;
-        anyhow::ensure!(state.version == 6, "invalid visibility metadata");
+        anyhow::ensure!(
+            state.version
+                == match descriptor.domain.cohort.profile {
+                    CapacityProfile::LegacyCountV1 => 6,
+                    CapacityProfile::ByteBound16MiBV1 => 7,
+                },
+            "invalid visibility metadata"
+        );
         validate_common(
             state.shard,
             state.epoch,
@@ -436,7 +485,10 @@ pub(super) fn d1_metadata_bytes(
             Role::Member,
         )?;
         return Ok(serde_json::to_vec(&MemberMetadata {
-            version: 12,
+            version: match descriptor.domain.cohort.profile {
+                CapacityProfile::LegacyCountV1 => 12,
+                CapacityProfile::ByteBound16MiBV1 => 14,
+            },
             shard: state.shard,
             epoch: state.epoch,
             sequence: state.sequence,
@@ -448,10 +500,18 @@ pub(super) fn d1_metadata_bytes(
                 epoch: visibility.epoch,
                 applied: visibility.applied,
                 commits: &visibility.commits,
+                activation: visibility.activation.clone(),
             },
             ledger: descriptor,
         })?);
     }
+    anyhow::ensure!(
+        state
+            .visibility
+            .as_ref()
+            .is_none_or(|v| v.activation.is_none()),
+        "unbound metadata cannot contain a capacity activation"
+    );
     // Only genuinely unbound/non-versioned modes reach the legacy writer.
     // Versions 5/9/10 are readers only; no compatibility-only writer remains.
     if state.visibility.is_some() || state.participant.is_some() {
@@ -494,7 +554,9 @@ pub(super) fn d1_metadata_bytes(
 mod tests {
     use super::*;
     use crate::participant_writes::{Authority, Intent};
-    use crate::transaction_decisions::{Command, HistoryCursor, Journal, Participant};
+    use crate::transaction_decisions::{
+        Command, HistoryCursor, Journal, MemberCapacityGrant, Participant,
+    };
     use openraft::CommittedLeaderId;
     use rocksdb::WriteBatch;
 
@@ -566,6 +628,7 @@ mod tests {
                 applied: 0,
                 journal,
                 commits: Vec::new(),
+                activation: None,
             });
         } else {
             state.version = 4;
@@ -575,12 +638,58 @@ mod tests {
         state
     }
 
+    fn byte_state(member: bool, confirmed: bool) -> D1State {
+        let mut state = state(member, false);
+        let old = if member {
+            &state.visibility.as_ref().unwrap().journal
+        } else {
+            state.coordinator.as_ref().unwrap()
+        };
+        let mut cohort = old.cohort().unwrap().clone();
+        cohort.profile = CapacityProfile::ByteBound16MiBV1;
+        let activation = CapacityActivation {
+            nonce: [3; 32],
+            log_id: LogId::new(CommittedLeaderId::new(3, 2), 1),
+        };
+        let mut journal = Journal::new(old.authority()).unwrap();
+        journal
+            .replay_event(Command::BindCohort {
+                cohort: cohort.clone(),
+            })
+            .unwrap();
+        if confirmed {
+            let grants = cohort
+                .members
+                .iter()
+                .map(|member| MemberCapacityGrant {
+                    member: member.clone(),
+                    activation: activation.clone(),
+                })
+                .collect();
+            journal
+                .replay_event(Command::ConfirmCohortCapacity { cohort, grants })
+                .unwrap();
+        }
+        if member {
+            state.version = 7;
+            let visibility = state.visibility.as_mut().unwrap();
+            visibility.journal = journal;
+            visibility.activation = Some(activation);
+        } else {
+            state.coordinator = Some(journal);
+        }
+        state.validate().unwrap();
+        state.validate_capacity_activation(applied()).unwrap();
+        state
+    }
+
     fn persist(db: &DB, state: &D1State) -> (Descriptor, Vec<u8>) {
         let mut batch = WriteBatch::default();
-        let descriptor = event_ledger::stage(&mut batch, None, Some(state), applied(), false)
+        let staged = event_ledger::stage(&mut batch, None, Some(state), applied(), false)
             .unwrap()
             .unwrap();
-        let bytes = d1_metadata_bytes(state, Some(&descriptor)).unwrap();
+        let bytes = d1_metadata_bytes(state, Some(&staged)).unwrap();
+        let descriptor = staged.descriptor_for(state).unwrap().clone();
         batch.put(D1_KEY, &bytes);
         batch.put(
             super::super::APPLIED_KEY,
@@ -588,6 +697,189 @@ mod tests {
         );
         db.write(batch).unwrap();
         (descriptor, bytes)
+    }
+
+    fn state_journal_mut(state: &mut D1State) -> &mut Journal {
+        match &mut state.coordinator {
+            Some(journal) => journal,
+            None => &mut state.visibility.as_mut().unwrap().journal,
+        }
+    }
+
+    fn append_begin(state: &mut D1State) {
+        let journal = state_journal_mut(state);
+        let member = &journal.cohort().unwrap().members[0];
+        journal
+            .replay_event(Command::Begin {
+                id: [42; 16],
+                participants: vec![Participant {
+                    shard: member.shard,
+                    epoch: member.epoch,
+                    mode: member.mode,
+                    intent: [43; 32],
+                }],
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn staged_metadata_requires_exact_candidate_for_append_noop_and_replacement() {
+        for member in [false, true] {
+            for old in [state(member, false), byte_state(member, true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = DB::open_default(dir.path()).unwrap();
+                let (descriptor, _) = persist(&db, &old);
+                let loaded = event_ledger::load(&db, &descriptor).unwrap();
+                for append in [false, true] {
+                    let mut candidate = old.clone();
+                    if append {
+                        append_begin(&mut candidate);
+                    }
+                    for has_prior in [false, true] {
+                        for replace in [false, true] {
+                            let mut batch = WriteBatch::default();
+                            let staged = event_ledger::stage(
+                                &mut batch,
+                                has_prior.then_some(&loaded),
+                                Some(&candidate),
+                                applied(),
+                                replace,
+                            )
+                            .unwrap()
+                            .unwrap();
+                            let staged_descriptor = staged.descriptor_for(&candidate).unwrap();
+                            assert_eq!(
+                                staged_descriptor.event_count,
+                                descriptor.event_count + u64::from(append)
+                            );
+                            assert_eq!(staged_descriptor.applied, applied());
+                            let bytes = d1_metadata_bytes(&candidate, Some(&staged)).unwrap();
+                            let metadata: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            assert_eq!(
+                                metadata["ledger"],
+                                serde_json::to_value(staged_descriptor).unwrap()
+                            );
+                            let equal_candidate = candidate.clone();
+                            assert_eq!(equal_candidate, candidate);
+                            assert!(!std::ptr::eq(&equal_candidate, &candidate));
+                            assert!(d1_metadata_bytes(&equal_candidate, Some(&staged)).is_err());
+                            let mut foreign = candidate.clone();
+                            foreign.shard += 1;
+                            assert!(d1_metadata_bytes(&foreign, Some(&staged)).is_err());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_authority_requires_exact_journal_and_complete_hydrated_domain() {
+        for member in [false, true] {
+            for candidate in [state(member, false), byte_state(member, true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = DB::open_default(dir.path()).unwrap();
+                let (descriptor, _) = persist(&db, &candidate);
+                let loaded = event_ledger::load(&db, &descriptor).unwrap();
+                loaded.validate_hydrated_state(&candidate).unwrap();
+                // Hydration clones the reconstructed value; unlike staging, it
+                // deliberately requires exact value equality, not pointer identity.
+                loaded.validate_hydrated_state(&candidate.clone()).unwrap();
+                for fault in 0..6 {
+                    let mut foreign = candidate.clone();
+                    match fault {
+                        0 => foreign.shard += 1,
+                        1 => foreign.epoch += 1,
+                        2 => foreign.managed.as_mut().unwrap().mode_id[0] ^= 1,
+                        3 => append_begin(&mut foreign),
+                        4 => {
+                            let journal = state_journal_mut(&mut foreign);
+                            let mut cohort = journal.cohort().unwrap().clone();
+                            cohort.members[0].epoch += 1;
+                            *journal = Journal::new(journal.authority()).unwrap();
+                            journal
+                                .replay_event(Command::BindCohort { cohort })
+                                .unwrap();
+                        }
+                        5 => {
+                            let journal = state_journal_mut(&mut foreign);
+                            let cohort = journal.cohort().unwrap().clone();
+                            *journal = Journal::new([99; 16]).unwrap();
+                            journal
+                                .replay_event(Command::BindCohort { cohort })
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        loaded.validate_hydrated_state(&foreign).is_err(),
+                        "fault {fault}"
+                    );
+                }
+                let foreign_role = if member {
+                    let mut coordinator = state(false, false);
+                    coordinator.coordinator = Some(loaded.journal().clone());
+                    coordinator
+                } else {
+                    let mut participant = state(true, false);
+                    participant.visibility.as_mut().unwrap().journal = loaded.journal().clone();
+                    participant
+                };
+                assert!(loaded.validate_hydrated_state(&foreign_role).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_authority_still_checks_activation_and_full_applied_identity() {
+        let candidate = byte_state(true, true);
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let (descriptor, _) = persist(&db, &candidate);
+        let loaded = event_ledger::load(&db, &descriptor).unwrap();
+        for fault in 0..4 {
+            let mut changed = candidate.clone();
+            let activation = &mut changed.visibility.as_mut().unwrap().activation;
+            match fault {
+                0 => *activation = None,
+                1 => activation.as_mut().unwrap().nonce = [4; 32],
+                2 => activation.as_mut().unwrap().log_id.index = 18,
+                3 => {
+                    activation.as_mut().unwrap().log_id =
+                        LogId::new(CommittedLeaderId::new(3, 3), 17)
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                loaded.validate_hydrated_state(&changed).is_err(),
+                "fault {fault}"
+            );
+            for replace in [false, true] {
+                let mut batch = WriteBatch::default();
+                assert!(event_ledger::stage(
+                    &mut batch,
+                    Some(&loaded),
+                    Some(&changed),
+                    applied(),
+                    replace,
+                )
+                .is_err());
+            }
+        }
+        for applied in [None, Some(LogId::new(CommittedLeaderId::new(3, 3), 1))] {
+            for replace in [false, true] {
+                let mut batch = WriteBatch::default();
+                assert!(event_ledger::stage(
+                    &mut batch,
+                    Some(&loaded),
+                    Some(&candidate),
+                    applied,
+                    replace,
+                )
+                .is_err());
+            }
+        }
     }
 
     #[test]
@@ -628,11 +920,173 @@ mod tests {
         }
     }
 
+    #[test]
+    fn byte_profile_metadata_reopens_with_exact_immutable_activation() {
+        for member in [false, true] {
+            for confirmed in [false, true] {
+                let state = byte_state(member, confirmed);
+                let dir = tempfile::tempdir().unwrap();
+                let bytes = {
+                    let db = DB::open_default(dir.path()).unwrap();
+                    let (descriptor, bytes) = persist(&db, &state);
+                    assert_eq!(descriptor.version, 2);
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(value["version"], if member { 14 } else { 13 });
+                    assert_eq!(
+                        value["ledger"]["domain"]["cohort"]["profile"],
+                        "ByteBound16MiBV1"
+                    );
+                    assert_eq!(value["ledger"]["version"], 2);
+                    for forbidden in ["journal", "coordinator", "events", "state"] {
+                        assert!(value.get(forbidden).is_none());
+                    }
+                    if member {
+                        assert_eq!(
+                            value["visibility"]["activation"],
+                            serde_json::to_value(
+                                state
+                                    .visibility
+                                    .as_ref()
+                                    .unwrap()
+                                    .activation
+                                    .as_ref()
+                                    .unwrap()
+                            )
+                            .unwrap()
+                        );
+                        assert!(value["visibility"].get("journal").is_none());
+                    }
+                    bytes
+                };
+                let db = DB::open_default(dir.path()).unwrap();
+                let loaded = load(&db, applied()).unwrap().unwrap();
+                assert_eq!(loaded.state, state);
+                assert_eq!(loaded.metadata_bytes, bytes);
+                assert!(loaded.decision_indexed);
+                assert_eq!(loaded.request_indexed, !member);
+                assert!(loaded.ledger.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn byte_member_metadata_rejects_missing_changed_or_future_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let state = byte_state(true, true);
+        let (_, bytes) = persist(&db, &state);
+        for fault in 0..9 {
+            let mut meta: MemberHeader = decode_new(&bytes).unwrap();
+            match fault {
+                0 => meta.version = 12,
+                1 => meta.ledger.version = 1,
+                2 => meta.ledger.domain.cohort.profile = CapacityProfile::LegacyCountV1,
+                3 => meta.visibility.activation = None,
+                4 => meta.visibility.activation.as_mut().unwrap().nonce = [0; 32],
+                5 => meta.visibility.activation.as_mut().unwrap().nonce = [4; 32],
+                6 => meta.visibility.activation.as_mut().unwrap().log_id.index = 18,
+                7 => {
+                    meta.visibility.activation.as_mut().unwrap().log_id =
+                        LogId::new(CommittedLeaderId::new(3, 3), 17)
+                }
+                8 => {
+                    meta.visibility
+                        .activation
+                        .as_mut()
+                        .unwrap()
+                        .log_id
+                        .leader_id
+                        .term = 0
+                }
+                _ => unreachable!(),
+            }
+            db.put(D1_KEY, serde_json::to_vec(&meta).unwrap()).unwrap();
+            assert!(load(&db, applied()).is_err(), "fault {fault}");
+        }
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let activation = serde_json::to_string(
+            state
+                .visibility
+                .as_ref()
+                .unwrap()
+                .activation
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        for replacement in ["null", "{}"] {
+            db.put(
+                D1_KEY,
+                text.replace(
+                    &format!("\"activation\":{activation}"),
+                    &format!("\"activation\":{replacement}"),
+                ),
+            )
+            .unwrap();
+            assert!(load(&db, applied()).is_err());
+        }
+        for field in ["nonce", "log_id", "extra"] {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if field == "extra" {
+                value["visibility"]["activation"][field] = serde_json::json!(0);
+            } else {
+                value["visibility"]["activation"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            }
+            assert!(serde_json::from_value::<MemberHeader>(value).is_err());
+        }
+        // An activation cannot be smuggled into a legacy disk-12 envelope.
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(legacy_dir.path()).unwrap();
+        let legacy = self::state(true, false);
+        let (_, bytes) = persist(&db, &legacy);
+        let mut meta: MemberHeader = decode_new(&bytes).unwrap();
+        meta.visibility.activation = Some(CapacityActivation {
+            nonce: [3; 32],
+            log_id: applied().unwrap(),
+        });
+        db.put(D1_KEY, serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert!(load(&db, applied()).is_err());
+    }
+
+    #[test]
+    fn legacy_disk_envelopes_never_reinterpret_byte_profile_archives() {
+        for member in [false, true] {
+            let state = byte_state(member, true);
+            for version in if member {
+                vec![6, 7, 10]
+            } else {
+                vec![5, 8, 9]
+            } {
+                let dir = tempfile::tempdir().unwrap();
+                let db = DB::open_default(dir.path()).unwrap();
+                let bytes = serde_json::to_vec(&LegacyMetadata {
+                    version,
+                    state: &state,
+                })
+                .unwrap();
+                db.put(D1_KEY, bytes).unwrap();
+                assert!(load(&db, applied()).is_err(), "legacy version {version}");
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let (_, bytes) = persist(&db, &state);
+            if !member {
+                let mut meta: CoordinatorHeader = decode_new(&bytes).unwrap();
+                meta.version = 11;
+                db.put(D1_KEY, serde_json::to_vec(&meta).unwrap()).unwrap();
+                assert!(load(&db, applied()).is_err());
+            }
+        }
+    }
+
     fn decodes_header(member: bool, bytes: &[u8]) -> bool {
         if member {
-            serde_json::from_slice::<D1MetadataV12>(bytes).is_ok()
+            serde_json::from_slice::<MemberHeader>(bytes).is_ok()
         } else {
-            serde_json::from_slice::<D1MetadataV11>(bytes).is_ok()
+            serde_json::from_slice::<CoordinatorHeader>(bytes).is_ok()
         }
     }
 
@@ -683,7 +1137,7 @@ mod tests {
         }
         let spaced = [MEMBER_BOUND, b" "].concat();
         assert!(decodes_header(true, &spaced));
-        assert!(decode_new::<D1MetadataV12>(&spaced).is_err());
+        assert!(decode_new::<MemberHeader>(&spaced).is_err());
     }
 
     #[test]
@@ -731,7 +1185,14 @@ mod tests {
             assert!(load(&empty_db, applied()).is_err());
             let mut foreign = descriptor;
             foreign.domain.shard += 1;
-            assert!(d1_metadata_bytes(&state, Some(&foreign)).is_err());
+            assert!(event_ledger::load(&db, &foreign).is_err());
+            let mut batch = WriteBatch::default();
+            let staged = event_ledger::stage(&mut batch, None, Some(&state), applied(), false)
+                .unwrap()
+                .unwrap();
+            let mut foreign = state.clone();
+            foreign.shard += 1;
+            assert!(d1_metadata_bytes(&foreign, Some(&staged)).is_err());
         }
     }
 
@@ -820,7 +1281,7 @@ mod tests {
             .unwrap();
         let bytes = d1_metadata_bytes(&state, Some(&descriptor)).unwrap();
         assert!(bytes.len() > 4 * crate::transaction_decisions::MAX_HISTORY_PAGE_BYTES);
-        let metadata: D1MetadataV12 = decode_new(&bytes).unwrap();
+        let metadata: MemberHeader = decode_new(&bytes).unwrap();
         assert_eq!(metadata.participant, *state.participant.as_ref().unwrap());
         assert_eq!(
             metadata.dedup_bytes_limit,
@@ -831,6 +1292,6 @@ mod tests {
         let missing = String::from_utf8(bytes)
             .unwrap()
             .replacen("\"decision\":null,", "", 1);
-        assert!(decode_new::<D1MetadataV12>(missing.as_bytes()).is_err());
+        assert!(decode_new::<MemberHeader>(missing.as_bytes()).is_err());
     }
 }

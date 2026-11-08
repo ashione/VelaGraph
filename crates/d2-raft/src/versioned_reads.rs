@@ -45,10 +45,13 @@ pub(crate) struct State {
     pub applied: u64,
     pub journal: Journal,
     pub commits: Vec<CommitVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<crate::transaction_decisions::CapacityActivation>,
 }
 impl State {
     pub fn validate_successor(&self, next: &Self) -> bool {
         self.journal.cohort() == next.journal.cohort()
+            && self.activation == next.activation
             && self.epoch == next.epoch
             && self.baseline_sequence == next.baseline_sequence
             && next.applied >= self.applied
@@ -56,6 +59,18 @@ impl State {
             && next.commits.starts_with(&self.commits)
     }
     pub fn validate(&self, d1: &D1State) -> anyhow::Result<()> {
+        let byte_bound = self.journal.capacity_profile()
+            == crate::transaction_decisions::CapacityProfile::ByteBound16MiBV1;
+        anyhow::ensure!(
+            (byte_bound && d1.version == 7 && self.activation.is_some())
+                || (!byte_bound && d1.version == 6 && self.activation.is_none()),
+            "invalid visibility profile/activation version"
+        );
+        if let Some(activation) = &self.activation {
+            activation
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid activation: {e:?}"))?;
+        }
         let participant = d1
             .participant
             .as_ref()
@@ -129,6 +144,10 @@ impl State {
             "unmapped data publication"
         );
         for record in &participant.records {
+            if byte_bound {
+                d1.check_capacity_prepare(&record.participant, record.id, record.request.as_ref())
+                    .map_err(|e| anyhow::anyhow!("unadmitted capacity intent: {e:?}"))?;
+            }
             if let Some(tx) = self.journal.transaction(record.id) {
                 anyhow::ensure!(
                     tx.participants.contains(&record.participant),
@@ -149,6 +168,76 @@ impl State {
 }
 
 impl D1State {
+    /// Validate the immutable activation against this replica's applied marker.
+    /// LogId orders activation; only the random nonce distinguishes fresh state.
+    pub(crate) fn validate_capacity_activation(
+        &self,
+        applied: Option<openraft::LogId<crate::NodeId>>,
+    ) -> anyhow::Result<()> {
+        if let Some(visibility) = &self.visibility {
+            self.check_cohort(&visibility.journal)
+                .map_err(|e| anyhow::anyhow!("invalid capacity identity: {e:?}"))?;
+            if let Some(activation) = &visibility.activation {
+                activation
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("invalid activation: {e:?}"))?;
+                anyhow::ensure!(
+                    applied.is_some_and(|current| {
+                        activation.log_id.index <= current.index
+                            && activation.log_id.leader_id <= current.leader_id
+                            && (activation.log_id.index != current.index
+                                || activation.log_id == current)
+                    }),
+                    "capacity activation is not in applied history"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// New-profile preparation is authorized by locally retained authority,
+    /// including exact original Plan bytes when the transaction has an ID record.
+    pub(crate) fn check_capacity_prepare(
+        &self,
+        descriptor: &crate::transaction_decisions::Participant,
+        id: [u8; 16],
+        request: Option<&crate::D1WriteRequest>,
+    ) -> Result<(), D1Error> {
+        let Some(visibility) = &self.visibility else {
+            return Ok(());
+        };
+        if visibility.journal.capacity_profile()
+            == crate::transaction_decisions::CapacityProfile::LegacyCountV1
+        {
+            return Ok(());
+        }
+        self.check_cohort(&visibility.journal)?;
+        if !visibility.journal.capacity_ready() {
+            return Err(D1Error::CoordinatorRejected(
+                crate::transaction_decisions::Error::CapacityNotConfirmed,
+            ));
+        }
+        let tx = visibility
+            .journal
+            .transaction(id)
+            .ok_or(D1Error::VisibilityHistory)?;
+        if !tx.participants.contains(descriptor) {
+            return Err(D1Error::ParticipantIdentity);
+        }
+        if let Some(record) = visibility.journal.request_for_transaction(id) {
+            let plan = crate::request_plans::Plan::decode(&record.payload)
+                .map_err(|_| D1Error::VisibilityHistory)?;
+            if !plan
+                .parts
+                .iter()
+                .any(|part| part.descriptor == *descriptor && request == Some(&part.request))
+            {
+                return Err(D1Error::IdempotencyConflict);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_cohort(&self, journal: &Journal) -> Result<(), D1Error> {
         if self
             .visibility
@@ -158,6 +247,22 @@ impl D1State {
             return Err(D1Error::VisibilityHistory);
         }
         if let Some(cohort) = journal.cohort() {
+            if let Some(visibility) = &self.visibility {
+                let byte_bound = cohort.profile
+                    == crate::transaction_decisions::CapacityProfile::ByteBound16MiBV1;
+                if byte_bound != visibility.activation.is_some() {
+                    return Err(D1Error::VisibilityHistory);
+                }
+                if let Some(grants) = journal.capacity_grants() {
+                    let own = grants
+                        .iter()
+                        .find(|grant| grant.member.shard == self.shard)
+                        .ok_or(D1Error::VisibilityHistory)?;
+                    if visibility.activation.as_ref() != Some(&own.activation) {
+                        return Err(D1Error::VisibilityHistory);
+                    }
+                }
+            }
             let participant = self
                 .participant
                 .as_ref()

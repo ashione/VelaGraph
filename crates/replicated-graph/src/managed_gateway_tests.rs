@@ -14,6 +14,7 @@ fn authority() -> Authority {
 }
 fn binding() -> Cohort {
     Cohort {
+        profile: Default::default(),
         coordinator_shard: 9,
         coordinator_epoch: 1,
         members: vec![

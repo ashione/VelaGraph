@@ -58,6 +58,15 @@ pub enum D1Command {
         mode_id: [u8; 16],
         journal: crate::transaction_decisions::Journal,
     },
+    /// Trusted initialization proposes a fresh OS-random generation. Apply fixes
+    /// it with the first activation LogId; replicas never generate randomness.
+    EnableByteBoundReads {
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        journal: crate::transaction_decisions::Journal,
+        generation_nonce: [u8; 32],
+    },
     AdvanceVisibility {
         authority: crate::participant_writes::Authority,
         shard: u64,
@@ -318,7 +327,7 @@ impl D1State {
                         false
                     )
                     | (
-                        6,
+                        6 | 7,
                         None | Some(EXTENDED_DEDUP_BYTES),
                         true,
                         false,
@@ -484,8 +493,12 @@ impl D1State {
             return Err(D1Error::InvalidDedupCapacity);
         }
         if new_bytes == EXTENDED_DEDUP_BYTES {
-            self.version = if self.visibility.is_some() {
-                6
+            self.version = if let Some(visibility) = &self.visibility {
+                if visibility.activation.is_some() {
+                    7
+                } else {
+                    6
+                }
             } else if self.participant.is_some() {
                 5
             } else if self.coordinator.is_some() {

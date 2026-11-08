@@ -354,6 +354,7 @@ impl StateMachine {
         }
         if let Some(d1) = &d1 {
             d1.validate()?;
+            d1.validate_capacity_activation(last_applied_log)?;
         }
         anyhow::ensure!(
             d1.is_none() || last_applied_log.is_some(),
@@ -685,6 +686,116 @@ impl StateMachine {
         let cursor = blocking_section(|| visibility.journal.history_cursor())
             .map_err(|_| D1Error::VisibilityHistory)?;
         Ok((cursor, self.decision_frontier(d1)?))
+    }
+
+    /// Leader-barrier callers inspect the actual persisted immutable binding.
+    /// VisibilityNotEnabled is returned only for a valid empty activation baseline.
+    pub async fn participant_capacity_grant(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        authority: &crate::participant_writes::Authority,
+        cohort: &crate::transaction_decisions::Cohort,
+    ) -> Result<crate::transaction_decisions::MemberCapacityGrant, D1Error> {
+        let state = self.state.read().await;
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted
+            .as_ref()
+            .map(|loaded| &loaded.state)
+            .or(state.d1.as_ref())
+            .ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1
+            .managed
+            .as_ref()
+            .is_none_or(|mode| mode.mode_id != mode_id)
+            || d1
+                .participant
+                .as_ref()
+                .is_none_or(|p| &p.authority != authority)
+            || cohort.profile != crate::transaction_decisions::CapacityProfile::ByteBound16MiBV1
+            || cohort.validate().is_err()
+            || cohort.coordinator_shard != authority.shard
+        {
+            return Err(D1Error::VisibilityHistory);
+        }
+        let member = cohort
+            .members
+            .iter()
+            .find(|member| member.shard == shard && member.epoch == epoch && member.mode == mode_id)
+            .ok_or(D1Error::VisibilityHistory)?;
+        let Some(visibility) = &d1.visibility else {
+            if d1.sequence != 0
+                || !d1.dedup.is_empty()
+                || d1
+                    .participant
+                    .as_ref()
+                    .is_none_or(|p| p.activated_sequence != 0 || !p.records.is_empty())
+            {
+                return Err(D1Error::VisibilityHistory);
+            }
+            return Err(D1Error::VisibilityNotEnabled);
+        };
+        if visibility.journal.cohort() != Some(cohort)
+            || visibility.journal.authority() != authority.mode
+        {
+            return Err(D1Error::VisibilityHistory);
+        }
+        d1.validate_capacity_activation(state.last_applied_log)
+            .map_err(|_| D1Error::VisibilityHistory)?;
+        let activation = visibility
+            .activation
+            .clone()
+            .ok_or(D1Error::VisibilityHistory)?;
+        Ok(crate::transaction_decisions::MemberCapacityGrant {
+            member: member.clone(),
+            activation,
+        })
+    }
+
+    /// Prepare may first retain a missing suffix, but never replace a later
+    /// observation. Compare complete original event prefixes, not just counters.
+    pub async fn participant_prepare_history(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        incoming: &crate::transaction_decisions::Journal,
+    ) -> Result<crate::transaction_decisions::HistoryCursor, D1Error> {
+        let state = self.state.read().await;
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted
+            .as_ref()
+            .map(|loaded| &loaded.state)
+            .or(state.d1.as_ref())
+            .ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1
+            .managed
+            .as_ref()
+            .is_none_or(|mode| mode.mode_id != mode_id)
+        {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        d1.check_cohort(incoming)?;
+        let journal = &d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?
+            .journal;
+        if journal.validate_successor(incoming).is_err()
+            && incoming.validate_successor(journal).is_err()
+        {
+            return Err(D1Error::VisibilityHistory);
+        }
+        journal
+            .history_cursor()
+            .map_err(|_| D1Error::VisibilityHistory)
     }
 
     /// Verify one retained terminal cut without materializing graph payloads.
@@ -1335,6 +1446,15 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             )
             .into());
         }
+        if let Some(d1) = &d1 {
+            d1.validate_capacity_activation(meta.last_log_id)
+                .map_err(|error| {
+                    StorageIOError::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(error.to_string()),
+                    )
+                })?;
+        }
         // Serialize persistence and publication with apply and snapshot build.
         let mut sm = self.state.write().await;
         if sm.last_applied_log.is_some_and(|current| {
@@ -1648,6 +1768,91 @@ fn apply_operations(
     }
 }
 
+// Both profiles share activation fencing. Only the new dedicated command may
+// fix a generation, and only the first successful command chooses its LogId.
+fn enable_visibility(
+    next: &mut ApplyDelta,
+    shard: u64,
+    epoch: u64,
+    mode_id: [u8; 16],
+    journal: crate::transaction_decisions::Journal,
+    nonce: Option<[u8; 32]>,
+) -> Result<D1Result, D1Error> {
+    use crate::transaction_decisions::{CapacityActivation, CapacityProfile};
+    let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+    d1.check_shard(shard)?;
+    d1.check_epoch(epoch)?;
+    if d1
+        .managed
+        .as_ref()
+        .is_none_or(|mode| mode.mode_id != mode_id)
+    {
+        return Err(D1Error::ManagedModeConflict);
+    }
+    let participant = d1
+        .participant
+        .as_ref()
+        .ok_or(D1Error::ParticipantNotEnabled)?;
+    if journal.authority() != participant.authority.mode || journal.transaction_count() != 0 {
+        return Err(D1Error::VisibilityHistory);
+    }
+    let byte_bound = journal.capacity_profile() == CapacityProfile::ByteBound16MiBV1;
+    if byte_bound != nonce.is_some() || journal.capacity_grants().is_some() {
+        return Err(D1Error::VisibilityHistory);
+    }
+    d1.check_cohort(&journal)?;
+    if let Some(existing) = &d1.visibility {
+        if existing
+            .activation
+            .as_ref()
+            .map(|generation| generation.nonce)
+            != nonce
+        {
+            return Err(D1Error::IdempotencyConflict);
+        }
+        return Ok(D1Result::Visibility {
+            applied_prefix: existing.applied,
+        });
+    }
+    if !participant.records.is_empty() {
+        return Err(D1Error::VisibilityHistory);
+    }
+    let activation = match nonce {
+        Some(nonce) => {
+            if d1.sequence != 0
+                || !d1.dedup.is_empty()
+                || participant.activated_sequence != 0
+                || journal
+                    .history_cursor()
+                    .map_err(|_| D1Error::VisibilityHistory)?
+                    .event_count
+                    != 1
+            {
+                return Err(D1Error::VisibilityHistory);
+            }
+            let activation = CapacityActivation {
+                nonce,
+                log_id: next.last_applied_log.ok_or(D1Error::VisibilityHistory)?,
+            };
+            activation
+                .validate()
+                .map_err(|_| D1Error::VisibilityHistory)?;
+            Some(activation)
+        }
+        None => None,
+    };
+    d1.visibility = Some(crate::versioned_reads::State {
+        baseline_sequence: d1.sequence,
+        epoch: d1.epoch,
+        applied: 0,
+        journal,
+        commits: Vec::new(),
+        activation,
+    });
+    d1.version = if byte_bound { 7 } else { 6 };
+    Ok(D1Result::Visibility { applied_prefix: 0 })
+}
+
 fn apply_d1(
     base: &StateMachineData,
     next: &mut ApplyDelta,
@@ -1660,39 +1865,14 @@ fn apply_d1(
             epoch,
             mode_id,
             journal,
-        } => {
-            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
-            d1.check_shard(shard)?;
-            d1.check_epoch(epoch)?;
-            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-                return Err(D1Error::ManagedModeConflict);
-            }
-            let participant = d1
-                .participant
-                .as_ref()
-                .ok_or(D1Error::ParticipantNotEnabled)?;
-            if journal.authority() != participant.authority.mode || journal.transaction_count() != 0
-            {
-                return Err(D1Error::VisibilityHistory);
-            }
-            d1.check_cohort(&journal)?;
-            if d1.visibility.is_none() {
-                if !participant.records.is_empty() {
-                    return Err(D1Error::VisibilityHistory);
-                }
-                d1.visibility = Some(crate::versioned_reads::State {
-                    baseline_sequence: d1.sequence,
-                    epoch: d1.epoch,
-                    applied: 0,
-                    journal,
-                    commits: Vec::new(),
-                });
-                d1.version = 6;
-            }
-            Ok(D1Result::Visibility {
-                applied_prefix: d1.visibility.as_ref().unwrap().applied,
-            })
-        }
+        } => enable_visibility(next, shard, epoch, mode_id, journal, None),
+        D1Command::EnableByteBoundReads {
+            shard,
+            epoch,
+            mode_id,
+            journal,
+            generation_nonce,
+        } => enable_visibility(next, shard, epoch, mode_id, journal, Some(generation_nonce)),
         D1Command::AdvanceVisibility {
             authority,
             shard,

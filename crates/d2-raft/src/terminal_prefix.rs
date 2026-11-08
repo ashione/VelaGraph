@@ -1,11 +1,17 @@
 //! Exact, bounded terminal-prefix evidence, independent of request/Plan archives.
 //! This is a deterministic projection of a replay-validated journal, not an
 //! authenticated certificate. Every record through the chosen cut is present.
-use crate::transaction_decisions::{
-    Cohort, Decision, Error, Journal, Participant, MAX_PARTICIPANTS, MAX_TRANSACTIONS,
+use crate::capacity_policy::{
+    canonical_size, deserialize_bounded_vec, CapacityProfile, RejectExtra, BYTE_MAX_TRANSACTIONS,
+    MAX_BYTE_PROFILE_TERMINAL_BYTES,
 };
-use serde::{Deserialize, Serialize};
+use crate::transaction_decisions::{
+    deserialize_participants, deserialize_prepared, Cohort, Decision, Error, Journal, Participant,
+    MAX_PARTICIPANTS,
+};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
+use std::fmt;
 
 /// Canonical segment size. Only the final segment may contain fewer records.
 pub const SEGMENT_TRANSACTIONS: usize = 32;
@@ -15,7 +21,9 @@ pub const SEGMENT_TRANSACTIONS: usize = 32;
 pub(crate) struct Terminal {
     pub(crate) id: [u8; 16],
     pub(crate) ordinal: u64,
+    #[serde(deserialize_with = "deserialize_participants")]
     pub(crate) participants: Vec<Participant>,
+    #[serde(deserialize_with = "deserialize_prepared")]
     pub(crate) prepared: Vec<bool>,
     pub(crate) decision: Decision,
 }
@@ -38,12 +46,50 @@ struct Encoding {
     authority: [u8; 16],
     cohort: Cohort,
     through: u64,
+    #[serde(deserialize_with = "deserialize_segments")]
     segments: Vec<Vec<Terminal>>,
 }
+fn deserialize_segments<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<Terminal>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Segment(#[serde(deserialize_with = "deserialize_segment")] Vec<Terminal>);
+    fn deserialize_segment<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Terminal>, D::Error> {
+        deserialize_bounded_vec(d, SEGMENT_TRANSACTIONS)
+    }
+    struct Segments;
+    impl<'de> de::Visitor<'de> for Segments {
+        type Value = Vec<Vec<Terminal>>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("bounded exact terminal segments")
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let limit = BYTE_MAX_TRANSACTIONS.div_ceil(SEGMENT_TRANSACTIONS);
+            if seq.size_hint().is_some_and(|count| count > limit) {
+                return Err(de::Error::custom("too many terminal segments"));
+            }
+            let mut segments = Vec::new();
+            let mut bytes = 0;
+            while segments.len() < limit {
+                let Some(segment) = seq.next_element::<Segment>()? else {
+                    return Ok(segments);
+                };
+                // Every possible legacy 1024-record proof is smaller than this
+                // byte-derived bound too. Check incrementally before retaining
+                // the next bounded segment; the complete envelope is checked below.
+                bytes += canonical_size(&segment.0, MAX_BYTE_PROFILE_TERMINAL_BYTES - bytes)
+                    .map_err(|_| de::Error::custom("terminal segment byte budget exceeded"))?;
+                segments.push(segment.0);
+            }
+            seq.next_element_seed(RejectExtra)?;
+            Ok(segments)
+        }
+    }
+    d.deserialize_seq(Segments)
+}
+
 impl From<TerminalPrefix> for Encoding {
     fn from(value: TerminalPrefix) -> Self {
         Self {
-            version: 1,
+            version: value.cohort.profile.terminal_prefix_version(),
             authority: value.authority,
             cohort: value.cohort,
             through: value.through,
@@ -54,14 +100,18 @@ impl From<TerminalPrefix> for Encoding {
 impl TryFrom<Encoding> for TerminalPrefix {
     type Error = &'static str;
     fn try_from(value: Encoding) -> Result<Self, Self::Error> {
-        if value.version != 1
+        if value.version != value.cohort.profile.terminal_prefix_version()
             || value.authority == [0; 16]
             || value.cohort.validate().is_err()
-            || value.through > MAX_TRANSACTIONS as u64
+            || value.through > value.cohort.profile.max_transactions() as u64
         {
             return Err("invalid terminal prefix identity/version");
         }
-        let count = value.through as usize;
+        if value.cohort.profile == CapacityProfile::ByteBound16MiBV1 {
+            canonical_size(&value, MAX_BYTE_PROFILE_TERMINAL_BYTES)
+                .map_err(|_| "terminal prefix byte budget exceeded")?;
+        }
+        let count = usize::try_from(value.through).map_err(|_| "terminal prefix count overflow")?;
         if value.segments.len() != count.div_ceil(SEGMENT_TRANSACTIONS) {
             return Err("invalid terminal prefix segments");
         }
@@ -106,7 +156,7 @@ impl TerminalPrefix {
         segments: Vec<Vec<Terminal>>,
     ) -> Result<Self, Error> {
         Self::try_from(Encoding {
-            version: 1,
+            version: cohort.profile.terminal_prefix_version(),
             authority,
             cohort,
             through,
@@ -130,7 +180,7 @@ impl Journal {
     /// Later transactions do not contribute evidence or projection work.
     pub fn terminal_prefix(&self, version: u64) -> Result<TerminalPrefix, Error> {
         let cohort = self.cohort().ok_or(Error::IncompatibleHistory)?.clone();
-        if version > self.transaction_count() as u64 {
+        if version > u64::try_from(self.transaction_count()).map_err(|_| Error::InvalidJournal)? {
             return Err(Error::UnknownTransaction);
         }
         let mut segments = Vec::new();
@@ -149,7 +199,7 @@ impl Journal {
             segments.push(segment);
         }
         TerminalPrefix::try_from(Encoding {
-            version: 1,
+            version: cohort.profile.terminal_prefix_version(),
             authority: self.authority(),
             cohort,
             through: version,
@@ -162,11 +212,12 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction_decisions::{Command, Member};
+    use crate::transaction_decisions::{Command, Member, MAX_TRANSACTIONS};
     use serde_json::{json, Value};
 
     fn cohort() -> Cohort {
         Cohort {
+            profile: CapacityProfile::LegacyCountV1,
             coordinator_shard: 9,
             coordinator_epoch: 1,
             members: vec![Member {

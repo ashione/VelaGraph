@@ -576,6 +576,7 @@ fn bound_journal() -> Journal {
     let mut j = Journal::new([9; 16]).unwrap();
     j.apply(Command::BindCohort {
         cohort: Cohort {
+            profile: Default::default(),
             coordinator_shard: 9,
             coordinator_epoch: 1,
             members: vec![

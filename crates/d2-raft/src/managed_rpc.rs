@@ -7,12 +7,13 @@ use crate::participant_writes::{Authority, Status};
 use crate::request_index::RequestLookup;
 use crate::terminal_prefix::TerminalPrefix;
 use crate::transaction_decisions::{
-    Cohort, Command, HistoryCursor, HistoryPage, Journal, Participant, MAX_TRANSACTIONS,
+    CapacityProfile, Cohort, Command, HistoryCursor, HistoryPage, Journal, MemberCapacityGrant,
+    Participant,
 };
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
 use crate::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, NodeHandle};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +26,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 const CONCURRENCY: usize = 4;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,6 +121,15 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    GrantStatus {
+        authority: Authority,
+        target: Target,
+        cohort: Cohort,
+    },
+    ConfirmCapacity {
+        authority: Authority,
+        epoch: u64,
+    },
     HistoryStatus {
         authority: Authority,
         target: Target,
@@ -193,6 +203,8 @@ enum Operation {
 impl Operation {
     fn tag(&self) -> u8 {
         match self {
+            Self::GrantStatus { .. } => 15,
+            Self::ConfirmCapacity { .. } => 16,
             Self::LookupRequest { .. } => 10,
             Self::HistoryStatus { .. } => 11,
             Self::HistoryPage { .. } => 12,
@@ -222,6 +234,8 @@ struct Reply {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Value {
+    Grant(CapacityGrantStatus),
+    Capacity(CohortCapacity),
     HistoryStatus(HistoryStatus),
     HistoryPage(HistoryPage),
     HistorySynced(HistoryStatus),
@@ -235,6 +249,30 @@ enum Value {
     Summary(CoordinatorSummary),
     Evidence(TerminalPrefix),
     Snapshot(Snapshot, TerminalPrefix),
+}
+// Responses bind the generation to the same complete identity as the endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityGrantStatus {
+    authority: Authority,
+    cohort: Cohort,
+    grant: MemberCapacityGrant,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortCapacity {
+    authority: Authority,
+    cohort: Cohort,
+    #[serde(deserialize_with = "deserialize_capacity_grants")]
+    grants: Vec<MemberCapacityGrant>,
+}
+fn deserialize_capacity_grants<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<MemberCapacityGrant>, D::Error> {
+    crate::capacity_policy::deserialize_bounded_vec(
+        deserializer,
+        crate::transaction_decisions::MAX_PARTICIPANTS,
+    )
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -325,6 +363,45 @@ async fn cpu_with_slots<T: Send + 'static>(
     .await
     .map_err(|_| Error::Unavailable)?
 }
+// A caller's timeout does not cancel a running spawn_blocking closure. Put
+// the same absolute deadline inside that closure as well, so pending Raft or
+// state-lock awaits are dropped and the CPU permit is released on expiration.
+// Type-erase at the synchronous boundary: nested managed/cohort futures must
+// not embed the complete execution future in every caller's async layout.
+type BoundedWork<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, Error>> + Send + 'static>>;
+fn bounded_cpu<T: Send + 'static>(
+    deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = Result<T, Error>> + Send + 'static,
+) -> BoundedWork<T> {
+    bounded_cpu_with_slots(cpu_slots().clone(), deadline, work)
+}
+fn bounded_cpu_with_slots<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = Result<T, Error>> + Send + 'static,
+) -> BoundedWork<T> {
+    let work: BoundedWork<T> = Box::pin(work);
+    Box::pin(async move {
+        let runtime = tokio::runtime::Handle::current();
+        tokio::time::timeout_at(
+            deadline,
+            cpu_with_slots(slots, move || {
+                runtime.block_on(async {
+                    let result = tokio::time::timeout_at(deadline, work)
+                        .await
+                        .map_err(|_| Error::Unavailable)?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Error::Unavailable);
+                    }
+                    result
+                })
+            }),
+        )
+        .await
+        .map_err(|_| Error::Unavailable)?
+    })
+}
 struct BoundedWriter(Vec<u8>);
 impl Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -404,6 +481,7 @@ impl Client {
     // Fail before connecting: the response envelope cannot make a request for
     // another role, mode, cohort or participant valid on this fixed endpoint.
     fn validate_operation(&self, operation: &Operation) -> Result<(), Error> {
+        check_public_operation(operation)?;
         let participant = |target: &Target| {
             self.identity.role == Role::Participant && self.identity.target == *target
         };
@@ -413,6 +491,11 @@ impl Client {
         };
         let valid = match operation {
             Operation::HistoryStatus {
+                authority,
+                target,
+                cohort,
+            }
+            | Operation::GrantStatus {
                 authority,
                 target,
                 cohort,
@@ -458,6 +541,7 @@ impl Client {
                     && cut.cohort == self.identity.cohort
             }
             Operation::Journal { authority, epoch }
+            | Operation::ConfirmCapacity { authority, epoch }
             | Operation::LookupRequest {
                 authority, epoch, ..
             }
@@ -585,12 +669,13 @@ impl NodeRef<'_> {
         };
         let deadline = tokio::time::Instant::now() + duration;
         let op = build();
+        check_public_operation(&op)?;
         if tokio::time::Instant::now() >= deadline {
             return Err(Error::Unavailable);
         }
         let result = tokio::time::timeout_at(deadline, async {
             match self {
-                Self::Local(node) => dispatch(node, None, op, deadline).await,
+                Self::Local(node) => dispatch(node, None, None, op, deadline).await,
                 Self::Remote(client) => client.call_at(op, deadline).await,
             }
         })
@@ -600,6 +685,59 @@ impl NodeRef<'_> {
             return Err(Error::Unavailable);
         }
         result
+    }
+    /// Observe a member's immutable generation after its real leader barrier.
+    pub async fn grant_status(
+        self,
+        authority: &Authority,
+        target: &Target,
+        cohort: &Cohort,
+    ) -> Result<MemberCapacityGrant, Error> {
+        match self
+            .call(|| Operation::GrantStatus {
+                authority: authority.clone(),
+                target: target.clone(),
+                cohort: cohort.clone(),
+            })
+            .await?
+        {
+            Value::Grant(status) => {
+                check_grant_status(&status, authority, target, cohort)?;
+                Ok(status.grant)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Ask the configured coordinator to obtain all member grants itself.
+    /// Local handles have no trusted endpoint set and cannot confirm capacity.
+    pub async fn confirm_capacity(
+        self,
+        authority: &Authority,
+        epoch: u64,
+    ) -> Result<Vec<MemberCapacityGrant>, Error> {
+        let Self::Remote(client) = self else {
+            return Err(Error::Identity);
+        };
+        match self
+            .call(|| Operation::ConfirmCapacity {
+                authority: authority.clone(),
+                epoch,
+            })
+            .await?
+        {
+            Value::Capacity(value) => {
+                if value.authority != *authority
+                    || value.cohort != client.identity.cohort
+                    || value.cohort.coordinator_epoch != epoch
+                {
+                    return Err(Error::Identity);
+                }
+                crate::capacity_policy::validate_grants(&value.cohort, &value.grants)
+                    .map_err(|_| Error::Identity)?;
+                Ok(value.grants)
+            }
+            _ => Err(Error::Protocol),
+        }
     }
     /// Leader-barrier point recovery of an original durable admission and current transaction.
     pub async fn request(
@@ -734,6 +872,7 @@ impl NodeRef<'_> {
             Value::Visibility(v) => {
                 let cohort = v.cohort.as_ref().ok_or(Error::Identity)?;
                 if v.baseline_sequence != 0
+                    || v.applied_prefix > cohort.profile.max_transactions() as u64
                     || v.authority.mode == [0; 16]
                     || cohort.coordinator_shard != v.authority.shard
                     || !cohort.members.iter().any(|m| {
@@ -874,7 +1013,10 @@ impl NodeRef<'_> {
         cut: &HistoryCursor,
     ) -> Result<u64, Error> {
         check_member_cursor(cut, authority, target, &cut.cohort)?;
-        if ordinal == 0 || ordinal > MAX_TRANSACTIONS as u64 {
+        if ordinal == 0
+            || ordinal > cut.cohort.profile.max_transactions() as u64
+            || ordinal > (cut.event_count - 1) / 2
+        {
             return Err(Error::Identity);
         }
         match self
@@ -887,7 +1029,8 @@ impl NodeRef<'_> {
             .await?
         {
             Value::RetainedPrefix(applied)
-                if applied >= ordinal && applied <= MAX_TRANSACTIONS as u64 =>
+                if applied >= ordinal
+                    && applied <= cut.cohort.profile.max_transactions() as u64 =>
             {
                 Ok(applied)
             }
@@ -1013,6 +1156,7 @@ impl NodeRef<'_> {
                         || v.authority.mode != proof.authority()
                         || v.authority.shard != proof.cohort().coordinator_shard
                         || v.applied_prefix < version
+                        || v.applied_prefix > proof.cohort().profile.max_transactions() as u64
                     {
                         return Err(Error::Identity);
                     }
@@ -1048,6 +1192,381 @@ impl NodeRef<'_> {
     }
 }
 
+fn check_public_operation(operation: &Operation) -> Result<(), Error> {
+    if matches!(
+        operation,
+        Operation::Command {
+            command: Command::BindCohort { .. } | Command::ConfirmCohortCapacity { .. },
+            ..
+        }
+    ) {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+fn check_capacity_binding(
+    authority: &Authority,
+    target: &Target,
+    cohort: &Cohort,
+) -> Result<(), Error> {
+    if cohort.validate().is_err()
+        || cohort.profile != CapacityProfile::ByteBound16MiBV1
+        || authority.mode == [0; 16]
+        || authority.shard != cohort.coordinator_shard
+        || !cohort.members.iter().any(|member| {
+            member.shard == target.shard
+                && member.epoch == target.epoch
+                && member.mode == target.mode
+        })
+    {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+fn check_grant_status(
+    status: &CapacityGrantStatus,
+    authority: &Authority,
+    target: &Target,
+    cohort: &Cohort,
+) -> Result<(), Error> {
+    check_capacity_binding(authority, target, cohort)?;
+    if status.authority != *authority
+        || status.cohort != *cohort
+        || status.grant.member.shard != target.shard
+        || status.grant.member.epoch != target.epoch
+        || status.grant.member.mode != target.mode
+        || status.grant.activation.validate().is_err()
+    {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+fn validate_capacity_endpoints(identity: &Identity, members: &mut [Client]) -> Result<(), Error> {
+    identity.validate()?;
+    if identity.role != Role::Coordinator
+        || identity.cohort.profile != CapacityProfile::ByteBound16MiBV1
+        || members.len() != identity.cohort.members.len()
+    {
+        return Err(Error::Identity);
+    }
+    members.sort_by_key(|client| client.identity.target.shard);
+    let mut groups = BTreeSet::from([identity.group]);
+    let mut addresses = BTreeSet::new();
+    for (member, client) in identity.cohort.members.iter().zip(members) {
+        client.identity.validate()?;
+        if client.identity.role != Role::Participant
+            || client.identity.authority != identity.authority
+            || client.identity.cohort != identity.cohort
+            || client.identity.target.shard != member.shard
+            || client.identity.target.epoch != member.epoch
+            || client.identity.target.mode != member.mode
+            // One Raft group owns one shard. A group or address cannot stand
+            // in for two members, even if the supplied node IDs differ.
+            || !groups.insert(client.identity.group)
+            || !addresses.insert(client.address)
+        {
+            return Err(Error::Identity);
+        }
+    }
+    Ok(())
+}
+async fn leader_barrier(node: &WorkNode, deadline: tokio::time::Instant) -> Result<(), Error> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Unavailable);
+    }
+    node.raft
+        .ensure_linearizable()
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::Unavailable);
+    }
+    Ok(())
+}
+fn generate_activation_nonce(nonce: &mut [u8; 32]) -> Result<(), Error> {
+    getrandom::fill(nonce).map_err(|_| Error::Unavailable)?;
+    if *nonce == [0; 32] {
+        return Err(Error::Unavailable);
+    }
+    Ok(())
+}
+/// Activate a genuinely empty member with a server-owned OS-random generation.
+/// This trusted local control-plane helper accepts no caller generation. Retry
+/// reads the first durable winner, including after an uncertain proposal result.
+pub async fn activate_byte_bound_member(
+    node: &NodeHandle,
+    authority: &Authority,
+    target: &Target,
+    cohort: &Cohort,
+) -> Result<MemberCapacityGrant, Error> {
+    activate_member_with_entropy(node, authority, target, cohort, generate_activation_nonce).await
+}
+async fn activate_member_with_entropy(
+    node: &NodeHandle,
+    authority: &Authority,
+    target: &Target,
+    cohort: &Cohort,
+    entropy: fn(&mut [u8; 32]) -> Result<(), Error>,
+) -> Result<MemberCapacityGrant, Error> {
+    check_capacity_binding(authority, target, cohort)?;
+    let node = WorkNode {
+        raft: node.raft.clone(),
+        state_machine: node.state_machine.clone(),
+    };
+    let authority = authority.clone();
+    let target = target.clone();
+    let cohort = cohort.clone();
+    let deadline = tokio::time::Instant::now() + LOCAL_TIMEOUT;
+    bounded_cpu(deadline, async move {
+        leader_barrier(&node, deadline).await?;
+        match node
+            .state_machine
+            .participant_capacity_grant(
+                target.shard,
+                target.epoch,
+                target.mode,
+                &authority,
+                &cohort,
+            )
+            .await
+        {
+            Ok(grant) => return Ok(grant),
+            Err(D1Error::VisibilityNotEnabled) => {}
+            Err(error) => return Err(application_error(error)),
+        }
+        // The source getter permits this only for the validated empty baseline.
+        // All entropy is obtained before the deterministic activation proposal.
+        let mut generation_nonce = [0; 32];
+        entropy(&mut generation_nonce)?;
+        if generation_nonce == [0; 32] {
+            return Err(Error::Unavailable);
+        }
+        let mut journal = Journal::new(authority.mode).map_err(|_| Error::Identity)?;
+        journal
+            .apply(Command::BindCohort {
+                cohort: cohort.clone(),
+            })
+            .map_err(|_| Error::Identity)?;
+        let proposal = submit(
+            &node,
+            deadline,
+            D1Command::EnableByteBoundReads {
+                shard: target.shard,
+                epoch: target.epoch,
+                mode_id: target.mode,
+                journal,
+                generation_nonce,
+            },
+        )
+        .await;
+        leader_barrier(&node, deadline).await?;
+        match node
+            .state_machine
+            .participant_capacity_grant(
+                target.shard,
+                target.epoch,
+                target.mode,
+                &authority,
+                &cohort,
+            )
+            .await
+        {
+            // A competing first proposal can win. Its retained generation,
+            // never this attempt's candidate, is the authoritative response.
+            Ok(grant) => Ok(grant),
+            Err(error) => Err(proposal.err().unwrap_or_else(|| application_error(error))),
+        }
+    })
+    .await
+}
+// Keep network fan-out outside the bounded CPU pool: concurrent confirmations
+// must not hold every worker permit while waiting for member RPC decoding.
+async fn confirm_cohort_capacity(
+    node: &NodeHandle,
+    pinned: Option<Identity>,
+    members: Option<Arc<[Client]>>,
+    authority: Authority,
+    epoch: u64,
+    deadline: tokio::time::Instant,
+) -> Result<Value, Error> {
+    let identity = pinned.ok_or(Error::Identity)?;
+    let members = members.ok_or(Error::Identity)?;
+    if identity.role != Role::Coordinator
+        || identity.authority != authority
+        || identity.target.epoch != epoch
+        || identity.cohort.profile != CapacityProfile::ByteBound16MiBV1
+    {
+        return Err(Error::Identity);
+    }
+    let Value::Journal(journal) = dispatch_operation(
+        node,
+        Some(identity.clone()),
+        Operation::Journal {
+            authority: authority.clone(),
+            epoch,
+        },
+        deadline,
+    )
+    .await?
+    else {
+        return Err(Error::Protocol);
+    };
+    if let Some(grants) = journal.capacity_grants() {
+        return Ok(Value::Capacity(CohortCapacity {
+            authority,
+            cohort: identity.cohort,
+            grants: grants.to_vec(),
+        }));
+    }
+    drop(journal);
+    let mut grants = Vec::with_capacity(members.len());
+    for member in members.iter() {
+        // Client timeouts remain capped by the one original server deadline.
+        let value = member
+            .call_at(
+                Operation::GrantStatus {
+                    authority: authority.clone(),
+                    target: member.identity.target.clone(),
+                    cohort: identity.cohort.clone(),
+                },
+                deadline,
+            )
+            .await?;
+        let Value::Grant(status) = value else {
+            return Err(Error::Protocol);
+        };
+        check_grant_status(
+            &status,
+            &authority,
+            &member.identity.target,
+            &identity.cohort,
+        )?;
+        grants.push(status.grant);
+    }
+    crate::capacity_policy::validate_grants(&identity.cohort, &grants)
+        .map_err(|_| Error::Identity)?;
+    let node = WorkNode {
+        raft: node.raft.clone(),
+        state_machine: node.state_machine.clone(),
+    };
+    bounded_cpu(deadline, async move {
+        leader_barrier(&node, deadline).await?;
+        let current = checked_journal(&node, Some(&identity), &authority, epoch).await?;
+        if let Some(retained) = current.capacity_grants() {
+            if retained != grants.as_slice() {
+                return Err(Error::Identity);
+            }
+            return Ok(Value::Capacity(CohortCapacity {
+                authority,
+                cohort: identity.cohort,
+                grants,
+            }));
+        }
+        let proposal = submit(
+            &node,
+            deadline,
+            D1Command::Coordinator {
+                shard: authority.shard,
+                epoch,
+                mode_id: authority.mode,
+                command: Command::ConfirmCohortCapacity {
+                    cohort: identity.cohort.clone(),
+                    grants: grants.clone(),
+                },
+            },
+        )
+        .await;
+        // A lost ACK or a concurrent identical proposal is recovered from the
+        // durable source. No timeout can authorize replacing a generation.
+        leader_barrier(&node, deadline).await?;
+        let retained = checked_journal(&node, Some(&identity), &authority, epoch).await?;
+        match retained.capacity_grants() {
+            Some(saved) if saved == grants.as_slice() => Ok(Value::Capacity(CohortCapacity {
+                authority,
+                cohort: identity.cohort,
+                grants,
+            })),
+            Some(_) => Err(Error::Identity),
+            None => Err(proposal.err().unwrap_or(Error::Protocol)),
+        }
+    })
+    .await
+}
+async fn retain_prepare_history(
+    node: &WorkNode,
+    authority: &Authority,
+    target: &Target,
+    journal: &Journal,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    let cut = journal.history_cursor().map_err(|_| Error::Identity)?;
+    let mut cursor = node
+        .state_machine
+        .participant_prepare_history(target.shard, target.epoch, target.mode, journal)
+        .await
+        .map_err(application_error)?;
+    // The durable getter already proves exact prefix compatibility in either
+    // direction. Preserve a later local history rather than rolling it back.
+    if cursor.event_count >= cut.event_count {
+        return Ok(());
+    }
+    // Every accepted page must move the position; the byte-derived event bound
+    // and the original absolute deadline independently bound this loop.
+    for _ in 0..journal.capacity_profile().max_history_events() {
+        if cursor.event_count >= cut.event_count {
+            return Ok(());
+        }
+        let page = journal
+            .history_page(&cursor, Some(&cut))
+            .map_err(|_| Error::Identity)?;
+        let end = page.end.clone();
+        if end.event_count <= cursor.event_count {
+            return Err(Error::Identity);
+        }
+        match submit(
+            node,
+            deadline,
+            D1Command::SyncHistory {
+                authority: authority.clone(),
+                shard: target.shard,
+                epoch: target.epoch,
+                mode_id: target.mode,
+                page: Box::new(page),
+            },
+        )
+        .await?
+        {
+            D1Result::HistorySynced {
+                cursor: observed,
+                applied_prefix,
+            } => {
+                let status = HistoryStatus {
+                    cursor: observed,
+                    applied_prefix,
+                };
+                check_history_status(&status, authority, target, &cut.cohort)?;
+                if status.cursor.event_count < end.event_count
+                    || (status.cursor.event_count == end.event_count && status.cursor != end)
+                {
+                    return Err(Error::Identity);
+                }
+                // Recheck the exact source against any concurrent longer local
+                // history before allowing the subsequent prepare command.
+                cursor = node
+                    .state_machine
+                    .participant_prepare_history(target.shard, target.epoch, target.mode, journal)
+                    .await
+                    .map_err(application_error)?;
+                if cursor.event_count < end.event_count {
+                    return Err(Error::Identity);
+                }
+            }
+            _ => return Err(Error::Protocol),
+        }
+    }
+    Err(Error::Capacity)
+}
+
 fn check_member_cursor(
     cursor: &HistoryCursor,
     authority: &Authority,
@@ -1076,7 +1595,7 @@ fn check_history_status(
     check_member_cursor(&status.cursor, authority, target, cohort)?;
     // Every consumed ordinal needs an admission/Begin and terminal decision,
     // in addition to the initial BindCohort. A cursor alone does not prove V.
-    if status.applied_prefix > MAX_TRANSACTIONS as u64
+    if status.applied_prefix > cohort.profile.max_transactions() as u64
         || status.applied_prefix > (status.cursor.event_count - 1) / 2
     {
         return Err(Error::Identity);
@@ -1127,7 +1646,7 @@ fn check_summary(
         || value.cohort.validate().is_err()
         || value.cohort.coordinator_shard != authority.shard
         || value.cohort.coordinator_epoch != epoch
-        || value.resolved_prefix > crate::transaction_decisions::MAX_TRANSACTIONS as u64
+        || value.resolved_prefix > value.cohort.profile.max_transactions() as u64
     {
         return Err(Error::Identity);
     }
@@ -1200,7 +1719,7 @@ async fn checked_journal(
     }
     Ok(journal)
 }
-// Disk format errors do not expand the v4 wire enum. Peers already understand
+// Disk format errors do not expand the wire error enum. Peers already understand
 // history mismatch and transient unavailability; the ledger stays private.
 fn application_error(error: D1Error) -> Error {
     match error {
@@ -1233,6 +1752,18 @@ struct WorkNode {
 async fn dispatch(
     node: &NodeHandle,
     pinned: Option<Identity>,
+    members: Option<Arc<[Client]>>,
+    op: Operation,
+    deadline: tokio::time::Instant,
+) -> Result<Value, Error> {
+    if let Operation::ConfirmCapacity { authority, epoch } = op {
+        return confirm_cohort_capacity(node, pinned, members, authority, epoch, deadline).await;
+    }
+    dispatch_operation(node, pinned, op, deadline).await
+}
+async fn dispatch_operation(
+    node: &NodeHandle,
+    pinned: Option<Identity>,
     op: Operation,
     deadline: tokio::time::Instant,
 ) -> Result<Value, Error> {
@@ -1240,18 +1771,8 @@ async fn dispatch(
         raft: node.raft.clone(),
         state_machine: node.state_machine.clone(),
     };
-    let runtime = tokio::runtime::Handle::current();
-    cpu(move || {
-        runtime.block_on(async {
-            let result =
-                tokio::time::timeout_at(deadline, execute(&node, pinned.as_ref(), op, deadline))
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::Unavailable);
-            }
-            result
-        })
+    bounded_cpu(deadline, async move {
+        execute(&node, pinned.as_ref(), op, deadline).await
     })
     .await
 }
@@ -1261,17 +1782,37 @@ async fn execute(
     op: Operation,
     deadline: tokio::time::Instant,
 ) -> Result<Value, Error> {
-    if tokio::time::Instant::now() >= deadline {
-        return Err(Error::Unavailable);
-    }
-    node.raft
-        .ensure_linearizable()
-        .await
-        .map_err(|_| Error::Unavailable)?;
-    if tokio::time::Instant::now() >= deadline {
-        return Err(Error::Unavailable);
-    }
+    leader_barrier(node, deadline).await?;
     match op {
+        Operation::ConfirmCapacity { .. } => Err(Error::Identity),
+        Operation::GrantStatus {
+            authority,
+            target,
+            cohort,
+        } => {
+            let info = visibility(node, &target, pinned).await?;
+            if info.authority != authority || info.cohort.as_ref() != Some(&cohort) {
+                return Err(Error::Identity);
+            }
+            let grant = node
+                .state_machine
+                .participant_capacity_grant(
+                    target.shard,
+                    target.epoch,
+                    target.mode,
+                    &authority,
+                    &cohort,
+                )
+                .await
+                .map_err(application_error)?;
+            let status = CapacityGrantStatus {
+                authority: authority.clone(),
+                cohort: cohort.clone(),
+                grant,
+            };
+            check_grant_status(&status, &authority, &target, &cohort)?;
+            Ok(Value::Grant(status))
+        }
         Operation::HistoryStatus {
             authority,
             target,
@@ -1377,6 +1918,11 @@ async fn execute(
             if info.authority != authority || info.cohort.as_ref() != Some(&cut.cohort) {
                 return Err(Error::Identity);
             }
+            let max_applied = (cut.event_count - 1) / 2;
+            let max_transactions = cut.cohort.profile.max_transactions() as u64;
+            if ordinal == 0 || ordinal > max_transactions || ordinal > max_applied {
+                return Err(Error::Identity);
+            }
             match submit(
                 node,
                 deadline,
@@ -1392,7 +1938,7 @@ async fn execute(
             .await?
             {
                 D1Result::Visibility { applied_prefix }
-                    if applied_prefix >= ordinal && applied_prefix <= MAX_TRANSACTIONS as u64 =>
+                    if applied_prefix >= ordinal && applied_prefix <= max_transactions =>
                 {
                     Ok(Value::RetainedPrefix(applied_prefix))
                 }
@@ -1470,7 +2016,10 @@ async fn execute(
             command,
         } => {
             checked_journal(node, pinned, &authority, epoch).await?;
-            if matches!(command, Command::BindCohort { .. }) {
+            if matches!(
+                command,
+                Command::BindCohort { .. } | Command::ConfirmCohortCapacity { .. }
+            ) {
                 return Err(Error::Identity);
             }
             match submit(
@@ -1534,6 +2083,9 @@ async fn execute(
                 {
                     return Err(Error::Identity);
                 }
+            }
+            if cohort.profile == CapacityProfile::ByteBound16MiBV1 {
+                retain_prepare_history(node, &authority, &target, &journal, deadline).await?;
             }
             match submit(
                 node,
@@ -1629,6 +2181,32 @@ impl Server {
         address: SocketAddr,
         timeout: Duration,
     ) -> Result<Self, Error> {
+        if identity.role == Role::Coordinator
+            && identity.cohort.profile == CapacityProfile::ByteBound16MiBV1
+        {
+            return Err(Error::Identity);
+        }
+        Self::bind_configured(node, identity, None, address, timeout).await
+    }
+    /// Bind a byte-budget coordinator to its complete, immutable trusted endpoint set.
+    /// Every member, including nonparticipants, is checked during confirmation.
+    pub async fn bind_byte_bound_coordinator(
+        node: Arc<NodeHandle>,
+        identity: Identity,
+        mut members: Vec<Client>,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        validate_capacity_endpoints(&identity, &mut members)?;
+        Self::bind_configured(node, identity, Some(members.into()), address, timeout).await
+    }
+    async fn bind_configured(
+        node: Arc<NodeHandle>,
+        identity: Identity,
+        members: Option<Arc<[Client]>>,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
         identity.validate()?;
         valid_timeout(timeout)?;
         if identity.node != node.id || identity.group != node.group_id() {
@@ -1646,7 +2224,13 @@ impl Server {
         let deadline = tokio::time::Instant::now() + timeout;
         tokio::time::timeout_at(
             deadline,
-            dispatch(&node, Some(identity.clone()), probe, deadline),
+            dispatch(
+                &node,
+                Some(identity.clone()),
+                members.clone(),
+                probe,
+                deadline,
+            ),
         )
         .await
         .map_err(|_| Error::Unavailable)??;
@@ -1665,7 +2249,7 @@ impl Server {
                     accepted = listener.accept() => {
                         let Ok((mut stream,_)) = accepted else { break; };
                         let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
-                        let node = node.clone(); let identity = identity.clone();
+                        let node = node.clone(); let identity = identity.clone(); let members = members.clone();
                         handlers.spawn(async move {
                             let _permit = permit;
                             let deadline = tokio::time::Instant::now() + timeout;
@@ -1673,7 +2257,7 @@ impl Server {
                                 let request: Request = receive(&mut stream).await?;
                                 let operation = request.operation.tag();
                                 let result = if request.version != PROTOCOL_VERSION { Err(Error::Protocol) } else if request.identity != identity { Err(Error::Identity) }
-                                    else { dispatch(&node,Some(identity.clone()),request.operation,deadline).await };
+                                    else { dispatch(&node,Some(identity.clone()),members,request.operation,deadline).await };
                                 let bytes = match encode(Reply { version:PROTOCOL_VERSION,operation,identity:identity.clone(),nonce:request.nonce,result }).await {
                                     Ok(bytes) => bytes,
                                     Err(error) => encode(Reply { version:PROTOCOL_VERSION,operation,identity,nonce:request.nonce,result:Err(error) }).await?,
@@ -1716,6 +2300,7 @@ impl Drop for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction_decisions::MAX_TRANSACTIONS;
     #[test]
     fn bounded_writer_and_strict_json() {
         let mut writer = BoundedWriter(vec![0; MAX_FRAME_BYTES - 1]);
@@ -1772,6 +2357,7 @@ mod tests {
                 mode: [9; 16],
             },
             cohort: Cohort {
+                profile: CapacityProfile::LegacyCountV1,
                 coordinator_shard: 9,
                 coordinator_epoch: 1,
                 members: vec![crate::transaction_decisions::Member {
@@ -1830,7 +2416,7 @@ mod tests {
                     1 => reply.nonce += 1,
                     2 => reply.operation += 1,
                     3 => reply.version += 1,
-                    _ => reply.version = 3,
+                    _ => reply.version = 4,
                 }
                 send(&mut stream, &encode(reply).await.unwrap())
                     .await
@@ -2272,7 +2858,7 @@ mod tests {
         id
     }
     #[test]
-    fn history_wire_v4_operation_tags_are_explicit() {
+    fn history_wire_v5_operation_tags_are_explicit() {
         let journal = terminal_journal(1);
         let base = journal.history_cursor_at(1).unwrap();
         let page = journal.history_page(&base, None).unwrap();
@@ -2301,7 +2887,7 @@ mod tests {
                 cut: page.cut,
             },
         ];
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(operations.each_ref().map(Operation::tag), [11, 12, 13, 14]);
         for (operation, name) in operations.into_iter().zip([
             "HistoryStatus",
@@ -2317,7 +2903,7 @@ mod tests {
             };
             let bytes = encode_sync(&request).unwrap();
             let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(wire["version"], 4);
+            assert_eq!(wire["version"], 5);
             assert_eq!(wire["nonce"], 17);
             assert_eq!(
                 wire["operation"]
@@ -2810,7 +3396,7 @@ mod tests {
         send(
             &mut legacy,
             &encode_sync(&Request {
-                version: 3,
+                version: 4,
                 identity: identity(),
                 nonce: 1,
                 operation: Operation::Journal {
@@ -2933,5 +3519,973 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn byte_identity() -> Identity {
+        let mut id = identity();
+        id.cohort.profile = CapacityProfile::ByteBound16MiBV1;
+        id.cohort
+            .members
+            .push(crate::transaction_decisions::Member {
+                shard: 8,
+                epoch: 1,
+                mode: [8; 16],
+            });
+        id
+    }
+    fn byte_member_identity(shard: u64) -> Identity {
+        let mut id = byte_identity();
+        let member = id
+            .cohort
+            .members
+            .iter()
+            .find(|member| member.shard == shard)
+            .unwrap();
+        id.group = shard;
+        id.target = Target {
+            shard,
+            epoch: member.epoch,
+            mode: member.mode,
+        };
+        id.role = Role::Participant;
+        id
+    }
+    fn byte_grants() -> Vec<MemberCapacityGrant> {
+        byte_identity()
+            .cohort
+            .members
+            .into_iter()
+            .map(|member| MemberCapacityGrant {
+                activation: crate::transaction_decisions::CapacityActivation {
+                    nonce: [member.shard as u8; 32],
+                    log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 4),
+                },
+                member,
+            })
+            .collect()
+    }
+    async fn capacity_node(cluster: &crate::Cluster, identity: &Identity) -> Arc<NodeHandle> {
+        let node = Arc::new(
+            cluster
+                .in_group(identity.group)
+                .start(identity.node)
+                .await
+                .unwrap(),
+        );
+        node.raft
+            .initialize(BTreeMap::from([(
+                identity.node,
+                openraft::BasicNode::default(),
+            )]))
+            .await
+            .unwrap();
+        node.raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |metrics| {
+                    metrics.current_leader == Some(identity.node) && metrics.last_applied.is_some()
+                },
+                "capacity leader",
+            )
+            .await
+            .unwrap();
+        let mut commands = vec![
+            D1Command::Activate {
+                shard: identity.target.shard,
+                epoch: identity.target.epoch,
+            },
+            D1Command::EnableManagedWrites {
+                shard: identity.target.shard,
+                epoch: identity.target.epoch,
+                expected_sequence: 0,
+                mode_id: identity.target.mode,
+            },
+        ];
+        match identity.role {
+            Role::Coordinator => {
+                commands.push(D1Command::EnableCoordinator {
+                    shard: identity.target.shard,
+                    epoch: identity.target.epoch,
+                    mode_id: identity.target.mode,
+                });
+                commands.push(D1Command::Coordinator {
+                    shard: identity.target.shard,
+                    epoch: identity.target.epoch,
+                    mode_id: identity.target.mode,
+                    command: Command::BindCohort {
+                        cohort: identity.cohort.clone(),
+                    },
+                });
+            }
+            Role::Participant => commands.push(D1Command::EnableParticipant {
+                shard: identity.target.shard,
+                epoch: identity.target.epoch,
+                mode_id: identity.target.mode,
+                authority: identity.authority.clone(),
+            }),
+        }
+        for command in commands {
+            node.raft
+                .client_write(LogCommand::D1V1(command))
+                .await
+                .unwrap()
+                .data
+                .d1
+                .unwrap()
+                .unwrap();
+        }
+        node
+    }
+    async fn capacity_client(node: Arc<NodeHandle>, identity: Identity) -> (Client, Server) {
+        let server = Server::bind(
+            node,
+            identity.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let client = Client::new(server.local_addr(), identity, Duration::from_secs(2)).unwrap();
+        (client, server)
+    }
+    #[test]
+    fn capacity_endpoint_set_is_complete_unique_and_profile_bound() {
+        let id = byte_identity();
+        let client = |shard: u64| {
+            Client::new(
+                format!("127.0.0.1:{}", 10000 + shard).parse().unwrap(),
+                byte_member_identity(shard),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        };
+        let original = vec![client(7), client(8)];
+        for fault in 0..10 {
+            let mut clients = original.clone();
+            match fault {
+                0 => {
+                    clients.pop();
+                }
+                1 => clients.push(client(7)),
+                2 => clients[1] = clients[0].clone(),
+                3 => clients[1].identity.cohort.profile = CapacityProfile::LegacyCountV1,
+                4 => clients[1].identity.authority.mode = [3; 16],
+                5 => clients[1].identity.role = Role::Coordinator,
+                6 => clients[1].identity.target.epoch += 1,
+                7 => clients[1].identity.group = clients[0].identity.group,
+                8 => clients[1].address = clients[0].address,
+                _ => clients[1].identity.group = id.group,
+            }
+            assert_eq!(
+                validate_capacity_endpoints(&id, &mut clients),
+                Err(Error::Identity),
+                "fault {fault}"
+            );
+        }
+        let mut reverse = vec![client(8), client(7)];
+        validate_capacity_endpoints(&id, &mut reverse).unwrap();
+        assert_eq!(reverse[0].identity.target.shard, 7);
+        assert!(serde_json::from_value::<Operation>(serde_json::json!({
+            "ConfirmCapacity": { "authority": id.authority, "epoch": 1, "grants": byte_grants() },
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<Operation>(serde_json::json!({
+            "GrantStatus": { "authority": id.authority, "target": byte_member_identity(7).target,
+                "cohort": id.cohort, "generation_nonce": vec![7; 32] },
+        }))
+        .is_err());
+    }
+    #[tokio::test]
+    async fn matching_envelopes_cannot_substitute_capacity_binding_or_generation_shape() {
+        let id = byte_member_identity(7);
+        for fault in 0..8 {
+            let mut status = CapacityGrantStatus {
+                authority: id.authority.clone(),
+                cohort: id.cohort.clone(),
+                grant: byte_grants().remove(0),
+            };
+            match fault {
+                0 => status.authority.mode = [3; 16],
+                1 => status.cohort.profile = CapacityProfile::LegacyCountV1,
+                2 => status.cohort.coordinator_epoch += 1,
+                3 => status.grant.member.shard = 8,
+                4 => status.grant.member.mode = [8; 16],
+                5 => status.grant.activation.nonce = [0; 32],
+                6 => status.grant.activation.log_id.index = 0,
+                _ => status.grant.activation.log_id.leader_id.term = 0,
+            }
+            let (client, peer) = fake_value(id.clone(), Value::Grant(status)).await;
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .grant_status(&id.authority, &id.target, &id.cohort)
+                    .await,
+                Err(Error::Identity),
+                "fault {fault}"
+            );
+            peer.await.unwrap();
+        }
+        for fault in 0..6 {
+            let coordinator = byte_identity();
+            let mut value = CohortCapacity {
+                authority: coordinator.authority.clone(),
+                cohort: coordinator.cohort.clone(),
+                grants: byte_grants(),
+            };
+            match fault {
+                0 => value.cohort.profile = CapacityProfile::LegacyCountV1,
+                1 => {
+                    value.grants.pop();
+                }
+                2 => value.grants.reverse(),
+                3 => value.grants[1] = value.grants[0].clone(),
+                4 => value.grants[0].activation.nonce = [0; 32],
+                _ => value.authority.mode = [3; 16],
+            }
+            let (client, peer) = fake_value(coordinator.clone(), Value::Capacity(value)).await;
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .confirm_capacity(&coordinator.authority, 1)
+                    .await,
+                Err(Error::Identity),
+                "confirmation fault {fault}"
+            );
+            peer.await.unwrap();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_entropy_failure_and_lost_ack_retry_preserve_first_generation() {
+        let cluster = crate::Cluster::new();
+        let id = byte_member_identity(7);
+        let node = capacity_node(&cluster, &id).await;
+        let before = node.raft.metrics().borrow().last_log_index;
+        assert_eq!(
+            activate_member_with_entropy(&node, &id.authority, &id.target, &id.cohort, |_| Err(
+                Error::Unavailable
+            ))
+            .await,
+            Err(Error::Unavailable)
+        );
+        assert_eq!(node.raft.metrics().borrow().last_log_index, before);
+        assert_eq!(
+            node.state_machine
+                .participant_capacity_grant(
+                    id.target.shard,
+                    id.target.epoch,
+                    id.target.mode,
+                    &id.authority,
+                    &id.cohort,
+                )
+                .await,
+            Err(D1Error::VisibilityNotEnabled)
+        );
+        let mut journal = Journal::new(id.authority.mode).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: id.cohort.clone(),
+            })
+            .unwrap();
+        // Apply an activation, then deliberately discard its ACK. The public
+        // helper must recover the stored first generation without new entropy.
+        node.raft
+            .client_write(LogCommand::D1V1(D1Command::EnableByteBoundReads {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                journal: journal.clone(),
+                generation_nonce: [17; 32],
+            }))
+            .await
+            .unwrap()
+            .data
+            .d1
+            .unwrap()
+            .unwrap();
+        let first =
+            activate_member_with_entropy(&node, &id.authority, &id.target, &id.cohort, |_| {
+                panic!("retry generated a replacement incarnation")
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.activation.nonce, [17; 32]);
+        let rejected = node
+            .raft
+            .client_write(LogCommand::D1V1(D1Command::EnableByteBoundReads {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                journal,
+                generation_nonce: [18; 32],
+            }))
+            .await
+            .unwrap()
+            .data
+            .d1
+            .unwrap();
+        assert!(rejected.is_err());
+        assert_eq!(
+            activate_byte_bound_member(&node, &id.authority, &id.target, &id.cohort).await,
+            Ok(first)
+        );
+        node.raft.shutdown().await.unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn actual_coordinator_owns_all_grants_and_retains_confirmation_offline() {
+        let cluster = crate::Cluster::new();
+        let id = byte_identity();
+        let coordinator = capacity_node(&cluster, &id).await;
+        let writer_id = byte_member_identity(7);
+        let observer_id = byte_member_identity(8);
+        let writer = capacity_node(&cluster, &writer_id).await;
+        let observer = capacity_node(&cluster, &observer_id).await;
+        let writer_grant = activate_byte_bound_member(
+            &writer,
+            &writer_id.authority,
+            &writer_id.target,
+            &writer_id.cohort,
+        )
+        .await
+        .unwrap();
+        let observer_grant = activate_byte_bound_member(
+            &observer,
+            &observer_id.authority,
+            &observer_id.target,
+            &observer_id.cohort,
+        )
+        .await
+        .unwrap();
+        let (writer_client, writer_server) =
+            capacity_client(writer.clone(), writer_id.clone()).await;
+        let (observer_client, observer_server) =
+            capacity_client(observer.clone(), observer_id.clone()).await;
+        assert!(matches!(
+            Server::bind(
+                coordinator.clone(),
+                id.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_secs(2)
+            )
+            .await,
+            Err(Error::Identity)
+        ));
+        assert!(matches!(
+            Server::bind_byte_bound_coordinator(
+                coordinator.clone(),
+                id.clone(),
+                vec![writer_client.clone()],
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_secs(2)
+            )
+            .await,
+            Err(Error::Identity)
+        ));
+        let server = Server::bind_byte_bound_coordinator(
+            coordinator.clone(),
+            id.clone(),
+            vec![observer_client.clone(), writer_client.clone()],
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let client = Client::new(server.local_addr(), id.clone(), Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            NodeRef::Local(&coordinator)
+                .confirm_capacity(&id.authority, 1)
+                .await,
+            Err(Error::Identity)
+        );
+        let command = Command::ConfirmCohortCapacity {
+            cohort: id.cohort.clone(),
+            grants: byte_grants(),
+        };
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .command(&id.authority, 1, command.clone())
+                .await,
+            Err(Error::Identity)
+        );
+        // Bypass client validation to prove the actual TCP server rejects forged
+        // grants on the ordinary Command route as well.
+        let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+        send(
+            &mut stream,
+            &encode_sync(&Request {
+                version: PROTOCOL_VERSION,
+                identity: id.clone(),
+                nonce: 19,
+                operation: Operation::Command {
+                    authority: id.authority.clone(),
+                    epoch: 1,
+                    command,
+                },
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let reply: Reply = receive(&mut stream).await.unwrap();
+        assert_eq!(reply.nonce, 19);
+        assert!(matches!(reply.result, Err(Error::Identity)));
+        let offline_address = observer_server.local_addr();
+        observer_server.shutdown().await;
+        assert!(matches!(
+            NodeRef::Remote(&client)
+                .confirm_capacity(&id.authority, 1)
+                .await,
+            Err(Error::Unavailable)
+        ));
+        let unready = NodeRef::Remote(&client)
+            .journal(&id.authority, 1)
+            .await
+            .unwrap();
+        assert!(!unready.capacity_ready());
+        assert_eq!(unready.history_cursor().unwrap().event_count, 1);
+        let begin = Command::Begin {
+            id: [1; 16],
+            participants: vec![Participant {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+                intent: [1; 32],
+            }],
+        };
+        assert!(NodeRef::Remote(&client)
+            .command(&id.authority, 1, begin.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .journal(&id.authority, 1)
+                .await
+                .unwrap()
+                .transaction_count(),
+            0
+        );
+        let observer_server = Server::bind(
+            observer.clone(),
+            observer_id.clone(),
+            offline_address,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let expected = vec![writer_grant, observer_grant];
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .confirm_capacity(&id.authority, 1)
+                .await
+                .unwrap(),
+            expected
+        );
+        let confirmed = NodeRef::Remote(&client)
+            .journal(&id.authority, 1)
+            .await
+            .unwrap();
+        assert_eq!(confirmed.history_cursor().unwrap().event_count, 2);
+        assert_eq!(confirmed.transaction_count(), 0);
+        let descriptor = Participant {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+            intent: [2; 32],
+        };
+        let request = D1WriteRequest {
+            shard: 7,
+            epoch: 1,
+            request_id: [2; 16],
+            expected_sequence: Some(0),
+            operations: vec![crate::WriteOp::put("capacity-key", "value")],
+        };
+        let plan = crate::request_plans::Plan {
+            version: 1,
+            id: [2; 16],
+            authority: id.authority.clone(),
+            cohort: id.cohort.clone(),
+            validation_version: 0,
+            parts: vec![crate::request_plans::Part {
+                descriptor: descriptor.clone(),
+                request: request.clone(),
+            }],
+        };
+        NodeRef::Remote(&client)
+            .command(
+                &id.authority,
+                1,
+                Command::AdmitRequest {
+                    id: [3; 16],
+                    request: vec![1],
+                    payload: plan.encode().unwrap(),
+                    transaction_id: [2; 16],
+                    participants: vec![descriptor.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        let admission = NodeRef::Remote(&client)
+            .journal(&id.authority, 1)
+            .await
+            .unwrap();
+        // Privileged raw preparation still cannot reserve an identity until its
+        // confirmed grant and exact original Plan have been retained locally.
+        assert!(writer
+            .raft
+            .client_write(LogCommand::D1V1(D1Command::PrepareParticipant {
+                authority: id.authority.clone(),
+                participant: descriptor.clone(),
+                request: request.clone(),
+            }))
+            .await
+            .unwrap()
+            .data
+            .d1
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            NodeRef::Remote(&writer_client)
+                .prepare(&id.authority, &descriptor, request.clone(), &admission)
+                .await
+                .unwrap(),
+            Status::Prepared
+        );
+        NodeRef::Remote(&client)
+            .command(
+                &id.authority,
+                1,
+                Command::Prepared {
+                    id: [2; 16],
+                    participant: descriptor.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let later = NodeRef::Remote(&client)
+            .journal(&id.authority, 1)
+            .await
+            .unwrap();
+        let base = NodeRef::Remote(&writer_client)
+            .history_status(&id.authority, &writer_id.target, &id.cohort)
+            .await
+            .unwrap()
+            .cursor;
+        let page = later.history_page(&base, None).unwrap();
+        let retained = NodeRef::Remote(&writer_client)
+            .sync_history(&id.authority, &writer_id.target, &page)
+            .await
+            .unwrap();
+        assert_eq!(
+            NodeRef::Remote(&writer_client)
+                .prepare(&id.authority, &descriptor, request.clone(), &admission)
+                .await
+                .unwrap(),
+            Status::Prepared
+        );
+        assert_eq!(
+            NodeRef::Remote(&writer_client)
+                .history_status(&id.authority, &writer_id.target, &id.cohort)
+                .await
+                .unwrap(),
+            retained
+        );
+        let mut changed = request;
+        changed.operations = vec![crate::WriteOp::put("capacity-key", "different")];
+        assert_eq!(
+            NodeRef::Remote(&writer_client)
+                .prepare(&id.authority, &descriptor, changed, &admission)
+                .await,
+            Err(Error::Identity)
+        );
+        // The retained canonical grant survives missing members and exact retry;
+        // confirmation never re-queries offline members or creates a new event.
+        observer_server.shutdown().await;
+        writer_server.shutdown().await;
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .confirm_capacity(&id.authority, 1)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .journal(&id.authority, 1)
+                .await
+                .unwrap(),
+            later
+        );
+        NodeRef::Remote(&client)
+            .command(&id.authority, 1, begin)
+            .await
+            .unwrap();
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .journal(&id.authority, 1)
+                .await
+                .unwrap()
+                .transaction_count(),
+            2
+        );
+        server.shutdown().await;
+        observer.raft.shutdown().await.unwrap();
+        writer.raft.shutdown().await.unwrap();
+        coordinator.raft.shutdown().await.unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_grant_status_checks_pinned_group_node_and_profile() {
+        let cluster = crate::Cluster::new();
+        let id = byte_member_identity(7);
+        let node = capacity_node(&cluster, &id).await;
+        let grant = activate_byte_bound_member(&node, &id.authority, &id.target, &id.cohort)
+            .await
+            .unwrap();
+        let (client, server) = capacity_client(node.clone(), id.clone()).await;
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .grant_status(&id.authority, &id.target, &id.cohort)
+                .await,
+            Ok(grant)
+        );
+        for fault in 0..3 {
+            let mut wrong = id.clone();
+            match fault {
+                0 => wrong.group += 1,
+                1 => wrong.node += 1,
+                _ => wrong.cohort.profile = CapacityProfile::LegacyCountV1,
+            }
+            let client =
+                Client::new(server.local_addr(), wrong.clone(), Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                NodeRef::Remote(&client)
+                    .grant_status(&wrong.authority, &wrong.target, &wrong.cohort)
+                    .await,
+                Err(Error::Identity)
+            );
+        }
+        server.shutdown().await;
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_async_deadline_drops_pending_work_and_releases_permit_after_caller_cancel() {
+        struct Dropped(Option<oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        for cancel_caller in [false, true] {
+            let slots = Arc::new(Semaphore::new(1));
+            let (entered, ready) = oneshot::channel();
+            let (dropped, canceled) = oneshot::channel();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+            let work_slots = slots.clone();
+            let work = tokio::spawn(async move {
+                bounded_cpu_with_slots(work_slots, deadline, async move {
+                    let _drop = Dropped(Some(dropped));
+                    let _ = entered.send(());
+                    std::future::pending::<Result<(), Error>>().await
+                })
+                .await
+            });
+            ready.await.unwrap();
+            assert!(slots.clone().try_acquire_owned().is_err());
+            if cancel_caller {
+                work.abort();
+                assert!(work.await.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(work.await.unwrap(), Err(Error::Unavailable));
+            }
+            // Releasing the caller is insufficient. The timer inside the
+            // blocking closure must actually drop its still-pending future.
+            tokio::time::timeout_at(deadline + Duration::from_secs(1), canceled)
+                .await
+                .unwrap()
+                .unwrap();
+            let permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(permit);
+            assert_eq!(slots.available_permits(), 1);
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn actual_quorum_loss_bounds_activation_submit_and_releases_cpu_permit() {
+        let cluster = crate::Cluster::new();
+        let id = byte_member_identity(7);
+        let group = cluster.in_group(id.group);
+        let leader = capacity_node(&cluster, &id).await;
+        let second = group.start(2).await.unwrap();
+        let third = group.start(3).await.unwrap();
+        for follower in [2, 3] {
+            leader
+                .raft
+                .add_learner(follower, openraft::BasicNode::default(), true)
+                .await
+                .unwrap();
+        }
+        leader
+            .raft
+            .change_membership(BTreeSet::from([1, 2, 3]), false)
+            .await
+            .unwrap();
+        leader.raft.ensure_linearizable().await.unwrap();
+        let mut journal = Journal::new(id.authority.mode).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: id.cohort.clone(),
+            })
+            .unwrap();
+        for follower in [2, 3] {
+            group.policy.deny(1, follower).await;
+            group.policy.deny(follower, 1).await;
+        }
+        let node = WorkNode {
+            raft: leader.raft.clone(),
+            state_machine: leader.state_machine.clone(),
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let (entered, ready) = oneshot::channel();
+        let work_slots = slots.clone();
+        let work = tokio::spawn(async move {
+            bounded_cpu_with_slots(work_slots, deadline, async move {
+                let _ = entered.send(());
+                // Quorum disappeared after the successful leader barrier. An
+                // actual Raft proposal now remains pending, as can happen in
+                // either activation or the verified confirmation commit phase.
+                submit(
+                    &node,
+                    deadline,
+                    D1Command::EnableByteBoundReads {
+                        shard: 7,
+                        epoch: 1,
+                        mode_id: [7; 16],
+                        journal,
+                        generation_nonce: [29; 32],
+                    },
+                )
+                .await
+            })
+            .await
+        });
+        ready.await.unwrap();
+        assert_eq!(work.await.unwrap(), Err(Error::Unavailable));
+        let permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(slots.available_permits(), 1);
+        // No missing quorum may be replaced by a fresh nonce or an optimistic
+        // grant. The public activation path must finish within its own deadline.
+        assert_eq!(
+            tokio::time::timeout(
+                LOCAL_TIMEOUT + Duration::from_secs(1),
+                activate_member_with_entropy(
+                    &leader,
+                    &id.authority,
+                    &id.target,
+                    &id.cohort,
+                    |_| panic!("lost quorum reached activation entropy")
+                ),
+            )
+            .await
+            .unwrap(),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(
+            leader
+                .state_machine
+                .participant_capacity_grant(7, 1, [7; 16], &id.authority, &id.cohort,)
+                .await,
+            Err(D1Error::VisibilityNotEnabled)
+        );
+        // Do not heal and retry an uncertain proposal. Shutdown removes the
+        // pending test group without asserting that timeout erased its log.
+        leader.raft.shutdown().await.unwrap();
+        second.raft.shutdown().await.unwrap();
+        third.raft.shutdown().await.unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_leader_confirmation_fails_closed_with_bounded_deadline() {
+        let cluster = crate::Cluster::new();
+        let id = byte_identity();
+        let coordinator = capacity_node(&cluster, &id).await;
+        let members = [7, 8]
+            .into_iter()
+            .map(|shard| {
+                Client::new(
+                    format!("127.0.0.1:{}", 10000 + shard).parse().unwrap(),
+                    byte_member_identity(shard),
+                    Duration::from_secs(1),
+                )
+                .unwrap()
+            })
+            .collect();
+        let server = Server::bind_byte_bound_coordinator(
+            coordinator.clone(),
+            id.clone(),
+            members,
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_millis(250),
+        )
+        .await
+        .unwrap();
+        let client = Client::new(server.local_addr(), id.clone(), Duration::from_secs(1)).unwrap();
+        coordinator.raft.shutdown().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                NodeRef::Remote(&client).confirm_capacity(&id.authority, 1),
+            )
+            .await
+            .unwrap(),
+            Err(Error::Unavailable)
+        );
+        let journal = coordinator
+            .state_machine
+            .coordinator_journal(9, 1, [9; 16])
+            .await
+            .unwrap();
+        assert!(!journal.capacity_ready());
+        assert_eq!(journal.history_cursor().unwrap().event_count, 1);
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn combined_snapshot_and_terminal_proof_obey_exact_whole_frame_boundary() {
+        check_combined_frame_boundary(
+            terminal_journal(1).terminal_prefix(1).unwrap(),
+            participant_identity(),
+        );
+    }
+    #[test]
+    fn byte_profile_combined_snapshot_and_extended_proof_obey_exact_frame_boundary() {
+        let id = byte_member_identity(7);
+        let mut journal = Journal::new(id.authority.mode).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: id.cohort.clone(),
+            })
+            .unwrap();
+        journal
+            .apply(Command::ConfirmCohortCapacity {
+                cohort: id.cohort.clone(),
+                grants: byte_grants(),
+            })
+            .unwrap();
+        for counter in 1..=1025u64 {
+            let mut transaction = [0; 16];
+            transaction[..8].copy_from_slice(&counter.to_be_bytes());
+            journal
+                .apply(Command::Begin {
+                    id: transaction,
+                    participants: vec![Participant {
+                        shard: 7,
+                        epoch: 1,
+                        mode: [7; 16],
+                        intent: [1; 32],
+                    }],
+                })
+                .unwrap();
+            journal
+                .apply(Command::Decide {
+                    id: transaction,
+                    decision: crate::transaction_decisions::Decision::Abort,
+                })
+                .unwrap();
+        }
+        let proof = journal.terminal_prefix(1025).unwrap();
+        let encoded = serde_json::to_value(&proof).unwrap();
+        assert_eq!(encoded["version"], 2);
+        check_summary(
+            &CoordinatorSummary {
+                authority: id.authority.clone(),
+                cohort: id.cohort.clone(),
+                resolved_prefix: 1025,
+            },
+            &id.authority,
+            1,
+        )
+        .unwrap();
+        check_history_status(
+            &HistoryStatus {
+                cursor: journal.history_cursor().unwrap(),
+                applied_prefix: 1025,
+            },
+            &id.authority,
+            &id.target,
+            &id.cohort,
+        )
+        .unwrap();
+        check_combined_frame_boundary(proof, id);
+    }
+    fn check_combined_frame_boundary(proof: TerminalPrefix, id: Identity) {
+        id.validate().unwrap();
+        let mut reply = Reply {
+            version: PROTOCOL_VERSION,
+            operation: 7,
+            identity: id.clone(),
+            nonce: u64::MAX,
+            result: Ok(Value::Snapshot(
+                Snapshot {
+                    shard: 7,
+                    epoch: 1,
+                    authority: id.authority.clone(),
+                    version: proof.version(),
+                    baseline_sequence: 0,
+                    cohort: Some(id.cohort.clone()),
+                    applied_prefix: proof.version(),
+                    local_sequence: 0,
+                    replay_operations: 0,
+                    entries: vec![(vec![1], vec![0])],
+                },
+                proof.clone(),
+            )),
+        };
+        let base = encode_sync(&reply).unwrap().len();
+        let growth = MAX_FRAME_BYTES - 1 - base;
+        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result {
+            let value = &mut snapshot.entries[0].1;
+            // Each appended 255 adds four JSON bytes. Keep the initial zero
+            // for the later one-byte transitions 0 -> 10 -> 100.
+            let appended = growth.div_ceil(4);
+            value.extend(std::iter::repeat_n(255, appended));
+            let reduction = 4 * appended - growth;
+            if reduction >= 2 {
+                value[appended] = 0;
+            }
+            if reduction % 2 == 1 {
+                value[appended - 1] = 10;
+            }
+            assert!(value.len() + 1 < crate::versioned_reads::MAX_READ_BYTES);
+        }
+
+        // Actual Reply + Value::Snapshot, including both the rows and the
+        // checked evidence. A proof-only frame measurement is insufficient.
+        assert_eq!(encode_sync(&reply).unwrap().len(), MAX_FRAME_BYTES - 1);
+        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result {
+            snapshot.entries[0].1[0] = 10;
+        }
+        assert_eq!(encode_sync(&reply).unwrap().len(), MAX_FRAME_BYTES);
+        if let Ok(Value::Snapshot(snapshot, retained)) = &mut reply.result {
+            snapshot.entries[0].1[0] = 100;
+            // Both components individually fit, but their complete envelope
+            // is one byte over the frame. Row capture's 64 MiB raw-data bound
+            // does not promise that JSON rows plus proof fit a 32 MiB frame.
+            assert!(encode_sync(snapshot).unwrap().len() < MAX_FRAME_BYTES);
+            assert!(encode_sync(retained).unwrap().len() < MAX_FRAME_BYTES);
+            assert_eq!(*retained, proof);
+        }
+        // The encoder owns its temporary writer: failure returns only the
+        // typed error, never a partially encoded successful response.
+        assert_eq!(encode_sync(&reply), Err(Error::Capacity));
+        reply.result = Err(Error::Capacity);
+        let fallback = encode_sync(&reply).unwrap();
+        assert!(fallback.len() < 4096);
+        let decoded: Reply = serde_json::from_slice(&fallback).unwrap();
+        assert!(matches!(decoded.result, Err(Error::Capacity)));
     }
 }

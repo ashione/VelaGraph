@@ -1,6 +1,7 @@
 //! Bounded transfers of exact retained journal events. Cursors are integrity
 //! commitments, not authentication. The full replayed Journal remains authority.
-use super::{Cohort, Command, Error, Journal, MAX_PARTICIPANTS, MAX_TRANSACTIONS};
+use super::{CapacityProfile, Cohort, Command, Error, Journal};
+use crate::capacity_policy::canonical_size;
 use crate::participant_writes::Authority;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,10 +13,14 @@ pub const MAX_HISTORY_PAGE_EVENTS: usize = 32;
 /// Maximum sum of canonical command JSON byte lengths in one history page.
 /// The complete transport frame has its own, separate bound.
 pub const MAX_HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const MAX_HISTORY_EVENTS: u64 = (MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2) + 1) as u64;
+#[cfg(test)]
+const MAX_HISTORY_EVENTS: u64 = CapacityProfile::LegacyCountV1.max_history_events();
+#[cfg(test)]
 const VERSION: u32 = 1;
 const IDENTITY_DOMAIN: &[u8] = b"d2-raft/journal-history/v1\0";
 const EVENT_DOMAIN: &[u8] = b"d2-raft/journal-history/event/v1\0";
+const BYTE_IDENTITY_DOMAIN: &[u8] = b"d2-raft/journal-history/v2\0";
+const BYTE_EVENT_DOMAIN: &[u8] = b"d2-raft/journal-history/event/v2\0";
 
 /// A checked commitment to an absolute prefix of one full cohort's history.
 ///
@@ -65,7 +70,9 @@ impl HistoryCursor {
     /// Validate the format and full identity, not the unavailable history bytes.
     /// The identity-bound empty root can be verified without any history.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != VERSION || self.event_count > MAX_HISTORY_EVENTS {
+        if self.version != self.cohort.profile.history_version()
+            || self.event_count > self.cohort.profile.max_history_events()
+        {
             return Err(Error::InvalidJournal);
         }
         if self.authority.mode == [0; 16] || self.authority.shard != self.cohort.coordinator_shard {
@@ -78,18 +85,23 @@ impl HistoryCursor {
         Ok(())
     }
 
-    /// Extend the existing v1 chain once per original event. Semantic replay is
+    /// Extend the profile-bound chain once per original event. Semantic replay is
     /// the caller's responsibility; no independently invented ledger hash exists.
     pub(crate) fn extend(&self, events: &[Command]) -> Result<Self, Error> {
         self.validate()?;
         let event_count = self
             .event_count
-            .checked_add(events.len() as u64)
-            .filter(|count| *count <= MAX_HISTORY_EVENTS)
+            .checked_add(u64::try_from(events.len()).map_err(|_| Error::InvalidJournal)?)
+            .filter(|count| *count <= self.cohort.profile.max_history_events())
             .ok_or(Error::InvalidJournal)?;
         let mut root = self.root;
         for (offset, event) in events.iter().enumerate() {
-            root = event_root(root, self.event_count + offset as u64 + 1, event)?;
+            root = event_root(
+                self.cohort.profile,
+                root,
+                self.event_count + offset as u64 + 1,
+                event,
+            )?;
         }
         Ok(Self {
             event_count,
@@ -150,7 +162,9 @@ impl HistoryPage {
     /// This does not authenticate the base, unseen cut or semantic transitions;
     /// `Journal::merge_history_page` checks those against local durable history.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != VERSION || self.events.len() > MAX_HISTORY_PAGE_EVENTS {
+        if self.version != self.base.cohort.profile.history_version()
+            || self.events.len() > MAX_HISTORY_PAGE_EVENTS
+        {
             return Err(Error::InvalidJournal);
         }
         self.base.validate()?;
@@ -225,28 +239,8 @@ fn deserialize_events<'de, D: Deserializer<'de>>(
     deserializer.deserialize_seq(Events)
 }
 
-struct ByteCounter {
-    bytes: usize,
-    limit: usize,
-}
-impl Write for ByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.limit - self.bytes {
-            return Err(io::Error::other(
-                "canonical history event exceeds byte limit",
-            ));
-        }
-        self.bytes += bytes.len();
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 fn event_size(event: &Command, limit: usize) -> Result<usize, Error> {
-    let mut counter = ByteCounter { bytes: 0, limit };
-    serde_json::to_writer(&mut counter, event).map_err(|_| Error::Capacity)?;
-    Ok(counter.bytes)
+    canonical_size(event, limit)
 }
 struct HashWriter(Sha256);
 impl Write for HashWriter {
@@ -268,15 +262,28 @@ fn identity_root(authority: &Authority, cohort: &Cohort) -> Result<[u8; 32], Err
     let bytes =
         serde_json::to_vec(&Identity { authority, cohort }).map_err(|_| Error::InvalidJournal)?;
     let mut hash = Sha256::new();
-    hash.update(IDENTITY_DOMAIN);
+    hash.update(if cohort.profile.is_legacy() {
+        IDENTITY_DOMAIN
+    } else {
+        BYTE_IDENTITY_DOMAIN
+    });
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
     Ok(hash.finalize().into())
 }
-fn event_root(previous: [u8; 32], index: u64, event: &Command) -> Result<[u8; 32], Error> {
+fn event_root(
+    profile: CapacityProfile,
+    previous: [u8; 32],
+    index: u64,
+    event: &Command,
+) -> Result<[u8; 32], Error> {
     let bytes = event_size(event, MAX_HISTORY_PAGE_BYTES)?;
     let mut hash = HashWriter(Sha256::new());
-    hash.0.update(EVENT_DOMAIN);
+    hash.0.update(if profile.is_legacy() {
+        EVENT_DOMAIN
+    } else {
+        BYTE_EVENT_DOMAIN
+    });
     hash.0.update(previous);
     hash.0.update(index.to_be_bytes());
     hash.0.update((bytes as u64).to_be_bytes());
@@ -288,27 +295,30 @@ impl Journal {
     /// Derive the current position from the full retained, replay-validated events.
     /// This API requires a bound fixed cohort; no separately persisted root exists.
     pub fn history_cursor(&self) -> Result<HistoryCursor, Error> {
-        self.history_cursor_at(self.events.len() as u64)
+        self.history_cursor_at(u64::try_from(self.events.len()).map_err(|_| Error::InvalidJournal)?)
     }
 
     /// Derive any exact retained prefix, including the identity-bound zero root.
-    /// The hash format remains v1 when journal storage changes from v2 to v3.
+    /// Legacy storage v2/v3 uses hash v1; byte-bound storage v4 uses hash v2.
     pub fn history_cursor_at(&self, count: u64) -> Result<HistoryCursor, Error> {
-        if count > MAX_HISTORY_EVENTS || count > self.events.len() as u64 {
+        if count > self.capacity_profile().max_history_events()
+            || count > u64::try_from(self.events.len()).map_err(|_| Error::InvalidJournal)?
+        {
             return Err(Error::IncompatibleHistory);
         }
-        let cohort = self.cohort.as_ref().ok_or(Error::InvalidIdentity)?;
+        let cohort = self.cohort().ok_or(Error::InvalidIdentity)?;
         let authority = Authority {
             shard: cohort.coordinator_shard,
             mode: self.authority,
         };
         cohort.validate()?;
         let mut root = identity_root(&authority, cohort)?;
-        for (index, event) in self.events.iter().take(count as usize).enumerate() {
-            root = event_root(root, index as u64 + 1, event)?;
+        let count_usize = usize::try_from(count).map_err(|_| Error::InvalidJournal)?;
+        for (index, event) in self.events.iter().take(count_usize).enumerate() {
+            root = event_root(cohort.profile, root, index as u64 + 1, event)?;
         }
         Ok(HistoryCursor {
-            version: VERSION,
+            version: cohort.profile.history_version(),
             authority,
             cohort: cohort.clone(),
             event_count: count,
@@ -317,7 +327,7 @@ impl Journal {
     }
 
     fn validate_history_cursor(&self, cursor: &HistoryCursor) -> Result<(), Error> {
-        let cohort = self.cohort.as_ref().ok_or(Error::InvalidIdentity)?;
+        let cohort = self.cohort().ok_or(Error::InvalidIdentity)?;
         cursor.validate_identity(
             &Authority {
                 shard: cohort.coordinator_shard,
@@ -353,8 +363,9 @@ impl Journal {
         let mut events = Vec::new();
         let mut bytes = 0;
         let mut root = base.root;
-        let start = base.event_count as usize;
-        for event in self.events[start..cut.event_count as usize]
+        let start = usize::try_from(base.event_count).map_err(|_| Error::InvalidJournal)?;
+        let stop = usize::try_from(cut.event_count).map_err(|_| Error::InvalidJournal)?;
+        for event in self.events[start..stop]
             .iter()
             .take(MAX_HISTORY_PAGE_EVENTS)
         {
@@ -363,14 +374,19 @@ impl Journal {
                 break;
             }
             bytes += size;
-            root = event_root(root, base.event_count + events.len() as u64 + 1, event)?;
+            root = event_root(
+                base.cohort.profile,
+                root,
+                base.event_count + events.len() as u64 + 1,
+                event,
+            )?;
             events.push(event.clone());
         }
         let mut end = base.clone();
         end.event_count += events.len() as u64;
         end.root = root;
         let page = HistoryPage {
-            version: VERSION,
+            version: base.cohort.profile.history_version(),
             base: base.clone(),
             end,
             cut,
@@ -389,7 +405,10 @@ impl Journal {
         self.validate_history_cursor(&page.base)?;
         let mut candidate = self.clone();
         for (offset, event) in page.events.iter().enumerate() {
-            let index = page.base.event_count as usize + offset;
+            let index = usize::try_from(page.base.event_count)
+                .ok()
+                .and_then(|n| n.checked_add(offset))
+                .ok_or(Error::InvalidJournal)?;
             if let Some(existing) = candidate.events.get(index) {
                 if existing != event {
                     return Err(Error::IncompatibleHistory);
@@ -411,7 +430,11 @@ impl Journal {
     pub fn history_prefix(&self, cut: &HistoryCursor) -> Result<Self, Error> {
         self.validate_history_cursor(cut)?;
         let mut prefix = Self::new(self.authority)?;
-        for event in self.events.iter().take(cut.event_count as usize) {
+        for event in self
+            .events
+            .iter()
+            .take(usize::try_from(cut.event_count).map_err(|_| Error::InvalidJournal)?)
+        {
             prefix.replay_event(event.clone())?;
         }
         Ok(prefix)
@@ -425,6 +448,7 @@ mod tests {
 
     fn cohort() -> Cohort {
         Cohort {
+            profile: CapacityProfile::LegacyCountV1,
             coordinator_shard: 9,
             coordinator_epoch: 7,
             members: vec![
@@ -485,7 +509,13 @@ mod tests {
         let mut end = base.clone();
         for event in &events {
             end.event_count += 1;
-            end.root = event_root(end.root, end.event_count, event).unwrap();
+            end.root = event_root(
+                CapacityProfile::LegacyCountV1,
+                end.root,
+                end.event_count,
+                event,
+            )
+            .unwrap();
         }
         HistoryPage {
             version: VERSION,
@@ -580,10 +610,19 @@ mod tests {
         assert_ne!(identity_root(&base.authority, &reversed).unwrap(), expected);
         assert!(reversed.validate().is_err());
         let event = begin(1);
-        let root = event_root(expected, 1, &event).unwrap();
-        assert_ne!(root, event_root(expected, 2, &event).unwrap());
-        assert_ne!(root, event_root([8; 32], 1, &event).unwrap());
-        assert_ne!(root, event_root(expected, 1, &begin(2)).unwrap());
+        let root = event_root(CapacityProfile::LegacyCountV1, expected, 1, &event).unwrap();
+        assert_ne!(
+            root,
+            event_root(CapacityProfile::LegacyCountV1, expected, 2, &event).unwrap()
+        );
+        assert_ne!(
+            root,
+            event_root(CapacityProfile::LegacyCountV1, [8; 32], 1, &event).unwrap()
+        );
+        assert_ne!(
+            root,
+            event_root(CapacityProfile::LegacyCountV1, expected, 1, &begin(2)).unwrap()
+        );
         assert_ne!(root, expected);
         let bytes = serde_json::to_vec(&event).unwrap();
         let mut wrong_length = Sha256::new();
