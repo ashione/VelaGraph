@@ -2,7 +2,10 @@
 //! No remote Global Gremlin admission. Plans are immutable in-memory retry values.
 use d2_raft::participant_writes::Authority;
 use d2_raft::request_index::RequestLookup;
-use d2_raft::transaction_decisions::{Cohort, Command, Decision, Journal, Participant};
+use d2_raft::target_evidence::TargetEvidence;
+use d2_raft::transaction_decisions::{
+    Cohort, Command, Decision, HistoryCursor, Participant, Transaction,
+};
 use d2_raft::{
     cohort_reads,
     managed_rpc::{self, NodeRef},
@@ -55,14 +58,14 @@ pub enum Outcome {
     Committed { ordinal: u64, visible: bool },
     Aborted { ordinal: u64, visible: bool },
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Part {
     descriptor: Participant,
     request: D1WriteRequest,
 }
 /// Keep this exact value across every uncertain result. Cloning retains identity;
 /// preparing again creates a different transaction and is not a retry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     id: [u8; 16],
     authority: Authority,
@@ -496,8 +499,8 @@ impl<'a> GraphCohort<'a> {
                 return Ok(existing);
             }
             let payload = candidate.durable_bytes()?;
-            // The command path still validates the full journal on the server.
-            // Point recovery does not change bounded execution or admission caps.
+            // Apply independently validates the anchored original history.
+            // Point recovery does not change admission or original Plan limits.
             let result = self
                 .command(Command::AdmitRequest {
                     id,
@@ -524,11 +527,13 @@ impl<'a> GraphCohort<'a> {
         .await
         .map_err(|_| Error::Uncertain)?
     }
-    async fn journal(&self) -> Result<Journal> {
-        self.coordinator
-            .journal(&self.authority, self.epoch)
-            .await
-            .map_err(Error::from)
+    async fn target(&self, plan: &Plan) -> Result<TargetEvidence> {
+        let target = self
+            .coordinator
+            .target(&self.authority, self.epoch, plan.id)
+            .await?;
+        self.check_plan(plan, &target)?;
+        Ok(target)
     }
     async fn command(&self, command: Command) -> Result<()> {
         self.coordinator
@@ -536,11 +541,31 @@ impl<'a> GraphCohort<'a> {
             .await
             .map_err(Error::from)
     }
-    fn check_plan(&self, plan: &Plan, journal: &Journal) -> Result<()> {
-        if self.authority != plan.authority || journal.cohort() != Some(&plan.cohort) {
+    fn check_plan(&self, plan: &Plan, target: &TargetEvidence) -> Result<()> {
+        if self.authority != plan.authority
+            || target.cut.cohort != plan.cohort
+            || target.id != plan.id
+        {
             return Err(Error::Identity);
         }
-        self.check_cohort(&plan.cohort)
+        self.check_cohort(&plan.cohort)?;
+        if let Some(found) = &target.record {
+            if found.transaction.participants
+                != plan
+                    .parts
+                    .iter()
+                    .map(|part| part.descriptor.clone())
+                    .collect::<Vec<_>>()
+            {
+                return Err(Error::Identity);
+            }
+            if let Some(original) = &found.request {
+                if Plan::from_durable(&original.payload)? != *plan {
+                    return Err(Error::Identity);
+                }
+            }
+        }
+        Ok(())
     }
     fn check_cohort(&self, cohort: &Cohort) -> Result<()> {
         if cohort.validate().is_err()
@@ -563,28 +588,27 @@ impl<'a> GraphCohort<'a> {
     /// Read the durable decision without preparing, deciding, or advancing it.
     /// A known decision survives unavailable members as `visible: false`.
     pub async fn status(&self, plan: &Plan) -> Result<Option<Outcome>> {
-        let journal = tokio::time::timeout(Duration::from_secs(30), self.journal())
+        let target = tokio::time::timeout(Duration::from_secs(30), self.target(plan))
             .await
             .map_err(|_| Error::Uncertain)??;
-        self.check_plan(plan, &journal)?;
-        let tx = journal.transaction(plan.id).ok_or(Error::Identity)?;
-        if tx.participants
-            != plan
-                .parts
-                .iter()
-                .map(|p| p.descriptor.clone())
-                .collect::<Vec<_>>()
-        {
-            return Err(Error::Identity);
-        }
+        let tx = &target.record.as_ref().ok_or(Error::Identity)?.transaction;
         let Some(decision) = tx.decision else {
             return Ok(None);
         };
         let ordinal = tx.ordinal;
+        // A terminal above an earlier hole is still a known decision. Failure
+        // to obtain/compare the full prefix means unknown visibility, not abort.
         let visible = matches!(
             tokio::time::timeout(Duration::from_secs(5), async {
-                for (node, target) in &self.members {
-                    node.prefix(target, ordinal, &journal).await?;
+                let proof = self
+                    .coordinator
+                    .terminal(&self.authority, self.epoch, ordinal)
+                    .await?;
+                if proof.cohort() != &plan.cohort || !proof.matches_transaction(tx) {
+                    return Err(Error::Identity);
+                }
+                for (node, member) in &self.members {
+                    node.prefix_terminal(member, &proof).await?;
                 }
                 Ok::<(), Error>(())
             })
@@ -611,26 +635,22 @@ impl<'a> GraphCohort<'a> {
         let decision = tokio::time::timeout(Duration::from_secs(30), self.decide(plan, abort))
             .await
             .map_err(|_| Error::Uncertain)??;
-        let (ordinal, decision) = decision;
+        let ordinal = decision.ordinal;
+        let outcome = decision.decision.ok_or(Error::Identity)?;
         let visible = matches!(
-            tokio::time::timeout(Duration::from_secs(30), self.advance_to(plan, ordinal)).await,
+            tokio::time::timeout(Duration::from_secs(30), self.advance_to(plan, &decision)).await,
             Ok(Ok(()))
         );
-        Ok(match decision {
+        Ok(match outcome {
             Decision::Commit => Outcome::Committed { ordinal, visible },
             Decision::Abort => Outcome::Aborted { ordinal, visible },
         })
     }
-    async fn decide(&self, plan: &Plan, abort: bool) -> Result<(u64, Decision)> {
-        let journal = self.journal().await?;
-        self.check_plan(plan, &journal)?;
-        if let Some(tx) = journal.transaction(plan.id) {
-            let expected: Vec<_> = plan.parts.iter().map(|p| p.descriptor.clone()).collect();
-            if tx.participants != expected {
-                return Err(Error::Identity);
-            }
-            if let Some(decision) = tx.decision {
-                return Ok((tx.ordinal, decision));
+    async fn decide(&self, plan: &Plan, abort: bool) -> Result<Transaction> {
+        let target = self.target(plan).await?;
+        if let Some(found) = target.record {
+            if found.transaction.decision.is_some() {
+                return Ok(found.transaction);
             }
         }
         if abort {
@@ -639,7 +659,7 @@ impl<'a> GraphCohort<'a> {
                 participants: plan.parts.iter().map(|p| p.descriptor.clone()).collect(),
             })
             .await?;
-            return self.request_decision(plan.id, Decision::Abort).await;
+            return self.request_decision(plan, Decision::Abort).await;
         }
         for (node, target) in self.members.iter().filter(|(_, target)| {
             plan.parts
@@ -659,70 +679,122 @@ impl<'a> GraphCohort<'a> {
             participants: plan.parts.iter().map(|p| p.descriptor.clone()).collect(),
         })
         .await?;
-        let journal = self.journal().await?;
-        let tx = journal.transaction(plan.id).ok_or(Error::Identity)?;
-        if let Some(decision) = tx.decision {
-            return Ok((tx.ordinal, decision));
+        let target = self.target(plan).await?;
+        let transaction = target.record.ok_or(Error::Identity)?.transaction;
+        if transaction.decision.is_some() {
+            return Ok(transaction);
         }
-        if !abort {
-            for part in &plan.parts {
-                let node = self
-                    .members
-                    .iter()
-                    .find(|(_, t)| t.shard == part.descriptor.shard)
-                    .ok_or(Error::Identity)?
-                    .0;
-                let prepared = async {
-                    let evidence = self.journal().await?;
-                    let status = node
-                        .prepare(
-                            &self.authority,
-                            &part.descriptor,
-                            part.request.clone(),
-                            &evidence,
-                        )
-                        .await?;
-                    if status != d2_raft::participant_writes::Status::Prepared {
-                        return Err(Error::Uncertain);
-                    }
-                    self.command(Command::Prepared {
-                        id: plan.id,
-                        participant: part.descriptor.clone(),
-                    })
-                    .await
+        for part in &plan.parts {
+            let (node, member) = self
+                .members
+                .iter()
+                .find(|(_, target)| target.shard == part.descriptor.shard)
+                .ok_or(Error::Identity)?;
+            let prepared = async {
+                let evidence = self.target(plan).await?;
+                let tx = &evidence.record.as_ref().ok_or(Error::Identity)?.transaction;
+                // A concurrent decision is recovered below rather than issuing
+                // a Prepare against a terminal source cut.
+                if tx.decision.is_some() {
+                    return Err(Error::Uncertain);
                 }
-                .await;
-                if let Err(error) = prepared {
-                    // No implicit abort on a timeout or a rejected Prepare. The
-                    // caller can resolve/retry or explicitly abort this plan.
-                    let latest = self.journal().await?;
-                    if let Some(decision) = latest.transaction(plan.id).and_then(|t| t.decision) {
-                        return Ok((tx.ordinal, decision));
-                    }
-                    return Err(error);
+                self.retain_for_prepare(*node, member, &evidence.cut)
+                    .await?;
+                let status = node
+                    .prepare_retained(
+                        &self.authority,
+                        &part.descriptor,
+                        part.request.clone(),
+                        &evidence.cut,
+                    )
+                    .await?;
+                if status != d2_raft::participant_writes::Status::Prepared {
+                    return Err(Error::Uncertain);
                 }
+                self.command(Command::Prepared {
+                    id: plan.id,
+                    participant: part.descriptor.clone(),
+                })
+                .await
+            }
+            .await;
+            if let Err(error) = prepared {
+                // No implicit abort on rejection or unknown ACK. Read this
+                // exact ID again; the caller retains the same original Plan.
+                let latest = self.target(plan).await?;
+                if let Some(found) = latest.record {
+                    if found.transaction.decision.is_some() {
+                        return Ok(found.transaction);
+                    }
+                }
+                return Err(error);
             }
         }
-        self.request_decision(plan.id, Decision::Commit).await
+        self.request_decision(plan, Decision::Commit).await
     }
-    async fn request_decision(&self, id: [u8; 16], requested: Decision) -> Result<(u64, Decision)> {
+    async fn request_decision(&self, plan: &Plan, requested: Decision) -> Result<Transaction> {
         let result = self
             .command(Command::Decide {
-                id,
+                id: plan.id,
                 decision: requested,
             })
             .await;
-        let latest = self.journal().await?;
-        if let Some(terminal) = latest
-            .transaction(id)
-            .and_then(|t| t.decision.map(|d| (t.ordinal, d)))
-        {
-            return Ok(terminal);
+        let latest = self.target(plan).await?;
+        if let Some(found) = latest.record {
+            if found.transaction.decision.is_some() {
+                return Ok(found.transaction);
+            }
         }
         result?;
         Err(Error::Uncertain)
     }
-    async fn advance_to(&self, plan: &Plan, ordinal: u64) -> Result<()> {
+    async fn retain_for_prepare(
+        &self,
+        node: NodeRef<'_>,
+        member: &versioned_reads::Target,
+        cut: &HistoryCursor,
+    ) -> Result<()> {
+        let status = node
+            .history_status(&self.authority, member, &cut.cohort)
+            .await?;
+        // A later observation is preserved. The empty old-cut page still makes
+        // SyncHistory prove that exact ancestor, independently of the reply.
+        let mut base = if status.cursor.event_count > cut.event_count {
+            cut.clone()
+        } else {
+            status.cursor
+        };
+        for _ in 0..=cut.cohort.profile.max_history_events() {
+            let page = self
+                .coordinator
+                .history_page(&self.authority, self.epoch, &base, Some(cut))
+                .await?;
+            let result = node.sync_history(&self.authority, member, &page).await;
+            match result {
+                Err(managed_rpc::Error::Unavailable) => {
+                    node.sync_history(&self.authority, member, &page).await?;
+                }
+                other => {
+                    other?;
+                }
+            }
+            if page.end == *cut {
+                return Ok(());
+            }
+            if page.end.event_count <= base.event_count {
+                return Err(Error::Identity);
+            }
+            base = page.end;
+        }
+        Err(Error::Capacity)
+    }
+    async fn advance_to(&self, plan: &Plan, transaction: &Transaction) -> Result<()> {
+        let ordinal = transaction.ordinal;
+        // The exact terminal target is retained from decide; do not combine a
+        // different target with a numerically equal later proof.
+        if transaction.id != plan.id || transaction.decision.is_none() {
+            return Err(Error::Identity);
+        }
         // Validate the immutable local plan without requesting its full archive.
         self.check_cohort(&plan.cohort)?;
         if plan.authority != self.authority || ordinal == 0 {
@@ -732,7 +804,7 @@ impl<'a> GraphCohort<'a> {
             .coordinator
             .terminal(&self.authority, self.epoch, ordinal)
             .await?;
-        if proof.cohort() != &plan.cohort {
+        if proof.cohort() != &plan.cohort || !proof.matches_transaction(transaction) {
             return Err(Error::Identity);
         }
         for (node, target) in &self.members {

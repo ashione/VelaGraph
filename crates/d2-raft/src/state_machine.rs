@@ -308,6 +308,12 @@ struct ApplyPublishGate {
     release: std::sync::mpsc::Receiver<()>,
 }
 
+type CoordinatorGrants = Option<Vec<crate::transaction_decisions::MemberCapacityGrant>>;
+type CoordinatorControlIdentity = (
+    Option<crate::transaction_decisions::Cohort>,
+    CoordinatorGrants,
+);
+
 /// Opaque publication pause for deterministic diagnostics. It exposes no data
 /// or mutation methods; dropping it resumes state-machine work.
 pub struct StateMachinePause<'a> {
@@ -324,13 +330,14 @@ pub struct StateMachine {
     apply_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
     #[cfg(test)]
     snapshot_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     forbid_coordinator_journal: AtomicBool,
 }
 
 impl StateMachine {
-    #[cfg(test)]
-    pub(crate) fn forbid_coordinator_journal(&self, forbidden: bool) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn forbid_coordinator_journal(&self, forbidden: bool) {
         self.forbid_coordinator_journal
             .store(forbidden, Ordering::SeqCst);
     }
@@ -338,7 +345,7 @@ impl StateMachine {
     // The test switch belongs to this state machine, then installs the guard on
     // the actual worker thread. Other nodes and parallel tests are unaffected.
     fn coordinator_operation<T>(&self, work: impl FnOnce() -> T) -> T {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if self.forbid_coordinator_journal.load(Ordering::SeqCst) {
             return crate::transaction_decisions::without_full_journal(work);
         }
@@ -525,7 +532,7 @@ impl StateMachine {
             apply_publish_gate: Default::default(),
             #[cfg(test)]
             snapshot_publish_gate: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             forbid_coordinator_journal: AtomicBool::new(false),
         })
     }
@@ -1336,27 +1343,88 @@ impl StateMachine {
         cut: Option<&crate::transaction_decisions::HistoryCursor>,
     ) -> Result<crate::transaction_decisions::HistoryPage, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        if let Some(published) = self.archive_cut(&state)? {
-            return blocking_section(|| {
-                event_ledger::history_page(&self.storage.as_ref().unwrap().db, published, base, cut)
-            });
-        }
-        let persisted =
-            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
-        let d1 = persisted.as_ref().map_or(d1, |loaded| &loaded.state);
-        let journal = d1
-            .coordinator
-            .as_ref()
-            .and_then(Coordinator::full)
-            .ok_or(D1Error::CoordinatorNotEnabled)?;
-        self.decision_frontier(d1)?;
-        blocking_section(|| journal.history_page(base, cut)).map_err(|_| D1Error::VisibilityHistory)
+        self.coordinator_operation(|| {
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            d1.coordinator
+                .as_ref()
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            if let Some(published) = self.archive_cut(&state)? {
+                if published.descriptor().domain.role != event_ledger::Role::Coordinator {
+                    return Err(D1Error::EventLedgerHistory);
+                }
+                return blocking_section(|| {
+                    event_ledger::history_page(
+                        &self.storage.as_ref().unwrap().db,
+                        published,
+                        base,
+                        cut,
+                    )
+                });
+            }
+            let persisted =
+                blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+            let d1 = persisted.as_ref().map_or(d1, |loaded| &loaded.state);
+            let journal = d1
+                .coordinator
+                .as_ref()
+                .and_then(Coordinator::full)
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            self.decision_frontier(d1)?;
+            blocking_section(|| journal.history_page(base, cut))
+                .map_err(|_| D1Error::VisibilityHistory)
+        })
+    }
+
+    /// One exact target and its original binding at a single source-validated
+    /// event cut. Distributed callers must first establish a leader barrier.
+    pub async fn coordinator_target(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        id: [u8; 16],
+    ) -> Result<crate::target_evidence::TargetEvidence, D1Error> {
+        let state = self.state.read().await;
+        self.coordinator_operation(|| {
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            let coordinator = d1
+                .coordinator
+                .as_ref()
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            if let Some(published) = self.archive_cut(&state)? {
+                if published.descriptor().domain.role != event_ledger::Role::Coordinator {
+                    return Err(D1Error::EventLedgerHistory);
+                }
+                if let Some(checkpoint) = coordinator.active_arc() {
+                    if !Arc::ptr_eq(checkpoint, published.checkpoint_arc()) {
+                        return Err(D1Error::EventLedgerHistory);
+                    }
+                }
+                return blocking_section(|| {
+                    event_ledger::lookup_target(&self.storage.as_ref().unwrap().db, published, id)
+                });
+            }
+            let persisted =
+                blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+            let d1 = persisted.as_ref().map_or(d1, |loaded| &loaded.state);
+            let journal = d1
+                .coordinator
+                .as_ref()
+                .and_then(Coordinator::full)
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            crate::target_evidence::TargetEvidence::from_journal(journal, id)
+                .map_err(|_| D1Error::VisibilityHistory)
+        })
     }
 
     /// Local point recovery; distributed callers must first establish a leader barrier.
@@ -1369,32 +1437,40 @@ impl StateMachine {
         id: [u8; 16],
     ) -> Result<crate::request_index::RequestLookup, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        if let Some(published) = self.archive_cut(&state)? {
-            return blocking_section(|| {
-                event_ledger::lookup_request(&self.storage.as_ref().unwrap().db, published, id)
-            });
-        }
-        let db = self
-            .storage
-            .as_ref()
-            .filter(|s| s.request_indexed.load(Ordering::Relaxed));
-        blocking_section(|| {
-            if let Some(storage) = db {
-                let manifest = storage
-                    .request_manifest
-                    .lock()
-                    .map_err(|_| D1Error::RequestIndexUnavailable)?;
-                let manifest = manifest.as_deref().ok_or(D1Error::RequestIndexHistory)?;
-                crate::request_index::lookup(d1, id, Some((&storage.db, manifest)))
-            } else {
-                crate::request_index::lookup(d1, id, None)
+        self.coordinator_operation(|| {
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
             }
+            d1.coordinator
+                .as_ref()
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            if let Some(published) = self.archive_cut(&state)? {
+                if published.descriptor().domain.role != event_ledger::Role::Coordinator {
+                    return Err(D1Error::EventLedgerHistory);
+                }
+                return blocking_section(|| {
+                    event_ledger::lookup_request(&self.storage.as_ref().unwrap().db, published, id)
+                });
+            }
+            let db = self
+                .storage
+                .as_ref()
+                .filter(|s| s.request_indexed.load(Ordering::Relaxed));
+            blocking_section(|| {
+                if let Some(storage) = db {
+                    let manifest = storage
+                        .request_manifest
+                        .lock()
+                        .map_err(|_| D1Error::RequestIndexUnavailable)?;
+                    let manifest = manifest.as_deref().ok_or(D1Error::RequestIndexHistory)?;
+                    crate::request_index::lookup(d1, id, Some((&storage.db, manifest)))
+                } else {
+                    crate::request_index::lookup(d1, id, None)
+                }
+            })
         })
     }
 
@@ -1407,59 +1483,84 @@ impl StateMachine {
         mode_id: [u8; 16],
     ) -> Result<crate::managed_rpc::CoordinatorSummary, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        let journal = d1
-            .coordinator
-            .as_ref()
-            .ok_or(D1Error::CoordinatorNotEnabled)?;
-        if let Some(checkpoint) = journal.active() {
-            let published = self
-                .archive_cut(&state)?
-                .ok_or(D1Error::EventLedgerHistory)?;
-            let verified = blocking_section(|| {
-                event_ledger::verify_active(&self.storage.as_ref().unwrap().db, published)
-            })?;
-            if checkpoint != verified.checkpoint() {
-                return Err(D1Error::EventLedgerHistory);
+        self.coordinator_operation(|| {
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
             }
-            return Ok(crate::managed_rpc::CoordinatorSummary {
+            let journal = d1
+                .coordinator
+                .as_ref()
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            if let Some(checkpoint) = journal.active() {
+                let published = self
+                    .archive_cut(&state)?
+                    .ok_or(D1Error::EventLedgerHistory)?;
+                let verified = blocking_section(|| {
+                    event_ledger::verify_active(&self.storage.as_ref().unwrap().db, published)
+                })?;
+                if checkpoint != verified.checkpoint() {
+                    return Err(D1Error::EventLedgerHistory);
+                }
+                return Ok(crate::managed_rpc::CoordinatorSummary {
+                    authority: crate::participant_writes::Authority {
+                        shard,
+                        mode: checkpoint.authority(),
+                    },
+                    cohort: checkpoint
+                        .cohort()
+                        .cloned()
+                        .ok_or(D1Error::VisibilityHistory)?,
+                    resolved_prefix: checkpoint.resolved_prefix(),
+                });
+            }
+            Ok(crate::managed_rpc::CoordinatorSummary {
                 authority: crate::participant_writes::Authority {
                     shard,
-                    mode: checkpoint.authority(),
+                    mode: journal.authority(),
                 },
-                cohort: checkpoint
+                cohort: journal
                     .cohort()
                     .cloned()
                     .ok_or(D1Error::VisibilityHistory)?,
-                resolved_prefix: checkpoint.resolved_prefix(),
-            });
-        }
-        Ok(crate::managed_rpc::CoordinatorSummary {
-            authority: crate::participant_writes::Authority {
-                shard,
-                mode: journal.authority(),
-            },
-            cohort: journal
-                .cohort()
-                .cloned()
-                .ok_or(D1Error::VisibilityHistory)?,
-            resolved_prefix: self.decision_frontier(d1)?,
+                resolved_prefix: self.decision_frontier(d1)?,
+            })
         })
     }
 
-    /// Compact command preflight. The Raft apply independently repeats source
-    /// validation; no full Journal transfer or reconstruction is needed here.
+    /// Compact command preflight shares the grant-confirmation source closure.
     pub(crate) async fn coordinator_command_identity(
         &self,
         shard: u64,
         epoch: u64,
         mode_id: [u8; 16],
     ) -> Result<Option<crate::transaction_decisions::Cohort>, D1Error> {
+        self.coordinator_control_identity(shard, epoch, mode_id)
+            .await
+            .map(|v| v.0)
+    }
+
+    /// Private compact grant view. It does not introduce an unused wire getter.
+    pub(crate) async fn coordinator_capacity_identity(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<(crate::transaction_decisions::Cohort, CoordinatorGrants), D1Error> {
+        let (cohort, grants) = self
+            .coordinator_control_identity(shard, epoch, mode_id)
+            .await?;
+        Ok((cohort.ok_or(D1Error::VisibilityHistory)?, grants))
+    }
+
+    async fn coordinator_control_identity(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<CoordinatorControlIdentity, D1Error> {
         let state = self.state.read().await;
         self.coordinator_operation(|| {
             let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
@@ -1486,19 +1587,24 @@ impl StateMachine {
                 if checkpoint != verified.checkpoint() {
                     return Err(D1Error::EventLedgerHistory);
                 }
-                Ok(checkpoint.cohort().cloned())
+                Ok((
+                    checkpoint.cohort().cloned(),
+                    checkpoint.capacity_grants().map(<[_]>::to_vec),
+                ))
             } else {
                 let persisted =
                     blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
-                Ok(persisted
+                let coordinator = persisted
                     .as_ref()
                     .map(|loaded| &loaded.state)
                     .unwrap_or(d1)
                     .coordinator
                     .as_ref()
-                    .ok_or(D1Error::CoordinatorNotEnabled)?
-                    .cohort()
-                    .cloned())
+                    .ok_or(D1Error::CoordinatorNotEnabled)?;
+                Ok((
+                    coordinator.cohort().cloned(),
+                    coordinator.capacity_grants().map(<[_]>::to_vec),
+                ))
             }
         })
     }
@@ -2796,6 +2902,11 @@ fn apply_d1(
                 crate::participant_writes::Status::Unknown,
             ))
         }
+        D1Command::PrepareRetained(prepare) => next
+            .d1
+            .as_mut()
+            .ok_or(D1Error::NotActivated)?
+            .prepare_retained(&prepare, base.d1.as_ref()),
         D1Command::PrepareParticipant {
             authority,
             participant,
@@ -4091,3 +4202,87 @@ mod member_checkpoint_tests;
 #[cfg(test)]
 #[path = "member_network_tests.rs"]
 mod member_network_tests;
+
+#[cfg(test)]
+mod retained_source_role_tests {
+    use super::*;
+    use crate::participant_writes::Authority;
+    use crate::transaction_decisions::{Cohort, Command, Journal, Member};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn member_archive_cannot_answer_coordinator_target_request_or_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut member = Arc::new(StateMachine::open(dir.path()).unwrap());
+        let authority = Authority {
+            shard: 9,
+            mode: [9; 16],
+        };
+        let mut journal = Journal::new(authority.mode).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: Cohort {
+                    coordinator_shard: 9,
+                    coordinator_epoch: 1,
+                    members: vec![Member {
+                        shard: 7,
+                        epoch: 1,
+                        mode: [7; 16],
+                    }],
+                    profile: Default::default(),
+                },
+            })
+            .unwrap();
+        let cut = journal.history_cursor().unwrap();
+        let commands = [
+            D1Command::Activate { shard: 7, epoch: 1 },
+            D1Command::EnableManagedWrites {
+                shard: 7,
+                epoch: 1,
+                expected_sequence: 0,
+                mode_id: [7; 16],
+            },
+            D1Command::EnableParticipant {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                authority,
+            },
+            D1Command::EnableVersionedReads {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                journal,
+            },
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let entry = Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index as u64 + 1),
+                payload: EntryPayload::Normal(LogCommand::D1V1(command)),
+            };
+            member
+                .apply([entry])
+                .await
+                .unwrap()
+                .remove(0)
+                .d1
+                .unwrap()
+                .unwrap();
+        }
+        assert!(member.state.read().await.archive_cut.is_some());
+        member.forbid_coordinator_journal(true);
+        assert_eq!(
+            member.coordinator_target(7, 1, [7; 16], [1; 16]).await,
+            Err(D1Error::CoordinatorNotEnabled)
+        );
+        assert_eq!(
+            member.coordinator_request(7, 1, [7; 16], [1; 16]).await,
+            Err(D1Error::CoordinatorNotEnabled)
+        );
+        assert_eq!(
+            member
+                .coordinator_history_page(7, 1, [7; 16], &cut, Some(&cut))
+                .await,
+            Err(D1Error::CoordinatorNotEnabled)
+        );
+    }
+}

@@ -164,6 +164,30 @@ impl TerminalPrefix {
         })
         .map_err(|_| Error::InvalidJournal)
     }
+    /// Compare every field of one exact terminal transaction with this prefix.
+    /// A matching ordinal alone cannot certify a separately sampled target.
+    pub fn matches_transaction(
+        &self,
+        transaction: &crate::transaction_decisions::Transaction,
+    ) -> bool {
+        let Some(index) = transaction
+            .ordinal
+            .checked_sub(1)
+            .and_then(|n| usize::try_from(n).ok())
+        else {
+            return false;
+        };
+        self.segments
+            .get(index / SEGMENT_TRANSACTIONS)
+            .and_then(|segment| segment.get(index % SEGMENT_TRANSACTIONS))
+            .is_some_and(|record| {
+                record.id == transaction.id
+                    && record.ordinal == transaction.ordinal
+                    && record.participants == transaction.participants
+                    && record.prepared == transaction.prepared
+                    && Some(record.decision) == transaction.decision
+            })
+    }
     pub fn authority(&self) -> [u8; 16] {
         self.authority
     }

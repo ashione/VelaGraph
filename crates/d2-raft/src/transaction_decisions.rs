@@ -220,7 +220,7 @@ impl Transaction {
 /// Immutable append-only history. The private state cannot be deserialized
 /// without replaying every transition. No timeout implicitly aborts a transaction.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(not(test), derive(Clone))]
+#[cfg_attr(not(any(test, feature = "test-hooks")), derive(Clone))]
 #[serde(try_from = "Encoding", into = "Encoding")]
 pub struct Journal {
     authority: [u8; 16],
@@ -234,12 +234,12 @@ pub struct Journal {
     capacity_grants: Option<Vec<MemberCapacityGrant>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     static FULL_JOURNAL_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn assert_full_journal_allowed() {
     FULL_JOURNAL_FORBIDDEN.with(|forbidden| {
         assert!(
@@ -251,7 +251,7 @@ pub(crate) fn assert_full_journal_allowed() {
 
 /// Test-only tripwire: selected readers run after all source Journals are
 /// dropped and must not construct, decode, clone or reconstruct a full prefix.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn without_full_journal<T>(read: impl FnOnce() -> T) -> T {
     struct Reset(bool);
     impl Drop for Reset {
@@ -263,7 +263,7 @@ pub(crate) fn without_full_journal<T>(read: impl FnOnce() -> T) -> T {
     read()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Clone for Journal {
     fn clone(&self) -> Self {
         assert_full_journal_allowed();
@@ -307,7 +307,7 @@ impl TryFrom<Encoding> for Journal {
 
 impl Journal {
     pub fn new(authority: [u8; 16]) -> Result<Self, Error> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         assert_full_journal_allowed();
         if authority == [0; 16] {
             return Err(Error::InvalidIdentity);
@@ -498,7 +498,7 @@ impl Journal {
     /// Strict structural and semantic replay; serialized derived watermarks are
     /// intentionally absent. Bounded by input bytes and finite unique events.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         assert_full_journal_allowed();
         Self::decode_with_limit(bytes, MAX_JOURNAL_BYTES)
     }
