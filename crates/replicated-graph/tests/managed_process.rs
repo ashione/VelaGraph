@@ -2,12 +2,16 @@
 //! Every parent data path crosses TCP. Only each child owns its own Raft handle.
 use anyhow::{anyhow, Context};
 use d2_raft::{
-    managed_rpc::{Client, Identity, NodeRef, Role, Server},
+    managed_rpc::{activate_byte_bound_member, Client, Identity, NodeRef, Role, Server},
     participant_writes::Authority,
-    transaction_decisions::{Cohort, Command as DecisionCommand, Decision, Journal, Member},
+    transaction_decisions::{
+        CapacityProfile, Cohort, Command as DecisionCommand, Decision, Journal, Member,
+        MemberCapacityGrant, RequestRecord,
+    },
     versioned_reads::{ReadLimit, Target},
-    Cluster, D1Command, LogCommand, NodeHandle,
+    Cluster, D1Command, LogCommand, NodeHandle, StateMachine,
 };
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use replicated_graph::{
     managed_gateway::{
         self as gateway, Binding, EdgeData, Entity, Gateway, Mapping, Mutation, Operation,
@@ -21,14 +25,19 @@ use rocksdb_sql_table::{
     experimental_graph::{CrossEdge, VertexRef},
     Value,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{Cursor, Write as _},
     net::SocketAddr,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
     time::Duration,
 };
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUDGET: Duration = Duration::from_secs(15);
 const CHILD_ENV: &str = "MANAGED_PROCESS_DIRECTORY";
@@ -40,6 +49,7 @@ fn authority() -> Authority {
 }
 fn cohort() -> Cohort {
     Cohort {
+        profile: Default::default(),
         coordinator_shard: 9,
         coordinator_epoch: 1,
         members: [7, 8]
@@ -59,6 +69,9 @@ fn target(shard: u64) -> Target {
     }
 }
 fn identity(shard: u64) -> Identity {
+    identity_in(shard, cohort())
+}
+fn identity_in(shard: u64, cohort: Cohort) -> Identity {
     Identity {
         group: shard,
         node: 1,
@@ -69,7 +82,7 @@ fn identity(shard: u64) -> Identity {
             Role::Participant
         },
         authority: authority(),
-        cohort: cohort(),
+        cohort,
     }
 }
 fn binding() -> Binding {
@@ -107,6 +120,8 @@ async fn managed_node_child() -> anyhow::Result<()> {
     let shard: u64 = std::env::var("MANAGED_PROCESS_SHARD")?.parse()?;
     let address: SocketAddr = std::env::var("MANAGED_PROCESS_ADDRESS")?.parse()?;
     let fresh = std::env::var("MANAGED_PROCESS_FRESH")? == "1";
+    let config: ProcessConfig = serde_json::from_slice(&fs::read(directory.join("fixture.json"))?)?;
+    restore_fixture_snapshot(&directory).await?;
     let cluster = Cluster::new().in_group(shard);
     let node = Arc::new(cluster.start_durable(1, directory.join("data")).await?);
     if fresh {
@@ -148,7 +163,9 @@ async fn managed_node_child() -> anyhow::Result<()> {
                     shard,
                     epoch: 1,
                     mode_id: target(shard).mode,
-                    command: DecisionCommand::BindCohort { cohort: cohort() },
+                    command: DecisionCommand::BindCohort {
+                        cohort: config.cohort.clone(),
+                    },
                 },
             )
             .await?;
@@ -163,50 +180,181 @@ async fn managed_node_child() -> anyhow::Result<()> {
                 },
             )
             .await?;
-            let mut journal = Journal::new(authority().mode).map_err(|e| anyhow!("{e:?}"))?;
-            journal
-                .apply(DecisionCommand::BindCohort { cohort: cohort() })
-                .map_err(|e| anyhow!("{e:?}"))?;
-            local_command(
-                &node,
-                D1Command::EnableVersionedReads {
-                    shard,
-                    epoch: 1,
-                    mode_id: target(shard).mode,
-                    journal,
-                },
-            )
-            .await?;
+            if config.cohort.profile == CapacityProfile::ByteBound16MiBV1 {
+                activate_byte_bound_member(&node, &authority(), &target(shard), &config.cohort)
+                    .await?;
+            } else {
+                let mut journal = Journal::new(authority().mode).map_err(|e| anyhow!("{e:?}"))?;
+                journal
+                    .apply(DecisionCommand::BindCohort {
+                        cohort: config.cohort.clone(),
+                    })
+                    .map_err(|e| anyhow!("{e:?}"))?;
+                local_command(
+                    &node,
+                    D1Command::EnableVersionedReads {
+                        shard,
+                        epoch: 1,
+                        mode_id: target(shard).mode,
+                        journal,
+                    },
+                )
+                .await?;
+            }
         }
     }
-    let server = Server::bind(node, identity(shard), address, BUDGET).await?;
+    let own_identity = identity_in(shard, config.cohort.clone());
+    let server = if shard == 9 && config.cohort.profile == CapacityProfile::ByteBound16MiBV1 {
+        let members = config
+            .members
+            .iter()
+            .map(|(member, address)| {
+                Client::new(
+                    *address,
+                    identity_in(*member, config.cohort.clone()),
+                    BUDGET,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Server::bind_byte_bound_coordinator(node.clone(), own_identity, members, address, BUDGET)
+            .await?
+    } else {
+        Server::bind(node.clone(), own_identity, address, BUDGET).await?
+    };
     fs::write(
         directory.join("ready.tmp"),
         serde_json::to_vec(&(std::process::id(), server.local_addr()))?,
     )?;
     fs::rename(directory.join("ready.tmp"), directory.join("ready.json"))?;
-    std::future::pending::<()>().await;
+    // Test-only filesystem control. No production RPC or public bypass is added.
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if directory.join("snapshot.request").exists() {
+            node.raft.ensure_linearizable().await?;
+            server.shutdown().await;
+            node.raft.shutdown().await?;
+            let mut state = node.state_machine.clone();
+            let snapshot = state.build_snapshot().await?;
+            atomic_json(
+                &directory.join("snapshot.json"),
+                &FixtureSnapshot {
+                    meta: snapshot.meta,
+                    bytes: snapshot.snapshot.into_inner(),
+                },
+            )?;
+            return Ok(());
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessConfig {
+    cohort: Cohort,
+    members: Vec<(u64, SocketAddr)>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureSnapshot {
+    meta: openraft::SnapshotMeta<u64, openraft::BasicNode>,
+    bytes: Vec<u8>,
+}
+fn atomic_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&serde_json::to_vec(value)?)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    fs::File::open(path.parent().context("checkpoint parent")?)?.sync_all()?;
     Ok(())
+}
+async fn restore_fixture_snapshot(directory: &Path) -> anyhow::Result<()> {
+    let data = directory.join("data");
+    if !data.join("state.before-snapshot.db").exists()
+        || directory.join("snapshot.restored").exists()
+    {
+        return Ok(());
+    }
+    let snapshot: FixtureSnapshot =
+        serde_json::from_slice(&fs::read(directory.join("snapshot.json"))?)?;
+    let mut state = Arc::new(StateMachine::open(data.join("state.db"))?);
+    state
+        .install_snapshot(&snapshot.meta, Box::new(Cursor::new(snapshot.bytes)))
+        .await?;
+    anyhow::ensure!(
+        state.applied().await == snapshot.meta.last_log_id,
+        "snapshot applied marker changed"
+    );
+    drop(state);
+    atomic_json(&directory.join("snapshot.restored"), &snapshot.meta)?;
+    Ok(())
+}
+struct FixtureDirectory {
+    path: PathBuf,
+    _temporary: Option<tempfile::TempDir>,
+}
+impl FixtureDirectory {
+    fn temporary() -> anyhow::Result<Self> {
+        let temporary = tempfile::tempdir()?;
+        Ok(Self {
+            path: temporary.path().to_owned(),
+            _temporary: Some(temporary),
+        })
+    }
+    fn retained(path: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&path)?;
+        Ok(Self {
+            path,
+            _temporary: None,
+        })
+    }
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 struct Process {
     child: Child,
-    directory: tempfile::TempDir,
+    directory: FixtureDirectory,
     shard: u64,
     address: SocketAddr,
+    config: ProcessConfig,
 }
 impl Process {
     async fn start(shard: u64) -> anyhow::Result<Self> {
+        Self::configured(
+            shard,
+            FixtureDirectory::temporary()?,
+            ProcessConfig {
+                cohort: cohort(),
+                members: Vec::new(),
+            },
+        )
+        .await
+    }
+    async fn configured(
+        shard: u64,
+        directory: FixtureDirectory,
+        config: ProcessConfig,
+    ) -> anyhow::Result<Self> {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = reservation.local_addr()?;
-        let directory = tempfile::tempdir()?;
+        let fresh = !directory.path().join("data").exists();
+        atomic_json(&directory.path().join("fixture.json"), &config)?;
+        if directory.path().join("ready.json").exists() {
+            fs::remove_file(directory.path().join("ready.json"))?;
+        }
+        if directory.path().join("snapshot.request").exists() {
+            fs::remove_file(directory.path().join("snapshot.request"))?;
+        }
         drop(reservation);
-        let child = Self::launch(directory.path(), shard, address, true)?;
+        let child = Self::launch(directory.path(), shard, address, fresh)?;
         let mut process = Self {
             child,
             directory,
             shard,
             address,
+            config,
         };
         process.ready().await?;
         Ok(process)
@@ -259,8 +407,37 @@ impl Process {
         self.child = Self::launch(self.directory.path(), self.shard, self.address, false)?;
         self.ready().await
     }
+    async fn snapshot_restore(&mut self) -> anyhow::Result<()> {
+        if self.directory.path().join("snapshot.restored").exists() {
+            return Ok(());
+        }
+        atomic_json(&self.directory.path().join("snapshot.request"), &true)?;
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    anyhow::ensure!(status.success(), "snapshot child failed: {status}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        anyhow::ensure!(
+            self.directory.path().join("snapshot.json").exists(),
+            "missing full snapshot"
+        );
+        let data = self.directory.path().join("data");
+        fs::rename(data.join("state.db"), data.join("state.before-snapshot.db"))?;
+        fs::remove_file(self.directory.path().join("snapshot.request"))?;
+        self.reopen().await
+    }
     fn client(&self) -> anyhow::Result<Client> {
-        Ok(Client::new(self.address, identity(self.shard), BUDGET)?)
+        Ok(Client::new(
+            self.address,
+            identity_in(self.shard, self.config.cohort.clone()),
+            BUDGET,
+        )?)
     }
 }
 impl Drop for Process {
@@ -270,11 +447,22 @@ impl Drop for Process {
     }
 }
 async fn call(g: &Gateway, operation: Operation) -> gateway::Result<Reply> {
-    gateway::request(g.local_addr(), binding(), operation, BUDGET).await
+    call_bound(g, binding(), operation).await
+}
+async fn call_bound(g: &Gateway, binding: Binding, operation: Operation) -> gateway::Result<Reply> {
+    gateway::request(g.local_addr(), binding, operation, BUDGET).await
 }
 async fn open(g: &Gateway, version: Option<u64>) -> anyhow::Result<Session> {
-    match call(
+    open_bound(g, binding(), version).await
+}
+async fn open_bound(
+    g: &Gateway,
+    binding: Binding,
+    version: Option<u64>,
+) -> anyhow::Result<Session> {
+    match call_bound(
         g,
+        binding,
         Operation::OpenSession {
             version,
             ttl_millis: 60000,
@@ -292,8 +480,18 @@ async fn read(
     partition: u32,
     text: &str,
 ) -> anyhow::Result<Vec<QueryRow>> {
-    match call(
+    read_bound(g, binding(), session, partition, text).await
+}
+async fn read_bound(
+    g: &Gateway,
+    binding: Binding,
+    session: &Session,
+    partition: u32,
+    text: &str,
+) -> anyhow::Result<Vec<QueryRow>> {
+    match call_bound(
         g,
+        binding,
         Operation::Read {
             session: session.clone(),
             query: Query {
@@ -1378,5 +1576,570 @@ async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::
     eprintln!("concurrent exact-prefix captures: 6 fixed V2 acquisitions, 4 new commits, final V6; child PIDs {:?}",
         [coordinator.child.id(), a.child.id(), b.child.id()]);
     g.shutdown().await;
+    Ok(())
+}
+
+const EXTENDED_WRITES: u64 = 1025;
+const RETAINED_ENV: &str = "BYTE_BOUND_PROCESS_DIRECTORY";
+
+fn byte_binding() -> Binding {
+    let mut value = binding();
+    value.cohort.profile = CapacityProfile::ByteBound16MiBV1;
+    value
+}
+fn extended_write(ordinal: u64) -> Write {
+    Write {
+        // The complete u128 identity is stable across every interrupted attempt.
+        external_id: u128::from(ordinal).to_be_bytes(),
+        mutation: Mutation::CreateVertex {
+            partition: 7,
+            vertex: VertexData {
+                id: ordinal,
+                labels: vec!["person".into()],
+                properties: BTreeMap::new(),
+            },
+        },
+    }
+}
+fn canonical_write(write: &Write) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&(
+        "managed-graph-command-v1",
+        byte_binding(),
+        &write.mutation,
+    ))?)
+}
+
+/// Every persisted checkpoint denotes an INCOMPLETE run until all recovery,
+/// snapshot and original-prefix assertions finish. Pending IDs are saved before
+/// network I/O; advancing this checkpoint requires a visible Commit response.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleCheckpoint {
+    format: u32,
+    binding: Binding,
+    source_sha256: String,
+    elf_sha256: String,
+    executable: PathBuf,
+    harness_timeout_secs: u64,
+    verified_ordinal: u64,
+    pending_external_id: Option<[u8; 16]>,
+    originals: BTreeMap<u64, RequestRecord>,
+    proofs: BTreeMap<u64, Vec<u8>>,
+    grants: Vec<MemberCapacityGrant>,
+    ack_loss_recovered: bool,
+    snapshots_restored: bool,
+    completed: bool,
+}
+impl LifecycleCheckpoint {
+    fn load(directory: &Path, retained: bool, timeout: u64) -> anyhow::Result<Self> {
+        let source_sha256 = std::env::var("BYTE_BOUND_PROCESS_SOURCE_SHA256").unwrap_or_default();
+        let elf_sha256 = std::env::var("BYTE_BOUND_PROCESS_ELF_SHA256").unwrap_or_default();
+        if retained {
+            for (name, hash) in [("source", &source_sha256), ("ELF", &elf_sha256)] {
+                anyhow::ensure!(
+                    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "retained lifecycle requires externally verified {name} SHA-256 metadata"
+                );
+            }
+        }
+        let executable = std::env::current_exe()?;
+        let path = directory.join("progress.json");
+        if path.exists() {
+            let mut saved: Self = serde_json::from_slice(&fs::read(path)?)?;
+            anyhow::ensure!(
+                saved.format == 1
+                    && saved.binding == byte_binding()
+                    && saved.source_sha256 == source_sha256
+                    && saved.elf_sha256 == elf_sha256
+                    && saved.executable == executable
+                    && saved.verified_ordinal <= EXTENDED_WRITES,
+                "refusing resume with changed source, ELF, binding, or checkpoint format"
+            );
+            anyhow::ensure!(
+                saved
+                    .pending_external_id
+                    .is_none_or(|id| id == extended_write(saved.verified_ordinal + 1).external_id),
+                "checkpoint pending ID is not the original next request"
+            );
+            saved.harness_timeout_secs = timeout;
+            saved.completed = false;
+            return Ok(saved);
+        }
+        anyhow::ensure!(
+            ![7, 8, 9].iter().any(|shard| directory
+                .join(format!("shard-{shard}"))
+                .join("data")
+                .exists()),
+            "durable databases without original checkpoint must not be silently reinitialized"
+        );
+        Ok(Self {
+            format: 1,
+            binding: byte_binding(),
+            source_sha256,
+            elf_sha256,
+            executable,
+            harness_timeout_secs: timeout,
+            verified_ordinal: 0,
+            pending_external_id: None,
+            originals: BTreeMap::new(),
+            proofs: BTreeMap::new(),
+            grants: Vec::new(),
+            ack_loss_recovered: false,
+            snapshots_restored: false,
+            completed: false,
+        })
+    }
+    fn save(&self, directory: &Path) -> anyhow::Result<()> {
+        atomic_json(&directory.join("progress.json"), self)
+    }
+}
+
+async fn retain_original(
+    coordinator: &Client,
+    ordinal: u64,
+    checkpoint: &mut LifecycleCheckpoint,
+) -> anyhow::Result<()> {
+    let write = extended_write(ordinal);
+    let found = NodeRef::Remote(coordinator)
+        .request(&authority(), 1, write.external_id)
+        .await?
+        .record
+        .context("original point request missing")?;
+    assert_eq!(found.record.id, write.external_id);
+    assert_eq!(found.record.request, canonical_write(&write)?);
+    assert_eq!(found.transaction.ordinal, ordinal);
+    assert_eq!(found.transaction.decision, Some(Decision::Commit));
+    let plan = d2_raft::request_plans::Plan::decode(&found.record.payload)
+        .map_err(|e| anyhow!("original Plan: {e:?}"))?;
+    assert_eq!(plan.id, found.record.transaction_id);
+    assert_eq!(plan.cohort, byte_binding().cohort);
+    assert_eq!(plan.parts.len(), 1);
+    assert_eq!(plan.parts[0].descriptor.shard, 7);
+    assert_eq!(plan.parts[0].request.expected_sequence, Some(ordinal - 1));
+    if let Some(original) = checkpoint.originals.get(&ordinal) {
+        assert_eq!(
+            &found.record, original,
+            "original request/Plan changed at {ordinal}"
+        );
+    } else {
+        checkpoint.originals.insert(ordinal, found.record);
+    }
+    Ok(())
+}
+
+fn assert_complete_commits(
+    proof: &d2_raft::terminal_prefix::TerminalPrefix,
+    version: u64,
+) -> anyhow::Result<()> {
+    assert_eq!(proof.version(), version);
+    assert_eq!(proof.cohort(), &byte_binding().cohort);
+    let encoded = serde_json::to_value(proof)?;
+    let segments = encoded["segments"]
+        .as_array()
+        .context("terminal segments")?;
+    let mut ordinal = 0;
+    for segment in segments {
+        for terminal in segment.as_array().context("terminal segment rows")? {
+            ordinal += 1;
+            assert_eq!(terminal["ordinal"], ordinal);
+            assert_eq!(terminal["decision"], "Commit");
+            assert_eq!(
+                terminal["participants"]
+                    .as_array()
+                    .context("participants")?
+                    .len(),
+                1
+            );
+            assert_eq!(terminal["participants"][0]["shard"], 7);
+            assert_eq!(terminal["prepared"], serde_json::json!([true]));
+        }
+    }
+    assert_eq!(ordinal, version, "proof must contain every ordinal 1..=V");
+    Ok(())
+}
+
+async fn retain_proof(
+    coordinator: &Client,
+    version: u64,
+    checkpoint: &mut LifecycleCheckpoint,
+) -> anyhow::Result<()> {
+    let proof = NodeRef::Remote(coordinator)
+        .terminal(&authority(), 1, version)
+        .await?;
+    assert_complete_commits(&proof, version)?;
+    let bytes = serde_json::to_vec(&proof)?;
+    if let Some(original) = checkpoint.proofs.get(&version) {
+        assert_eq!(
+            &bytes, original,
+            "old terminal prefix changed at V{version}"
+        );
+    } else {
+        checkpoint.proofs.insert(version, bytes);
+    }
+    Ok(())
+}
+
+async fn verify_old_versions(g: &Gateway, through: u64) -> anyhow::Result<()> {
+    for version in [0, 1, 256, 1024].into_iter().filter(|v| *v <= through) {
+        // Never retain a 60-second session through the long write loop.
+        let session = open_bound(g, byte_binding(), Some(version)).await?;
+        assert_eq!(session.version, version);
+        let first = read_bound(g, byte_binding(), &session, 7, "g.V(1)").await?;
+        assert_eq!(
+            first,
+            if version == 0 {
+                vec![]
+            } else {
+                vec![row(7, 1)]
+            }
+        );
+        if version > 0 {
+            assert_eq!(
+                read_bound(g, byte_binding(), &session, 7, &format!("g.V({version})")).await?,
+                vec![row(7, version)]
+            );
+        }
+        assert!(read_bound(
+            g,
+            byte_binding(),
+            &session,
+            7,
+            &format!("g.V({})", version + 1)
+        )
+        .await?
+        .is_empty());
+        assert!(read_bound(g, byte_binding(), &session, 8, "g.V(1)")
+            .await?
+            .is_empty());
+        call_bound(g, byte_binding(), Operation::Close { session }).await?;
+    }
+    Ok(())
+}
+
+async fn verify_retained_lifecycle(
+    g: &Gateway,
+    coordinator: &Client,
+    members: [&Client; 2],
+    checkpoint: &mut LifecycleCheckpoint,
+) -> anyhow::Result<()> {
+    let c = NodeRef::Remote(coordinator);
+    let summary = c.summary(&authority(), 1).await?;
+    assert_eq!(summary.resolved_prefix, EXTENDED_WRITES);
+    assert_eq!(summary.cohort, byte_binding().cohort);
+    assert_eq!(
+        c.confirm_capacity(&authority(), 1).await?,
+        checkpoint.grants
+    );
+    let proof = c.terminal(&authority(), 1, EXTENDED_WRITES).await?;
+    assert_complete_commits(&proof, EXTENDED_WRITES)?;
+    for (client, shard, sequence) in [(members[0], 7, EXTENDED_WRITES), (members[1], 8, 0)] {
+        assert_eq!(
+            NodeRef::Remote(client)
+                .visibility(&target(shard))
+                .await?
+                .applied_prefix,
+            EXTENDED_WRITES
+        );
+        let snapshot = NodeRef::Remote(client)
+            .read_terminal(
+                &target(shard),
+                ReadLimit {
+                    // Match the existing production gateway capture contract, not the
+                    // legacy 1000-row test fixture. No production limit is changed.
+                    rows: 10000,
+                    bytes: 2 * 1024 * 1024,
+                    operations: 100000,
+                },
+                &proof,
+            )
+            .await?;
+        assert_eq!(snapshot.applied_prefix, EXTENDED_WRITES);
+        assert_eq!(snapshot.local_sequence, sequence);
+        let grant = NodeRef::Remote(client)
+            .grant_status(&authority(), &target(shard), &byte_binding().cohort)
+            .await?;
+        assert_eq!(
+            Some(&grant),
+            checkpoint.grants.iter().find(|g| g.member.shard == shard)
+        );
+    }
+    // A different, freshly prepared candidate must not replace the original
+    // Plan for an old external ID with identical canonical request bytes.
+    let graph = GraphCohort::from_endpoints(
+        c,
+        authority(),
+        1,
+        vec![
+            (NodeRef::Remote(members[0]), target(7)),
+            (NodeRef::Remote(members[1]), target(8)),
+        ],
+    );
+    let snapshot = graph
+        .snapshot(
+            Some(EXTENDED_WRITES),
+            ReadLimit {
+                rows: 10000,
+                bytes: 2 * 1024 * 1024,
+                operations: 100000,
+            },
+            Duration::from_secs(60),
+        )
+        .await?;
+    let candidate =
+        snapshot.prepare_vertex(7, &rocksdb_sql_table::Vertex::new(EXTENDED_WRITES + 1))?;
+    assert_ne!(candidate.id(), checkpoint.originals[&1].transaction_id);
+    let recovered = graph
+        .admit_request(
+            extended_write(1).external_id,
+            canonical_write(&extended_write(1))?,
+            &candidate,
+        )
+        .await?;
+    assert_eq!(recovered.id(), checkpoint.originals[&1].transaction_id);
+    assert_eq!(recovered.validation_version(), 0);
+    drop(snapshot);
+    for ordinal in [1, 256, 1024, 1025] {
+        retain_original(coordinator, ordinal, checkpoint).await?;
+        let original = &checkpoint.originals[&ordinal];
+        assert_eq!(
+            committed(
+                call_bound(
+                    g,
+                    byte_binding(),
+                    Operation::Submit(extended_write(ordinal))
+                )
+                .await?
+            ),
+            (original.transaction_id, ordinal)
+        );
+        let mut changed = extended_write(ordinal);
+        if let Mutation::CreateVertex { vertex, .. } = &mut changed.mutation {
+            vertex.labels = vec!["changed".into()];
+        }
+        assert_eq!(
+            call_bound(g, byte_binding(), Operation::Submit(changed)).await,
+            Err(gateway::Error::Identity)
+        );
+        retain_original(coordinator, ordinal, checkpoint).await?;
+    }
+    for version in [0, 1, 256, 1024] {
+        retain_proof(coordinator, version, checkpoint).await?;
+    }
+    assert_eq!(
+        c.summary(&authority(), 1).await?.resolved_prefix,
+        EXTENDED_WRITES
+    );
+    // Exact whole-journal cardinality is checked once per recovery phase. The
+    // long loop itself uses bounded point/status/proof operations, not archives.
+    assert_eq!(
+        c.journal(&authority(), 1).await?.transaction_count(),
+        EXTENDED_WRITES as usize
+    );
+    verify_old_versions(g, EXTENDED_WRITES).await?;
+    Ok(())
+}
+
+/// Forward the actual gateway request verbatim, receive its entire bounded
+/// response, then close without forwarding a byte of the ACK. The caller must
+/// observe Unknown; this is transport ACK loss, not a fabricated status.
+async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let upstream = g.local_addr();
+    let proxy = tokio::spawn(async move {
+        tokio::time::timeout(BUDGET, async move {
+            let (mut caller, _) = listener.accept().await?;
+            let length = caller.read_u32().await?;
+            anyhow::ensure!(
+                length as usize <= gateway::MAX_REQUEST_BYTES,
+                "proxy request frame"
+            );
+            let mut bytes = vec![0; length as usize];
+            caller.read_exact(&mut bytes).await?;
+            let mut server = tokio::net::TcpStream::connect(upstream).await?;
+            server.write_u32(length).await?;
+            server.write_all(&bytes).await?;
+            let length = server.read_u32().await?;
+            anyhow::ensure!(
+                length as usize <= gateway::MAX_RESPONSE_BYTES,
+                "proxy response frame"
+            );
+            let mut discarded = vec![0; length as usize];
+            server.read_exact(&mut discarded).await?;
+            // Validate a full JSON response was lost, without telling the client its
+            // outcome. The durable point lookup below is the recovery authority.
+            let _: serde_json::Value = serde_json::from_slice(&discarded)?;
+            drop(caller);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    });
+    let result = gateway::request(address, byte_binding(), Operation::Submit(write), BUDGET).await;
+    tokio::time::timeout(BUDGET, proxy).await???;
+    assert_eq!(result, Err(gateway::Error::Unknown));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "long release functional test; mandatory in CoreHR release CI"
+)]
+async fn byte_bound_independent_processes_1025_writes_retain_original_lifecycle(
+) -> anyhow::Result<()> {
+    let timeout = std::env::var("BYTE_BOUND_PROCESS_TIMEOUT_SECS")
+        .unwrap_or_else(|_| "21600".into())
+        .parse::<u64>()?;
+    anyhow::ensure!(
+        (1..=86400).contains(&timeout),
+        "invalid test harness timeout"
+    );
+    tokio::time::timeout(Duration::from_secs(timeout), extended_lifecycle(timeout))
+        .await
+        .context(
+            "INCOMPLETE: lifecycle harness timeout; retain checkpoint and retry the original IDs",
+        )?
+}
+
+async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
+    let retained = std::env::var_os(RETAINED_ENV);
+    let root = match retained {
+        Some(path) => FixtureDirectory::retained(PathBuf::from(path))?,
+        None => FixtureDirectory::temporary()?,
+    };
+    let is_retained = root._temporary.is_none();
+    let mut checkpoint = LifecycleCheckpoint::load(root.path(), is_retained, timeout)?;
+    checkpoint.save(root.path())?;
+    let member_config = ProcessConfig {
+        cohort: byte_binding().cohort,
+        members: vec![],
+    };
+    let mut a = Process::configured(
+        7,
+        FixtureDirectory::retained(root.path().join("shard-7"))?,
+        member_config.clone(),
+    )
+    .await?;
+    let mut b = Process::configured(
+        8,
+        FixtureDirectory::retained(root.path().join("shard-8"))?,
+        member_config,
+    )
+    .await?;
+    let mut coordinator = Process::configured(
+        9,
+        FixtureDirectory::retained(root.path().join("shard-9"))?,
+        ProcessConfig {
+            cohort: byte_binding().cohort,
+            members: vec![(7, a.address), (8, b.address)],
+        },
+    )
+    .await?;
+    assert_eq!(
+        BTreeSet::from([
+            std::process::id(),
+            a.child.id(),
+            b.child.id(),
+            coordinator.child.id()
+        ])
+        .len(),
+        4
+    );
+    let c_client = coordinator.client()?;
+    let a_client = a.client()?;
+    let b_client = b.client()?;
+    let c = NodeRef::Remote(&c_client);
+    let grants = c.confirm_capacity(&authority(), 1).await?;
+    if checkpoint.grants.is_empty() {
+        checkpoint.grants = grants;
+    } else {
+        assert_eq!(
+            checkpoint.grants, grants,
+            "resume must preserve first member generations"
+        );
+    }
+    assert_eq!(checkpoint.grants.len(), 2);
+    let g = Gateway::bind_remote(
+        RemoteConfig {
+            coordinator: c_client.clone(),
+            binding: byte_binding(),
+            members: vec![a_client.clone(), b_client.clone()],
+        },
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
+    retain_proof(&c_client, 0, &mut checkpoint).await?;
+    checkpoint.save(root.path())?;
+    eprintln!("byte-bound lifecycle INCOMPLETE: directory={} verified={} source_sha256={} elf_sha256={} timeout={}s coordinator={} writer={} nonparticipant={}",
+        root.path().display(), checkpoint.verified_ordinal, checkpoint.source_sha256, checkpoint.elf_sha256,
+        timeout, coordinator.child.id(), a.child.id(), b.child.id());
+    let stop_after = std::env::var("BYTE_BOUND_PROCESS_STOP_AFTER")
+        .ok()
+        .map(|v| v.parse::<u64>())
+        .transpose()?;
+    let started = std::time::Instant::now();
+    for ordinal in checkpoint.verified_ordinal + 1..=EXTENDED_WRITES {
+        let write = extended_write(ordinal);
+        checkpoint.pending_external_id = Some(write.external_id);
+        checkpoint.save(root.path())?;
+        if ordinal == EXTENDED_WRITES && !checkpoint.ack_loss_recovered {
+            discard_gateway_ack(&g, write.clone()).await?;
+            retain_original(&c_client, ordinal, &mut checkpoint).await?;
+            checkpoint.save(root.path())?;
+            b.stop()?;
+            coordinator.stop()?;
+            coordinator.reopen().await?;
+            b.reopen().await?;
+            retain_original(&c_client, ordinal, &mut checkpoint).await?;
+        }
+        let (transaction_id, committed_ordinal) =
+            committed(call_bound(&g, byte_binding(), Operation::Submit(write)).await?);
+        assert_eq!(committed_ordinal, ordinal);
+        if [1, 256, 1024, 1025].contains(&ordinal) {
+            retain_original(&c_client, ordinal, &mut checkpoint).await?;
+            assert_eq!(
+                checkpoint.originals[&ordinal].transaction_id,
+                transaction_id
+            );
+            retain_proof(&c_client, ordinal, &mut checkpoint).await?;
+            verify_old_versions(&g, ordinal).await?;
+        }
+        if ordinal == EXTENDED_WRITES {
+            checkpoint.ack_loss_recovered = true;
+        }
+        checkpoint.verified_ordinal = ordinal;
+        checkpoint.pending_external_id = None;
+        checkpoint.save(root.path())?;
+        if ordinal == 1 || ordinal % 16 == 0 || ordinal == EXTENDED_WRITES {
+            eprintln!("byte-bound lifecycle INCOMPLETE: verified={ordinal}/{EXTENDED_WRITES} external_id={:?} transaction_id={transaction_id:?} elapsed_this_attempt={:?} checkpoint={}",
+                extended_write(ordinal).external_id, started.elapsed(), root.path().join("progress.json").display());
+        }
+        if stop_after.is_some_and(|cut| ordinal >= cut && ordinal < EXTENDED_WRITES) {
+            anyhow::bail!("INCOMPLETE: intentional functional prefix stop at {ordinal}; resume this exact checkpoint and original IDs; this is not a 1025-write acceptance pass");
+        }
+    }
+    verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
+    // Reopen the actual single writer too, then prove the old IDs and versions.
+    a.stop()?;
+    a.reopen().await?;
+    verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
+    if !checkpoint.snapshots_restored {
+        // There are no concurrent gateway writes during these full snapshot cuts.
+        // Each child closes RPC, shuts down Raft after a barrier, exports complete
+        // meta/data, and installs it into a fresh state.db on the next launch.
+        for process in [&mut a, &mut b, &mut coordinator] {
+            process.snapshot_restore().await?;
+        }
+        checkpoint.snapshots_restored = true;
+        checkpoint.save(root.path())?;
+    }
+    verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
+    assert!(checkpoint.ack_loss_recovered && checkpoint.snapshots_restored);
+    g.shutdown().await;
+    checkpoint.completed = true;
+    checkpoint.save(root.path())?;
+    eprintln!("byte-bound lifecycle COMPLETE: 1025 gateway writes; exact original IDs/Plans; complete old-V proofs; crash/reopen; three full snapshot restores; source_sha256={} elf_sha256={} checkpoint={}",
+        checkpoint.source_sha256, checkpoint.elf_sha256, root.path().join("progress.json").display());
     Ok(())
 }

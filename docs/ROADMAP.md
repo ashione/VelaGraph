@@ -452,3 +452,14 @@ full logical snapshots remain atomic. This removes the live full-archive rewrite
 not complete replay/memory/snapshot work or lifetime caps. Shared codec/replay
 replaces duplicated paths; full-cohort pre-admission capacity and lazy exact-ID
 recovery remain required before safely lifting limits.
+
+### Immutable byte-budget cohort capacity
+
+[The fresh-cohort profile](COHORT_CAPACITY_PROFILE.md) binds one common 16 MiB
+reserved-history contract to the complete cohort before admission. Actual durable
+member generations and server-owned confirmation replace caller capability claims.
+Byte-derived structural guards replace the new profile's legacy request/transaction
+counts; original Plans, holes, old V, local D1 limits and complete recovery remain.
+Existing cohorts cannot be retagged. Shared policy/codec/validation paths avoid a
+second persistence engine. This is a bounded lifecycle extension, not unlimited
+writes, lazy retained archives or a performance milestone.

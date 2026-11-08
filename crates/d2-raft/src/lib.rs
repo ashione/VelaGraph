@@ -11,6 +11,7 @@
 //! example (https://github.com/databendlabs/openraft); see NOTICE.
 
 mod blocking;
+pub mod capacity_policy;
 pub mod cohort_reads;
 mod d1;
 mod decision_segments;

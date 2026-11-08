@@ -1,5 +1,9 @@
 # Authoritative event ledger
 
+Later opt-in profile: [immutable byte-budget cohort capacity](COHORT_CAPACITY_PROFILE.md)
+adds disk v13/v14 only for newly initialized cohorts. This document describes the
+published legacy profile and its unchanged v11/v12/count-bound contract.
+
 Status: fixed-cohort live disk state now reconstructs its decision authority from
 original, independently stored Command segments. New coordinator disk version 11
 and member version 12 no longer embed a complete Journal in `sm/d1`. This removes

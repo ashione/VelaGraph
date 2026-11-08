@@ -194,3 +194,14 @@ replays use the retained session V. The original smaller `Read` operation and
 write identity protocol remain unchanged. Complete-result pagination is separately
 bounded, query-bound and replayable; it is not incremental hierarchy-job paging.
 See [the full contract](MANAGED_FIXED_TRAVERSALS.md).
+
+## Opt-in byte-budget cohort identity
+
+The [immutable byte-budget profile](COHORT_CAPACITY_PROFILE.md) is selected only
+for a new empty fixed cohort. Its explicit `ByteBound16MiBV1` tag is part of Cohort
+inside Binding, canonical mutation identity, sessions and internal proofs. Legacy
+Binding bytes are unchanged. Gateway framing/operations remain v1; old strict
+peers reject the new profile tag, and new bindings cannot be substituted for old
+ones. Internal managed peers require v5 and durable full-cohort confirmation.
+No Gremlin mutation syntax, partial result fallback or unlimited write contract is
+introduced. Existing cohorts cannot be retagged or reset to select this profile.

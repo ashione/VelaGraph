@@ -43,16 +43,28 @@ jobs:
           prefix-key: corehr-release-v1
           cache-on-failure: false
       - name: Test evidence validator
-        run: python3 -m unittest discover -s scripts -p 'test_corehr*ci.py'
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_corehr*ci.py'
+          python3 -m unittest discover -s scripts -p 'test_managed_lifecycle_ci.py'
       - name: Build release fixture, query harnesses and node
         run: |
           cargo build --release --locked --example corehr_fixture
           cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --example corehr_result_pages --bin graph-node
+      - name: Verify retained 1025-write lifecycle in release
+        id: managed_lifecycle
+        run: python3 scripts/managed_lifecycle_ci.py managed-lifecycle-ci-results
       - name: Run complete CoreHR scenario
         run: python3 scripts/corehr_ci.py corehr-ci-results
       - name: Publish measured summary
         if: always()
         run: |
+          if test '${{ steps.managed_lifecycle.outcome }}' = success && test -f managed-lifecycle-ci-results/summary.md; then
+            cat managed-lifecycle-ci-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Managed lifecycle INCOMPLETE. Inspect retained build/test logs and checkpoint; this is not a 1025-write acceptance pass.' >> "$GITHUB_STEP_SUMMARY"
+          fi
           if test -f corehr-ci-results/summary.md; then
             cat corehr-ci-results/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
@@ -72,3 +84,10 @@ jobs:
             corehr-ci-results/*.md
             corehr-ci-results/*-fixture/manifest.json
             corehr-ci-results/*-db/node-*.log
+            managed-lifecycle-ci-results/*.json
+            managed-lifecycle-ci-results/*.jsonl
+            managed-lifecycle-ci-results/*.stdout
+            managed-lifecycle-ci-results/*.stderr
+            managed-lifecycle-ci-results/*.md
+            managed-lifecycle-ci-results/managed_process
+            managed-lifecycle-ci-results/lifecycle/progress.json

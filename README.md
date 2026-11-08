@@ -688,7 +688,7 @@ Managed fixed-cohort reads now use [exact segmented terminal-prefix evidence](do
 at the chosen V rather than transferring the original request/Plan archive. This
 keeps old-V evidence independent of later archive growth without changing durable
 retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
-boundary. Internal managed peers now require protocol v4; evidence remains O(V).
+boundary. Internal managed peers now require protocol v5; evidence remains O(V).
 
 [A2.1 durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) now returns
 one exact original external-ID/Plan binding without transferring the full Journal.
@@ -711,3 +711,11 @@ fixed-cohort Commands as the sole live decision authority in disk v11/v12.
 Ordinary apply no longer rewrites a full Journal archive in state metadata.
 Open, apply and history-source reads strictly replay the raw segments; complete
 memory history/snapshots and all 256/1,024/16 MiB lifetime limits remain.
+
+New empty cohorts can explicitly select the [immutable byte-budget capacity
+profile](docs/COHORT_CAPACITY_PROFILE.md). Actual durable grants from every member
+precede admission; original IDs/Plans and old read versions remain retained.
+This profile replaces the legacy 256/1,024 count quotas with byte-derived guards,
+while the 16 MiB reserved Journal, local D1 limits, complete replay/snapshots and
+whole-frame bounds remain. Existing/default cohorts stay legacy; there is no
+online conversion or unlimited-lifetime claim. New managed peers require RPC v5.

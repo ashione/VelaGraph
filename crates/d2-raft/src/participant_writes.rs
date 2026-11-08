@@ -42,10 +42,11 @@ impl Intent {
         }
     }
     fn bytes(&self) -> usize {
-        256 + self
-            .request
-            .as_ref()
-            .map_or(0, D1WriteRequest::retained_size)
+        crate::capacity_policy::INTENT_FIXED_BYTES
+            + self
+                .request
+                .as_ref()
+                .map_or(0, D1WriteRequest::retained_size)
     }
 }
 
@@ -84,7 +85,8 @@ impl State {
             "invalid participant authority"
         );
         anyhow::ensure!(
-            self.activated_sequence <= d1.sequence && self.records.len() <= MAX_INTENTS,
+            self.activated_sequence <= d1.sequence
+                && self.records.len() <= d1.capacity_profile().max_intents(),
             "invalid participant history bounds"
         );
         anyhow::ensure!(
@@ -201,6 +203,13 @@ impl State {
 }
 
 impl D1State {
+    pub(crate) fn capacity_profile(&self) -> crate::transaction_decisions::CapacityProfile {
+        self.coordinator
+            .as_ref()
+            .or_else(|| self.visibility.as_ref().map(|v| &v.journal))
+            .map_or_else(Default::default, |journal| journal.capacity_profile())
+    }
+
     pub(crate) fn check_participant(
         &self,
         authority: &Authority,
@@ -237,6 +246,7 @@ impl D1State {
     ) -> Result<D1Result, D1Error> {
         self.check_participant(authority, &descriptor)?;
         request.validate()?;
+        self.check_capacity_prepare(&descriptor, request.request_id, Some(&request))?;
         if request.request_id == [0; 16]
             || request.shard != descriptor.shard
             || request.epoch != descriptor.epoch
@@ -293,7 +303,7 @@ impl D1State {
             decision: None,
             sequence: None,
         };
-        if state.records.len() >= MAX_INTENTS
+        if state.records.len() >= self.capacity_profile().max_intents()
             || state
                 .records
                 .iter()
@@ -337,13 +347,13 @@ impl D1State {
             {
                 return Err(D1Error::IdempotencyConflict);
             }
-            if state.records.len() >= MAX_INTENTS
+            if state.records.len() >= self.capacity_profile().max_intents()
                 || state
                     .records
                     .iter()
                     .map(Intent::bytes)
                     .sum::<usize>()
-                    .saturating_add(256)
+                    .saturating_add(crate::capacity_policy::INTENT_FIXED_BYTES)
                     > MAX_INTENT_BYTES
             {
                 return Err(D1Error::ParticipantCapacity);

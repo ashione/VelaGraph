@@ -273,6 +273,7 @@ mod tests {
     }
     fn cohort() -> Cohort {
         Cohort {
+            profile: Default::default(),
             coordinator_shard: 9,
             coordinator_epoch: 1,
             members: vec![member(7), member(8)],

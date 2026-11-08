@@ -17,6 +17,7 @@ fn authority() -> Authority {
 }
 fn cohort() -> Cohort {
     Cohort {
+        profile: Default::default(),
         coordinator_shard: 9,
         coordinator_epoch: 1,
         members: vec![7, 8]
@@ -821,10 +822,10 @@ async fn process_death_preserves_filled_tail_migration_member_and_snapshot() -> 
             .unwrap()
             .unwrap();
         let ledger = recovered.ledger.unwrap();
-        assert_eq!(ledger.journal, journal(33));
-        assert_eq!(ledger.descriptor.event_count, 67);
-        assert_eq!(ledger.descriptor.segment_count, 3);
-        assert_eq!(ledger.descriptor.applied, sm.applied().await);
+        assert_eq!(ledger.journal(), &journal(33));
+        assert_eq!(ledger.descriptor().event_count, 67);
+        assert_eq!(ledger.descriptor().segment_count, 3);
+        assert_eq!(ledger.descriptor().applied, sm.applied().await);
         assert_eq!(rows(&sm).len(), 2);
         assert_eq!(manifest(&sm)["through"], 33);
         assert_eq!(

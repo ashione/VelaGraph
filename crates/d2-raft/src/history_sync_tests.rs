@@ -14,6 +14,7 @@ fn authority() -> Authority {
 }
 fn cohort() -> Cohort {
     Cohort {
+        profile: Default::default(),
         coordinator_shard: 9,
         coordinator_epoch: 1,
         members: vec![7, 8]
@@ -130,6 +131,18 @@ async fn apply(sm: &mut Arc<StateMachine>, command: D1Command) -> Result<D1Resul
         .unwrap()
 }
 async fn setup(sm: &mut Arc<StateMachine>) {
+    setup_activation(
+        sm,
+        D1Command::EnableVersionedReads {
+            shard: 7,
+            epoch: 1,
+            mode_id: [7; 16],
+            journal: empty(),
+        },
+    )
+    .await;
+}
+async fn setup_activation(sm: &mut Arc<StateMachine>, activation: D1Command) {
     for command in [
         D1Command::Activate { shard: 7, epoch: 1 },
         D1Command::EnableManagedWrites {
@@ -144,12 +157,7 @@ async fn setup(sm: &mut Arc<StateMachine>) {
             mode_id: [7; 16],
             authority: authority(),
         },
-        D1Command::EnableVersionedReads {
-            shard: 7,
-            epoch: 1,
-            mode_id: [7; 16],
-            journal: empty(),
-        },
+        activation,
     ] {
         apply(sm, command).await.unwrap();
     }
@@ -656,9 +664,25 @@ async fn synced_original_request_and_plan_survive_abort_retry_reopen_and_snapsho
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn suffix_sync_with_full_intent_budget_preserves_unknown_abort_capacity() {
+    full_intent_abort(false).await;
+    full_intent_abort(true).await;
+}
+async fn full_intent_abort(byte_profile: bool) {
     let directory = tempfile::tempdir().unwrap();
     let mut sm = Arc::new(StateMachine::open(directory.path()).unwrap());
-    setup(&mut sm).await;
+    let mut j = if byte_profile {
+        byte_capacity::setup_byte(&mut sm, [17; 32]).await;
+        byte_capacity::confirmed(&sm).await
+    } else {
+        setup(&mut sm).await;
+        empty()
+    };
+    j.apply(Command::Begin {
+        id: id(1),
+        participants: vec![descriptor(7)],
+    })
+    .unwrap();
+    sync_all(&mut sm, &j).await;
     let value = vec![0; crate::participant_writes::MAX_INTENT_BYTES - 256 - 128 - 64 - 3];
     let mut large = request(1);
     large.operations = vec![WriteOp::put("big", value)];
@@ -672,7 +696,16 @@ async fn suffix_sync_with_full_intent_budget_preserves_unknown_abort_capacity() 
     )
     .await
     .unwrap();
-    let mut j = committed();
+    j.apply(Command::Prepared {
+        id: id(1),
+        participant: descriptor(7),
+    })
+    .unwrap();
+    j.apply(Command::Decide {
+        id: id(1),
+        decision: Decision::Commit,
+    })
+    .unwrap();
     let cut = sync_all(&mut sm, &j).await;
     apply(&mut sm, advance(1, &cut)).await.unwrap();
     j.apply(Command::Begin {
@@ -775,4 +808,468 @@ async fn pre_sync_failure_keeps_cursor_data_watermark_and_raft_marker_atomic() {
     }
     assert_eq!(status(&sm).await, (page.cut, 1));
     assert_eq!(sm.get_raw(b"x").await, Some(b"committed".to_vec()));
+}
+
+mod byte_capacity {
+    use super::*;
+    use crate::transaction_decisions::{CapacityActivation, CapacityProfile, MemberCapacityGrant};
+
+    fn binding() -> Cohort {
+        Cohort {
+            profile: CapacityProfile::ByteBound16MiBV1,
+            ..cohort()
+        }
+    }
+    fn empty_byte() -> Journal {
+        let mut journal = Journal::new(authority().mode).unwrap();
+        journal
+            .apply(Command::BindCohort { cohort: binding() })
+            .unwrap();
+        journal
+    }
+    fn activation(nonce: [u8; 32]) -> D1Command {
+        D1Command::EnableByteBoundReads {
+            shard: 7,
+            epoch: 1,
+            mode_id: [7; 16],
+            journal: empty_byte(),
+            generation_nonce: nonce,
+        }
+    }
+    pub(super) async fn setup_byte(sm: &mut Arc<StateMachine>, nonce: [u8; 32]) {
+        setup_activation(sm, activation(nonce)).await;
+    }
+    async fn grant(sm: &StateMachine) -> MemberCapacityGrant {
+        sm.participant_capacity_grant(7, 1, [7; 16], &authority(), &binding())
+            .await
+            .unwrap()
+    }
+    // Raw deterministic state tests use trusted proposals. Actual server-owned
+    // origin/leader barriers and every member are exercised by managed RPC tests.
+    pub(super) async fn confirmed(sm: &StateMachine) -> Journal {
+        let mut journal = empty_byte();
+        journal
+            .apply(Command::ConfirmCohortCapacity {
+                cohort: binding(),
+                grants: vec![
+                    grant(sm).await,
+                    MemberCapacityGrant {
+                        member: binding().members[1].clone(),
+                        activation: CapacityActivation {
+                            nonce: [18; 32],
+                            log_id: LogId::new(CommittedLeaderId::new(1, 1), 4),
+                        },
+                    },
+                ],
+            })
+            .unwrap();
+        journal
+    }
+
+    #[tokio::test]
+    async fn activation_is_atomic_immutable_and_preserved_by_reopen_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(directory.path()).unwrap());
+        setup_byte(&mut sm, [17; 32]).await;
+        let first = grant(&sm).await;
+        assert_eq!(first.activation.log_id.index, 4);
+        apply(&mut sm, activation([17; 32])).await.unwrap();
+        assert_eq!(grant(&sm).await, first);
+        let before = d1_bytes(&sm).await;
+        assert_eq!(
+            apply(&mut sm, activation([19; 32])).await,
+            Err(D1Error::IdempotencyConflict)
+        );
+        assert_eq!(d1_bytes(&sm).await, before);
+        assert_eq!(
+            apply(
+                &mut sm,
+                D1Command::EnableVersionedReads {
+                    shard: 7,
+                    epoch: 1,
+                    mode_id: [7; 16],
+                    journal: empty_byte(),
+                }
+            )
+            .await,
+            Err(D1Error::VisibilityHistory)
+        );
+        apply(
+            &mut sm,
+            D1Command::SetDedupCapacity {
+                shard: 7,
+                epoch: 1,
+                expected_bytes: crate::MAX_DEDUP_BYTES,
+                new_bytes: crate::EXTENDED_DEDUP_BYTES,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sm.state.read().await.d1.as_ref().unwrap().version, 7);
+        let image = sm.build_snapshot().await.unwrap();
+        drop(sm);
+        let sm = Arc::new(StateMachine::open(directory.path()).unwrap());
+        assert_eq!(grant(&sm).await, first);
+        let mut restored = Arc::new(StateMachine::default());
+        restored
+            .install_snapshot(&image.meta, image.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(grant(&restored).await, first);
+        assert_eq!(d1_bytes(&restored).await, d1_bytes(&sm).await);
+    }
+
+    #[tokio::test]
+    async fn fresh_same_log_id_nonce_cannot_reuse_grant_or_snapshot_replace_binding() {
+        let mut first = Arc::new(StateMachine::default());
+        setup_byte(&mut first, [17; 32]).await;
+        let journal = confirmed(&first).await;
+        let image = first.build_snapshot().await.unwrap();
+        let mut fresh = Arc::new(StateMachine::default());
+        setup_byte(&mut fresh, [19; 32]).await;
+        assert_eq!(
+            grant(&first).await.activation.log_id,
+            grant(&fresh).await.activation.log_id
+        );
+        assert_ne!(
+            grant(&first).await.activation.nonce,
+            grant(&fresh).await.activation.nonce
+        );
+        let before = d1_bytes(&fresh).await;
+        let page = journal.history_page(&status(&fresh).await.0, None).unwrap();
+        assert_eq!(
+            apply(&mut fresh, sync(page)).await,
+            Err(D1Error::VisibilityHistory)
+        );
+        assert_eq!(d1_bytes(&fresh).await, before);
+        let mut meta = image.meta;
+        meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 100));
+        assert!(fresh.install_snapshot(&meta, image.snapshot).await.is_err());
+        assert_eq!(d1_bytes(&fresh).await, before);
+    }
+
+    #[tokio::test]
+    async fn raw_prepare_requires_retained_confirmation_and_exact_original_plan() {
+        let mut sm = Arc::new(StateMachine::default());
+        setup_byte(&mut sm, [17; 32]).await;
+        assert_eq!(
+            apply(&mut sm, prepare(1)).await,
+            Err(D1Error::CoordinatorRejected(
+                crate::transaction_decisions::Error::CapacityNotConfirmed,
+            ))
+        );
+        let mut journal = confirmed(&sm).await;
+        sync_all(&mut sm, &journal).await;
+        assert_eq!(
+            apply(&mut sm, prepare(1)).await,
+            Err(D1Error::VisibilityHistory)
+        );
+        let plan = crate::request_plans::Plan {
+            version: 1,
+            id: id(1),
+            authority: authority(),
+            cohort: binding(),
+            validation_version: 0,
+            parts: vec![crate::request_plans::Part {
+                descriptor: descriptor(7),
+                request: request(1),
+            }],
+        };
+        let payload = plan.encode().unwrap();
+        journal
+            .apply(Command::AdmitRequest {
+                id: id(99),
+                request: b"original".to_vec(),
+                payload: payload.clone(),
+                transaction_id: id(1),
+                participants: vec![descriptor(7)],
+            })
+            .unwrap();
+        sync_all(&mut sm, &journal).await;
+        let mut wrong = request(1);
+        wrong.operations = vec![WriteOp::put("x", "changed")];
+        assert_eq!(
+            apply(
+                &mut sm,
+                D1Command::PrepareParticipant {
+                    authority: authority(),
+                    participant: descriptor(7),
+                    request: wrong,
+                }
+            )
+            .await,
+            Err(D1Error::IdempotencyConflict)
+        );
+        apply(&mut sm, prepare(1)).await.unwrap();
+        journal
+            .apply(Command::Prepared {
+                id: id(1),
+                participant: descriptor(7),
+            })
+            .unwrap();
+        journal
+            .apply(Command::Decide {
+                id: id(1),
+                decision: Decision::Commit,
+            })
+            .unwrap();
+        let cut = sync_all(&mut sm, &journal).await;
+        assert_eq!(status(&sm).await.1, 0);
+        assert_eq!(sm.get_raw(b"x").await, None);
+        apply(&mut sm, advance(1, &cut)).await.unwrap();
+        assert_eq!(sm.get_raw(b"x").await, Some(b"committed".to_vec()));
+        assert_eq!(
+            apply(&mut sm, prepare(1)).await.unwrap(),
+            D1Result::Participant(Status::Committed { sequence: 1 })
+        );
+        let before = journal.encode().unwrap();
+        journal
+            .apply(Command::AdmitRequest {
+                id: id(99),
+                request: b"original".to_vec(),
+                payload: b"losing candidate".to_vec(),
+                transaction_id: id(2),
+                participants: vec![descriptor(7)],
+            })
+            .unwrap();
+        assert_eq!(journal.encode().unwrap(), before);
+        assert_eq!(journal.request(id(99)).unwrap().payload, payload);
+        assert!(read(&sm, 0, &journal).await.unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_binding_and_malformed_generation_never_activate_new_profile() {
+        let mut legacy = Arc::new(StateMachine::default());
+        setup(&mut legacy).await;
+        let before = d1_bytes(&legacy).await;
+        assert_eq!(
+            apply(&mut legacy, activation([17; 32])).await,
+            Err(D1Error::VisibilityHistory)
+        );
+        assert_eq!(d1_bytes(&legacy).await, before);
+        assert!(legacy
+            .participant_capacity_grant(7, 1, [7; 16], &authority(), &binding())
+            .await
+            .is_err());
+        let mut state = legacy.state.read().await.d1.as_ref().unwrap().clone();
+        state.visibility.as_mut().unwrap().activation = Some(CapacityActivation {
+            nonce: [17; 32],
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 4),
+        });
+        assert!(state.validate().is_err());
+        let mut sm = Arc::new(StateMachine::default());
+        setup_byte(&mut sm, [17; 32]).await;
+        let mut state = sm.state.read().await.d1.as_ref().unwrap().clone();
+        state.visibility.as_mut().unwrap().activation = None;
+        assert!(state.validate().is_err());
+        assert!(sm
+            .state
+            .read()
+            .await
+            .d1
+            .as_ref()
+            .unwrap()
+            .validate_capacity_activation(Some(LogId::new(CommittedLeaderId::new(1, 1), 3)))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_activation_sync_publishes_no_nonce_then_exact_retry_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(directory.path()).unwrap());
+        for command in [
+            D1Command::Activate { shard: 7, epoch: 1 },
+            D1Command::EnableManagedWrites {
+                shard: 7,
+                epoch: 1,
+                expected_sequence: 0,
+                mode_id: [7; 16],
+            },
+            D1Command::EnableParticipant {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                authority: authority(),
+            },
+        ] {
+            apply(&mut sm, command).await.unwrap();
+        }
+        assert_eq!(
+            sm.participant_capacity_grant(7, 1, [7; 16], &authority(), &binding())
+                .await,
+            Err(D1Error::VisibilityNotEnabled)
+        );
+        let before = d1_bytes(&sm).await;
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm.apply([entry(4, activation([17; 32]))]).await.is_err());
+        assert_eq!(d1_bytes(&sm).await, before);
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(directory.path()).unwrap());
+        assert_eq!(d1_bytes(&sm).await, before);
+        apply(&mut sm, activation([17; 32])).await.unwrap();
+        assert_eq!(grant(&sm).await.activation.nonce, [17; 32]);
+    }
+
+    #[tokio::test]
+    async fn validated_full_d1_history_still_consumes_unknown_abort_and_nonparticipant() {
+        let mut origin = Arc::new(StateMachine::default());
+        setup_byte(&mut origin, [17; 32]).await;
+        let mut state = origin.state.read().await.d1.as_ref().unwrap().clone();
+        let mut journal = confirmed(&origin).await;
+        // Construct one complete validated recovery fixture. This deliberately
+        // does not stand in for the separate 1025 real gateway-commit acceptance.
+        for ordinal in 1..=crate::MAX_DEDUP_REQUESTS as u64 {
+            let mut req = request(ordinal);
+            req.expected_sequence = Some(ordinal - 1);
+            req.operations = vec![WriteOp::put("x", ordinal.to_string())];
+            journal
+                .replay_event(Command::Begin {
+                    id: id(ordinal),
+                    participants: vec![descriptor(7)],
+                })
+                .unwrap();
+            journal
+                .replay_event(Command::Prepared {
+                    id: id(ordinal),
+                    participant: descriptor(7),
+                })
+                .unwrap();
+            journal
+                .replay_event(Command::Decide {
+                    id: id(ordinal),
+                    decision: Decision::Commit,
+                })
+                .unwrap();
+            state
+                .participant
+                .as_mut()
+                .unwrap()
+                .records
+                .push(crate::participant_writes::Intent {
+                    id: id(ordinal),
+                    participant: descriptor(7),
+                    request: Some(req.clone()),
+                    decision: Some(Decision::Commit),
+                    sequence: Some(ordinal),
+                });
+            state.dedup.push(DedupRecord {
+                request: req,
+                sequence: ordinal,
+            });
+            state.visibility.as_mut().unwrap().commits.push(
+                crate::versioned_reads::CommitVersion {
+                    ordinal,
+                    id: id(ordinal),
+                    sequence: ordinal,
+                },
+            );
+        }
+        state.sequence = crate::MAX_DEDUP_REQUESTS as u64;
+        state.visibility.as_mut().unwrap().applied = state.sequence;
+        state.visibility.as_mut().unwrap().journal = journal.clone();
+        state.validate().unwrap();
+        let first_request = state.dedup[0].request.clone();
+        let mut image = origin.build_snapshot().await.unwrap();
+        image.meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 20_000));
+        let snapshot = SnapshotV1 {
+            version: 1,
+            entries: vec![(b"x".to_vec(), state.sequence.to_string().into_bytes())],
+            d1: state,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(directory.path()).unwrap());
+        sm.install_snapshot(
+            &image.meta,
+            Box::new(Cursor::new(serde_json::to_vec(&snapshot).unwrap())),
+        )
+        .await
+        .unwrap();
+        let exhausted = crate::MAX_DEDUP_REQUESTS as u64 + 1;
+        journal
+            .apply(Command::Begin {
+                id: id(exhausted),
+                participants: vec![descriptor(7)],
+            })
+            .unwrap();
+        sync_all(&mut sm, &journal).await;
+        let mut req = request(exhausted);
+        req.expected_sequence = Some(exhausted - 1);
+        assert_eq!(
+            apply(
+                &mut sm,
+                D1Command::PrepareParticipant {
+                    authority: authority(),
+                    participant: descriptor(7),
+                    request: req,
+                }
+            )
+            .await,
+            Err(D1Error::DedupCapacity)
+        );
+        journal
+            .apply(Command::Decide {
+                id: id(exhausted),
+                decision: Decision::Abort,
+            })
+            .unwrap();
+        let cut = sync_all(&mut sm, &journal).await;
+        apply(&mut sm, advance(exhausted, &cut)).await.unwrap();
+        journal
+            .apply(Command::Begin {
+                id: id(exhausted + 1),
+                participants: vec![descriptor(8)],
+            })
+            .unwrap();
+        journal
+            .apply(Command::Decide {
+                id: id(exhausted + 1),
+                decision: Decision::Abort,
+            })
+            .unwrap();
+        let cut = sync_all(&mut sm, &journal).await;
+        apply(&mut sm, advance(exhausted + 1, &cut)).await.unwrap();
+        assert_eq!(
+            apply(
+                &mut sm,
+                D1Command::PrepareParticipant {
+                    authority: authority(),
+                    participant: descriptor(7),
+                    request: first_request,
+                }
+            )
+            .await
+            .unwrap(),
+            D1Result::Participant(Status::Committed { sequence: 1 })
+        );
+        assert_eq!(
+            sm.state
+                .read()
+                .await
+                .d1
+                .as_ref()
+                .unwrap()
+                .participant
+                .as_ref()
+                .unwrap()
+                .records
+                .len(),
+            crate::MAX_DEDUP_REQUESTS
+        );
+        drop(sm);
+        let sm = Arc::new(StateMachine::open(directory.path()).unwrap());
+        assert_eq!(status(&sm).await, (cut, exhausted + 1));
+        assert_eq!(
+            read(&sm, 1, &journal)
+                .await
+                .unwrap()
+                .entries
+                .get(b"x".as_slice()),
+            Some(&b"1".to_vec())
+        );
+        assert!(read(&sm, 0, &journal).await.unwrap().entries.is_empty());
+    }
 }
