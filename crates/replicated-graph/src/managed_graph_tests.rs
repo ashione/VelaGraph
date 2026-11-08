@@ -1668,6 +1668,11 @@ async fn actual_durable_gateway_uses_retained_control_with_lost_acks_and_reopen(
         }
     );
     drop(graph);
+    let closing: Vec<_> = nodes
+        .iter()
+        .zip([9, 7, 8])
+        .map(|(node, shard)| (shard, node.state_machine.clone()))
+        .collect();
     c_stop.send(()).unwrap();
     a_stop.send(()).unwrap();
     assert_eq!(c_proxy.await.unwrap(), 3);
@@ -1679,6 +1684,28 @@ async fn actual_durable_gateway_uses_retained_control_with_lost_acks_and_reopen(
         cluster.in_group(shard).shutdown(node).await;
     }
     drop(nodes);
+    // OpenRaft shutdown does not join the state-machine/snapshot workers.
+    // Wait for their owners, then synchronously close each DB before one reopen.
+    for (shard, mut state) in closing {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match Arc::try_unwrap(state) {
+                Ok(state) => {
+                    drop(state);
+                    break;
+                }
+                Err(shared) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "shard {shard} still has {} state-machine owners before reopen",
+                        Arc::strong_count(&shared)
+                    );
+                    state = shared;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
     let mut reopened = Vec::new();
     for (shard, directory) in [9, 7, 8].into_iter().zip(&directories) {
         let node = cluster
