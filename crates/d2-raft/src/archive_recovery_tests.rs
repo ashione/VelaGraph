@@ -232,7 +232,8 @@ fn rows(sm: &StateMachine, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .filter(|(key, _)| key.starts_with(prefix))
         .collect()
 }
-// The published 11/13/15 schema has identical typed fields and field order.
+// The published 11/13/15 schema shares these fields with disk16.
+// Only disk16 carries the trailing checkpoint; legacy fixtures omit it.
 // Keeping this strict copy local prevents JSON-tree rewriting from accidentally
 // manufacturing a noncanonical fixture which fails before index validation.
 #[derive(Serialize, Deserialize)]
@@ -245,6 +246,8 @@ struct Header {
     dedup_bytes_limit: Option<usize>,
     managed: crate::D1ManagedMode,
     ledger: event_ledger::Descriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<crate::transaction_decisions::checkpoint::ActiveCheckpoint>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -268,7 +271,8 @@ fn header(sm: &StateMachine) -> Header {
 }
 fn assert_retired(sm: &StateMachine, profile: CapacityProfile) {
     let value = header(sm);
-    assert_eq!(value.version, 15);
+    assert_eq!(value.version, 16);
+    assert!(value.checkpoint.is_some());
     assert_eq!(value.ledger.domain.cohort, cohort(profile));
     assert_eq!(value.ledger.version, profile.storage_format());
     assert!(rows(sm, PREFIX).is_empty());
@@ -298,19 +302,22 @@ async fn legacy_fixture(path: &Path, profile: CapacityProfile) {
     setup(&mut sm, profile).await;
     apply(&mut sm, vec![admit(profile, 900, 1), abort(1)]).await;
     let state = sm.state.read().await;
+    let full = sm.load_disk_state(&state).unwrap().unwrap().state;
     let mut value = header(&sm);
-    assert_eq!(value.version, 15);
+    assert_eq!(value.version, 16);
+    assert!(value.checkpoint.is_some());
     value.version = if profile == CapacityProfile::LegacyCountV1 {
         11
     } else {
         13
     };
+    value.checkpoint = None;
     let storage = sm.storage.as_ref().unwrap();
     let mut batch = WriteBatch::default();
     crate::request_index::stage(
         &mut batch,
         None,
-        state.d1.as_ref(),
+        Some(&full),
         state.last_applied_log,
         false,
         true,
@@ -318,8 +325,7 @@ async fn legacy_fixture(path: &Path, profile: CapacityProfile) {
     .unwrap();
     batch.put(D1_KEY, serde_json::to_vec(&value).unwrap());
     storage.write_sync(batch).unwrap();
-    crate::request_index::validate(&storage.db, state.d1.as_ref(), state.last_applied_log, true)
-        .unwrap();
+    crate::request_index::validate(&storage.db, Some(&full), state.last_applied_log, true).unwrap();
     assert_eq!(rows(&sm, PREFIX).len(), 1);
     assert!(storage.db.get(MANIFEST_KEY).unwrap().is_some());
     drop(state);
@@ -415,8 +421,8 @@ fn archive_reads_match_strict_replay_across_profiles_and_frozen_cuts() {
         for external in [1, 17, 33, 999] {
             let expected = runtime.block_on(async {
                 let state = sm.state.read().await;
-                crate::request_index::lookup(state.d1.as_ref().unwrap(), id(external), None)
-                    .unwrap()
+                let full = sm.load_disk_state(&state).unwrap().unwrap().state;
+                crate::request_index::lookup(&full, id(external), None).unwrap()
             });
             let actual = crate::transaction_decisions::without_full_journal(|| {
                 runtime.block_on(lookup(&sm, external))
@@ -478,7 +484,7 @@ async fn archive_read_closes_full_namespace_after_found_missing_and_old_cut() {
             let base = frozen.history_cursor_at(0).unwrap();
             let cut = frozen.history_cursor().unwrap();
             apply(&mut sm, (2..=34).map(|n| admit(profile, n, n)).collect()).await;
-            let cached = serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap()).unwrap();
+            let cached = sm.state.read().await.d1.as_ref().unwrap().clone();
             let original = lookup(&sm, 900).await;
             assert!(original.record.is_some());
             assert!(lookup(&sm, 999).await.record.is_none());
@@ -513,10 +519,7 @@ async fn archive_read_closes_full_namespace_after_found_missing_and_old_cut() {
                         .unwrap();
                 }
             }
-            assert_eq!(
-                serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap()).unwrap(),
-                cached
-            );
+            assert_eq!(sm.state.read().await.d1.as_ref().unwrap().clone(), cached);
             for external in [900, 999] {
                 assert!(
                     sm.coordinator_request(7, 3, [1; 16], id(external))
@@ -551,7 +554,7 @@ async fn legacy_index_damage_cannot_be_repaired_by_ordinary_migration() {
             legacy_fixture(dir.path(), profile).await;
             let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
             let marker = sm.applied().await;
-            let cached = serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap()).unwrap();
+            let cached = sm.state.read().await.d1.as_ref().unwrap().clone();
             let (key, value) = rows(&sm, PREFIX).pop().unwrap();
             let db = &sm.storage.as_ref().unwrap().db;
             match case {
@@ -581,10 +584,7 @@ async fn legacy_index_damage_cannot_be_repaired_by_ordinary_migration() {
             );
             assert_eq!(disk(&sm), damaged);
             assert_eq!(sm.applied().await, marker);
-            assert_eq!(
-                serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap()).unwrap(),
-                cached
-            );
+            assert_eq!(sm.state.read().await.d1.as_ref().unwrap().clone(), cached);
             assert_eq!(
                 header(&sm).version,
                 if profile == CapacityProfile::LegacyCountV1 {
@@ -600,7 +600,7 @@ async fn legacy_index_damage_cannot_be_repaired_by_ordinary_migration() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn disk15_reintroduced_request_row_or_manifest_rejects_all_authoritative_paths() {
+async fn disk16_reintroduced_request_row_or_manifest_rejects_all_authoritative_paths() {
     for profile in profiles() {
         for manifest in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -808,7 +808,7 @@ async fn archive_retirement_crash_child() -> anyhow::Result<()> {
     // This marker is written only after the existing post-sync gate is reached,
     // and the independently inspected disk already contains the complete retirement.
     let published = header(&observer);
-    assert_eq!(published.version, 15);
+    assert_eq!(published.version, 16);
     assert_eq!(published.ledger.domain.cohort, cohort(profile));
     assert!(rows(&observer, PREFIX).is_empty());
     assert!(observer
@@ -1141,7 +1141,7 @@ async fn managed_tcp_archive_reads_reject_damaged_tail_and_recover_exact_evidenc
 }
 
 #[tokio::test]
-async fn disk15_missing_private_cut_never_falls_back_and_membership_refreshes_it() {
+async fn disk16_missing_private_cut_never_falls_back_and_membership_refreshes_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
     let profile = CapacityProfile::LegacyCountV1;

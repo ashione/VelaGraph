@@ -710,11 +710,14 @@ integrity assumption, and the 256 / 1,024 / 16 MiB lifetime limits remain unchan
 
 The [authoritative event ledger](docs/AUTHORITATIVE_EVENT_LEDGER.md) stores
 fixed-cohort Commands as the sole live decision authority. Bound coordinators
-write disk v15; members keep v12/v14. Open, apply, snapshot and other full-history
-paths still strictly replay raw segments and retain complete Journals. The two
-archive readers do not remove writer/member/snapshot residency, the 16 MiB
-lifetime budget, profile-specific bounds or local D1 limits. Wire formats,
-capacity grants and managed RPC v5 are unchanged by this reader slice.
+in the [S2 draft](docs/COORDINATOR_ACTIVE_CHECKPOINT.md) write disk v16 and consume
+an active checkpoint instead of a resident/ordinary apply-candidate full Journal;
+members keep v12/v14. Raw closure is still checked on each ordinary writer call.
+Cold replay, member/control/Terminal paths and complete snapshots still materialize
+history; metadata and current snapshot bytes remain resident. Resolving holes
+releases no historical capacity. The 16 MiB lifetime budget, profile-specific and
+local D1 limits, grants and managed RPC v5 are unchanged. S1 disk v15 remains an
+actual migration input. Draft implementation acceptance is not claimed.
 
 New empty cohorts can explicitly select the [immutable byte-budget capacity
 profile](docs/COHORT_CAPACITY_PROFILE.md). Actual durable grants from every member

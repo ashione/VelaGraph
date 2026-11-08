@@ -123,8 +123,8 @@ fn index_rows(sm: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
         .filter(|(k, _)| k.starts_with(PREFIX))
         .collect()
 }
-// Exact published journal-less coordinator schema. Fixture rewrites change only
-// this typed version field and stage actual legacy rows from the frozen state.
+// Typed disk16 and legacy header fields. Legacy fixtures explicitly remove the
+// checkpoint and stage historical rows from the materialized frozen authority.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyIndexHeader {
@@ -135,6 +135,8 @@ struct LegacyIndexHeader {
     dedup_bytes_limit: Option<usize>,
     managed: crate::D1ManagedMode,
     ledger: event_ledger::Descriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<crate::transaction_decisions::checkpoint::ActiveCheckpoint>,
 }
 fn assert_retired(sm: &StateMachine) {
     assert!(index_rows(sm).is_empty());
@@ -143,24 +145,28 @@ fn assert_retired(sm: &StateMachine) {
     assert!(!storage.request_indexed.load(Ordering::Relaxed));
     let header: LegacyIndexHeader =
         serde_json::from_slice(&storage.db.get(D1_KEY).unwrap().unwrap()).unwrap();
-    assert_eq!(header.version, 15);
+    assert_eq!(header.version, 16);
+    assert!(header.checkpoint.is_some());
 }
 async fn indexed_legacy_fixture(path: &Path) {
     let mut sm = Arc::new(StateMachine::open(path).unwrap());
     setup(&mut sm).await;
     sm.apply([entry(5, admit(900, 1))]).await.unwrap();
     let state = sm.state.read().await;
+    let full = sm.load_disk_state(&state).unwrap().unwrap().state;
     let storage = sm.storage.as_ref().unwrap();
     let bytes = storage.db.get(D1_KEY).unwrap().unwrap();
     let mut header: LegacyIndexHeader = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(header.version, 15);
+    assert_eq!(header.version, 16);
+    assert!(header.checkpoint.is_some());
     assert_eq!(serde_json::to_vec(&header).unwrap(), bytes);
     header.version = 11;
+    header.checkpoint = None;
     let mut batch = WriteBatch::default();
     crate::request_index::stage(
         &mut batch,
         None,
-        state.d1.as_ref(),
+        Some(&full),
         state.last_applied_log,
         false,
         true,
@@ -168,8 +174,7 @@ async fn indexed_legacy_fixture(path: &Path) {
     .unwrap();
     batch.put(D1_KEY, serde_json::to_vec(&header).unwrap());
     storage.write_sync(batch).unwrap();
-    crate::request_index::validate(&storage.db, state.d1.as_ref(), state.last_applied_log, true)
-        .unwrap();
+    crate::request_index::validate(&storage.db, Some(&full), state.last_applied_log, true).unwrap();
     assert_eq!(index_rows(&sm).len(), 1);
     assert!(storage.db.get(MANIFEST_KEY).unwrap().is_some());
     drop(state);
@@ -299,7 +304,7 @@ async fn index_admission_batch_retry_failure_and_reopen_are_atomic() {
                 .unwrap()
         )
         .unwrap()["version"],
-        15
+        16
     );
 }
 

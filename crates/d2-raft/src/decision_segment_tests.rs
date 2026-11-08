@@ -198,18 +198,19 @@ fn fail_sync(sm: &StateMachine) {
 async fn downgrade(sm: &StateMachine, member: bool) {
     let storage = sm.storage.as_ref().unwrap();
     let state = sm.state.read().await;
+    let full = sm.load_disk_state(&state).unwrap().unwrap().state;
     // Construct an actual published legacy header, not a new header with a
     // changed number. The fixture is reopened before any read or mutation.
     let metadata = serde_json::json!({
         "version": if member { 7 } else { 8 },
-        "state": state.d1.as_ref().unwrap().stage(),
+        "state": full.stage(),
     });
     let mut batch = WriteBatch::default();
     if !member {
         crate::request_index::stage(
             &mut batch,
             None,
-            state.d1.as_ref(),
+            Some(&full),
             state.last_applied_log,
             false,
             true,
@@ -256,16 +257,7 @@ async fn boundaries_holes_and_member_applied_are_distinct() {
     assert_eq!(rows(&coord).len(), 3);
     assert_eq!(rows(&coord)[0], sealed);
     assert_eq!(prefix(&coord, 1, false).await, old);
-    let history = coord
-        .state
-        .read()
-        .await
-        .d1
-        .as_ref()
-        .unwrap()
-        .coordinator
-        .clone()
-        .unwrap();
+    let history = coord.coordinator_journal(9, 1, [9; 16]).await.unwrap();
     for ordinal in 1..=64 {
         apply(&mut member, vec![advance(ordinal, &history)]).await;
         if [31, 32, 33, 64].contains(&ordinal) {
@@ -974,16 +966,7 @@ async fn unchanged_transaction_cap_preserves_last_reserved_decision_and_nonparti
         prefix(&sm, 1, false).await,
         journal(1).terminal_prefix(1).unwrap()
     );
-    let history = sm
-        .state
-        .read()
-        .await
-        .d1
-        .as_ref()
-        .unwrap()
-        .coordinator
-        .clone()
-        .unwrap();
+    let history = sm.coordinator_journal(9, 1, [9; 16]).await.unwrap();
     let member_dir = tempfile::tempdir().unwrap();
     let mut member = Arc::new(StateMachine::open(member_dir.path()).unwrap());
     setup(&mut member, true).await;

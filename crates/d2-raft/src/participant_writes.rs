@@ -206,8 +206,13 @@ impl D1State {
     pub(crate) fn capacity_profile(&self) -> crate::transaction_decisions::CapacityProfile {
         self.coordinator
             .as_ref()
-            .or_else(|| self.visibility.as_ref().map(|v| &v.journal))
-            .map_or_else(Default::default, |journal| journal.capacity_profile())
+            .map(|coordinator| coordinator.capacity_profile())
+            .or_else(|| {
+                self.visibility
+                    .as_ref()
+                    .map(|v| v.journal.capacity_profile())
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn check_participant(

@@ -149,7 +149,11 @@ struct Manifest {
 }
 impl Manifest {
     fn of(state: &D1State, applied: Option<LogId<NodeId>>) -> anyhow::Result<Self> {
-        let journal = state.coordinator.as_ref().unwrap();
+        let journal = state
+            .coordinator
+            .as_ref()
+            .and_then(|coordinator| coordinator.full())
+            .ok_or_else(|| anyhow::anyhow!("legacy request index requires full journal"))?;
         let mut encoded_bytes = 0u64;
         for record in journal.requests() {
             encoded_bytes += (key(state, record.id).len()
@@ -195,7 +199,11 @@ pub(crate) fn validate(
         }
         anyhow::ensure!(indexed, "orphan or mixed-format request index");
         let state = state.ok_or_else(|| anyhow::anyhow!("orphan request index"))?;
-        let journal = state.coordinator.as_ref().unwrap();
+        let journal = state
+            .coordinator
+            .as_ref()
+            .and_then(|coordinator| coordinator.full())
+            .ok_or_else(|| anyhow::anyhow!("legacy request index requires full journal"))?;
         count += 1;
         anyhow::ensure!(count <= journal.requests().len(), "extra request index row");
         let row = Row::decode(&value)?;
@@ -227,7 +235,7 @@ pub(crate) fn validate(
     Ok(())
 }
 
-/// Disk-15 has no duplicate request namespace, including malformed/foreign rows.
+/// Disk15/16 has no duplicate request namespace, including malformed/foreign rows.
 /// Use the same snapshot as the raw reader so residue cannot cross read cuts.
 pub(crate) fn reject_retired_snapshot(snapshot: &Snapshot<'_>) -> anyhow::Result<()> {
     // Inspect keys only: malformed retired values have no useful size bound and
@@ -273,7 +281,11 @@ pub(crate) fn stage_unbound_or_retire(
     });
     let manifest = unbound
         .map(|state| -> anyhow::Result<Vec<u8>> {
-            let journal = state.coordinator.as_ref().unwrap();
+            let journal = state
+                .coordinator
+                .as_ref()
+                .and_then(|coordinator| coordinator.full())
+                .ok_or_else(|| anyhow::anyhow!("legacy request index requires full journal"))?;
             anyhow::ensure!(
                 journal.cohort().is_none()
                     && journal.requests().is_empty()
@@ -323,11 +335,16 @@ pub(crate) fn stage(
     let Some(state) = next.filter(|s| s.coordinator.is_some()) else {
         return Ok(None);
     };
-    let journal = state.coordinator.as_ref().unwrap();
+    let journal = state
+        .coordinator
+        .as_ref()
+        .unwrap()
+        .full()
+        .expect("legacy request index requires full journal");
     let skip = if indexed && !replace {
         before
             .and_then(|s| s.coordinator.as_ref())
-            .map_or(0, |j| j.requests().len())
+            .map_or(0, |j| j.full().unwrap().requests().len())
     } else {
         0
     };
@@ -352,6 +369,7 @@ pub(crate) fn lookup(
     let journal = state
         .coordinator
         .as_ref()
+        .and_then(|state| state.full())
         .ok_or(D1Error::CoordinatorNotEnabled)?;
     let expected = journal.request(id);
     let record = if let Some((db, manifest)) = index {
@@ -457,7 +475,7 @@ mod tests {
             journal.replay_event(event).unwrap();
         }
         let mut state = D1State::new(cohort.coordinator_shard, cohort.coordinator_epoch);
-        state.coordinator = Some(journal);
+        state.coordinator = Some(journal.into());
         state
     }
 
@@ -493,7 +511,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        unbound.coordinator = Some(journal);
+        unbound.coordinator = Some(journal.into());
         let mut batch = WriteBatch::default();
         let bytes = stage_unbound_or_retire(&mut batch, Some(&unbound), None, true)
             .unwrap()
@@ -556,7 +574,12 @@ mod tests {
     #[test]
     fn byte_profile_request_index_reopens_and_binds_original_plan_and_namespace() {
         let state = byte_state();
-        let journal = state.coordinator.as_ref().unwrap();
+        let journal = state
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .full()
+            .expect("legacy request index requires full journal");
         let record = &journal.requests()[0];
         let dir = tempfile::tempdir().unwrap();
         let manifest = {
@@ -671,7 +694,7 @@ mod tests {
     #[test]
     fn index_key_row_and_manifest_have_versioned_golden_encodings() {
         let mut state = D1State::new(7, 3);
-        state.coordinator = Some(Journal::new([1; 16]).unwrap());
+        state.coordinator = Some(Journal::new([1; 16]).unwrap().into());
         assert_eq!(
             key(&state, [2; 16]),
             [

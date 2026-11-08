@@ -86,20 +86,25 @@ GlobalCommittedSnapshot admission is still Unsupported.
 
 [Point recovery](DURABLE_REQUEST_INDEX.md) provides leader-barrier original-Plan
 lookup and admission readback without transferring the full Journal. Current bound
-coordinator disk v15 derives that evidence from raw Commands, retaining only the
-target request and transaction. Begin and AdmitRequest determine absolute ordinals;
+coordinator disk v16 (and actual S1 disk-v15 migration inputs) derives that
+evidence from raw Commands, retaining only the target request and transaction.
+Begin and AdmitRequest determine absolute ordinals;
 binding/grant events do not. Matching Prepared/Decide events preserve partial
 prepares and terminal decisions even beyond an earlier unresolved hole. Found and
 absent results both require full namespace/chain verification against a private
 validated published cut; Unknown never means Abort.
 
 The duplicate request index is retired only after strict legacy validation during
-normal atomic migration. Actual legacy formats keep their old readers until apply;
-disk v15 residual request rows/manifests fail closed. Explicit validated snapshot
-repair remains supported. See the [storage/read contract](AUTHORITATIVE_EVENT_LEDGER.md).
+normal atomic migration. Actual v15 and older legacy formats keep their readers
+until a successful batch writes v16; v15 already requires the index to be absent.
+Residual request rows/manifests fail closed in both v15 and v16. Explicit validated
+snapshot repair remains supported. See the [storage/read contract](AUTHORITATIVE_EVENT_LEDGER.md).
 Managed RPC v5, original Plan bytes, first-plan-wins behavior and existing deadlines
-are unchanged. End-to-end decide/status/Prepare, writer/member state and complete
-snapshots still use full Journals. The opt-in [byte profile](COHORT_CAPACITY_PROFILE.md)
+are unchanged. The [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md) consumes an active
+checkpoint for the durable bound coordinator resident/ordinary apply candidate
+and uses compact remote Command preflight. Cold replay, explicit control/Terminal,
+end-to-end decide/status/Prepare, member state and complete snapshot materialization
+still use full Journals. S2 acceptance is pending. The opt-in [byte profile](COHORT_CAPACITY_PROFILE.md)
 replaces the legacy count quotas above, not the 16 MiB budget or local D1 limits.
 Every archive lookup remains O(total history); no speed or lifetime extension is
 claimed by this reader change.

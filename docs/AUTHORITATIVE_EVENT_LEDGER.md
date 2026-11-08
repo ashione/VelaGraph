@@ -1,7 +1,18 @@
 # Authoritative event ledger
 
-Status: fixed-cohort live disk state reconstructs decision authority from original
-Command segments. Bound coordinators now write **disk v15** for both unchanged
+Current source status: [S2 active checkpoint](COORDINATOR_ACTIVE_CHECKPOINT.md)
+replaces the durable bound coordinator runtime and ordinary apply candidate with
+a consumed checkpoint and writes disk v16. Raw Commands remain sole authority;
+profiles, grants, member formats and RPC v5 are unchanged. This is a draft
+implementation, with acceptance still pending.
+
+The sections below preserve the **historical S1 / disk-v15 contract**, including
+its full-writer replay and resident-Journal limitations; those are not descriptions
+of the new disk-v16 ordinary writer. They still specify actual v15 migration
+inputs and the shared raw/read contracts unless S2 explicitly replaces a path.
+
+S1 status: fixed-cohort live disk state reconstructs decision authority from original
+Command segments. Bound coordinators in S1 write **disk v15** for both unchanged
 profiles; members retain v12 (`LegacyCountV1`) or v14 (`ByteBound16MiBV1`). The
 historical v11/v13 coordinator headers remain strict migration inputs. None of
 these typed headers embeds the complete Journal in `sm/d1`.
@@ -110,14 +121,24 @@ below instead. Private history/I/O failures retain existing error mappings; no n
 wire errors or fallback protocol are added. Existing terminal/read entrypoints
 keep their requested-index-range checks rather than claiming to scan all unrelated
 future rows. Coordinator Summary/Terminal also reject retired request rows or
-manifests with a key-only check; this does not scan unrelated raw or terminal rows.
-Disk-v15 errors never fall back to the cached Journal.
+manifests with a key-only check. In S1 this did not scan unrelated raw or terminal
+rows. Current S2 Summary additionally verifies the complete raw cut; Terminal
+explicitly materializes full raw history while still checking only the requested
+terminal rows. Disk-v15/v16 errors never fall back to a cached Journal.
 
 ## Archive-backed coordinator reads (S1)
 
-`PublishedArchiveCut` is private, non-serializable and contains no Journal,
-event list, Plan archive or transaction vector. It binds full role/local/authority/
-cohort/profile identity, exact raw descriptor and metadata bytes, full applied
+In historical S1, `PublishedArchiveCut` is private, non-serializable and contains
+no Journal, event list, Plan archive or transaction vector. In current S2, the cut
+and runtime share one immutable checkpoint Arc containing the bounded active
+transaction vector `(R,N]`; neither owns a full Journal. Storage and cut each cache
+canonical metadata bytes including the checkpoint. Reading `sm/d1` from the DB
+snapshot additionally owns temporary metadata bytes, including checkpoint bytes
+up to its structural ceiling. Complete current snapshot bytes remain resident.
+The target/page retention descriptions below concern the raw projection, not the
+reader's total allocations or the whole process. See the [S2 memory boundary](COORDINATOR_ACTIVE_CHECKPOINT.md#replacement-and-authority).
+
+The cut binds full role/local/authority/cohort/profile identity, exact raw descriptor and metadata bytes, full applied
 LogId (including leader identity), resolved frontier and expected decision manifest.
 It is prepared only from strict cold-open validation or the exact validated
 apply/snapshot candidate. Publication happens under the existing state lock after
@@ -145,9 +166,9 @@ semantically invalid but consistently rehashed archive. No caller can supply or
 deserialize a cut. Ordinary reads cannot repair missing data.
 
 LookupRequest counts Begin and AdmitRequest, not BindCohort or capacity-confirmation
-events, to derive the absolute transaction ordinal. It retains only the requested
-original request (at most 64 KiB), exact original Plan (at most 256 KiB), transaction
-and up to 64 ordered participants, plus one current row and scalar counters.
+events, to derive the absolute transaction ordinal. Its raw projection retains
+only the requested original request (at most 64 KiB), exact original Plan
+(at most 256 KiB), transaction and up to 64 ordered participants, plus one current row and scalar counters.
 Matching Prepared/Decide events use the same extracted Transaction transition
 checks as strict Journal replay. Pending prepare bits and terminal decisions beyond
 an earlier hole remain exact. The unchanged RequestLookup validator runs after
@@ -156,7 +177,8 @@ No collection proportional to all external IDs is retained by this reader.
 
 HistoryPage captures roots at the absolute base and frozen-cut event positions,
 collects at most 32 events / 4 MiB, and continues verification to the current head.
-It retains one current row plus one bounded page. Existing V0/empty, overlap,
+Its raw projection retains one current row plus one bounded page, in addition to
+metadata validation and the shared state described above. Existing V0/empty, overlap,
 immutable-cut and future-tail semantics remain. The same-snapshot decision
 manifest/frontier check uses the expected published bytes, not a full Journal.
 
@@ -164,9 +186,11 @@ Each read is still **O(total history) disk work**. Existing deadlines and bounde
 CPU-permit rules remain; timeout is an error, not partial output or unknown-ID
 success. This is reader independence and bounded result retention, not node-wide
 lazy recovery, a measured memory reduction, a throughput improvement or a longer
-write lifetime. Full Journal reconstruction remains on open/apply/snapshot and
-other paths, including participant HistoryStatus, grants and client decide/status/
-Prepare flows. Complete current snapshot bytes also remain resident.
+write lifetime. Historical S1 retained full Journal reconstruction on ordinary
+apply. S2 removes it from disk-v16 coordinator apply, while open/snapshot/member
+and explicit control paths still materialize complete history, including
+participant HistoryStatus, grants and client decide/status/Prepare flows.
+Complete current snapshot bytes also remain resident.
 
 ## Complete snapshots and migration
 

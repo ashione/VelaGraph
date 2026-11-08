@@ -5,7 +5,9 @@
 use super::event_ledger::{self, Descriptor, Role, Staged};
 use super::{D1_KEY, MAX_DEDUP_REQUESTS};
 use crate::capacity_policy::{CapacityActivation, CapacityProfile};
+use crate::coordinator_state::Coordinator;
 use crate::d1::D1State;
+use crate::transaction_decisions::checkpoint::ActiveCheckpoint;
 use crate::{D1ManagedMode, NodeId};
 use openraft::LogId;
 use rocksdb::DB;
@@ -67,6 +69,134 @@ struct CoordinatorMetadata<M, L> {
     ledger: L,
 }
 type CoordinatorHeader = CoordinatorMetadata<D1ManagedMode, Descriptor>;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveCoordinatorMetadata<M, L, C> {
+    version: u32,
+    shard: u64,
+    epoch: u64,
+    sequence: u64,
+    #[serde(deserialize_with = "required_option")]
+    dedup_bytes_limit: Option<usize>,
+    managed: M,
+    ledger: L,
+    checkpoint: C,
+}
+type ActiveCoordinatorHeader =
+    ActiveCoordinatorMetadata<D1ManagedMode, Descriptor, ActiveCheckpoint>;
+// One complete 64-member raw domain, descriptor counters/root/LogId and the D1
+// shell. Actual maximum-width codecs are pinned below; this is not admission.
+const MAX_ACTIVE_METADATA_OVERHEAD: usize = 16 * 1024;
+const MAX_ACTIVE_METADATA_BYTES: usize =
+    crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES
+        + MAX_ACTIVE_METADATA_OVERHEAD;
+
+pub(super) fn validate_active_metadata(
+    bytes: &[u8],
+    descriptor: &Descriptor,
+    checkpoint: &ActiveCheckpoint,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_ACTIVE_METADATA_BYTES,
+        "active metadata exceeds structural byte bound"
+    );
+    let meta: ActiveCoordinatorHeader = decode_new(bytes)?;
+    anyhow::ensure!(
+        meta.version == 16 && &meta.ledger == descriptor && &meta.checkpoint == checkpoint,
+        "active metadata differs from exact checkpoint candidate"
+    );
+    validate_disk_profile(16, Role::Coordinator, descriptor)?;
+    validate_common(
+        meta.shard,
+        meta.epoch,
+        meta.sequence,
+        meta.dedup_bytes_limit,
+        &meta.managed,
+        descriptor,
+        Role::Coordinator,
+    )?;
+    validate_checkpoint(descriptor, checkpoint)?;
+    Ok(())
+}
+
+fn validate_checkpoint(
+    descriptor: &Descriptor,
+    checkpoint: &ActiveCheckpoint,
+) -> anyhow::Result<()> {
+    checkpoint
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid active checkpoint: {e:?}"))?;
+    anyhow::ensure!(
+        descriptor.domain.role == Role::Coordinator
+            && checkpoint.authority() == descriptor.domain.authority.mode
+            && checkpoint.cohort() == Some(&descriptor.domain.cohort)
+            && checkpoint.event_count() == descriptor.event_count,
+        "checkpoint differs from raw authority domain/count"
+    );
+    Ok(())
+}
+
+pub(super) fn active_metadata_bytes(
+    state: &D1State,
+    descriptor: &Descriptor,
+    checkpoint: &ActiveCheckpoint,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        state.version == 4
+            && state.sequence == 0
+            && state.dedup.is_empty()
+            && state.participant.is_none()
+            && state.visibility.is_none(),
+        "invalid active coordinator state"
+    );
+    let coordinator = state
+        .coordinator
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing coordinator"))?;
+    match coordinator {
+        Coordinator::Full(journal) => anyhow::ensure!(
+            ActiveCheckpoint::from_journal(journal)
+                .map_err(|e| anyhow::anyhow!("checkpoint derivation: {e:?}"))?
+                == *checkpoint,
+            "checkpoint differs from full candidate"
+        ),
+        Coordinator::Active(active) => anyhow::ensure!(
+            active.as_ref() == checkpoint,
+            "checkpoint differs from live candidate"
+        ),
+    }
+    let managed = state
+        .managed
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing managed coordinator"))?;
+    validate_disk_profile(16, Role::Coordinator, descriptor)?;
+    validate_common(
+        state.shard,
+        state.epoch,
+        state.sequence,
+        state.dedup_bytes_limit,
+        managed,
+        descriptor,
+        Role::Coordinator,
+    )?;
+    validate_checkpoint(descriptor, checkpoint)?;
+    let bytes = serde_json::to_vec(&ActiveCoordinatorMetadata {
+        version: 16,
+        shard: state.shard,
+        epoch: state.epoch,
+        sequence: state.sequence,
+        dedup_bytes_limit: state.dedup_bytes_limit,
+        managed,
+        ledger: descriptor,
+        checkpoint,
+    })?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_ACTIVE_METADATA_BYTES,
+        "active metadata exceeds structural byte bound"
+    );
+    Ok(bytes)
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,11 +304,13 @@ fn validate_disk_profile(version: u32, role: Role, descriptor: &Descriptor) -> a
     let expected = match (version, role) {
         (11, Role::Coordinator) | (12, Role::Member) => CapacityProfile::LegacyCountV1,
         (13, Role::Coordinator) | (14, Role::Member) => CapacityProfile::ByteBound16MiBV1,
-        (15, Role::Coordinator) => match (descriptor.domain.cohort.profile, descriptor.version) {
-            (CapacityProfile::LegacyCountV1, 1) => CapacityProfile::LegacyCountV1,
-            (CapacityProfile::ByteBound16MiBV1, 2) => CapacityProfile::ByteBound16MiBV1,
-            _ => anyhow::bail!("unsupported disk-15 ledger profile/format"),
-        },
+        (15 | 16, Role::Coordinator) => {
+            match (descriptor.domain.cohort.profile, descriptor.version) {
+                (CapacityProfile::LegacyCountV1, 1) => CapacityProfile::LegacyCountV1,
+                (CapacityProfile::ByteBound16MiBV1, 2) => CapacityProfile::ByteBound16MiBV1,
+                _ => anyhow::bail!("unsupported disk-15 ledger profile/format"),
+            }
+        }
         _ => anyhow::bail!("invalid role for D1 disk version"),
     };
     anyhow::ensure!(
@@ -207,7 +339,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
     let mut request_indexed = false;
     let mut decision_indexed = false;
     let mut ledger = None;
-    if !matches!(version, 11..=15) {
+    if !matches!(version, 11..=16) {
         event_ledger::reject_orphans(db)?;
     }
     let state = match version {
@@ -299,6 +431,43 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             decision_indexed = meta.version == 10;
             meta.state
         }
+        16 => {
+            anyhow::ensure!(
+                bytes.len() <= MAX_ACTIVE_METADATA_BYTES,
+                "active metadata exceeds structural byte bound"
+            );
+            let meta: ActiveCoordinatorHeader = decode_new(&bytes)?;
+            validate_active_metadata(&bytes, &meta.ledger, &meta.checkpoint)?;
+            anyhow::ensure!(
+                meta.sequence == 0 && meta.ledger.applied == applied,
+                "active coordinator sequence/applied marker mismatch"
+            );
+            crate::request_index::reject_retired_namespace(db)?;
+            let loaded = event_ledger::load(db, &meta.ledger)?;
+            let derived = ActiveCheckpoint::from_journal(loaded.journal())
+                .map_err(|e| anyhow::anyhow!("checkpoint replay: {e:?}"))?;
+            anyhow::ensure!(
+                derived == meta.checkpoint,
+                "persisted checkpoint disagrees with strict raw replay"
+            );
+            let state = D1State {
+                version: 4,
+                dedup_bytes_limit: meta.dedup_bytes_limit,
+                managed: Some(meta.managed),
+                coordinator: Some(loaded.journal().clone().into()),
+                participant: None,
+                visibility: None,
+                shard: meta.shard,
+                epoch: meta.epoch,
+                sequence: 0,
+                dedup: Vec::new(),
+            };
+            loaded.validate_hydrated_state(&state)?;
+            ledger = Some(loaded);
+            decision_indexed = true;
+            request_indexed = false;
+            state
+        }
         11 | 13 | 15 => {
             let meta: CoordinatorHeader = decode_new(&bytes)?;
             validate_disk_profile(version, Role::Coordinator, &meta.ledger)?;
@@ -324,7 +493,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                 version: 4,
                 dedup_bytes_limit: meta.dedup_bytes_limit,
                 managed: Some(meta.managed),
-                coordinator: Some(loaded.journal().clone()),
+                coordinator: Some(loaded.journal().clone().into()),
                 participant: None,
                 visibility: None,
                 shard: meta.shard,
@@ -390,6 +559,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             state
                 .coordinator
                 .iter()
+                .filter_map(Coordinator::full)
                 .chain(state.visibility.iter().map(|v| &v.journal))
                 .all(|j| j.capacity_profile() == CapacityProfile::LegacyCountV1)
                 && state
@@ -419,6 +589,7 @@ pub(super) fn d1_metadata_bytes(
     let bound = state
         .coordinator
         .iter()
+        .filter_map(Coordinator::full)
         .chain(
             state
                 .visibility
@@ -528,7 +699,10 @@ pub(super) fn d1_metadata_bytes(
     }
     if let Some(journal) = &state.coordinator {
         anyhow::ensure!(
-            journal.cohort().is_none() && journal.requests().is_empty(),
+            journal.cohort().is_none()
+                && journal
+                    .full()
+                    .is_some_and(|full| full.requests().is_empty()),
             "unbound coordinator cannot contain a cohort or external requests"
         );
         return Ok(serde_json::to_vec(&LegacyMetadata { version: 8, state })?);
@@ -642,7 +816,7 @@ mod tests {
             });
         } else {
             state.version = 4;
-            state.coordinator = Some(journal);
+            state.coordinator = Some(journal.into());
         }
         state.validate().unwrap();
         state
@@ -653,7 +827,7 @@ mod tests {
         let old = if member {
             &state.visibility.as_ref().unwrap().journal
         } else {
-            state.coordinator.as_ref().unwrap()
+            state.coordinator.as_ref().unwrap().full().unwrap()
         };
         let mut cohort = old.cohort().unwrap().clone();
         cohort.profile = CapacityProfile::ByteBound16MiBV1;
@@ -686,7 +860,7 @@ mod tests {
             visibility.journal = journal;
             visibility.activation = Some(activation);
         } else {
-            state.coordinator = Some(journal);
+            state.coordinator = Some(journal.into());
         }
         state.validate().unwrap();
         state.validate_capacity_activation(applied()).unwrap();
@@ -711,7 +885,7 @@ mod tests {
 
     fn state_journal_mut(state: &mut D1State) -> &mut Journal {
         match &mut state.coordinator {
-            Some(journal) => journal,
+            Some(journal) => journal.full_mut().unwrap(),
             None => &mut state.visibility.as_mut().unwrap().journal,
         }
     }
@@ -829,7 +1003,7 @@ mod tests {
                 }
                 let foreign_role = if member {
                     let mut coordinator = state(false, false);
-                    coordinator.coordinator = Some(loaded.journal().clone());
+                    coordinator.coordinator = Some(loaded.journal().clone().into());
                     coordinator
                 } else {
                     let mut participant = state(true, false);
@@ -938,6 +1112,88 @@ mod tests {
     }
 
     #[test]
+    fn disk16_golden_and_maximum_metadata_overhead_are_bounded() {
+        let state = state(false, false);
+        let mut batch = WriteBatch::default();
+        let staged = event_ledger::stage(&mut batch, None, Some(&state), applied(), false)
+            .unwrap()
+            .unwrap();
+        let checkpoint =
+            ActiveCheckpoint::from_journal(state.coordinator.as_ref().unwrap().full().unwrap())
+                .unwrap();
+        let descriptor = staged.descriptor_for(&state).unwrap();
+        let bytes = active_metadata_bytes(&state, descriptor, &checkpoint).unwrap();
+        assert_eq!(
+            bytes,
+            include_bytes!("../tests/fixtures/active-coordinator-metadata-bound-v16.json")
+        );
+        validate_active_metadata(&bytes, descriptor, &checkpoint).unwrap();
+        assert!(validate_active_metadata(
+            &vec![b' '; MAX_ACTIVE_METADATA_BYTES + 1],
+            descriptor,
+            &checkpoint
+        )
+        .is_err());
+
+        let cohort = crate::transaction_decisions::Cohort {
+            coordinator_shard: u64::MAX,
+            coordinator_epoch: u64::MAX,
+            profile: CapacityProfile::ByteBound16MiBV1,
+            members: (0..crate::transaction_decisions::MAX_PARTICIPANTS as u64)
+                .map(|n| crate::transaction_decisions::Member {
+                    shard: u64::MAX - 1 - n,
+                    epoch: u64::MAX,
+                    mode: [255; 16],
+                })
+                .rev()
+                .collect(),
+        };
+        let mut journal = Journal::new([255; 16]).unwrap();
+        journal.apply(Command::BindCohort { cohort }).unwrap();
+        let mut wide = D1State::new(u64::MAX, u64::MAX);
+        wide.version = 4;
+        wide.managed = Some(D1ManagedMode {
+            mode_id: [255; 16],
+            activated_sequence: 0,
+        });
+        wide.dedup_bytes_limit = Some(crate::EXTENDED_DEDUP_BYTES);
+        wide.coordinator = Some(journal.into());
+        let marker = Some(LogId::new(
+            CommittedLeaderId::new(u64::MAX, u64::MAX),
+            u64::MAX,
+        ));
+        let mut batch = WriteBatch::default();
+        let staged = event_ledger::stage(&mut batch, None, Some(&wide), marker, false)
+            .unwrap()
+            .unwrap();
+        let checkpoint =
+            ActiveCheckpoint::from_journal(wide.coordinator.as_ref().unwrap().full().unwrap())
+                .unwrap();
+        let mut descriptor = staged.descriptor_for(&wide).unwrap().clone();
+        // Maximal scalar digit widths only enlarge the header. The typed
+        // structure's actual overhead is independent of checkpoint contents.
+        descriptor.event_count = u64::MAX;
+        descriptor.segment_count = u64::MAX;
+        descriptor.encoded_bytes = u64::MAX;
+        descriptor.head_root = [255; 32];
+        let bytes = serde_json::to_vec(&ActiveCoordinatorMetadata {
+            version: 16,
+            shard: wide.shard,
+            epoch: wide.epoch,
+            sequence: wide.sequence,
+            dedup_bytes_limit: wide.dedup_bytes_limit,
+            managed: wide.managed.as_ref().unwrap(),
+            ledger: &descriptor,
+            checkpoint: &checkpoint,
+        })
+        .unwrap();
+        assert!(
+            bytes.len() - serde_json::to_vec(&checkpoint).unwrap().len()
+                <= MAX_ACTIVE_METADATA_OVERHEAD
+        );
+    }
+
+    #[test]
     fn byte_profile_metadata_reopens_with_exact_immutable_activation() {
         for member in [false, true] {
             for confirmed in [false, true] {
@@ -991,7 +1247,7 @@ mod tests {
         // Derive this fixture from the admitted cohort, not the distinct
         // bound-only golden (whose member identities intentionally differ).
         let mut byte = state(false, true);
-        let original = byte.coordinator.take().unwrap();
+        let original = byte.coordinator.take().unwrap().into_full().unwrap();
         let mut cohort = original.cohort().unwrap().clone();
         cohort.profile = CapacityProfile::ByteBound16MiBV1;
         let mut history = Journal::new(original.authority()).unwrap();
@@ -1017,7 +1273,7 @@ mod tests {
                     .collect(),
             })
             .unwrap();
-        byte.coordinator = Some(history);
+        byte.coordinator = Some(history.into());
         for event in &original.events()[1..] {
             let mut event = event.clone();
             if let Command::AdmitRequest { payload, .. } = &mut event {
@@ -1027,6 +1283,8 @@ mod tests {
             }
             byte.coordinator
                 .as_mut()
+                .unwrap()
+                .full_mut()
                 .unwrap()
                 .replay_event(event)
                 .unwrap();
@@ -1051,7 +1309,13 @@ mod tests {
             assert!(loaded.request_indexed);
             assert!(loaded.decision_indexed);
             crate::request_index::validate(&db, Some(&loaded.state), applied(), true).unwrap();
-            let record = &state.coordinator.as_ref().unwrap().requests()[0];
+            let record = &state
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .full()
+                .unwrap()
+                .requests()[0];
             db.delete(crate::request_index::key(&state, record.id))
                 .unwrap();
             assert!(
@@ -1150,8 +1414,11 @@ mod tests {
             assert!(load(&db, None).is_err());
             assert_eq!(load(&db, applied()).unwrap().unwrap().state, state);
             let mut legacy = state.clone();
-            legacy.coordinator =
-                Some(Journal::new(state.managed.as_ref().unwrap().mode_id).unwrap());
+            legacy.coordinator = Some(
+                Journal::new(state.managed.as_ref().unwrap().mode_id)
+                    .unwrap()
+                    .into(),
+            );
             db.put(
                 D1_KEY,
                 serde_json::to_vec(&LegacyMetadata {
@@ -1457,7 +1724,13 @@ mod tests {
             )
             .unwrap();
             if loaded.request_indexed {
-                let record = &state.coordinator.as_ref().unwrap().requests()[0];
+                let record = &state
+                    .coordinator
+                    .as_ref()
+                    .unwrap()
+                    .full()
+                    .unwrap()
+                    .requests()[0];
                 db.delete(crate::request_index::key(&state, record.id))
                     .unwrap();
                 assert!(
@@ -1467,7 +1740,7 @@ mod tests {
             }
         }
         let mut unbound = state(false, false);
-        unbound.coordinator = Some(Journal::new([9; 16]).unwrap());
+        unbound.coordinator = Some(Journal::new([9; 16]).unwrap().into());
         let bytes = d1_metadata_bytes(&unbound, None).unwrap();
         let metadata: LegacyMetadata<D1State> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(metadata.version, 8);
