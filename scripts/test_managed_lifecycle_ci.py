@@ -797,6 +797,23 @@ class HandoffTests(unittest.TestCase):
                 with patch.dict(os.environ, {'GITHUB_SHA': 'f' * 40, 'LIFECYCLE_EVENT_HEAD_SHA': 'f' * 40}), self.assertRaises(ValueError):
                     gate.checkout_identity(root)
 
+    def test_provenance_path_is_exported_at_runtime_not_job_expression_scope(self):
+        text = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()
+        runtime = text.split('  lifecycle:', 1)[1].split('  scenario:', 1)[0]
+        before_steps = runtime.split('    steps:', 1)[0]
+        # GitHub's context-availability contract excludes runner from jobs.<id>.env.
+        # https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
+        def check_job_scope(prefix):
+            self.assertNotIn('${{ runner.', prefix)
+            self.assertNotIn('LIFECYCLE_ARTIFACT_METADATA:', prefix)
+        check_job_scope(before_steps)
+        with self.assertRaises(AssertionError):
+            check_job_scope(before_steps + '      LIFECYCLE_ARTIFACT_METADATA: ${{ runner.temp }}/metadata.json\n')
+        script = runtime.split('          script: |', 1)[1].split('      - name:', 1)[0]
+        self.assertIn("core.exportVariable('LIFECYCLE_ARTIFACT_METADATA',", script)
+        self.assertIn("require('path').join(process.env.RUNNER_TEMP, 'managed-lifecycle-artifact-service.json')", script)
+        self.assertLess(script.index('core.exportVariable('), script.index('fs.writeFileSync('))
+
     def test_workflow_routes_only_required_current_run_artifact_and_preserves_gates(self):
         text = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()
         builder = text.split('  lifecycle-build:', 1)[1].split('  lifecycle:', 1)[0]

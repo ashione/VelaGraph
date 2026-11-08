@@ -98,7 +98,6 @@ jobs:
       LIFECYCLE_ARTIFACT_ID: ${{ needs.lifecycle-build.outputs.artifact-id }}
       LIFECYCLE_BUNDLE_SHA256: ${{ needs.lifecycle-build.outputs.bundle-sha256 }}
       LIFECYCLE_BUNDLE_LENGTH: ${{ needs.lifecycle-build.outputs.bundle-length }}
-      LIFECYCLE_ARTIFACT_METADATA: ${{ runner.temp }}/managed-lifecycle-artifact-service.json
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,6 +110,8 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            core.exportVariable('LIFECYCLE_ARTIFACT_METADATA',
+              require('path').join(process.env.RUNNER_TEMP, 'managed-lifecycle-artifact-service.json'));
             const id = process.env.LIFECYCLE_ARTIFACT_ID;
             if (!/^[1-9][0-9]*$/.test(id || '') || !Number.isSafeInteger(Number(id))) {
               throw new Error('Missing required build-job artifact ID');
