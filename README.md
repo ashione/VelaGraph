@@ -1,6 +1,6 @@
-# RocksDB-backed Distributed Property Graph (Experimental)
+# VelaGraph (Experimental)
 
-An experimental **distributed property-graph engine** built on a RocksDB storage
+VelaGraph is an experimental **distributed property-graph engine** built on a RocksDB storage
 kernel, with a bounded standard Gremlin subset and a separate SQL table engine.
 The repository combines local graph storage and single-partition transactions
 with Raft-backed storage nodes, static remote routing, and bounded cross-shard
