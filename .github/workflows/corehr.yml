@@ -22,14 +22,21 @@ env:
   CARGO_BUILD_JOBS: '2'
   TOKIO_WORKER_THREADS: '2'
 
+# These are independent acceptance gates, not stages of one scenario.
+# Each runner invokes Cargo against the same immutable event commit; cache hits
+# accelerate compilation, never replace fresh test execution or evidence.
 jobs:
-  full-scale:
-    name: CoreHR 200k people / 5k departments
+  lifecycle:
+    name: Retained 1025-write release lifecycle
     runs-on: ubuntu-latest
-    # Operational runner bound, not a latency regression threshold.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact event commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -42,21 +49,15 @@ jobs:
         with:
           prefix-key: corehr-release-v1
           cache-on-failure: false
-      - name: Test evidence validator
+          # Fork/PR jobs may restore base caches, but only main publishes caches.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Test lifecycle evidence validator
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: |
-          python3 -m unittest discover -s scripts -p 'test_corehr*ci.py'
-          python3 -m unittest discover -s scripts -p 'test_managed_lifecycle_ci.py'
-      - name: Build release fixture, query harnesses and node
-        run: |
-          cargo build --release --locked --example corehr_fixture
-          cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --example corehr_result_pages --bin graph-node
+        run: python3 -m unittest discover -s scripts -p 'test_managed_lifecycle_ci.py'
       - name: Verify retained 1025-write lifecycle in release
         id: managed_lifecycle
         run: python3 scripts/managed_lifecycle_ci.py managed-lifecycle-ci-results
-      - name: Run complete CoreHR scenario
-        run: python3 scripts/corehr_ci.py corehr-ci-results
       - name: Publish measured summary
         if: always()
         run: |
@@ -65,6 +66,60 @@ jobs:
           else
             echo 'Managed lifecycle INCOMPLETE. Inspect retained build/test logs and checkpoint; this is not a 1025-write acceptance pass.' >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Retain evidence, including partial failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            managed-lifecycle-ci-results/*.json
+            managed-lifecycle-ci-results/*.jsonl
+            managed-lifecycle-ci-results/*.stdout
+            managed-lifecycle-ci-results/*.stderr
+            managed-lifecycle-ci-results/*.md
+            managed-lifecycle-ci-results/managed_process
+            managed-lifecycle-ci-results/lifecycle/progress.json
+
+  scenario:
+    name: CoreHR full-scale scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact event commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          test -n "$libclang_path" && test "$libclang_path" != .
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: corehr-release-v1
+          cache-on-failure: false
+          # Fork/PR jobs may restore base caches, but only main publishes caches.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Test CoreHR evidence validators
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s scripts -p 'test_corehr*ci.py'
+      - name: Build release fixture, query harnesses and node
+        run: |
+          cargo build --release --locked --example corehr_fixture
+          cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --example corehr_result_pages --bin graph-node
+      - name: Run complete CoreHR scenario
+        run: python3 scripts/corehr_ci.py corehr-ci-results
+      - name: Publish measured summary
+        if: always()
+        run: |
           if test -f corehr-ci-results/summary.md; then
             cat corehr-ci-results/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
@@ -84,10 +139,21 @@ jobs:
             corehr-ci-results/*.md
             corehr-ci-results/*-fixture/manifest.json
             corehr-ci-results/*-db/node-*.log
-            managed-lifecycle-ci-results/*.json
-            managed-lifecycle-ci-results/*.jsonl
-            managed-lifecycle-ci-results/*.stdout
-            managed-lifecycle-ci-results/*.stderr
-            managed-lifecycle-ci-results/*.md
-            managed-lifecycle-ci-results/managed_process
-            managed-lifecycle-ci-results/lifecycle/progress.json
+
+  # Preserve the old check name so existing required-check configurations cannot
+  # accidentally accept the scenario while missing a failed/skipped lifecycle.
+  full-scale:
+    name: CoreHR 200k people / 5k departments
+    needs: [lifecycle, scenario]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both acceptance gates
+        env:
+          LIFECYCLE_RESULT: ${{ needs.lifecycle.result }}
+          COREHR_RESULT: ${{ needs.scenario.result }}
+        run: |
+          printf 'Lifecycle: %s\nCoreHR: %s\n' "$LIFECYCLE_RESULT" "$COREHR_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          test "$LIFECYCLE_RESULT" = success
+          test "$COREHR_RESULT" = success
