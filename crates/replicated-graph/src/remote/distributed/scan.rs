@@ -52,15 +52,7 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
     };
     hierarchy::validate_depth(query)?;
     for step in &query.steps()[..at] {
-        if !matches!(
-            step,
-            Step::Existing(GremlinStep::Has { .. })
-                | Step::Existing(GremlinStep::HasLabel(_))
-                | Step::Existing(GremlinStep::Limit(_))
-                | Step::Dedup
-        ) {
-            return Err(QueryFailure::Unsupported);
-        }
+        scan_step(step)?;
     }
     for (index, step) in query.steps().iter().enumerate().skip(at) {
         match step {
@@ -80,21 +72,27 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
     }
     Ok(Some(at))
 }
+// One conversion contract for scan-only queries and traversal seed prefixes.
+// None is the exact identity operation on unique partition-qualified roots.
+// This helper must never be used for post-expansion traversers.
+fn scan_step(step: &Step) -> Result<Option<ScanStep>, QueryFailure> {
+    match step {
+        Step::Existing(GremlinStep::Has { key, value }) => Ok(Some(ScanStep::Has {
+            key: key.clone(),
+            value: value.clone(),
+        })),
+        Step::Existing(GremlinStep::HasLabel(labels)) => {
+            Ok(Some(ScanStep::HasLabel(labels.clone())))
+        }
+        Step::Existing(GremlinStep::Limit(n)) => Ok(Some(ScanStep::Limit(*n))),
+        Step::Dedup => Ok(None),
+        _ => Err(QueryFailure::Unsupported),
+    }
+}
 fn filter_steps(steps: &[Step]) -> Result<Vec<ScanStep>, QueryFailure> {
     steps
         .iter()
-        // Global scan roots are unique qualified vertices. Prefix identity
-        // dedup is exact; never apply this elimination after expansion.
-        .filter(|step| !matches!(step, Step::Dedup))
-        .map(|step| match step {
-            Step::Existing(GremlinStep::Has { key, value }) => Ok(ScanStep::Has {
-                key: key.clone(),
-                value: value.clone(),
-            }),
-            Step::Existing(GremlinStep::HasLabel(labels)) => Ok(ScanStep::HasLabel(labels.clone())),
-            Step::Existing(GremlinStep::Limit(n)) => Ok(ScanStep::Limit(*n)),
-            _ => Err(QueryFailure::Unsupported),
-        })
+        .filter_map(|step| scan_step(step).transpose())
         .collect()
 }
 pub(super) fn steps(query: &GremlinQuery) -> Result<Vec<ScanStep>, QueryFailure> {
@@ -103,25 +101,16 @@ pub(super) fn steps(query: &GremlinQuery) -> Result<Vec<ScanStep>, QueryFailure>
     let mut count = false;
     for (index, step) in query.steps().iter().enumerate() {
         match step {
-            Step::Existing(GremlinStep::Has { key, value }) => result.push(ScanStep::Has {
-                key: key.clone(),
-                value: value.clone(),
-            }),
-            Step::Existing(GremlinStep::HasLabel(labels)) => {
-                result.push(ScanStep::HasLabel(labels.clone()))
-            }
-            Step::Existing(GremlinStep::Limit(n)) => {
-                has_limit = true;
-                result.push(ScanStep::Limit(*n));
-            }
-            // A scan emits each partition-qualified vertex once. Filters and
-            // limits cannot introduce duplicates, so dedup is an identity here.
-            Step::Dedup => {}
             Step::ValueMap(keys) if index + 1 == query.steps().len() => {
                 projection::validate_keys(keys)?;
             }
             Step::Existing(GremlinStep::Count) if index + 1 == query.steps().len() => count = true,
-            _ => return Err(QueryFailure::Unsupported),
+            _ => {
+                if let Some(converted) = scan_step(step)? {
+                    has_limit |= matches!(converted, ScanStep::Limit(_));
+                    result.push(converted);
+                }
+            }
         }
     }
     if !count && !has_limit {
@@ -298,6 +287,71 @@ impl Execution<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_scan_conversion_keeps_context_specific_limits() {
+        let query =
+            GremlinQuery::parse("g.V().hasLabel('node').has('active',true).dedup().limit(7)")
+                .unwrap();
+        let converted = steps(&query).unwrap();
+        assert!(matches!(converted.as_slice(), [ScanStep::HasLabel(labels),
+            ScanStep::Has { key, value: Some(Value::Boolean(true)) }, ScanStep::Limit(7)]
+            if labels == &["node".to_string()] && key == "active"));
+        for prefix in [
+            "g.V().dedup().hasLabel('node').has('active',true)",
+            "g.V().limit(129).dedup().has('active').limit(7)",
+        ] {
+            let plain = GremlinQuery::parse(prefix).unwrap();
+            let mut expected = filter_steps(plain.steps()).unwrap();
+            let has_limit = expected.iter().any(|s| matches!(s, ScanStep::Limit(_)));
+            if !has_limit {
+                expected.push(ScanStep::Limit(100));
+            }
+            assert_eq!(
+                serde_json::to_value(steps(&plain).unwrap()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            for suffix in [
+                ".count()",
+                ".valueMap('name')",
+                ".out().count()",
+                ".repeat(__.in()).times(2).emit().dedup().count()",
+            ] {
+                let query = GremlinQuery::parse(&format!("{prefix}{suffix}")).unwrap();
+                if let Some(at) = join_at(&query).unwrap() {
+                    assert_eq!(
+                        serde_json::to_value(filter_steps(&query.steps()[..at]).unwrap()).unwrap(),
+                        serde_json::to_value(filter_steps(plain.steps()).unwrap()).unwrap()
+                    );
+                } else {
+                    let result = steps(&query).unwrap();
+                    if suffix == ".count()" {
+                        assert_eq!(
+                            serde_json::to_value(result).unwrap(),
+                            serde_json::to_value(filter_steps(plain.steps()).unwrap()).unwrap()
+                        );
+                    } else {
+                        assert_eq!(
+                            serde_json::to_value(result).unwrap(),
+                            serde_json::to_value(steps(&plain).unwrap()).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+        for text in [
+            "g.V().values('x').out()",
+            "g.V().valueMap('x').out()",
+            "g.V().out().values('x')",
+            "g.V().hasLabel('absent').valueMap('x').count()",
+        ] {
+            let query = GremlinQuery::parse(text);
+            assert!(
+                query.map_or(true, |q| join_at(&q).is_err()
+                    || (join_at(&q).unwrap().is_none() && steps(&q).is_err())),
+                "{text}"
+            );
+        }
+    }
     #[test]
     fn joined_plan_preserves_prefix_and_has_no_implicit_limit() {
         for text in [
