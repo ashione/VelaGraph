@@ -81,6 +81,8 @@ jobs:
             managed-lifecycle-ci-results/*.md
             managed-lifecycle-ci-results/managed_process
             managed-lifecycle-ci-results/lifecycle/progress.json
+            managed-lifecycle-ci-results/lifecycle/artifacts/**
+            managed-lifecycle-ci-results/lifecycle/progress.json.tmp
 
   scenario:
     name: CoreHR full-scale scenario

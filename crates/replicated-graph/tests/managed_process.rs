@@ -1579,6 +1579,10 @@ async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::
     Ok(())
 }
 
+#[path = "support/lifecycle_metrics.rs"]
+mod lifecycle_metrics;
+use lifecycle_metrics::Metrics;
+
 const EXTENDED_WRITES: u64 = 1025;
 const RETAINED_ENV: &str = "BYTE_BOUND_PROCESS_DIRECTORY";
 
@@ -1609,96 +1613,18 @@ fn canonical_write(write: &Write) -> anyhow::Result<Vec<u8>> {
     ))?)
 }
 
-/// Every persisted checkpoint denotes an INCOMPLETE run until all recovery,
-/// snapshot and original-prefix assertions finish. Pending IDs are saved before
-/// network I/O; advancing this checkpoint requires a visible Commit response.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LifecycleCheckpoint {
-    format: u32,
-    binding: Binding,
-    source_sha256: String,
-    elf_sha256: String,
-    executable: PathBuf,
-    harness_timeout_secs: u64,
-    verified_ordinal: u64,
-    pending_external_id: Option<[u8; 16]>,
-    originals: BTreeMap<u64, RequestRecord>,
-    proofs: BTreeMap<u64, Vec<u8>>,
-    grants: Vec<MemberCapacityGrant>,
-    ack_loss_recovered: bool,
-    snapshots_restored: bool,
-    completed: bool,
-}
-impl LifecycleCheckpoint {
-    fn load(directory: &Path, retained: bool, timeout: u64) -> anyhow::Result<Self> {
-        let source_sha256 = std::env::var("BYTE_BOUND_PROCESS_SOURCE_SHA256").unwrap_or_default();
-        let elf_sha256 = std::env::var("BYTE_BOUND_PROCESS_ELF_SHA256").unwrap_or_default();
-        if retained {
-            for (name, hash) in [("source", &source_sha256), ("ELF", &elf_sha256)] {
-                anyhow::ensure!(
-                    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "retained lifecycle requires externally verified {name} SHA-256 metadata"
-                );
-            }
-        }
-        let executable = std::env::current_exe()?;
-        let path = directory.join("progress.json");
-        if path.exists() {
-            let mut saved: Self = serde_json::from_slice(&fs::read(path)?)?;
-            anyhow::ensure!(
-                saved.format == 1
-                    && saved.binding == byte_binding()
-                    && saved.source_sha256 == source_sha256
-                    && saved.elf_sha256 == elf_sha256
-                    && saved.executable == executable
-                    && saved.verified_ordinal <= EXTENDED_WRITES,
-                "refusing resume with changed source, ELF, binding, or checkpoint format"
-            );
-            anyhow::ensure!(
-                saved
-                    .pending_external_id
-                    .is_none_or(|id| id == extended_write(saved.verified_ordinal + 1).external_id),
-                "checkpoint pending ID is not the original next request"
-            );
-            saved.harness_timeout_secs = timeout;
-            saved.completed = false;
-            return Ok(saved);
-        }
-        anyhow::ensure!(
-            ![7, 8, 9].iter().any(|shard| directory
-                .join(format!("shard-{shard}"))
-                .join("data")
-                .exists()),
-            "durable databases without original checkpoint must not be silently reinitialized"
-        );
-        Ok(Self {
-            format: 1,
-            binding: byte_binding(),
-            source_sha256,
-            elf_sha256,
-            executable,
-            harness_timeout_secs: timeout,
-            verified_ordinal: 0,
-            pending_external_id: None,
-            originals: BTreeMap::new(),
-            proofs: BTreeMap::new(),
-            grants: Vec::new(),
-            ack_loss_recovered: false,
-            snapshots_restored: false,
-            completed: false,
-        })
-    }
-    fn save(&self, directory: &Path) -> anyhow::Result<()> {
-        atomic_json(&directory.join("progress.json"), self)
-    }
-}
+// Harness persistence owns no production state and keeps all original assertion
+// inputs in memory while publishing only small durable references.
+#[path = "support/lifecycle_evidence.rs"]
+mod lifecycle_evidence;
+use lifecycle_evidence::LifecycleCheckpoint;
 
 async fn retain_original(
     coordinator: &Client,
     ordinal: u64,
     checkpoint: &mut LifecycleCheckpoint,
 ) -> anyhow::Result<()> {
+    let _span = checkpoint.metrics.span("milestone.original_request_plan");
     let write = extended_write(ordinal);
     let found = NodeRef::Remote(coordinator)
         .request(&authority(), 1, write.external_id)
@@ -1763,6 +1689,7 @@ async fn retain_proof(
     version: u64,
     checkpoint: &mut LifecycleCheckpoint,
 ) -> anyhow::Result<()> {
+    let _span = checkpoint.metrics.span("milestone.proof_capture_assertion");
     let proof = NodeRef::Remote(coordinator)
         .terminal(&authority(), 1, version)
         .await?;
@@ -1822,6 +1749,7 @@ async fn verify_retained_lifecycle(
     members: [&Client; 2],
     checkpoint: &mut LifecycleCheckpoint,
 ) -> anyhow::Result<()> {
+    let _span = checkpoint.metrics.span("recovery.complete_verification");
     let c = NodeRef::Remote(coordinator);
     let summary = c.summary(&authority(), 1).await?;
     assert_eq!(summary.resolved_prefix, EXTENDED_WRITES);
@@ -2009,7 +1937,7 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
     };
     let is_retained = root._temporary.is_none();
     let mut checkpoint = LifecycleCheckpoint::load(root.path(), is_retained, timeout)?;
-    checkpoint.save(root.path())?;
+    checkpoint.save(root.path(), "setup")?;
     let member_config = ProcessConfig {
         cohort: byte_binding().cohort,
         members: vec![],
@@ -2070,7 +1998,7 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
     )
     .await?;
     retain_proof(&c_client, 0, &mut checkpoint).await?;
-    checkpoint.save(root.path())?;
+    checkpoint.save(root.path(), "setup")?;
     eprintln!("byte-bound lifecycle INCOMPLETE: directory={} verified={} source_sha256={} elf_sha256={} timeout={}s coordinator={} writer={} nonparticipant={}",
         root.path().display(), checkpoint.verified_ordinal, checkpoint.source_sha256, checkpoint.elf_sha256,
         timeout, coordinator.child.id(), a.child.id(), b.child.id());
@@ -2082,19 +2010,32 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
     for ordinal in checkpoint.verified_ordinal + 1..=EXTENDED_WRITES {
         let write = extended_write(ordinal);
         checkpoint.pending_external_id = Some(write.external_id);
-        checkpoint.save(root.path())?;
+        checkpoint.save(root.path(), "pending")?;
         if ordinal == EXTENDED_WRITES && !checkpoint.ack_loss_recovered {
-            discard_gateway_ack(&g, write.clone()).await?;
+            let _recovery_span = checkpoint.metrics.span("recovery.ack_loss");
+            {
+                let _span = checkpoint.metrics.span("gateway.discarded_ack_submit");
+                discard_gateway_ack(&g, write.clone()).await?;
+            }
             retain_original(&c_client, ordinal, &mut checkpoint).await?;
-            checkpoint.save(root.path())?;
+            checkpoint.save(root.path(), "ack_loss")?;
             b.stop()?;
             coordinator.stop()?;
-            coordinator.reopen().await?;
-            b.reopen().await?;
+            {
+                let _span = checkpoint.metrics.span("recovery.reopen_coordinator");
+                coordinator.reopen().await?;
+            }
+            {
+                let _span = checkpoint.metrics.span("recovery.reopen_nonparticipant");
+                b.reopen().await?;
+            }
             retain_original(&c_client, ordinal, &mut checkpoint).await?;
         }
-        let (transaction_id, committed_ordinal) =
-            committed(call_bound(&g, byte_binding(), Operation::Submit(write)).await?);
+        let reply = {
+            let _span = checkpoint.metrics.span("gateway.submit");
+            call_bound(&g, byte_binding(), Operation::Submit(write)).await?
+        };
+        let (transaction_id, committed_ordinal) = committed(reply);
         assert_eq!(committed_ordinal, ordinal);
         if [1, 256, 1024, 1025].contains(&ordinal) {
             retain_original(&c_client, ordinal, &mut checkpoint).await?;
@@ -2103,6 +2044,7 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
                 transaction_id
             );
             retain_proof(&c_client, ordinal, &mut checkpoint).await?;
+            let _span = checkpoint.metrics.span("milestone.old_version_reads");
             verify_old_versions(&g, ordinal).await?;
         }
         if ordinal == EXTENDED_WRITES {
@@ -2110,8 +2052,14 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
         }
         checkpoint.verified_ordinal = ordinal;
         checkpoint.pending_external_id = None;
-        checkpoint.save(root.path())?;
+        checkpoint.save(root.path(), "verified")?;
         if ordinal == 1 || ordinal % 16 == 0 || ordinal == EXTENDED_WRITES {
+            checkpoint.metrics.emit(
+                &checkpoint.source_sha256,
+                &checkpoint.elf_sha256,
+                ordinal,
+                false,
+            );
             eprintln!("byte-bound lifecycle INCOMPLETE: verified={ordinal}/{EXTENDED_WRITES} external_id={:?} transaction_id={transaction_id:?} elapsed_this_attempt={:?} checkpoint={}",
                 extended_write(ordinal).external_id, started.elapsed(), root.path().join("progress.json").display());
         }
@@ -2122,23 +2070,27 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
     verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
     // Reopen the actual single writer too, then prove the old IDs and versions.
     a.stop()?;
-    a.reopen().await?;
+    {
+        let _span = checkpoint.metrics.span("recovery.reopen_writer");
+        a.reopen().await?;
+    }
     verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
     if !checkpoint.snapshots_restored {
         // There are no concurrent gateway writes during these full snapshot cuts.
         // Each child closes RPC, shuts down Raft after a barrier, exports complete
         // meta/data, and installs it into a fresh state.db on the next launch.
         for process in [&mut a, &mut b, &mut coordinator] {
+            let _span = checkpoint.metrics.span("recovery.snapshot_export_install");
             process.snapshot_restore().await?;
         }
         checkpoint.snapshots_restored = true;
-        checkpoint.save(root.path())?;
+        checkpoint.save(root.path(), "snapshot_flag")?;
     }
     verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
     assert!(checkpoint.ack_loss_recovered && checkpoint.snapshots_restored);
     g.shutdown().await;
     checkpoint.completed = true;
-    checkpoint.save(root.path())?;
+    checkpoint.save(root.path(), "complete")?;
     eprintln!("byte-bound lifecycle COMPLETE: 1025 gateway writes; exact original IDs/Plans; complete old-V proofs; crash/reopen; three full snapshot restores; source_sha256={} elf_sha256={} checkpoint={}",
         checkpoint.source_sha256, checkpoint.elf_sha256, root.path().join("progress.json").display());
     Ok(())

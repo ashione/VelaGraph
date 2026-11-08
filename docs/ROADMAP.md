@@ -509,3 +509,10 @@ Acceptance is pending, including frozen-source correctness/crash/regression, fre
 release 1,025-write recovery and remote CI gates. All-member closed checkpoints,
 member active state, bounded retained archives/control proofs and streamed
 snapshot closure remain subsequent work before removing the lifetime bound.
+
+### S4 retained gateway control
+
+Actual managed execute/status/retry/abort and Prepare use bounded exact target
+evidence and retained original-event cuts. See [the contract](RETAINED_GATEWAY_CONTROL.md)
+for wire6/new Raft command upgrade restrictions, unchanged finite quotas and
+explicit full-proof/snapshot boundaries. Test presence does not claim acceptance.

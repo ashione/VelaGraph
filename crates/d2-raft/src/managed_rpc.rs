@@ -5,6 +5,8 @@
 use crate::cohort_reads::VisibilityInfo;
 use crate::participant_writes::{Authority, Status};
 use crate::request_index::RequestLookup;
+use crate::retained_prepare::RetainedPrepare;
+use crate::target_evidence::TargetEvidence;
 use crate::terminal_prefix::TerminalPrefix;
 use crate::transaction_decisions::{
     CapacityProfile, Cohort, Command, HistoryCursor, HistoryPage, Journal, MemberCapacityGrant,
@@ -26,7 +28,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 6;
 const CONCURRENCY: usize = 4;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -121,6 +123,12 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    LookupTarget {
+        authority: Authority,
+        epoch: u64,
+        id: [u8; 16],
+    },
+    PrepareRetained(Box<RetainedPrepare>),
     GrantStatus {
         authority: Authority,
         target: Target,
@@ -203,6 +211,8 @@ enum Operation {
 impl Operation {
     fn tag(&self) -> u8 {
         match self {
+            Self::LookupTarget { .. } => 17,
+            Self::PrepareRetained(_) => 18,
             Self::GrantStatus { .. } => 15,
             Self::ConfirmCapacity { .. } => 16,
             Self::LookupRequest { .. } => 10,
@@ -234,6 +244,7 @@ struct Reply {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Value {
+    Target(TargetEvidence),
     Grant(CapacityGrantStatus),
     Capacity(CohortCapacity),
     HistoryStatus(HistoryStatus),
@@ -551,7 +562,10 @@ impl Client {
                     && cut.authority == *authority
                     && cut.cohort == self.identity.cohort
             }
-            Operation::Journal { authority, epoch }
+            Operation::LookupTarget {
+                authority, epoch, ..
+            }
+            | Operation::Journal { authority, epoch }
             | Operation::ConfirmCapacity { authority, epoch }
             | Operation::LookupRequest {
                 authority, epoch, ..
@@ -568,6 +582,18 @@ impl Client {
                     && self.identity.target.epoch == *epoch
             }
             Operation::Visibility { target } => participant(target),
+            Operation::PrepareRetained(prepare) => {
+                let descriptor = &prepare.participant;
+                participant(&Target {
+                    shard: descriptor.shard,
+                    epoch: descriptor.epoch,
+                    mode: descriptor.mode,
+                }) && self.identity.authority == prepare.authority
+                    && prepare.cut.authority == prepare.authority
+                    && prepare.cut.cohort == self.identity.cohort
+                    && prepare.request.shard == descriptor.shard
+                    && prepare.request.epoch == descriptor.epoch
+            }
             Operation::Prepare {
                 authority,
                 participant: descriptor,
@@ -778,6 +804,47 @@ impl NodeRef<'_> {
             _ => Err(Error::Protocol),
         }
     }
+    /// Exact transaction and optional original Plan at one anchored source cut.
+    /// This is trusted source evidence, not a cryptographic inclusion proof.
+    pub async fn target(
+        self,
+        authority: &Authority,
+        epoch: u64,
+        id: [u8; 16],
+    ) -> Result<TargetEvidence, Error> {
+        self.bounded(async {
+            match self
+                .call(|| Operation::LookupTarget {
+                    authority: authority.clone(),
+                    epoch,
+                    id,
+                })
+                .await?
+            {
+                Value::Target(value) => {
+                    let authority = authority.clone();
+                    let expected = match self {
+                        Self::Remote(c) => Some(c.identity.cohort.clone()),
+                        _ => None,
+                    };
+                    cpu(move || {
+                        check_target(&value, &authority, epoch, id)?;
+                        if expected
+                            .as_ref()
+                            .is_some_and(|cohort| cohort != &value.cut.cohort)
+                        {
+                            return Err(Error::Identity);
+                        }
+                        Ok(value)
+                    })
+                    .await
+                }
+                _ => Err(Error::Protocol),
+            }
+        })
+        .await
+    }
+    /// Explicit full-history compatibility export. Ordinary graph control uses target.
     pub async fn journal(self, authority: &Authority, epoch: u64) -> Result<Journal, Error> {
         match self
             .call(|| Operation::Journal {
@@ -900,6 +967,42 @@ impl NodeRef<'_> {
             _ => Err(Error::Protocol),
         }
     }
+    /// Prepare only after bounded pages have retained this exact pending cut.
+    /// Apply independently proves the cut and original Plan before any retry.
+    pub async fn prepare_retained(
+        self,
+        authority: &Authority,
+        participant: &Participant,
+        request: D1WriteRequest,
+        cut: &HistoryCursor,
+    ) -> Result<Status, Error> {
+        check_member_cursor(
+            cut,
+            authority,
+            &Target {
+                shard: participant.shard,
+                epoch: participant.epoch,
+                mode: participant.mode,
+            },
+            &cut.cohort,
+        )?;
+        match self
+            .call(|| {
+                Operation::PrepareRetained(Box::new(RetainedPrepare {
+                    version: 1,
+                    authority: authority.clone(),
+                    participant: participant.clone(),
+                    request,
+                    cut: cut.clone(),
+                }))
+            })
+            .await?
+        {
+            Value::Status(value) => Ok(value),
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Explicit whole-Journal compatibility input, not the ordinary graph path.
     pub async fn prepare(
         self,
         authority: &Authority,
@@ -1409,27 +1512,24 @@ async fn confirm_cohort_capacity(
     {
         return Err(Error::Identity);
     }
-    let Value::Journal(journal) = dispatch_operation(
-        node,
-        Some(identity.clone()),
-        Operation::Journal {
-            authority: authority.clone(),
-            epoch,
-        },
-        deadline,
-    )
-    .await?
-    else {
-        return Err(Error::Protocol);
+    let initial_node = WorkNode {
+        raft: node.raft.clone(),
+        state_machine: node.state_machine.clone(),
     };
-    if let Some(grants) = journal.capacity_grants() {
+    let initial_identity = identity.clone();
+    let initial_authority = authority.clone();
+    let retained = bounded_cpu(deadline, async move {
+        leader_barrier(&initial_node, deadline).await?;
+        checked_capacity_identity(&initial_node, &initial_identity, &initial_authority, epoch).await
+    })
+    .await?;
+    if let Some(grants) = retained {
         return Ok(Value::Capacity(CohortCapacity {
             authority,
             cohort: identity.cohort,
-            grants: grants.to_vec(),
+            grants,
         }));
     }
-    drop(journal);
     let mut grants = Vec::with_capacity(members.len());
     for member in members.iter() {
         // Client timeouts remain capped by the one original server deadline.
@@ -1462,9 +1562,9 @@ async fn confirm_cohort_capacity(
     };
     bounded_cpu(deadline, async move {
         leader_barrier(&node, deadline).await?;
-        let current = checked_journal(&node, Some(&identity), &authority, epoch).await?;
-        if let Some(retained) = current.capacity_grants() {
-            if retained != grants.as_slice() {
+        let current = checked_capacity_identity(&node, &identity, &authority, epoch).await?;
+        if let Some(retained) = current {
+            if retained != grants {
                 return Err(Error::Identity);
             }
             return Ok(Value::Capacity(CohortCapacity {
@@ -1490,9 +1590,9 @@ async fn confirm_cohort_capacity(
         // A lost ACK or a concurrent identical proposal is recovered from the
         // durable source. No timeout can authorize replacing a generation.
         leader_barrier(&node, deadline).await?;
-        let retained = checked_journal(&node, Some(&identity), &authority, epoch).await?;
-        match retained.capacity_grants() {
-            Some(saved) if saved == grants.as_slice() => Ok(Value::Capacity(CohortCapacity {
+        let retained = checked_capacity_identity(&node, &identity, &authority, epoch).await?;
+        match retained {
+            Some(saved) if saved == grants => Ok(Value::Capacity(CohortCapacity {
                 authority,
                 cohort: identity.cohort,
                 grants,
@@ -1503,6 +1603,31 @@ async fn confirm_cohort_capacity(
     })
     .await
 }
+async fn checked_capacity_identity(
+    node: &WorkNode,
+    identity: &Identity,
+    authority: &Authority,
+    epoch: u64,
+) -> Result<Option<Vec<MemberCapacityGrant>>, Error> {
+    let (cohort, grants) = node
+        .state_machine
+        .coordinator_capacity_identity(authority.shard, epoch, authority.mode)
+        .await
+        .map_err(application_error)?;
+    if identity.role != Role::Coordinator
+        || identity.authority != *authority
+        || identity.target.epoch != epoch
+        || identity.cohort != cohort
+    {
+        return Err(Error::Identity);
+    }
+    if let Some(grants) = &grants {
+        crate::capacity_policy::validate_grants(&cohort, grants).map_err(|_| Error::Identity)?;
+    }
+    Ok(grants)
+}
+// Legacy whole-Journal Prepare compatibility only. New callers transfer source
+// pages and submit PrepareRetained; this helper is not used by managed graph.
 async fn retain_prepare_history(
     node: &WorkNode,
     authority: &Authority,
@@ -1662,6 +1787,20 @@ fn check_summary(
         return Err(Error::Identity);
     }
     Ok(())
+}
+fn check_target(
+    value: &TargetEvidence,
+    authority: &Authority,
+    epoch: u64,
+    id: [u8; 16],
+) -> Result<(), Error> {
+    if value.cut.authority != *authority
+        || value.cut.cohort.coordinator_epoch != epoch
+        || value.id != id
+    {
+        return Err(Error::Identity);
+    }
+    value.validate().map_err(|_| Error::Protocol)
 }
 fn check_request(
     value: &RequestLookup,
@@ -1997,6 +2136,27 @@ async fn execute(
             }
             Ok(Value::Evidence(proof))
         }
+        Operation::LookupTarget {
+            authority,
+            epoch,
+            id,
+        } => {
+            let value = node
+                .state_machine
+                .coordinator_target(authority.shard, epoch, authority.mode, id)
+                .await
+                .map_err(application_error)?;
+            check_target(&value, &authority, epoch, id)?;
+            if pinned.is_some_and(|p| {
+                p.role != Role::Coordinator
+                    || p.authority != authority
+                    || p.target.epoch != epoch
+                    || p.cohort != value.cut.cohort
+            }) {
+                return Err(Error::Identity);
+            }
+            Ok(Value::Target(value))
+        }
         Operation::LookupRequest {
             authority,
             epoch,
@@ -2067,6 +2227,29 @@ async fn execute(
         }
         Operation::Visibility { target } => {
             Ok(Value::Visibility(visibility(node, &target, pinned).await?))
+        }
+        Operation::PrepareRetained(prepare) => {
+            let target = Target {
+                shard: prepare.participant.shard,
+                epoch: prepare.participant.epoch,
+                mode: prepare.participant.mode,
+            };
+            let info = visibility(node, &target, pinned).await?;
+            check_member_cursor(
+                &prepare.cut,
+                &prepare.authority,
+                &target,
+                &prepare.cut.cohort,
+            )?;
+            if info.authority != prepare.authority
+                || info.cohort.as_ref() != Some(&prepare.cut.cohort)
+            {
+                return Err(Error::Identity);
+            }
+            match submit(node, deadline, D1Command::PrepareRetained(prepare)).await? {
+                D1Result::Participant(status) => Ok(Value::Status(status)),
+                _ => Err(Error::Protocol),
+            }
         }
         Operation::Prepare {
             authority,
@@ -2240,7 +2423,7 @@ impl Server {
             return Err(Error::Identity);
         }
         let probe = match identity.role {
-            Role::Coordinator => Operation::Journal {
+            Role::Coordinator => Operation::Summary {
                 authority: identity.authority.clone(),
                 epoch: identity.target.epoch,
             },
@@ -2941,7 +3124,7 @@ mod tests {
         id
     }
     #[test]
-    fn history_wire_v5_operation_tags_are_explicit() {
+    fn history_wire_v6_preserves_existing_operation_tags() {
         let journal = terminal_journal(1);
         let base = journal.history_cursor_at(1).unwrap();
         let page = journal.history_page(&base, None).unwrap();
@@ -2970,7 +3153,7 @@ mod tests {
                 cut: page.cut,
             },
         ];
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
         assert_eq!(operations.each_ref().map(Operation::tag), [11, 12, 13, 14]);
         for (operation, name) in operations.into_iter().zip([
             "HistoryStatus",
@@ -2986,7 +3169,7 @@ mod tests {
             };
             let bytes = encode_sync(&request).unwrap();
             let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(wire["version"], 5);
+            assert_eq!(wire["version"], 6);
             assert_eq!(wire["nonce"], 17);
             assert_eq!(
                 wire["operation"]
@@ -3483,7 +3666,7 @@ mod tests {
         send(
             &mut legacy,
             &encode_sync(&Request {
-                version: 4,
+                version: 5,
                 identity: identity(),
                 nonce: 1,
                 operation: Operation::Journal {
@@ -4582,4 +4765,5 @@ mod tests {
         let decoded: Reply = serde_json::from_slice(&fallback).unwrap();
         assert!(matches!(decoded.result, Err(Error::Capacity)));
     }
+    include!("retained_rpc_tests.rs");
 }
