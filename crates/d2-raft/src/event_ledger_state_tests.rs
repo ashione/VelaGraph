@@ -76,7 +76,7 @@ async fn journal_less_authority_and_multi_entry_overlay_keep_holes_and_old_versi
         0
     );
     let header = metadata(&sm);
-    assert_eq!(header["version"], 15);
+    assert_eq!(header["version"], 16);
     assert!(header.get("state").is_none() && header.get("coordinator").is_none());
     assert_eq!(header["ledger"]["event_count"], 64);
     assert_eq!(ledger_rows(&sm).len(), 2);
@@ -296,15 +296,16 @@ async fn published_v9_v10_migrate_atomically_and_reject_mixed_authorities() {
             append(&mut sm, 1, 1).await;
         }
         let state = sm.state.read().await;
+        let full = sm.load_disk_state(&state).unwrap().unwrap().state;
         let bytes = serde_json::to_vec(&serde_json::json!({"version":if member {10}else{9},
-            "state":state.d1.as_ref().unwrap().stage()}))
+            "state":full.stage()}))
         .unwrap();
         let mut legacy_index = WriteBatch::default();
         if !member {
             crate::request_index::stage(
                 &mut legacy_index,
                 None,
-                state.d1.as_ref(),
+                Some(&full),
                 state.last_applied_log,
                 false,
                 true,
@@ -336,7 +337,7 @@ async fn published_v9_v10_migrate_atomically_and_reject_mixed_authorities() {
         assert!(sm.apply([entry(index, command.clone())]).await.is_err());
         assert_eq!(disk(&sm), before);
         apply(&mut sm, vec![command]).await;
-        assert_eq!(metadata(&sm)["version"], if member { 12 } else { 15 });
+        assert_eq!(metadata(&sm)["version"], if member { 12 } else { 16 });
         assert_eq!(prefix(&sm, 1, member).await, old);
         assert_eq!(ledger_rows(&sm).len(), 1);
         drop(sm);

@@ -1,7 +1,8 @@
 # Durable request point recovery (A2.1)
 
-Current storage contract: [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
-uses bound coordinator disk v15 with no duplicate request rows or manifest. Actual
+Current storage contract: the [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md) writes
+bound coordinator disk v16, retaining the [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
+and absence of duplicate request rows/manifests introduced in S1 disk v15. Actual
 LookupRequest and HistoryPage read raw Commands through the strict loader's shared
 namespace walker. A private published cut connects the complete SHA-256 scan to
 previous strict semantic validation; neither a found ID nor absence permits an
@@ -11,22 +12,25 @@ retain only their target/page, not an O(all IDs) collection; disk work remains
 O(total history).
 
 Normal migration fully validates an old index against strict-replayed history
-before deleting it in the same synced batch as disk v15 and the applied marker.
-Old v11/v13 and earlier published formats retain their actual legacy readers until
-that migration. Missing or changed legacy rows are errors, not a repair shortcut.
-Disk v15 open/read/apply/snapshot-build rejects all residual request rows/manifests;
-explicit validated snapshot installation may rebuild into v15 and clear them.
+before deleting it in the same synced batch as disk v16 and the applied marker.
+Actual v15 and older published formats retain their legacy readers until successful
+migration; v15 already requires the retired index to be absent. Missing or changed
+legacy indexed rows are errors, not a repair shortcut. Both v15 and v16 reject
+residual request rows/manifests on open/read/apply/snapshot-build; explicit validated
+snapshot installation may rebuild into v16 and clear them.
 The only remaining production request-index writer is the disk-v8 empty manifest
 for an unbound, request-free coordinator. The general row writer/manifest summation
 is test-only for actual legacy fixtures, while strict legacy readers/validators
 and the public RequestLookup response types remain.
 
 The original A2.1 sections below document historical indexed formats, not a live
-bound-writer alternative. Complete Journal residency in other paths, full snapshots,
-the 16 MiB budget and D1 limits remain. Both existing profiles, capacity grants and
-managed RPC v5 are unchanged by S1; it adds no directory, wire operation or dependency.
-Fresh-source validation is required before publication; prior A2.1 test results
-are not S1 acceptance evidence.
+bound-writer alternative. S2 consumes an active checkpoint instead of a resident
+or ordinary apply-candidate full Journal on the disk-v16 coordinator path; it still
+checks complete raw closure. Cold replay, explicit control/Terminal and snapshot
+materialization, member state, the 16 MiB budget and D1 limits remain. Both existing
+profiles, capacity grants and managed RPC v5 are unchanged. S2 acceptance is pending;
+prior A2.1 or S1 results are not acceptance evidence for the changed source. No
+performance or lifetime increase is claimed.
 
 Historical A2.1 status: an experimental derived coordinator index and bounded
 point-recovery operation. **Its legacy 256 external requests, 1,024 transactions
@@ -123,9 +127,13 @@ Plan version/bounds, cohort, transaction ID/ordinal, complete participant list,
 prepared bits and terminal-state consistency. Canonical request bytes are compared
 exactly at the graph boundary. GraphCohort recovery and post-admission winner
 readback use only point recovery; admission uses the bounded Summary plus point
-lookup rather than fetching the archive. Server Command validation, execute,
-status, prepare and advance still use the complete Journal. This is not a general
-write-path optimization. Existing 32 MiB frame and per-record bounds remain.
+lookup rather than fetching the archive. In this historical A2.1 implementation,
+Server Command validation, execute, status, prepare and advance use the complete
+Journal. Current S2 ordinary remote Command preflight instead checks compact
+identity/cohort state and disk-v16 apply consumes the checkpoint; explicit
+full-history control paths remain as described above. The historical reader
+change is not a general write-path optimization. Existing 32 MiB frame and
+per-record bounds remain.
 
 ## Snapshots and rollback boundaries
 

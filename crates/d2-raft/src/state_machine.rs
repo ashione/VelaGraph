@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::blocking::blocking_section;
+use crate::coordinator_state::Coordinator;
 use crate::d1::{D1State, DedupRecord, MAX_DEDUP_REQUESTS};
+use crate::transaction_decisions::checkpoint::ActiveCheckpoint;
 use crate::types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};
 use crate::{D1Command, D1Error, D1Result, D1WriteStatus};
 
@@ -237,6 +239,44 @@ fn ledger_read_error(error: anyhow::Error) -> D1Error {
     }
 }
 
+fn is_active_metadata(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    serde_json::from_slice::<Version>(bytes).is_ok_and(|header| header.version == 16)
+}
+
+/// Drop complete coordinator authority only after the exact candidate has
+/// supplied the private cut. This conversion never changes logical history.
+fn compact_coordinator(
+    state: Option<&mut D1State>,
+    cut: Option<&event_ledger::PublishedArchiveCut>,
+) -> anyhow::Result<()> {
+    let Some(state) = state else {
+        return Ok(());
+    };
+    let Some(coordinator) = &state.coordinator else {
+        return Ok(());
+    };
+    if coordinator.cohort().is_none() {
+        return Ok(());
+    }
+    let cut =
+        cut.ok_or_else(|| anyhow::anyhow!("bound coordinator lacks validated publication cut"))?;
+    let checkpoint = match coordinator {
+        Coordinator::Full(journal) => ActiveCheckpoint::from_journal(journal)
+            .map_err(|error| anyhow::anyhow!("checkpoint derivation: {error:?}"))?,
+        Coordinator::Active(checkpoint) => checkpoint.as_ref().clone(),
+    };
+    anyhow::ensure!(
+        &checkpoint == cut.checkpoint(),
+        "checkpoint differs from publication cut"
+    );
+    state.coordinator = Some(Coordinator::Active(cut.checkpoint_arc().clone()));
+    Ok(())
+}
+
 fn data_key(key: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(DATA_PREFIX.len() + key.len());
     encoded.extend_from_slice(DATA_PREFIX);
@@ -280,9 +320,26 @@ pub struct StateMachine {
     apply_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
     #[cfg(test)]
     snapshot_publish_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
+    #[cfg(test)]
+    forbid_coordinator_journal: AtomicBool,
 }
 
 impl StateMachine {
+    #[cfg(test)]
+    pub(crate) fn forbid_coordinator_journal(&self, forbidden: bool) {
+        self.forbid_coordinator_journal
+            .store(forbidden, Ordering::SeqCst);
+    }
+
+    // The test switch belongs to this state machine, then installs the guard on
+    // the actual worker thread. Other nodes and parallel tests are unaffected.
+    fn coordinator_operation<T>(&self, work: impl FnOnce() -> T) -> T {
+        #[cfg(test)]
+        if self.forbid_coordinator_journal.load(Ordering::SeqCst) {
+            return crate::transaction_decisions::without_full_journal(work);
+        }
+        work()
+    }
     /// Pause state reads/publication for diagnostics without exposing mutable data.
     /// Do not retain this guard in normal serving code.
     pub async fn pause_state(&self) -> StateMachinePause<'_> {
@@ -426,6 +483,15 @@ impl StateMachine {
             _ => None,
         };
         let current_snapshot = load_snapshot(&storage.db)?;
+        if storage
+            .metadata
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(is_active_metadata)
+        {
+            compact_coordinator(d1.as_mut(), archive_cut.as_deref())?;
+        }
 
         let snapshot_idx = current_snapshot
             .as_ref()
@@ -447,6 +513,8 @@ impl StateMachine {
             apply_publish_gate: Default::default(),
             #[cfg(test)]
             snapshot_publish_gate: Default::default(),
+            #[cfg(test)]
+            forbid_coordinator_journal: AtomicBool::new(false),
         })
     }
 
@@ -550,8 +618,28 @@ impl StateMachine {
                 } else {
                     current.stage()
                 };
+                let mut actual = if loaded.legacy_dedup {
+                    loaded.state.clone()
+                } else {
+                    loaded.state.stage()
+                };
+                if current
+                    .coordinator
+                    .as_ref()
+                    .is_some_and(|coordinator| coordinator.active().is_some())
+                {
+                    let journal = actual
+                        .coordinator
+                        .as_ref()
+                        .and_then(Coordinator::full)
+                        .ok_or_else(|| anyhow::anyhow!("durable coordinator role changed"))?;
+                    actual.coordinator = Some(Coordinator::Active(Arc::new(
+                        ActiveCheckpoint::from_journal(journal)
+                            .map_err(|e| anyhow::anyhow!("checkpoint reconstruction: {e:?}"))?,
+                    )));
+                }
                 anyhow::ensure!(
-                    loaded.state == expected,
+                    actual == expected,
                     "durable state differs from published cut"
                 );
             }
@@ -561,8 +649,8 @@ impl StateMachine {
         Ok(loaded)
     }
 
-    // Inspect the already-published small header, never the untrusted disk
-    // discriminator. Disk15 cannot silently take the legacy Journal path if its
+    // Inspect the already-published metadata, never the untrusted disk
+    // discriminator. Disk15/16 cannot silently take the legacy Journal path if its
     // witness is missing. The actual read checks these bytes in one DB snapshot.
     fn archive_cut<'a>(
         &self,
@@ -582,7 +670,8 @@ impl StateMachine {
         let is_archive = metadata
             .as_deref()
             .map(|bytes| {
-                serde_json::from_slice::<Version>(bytes).map(|header| header.version == 15)
+                serde_json::from_slice::<Version>(bytes)
+                    .map(|header| matches!(header.version, 15 | 16))
             })
             .transpose()
             .map_err(|_| D1Error::EventLedgerHistory)?
@@ -615,7 +704,7 @@ impl StateMachine {
     }
 
     // Even range-backed V0/summary reads cannot accept a retired request
-    // namespace beside disk15. This checks keys, not unrelated raw/terminal rows.
+    // namespace beside disk15/16. This checks keys, not unrelated raw/terminal rows.
     fn check_retired_coordinator_index(&self, d1: &D1State) -> Result<(), D1Error> {
         if let Some(storage) = self.storage.as_ref().filter(|storage| {
             d1.coordinator.is_some() && !storage.request_indexed.load(Ordering::Relaxed)
@@ -1074,7 +1163,8 @@ impl StateMachine {
     ) -> Result<crate::transaction_decisions::Journal, D1Error> {
         let state = self.state.read().await;
         let persisted =
-            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+            blocking_section(|| self.coordinator_operation(|| self.load_disk_state(&state)))
+                .map_err(ledger_read_error)?;
         let d1 = persisted
             .as_ref()
             .map(|loaded| &loaded.state)
@@ -1089,11 +1179,17 @@ impl StateMachine {
         {
             return Err(D1Error::ManagedModeConflict);
         }
-        d1.coordinator.clone().ok_or(D1Error::CoordinatorNotEnabled)
+        self.coordinator_operation(|| {
+            d1.coordinator
+                .as_ref()
+                .and_then(Coordinator::full)
+                .cloned()
+                .ok_or(D1Error::CoordinatorNotEnabled)
+        })
     }
 
     /// Read a bounded raw-event suffix at a frozen cut, not an ordinal range.
-    /// Disk15 scans the raw archive without reconstructing a Journal. Actual
+    /// Disk15/16 scans the raw archive without reconstructing a Journal. Actual
     /// legacy formats retain their replay path until an atomic successful apply.
     /// Distributed callers must first establish a leader barrier.
     pub async fn coordinator_history_page(
@@ -1122,6 +1218,7 @@ impl StateMachine {
         let journal = d1
             .coordinator
             .as_ref()
+            .and_then(Coordinator::full)
             .ok_or(D1Error::CoordinatorNotEnabled)?;
         self.decision_frontier(d1)?;
         blocking_section(|| journal.history_page(base, cut)).map_err(|_| D1Error::VisibilityHistory)
@@ -1185,6 +1282,28 @@ impl StateMachine {
             .coordinator
             .as_ref()
             .ok_or(D1Error::CoordinatorNotEnabled)?;
+        if let Some(checkpoint) = journal.active() {
+            let published = self
+                .archive_cut(&state)?
+                .ok_or(D1Error::EventLedgerHistory)?;
+            let verified = blocking_section(|| {
+                event_ledger::verify_active(&self.storage.as_ref().unwrap().db, published)
+            })?;
+            if checkpoint != verified.checkpoint() {
+                return Err(D1Error::EventLedgerHistory);
+            }
+            return Ok(crate::managed_rpc::CoordinatorSummary {
+                authority: crate::participant_writes::Authority {
+                    shard,
+                    mode: checkpoint.authority(),
+                },
+                cohort: checkpoint
+                    .cohort()
+                    .cloned()
+                    .ok_or(D1Error::VisibilityHistory)?,
+                resolved_prefix: checkpoint.resolved_prefix(),
+            });
+        }
         Ok(crate::managed_rpc::CoordinatorSummary {
             authority: crate::participant_writes::Authority {
                 shard,
@@ -1198,8 +1317,60 @@ impl StateMachine {
         })
     }
 
-    /// Project only the requested terminal cut from the replay-validated state.
-    /// Later admitted request/Plan bytes are never copied by this read path.
+    /// Compact command preflight. The Raft apply independently repeats source
+    /// validation; no full Journal transfer or reconstruction is needed here.
+    pub(crate) async fn coordinator_command_identity(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<Option<crate::transaction_decisions::Cohort>, D1Error> {
+        let state = self.state.read().await;
+        self.coordinator_operation(|| {
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1
+                .managed
+                .as_ref()
+                .is_none_or(|mode| mode.mode_id != mode_id)
+            {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            let coordinator = d1
+                .coordinator
+                .as_ref()
+                .ok_or(D1Error::CoordinatorNotEnabled)?;
+            if let Some(checkpoint) = coordinator.active() {
+                let published = self
+                    .archive_cut(&state)?
+                    .ok_or(D1Error::EventLedgerHistory)?;
+                let verified = blocking_section(|| {
+                    event_ledger::verify_active(&self.storage.as_ref().unwrap().db, published)
+                })?;
+                if checkpoint != verified.checkpoint() {
+                    return Err(D1Error::EventLedgerHistory);
+                }
+                Ok(checkpoint.cohort().cloned())
+            } else {
+                let persisted =
+                    blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+                Ok(persisted
+                    .as_ref()
+                    .map(|loaded| &loaded.state)
+                    .unwrap_or(d1)
+                    .coordinator
+                    .as_ref()
+                    .ok_or(D1Error::CoordinatorNotEnabled)?
+                    .cohort()
+                    .cloned())
+            }
+        })
+    }
+
+    /// Project the requested terminal cut from a temporarily materialized full
+    /// authority. S2 retains this explicit control-read boundary; only the
+    /// requested terminal rows are checked against the complete Journal.
     pub async fn coordinator_terminal_prefix(
         &self,
         shard: u64,
@@ -1208,7 +1379,15 @@ impl StateMachine {
         version: u64,
     ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        // Terminal range validation deliberately retains the complete temporary
+        // authority path in S2; it never keeps that Journal in published state.
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted
+            .as_ref()
+            .map(|loaded| &loaded.state)
+            .or(state.d1.as_ref())
+            .ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
         d1.check_epoch(epoch)?;
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
@@ -1269,6 +1448,239 @@ impl StateMachine {
 
     pub async fn applied(&self) -> Option<LogId<NodeId>> {
         self.state.read().await.last_applied_log
+    }
+
+    /// Disk16 consumes a compact candidate and exact appended Commands. The
+    /// immutable raw prefix is checked against its private published cut, not
+    /// replayed into a resident or candidate Journal.
+    fn apply_active_entries<I>(
+        &self,
+        sm: &mut StateMachineData,
+        entries: I,
+    ) -> Result<Vec<ApplyResult>, StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>>,
+    {
+        let fail = |error: anyhow::Error| write_error(std::io::Error::other(error.to_string()));
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| fail(anyhow::anyhow!("active coordinator lacks disk")))?;
+        let cut = self
+            .archive_cut(sm)
+            .map_err(|e| fail(anyhow::anyhow!("active archive cut: {e:?}")))?
+            .ok_or_else(|| fail(anyhow::anyhow!("active coordinator lacks publication cut")))?;
+        let verified = event_ledger::verify_active(&storage.db, cut)
+            .map_err(|error| fail(anyhow::anyhow!("active archive verification: {error:?}")))?;
+        let current = sm
+            .d1
+            .as_ref()
+            .and_then(|d1| d1.coordinator.as_ref())
+            .and_then(Coordinator::active)
+            .ok_or_else(|| fail(anyhow::anyhow!("active coordinator missing")))?;
+        if current != verified.checkpoint() || sm.last_applied_log != verified.descriptor().applied
+        {
+            return Err(fail(anyhow::anyhow!(
+                "active state differs from publication cut"
+            )));
+        }
+        let domain = &verified.descriptor().domain;
+        let identity = crate::decision_segments::CheckpointIdentity {
+            shard: domain.shard,
+            epoch: domain.epoch,
+            mode: domain.mode,
+            cohort: domain.cohort.clone(),
+        };
+        let old_r = current.resolved_prefix();
+        let tail_key =
+            crate::decision_segments::checkpoint_tail_key(&identity, old_r).map_err(fail)?;
+        let tail_bytes = tail_key
+            .as_deref()
+            .map(|key| verified.get(key))
+            .transpose()
+            .map_err(fail)?
+            .flatten();
+        let tail_records =
+            if old_r.is_multiple_of(crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64) {
+                Vec::new()
+            } else {
+                let first = old_r / crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64
+                    * crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64
+                    + 1;
+                verified.transactions(first, old_r, &[]).map_err(fail)?
+            };
+        let stored_manifest = verified
+            .get(crate::decision_segments::MANIFEST_KEY)
+            .map_err(fail)?
+            .ok_or_else(|| fail(anyhow::anyhow!("missing terminal manifest")))?;
+        let checked_tail = crate::decision_segments::check_checkpoint_tail(
+            &identity,
+            old_r,
+            sm.last_applied_log,
+            verified.decision_manifest(),
+            &stored_manifest,
+            tail_bytes.as_deref(),
+            &tail_records,
+        )
+        .map_err(fail)?;
+        let mut next = ApplyDelta::new(sm);
+        let mut suffix = Vec::new();
+        let mut out = Vec::new();
+        let mut batch = WriteBatch::default();
+        for entry in entries {
+            next.last_applied_log = Some(entry.log_id);
+            match entry.payload {
+                EntryPayload::Blank => out.push(ApplyResult {
+                    value: None,
+                    d1: None,
+                }),
+                EntryPayload::Membership(membership) => {
+                    next.last_membership = StoredMembership::new(Some(entry.log_id), membership);
+                    out.push(ApplyResult {
+                        value: None,
+                        d1: None,
+                    });
+                }
+                EntryPayload::Normal(command) => {
+                    let mut result = ApplyResult {
+                        value: None,
+                        d1: None,
+                    };
+                    match command {
+                        LogCommand::Noop => {}
+                        LogCommand::TxnBatch(_) => {
+                            result.d1 = Some(Err(D1Error::LegacyWriteDisabled))
+                        }
+                        LogCommand::D1V1(D1Command::Coordinator {
+                            shard,
+                            epoch,
+                            mode_id,
+                            command,
+                        }) => {
+                            let mut lookup_failure = None;
+                            let applied = (|| -> Result<D1Result, D1Error> {
+                                let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+                                d1.check_shard(shard)?;
+                                d1.check_epoch(epoch)?;
+                                if d1
+                                    .managed
+                                    .as_ref()
+                                    .is_none_or(|mode| mode.mode_id != mode_id)
+                                {
+                                    return Err(D1Error::ManagedModeConflict);
+                                }
+                                if let crate::transaction_decisions::Command::BindCohort {
+                                    cohort,
+                                } = &command
+                                {
+                                    if cohort.coordinator_shard != shard
+                                        || cohort.coordinator_epoch != epoch
+                                    {
+                                        return Err(D1Error::ParticipantAuthority);
+                                    }
+                                }
+                                let Some(Coordinator::Active(checkpoint)) = d1.coordinator.as_mut()
+                                else {
+                                    return Err(D1Error::CoordinatorNotEnabled);
+                                };
+                                let transition = Arc::make_mut(checkpoint)
+                                    .apply(command, &mut |key| {
+                                        verified.lookup(key, &suffix).map_err(|error| {
+                                            lookup_failure = Some(error);
+                                            crate::transaction_decisions::Error::InvalidJournal
+                                        })
+                                    })
+                                    .map_err(D1Error::CoordinatorRejected)?;
+                                if let Some(command) = transition.accepted {
+                                    suffix.push(command);
+                                }
+                                Ok(D1Result::Coordinator {
+                                    resolved_prefix: checkpoint.resolved_prefix(),
+                                })
+                            })();
+                            if let Some(error) = lookup_failure {
+                                return Err(fail(error));
+                            }
+                            result.d1 = Some(applied);
+                        }
+                        LogCommand::D1V1(command) => {
+                            result.d1 = Some(apply_d1(sm, &mut next, &mut batch, command))
+                        }
+                    }
+                    out.push(result);
+                }
+            }
+        }
+        let d1 = next
+            .d1
+            .as_ref()
+            .ok_or_else(|| fail(anyhow::anyhow!("coordinator disappeared")))?;
+        d1.validate().map_err(fail)?;
+        let checkpoint = d1
+            .coordinator
+            .as_ref()
+            .and_then(Coordinator::active)
+            .ok_or_else(|| fail(anyhow::anyhow!("active coordinator role changed")))?;
+        let staged = event_ledger::stage_active(
+            &mut batch,
+            &verified,
+            checkpoint,
+            &suffix,
+            next.last_applied_log,
+        )
+        .map_err(fail)?;
+        let metadata = state_codec::active_metadata_bytes(
+            d1,
+            staged.descriptor_for(checkpoint).map_err(fail)?,
+            checkpoint,
+        )
+        .map_err(fail)?;
+        let manifest = crate::decision_segments::stage_checkpoint(
+            &mut batch,
+            &checked_tail,
+            staged.drained(),
+            checkpoint.resolved_prefix(),
+            next.last_applied_log,
+        )
+        .map_err(fail)?;
+        let archive_cut = Arc::new(
+            staged
+                .published_cut(
+                    d1.coordinator
+                        .as_ref()
+                        .and_then(Coordinator::active_arc)
+                        .unwrap(),
+                    &metadata,
+                    &manifest,
+                )
+                .map_err(fail)?,
+        );
+        let manifest = manifest.into_bytes();
+        batch.put(D1_KEY, &metadata);
+        batch.put(
+            APPLIED_KEY,
+            serde_json::to_vec(&next.last_applied_log).map_err(write_error)?,
+        );
+        batch.put(
+            MEMBERSHIP_KEY,
+            serde_json::to_vec(&next.last_membership).map_err(write_error)?,
+        );
+        storage.write_sync(batch)?;
+        next.archive_cut = Some(archive_cut);
+        *storage.metadata.lock().unwrap() = Some(metadata);
+        *storage.decision_manifest.lock().unwrap() = Some(manifest);
+        storage.legacy_d1.store(false, Ordering::Relaxed);
+        storage.request_indexed.store(false, Ordering::Relaxed);
+        storage.decision_indexed.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(gate) = self.apply_publish_gate.lock().unwrap().take() {
+            let _ = gate.entered.send(());
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("test must release apply publication gate");
+        }
+        next.publish(sm);
+        Ok(out)
     }
 }
 
@@ -1354,182 +1766,196 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     {
         let mut sm = self.state.write().await;
         blocking_section(|| {
-            let persisted = self
-                .load_disk_state(&sm)
-                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-            let mut next = ApplyDelta::new(&sm);
-            if let Some(loaded) = &persisted {
-                next.d1 = Some(loaded.state.stage());
-            }
-            let mut out = Vec::new();
-            let mut batch = WriteBatch::default();
+            self.coordinator_operation(|| {
+                if sm
+                    .d1
+                    .as_ref()
+                    .and_then(|d1| d1.coordinator.as_ref())
+                    .is_some_and(|coordinator| coordinator.active().is_some())
+                {
+                    return self.apply_active_entries(&mut sm, entries);
+                }
+                let persisted = self
+                    .load_disk_state(&sm)
+                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                let mut next = ApplyDelta::new(&sm);
+                if let Some(loaded) = &persisted {
+                    next.d1 = Some(loaded.state.stage());
+                }
+                let mut out = Vec::new();
+                let mut batch = WriteBatch::default();
 
-            for entry in entries {
-                next.last_applied_log = Some(entry.log_id);
-                match entry.payload {
-                    EntryPayload::Blank => out.push(ApplyResult {
-                        value: None,
-                        d1: None,
-                    }),
-                    EntryPayload::Membership(mem) => {
-                        next.last_membership = StoredMembership::new(Some(entry.log_id), mem);
-                        out.push(ApplyResult {
+                for entry in entries {
+                    next.last_applied_log = Some(entry.log_id);
+                    match entry.payload {
+                        EntryPayload::Blank => out.push(ApplyResult {
                             value: None,
                             d1: None,
-                        });
-                    }
-                    EntryPayload::Normal(cmd) => {
-                        let mut result = ApplyResult {
-                            value: None,
-                            d1: None,
-                        };
-                        match cmd {
-                            LogCommand::Noop => {}
-                            LogCommand::TxnBatch(operations) => {
-                                if next.d1.is_some() {
-                                    result.d1 = Some(Err(D1Error::LegacyWriteDisabled));
-                                } else {
-                                    apply_operations(&sm, &mut next, &mut batch, operations);
+                        }),
+                        EntryPayload::Membership(mem) => {
+                            next.last_membership = StoredMembership::new(Some(entry.log_id), mem);
+                            out.push(ApplyResult {
+                                value: None,
+                                d1: None,
+                            });
+                        }
+                        EntryPayload::Normal(cmd) => {
+                            let mut result = ApplyResult {
+                                value: None,
+                                d1: None,
+                            };
+                            match cmd {
+                                LogCommand::Noop => {}
+                                LogCommand::TxnBatch(operations) => {
+                                    if next.d1.is_some() {
+                                        result.d1 = Some(Err(D1Error::LegacyWriteDisabled));
+                                    } else {
+                                        apply_operations(&sm, &mut next, &mut batch, operations);
+                                    }
+                                }
+                                LogCommand::D1V1(command) => {
+                                    result.d1 = Some(apply_d1(&sm, &mut next, &mut batch, command));
                                 }
                             }
-                            LogCommand::D1V1(command) => {
-                                result.d1 = Some(apply_d1(&sm, &mut next, &mut batch, command));
-                            }
+                            out.push(result);
                         }
-                        out.push(result);
                     }
                 }
-            }
 
-            if let Some(storage) = &self.storage {
-                // Migration checks the complete old namespace, including absence
-                // for pre-index v5 or a newly activated coordinator. No normal
-                // write may publish disk15 alongside an unnoticed orphan row.
-                if storage.request_indexed.load(Ordering::Relaxed) {
-                    crate::request_index::validate(
-                        &storage.db,
-                        sm.d1.as_ref(),
-                        sm.last_applied_log,
-                        true,
+                if let Some(storage) = &self.storage {
+                    // Migration checks the complete old namespace, including absence
+                    // for pre-index v5 or a newly activated coordinator. No normal
+                    // write may publish disk16 alongside an unnoticed orphan row.
+                    if storage.request_indexed.load(Ordering::Relaxed) {
+                        crate::request_index::validate(
+                            &storage.db,
+                            sm.d1.as_ref(),
+                            sm.last_applied_log,
+                            true,
+                        )
+                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    } else if next
+                        .d1
+                        .as_ref()
+                        .is_some_and(|state| state.coordinator.is_some())
+                    {
+                        crate::request_index::reject_retired_namespace(&storage.db)
+                            .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    }
+                    // Only explicit snapshot replacement may rebuild a damaged
+                    // derived manifest; ordinary apply must not conceal corruption.
+                    let expected = storage.request_manifest.lock().unwrap();
+                    if storage
+                        .db
+                        .get(crate::request_index::MANIFEST_KEY)
+                        .map_err(write_error)?
+                        .as_deref()
+                        != expected.as_deref()
+                    {
+                        return Err(write_error(std::io::Error::other(
+                            "request manifest changed",
+                        )));
+                    }
+                    drop(expected);
+                    let expected = storage.decision_manifest.lock().unwrap();
+                    if storage
+                        .db
+                        .get(crate::decision_segments::MANIFEST_KEY)
+                        .map_err(write_error)?
+                        .as_deref()
+                        != expected.as_deref()
+                    {
+                        return Err(write_error(std::io::Error::other(
+                            "decision manifest changed",
+                        )));
+                    }
+                    drop(expected);
+                    if storage.decision_indexed.load(Ordering::Relaxed) {
+                        crate::decision_segments::check_tail(&storage.db, sm.d1.as_ref().unwrap())
+                            .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    }
+                    let applied =
+                        serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
+                    let membership =
+                        serde_json::to_vec(&next.last_membership).map_err(write_error)?;
+                    let descriptor = event_ledger::stage(
+                        &mut batch,
+                        persisted.as_ref().and_then(|loaded| loaded.ledger.as_ref()),
+                        next.d1.as_ref(),
+                        next.last_applied_log,
+                        false,
                     )
                     .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                } else if next
-                    .d1
-                    .as_ref()
-                    .is_some_and(|state| state.coordinator.is_some())
-                {
-                    crate::request_index::reject_retired_namespace(&storage.db)
-                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                }
-                // Only explicit snapshot replacement may rebuild a damaged
-                // derived manifest; ordinary apply must not conceal corruption.
-                let expected = storage.request_manifest.lock().unwrap();
-                if storage
-                    .db
-                    .get(crate::request_index::MANIFEST_KEY)
-                    .map_err(write_error)?
-                    .as_deref()
-                    != expected.as_deref()
-                {
-                    return Err(write_error(std::io::Error::other(
-                        "request manifest changed",
-                    )));
-                }
-                drop(expected);
-                let expected = storage.decision_manifest.lock().unwrap();
-                if storage
-                    .db
-                    .get(crate::decision_segments::MANIFEST_KEY)
-                    .map_err(write_error)?
-                    .as_deref()
-                    != expected.as_deref()
-                {
-                    return Err(write_error(std::io::Error::other(
-                        "decision manifest changed",
-                    )));
-                }
-                drop(expected);
-                if storage.decision_indexed.load(Ordering::Relaxed) {
-                    crate::decision_segments::check_tail(&storage.db, sm.d1.as_ref().unwrap())
-                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                }
-                let applied = serde_json::to_vec(&next.last_applied_log).map_err(write_error)?;
-                let membership = serde_json::to_vec(&next.last_membership).map_err(write_error)?;
-                let descriptor = event_ledger::stage(
-                    &mut batch,
-                    persisted.as_ref().and_then(|loaded| loaded.ledger.as_ref()),
-                    next.d1.as_ref(),
-                    next.last_applied_log,
-                    false,
-                )
-                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                let metadata = next
-                    .d1
-                    .as_ref()
-                    .map(|d1| d1_metadata_bytes(d1, descriptor.as_ref()))
-                    .transpose()
-                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                if let Some(d1) = &next.d1 {
-                    batch.put(D1_KEY, metadata.as_ref().unwrap());
-                    if storage.legacy_d1.load(Ordering::Relaxed) {
-                        if let Some(previous) = &sm.d1 {
-                            put_dedup(&mut batch, &previous.dedup)?;
-                        }
-                    }
-                    put_dedup(&mut batch, &d1.dedup)?;
-                } else {
-                    batch.delete(D1_KEY);
-                }
-                let request_manifest = crate::request_index::stage_unbound_or_retire(
-                    &mut batch,
-                    next.d1.as_ref(),
-                    next.last_applied_log,
-                    storage.request_indexed.load(Ordering::Relaxed),
-                )
-                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                let decision_manifest = crate::decision_segments::stage(
-                    &mut batch,
-                    sm.d1.as_ref(),
-                    next.d1.as_ref(),
-                    next.last_applied_log,
-                    storage.decision_indexed.load(Ordering::Relaxed),
-                    false,
-                )
-                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                let archive_cut = staged_archive_cut(
-                    next.d1.as_ref(),
-                    descriptor.as_ref(),
-                    metadata.as_deref(),
-                    decision_manifest.as_deref(),
-                )
-                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                batch.put(APPLIED_KEY, applied);
-                batch.put(MEMBERSHIP_KEY, membership);
-                storage.write_sync(batch)?;
-                next.archive_cut = archive_cut;
-                *storage.metadata.lock().unwrap() = metadata;
-                storage.legacy_d1.store(false, Ordering::Relaxed);
-                storage
-                    .request_indexed
-                    .store(request_manifest.is_some(), Ordering::Relaxed);
-                *storage.request_manifest.lock().unwrap() = request_manifest;
-                *storage.decision_manifest.lock().unwrap() = decision_manifest;
-                storage.decision_indexed.store(
-                    next.d1
+                    let metadata = next
+                        .d1
                         .as_ref()
-                        .is_some_and(crate::decision_segments::enabled),
-                    Ordering::Relaxed,
-                );
-            }
-            #[cfg(test)]
-            if let Some(gate) = self.apply_publish_gate.lock().unwrap().take() {
-                let _ = gate.entered.send(());
-                gate.release
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("test must release apply publication gate");
-            }
-            next.publish(&mut sm);
-            Ok(out)
+                        .map(|d1| coordinator_metadata_bytes(d1, descriptor.as_ref()))
+                        .transpose()
+                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    if let Some(d1) = &next.d1 {
+                        batch.put(D1_KEY, metadata.as_ref().unwrap());
+                        if storage.legacy_d1.load(Ordering::Relaxed) {
+                            if let Some(previous) = &sm.d1 {
+                                put_dedup(&mut batch, &previous.dedup)?;
+                            }
+                        }
+                        put_dedup(&mut batch, &d1.dedup)?;
+                    } else {
+                        batch.delete(D1_KEY);
+                    }
+                    let request_manifest = crate::request_index::stage_unbound_or_retire(
+                        &mut batch,
+                        next.d1.as_ref(),
+                        next.last_applied_log,
+                        storage.request_indexed.load(Ordering::Relaxed),
+                    )
+                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    let decision_manifest = crate::decision_segments::stage(
+                        &mut batch,
+                        sm.d1.as_ref(),
+                        next.d1.as_ref(),
+                        next.last_applied_log,
+                        storage.decision_indexed.load(Ordering::Relaxed),
+                        false,
+                    )
+                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    let archive_cut = staged_archive_cut(
+                        next.d1.as_ref(),
+                        descriptor.as_ref(),
+                        metadata.as_deref(),
+                        decision_manifest.as_deref(),
+                    )
+                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    compact_coordinator(next.d1.as_mut(), archive_cut.as_deref())
+                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                    batch.put(APPLIED_KEY, applied);
+                    batch.put(MEMBERSHIP_KEY, membership);
+                    storage.write_sync(batch)?;
+                    next.archive_cut = archive_cut;
+                    *storage.metadata.lock().unwrap() = metadata;
+                    storage.legacy_d1.store(false, Ordering::Relaxed);
+                    storage
+                        .request_indexed
+                        .store(request_manifest.is_some(), Ordering::Relaxed);
+                    *storage.request_manifest.lock().unwrap() = request_manifest;
+                    *storage.decision_manifest.lock().unwrap() = decision_manifest;
+                    storage.decision_indexed.store(
+                        next.d1
+                            .as_ref()
+                            .is_some_and(crate::decision_segments::enabled),
+                        Ordering::Relaxed,
+                    );
+                }
+                #[cfg(test)]
+                if let Some(gate) = self.apply_publish_gate.lock().unwrap().take() {
+                    let _ = gate.entered.send(());
+                    gate.release
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("test must release apply publication gate");
+                }
+                next.publish(&mut sm);
+                Ok(out)
+            })
         })
     }
 
@@ -1614,7 +2040,32 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 let valid = incoming
                     .coordinator
                     .as_ref()
-                    .is_some_and(|next| journal.validate_successor(next).is_ok());
+                    .and_then(Coordinator::full)
+                    .is_some_and(|next| match journal {
+                        Coordinator::Full(current) => current.validate_successor(next).is_ok(),
+                        Coordinator::Active(checkpoint) => {
+                            let Some(cut) = sm.archive_cut.as_deref() else {
+                                return false;
+                            };
+                            if cut.checkpoint() != checkpoint.as_ref() {
+                                return false;
+                            }
+                            let descriptor = cut.descriptor();
+                            let Ok(cursor) = next.history_cursor_at(descriptor.event_count) else {
+                                return false;
+                            };
+                            if cursor.authority != descriptor.domain.authority
+                                || cursor.cohort != descriptor.domain.cohort
+                                || cursor.root != descriptor.head_root
+                            {
+                                return false;
+                            }
+                            next.history_prefix(&cursor)
+                                .ok()
+                                .and_then(|prefix| ActiveCheckpoint::from_journal(&prefix).ok())
+                                .is_some_and(|prefix| &prefix == checkpoint.as_ref())
+                        }
+                    });
                 if !valid {
                     return Err(StorageIOError::read_snapshot(
                         Some(meta.signature()),
@@ -1725,7 +2176,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             let metadata = next
                 .d1
                 .as_ref()
-                .map(|d1| d1_metadata_bytes(d1, descriptor.as_ref()))
+                .map(|d1| coordinator_metadata_bytes(d1, descriptor.as_ref()))
                 .transpose()
                 .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             if let Some(d1) = &next.d1 {
@@ -1757,6 +2208,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 decision_manifest.as_deref(),
             )
             .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+            compact_coordinator(next.d1.as_mut(), archive_cut.as_deref())
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
             put_snapshot(&mut batch, &stored)?;
@@ -1806,7 +2259,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     }
 }
 
-// Bound coordinator writes always stage disk15. Members and unbound legacy
+// Bound coordinator writes stage disk16. Members and unbound legacy
 // coordinators do not have an archive-backed point-recovery witness.
 fn staged_archive_cut(
     state: Option<&D1State>,
@@ -1825,6 +2278,27 @@ fn staged_archive_cut(
         ))),
         _ => Ok(None),
     }
+}
+
+fn coordinator_metadata_bytes(
+    state: &D1State,
+    staged: Option<&event_ledger::Staged<'_>>,
+) -> anyhow::Result<Vec<u8>> {
+    if let (Some(journal), Some(staged)) = (
+        state.coordinator.as_ref().and_then(Coordinator::full),
+        staged,
+    ) {
+        if journal.cohort().is_some() {
+            let checkpoint = ActiveCheckpoint::from_journal(journal)
+                .map_err(|e| anyhow::anyhow!("checkpoint derivation: {e:?}"))?;
+            return state_codec::active_metadata_bytes(
+                state,
+                staged.descriptor_for(state)?,
+                &checkpoint,
+            );
+        }
+    }
+    d1_metadata_bytes(state, staged)
 }
 
 /// An apply-call overlay. Only changed keys and newly accepted retry identities
@@ -2187,7 +2661,8 @@ fn apply_d1(
             if d1.coordinator.is_none() {
                 d1.coordinator = Some(
                     crate::transaction_decisions::Journal::new(mode_id)
-                        .map_err(D1Error::CoordinatorRejected)?,
+                        .map_err(D1Error::CoordinatorRejected)?
+                        .into(),
                 );
                 d1.version = 4;
             }
@@ -2219,6 +2694,7 @@ fn apply_d1(
             let journal = d1
                 .coordinator
                 .as_mut()
+                .and_then(Coordinator::full_mut)
                 .ok_or(D1Error::CoordinatorNotEnabled)?;
             journal
                 .apply(command)
@@ -3265,6 +3741,8 @@ mod coordinator_tests {
             .unwrap()
             .coordinator
             .clone()
+            .unwrap()
+            .into_full()
             .unwrap();
         assert_eq!(snapshot.resolved_prefix(), 0);
         assert_eq!(snapshot.transaction([2; 16]).unwrap().decision, None);
@@ -3314,6 +3792,8 @@ mod coordinator_tests {
                 .coordinator
                 .as_ref()
                 .unwrap()
+                .full()
+                .unwrap()
                 .transaction([2; 16])
                 .unwrap()
                 .decision,
@@ -3355,6 +3835,8 @@ mod coordinator_tests {
                 .coordinator
                 .as_ref()
                 .unwrap()
+                .full()
+                .unwrap()
                 .transaction([2; 16])
                 .unwrap()
                 .decision,
@@ -3379,6 +3861,8 @@ mod coordinator_tests {
             .unwrap()
             .coordinator
             .as_ref()
+            .unwrap()
+            .full()
             .unwrap()
             .transaction([2; 16])
             .is_some());
@@ -3408,3 +3892,7 @@ mod history_sync_tests;
 #[cfg(test)]
 #[path = "archive_recovery_tests.rs"]
 mod archive_recovery_tests;
+
+#[cfg(test)]
+#[path = "active_checkpoint_state_tests.rs"]
+mod active_checkpoint_state_tests;

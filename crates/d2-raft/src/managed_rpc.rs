@@ -2015,7 +2015,23 @@ async fn execute(
             epoch,
             command,
         } => {
-            checked_journal(node, pinned, &authority, epoch).await?;
+            if pinned.is_some_and(|p| {
+                p.role != Role::Coordinator || p.authority != authority || p.target.epoch != epoch
+            }) {
+                return Err(Error::Identity);
+            }
+            let cohort = node
+                .state_machine
+                .coordinator_command_identity(authority.shard, epoch, authority.mode)
+                .await
+                .map_err(application_error)?;
+            if cohort
+                .as_ref()
+                .is_some_and(|cohort| cohort.coordinator_epoch != epoch)
+                || pinned.is_some_and(|p| cohort.as_ref() != Some(&p.cohort))
+            {
+                return Err(Error::Identity);
+            }
             if matches!(
                 command,
                 Command::BindCohort { .. } | Command::ConfirmCohortCapacity { .. }

@@ -4,6 +4,7 @@
 use crate::d1::D1State;
 use crate::participant_writes::Authority;
 use crate::request_index::{RecoveredRequest, RequestLookup};
+use crate::transaction_decisions::checkpoint::{ActiveCheckpoint, LookupKey, LookupResult};
 use crate::transaction_decisions::{
     CapacityProfile, Cohort, Command, HistoryCursor, HistoryPage, Journal, RequestRecord,
     Transaction, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_EVENTS, MAX_JOURNAL_BYTES,
@@ -13,6 +14,7 @@ use crate::{D1Error, NodeId};
 use openraft::LogId;
 use rocksdb::{Direction, IteratorMode, Snapshot, WriteBatch, DB};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::Arc;
 
 pub(super) const PREFIX: &[u8] = b"sm/ledger/";
 const PREFIX_END: &[u8] = b"sm/ledger0";
@@ -155,7 +157,7 @@ struct View<'a> {
 impl<'a> View<'a> {
     fn of(state: &'a D1State) -> Option<Self> {
         let (role, journal) = match &state.coordinator {
-            Some(journal) => (Role::Coordinator, journal),
+            Some(coordinator) => (Role::Coordinator, coordinator.full()?),
             None => (Role::Member, &state.visibility.as_ref()?.journal),
         };
         let cohort = journal.cohort()?.clone();
@@ -226,6 +228,7 @@ fn fits(count: usize, bytes: usize, next_bytes: usize) -> bool {
     count < MAX_HISTORY_PAGE_EVENTS && next_bytes <= MAX_HISTORY_PAGE_BYTES - bytes
 }
 struct Tail {
+    events: Vec<Command>,
     first: u64,
     before: HistoryCursor,
     count: usize,
@@ -371,6 +374,7 @@ fn walk(
         }
         let row_count = row.events.len();
         let before = cursor.clone();
+        let original_events = row.events.clone();
         for event in row.events {
             let size = event_size(&event)?;
             cursor = cursor
@@ -380,6 +384,7 @@ fn walk(
         }
         anyhow::ensure!(cursor.root == row.after_root, "ledger row root mismatch");
         tail = Some(Tail {
+            events: original_events,
             first: row.first,
             before,
             count: row_count,
@@ -423,7 +428,7 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
 }
 
 /// An integrity expectation minted from one strictly validated, published
-/// coordinator state. It contains no Journal or event/transaction collection,
+/// coordinator state. It contains no Journal, events or drained transaction collection,
 /// is not serializable, and has no descriptor-only or public constructor.
 /// SHA-256 equality proves integrity relative to this cut, not authentication.
 #[derive(Debug)]
@@ -432,6 +437,7 @@ pub(super) struct PublishedArchiveCut {
     metadata: Vec<u8>,
     decision_manifest: Vec<u8>,
     resolved_prefix: u64,
+    checkpoint: Arc<ActiveCheckpoint>,
 }
 impl Loaded {
     /// Caller must first complete typed metadata and derived namespace checks,
@@ -462,28 +468,42 @@ impl Staged<'_> {
             descriptor.domain.role == Role::Coordinator,
             "archive recovery cut requires a bound coordinator"
         );
-        anyhow::ensure!(
-            super::state_codec::d1_metadata_bytes(state, Some(self))? == metadata,
-            "published archive metadata differs from staged state"
-        );
+        let journal = state
+            .coordinator
+            .as_ref()
+            .and_then(|coordinator| coordinator.full())
+            .ok_or_else(|| anyhow::anyhow!("missing coordinator archive"))?;
+        let checkpoint = ActiveCheckpoint::from_journal(journal).map_err(history_error)?;
+        if super::state_codec::d1_metadata_bytes(state, Some(self))? != metadata {
+            super::state_codec::validate_active_metadata(metadata, descriptor, &checkpoint)?;
+        }
         anyhow::ensure!(
             crate::decision_segments::manifest_bytes(state, descriptor.applied)?
                 == decision_manifest,
             "published archive decision manifest differs from staged state"
         );
-        let journal = state
-            .coordinator
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing coordinator archive"))?;
         Ok(PublishedArchiveCut {
             descriptor: descriptor.clone(),
             metadata: metadata.to_vec(),
             decision_manifest: decision_manifest.to_vec(),
             resolved_prefix: journal.resolved_prefix(),
+            checkpoint: Arc::new(checkpoint),
         })
     }
 }
 impl PublishedArchiveCut {
+    pub(super) fn checkpoint(&self) -> &ActiveCheckpoint {
+        self.checkpoint.as_ref()
+    }
+
+    pub(super) fn checkpoint_arc(&self) -> &Arc<ActiveCheckpoint> {
+        &self.checkpoint
+    }
+
+    pub(super) fn descriptor(&self) -> &Descriptor {
+        &self.descriptor
+    }
+
     fn snapshot<'a>(&self, db: &'a DB) -> Result<Snapshot<'a>, D1Error> {
         let snapshot = db.snapshot();
         if snapshot
@@ -493,6 +513,14 @@ impl PublishedArchiveCut {
             != Some(self.metadata.as_slice())
         {
             return Err(D1Error::EventLedgerHistory);
+        }
+        if snapshot
+            .get(crate::decision_segments::MANIFEST_KEY)
+            .map_err(|_| D1Error::DecisionIndexUnavailable)?
+            .as_deref()
+            != Some(self.decision_manifest.as_slice())
+        {
+            return Err(D1Error::DecisionIndexHistory);
         }
         crate::request_index::reject_retired_snapshot(&snapshot).map_err(|error| {
             if error.is::<rocksdb::Error>() {
@@ -513,6 +541,485 @@ impl PublishedArchiveCut {
             root: self.descriptor.head_root,
         }
     }
+}
+
+/// An operation-local snapshot verified against the private publication witness.
+/// It retains only the last bounded raw row, never a replayed Journal.
+pub(super) struct VerifiedArchive<'db, 'cut> {
+    snapshot: Snapshot<'db>,
+    cut: &'cut PublishedArchiveCut,
+    tail: Tail,
+}
+
+pub(super) fn verify_active<'db, 'cut>(
+    db: &'db DB,
+    cut: &'cut PublishedArchiveCut,
+) -> Result<VerifiedArchive<'db, 'cut>, D1Error> {
+    let snapshot = cut.snapshot(db)?;
+    cut.checkpoint
+        .validate()
+        .map_err(|_| D1Error::EventLedgerHistory)?;
+    let tail =
+        walk(&snapshot, &cut.descriptor, |_, _, _| Ok(())).map_err(super::ledger_read_error)?;
+    Ok(VerifiedArchive {
+        snapshot,
+        cut,
+        tail,
+    })
+}
+
+impl VerifiedArchive<'_, '_> {
+    pub(super) fn checkpoint(&self) -> &ActiveCheckpoint {
+        &self.cut.checkpoint
+    }
+
+    pub(super) fn descriptor(&self) -> &Descriptor {
+        &self.cut.descriptor
+    }
+
+    pub(super) fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.snapshot.get(key)?)
+    }
+
+    pub(super) fn decision_manifest(&self) -> &[u8] {
+        &self.cut.decision_manifest
+    }
+
+    /// Bounded ordinal projection for the prior terminal tail. Every raw row
+    /// still closes against the same cut, including rows after this interval.
+    pub(super) fn transactions(
+        &self,
+        first: u64,
+        last: u64,
+        overlay: &[Command],
+    ) -> anyhow::Result<Vec<Transaction>> {
+        anyhow::ensure!(
+            first > 0 && last >= first && last - first < 32,
+            "archive transaction projection exceeds terminal tail bound"
+        );
+        self.check_overlay(overlay)?;
+        let mut ordinal = 0u64;
+        let mut result: Vec<Transaction> = Vec::new();
+        let mut observe = |event: &Command| -> anyhow::Result<()> {
+            match event {
+                Command::Begin { id, participants }
+                | Command::AdmitRequest {
+                    transaction_id: id,
+                    participants,
+                    ..
+                } => {
+                    ordinal = ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("archive ordinal overflow"))?;
+                    if (first..=last).contains(&ordinal) {
+                        result.push(Transaction {
+                            id: *id,
+                            ordinal,
+                            participants: participants.clone(),
+                            prepared: vec![false; participants.len()],
+                            decision: None,
+                        });
+                    }
+                }
+                Command::Prepared { id, participant } => {
+                    if let Some(tx) = result.iter_mut().find(|tx| tx.id == *id) {
+                        anyhow::ensure!(
+                            tx.record_prepared(participant).map_err(history_error)?,
+                            "duplicate retained prepare"
+                        );
+                    }
+                }
+                Command::Decide { id, decision } => {
+                    if let Some(tx) = result.iter_mut().find(|tx| tx.id == *id) {
+                        anyhow::ensure!(
+                            tx.record_decision(*decision).map_err(history_error)?,
+                            "duplicate retained decision"
+                        );
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        walk(&self.snapshot, &self.cut.descriptor, |event, _, _| {
+            observe(&event)
+        })?;
+        for event in overlay {
+            observe(event)?;
+        }
+        anyhow::ensure!(
+            result.len() as u64 == last - first + 1,
+            "archive transaction interval is incomplete"
+        );
+        Ok(result)
+    }
+
+    /// The overlay is the complete accepted original Command suffix of this
+    /// operation, including Commands for transactions already drained from the
+    /// candidate checkpoint. It is deliberately not an active-record overlay.
+    pub(super) fn lookup(
+        &self,
+        key: LookupKey,
+        overlay: &[Command],
+    ) -> anyhow::Result<LookupResult> {
+        let mut projection = Projection::new(key);
+        walk(&self.snapshot, &self.cut.descriptor, |event, _, _| {
+            projection.observe(&event)
+        })?;
+        self.check_overlay(overlay)?;
+        for event in overlay {
+            projection.observe(event)?;
+        }
+        Ok(projection.finish())
+    }
+
+    fn check_overlay(&self, overlay: &[Command]) -> anyhow::Result<()> {
+        let count = self
+            .cut
+            .descriptor
+            .event_count
+            .checked_add(overlay.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("archive overlay event overflow"))?;
+        anyhow::ensure!(
+            count
+                <= self
+                    .cut
+                    .descriptor
+                    .domain
+                    .cohort
+                    .profile
+                    .max_history_events(),
+            "archive overlay exceeds event bound"
+        );
+        let mut bytes = 0usize;
+        for event in overlay {
+            bytes = bytes
+                .checked_add(event_size(event)?)
+                .filter(|bytes| *bytes <= MAX_JOURNAL_BYTES)
+                .ok_or_else(|| anyhow::anyhow!("archive overlay exceeds byte bound"))?;
+        }
+        Ok(())
+    }
+}
+
+/// One requested binding or transaction plus its absolute admission ordinal.
+/// This projection performs no admissions and is not an alternate authority.
+struct Projection {
+    key: LookupKey,
+    ordinal: u64,
+    request: Option<RequestRecord>,
+    transaction: Option<Transaction>,
+}
+impl Projection {
+    fn new(key: LookupKey) -> Self {
+        Self {
+            key,
+            ordinal: 0,
+            request: None,
+            transaction: None,
+        }
+    }
+
+    fn observe(&mut self, event: &Command) -> anyhow::Result<()> {
+        if matches!(event, Command::Begin { .. } | Command::AdmitRequest { .. }) {
+            self.ordinal = self
+                .ordinal
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("archive ordinal overflow"))?;
+        }
+        match event {
+            Command::AdmitRequest {
+                id,
+                request,
+                payload,
+                transaction_id,
+                participants,
+            } => {
+                if matches!(&self.key, LookupKey::Request(wanted) if wanted == id) {
+                    anyhow::ensure!(self.request.is_none(), "duplicate retained request");
+                    self.request = Some(RequestRecord {
+                        id: *id,
+                        request: request.clone(),
+                        payload: payload.clone(),
+                        transaction_id: *transaction_id,
+                    });
+                }
+                if matches!(&self.key, LookupKey::Transaction(wanted) if wanted == transaction_id) {
+                    self.admit(*transaction_id, participants)?;
+                }
+            }
+            Command::Begin { id, participants } => {
+                if matches!(&self.key, LookupKey::Transaction(wanted) if wanted == id) {
+                    self.admit(*id, participants)?;
+                }
+            }
+            Command::Prepared { id, participant } => {
+                if let Some(tx) = self.transaction.as_mut().filter(|tx| tx.id == *id) {
+                    anyhow::ensure!(
+                        tx.record_prepared(participant).map_err(history_error)?,
+                        "duplicate retained prepare"
+                    );
+                }
+            }
+            Command::Decide { id, decision } => {
+                if let Some(tx) = self.transaction.as_mut().filter(|tx| tx.id == *id) {
+                    anyhow::ensure!(
+                        tx.record_decision(*decision).map_err(history_error)?,
+                        "duplicate retained decision"
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn admit(
+        &mut self,
+        id: [u8; 16],
+        participants: &[crate::transaction_decisions::Participant],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.transaction.is_none(), "duplicate retained transaction");
+        self.transaction = Some(Transaction {
+            id,
+            ordinal: self.ordinal,
+            participants: participants.to_vec(),
+            prepared: vec![false; participants.len()],
+            decision: None,
+        });
+        Ok(())
+    }
+
+    fn finish(self) -> LookupResult {
+        match self.key {
+            LookupKey::Request(_) => LookupResult::Request(self.request),
+            LookupKey::Transaction(_) => LookupResult::Transaction(self.transaction),
+        }
+    }
+}
+
+/// Exact checkpoint candidate proven by reapplying only the new raw suffix with
+/// the shared checkpoint transition implementation. No Journal is constructed.
+pub(super) struct StagedActive<'a> {
+    candidate: &'a ActiveCheckpoint,
+    descriptor: Descriptor,
+    // Operation-local output of the exact shared transitions below. These
+    // records are handed to terminal staging and never retained by the cut.
+    drained: Vec<Transaction>,
+}
+impl StagedActive<'_> {
+    pub(super) fn drained(&self) -> &[Transaction] {
+        &self.drained
+    }
+
+    pub(super) fn descriptor_for(
+        &self,
+        checkpoint: &ActiveCheckpoint,
+    ) -> anyhow::Result<&Descriptor> {
+        anyhow::ensure!(
+            std::ptr::eq(self.candidate, checkpoint),
+            "active ledger proof belongs to a different candidate"
+        );
+        Ok(&self.descriptor)
+    }
+
+    pub(super) fn published_cut(
+        &self,
+        checkpoint: &Arc<ActiveCheckpoint>,
+        metadata: &[u8],
+        decision_manifest: &crate::decision_segments::StagedCheckpointManifest,
+    ) -> anyhow::Result<PublishedArchiveCut> {
+        let descriptor = self.descriptor_for(checkpoint.as_ref())?;
+        let decision_manifest = decision_manifest.bytes();
+        super::state_codec::validate_active_metadata(metadata, descriptor, checkpoint)?;
+        crate::decision_segments::validate_checkpoint_manifest(
+            &crate::decision_segments::CheckpointIdentity {
+                shard: descriptor.domain.shard,
+                epoch: descriptor.domain.epoch,
+                mode: descriptor.domain.mode,
+                cohort: descriptor.domain.cohort.clone(),
+            },
+            checkpoint.resolved_prefix(),
+            descriptor.applied,
+            decision_manifest,
+        )?;
+        Ok(PublishedArchiveCut {
+            descriptor: descriptor.clone(),
+            metadata: metadata.to_vec(),
+            decision_manifest: decision_manifest.to_vec(),
+            resolved_prefix: checkpoint.resolved_prefix(),
+            checkpoint: Arc::clone(checkpoint),
+        })
+    }
+}
+
+/// Preserve every sealed row and rewrite only a growing old tail plus new rows.
+/// Caller owns the atomic metadata/terminal/raw/applied batch and must discard
+/// the entire batch on any error, including a failed proof construction.
+pub(super) fn stage_active<'a>(
+    batch: &mut WriteBatch,
+    before: &VerifiedArchive<'_, '_>,
+    candidate: &'a ActiveCheckpoint,
+    suffix: &[Command],
+    applied: Option<LogId<NodeId>>,
+) -> anyhow::Result<StagedActive<'a>> {
+    before.check_overlay(suffix)?;
+    candidate.validate().map_err(history_error)?;
+    let mut expected = before.checkpoint().clone();
+    let drained_count = candidate
+        .resolved_prefix()
+        .checked_sub(expected.resolved_prefix())
+        .ok_or_else(|| anyhow::anyhow!("checkpoint resolved prefix regressed"))?;
+    let mut drained = Vec::new();
+    for (index, event) in suffix.iter().enumerate() {
+        let mut lookup_failure = None;
+        let transition = expected.apply(event.clone(), &mut |key| {
+            before.lookup(key, &suffix[..index]).map_err(|error| {
+                lookup_failure = Some(error);
+                crate::transaction_decisions::Error::InvalidJournal
+            })
+        });
+        if let Some(error) = lookup_failure {
+            return Err(error);
+        }
+        let transition = transition.map_err(history_error)?;
+        anyhow::ensure!(
+            transition.accepted.as_ref() == Some(event),
+            "raw suffix contains a rejected or duplicate event"
+        );
+        let count = drained
+            .len()
+            .checked_add(transition.drained.len())
+            .ok_or_else(|| anyhow::anyhow!("checkpoint drained count overflow"))?;
+        anyhow::ensure!(
+            count as u64 <= drained_count,
+            "raw suffix drains beyond candidate prefix"
+        );
+        drained.extend(transition.drained);
+    }
+    anyhow::ensure!(
+        &expected == candidate && drained.len() as u64 == drained_count,
+        "raw suffix checkpoint mismatch"
+    );
+    let old = &before.cut.descriptor;
+    if suffix.is_empty() {
+        return Ok(StagedActive {
+            candidate,
+            descriptor: Descriptor {
+                applied,
+                ..old.clone()
+            },
+            drained,
+        });
+    }
+    let mut cursor = before.tail.before.clone();
+    let mut segments = old
+        .segment_count
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("missing raw tail"))?;
+    let mut encoded = old
+        .encoded_bytes
+        .checked_sub(before.tail.encoded_bytes)
+        .ok_or_else(|| anyhow::anyhow!("raw tail byte mismatch"))?;
+    // Only one bounded row is assembled at a time; the operation's suffix is
+    // already owned by the caller and is not copied into an archive-sized Vec.
+    let mut events = before.tail.events.clone();
+    let mut bytes = before.tail.event_bytes;
+    for event in suffix {
+        let size = event_size(event)?;
+        if !fits(events.len(), bytes, size) {
+            write_active_row(
+                batch,
+                before,
+                &mut cursor,
+                &events,
+                bytes,
+                &mut segments,
+                &mut encoded,
+            )?;
+            events.clear();
+            bytes = 0;
+        }
+        events.push(event.clone());
+        bytes = bytes
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("raw tail bytes overflow"))?;
+    }
+    write_active_row(
+        batch,
+        before,
+        &mut cursor,
+        &events,
+        bytes,
+        &mut segments,
+        &mut encoded,
+    )?;
+    let descriptor = Descriptor {
+        version: old.version,
+        domain: old.domain.clone(),
+        event_count: cursor.event_count,
+        segment_count: segments,
+        encoded_bytes: encoded,
+        head_root: cursor.root,
+        applied,
+    };
+    descriptor.validate()?;
+    anyhow::ensure!(
+        descriptor.event_count == candidate.event_count(),
+        "checkpoint event mismatch"
+    );
+    Ok(StagedActive {
+        candidate,
+        descriptor,
+        drained,
+    })
+}
+
+fn write_active_row(
+    batch: &mut WriteBatch,
+    before: &VerifiedArchive<'_, '_>,
+    cursor: &mut HistoryCursor,
+    events: &[Command],
+    event_bytes: usize,
+    segments: &mut u64,
+    encoded: &mut u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!events.is_empty(), "empty staged ledger row");
+    let domain = &before.cut.descriptor.domain;
+    let after = cursor.extend(events).map_err(history_error)?;
+    let first = cursor
+        .event_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("ledger row position overflow"))?;
+    let row = Row {
+        version: domain.cohort.profile.storage_format(),
+        domain: domain.clone(),
+        first,
+        before_root: cursor.root,
+        after_root: after.root,
+        events: events.to_vec(),
+    };
+    let key = domain.key(first);
+    let value = serde_json::to_vec(&row)?;
+    let size = key
+        .len()
+        .checked_add(value.len())
+        .ok_or_else(|| anyhow::anyhow!("ledger encoded row overflow"))?;
+    anyhow::ensure!(
+        size <= MAX_ROW_OVERHEAD + event_bytes,
+        "ledger row schema exceeds proven overhead"
+    );
+    *encoded = encoded
+        .checked_add(size as u64)
+        .ok_or_else(|| anyhow::anyhow!("ledger encoded total overflow"))?;
+    *segments = segments
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("ledger segment count overflow"))?;
+    if first != before.tail.first || events != before.tail.events.as_slice() {
+        batch.put(key, value);
+    }
+    *cursor = after;
+    Ok(())
 }
 
 /// Recover only one original external-ID binding and its exact transaction.
@@ -875,7 +1382,7 @@ mod tests {
             mode_id: [9; 16],
             activated_sequence: 0,
         });
-        state.coordinator = Some(journal);
+        state.coordinator = Some(journal.into());
         state
     }
     fn history(count: u64) -> D1State {
@@ -1113,6 +1620,280 @@ mod tests {
         cut
     }
 
+    fn stage_active_terminals(
+        batch: &mut WriteBatch,
+        verified: &VerifiedArchive<'_, '_>,
+        drained: &[Transaction],
+        through: u64,
+        applied: Option<LogId<NodeId>>,
+    ) -> crate::decision_segments::StagedCheckpointManifest {
+        let descriptor = verified.descriptor();
+        let identity = crate::decision_segments::CheckpointIdentity {
+            shard: descriptor.domain.shard,
+            epoch: descriptor.domain.epoch,
+            mode: descriptor.domain.mode,
+            cohort: descriptor.domain.cohort.clone(),
+        };
+        let old_r = verified.checkpoint().resolved_prefix();
+        let tail_key = crate::decision_segments::checkpoint_tail_key(&identity, old_r).unwrap();
+        let tail = tail_key
+            .as_ref()
+            .map(|key| verified.get(key).unwrap().unwrap());
+        let projected = if tail.is_some() {
+            verified
+                .transactions(old_r / 32 * 32 + 1, old_r, &[])
+                .unwrap()
+        } else {
+            Vec::new()
+        };
+        let stored_manifest = verified
+            .get(crate::decision_segments::MANIFEST_KEY)
+            .unwrap()
+            .unwrap();
+        let checked = crate::decision_segments::check_checkpoint_tail(
+            &identity,
+            old_r,
+            descriptor.applied,
+            verified.decision_manifest(),
+            &stored_manifest,
+            tail.as_deref(),
+            &projected,
+        )
+        .unwrap();
+        crate::decision_segments::stage_checkpoint(batch, &checked, drained, through, applied)
+            .unwrap()
+    }
+
+    #[test]
+    fn active_raw_stage_matches_legacy_rows_without_a_full_journal() {
+        for count in [30, 31, 32, 33, 63, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let old = history(count);
+            let cut = persist_archive(&db, &old, marker(10));
+            let original = rows(&db);
+            let suffix = vec![begin(count), decide(count, Decision::Abort)];
+            let mut full = old.coordinator.as_ref().unwrap().full().unwrap().clone();
+            for event in &suffix {
+                full.replay_event(event.clone()).unwrap();
+            }
+            let candidate = Arc::new(ActiveCheckpoint::from_journal(&full).unwrap());
+            let expected_dir = tempfile::tempdir().unwrap();
+            let expected_db = DB::open_default(expected_dir.path()).unwrap();
+            let expected_state = state(full);
+            let expected = persist_archive(&expected_db, &expected_state, marker(11));
+            let mut live = expected_state.clone();
+            live.coordinator = Some(crate::coordinator_state::Coordinator::Active(
+                candidate.clone(),
+            ));
+            crate::transaction_decisions::without_full_journal(|| {
+                let verified = verify_active(&db, &cut).unwrap();
+                let mut empty_batch = WriteBatch::default();
+                let unchanged = stage_active(
+                    &mut empty_batch,
+                    &verified,
+                    verified.checkpoint(),
+                    &[],
+                    marker(11),
+                )
+                .unwrap();
+                assert_eq!(
+                    unchanged
+                        .descriptor_for(verified.checkpoint())
+                        .unwrap()
+                        .applied,
+                    marker(11)
+                );
+                assert!(unchanged.drained().is_empty());
+                let mut empty_operations = Operations::default();
+                empty_batch.iterate(&mut empty_operations);
+                assert!(empty_operations.puts.is_empty() && empty_operations.deletes.is_empty());
+                let mut batch = WriteBatch::default();
+                let staged =
+                    stage_active(&mut batch, &verified, &candidate, &suffix, marker(11)).unwrap();
+                assert_eq!(
+                    staged.descriptor_for(&candidate).unwrap(),
+                    &expected.descriptor
+                );
+                assert!(staged.descriptor_for(&candidate.as_ref().clone()).is_err());
+                let mut operations = Operations::default();
+                batch.iterate(&mut operations);
+                let changed: Vec<_> = rows(&expected_db)
+                    .into_iter()
+                    .filter(|row| !original.contains(row))
+                    .map(|row| row.0)
+                    .collect();
+                assert_eq!(operations.puts, changed);
+                assert!(operations.deletes.is_empty());
+                let manifest = stage_active_terminals(
+                    &mut batch,
+                    &verified,
+                    staged.drained(),
+                    candidate.resolved_prefix(),
+                    marker(11),
+                );
+                let metadata = super::super::state_codec::active_metadata_bytes(
+                    &live,
+                    staged.descriptor_for(&candidate).unwrap(),
+                    &candidate,
+                )
+                .unwrap();
+                let next_cut = staged
+                    .published_cut(&candidate, &metadata, &manifest)
+                    .unwrap();
+                assert!(Arc::ptr_eq(next_cut.checkpoint_arc(), &candidate));
+                assert!(std::ptr::eq(
+                    next_cut.checkpoint(),
+                    live.coordinator.as_ref().unwrap().active().unwrap()
+                ));
+                let equal_copy = Arc::new(candidate.as_ref().clone());
+                assert!(staged
+                    .published_cut(&equal_copy, &metadata, &manifest)
+                    .is_err());
+                let wrong_marker = stage_active_terminals(
+                    &mut WriteBatch::default(),
+                    &verified,
+                    &[],
+                    candidate.resolved_prefix(),
+                    marker(12),
+                );
+                assert!(staged
+                    .published_cut(&candidate, &metadata, &wrong_marker)
+                    .is_err());
+                let mut noncanonical = metadata.clone();
+                noncanonical.push(b' ');
+                assert!(staged
+                    .published_cut(&candidate, &noncanonical, &manifest)
+                    .is_err());
+                batch.put(super::super::D1_KEY, metadata);
+                batch.put(
+                    super::super::APPLIED_KEY,
+                    serde_json::to_vec(&marker(11)).unwrap(),
+                );
+                db.write(batch).unwrap();
+                assert_eq!(
+                    verify_active(&db, &next_cut).unwrap().checkpoint(),
+                    candidate.as_ref()
+                );
+            });
+            assert_eq!(rows(&db), rows(&expected_db));
+            for row in original.iter().take(original.len().saturating_sub(1)) {
+                assert_eq!(db.get(&row.0).unwrap().as_deref(), Some(row.1.as_slice()));
+            }
+        }
+    }
+
+    #[test]
+    fn active_projection_preserves_drained_same_batch_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let old = state(bound());
+        let cut = persist_archive(&db, &old, marker(1));
+        let overlay = vec![begin(1), decide(1, Decision::Abort), begin(2)];
+        let mut live = old.clone();
+        crate::transaction_decisions::without_full_journal(|| {
+            let verified = verify_active(&db, &cut).unwrap();
+            let mut checkpoint = verified.checkpoint().clone();
+            for (index, event) in overlay.iter().enumerate() {
+                checkpoint
+                    .apply(event.clone(), &mut |key| {
+                        verified
+                            .lookup(key, &overlay[..index])
+                            .map_err(|_| crate::transaction_decisions::Error::InvalidJournal)
+                    })
+                    .unwrap();
+            }
+            assert_eq!(checkpoint.resolved_prefix(), 1);
+            let recovered = verified
+                .lookup(LookupKey::Transaction(id(1)), &overlay)
+                .unwrap();
+            match recovered {
+                LookupResult::Transaction(Some(tx)) => {
+                    assert_eq!(tx.ordinal, 1);
+                    assert_eq!(tx.decision, Some(Decision::Abort));
+                }
+                _ => panic!("drained original transaction was lost"),
+            }
+            assert_eq!(verified.transactions(1, 2, &overlay).unwrap().len(), 2);
+            assert!(verified.transactions(1, 33, &overlay).is_err());
+            let retried = checkpoint
+                .apply(begin(1), &mut |key| {
+                    verified
+                        .lookup(key, &overlay)
+                        .map_err(|_| crate::transaction_decisions::Error::InvalidJournal)
+                })
+                .unwrap();
+            assert!(retried.accepted.is_none());
+            let checkpoint = Arc::new(checkpoint);
+            let mut batch = WriteBatch::default();
+            let staged =
+                stage_active(&mut batch, &verified, &checkpoint, &overlay, marker(2)).unwrap();
+            assert_eq!(
+                staged.drained(),
+                verified.transactions(1, 1, &overlay).unwrap()
+            );
+            let manifest =
+                stage_active_terminals(&mut batch, &verified, staged.drained(), 1, marker(2));
+            live.coordinator = Some(crate::coordinator_state::Coordinator::Active(
+                checkpoint.clone(),
+            ));
+            let metadata = super::super::state_codec::active_metadata_bytes(
+                &live,
+                staged.descriptor_for(&checkpoint).unwrap(),
+                &checkpoint,
+            )
+            .unwrap();
+            staged
+                .published_cut(&checkpoint, &metadata, &manifest)
+                .unwrap();
+            let wrong_prefix =
+                stage_active_terminals(&mut WriteBatch::default(), &verified, &[], 0, marker(2));
+            assert!(staged
+                .published_cut(&checkpoint, &metadata, &wrong_prefix)
+                .is_err());
+            let mut bad = overlay.clone();
+            bad.push(begin(1));
+            assert!(stage_active(
+                &mut WriteBatch::default(),
+                &verified,
+                &checkpoint,
+                &bad,
+                marker(2)
+            )
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn active_verification_checks_manifest_marker_and_later_raw_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let old = history(65);
+        for fault in 0..3 {
+            let cut = persist_archive(&db, &old, marker(1));
+            match fault {
+                0 => db
+                    .put(crate::decision_segments::MANIFEST_KEY, b"{}")
+                    .unwrap(),
+                1 => db
+                    .put(
+                        super::super::APPLIED_KEY,
+                        serde_json::to_vec(&marker(2)).unwrap(),
+                    )
+                    .unwrap(),
+                _ => db.put(&rows(&db).last().unwrap().0, b"{}").unwrap(),
+            }
+            crate::transaction_decisions::without_full_journal(|| {
+                let expected = if fault == 0 {
+                    D1Error::DecisionIndexHistory
+                } else {
+                    D1Error::EventLedgerHistory
+                };
+                assert_eq!(verify_active(&db, &cut).err(), Some(expected));
+            });
+        }
+    }
+
     #[test]
     fn archive_readers_match_replay_after_every_journal_is_dropped() {
         for profile in [
@@ -1122,7 +1903,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = DB::open_default(dir.path()).unwrap();
             let state = archive_state(profile, 36);
-            let journal = state.coordinator.as_ref().unwrap();
+            let journal = state.coordinator.as_ref().unwrap().full().unwrap();
             let expected: Vec<_> = [65, 66, 67, 68, 82, 100, 200]
                 .into_iter()
                 .map(|id| crate::request_index::lookup(&state, [id; 16], None).unwrap())
@@ -1215,7 +1996,7 @@ mod tests {
             let mut journal = if profile.is_legacy() {
                 bound()
             } else {
-                byte_history(0).coordinator.unwrap()
+                byte_history(0).coordinator.unwrap().into_full().unwrap()
             };
             for n in 1..=6 {
                 let mut event = large_admit(n);
@@ -1255,11 +2036,15 @@ mod tests {
                 .coordinator
                 .as_ref()
                 .unwrap()
+                .full()
+                .unwrap()
                 .history_cursor_at(0)
                 .unwrap();
             let old_cut = state
                 .coordinator
                 .as_ref()
+                .unwrap()
+                .full()
                 .unwrap()
                 .history_cursor_at(3)
                 .unwrap();
@@ -1400,7 +2185,10 @@ mod tests {
             include_str!("../tests/fixtures/event-ledger-member-key-v1.hex").trim()
         );
         let loaded = load(&db, &descriptor).unwrap();
-        assert_eq!(loaded.journal, *bound_state.coordinator.as_ref().unwrap());
+        assert_eq!(
+            loaded.journal,
+            *bound_state.coordinator.as_ref().unwrap().full().unwrap()
+        );
         loaded.validate_hydrated_state(&bound_state).unwrap();
         let j =
             Journal::decode(include_bytes!("../tests/fixtures/request-journal-v3.json")).unwrap();
@@ -1438,7 +2226,7 @@ mod tests {
         let db = DB::open_default(dir.path()).unwrap();
         assert_eq!(
             load(&db, &descriptor).unwrap().journal,
-            *state.coordinator.as_ref().unwrap()
+            *state.coordinator.as_ref().unwrap().full().unwrap()
         );
         let small = byte_history(33);
         for fault in 0..7 {
@@ -1475,7 +2263,7 @@ mod tests {
             assert!(load(&db, &descriptor).is_err(), "fault {fault}");
         }
         let domain = View::of(&small).unwrap().domain;
-        let events = small.coordinator.as_ref().unwrap().events();
+        let events = small.coordinator.as_ref().unwrap().full().unwrap().events();
         let ungranted = vec![events[0].clone(), events[2].clone(), events[1].clone()];
         let descriptor = forge_domain(&db, domain, &ungranted, &[3]);
         assert!(load(&db, &descriptor).is_err());
@@ -1562,7 +2350,7 @@ mod tests {
             assert!(load(&db, &descriptor).is_err());
         }
         let state = history(33);
-        let events = state.coordinator.as_ref().unwrap().events();
+        let events = state.coordinator.as_ref().unwrap().full().unwrap().events();
         let descriptor = forge(&db, events, &[31, 33]);
         assert!(load(&db, &descriptor).is_err());
         let descriptor = forge(&db, events, &[32, 33]);
@@ -1635,11 +2423,11 @@ mod tests {
                 db.write(batch).unwrap();
                 assert_eq!(
                     load(&db, next_descriptor).unwrap().journal,
-                    *next_state.coordinator.as_ref().unwrap()
+                    *next_state.coordinator.as_ref().unwrap().full().unwrap()
                 );
                 loaded
                     .journal
-                    .validate_successor(next_state.coordinator.as_ref().unwrap())
+                    .validate_successor(next_state.coordinator.as_ref().unwrap().full().unwrap())
                     .unwrap();
             }
         }
@@ -1661,7 +2449,14 @@ mod tests {
             replay(&mut prefix, begin(2)).unwrap();
             let substituted = state(prefix);
             assert_eq!(
-                substituted.coordinator.as_ref().unwrap().events().len(),
+                substituted
+                    .coordinator
+                    .as_ref()
+                    .unwrap()
+                    .full()
+                    .unwrap()
+                    .events()
+                    .len(),
                 events.len()
             );
             for candidate in [&regressed, &substituted] {
@@ -1812,14 +2607,14 @@ mod tests {
                 mode_id: domain.mode,
                 activated_sequence: 0,
             });
-            widest.coordinator = Some(journal);
+            widest.coordinator = Some(journal.into());
             let dir = tempfile::tempdir().unwrap();
             let db = DB::open_default(dir.path()).unwrap();
             let descriptor = persist(&db, &widest, marker(u64::MAX));
             assert_eq!(descriptor.version, profile.storage_format());
             assert_eq!(
                 load(&db, &descriptor).unwrap().journal,
-                *widest.coordinator.as_ref().unwrap()
+                *widest.coordinator.as_ref().unwrap().full().unwrap()
             );
             for event in &events {
                 // This width upper bound deliberately ignores Plan validity: no
@@ -1899,6 +2694,8 @@ mod tests {
         next.coordinator
             .as_mut()
             .unwrap()
+            .full_mut()
+            .unwrap()
             .replay_event(decide(1, Decision::Abort))
             .unwrap();
         let mut batch = WriteBatch::default();
@@ -1909,9 +2706,16 @@ mod tests {
         db.write(batch).unwrap();
         assert_eq!(
             load(&db, descriptor).unwrap().journal,
-            *next.coordinator.as_ref().unwrap()
+            *next.coordinator.as_ref().unwrap().full().unwrap()
         );
-        let mut invalid = next.coordinator.as_ref().unwrap().events().to_vec();
+        let mut invalid = next
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .full()
+            .unwrap()
+            .events()
+            .to_vec();
         invalid.push(decide(MAX_TRANSACTIONS as u64 + 1, Decision::Abort));
         let ends: Vec<_> = (MAX_HISTORY_PAGE_EVENTS..invalid.len())
             .step_by(MAX_HISTORY_PAGE_EVENTS)
@@ -1953,6 +2757,109 @@ mod tests {
         }
     }
     #[test]
+    fn active_large_plans_seal_byte_full_tail_without_full_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let mut journal = bound();
+        let mut event_bytes = event_size(&journal.events()[0]).unwrap();
+        let next_event = loop {
+            let event = large_admit(journal.events().len() as u64);
+            let size = event_size(&event).unwrap();
+            if !fits(journal.events().len(), event_bytes, size) {
+                break event;
+            }
+            event_bytes += size;
+            journal.replay_event(event).unwrap();
+        };
+        assert!(journal.events().len() + 1 < MAX_HISTORY_PAGE_EVENTS);
+        assert!(event_bytes + event_size(&next_event).unwrap() > MAX_HISTORY_PAGE_BYTES);
+        let old = state(journal.clone());
+        let cut = persist_archive(&db, &old, marker(20));
+        assert_eq!(cut.descriptor.segment_count, 1);
+        let original = rows(&db)[0].clone();
+        journal.replay_event(next_event.clone()).unwrap();
+        let expected_requests = journal.requests().to_vec();
+        let candidate = Arc::new(ActiveCheckpoint::from_journal(&journal).unwrap());
+        let expected_dir = tempfile::tempdir().unwrap();
+        let expected_db = DB::open_default(expected_dir.path()).unwrap();
+        let expected_state = state(journal);
+        let expected_cut = persist_archive(&expected_db, &expected_state, marker(21));
+        assert_eq!(expected_cut.descriptor.segment_count, 2);
+        let mut live = expected_state.clone();
+        live.coordinator = Some(crate::coordinator_state::Coordinator::Active(
+            candidate.clone(),
+        ));
+        drop(old);
+        drop(expected_state);
+        crate::transaction_decisions::without_full_journal(|| {
+            let verified = verify_active(&db, &cut).unwrap();
+            let suffix = [next_event];
+            let mut batch = WriteBatch::default();
+            let staged = stage_active(
+                &mut batch,
+                &verified,
+                candidate.as_ref(),
+                &suffix,
+                marker(21),
+            )
+            .unwrap();
+            assert_eq!(
+                staged.descriptor_for(candidate.as_ref()).unwrap(),
+                &expected_cut.descriptor
+            );
+            assert!(staged.drained().is_empty());
+            let mut operations = Operations::default();
+            batch.iterate(&mut operations);
+            assert_eq!(
+                operations.puts,
+                vec![cut.descriptor.domain.key(cut.descriptor.event_count + 1)]
+            );
+            assert!(operations.deletes.is_empty());
+            for request in &expected_requests {
+                assert_eq!(
+                    verified
+                        .lookup(LookupKey::Request(request.id), &suffix)
+                        .unwrap(),
+                    LookupResult::Request(Some(request.clone())),
+                );
+            }
+            let manifest = stage_active_terminals(
+                &mut batch,
+                &verified,
+                staged.drained(),
+                candidate.resolved_prefix(),
+                marker(21),
+            );
+            let metadata = super::super::state_codec::active_metadata_bytes(
+                &live,
+                staged.descriptor_for(candidate.as_ref()).unwrap(),
+                candidate.as_ref(),
+            )
+            .unwrap();
+            let next_cut = staged
+                .published_cut(&candidate, &metadata, &manifest)
+                .unwrap();
+            batch.put(super::super::D1_KEY, metadata);
+            batch.put(
+                super::super::APPLIED_KEY,
+                serde_json::to_vec(&marker(21)).unwrap(),
+            );
+            db.write(batch).unwrap();
+            assert_eq!(rows(&db), rows(&expected_db));
+            assert_eq!(rows(&db)[0], original);
+            let published = verify_active(&db, &next_cut).unwrap();
+            for request in &expected_requests {
+                assert_eq!(
+                    published
+                        .lookup(LookupKey::Request(request.id), &[])
+                        .unwrap(),
+                    LookupResult::Request(Some(request.clone())),
+                );
+            }
+        });
+    }
+
+    #[test]
     fn real_large_plans_seal_byte_full_tail_without_rewriting_original_requests() {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open_default(dir.path()).unwrap();
@@ -1978,6 +2885,8 @@ mod tests {
         next.coordinator
             .as_mut()
             .unwrap()
+            .full_mut()
+            .unwrap()
             .replay_event(next_event)
             .unwrap();
         let mut batch = WriteBatch::default();
@@ -1994,7 +2903,10 @@ mod tests {
         db.write(batch).unwrap();
         assert_eq!(rows(&db)[0], old_row);
         let loaded = load(&db, descriptor).unwrap();
-        assert_eq!(loaded.journal, *next.coordinator.as_ref().unwrap());
+        assert_eq!(
+            loaded.journal,
+            *next.coordinator.as_ref().unwrap().full().unwrap()
+        );
         for request in before.journal.requests() {
             assert_eq!(loaded.journal.request(request.id), Some(request));
         }
@@ -2058,6 +2970,8 @@ mod tests {
         next.coordinator
             .as_mut()
             .unwrap()
+            .full_mut()
+            .unwrap()
             .replay_event(decide(rejected - 1, Decision::Abort))
             .unwrap();
         let mut batch = WriteBatch::default();
@@ -2068,7 +2982,7 @@ mod tests {
         db.write(batch).unwrap();
         assert_eq!(
             load(&db, descriptor).unwrap().journal,
-            *next.coordinator.as_ref().unwrap()
+            *next.coordinator.as_ref().unwrap().full().unwrap()
         );
         let mut impossible = accepted;
         impossible.push(begin(rejected));

@@ -262,7 +262,7 @@ pub(crate) struct D1State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) managed: Option<D1ManagedMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) coordinator: Option<crate::transaction_decisions::Journal>,
+    pub(crate) coordinator: Option<crate::coordinator_state::Coordinator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) participant: Option<crate::participant_writes::State>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,6 +348,11 @@ impl D1State {
             );
         }
         if let Some(journal) = &self.coordinator {
+            if let Some(checkpoint) = journal.active() {
+                checkpoint.validate().map_err(|error| {
+                    anyhow::anyhow!("invalid coordinator checkpoint: {error:?}")
+                })?;
+            }
             if let Some(cohort) = journal.cohort() {
                 anyhow::ensure!(
                     cohort.coordinator_shard == self.shard

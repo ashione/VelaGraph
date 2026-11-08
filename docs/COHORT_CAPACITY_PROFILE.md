@@ -2,8 +2,11 @@
 
 VelaGraph's new, explicitly selected `ByteBound16MiBV1` profile extends the
 fixed-cohort lifetime beyond the legacy 256 external IDs and 1,024 transactions.
-It does not provide unlimited writes. The complete original Journal, exact
-external-ID/Plan bindings, in-memory history and full snapshots remain retained.
+It does not provide unlimited writes. Complete original Command history, exact
+external-ID/Plan bindings and full snapshots remain retained. The draft
+[S2 active checkpoint](COORDINATOR_ACTIVE_CHECKPOINT.md) replaces only durable
+bound-coordinator resident/ordinary-candidate Journals; acceptance is pending.
+Member history and explicit full-history materialization remain.
 
 Existing cohorts and the default remain `LegacyCountV1`. Only a genuinely empty,
 unbound fixed cohort can select the new profile. There is no online conversion,
@@ -116,9 +119,10 @@ The shared codec/replay implementation uses explicit profile gates:
 
 - Journal v4, history cursor/page v2 and TerminalPrefix v2 for the new profile.
 - Managed RPC v5, with no v4 fallback and no public query-format change.
-- Raw ledger/terminal-index format 2 and member disk v14. Bound coordinators now
-  write disk v15 under the [archive-reader contract](AUTHORITATIVE_EVENT_LEDGER.md);
-  former coordinator v13 remains an actual legacy migration input.
+- Raw ledger/terminal-index format 2 and member disk v14. The draft S2 bound
+  coordinator writes disk v16; S1 disk v15 and former coordinator v13 remain
+  actual legacy migration inputs. See the [archive-reader contract](AUTHORITATIVE_EVENT_LEDGER.md)
+  and [active checkpoint contract](COORDINATOR_ACTIVE_CHECKPOINT.md).
 - Member logical D1 version 7 carries its immutable activation nonce/LogId.
 - Legacy Journal v1/v2/v3, history/proof v1, raw/index format 1 and disk v11/v12
   retain their published count-bound meanings. Earlier published migration readers
@@ -130,9 +134,10 @@ binaries on every Raft replica and every managed endpoint before using new comma
 variants. An unchanged outer SnapshotV1 does not imply old binaries can replay new
 nested Journal/D1 formats or that rollback is supported.
 
-Typed metadata still contains no full Journal. Open/apply and other full-history
-source paths reconstruct raw Command authority before validating state. Disk-v15
-coordinator LookupRequest/HistoryPage instead scan the complete raw namespace
+Typed metadata still contains no full Journal. Cold open and explicit full-history
+source paths reconstruct raw Command authority before validating state. S1 apply
+also reconstructs it; S2 disk-v16 apply instead consumes the validated checkpoint.
+Archive-backed coordinator LookupRequest/HistoryPage scan the complete raw namespace
 against a private, previously strict-validated published cut, retaining only the
 target/page. Their duplicate request index is retired after strict old-index
 validation in the atomic migration batch. One synced batch commits
@@ -159,12 +164,15 @@ bytes, with a 2 MiB maximum event. The count/byte partition proof gives at most
 per-row overhead. These are derived validation ceilings, not a second admission
 pool. Existing per-row/index bounds are not raised to fit the extension.
 
-The implementation deliberately retains complete-memory Journal reconstruction,
-full replay on persistent apply, full logical snapshots and O(V) terminal proofs.
+The original profile/S1 implementation retains complete-memory Journal
+reconstruction and full replay on persistent apply. Draft S2 replaces that path
+only for the disk-v16 coordinator; cold replay, member and explicit full-history
+paths, full logical snapshots and O(V) terminal proofs remain.
 The 16 MiB Journal budget is not a bound on total process/snapshot memory: D1,
 intents, graph data and JSON byte-array expansion are separate. No performance
-experiment or throughput claim accompanies this change. S1's bounded coordinator
-readers do not remove the remaining full-archive residency or lifetime budget.
+experiment or throughput claim accompanies this change. Neither S1's bounded
+coordinator readers nor S2's consumed coordinator checkpoint remove the remaining
+full-archive paths or lifetime budget.
 Extending beyond the common lifetime byte budget still needs bounded live state,
 authoritative retained ID/Plan/ordinal recovery, and complete streamed checkpoint/
 snapshot closure across every member.

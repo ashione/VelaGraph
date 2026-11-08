@@ -6,14 +6,21 @@ its decisions; existing graph writers and global query admission are not wired.
 `GlobalCommittedSnapshot` remains Unsupported. Existing graph writes and reads
 are unchanged. This document is not a declaration that D4 is complete.
 
-Current storage/read extension: [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
-uses disk v15 for bound coordinators and retires their derived request index.
+Current storage/read extension: the [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md)
+writes disk v16 for bound coordinators. S1 disk v15 and older formats remain actual
+legacy-reader/migration inputs. S1's derived bound request index remains retired.
+The [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
+continue to use original raw Commands.
 LookupRequest and HistoryPage project bounded results from the complete raw
 namespace against a private, previously strict-validated published cut. Their
-reader helpers do not require a Journal; writer state, cold open, full snapshots
-and other protocol paths still do. Prepared/Decide checks are shared with strict
-Journal transitions. This changes neither decision semantics nor the 16 MiB
-budget. The [opt-in byte profile](COHORT_CAPACITY_PROFILE.md) replaces only legacy
+reader helpers do not require a Journal. S2 also replaces the durable bound
+coordinator resident/ordinary apply-candidate Journal with a consumed checkpoint,
+while checking complete raw closure. Cold open, explicit control/Terminal paths,
+member state and full snapshot materialization still use Journals. Shared
+transitions preserve decision semantics and exact reservations; draining the
+checkpoint refunds no historical bytes. S2 acceptance is pending, with no
+performance or lifetime increase claimed. This changes neither semantics nor the
+16 MiB budget. The [opt-in byte profile](COHORT_CAPACITY_PROFILE.md) replaces only legacy
 count quotas; the original prototype formats/limits below remain legacy contracts.
 
 The next atomicity layer needs a durable decision authority. A transaction ID,

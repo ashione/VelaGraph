@@ -466,8 +466,8 @@ writes, lazy retained archives or a performance milestone.
 
 ### Archive-backed coordinator recovery reads (S1)
 
-Bound coordinator disk v15 uses the shared raw namespace walker for actual
-LookupRequest and HistoryPage operations. It retains one exact original ID/Plan
+The historical S1 bound coordinator disk v15 uses the shared raw namespace walker
+for actual LookupRequest and HistoryPage operations. It retains one exact original ID/Plan
 and transaction or one bounded event page, not all IDs. Every successful found,
 absent or old-cut response first verifies the complete raw SHA-256 chain against
 a private cut published with validated state under the state lock. Cold open
@@ -480,11 +480,32 @@ rows/manifests, while genuinely unbound disk v8 retains only its empty manifest.
 Explicit validated snapshot repair remains available. See the
 [ledger contract](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1).
 
-The full Journal remains in writer/member state, cold replay, logical snapshots
-and other client/control paths. Reads are O(total history); the 16 MiB budget,
+In S1, the full Journal remains in writer/member state, cold replay, logical
+snapshots and other client/control paths. Reads are O(total history); the 16 MiB
+budget,
 D1 historical-data limits, complete-cohort grants, RPC/deadlines and both profiles
 are unchanged. No performance or removed-limit claim is made. Subsequent slices
 must remove remaining decide/status/Prepare dependencies, bound active state and
 full-cohort capacity, and close retained-archive checkpoint/snapshot recovery.
 Fresh frozen-source correctness, process-crash, 1,025-write release and remote CI
 gates remain required; this entry does not claim they have passed for S1.
+
+### Consumed coordinator active checkpoint (S2 draft)
+
+[The current draft](COORDINATOR_ACTIVE_CHECKPOINT.md) writes disk v16 and replaces
+the durable bound coordinator's resident and ordinary apply-candidate Journal
+with active `(R,N]` state, retaining terminals behind holes. The actual writer
+checks full raw closure, uses batch-overlay identity lookups and stages raw/terminal
+tails with exact shared reservation accounting. Draining R never refunds history
+or grants. Runtime and private cut share one immutable checkpoint; canonical
+metadata and complete current snapshot bytes remain resident.
+
+Cold replay, member state, explicit Journal/control/Terminal paths and complete
+SnapshotV1 materialization remain. Actual v15 and older inputs migrate only on a
+successful batch; explicit snapshot repair checks the independently anchored old
+prefix and exact checkpoint. Both profiles, 16 MiB, member/D1 limits, grants,
+RPC v5 and deadlines remain unchanged. No GC, larger archive or performance claim.
+Acceptance is pending, including frozen-source correctness/crash/regression, fresh
+release 1,025-write recovery and remote CI gates. All-member closed checkpoints,
+member active state, bounded retained archives/control proofs and streamed
+snapshot closure remain subsequent work before removing the lifetime bound.

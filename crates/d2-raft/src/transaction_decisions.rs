@@ -11,6 +11,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 #[path = "journal_history.rs"]
 mod history;
+
+#[path = "coordinator_checkpoint.rs"]
+pub(crate) mod checkpoint;
 pub use history::{HistoryCursor, HistoryPage, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_EVENTS};
 
 #[cfg(test)]
@@ -423,239 +426,46 @@ impl Journal {
         Ok(())
     }
 
-    fn event_bytes(command: &Command) -> Result<usize, Error> {
-        canonical_size(command, MAX_REQUEST_EVENT_BYTES)
-    }
-
+    #[cfg(test)]
     fn pending_bytes(tx: &Transaction) -> Result<usize, Error> {
-        let mut size = Self::event_bytes(&Command::Decide {
-            id: tx.id,
-            decision: Decision::Commit,
-        })?
-        .checked_add(1)
-        .ok_or(Error::Capacity)?;
-        for (participant, prepared) in tx.participants.iter().zip(&tx.prepared) {
-            if !prepared {
-                size = size
-                    .checked_add(Self::event_bytes(&Command::Prepared {
-                        id: tx.id,
-                        participant: participant.clone(),
-                    })?)
-                    .and_then(|n| n.checked_add(1))
-                    .ok_or(Error::Capacity)?;
-            }
-        }
-        Ok(size)
+        checkpoint::pending_bytes(tx)
     }
 
-    // Used on an unpublished candidate or during recovery; every prefix obeys
-    // the exact same admission rule. Replay work is linear in bounded events
-    // times the bounded participant/transaction lookup sizes, not journal bytes.
+    // Legacy replay and active apply consume the same transition and reservation grammar.
     fn append(&mut self, command: Command, limit: usize) -> Result<bool, Error> {
-        let released = match &command {
-            Command::AdmitRequest { .. }
-            | Command::BindCohort { .. }
-            | Command::ConfirmCohortCapacity { .. }
-            | Command::Begin { .. } => 0,
-            Command::Prepared { .. } => Self::event_bytes(&command)?
-                .checked_add(1)
-                .ok_or(Error::Capacity)?,
-            Command::Decide { id, .. } => self
-                .transaction(*id)
-                .map(Self::pending_bytes)
-                .transpose()?
-                .unwrap_or(0),
-        };
-        let old_envelope = self.envelope_bytes()?;
-        if !self.transition(&command)? {
+        let header = checkpoint::Header::from_journal(self)?;
+        let change = checkpoint::prepare(&header, &command, limit, &mut |key| {
+            Ok(match key {
+                checkpoint::LookupKey::Request(id) => {
+                    checkpoint::LookupResult::Request(self.request(id).cloned())
+                }
+                checkpoint::LookupKey::Transaction(id) => {
+                    checkpoint::LookupResult::Transaction(self.transaction(id).cloned())
+                }
+            })
+        })?;
+        let Some(change) = change else {
             return Ok(false);
-        }
-        let event_size = Self::event_bytes(&command)?;
-        let future = match &command {
-            Command::Begin { id, .. } => Self::pending_bytes(self.transaction(*id).unwrap())?,
-            Command::AdmitRequest { transaction_id, .. } => {
-                Self::pending_bytes(self.transaction(*transaction_id).unwrap())?
-            }
-            _ => 0,
         };
-        // Charge the actual versioned envelope too. Equal digit widths of
-        // today's versions are tested, never assumed by the reservation rule.
-        let new_envelope = self.envelope_bytes()?;
-        self.reserved_bytes = self
-            .reserved_bytes
-            .checked_sub(released)
-            .and_then(|n| n.checked_sub(old_envelope))
-            .and_then(|n| n.checked_add(new_envelope))
-            .and_then(|n| n.checked_add(event_size))
-            .and_then(|n| n.checked_add(usize::from(!self.events.is_empty())))
-            .and_then(|n| n.checked_add(future))
-            .ok_or(Error::Capacity)?;
-        if self.events.len()
-            >= usize::try_from(self.capacity_profile().max_history_events())
-                .map_err(|_| Error::Capacity)?
-        {
-            return Err(Error::Capacity);
+        self.cohort = change.header.cohort;
+        self.capacity_grants = change.header.capacity_grants;
+        self.reserved_bytes = change.header.reserved_bytes;
+        if let Some(tx) = change.transaction {
+            let index = usize::try_from(tx.ordinal.checked_sub(1).ok_or(Error::InvalidJournal)?)
+                .map_err(|_| Error::Capacity)?;
+            if index == self.transactions.len() {
+                self.transactions.push(tx);
+            } else {
+                *self
+                    .transactions
+                    .get_mut(index)
+                    .ok_or(Error::InvalidJournal)? = tx;
+            }
         }
-        if self.reserved_bytes > limit {
-            return Err(Error::Capacity);
+        if let Some(request) = change.request {
+            self.requests.push(request);
         }
         self.events.push(command);
-        Ok(true)
-    }
-
-    fn transition(&mut self, command: &Command) -> Result<bool, Error> {
-        match command {
-            Command::AdmitRequest {
-                id,
-                request,
-                payload,
-                transaction_id,
-                participants,
-            } => {
-                if *id == [0; 16]
-                    || request.is_empty()
-                    || payload.is_empty()
-                    || request.len() > MAX_REQUEST_BYTES
-                    || payload.len() > MAX_REQUEST_PAYLOAD_BYTES
-                    || self.cohort.is_none()
-                {
-                    return Err(Error::InvalidIdentity);
-                }
-                if let Some(existing) = self.request(*id) {
-                    return if existing.request == *request {
-                        Ok(false)
-                    } else {
-                        Err(Error::IdentityConflict)
-                    };
-                }
-                if !self.capacity_ready() {
-                    return Err(Error::CapacityNotConfirmed);
-                }
-                let plan = crate::request_plans::Plan::decode(payload)?;
-                if plan.id != *transaction_id
-                    || plan.authority.mode != self.authority
-                    || Some(&plan.cohort) != self.cohort.as_deref()
-                    || plan.validation_version > self.resolved_prefix()
-                    || plan
-                        .parts
-                        .iter()
-                        .map(|p| p.descriptor.clone())
-                        .collect::<Vec<_>>()
-                        != *participants
-                {
-                    return Err(Error::IdentityConflict);
-                }
-                if self.requests.len() >= self.capacity_profile().max_requests() {
-                    return Err(Error::Capacity);
-                }
-                if self.transaction(*transaction_id).is_some() {
-                    return Err(Error::IdentityConflict);
-                }
-                self.transition(&Command::Begin {
-                    id: *transaction_id,
-                    participants: participants.clone(),
-                })?;
-                self.requests.push(RequestRecord {
-                    id: *id,
-                    request: request.clone(),
-                    payload: payload.clone(),
-                    transaction_id: *transaction_id,
-                });
-            }
-            Command::BindCohort { cohort } => {
-                cohort.validate()?;
-                if let Some(existing) = self.cohort.as_deref() {
-                    return if existing == cohort {
-                        Ok(false)
-                    } else {
-                        Err(Error::IdentityConflict)
-                    };
-                }
-                if !self.events.is_empty() {
-                    return Err(Error::IncompatibleHistory);
-                }
-                self.cohort = Some(Box::new(cohort.clone()));
-            }
-            Command::ConfirmCohortCapacity { cohort, grants } => {
-                if self.cohort.as_deref() != Some(cohort) {
-                    return Err(Error::IdentityConflict);
-                }
-                validate_grants(cohort, grants)?;
-                if let Some(existing) = &self.capacity_grants {
-                    return if existing == grants {
-                        Ok(false)
-                    } else {
-                        Err(Error::IdentityConflict)
-                    };
-                }
-                if !self.transactions.is_empty() || !self.requests.is_empty() {
-                    return Err(Error::IncompatibleHistory);
-                }
-                self.capacity_grants = Some(grants.clone());
-            }
-            Command::Begin { id, participants } => {
-                if *id == [0; 16] {
-                    return Err(Error::InvalidIdentity);
-                }
-                if participants.is_empty()
-                    || participants.len() > MAX_PARTICIPANTS
-                    || participants
-                        .iter()
-                        .any(|p| p.mode == [0; 16] || p.intent == [0; 32])
-                    || participants
-                        .windows(2)
-                        .any(|pair| pair[0].shard >= pair[1].shard)
-                {
-                    return Err(Error::InvalidParticipants);
-                }
-                if self
-                    .cohort
-                    .as_ref()
-                    .is_some_and(|c| participants.iter().any(|p| !c.contains(p)))
-                {
-                    return Err(Error::UnknownParticipant);
-                }
-                if let Some(tx) = self.transaction(*id) {
-                    return if tx.participants == *participants {
-                        Ok(false)
-                    } else {
-                        Err(Error::IdentityConflict)
-                    };
-                }
-                if !self.capacity_ready() {
-                    return Err(Error::CapacityNotConfirmed);
-                }
-                if self.transactions.len() >= self.capacity_profile().max_transactions() {
-                    return Err(Error::Capacity);
-                }
-                self.transactions.push(Transaction {
-                    id: *id,
-                    ordinal: u64::try_from(self.transactions.len())
-                        .ok()
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or(Error::Capacity)?,
-                    participants: participants.clone(),
-                    prepared: vec![false; participants.len()],
-                    decision: None,
-                });
-            }
-            Command::Prepared { id, participant } => {
-                let tx = self
-                    .transactions
-                    .iter_mut()
-                    .find(|t| t.id == *id)
-                    .ok_or(Error::UnknownTransaction)?;
-                return tx.record_prepared(participant);
-            }
-            Command::Decide { id, decision } => {
-                let tx = self
-                    .transactions
-                    .iter_mut()
-                    .find(|t| t.id == *id)
-                    .ok_or(Error::UnknownTransaction)?;
-                return tx.record_decision(*decision);
-            }
-        }
         Ok(true)
     }
 
@@ -664,6 +474,7 @@ impl Journal {
         Ok(self.reserved_bytes)
     }
 
+    #[cfg(test)]
     fn envelope_bytes(&self) -> Result<usize, Error> {
         canonical_size(
             &Encoding {
