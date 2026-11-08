@@ -915,6 +915,62 @@ async fn process_death_after_index_retirement_sync_recovers_exact_old_id_plan_an
     Ok(())
 }
 
+// OpenRaft 0.9.25 shutdown joins its core/tick, not the state-machine worker.
+// Keep the final owner until that worker (and any snapshot worker) has dropped
+// its Arc, then close RocksDB synchronously before the single reopen attempt.
+async fn close_after_background_owners(
+    mut state: Arc<StateMachine>,
+    timeout: std::time::Duration,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, async move {
+        loop {
+            match Arc::try_unwrap(state) {
+                Ok(state) => {
+                    drop(state);
+                    return;
+                }
+                Err(shared) => {
+                    state = shared;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn close_waits_for_actual_owner_release_before_reopen() {
+    use std::{future::Future, task::Poll, time::Duration};
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateMachine::open(dir.path()).unwrap());
+    let background_owner = state.clone();
+    let mut close = std::pin::pin!(close_after_background_owners(state, Duration::from_secs(5)));
+    // Poll exactly once while the owner is deliberately retained. This checks
+    // the causal wait, without depending on a lucky worker scheduling order.
+    assert!(std::future::poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx).is_pending())).await);
+    drop(background_owner);
+    close.await.unwrap();
+    let reopened = StateMachine::open(dir.path()).unwrap();
+    assert_eq!(reopened.applied().await, None);
+}
+
+#[tokio::test]
+async fn close_reports_timeout_if_an_owner_is_not_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateMachine::open(dir.path()).unwrap());
+    let background_owner = state.clone();
+    assert!(
+        close_after_background_owners(state, std::time::Duration::ZERO)
+            .await
+            .is_err()
+    );
+    drop(background_owner);
+    let reopened = StateMachine::open(dir.path()).unwrap();
+    assert_eq!(reopened.applied().await, None);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn managed_tcp_archive_reads_reject_damaged_tail_and_recover_exact_evidence() {
     use crate::managed_rpc::{Client, Identity, NodeRef, Role, Server};
@@ -1072,8 +1128,12 @@ async fn managed_tcp_archive_reads_reject_damaged_tail_and_recover_exact_evidenc
     );
     assert_retired(&node.state_machine, profile);
     server.shutdown().await;
+    let closing_state = node.state_machine.clone();
     cluster.shutdown(&node).await;
     drop(node);
+    close_after_background_owners(closing_state, Duration::from_secs(5))
+        .await
+        .expect("background state-machine owners must release before reopening RocksDB");
     let sm = StateMachine::open(dir.path().join("state.db")).unwrap();
     assert_eq!(lookup(&sm, 900).await, original);
     assert_eq!(page(&sm, &base, Some(&cut)).await, old_page);
