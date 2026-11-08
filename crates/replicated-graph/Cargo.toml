@@ -21,5 +21,8 @@ getrandom = "0.3"
 rustix = { version = "1", features = ["net", "process"] }
 
 [dev-dependencies]
+# Existing locked official crates: SHA-256 content integrity and safe anchored fs I/O.
+sha2 = "=0.10.9"
+rustix = { version = "=1.1.6", features = ["fs"] }
 d2-raft = { path = "../d2-raft", features = ["test-hooks"] }
 tempfile = "3"

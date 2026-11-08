@@ -211,3 +211,10 @@ and a completed checkpoint with recovery/snapshot evidence. A debug CI pass alon
 is not this acceptance. RPC/session budgets remain unchanged; release evidence is
 not a performance comparison. Final frozen-tree tests and both remote CI gates
 remain required for delivery.
+
+The harness-only [retained evidence v2 layout](LIFECYCLE_EVIDENCE.md) stores full
+proofs and original RequestRecords once, behind a small strictly validated progress
+checkpoint. Every pending/verified durable boundary, exact original comparison
+and mandatory release acceptance remains. Strict same-identity v1 migration never
+resets progress or rebinds old source/ELF evidence. Diagnostic work counters are
+not a runtime performance claim and do not change production storage formats.
