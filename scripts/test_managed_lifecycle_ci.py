@@ -1,6 +1,8 @@
 import contextlib
 import copy
 import io
+import hashlib
+import shutil
 import json
 import os
 import pathlib
@@ -27,16 +29,58 @@ def output(name=gate.TEST, result='ok', passed=1, ignored=0, running=1):
             '0 measured; 10 filtered out; finished in 123.45s\n\n')
 
 
-def checkpoint(executable, source_hash='a' * 64, elf_hash='b' * 64):
-    # Synthetic validator data only; Rust verifies the actual request/proof bytes.
-    return {'format': 1, 'source_sha256': source_hash, 'elf_sha256': elf_hash,
-            'executable': str(executable), 'verified_ordinal': 1025,
-            'pending_external_id': None, 'completed': True,
-            'ack_loss_recovered': True, 'snapshots_restored': True,
-            'binding': {'cohort': {'profile': 'ByteBound16MiBV1'}},
-            'originals': {str(n): {'synthetic': True} for n in (1, 256, 1024, 1025)},
-            'proofs': {str(n): [1] for n in (0, 1, 256, 1024, 1025)},
-            'grants': [{'member': {'shard': n}} for n in (7, 8)]}
+def encoded(value):
+    return json.dumps(value, separators=(',', ':'), ensure_ascii=False).encode()
+
+
+def checkpoint(executable, directory, source_hash='a' * 64, elf_hash='b' * 64, migrated=False):
+    # Real complete artifact files with typed synthetic protocol fixtures. The
+    # subprocess fixture tests gate plumbing, not an actual lifecycle execution.
+    directory = pathlib.Path(directory)
+    artifacts = directory / 'artifacts'
+    artifacts.mkdir()
+    binding = gate.expected_binding()
+    saved = {'format': 2, 'source_sha256': source_hash, 'elf_sha256': elf_hash,
+             'executable': str(executable), 'harness_timeout_secs': 21600,
+             'verified_ordinal': 1025, 'pending_external_id': None, 'completed': True,
+             'ack_loss_recovered': True, 'snapshots_restored': True, 'binding': binding,
+             'originals': {}, 'proofs': {}, 'migration': None,
+             'grants': [{'member': member, 'activation': {'nonce': [member['shard']] * 32,
+                         'log_id': {'leader_id': {'term': 1, 'node_id': 1}, 'index': 1}}}
+                        for member in binding['cohort']['members']]}
+    originals, proofs = {}, {}
+    participant = {'shard': 7, 'epoch': 1, 'mode': [7] * 16, 'intent': [1] * 32}
+
+    def retain(kind, key, name, data):
+        (artifacts / name).write_bytes(data)
+        return {'format': 1, 'kind': kind, 'key': key, 'relative_path': 'artifacts/' + name,
+                'byte_length': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+
+    for key in sorted(gate.ORIGINAL_KEYS):
+        plan = {'version': 1, 'id': gate.original_id(key), 'authority': binding['authority'],
+                'cohort': binding['cohort'], 'validation_version': key - 1,
+                'parts': [{'descriptor': participant, 'request': {'shard': 7, 'epoch': 1,
+                           'request_id': gate.original_id(key), 'expected_sequence': key - 1,
+                           'operations': [{'Put': {'key': [1], 'value': [2]}}]}}]}
+        request = ['managed-graph-command-v1', binding, {'CreateVertex': {'partition': 7,
+                   'vertex': {'id': key, 'labels': ['person'], 'properties': {}}}}]
+        value = {'id': gate.original_id(key), 'request': list(encoded(request)),
+                 'payload': list(encoded(plan)), 'transaction_id': gate.original_id(key)}
+        originals[str(key)] = value
+        saved['originals'][str(key)] = retain('original', key, f'original-{key}.json', encoded(value))
+    for key in sorted(gate.PROOF_KEYS):
+        rows = [{'id': gate.original_id(n), 'ordinal': n, 'participants': [participant],
+                 'prepared': [True], 'decision': 'Commit'} for n in range(1, key + 1)]
+        value = {'version': 2, 'authority': [9] * 16, 'cohort': binding['cohort'],
+                 'through': key, 'segments': [rows[n:n + 32] for n in range(0, key, 32)]}
+        data = encoded(value)
+        proofs[str(key)] = list(data)
+        saved['proofs'][str(key)] = retain('proof', key, f'proof-v{key}.json', data)
+    if migrated:
+        legacy = {k: copy.deepcopy(v) for k, v in saved.items() if k != 'migration'}
+        legacy.update(format=1, originals=originals, proofs=proofs)
+        saved['migration'] = retain('legacy_checkpoint', 1, 'legacy-checkpoint-v1.json', encoded(legacy))
+    return saved
 
 
 class ValidatorTests(unittest.TestCase):
@@ -79,25 +123,169 @@ class ValidatorTests(unittest.TestCase):
             gate.validate_output(output(), 9)
 
     def test_complete_matching_checkpoint_required(self):
-        executable = pathlib.Path('/synthetic/managed_process')
-        valid = checkpoint(executable)
-        gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, executable)
-        for field, value in [('format', 2), ('format', True), ('source_sha256', 'c' * 64),
-                             ('elf_sha256', 'c' * 64), ('executable', '/wrong'),
-                             ('completed', False), ('completed', 1),
-                             ('verified_ordinal', 1024), ('verified_ordinal', 1025.0),
-                             ('pending_external_id', [0] * 16), ('ack_loss_recovered', False),
-                             ('snapshots_restored', False), ('originals', {}),
-                             ('proofs', {}), ('grants', []), ('binding', {})]:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = pathlib.Path('/synthetic/managed_process')
+            valid = checkpoint(executable, directory)
+            gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, executable, directory)
+            for field, value in [('format', 1), ('format', True), ('source_sha256', 'c' * 64),
+                                 ('elf_sha256', 'c' * 64), ('executable', '/wrong'),
+                                 ('completed', False), ('completed', 1),
+                                 ('verified_ordinal', 1024), ('verified_ordinal', 1025.0),
+                                 ('pending_external_id', [0] * 16), ('ack_loss_recovered', False),
+                                 ('snapshots_restored', False), ('originals', {}),
+                                 ('proofs', {}), ('grants', []), ('binding', {}),
+                                 ('harness_timeout_secs', 0),
+                                 ('binding', {**gate.expected_binding(), 'cohort': {**gate.expected_binding()['cohort'], 'coordinator_epoch': True}})]:
+                changed = copy.deepcopy(valid)
+                changed[field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, executable, directory)
+            for field in valid:
+                changed = copy.deepcopy(valid)
+                del changed[field]
+                with self.subTest(missing=field), self.assertRaises(ValueError):
+                    gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, executable, directory)
             changed = copy.deepcopy(valid)
-            changed[field] = value
-            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
-                gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, executable)
-        for field in valid:
-            changed = copy.deepcopy(valid)
-            del changed[field]
-            with self.subTest(missing=field), self.assertRaises(ValueError):
-                gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, executable)
+            changed['extra'] = 1
+            with self.assertRaises(ValueError):
+                gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, executable, directory)
+
+    def test_reference_paths_lengths_hashes_kinds_and_fields_are_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            valid = checkpoint('/synthetic/managed_process', directory)
+            changes = [('relative_path', '/tmp/proof-v1.json'), ('relative_path', 'artifacts/../proof-v1.json'),
+                       ('relative_path', 'artifacts/proof-v0.json'), ('byte_length', 0),
+                       ('byte_length', True), ('byte_length', 1.0), ('byte_length', gate.PROOF_LIMIT + 1),
+                       ('sha256', '0' * 64), ('sha256', 'A' * 64), ('kind', 'original'),
+                       ('key', 0), ('key', True), ('format', 2), ('extra', False)]
+            for field, value in changes:
+                changed = copy.deepcopy(valid)
+                changed['proofs']['1'][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, '/synthetic/managed_process', directory)
+            for field in valid['proofs']['1']:
+                changed = copy.deepcopy(valid)
+                del changed['proofs']['1'][field]
+                with self.assertRaises(ValueError):
+                    gate.validate_checkpoint(changed, 'a' * 64, 'b' * 64, '/synthetic/managed_process', directory)
+
+    def test_real_files_missing_truncated_corrupt_unsafe_and_extra_reject(self):
+        for case in ('missing', 'truncate', 'empty', 'flip', 'symlink', 'hardlink', 'extra', 'staging', 'parent_symlink', 'malformed_typed', 'wrong_proof_version'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                valid = checkpoint('/synthetic/managed_process', root)
+                path = root / 'artifacts/proof-v1.json'
+                data = path.read_bytes()
+                if case == 'missing': path.unlink()
+                elif case == 'truncate': path.write_bytes(data[:-1])
+                elif case == 'empty': path.write_bytes(b'')
+                elif case == 'flip': path.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+                elif case == 'symlink':
+                    path.unlink()
+                    path.symlink_to('proof-v0.json')
+                elif case == 'hardlink': os.link(path, root / 'alias')
+                elif case == 'extra': (root / 'artifacts/extra.json').write_text('{}')
+                elif case == 'staging': (root / 'artifacts/proof-v1.json.tmp').write_bytes(data)
+                elif case == 'parent_symlink':
+                    (root / 'artifacts').rename(root / 'elsewhere')
+                    (root / 'artifacts').symlink_to('elsewhere', target_is_directory=True)
+                else:
+                    value = gate.unique_json(data)
+                    if case == 'malformed_typed': value = {'synthetic': True}
+                    else: value['through'] = 0
+                    data = encoded(value)
+                    path.write_bytes(data)
+                    valid['proofs']['1'].update(byte_length=len(data), sha256=hashlib.sha256(data).hexdigest())
+                with self.assertRaises((ValueError, OSError)):
+                    gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+
+    def test_same_identity_migration_backup_is_required_and_cannot_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            valid = checkpoint('/synthetic/managed_process', root, migrated=True)
+            gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+            backup = root / 'artifacts/legacy-checkpoint-v1.json'
+            raw = backup.read_bytes()
+            legacy = gate.unique_json(raw)
+            legacy['elf_sha256'] = 'c' * 64
+            changed = encoded(legacy)
+            backup.write_bytes(changed)
+            valid['migration'].update(byte_length=len(changed), sha256=hashlib.sha256(changed).hexdigest())
+            with self.assertRaises(ValueError):
+                gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+            backup.write_bytes(raw)
+            valid['migration'].update(byte_length=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+            (root / 'artifacts/proof-v1.json').unlink()
+            with self.assertRaises(OSError):
+                gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+            self.assertFalse((root / 'artifacts/proof-v1.json').exists())
+
+    def test_copied_bundle_requires_every_artifact_and_rejects_v1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, copied = root / 'source', root / 'copied'
+            source.mkdir()
+            valid = checkpoint('/synthetic/managed_process', source)
+            shutil.copytree(source, copied)
+            gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', copied)
+            for name in sorted((copied / 'artifacts').iterdir()):
+                saved = name.read_bytes()
+                name.unlink()
+                with self.assertRaises(OSError):
+                    gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', copied)
+                name.write_bytes(saved)
+            valid['format'] = 1
+            with self.assertRaises(ValueError):
+                gate.validate_checkpoint(valid, 'a' * 64, 'b' * 64, '/synthetic/managed_process', copied)
+
+    def test_hash_valid_boolean_id_bytes_reject_like_rust(self):
+        for case, position, boolean in ((case, position, boolean)
+                                        for case in ('external', 'plan', 'write', 'legacy_pending')
+                                        for position, boolean in ((15, True), (0, False))):
+            with self.subTest(case=case, position=position, boolean=boolean), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                saved = checkpoint('/synthetic/managed_process', root, migrated=case == 'legacy_pending')
+                if case == 'legacy_pending':
+                    path = root / 'artifacts/legacy-checkpoint-v1.json'
+                    value = gate.unique_json(path.read_bytes())
+                    value.update(verified_ordinal=1024, pending_external_id=gate.original_id(1025),
+                                 ack_loss_recovered=False, snapshots_restored=False, completed=False)
+                    value['proofs'].pop('1025')
+                    reference = saved['migration']
+                    # An actual reachable pending-1025 migration remains valid.
+                    data = encoded(value)
+                    path.write_bytes(data)
+                    reference.update(byte_length=len(data), sha256=hashlib.sha256(data).hexdigest())
+                    gate.validate_checkpoint(saved, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+                    self.assertEqual(value['pending_external_id'][position], int(boolean))
+                    value['pending_external_id'][position] = boolean
+                else:
+                    path = root / 'artifacts/original-1.json'
+                    value = gate.unique_json(path.read_bytes())
+                    reference = saved['originals']['1']
+                    gate.validate_checkpoint(saved, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+                    if case == 'external':
+                        self.assertEqual(value['id'][position], int(boolean))
+                        value['id'][position] = boolean
+                    else:
+                        plan = gate.unique_json(bytes(value['payload']))
+                        if case == 'plan':
+                            self.assertEqual(plan['id'][position], int(boolean))
+                            plan['id'][position] = boolean
+                        else:
+                            self.assertEqual(plan['parts'][0]['request']['request_id'][position], int(boolean))
+                            plan['parts'][0]['request']['request_id'][position] = boolean
+                        value['payload'] = list(encoded(plan))
+                data = encoded(value)
+                path.write_bytes(data)
+                reference.update(byte_length=len(data), sha256=hashlib.sha256(data).hexdigest())
+                with self.assertRaises(ValueError):
+                    gate.validate_checkpoint(saved, 'a' * 64, 'b' * 64, '/synthetic/managed_process', root)
+
+    def test_duplicate_json_keys_and_nonfinite_values_reject(self):
+        for raw in ('{"format":2,"format":2}', '{"proofs":{"1":{},"1":{}}}', '{"value":NaN}'):
+            with self.assertRaises(ValueError):
+                gate.unique_json(raw)
 
     def test_hash_actual_tracked_untracked_and_deleted_source_not_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,7 +316,7 @@ class ValidatorTests(unittest.TestCase):
 
 class GateTests(unittest.TestCase):
     def run_fixture(self, root, out, test_output=None, exit_code=0, mutate=None,
-                    build_exit=0, artifact_mutate=None):
+                    build_exit=0, artifact_mutate=None, mutate_artifacts=None):
         selected = artifact(root)
         (root / 'source.rs').write_text('synthetic project source\n')
         binary = pathlib.Path(selected['executable'])
@@ -151,10 +339,12 @@ class GateTests(unittest.TestCase):
             self.assertTrue(os.access(command[0], os.X_OK))
             self.assertEqual(env['BYTE_BOUND_PROCESS_ELF_SHA256'], gate.sha256(binary))
             stdout.write(output() if test_output is None else test_output)
-            saved = checkpoint(command[0], env['BYTE_BOUND_PROCESS_SOURCE_SHA256'],
-                               env['BYTE_BOUND_PROCESS_ELF_SHA256'])
+            saved = checkpoint(command[0], env['BYTE_BOUND_PROCESS_DIRECTORY'],
+                               env['BYTE_BOUND_PROCESS_SOURCE_SHA256'], env['BYTE_BOUND_PROCESS_ELF_SHA256'])
             if mutate:
                 mutate(saved)
+            if mutate_artifacts:
+                mutate_artifacts(pathlib.Path(env['BYTE_BOUND_PROCESS_DIRECTORY']))
             (pathlib.Path(env['BYTE_BOUND_PROCESS_DIRECTORY']) / 'progress.json').write_text(json.dumps(saved))
             stderr.write('synthetic child stderr\n')
             return subprocess.CompletedProcess(command, exit_code)
@@ -188,13 +378,17 @@ class GateTests(unittest.TestCase):
                      {'mutate': lambda c: c.update(elf_sha256='c' * 64)},
                      {'mutate': lambda c: c.update(source_sha256='c' * 64)},
                      {'mutate': lambda c: c.update(completed=False)},
+                     {'mutate': lambda c: c.update(format=1)},
+                     {'mutate_artifacts': lambda p: (p / 'artifacts/proof-v1.json').unlink()},
+                     {'mutate_artifacts': lambda p: (p / 'artifacts/proof-v1.json').write_bytes(b'corrupt')},
+                     {'mutate_artifacts': lambda p: (p / 'artifacts/unexpected.json').write_text('{}')},
                      {'mutate': lambda c: c.update(verified_ordinal=1024)},
                      {'mutate': lambda c: c.update(pending_external_id=[0] * 16)}]
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 out = root / 'results'
-                with self.assertRaises(ValueError):
+                with self.assertRaises((ValueError, OSError)):
                     self.run_fixture(root, out, **scenario)
                 self.assertEqual(json.loads((out / 'execution.json').read_text())['status'], 'INCOMPLETE')
                 self.assertTrue((out / 'summary.md').read_text().startswith('Managed lifecycle INCOMPLETE:'))
