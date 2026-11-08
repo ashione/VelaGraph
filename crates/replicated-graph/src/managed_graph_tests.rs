@@ -1,5 +1,5 @@
 use super::*;
-use d2_raft::transaction_decisions::Member;
+use d2_raft::transaction_decisions::{Journal, Member};
 use d2_raft::{participant_driver, Cluster, D1Command, D1Result, LogCommand};
 use rocksdb_sql_table::experimental_graph::Direction;
 fn authority() -> Authority {
@@ -55,6 +55,9 @@ async fn start(cluster: &Cluster, shard: u64) -> NodeHandle {
     initialize(node, shard).await
 }
 async fn initialize(node: NodeHandle, shard: u64) -> NodeHandle {
+    initialize_cohort(node, shard, binding()).await
+}
+async fn initialize_cohort(node: NodeHandle, shard: u64, cohort: Cohort) -> NodeHandle {
     node.raft
         .initialize(BTreeMap::from([(
             1,
@@ -103,7 +106,9 @@ async fn initialize(node: NodeHandle, shard: u64) -> NodeHandle {
                 shard,
                 epoch: 1,
                 mode_id: [9; 16],
-                command: Command::BindCohort { cohort: binding() },
+                command: Command::BindCohort {
+                    cohort: cohort.clone(),
+                },
             },
         )
         .await
@@ -122,15 +127,27 @@ async fn initialize(node: NodeHandle, shard: u64) -> NodeHandle {
         .unwrap();
         let mut journal = Journal::new([9; 16]).unwrap();
         journal
-            .apply(Command::BindCohort { cohort: binding() })
+            .apply(Command::BindCohort {
+                cohort: cohort.clone(),
+            })
             .unwrap();
         submit(
             &node,
-            D1Command::EnableVersionedReads {
-                shard,
-                epoch: 1,
-                mode_id: [shard as u8; 16],
-                journal,
+            if cohort.profile == d2_raft::transaction_decisions::CapacityProfile::ByteBound16MiBV1 {
+                D1Command::EnableByteBoundReads {
+                    shard,
+                    epoch: 1,
+                    mode_id: [shard as u8; 16],
+                    journal,
+                    generation_nonce: [shard as u8; 32],
+                }
+            } else {
+                D1Command::EnableVersionedReads {
+                    shard,
+                    epoch: 1,
+                    mode_id: [shard as u8; 16],
+                    journal,
+                }
             },
         )
         .await
@@ -205,7 +222,8 @@ async fn graph_cross_shard_commit_partial_apply_and_same_plan_retry() {
     .unwrap();
     assert!(snapshot(&graph).await.edge(e.identity()).unwrap().is_none());
     // Resume the same plan after only the first participant became prepared.
-    let (ordinal, decision) = graph.decide(&plan, false).await.unwrap();
+    let tx = graph.decide(&plan, false).await.unwrap();
+    let (ordinal, decision) = (tx.ordinal, tx.decision.unwrap());
     assert_eq!(decision, Decision::Commit);
     versioned_reads::advance(&c, &a, authority(), 1, target(7), ordinal)
         .await
@@ -358,7 +376,8 @@ async fn committed_decision_is_not_misreported_when_a_member_stops() {
     let before = snapshot(&graph).await;
     let e = edge(7, 8, 30);
     let plan = before.prepare_edge(&e).unwrap();
-    let (ordinal, decision) = graph.decide(&plan, false).await.unwrap();
+    let tx = graph.decide(&plan, false).await.unwrap();
+    let (ordinal, decision) = (tx.ordinal, tx.decision.unwrap());
     assert_eq!(decision, Decision::Commit);
     b.raft.shutdown().await.unwrap();
     assert_eq!(
@@ -622,7 +641,8 @@ async fn prepared_target_guard_blocks_competitor_and_delete_preserves_old_views(
     let stale_properties = before_delete
         .prepare_edge_properties(e.identity(), &edge_patch(9))
         .unwrap();
-    let (ordinal, decision) = graph.decide(&deletion, false).await.unwrap();
+    let tx = graph.decide(&deletion, false).await.unwrap();
+    let (ordinal, decision) = (tx.ordinal, tx.decision.unwrap());
     assert_eq!(decision, Decision::Commit);
     versioned_reads::advance(&c, &b, authority(), 1, target(8), ordinal)
         .await
@@ -1015,7 +1035,11 @@ async fn incremental_history_catches_up_every_member_after_observed_only_page() 
     for id in 1..=20 {
         let plan = old.prepare_vertex(7, &Vertex::new(id)).unwrap();
         assert_eq!(
-            graph.decide(&plan, true).await.unwrap(),
+            graph
+                .decide(&plan, true)
+                .await
+                .map(|tx| (tx.ordinal, tx.decision.unwrap()))
+                .unwrap(),
             (id, Decision::Abort)
         );
         last = Some(plan);
@@ -1039,7 +1063,15 @@ async fn incremental_history_catches_up_every_member_after_observed_only_page() 
     assert_eq!(observed.applied_prefix, 0);
     assert_eq!(snapshot(&graph).await.version().unwrap(), 0);
 
-    graph.advance_to(&last.unwrap(), 20).await.unwrap();
+    let last = last.unwrap();
+    let tx = graph
+        .target(&last)
+        .await
+        .unwrap()
+        .record
+        .unwrap()
+        .transaction;
+    graph.advance_to(&last, &tx).await.unwrap();
     for (node, shard) in [(&a, 7), (&b, 8)] {
         let status = NodeRef::Local(node)
             .history_status(&authority(), &target(shard), &binding())
@@ -1071,6 +1103,10 @@ async fn incremental_history_catches_up_every_member_after_observed_only_page() 
     }
 }
 
+// Remote fixtures share the process-wide outbound pool. Serialize only their
+// top-level entrypoints; helpers and internal concurrent operations stay parallel.
+static REMOTE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Raw scripted peers verify the real managed wire path without permitting an
 /// accidental full Journal/Advance fallback, including lost acknowledgements.
 async fn history_peer(
@@ -1096,7 +1132,7 @@ async fn history_peer(
             let mut bytes = vec![0; length];
             stream.read_exact(&mut bytes).await.unwrap();
             let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(request["version"], 5);
+            assert_eq!(request["version"], 6);
             assert!(request["operation"].get("Journal").is_none());
             assert!(request["operation"].get("Advance").is_none());
             assert_eq!(request["operation"], expected);
@@ -1111,6 +1147,7 @@ async fn history_peer(
                 .unwrap()
                 .as_str()
             {
+                "LookupTarget" => 17,
                 "Terminal" => 9,
                 "HistoryStatus" => 11,
                 "HistoryPage" => 12,
@@ -1120,7 +1157,7 @@ async fn history_peer(
                 other => panic!("unexpected catch-up operation {other}"),
             };
             let reply = serde_json::json!({
-                "version": 5, "operation": tag, "identity": request["identity"],
+                "version": 6, "operation": tag, "identity": request["identity"],
                 "nonce": request["nonce"], "result": result,
             });
             let bytes = serde_json::to_vec(&reply).unwrap();
@@ -1195,6 +1232,7 @@ fn history_journal() -> Journal {
 }
 #[tokio::test]
 async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_commands() {
+    let _resources = REMOTE_FIXTURE.lock().await;
     use serde_json::json;
     let journal = history_journal();
     let base = journal.history_cursor_at(1).unwrap();
@@ -1289,7 +1327,10 @@ async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_c
             (NodeRef::Remote(&clients[1]), target(8)),
         ],
     );
-    graph.advance_to(&history_plan(), 20).await.unwrap();
+    graph
+        .advance_to(&history_plan(), journal.transaction([20; 16]).unwrap())
+        .await
+        .unwrap();
     coordinator_peer.await.unwrap();
     for peer in peers {
         peer.await.unwrap();
@@ -1298,6 +1339,7 @@ async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_c
 
 #[tokio::test]
 async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
+    let _resources = REMOTE_FIXTURE.lock().await;
     use serde_json::json;
     let journal = history_journal();
     let base = journal.history_cursor_at(1).unwrap();
@@ -1310,7 +1352,7 @@ async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
         (json!({"HistoryStatus": {"authority": authority(), "target": target(7), "cohort": binding()}}),
             Some(json!({"Ok": {"HistoryStatus": {"cursor": base, "applied_prefix": 0}}}))),
     ]).await;
-    // The second member is never contacted after the source rejects v5 paging.
+    // The second member is never contacted after the source rejects v6 paging.
     let graph = GraphCohort::from_endpoints(
         NodeRef::Remote(&coordinator),
         authority(),
@@ -1321,9 +1363,423 @@ async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
         ],
     );
     assert!(matches!(
-        graph.advance_to(&history_plan(), 20).await,
+        graph
+            .advance_to(&history_plan(), journal.transaction([20; 16]).unwrap())
+            .await,
         Err(Error::Identity)
     ));
     c_peer.await.unwrap();
     m_peer.await.unwrap();
+}
+
+/// Forward genuine managed requests to the real server and lose selected replies
+/// only after reading the complete applied server reply. This is actual ACK loss,
+/// not a synthetic successful response or a substituted transaction authority.
+async fn losing_proxy(
+    upstream: std::net::SocketAddr,
+    losses: Vec<&'static str>,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<usize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut losses = losses;
+        let mut lost = 0;
+        loop {
+            let (mut incoming, _) = tokio::select! {
+                _ = &mut stopped => break,
+                connection = listener.accept() => connection.unwrap(),
+            };
+            let length = incoming.read_u32().await.unwrap() as usize;
+            assert!(length <= managed_rpc::MAX_FRAME_BYTES);
+            let mut bytes = vec![0; length];
+            incoming.read_exact(&mut bytes).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let operation = &request["operation"];
+            assert!(operation.get("Journal").is_none());
+            assert!(operation.get("Prepare").is_none());
+            let name = if operation.get("ConfirmCapacity").is_some() {
+                "ConfirmCapacity"
+            } else if operation.get("PrepareRetained").is_some() {
+                "PrepareRetained"
+            } else if operation
+                .get("Command")
+                .and_then(|v| v.get("command"))
+                .and_then(|v| v.get("AdmitRequest"))
+                .is_some()
+            {
+                "AdmitRequest"
+            } else if operation
+                .get("Command")
+                .and_then(|v| v.get("command"))
+                .and_then(|v| v.get("Decide"))
+                .is_some()
+            {
+                "Decide"
+            } else {
+                "other"
+            };
+            let mut outgoing = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            outgoing.write_u32(length as u32).await.unwrap();
+            outgoing.write_all(&bytes).await.unwrap();
+            let length = outgoing.read_u32().await.unwrap() as usize;
+            assert!(length <= managed_rpc::MAX_FRAME_BYTES);
+            let mut reply = vec![0; length];
+            outgoing.read_exact(&mut reply).await.unwrap();
+            if let Some(index) = losses.iter().position(|loss| *loss == name) {
+                losses.remove(index);
+                lost += 1;
+            } else {
+                incoming.write_u32(length as u32).await.unwrap();
+                incoming.write_all(&reply).await.unwrap();
+            }
+        }
+        assert!(losses.is_empty(), "every planned ACK loss must occur");
+        lost
+    });
+    (address, stop, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn actual_durable_gateway_uses_retained_control_with_lost_acks_and_reopen() {
+    let _resources = REMOTE_FIXTURE.lock().await;
+    use std::sync::Arc;
+    // Negative control proves the dev-dependency feature activates the whole
+    // Journal guard chain. Isolate the intentionally panicking node completely.
+    {
+        let cluster = Cluster::new();
+        let directory = tempfile::tempdir().unwrap();
+        let node = initialize(
+            cluster
+                .in_group(9)
+                .start_durable(1, directory.path())
+                .await
+                .unwrap(),
+            9,
+        )
+        .await;
+        node.state_machine.forbid_coordinator_journal(true);
+        let state = node.state_machine.clone();
+        let panic =
+            tokio::spawn(async move { state.coordinator_journal(9, 1, [9; 16]).await }).await;
+        assert!(
+            panic.unwrap_err().is_panic(),
+            "old full-Journal path must trip the real dependency hook"
+        );
+        cluster.in_group(9).shutdown(&node).await;
+    }
+    let cluster = Cluster::new();
+    let directories = [
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    ];
+    let mut cohort = binding();
+    cohort.profile = d2_raft::transaction_decisions::CapacityProfile::ByteBound16MiBV1;
+    let identity = |shard| {
+        let mut id = history_identity(shard);
+        id.cohort = cohort.clone();
+        id
+    };
+    let mut nodes = Vec::new();
+    for (shard, directory) in [9, 7, 8].into_iter().zip(&directories) {
+        let node = Arc::new(
+            initialize_cohort(
+                cluster
+                    .in_group(shard)
+                    .start_durable(1, directory.path())
+                    .await
+                    .unwrap(),
+                shard,
+                cohort.clone(),
+            )
+            .await,
+        );
+        node.state_machine.forbid_coordinator_journal(true);
+        nodes.push(node);
+    }
+    let a_server = managed_rpc::Server::bind(
+        nodes[1].clone(),
+        identity(7),
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let b_server = managed_rpc::Server::bind(
+        nodes[2].clone(),
+        identity(8),
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let a_direct =
+        managed_rpc::Client::new(a_server.local_addr(), identity(7), Duration::from_secs(5))
+            .unwrap();
+    let b_client =
+        managed_rpc::Client::new(b_server.local_addr(), identity(8), Duration::from_secs(5))
+            .unwrap();
+    let c_server = managed_rpc::Server::bind_byte_bound_coordinator(
+        nodes[0].clone(),
+        identity(9),
+        vec![a_direct.clone(), b_client.clone()],
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let (c_address, c_stop, c_proxy) = losing_proxy(
+        c_server.local_addr(),
+        vec!["ConfirmCapacity", "AdmitRequest", "Decide"],
+    )
+    .await;
+    let (a_address, a_stop, a_proxy) =
+        losing_proxy(a_server.local_addr(), vec!["PrepareRetained"]).await;
+    let c_client =
+        managed_rpc::Client::new(c_address, identity(9), Duration::from_secs(5)).unwrap();
+    let a_client =
+        managed_rpc::Client::new(a_address, identity(7), Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        NodeRef::Remote(&c_client)
+            .confirm_capacity(&authority(), 1)
+            .await,
+        Err(managed_rpc::Error::Unavailable)
+    );
+    let grants = NodeRef::Remote(&c_client)
+        .confirm_capacity(&authority(), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        NodeRef::Remote(&c_client)
+            .confirm_capacity(&authority(), 1)
+            .await
+            .unwrap(),
+        grants
+    );
+    let graph = GraphCohort::from_endpoints(
+        NodeRef::Remote(&c_client),
+        authority(),
+        1,
+        vec![
+            (NodeRef::Remote(&a_client), target(7)),
+            (NodeRef::Remote(&b_client), target(8)),
+        ],
+    );
+    let direct = snapshot(&graph)
+        .await
+        .prepare_vertex(7, &Vertex::new(501))
+        .unwrap();
+    assert!(matches!(
+        graph.execute(&direct).await,
+        Err(Error::Uncertain)
+    ));
+    assert_eq!(
+        nodes[1]
+            .state_machine
+            .participant_status(7, 1, [7; 16], direct.id())
+            .await
+            .unwrap(),
+        d2_raft::participant_writes::Status::Prepared
+    );
+    let expected = Outcome::Committed {
+        ordinal: 1,
+        visible: true,
+    };
+    assert_eq!(graph.execute(&direct).await.unwrap(), expected);
+    assert_eq!(graph.status(&direct).await.unwrap(), Some(expected.clone()));
+    assert_eq!(graph.execute(&direct).await.unwrap(), expected);
+
+    let view = snapshot(&graph).await;
+    let original = view.prepare_vertex(8, &Vertex::new(502)).unwrap();
+    let changed = view.prepare_vertex(8, &Vertex::new(503)).unwrap();
+    let bytes = b"create vertex 8:502".to_vec();
+    let admitted = graph
+        .admit_request([222; 16], bytes.clone(), &original)
+        .await
+        .unwrap();
+    assert_eq!(admitted, original);
+    assert_eq!(
+        graph
+            .admit_request([222; 16], bytes.clone(), &changed)
+            .await
+            .unwrap(),
+        original
+    );
+    assert!(matches!(
+        graph.execute(&admitted).await.unwrap(),
+        Outcome::Committed {
+            ordinal: 2,
+            visible: true
+        }
+    ));
+    let mut substituted = admitted.clone();
+    substituted.parts[0].request.operations = vec![d2_raft::WriteOp::put("forged", "payload")];
+    assert!(matches!(
+        graph.status(&substituted).await,
+        Err(Error::Identity)
+    ));
+
+    let view = snapshot(&graph).await;
+    let hole = view.prepare_vertex(7, &Vertex::new(504)).unwrap();
+    let later = view.prepare_vertex(8, &Vertex::new(505)).unwrap();
+    graph
+        .command(Command::Begin {
+            id: hole.id,
+            participants: hole
+                .parts
+                .iter()
+                .map(|part| part.descriptor.clone())
+                .collect(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.abort(&later).await.unwrap(),
+        Outcome::Aborted {
+            ordinal: 4,
+            visible: false
+        }
+    );
+    assert_eq!(
+        graph.status(&later).await.unwrap(),
+        Some(Outcome::Aborted {
+            ordinal: 4,
+            visible: false
+        })
+    );
+    assert_eq!(
+        graph.abort(&hole).await.unwrap(),
+        Outcome::Aborted {
+            ordinal: 3,
+            visible: true
+        }
+    );
+    assert_eq!(
+        graph.execute(&later).await.unwrap(),
+        Outcome::Aborted {
+            ordinal: 4,
+            visible: true
+        }
+    );
+    drop(graph);
+    c_stop.send(()).unwrap();
+    a_stop.send(()).unwrap();
+    assert_eq!(c_proxy.await.unwrap(), 3);
+    assert_eq!(a_proxy.await.unwrap(), 1);
+    c_server.shutdown().await;
+    a_server.shutdown().await;
+    b_server.shutdown().await;
+    for (node, shard) in nodes.iter().zip([9, 7, 8]) {
+        cluster.in_group(shard).shutdown(node).await;
+    }
+    drop(nodes);
+    let mut reopened = Vec::new();
+    for (shard, directory) in [9, 7, 8].into_iter().zip(&directories) {
+        let node = cluster
+            .in_group(shard)
+            .start_durable(1, directory.path())
+            .await
+            .unwrap();
+        node.raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "retained reopen")
+            .await
+            .unwrap();
+        node.state_machine.forbid_coordinator_journal(true);
+        reopened.push(node);
+    }
+    let graph = self::graph(&reopened[0], &reopened[1], &reopened[2]);
+    let recovered = graph
+        .recover_request([222; 16], &bytes)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered, admitted);
+    assert_eq!(
+        graph.execute(&recovered).await.unwrap(),
+        Outcome::Committed {
+            ordinal: 2,
+            visible: true
+        }
+    );
+    assert_eq!(
+        graph.status(&later).await.unwrap(),
+        Some(Outcome::Aborted {
+            ordinal: 4,
+            visible: true
+        })
+    );
+    for (node, shard) in reopened.iter().zip([9, 7, 8]) {
+        cluster.in_group(shard).shutdown(node).await;
+    }
+}
+
+#[tokio::test]
+async fn status_never_combines_target_with_a_different_same_ordinal_proof() {
+    let _resources = REMOTE_FIXTURE.lock().await;
+    use serde_json::json;
+    let journal = history_journal();
+    let evidence = d2_raft::target_evidence::TargetEvidence {
+        version: 1,
+        cut: journal.history_cursor().unwrap(),
+        resolved_prefix: 20,
+        id: [20; 16],
+        record: Some(d2_raft::target_evidence::TargetRecord {
+            transaction: journal.transaction([20; 16]).unwrap().clone(),
+            request: None,
+        }),
+    };
+    let mut other = Journal::new(authority().mode).unwrap();
+    other
+        .apply(Command::BindCohort { cohort: binding() })
+        .unwrap();
+    for original in 1..=20u8 {
+        let id = if original == 20 { 21 } else { original };
+        other
+            .apply(Command::Begin {
+                id: [id; 16],
+                participants: vec![Participant {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                    intent: [original; 32],
+                }],
+            })
+            .unwrap();
+        other
+            .apply(Command::Decide {
+                id: [id; 16],
+                decision: Decision::Abort,
+            })
+            .unwrap();
+    }
+    let proof = other.terminal_prefix(20).unwrap();
+    assert!(!proof.matches_transaction(journal.transaction([20; 16]).unwrap()));
+    let (client, peer) = history_peer(history_identity(9), vec![
+        (json!({"LookupTarget": {"authority": authority(), "epoch": 1, "id": history_plan().id}}), Some(json!({"Ok": {"Target": evidence}}))),
+        (json!({"Terminal": {"authority": authority(), "epoch": 1, "version": 20}}), Some(json!({"Ok": {"Evidence": proof}}))),
+    ]).await;
+    let graph = GraphCohort::from_endpoints(
+        NodeRef::Remote(&client),
+        authority(),
+        1,
+        vec![
+            (NodeRef::Remote(&client), target(7)),
+            (NodeRef::Remote(&client), target(8)),
+        ],
+    );
+    assert_eq!(
+        graph.status(&history_plan()).await.unwrap(),
+        Some(Outcome::Aborted {
+            ordinal: 20,
+            visible: false
+        })
+    );
+    peer.await.unwrap();
 }

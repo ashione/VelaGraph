@@ -99,7 +99,7 @@ normal atomic migration. Actual v15 and older legacy formats keep their readers
 until a successful batch writes v16; v15 already requires the index to be absent.
 Residual request rows/manifests fail closed in both v15 and v16. Explicit validated
 snapshot repair remains supported. See the [storage/read contract](AUTHORITATIVE_EVENT_LEDGER.md).
-Managed RPC v5, original Plan bytes, first-plan-wins behavior and existing deadlines
+The S4 [managed RPC v6](RETAINED_GATEWAY_CONTROL.md), original Plan bytes, first-plan-wins behavior and existing deadlines
 are unchanged. The [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md) consumes an active
 checkpoint for the durable bound coordinator resident/ordinary apply candidate
 and uses compact remote Command preflight. Cold replay, explicit control/Terminal,
