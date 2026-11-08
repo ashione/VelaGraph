@@ -656,7 +656,8 @@ async fn synced_original_request_and_plan_survive_abort_retry_reopen_and_snapsho
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn suffix_sync_with_full_intent_budget_preserves_unknown_abort_capacity() {
-    let mut sm = Arc::new(StateMachine::default());
+    let directory = tempfile::tempdir().unwrap();
+    let mut sm = Arc::new(StateMachine::open(directory.path()).unwrap());
     setup(&mut sm).await;
     let value = vec![0; crate::participant_writes::MAX_INTENT_BYTES - 256 - 128 - 64 - 3];
     let mut large = request(1);
@@ -713,6 +714,33 @@ async fn suffix_sync_with_full_intent_budget_preserves_unknown_abort_capacity() 
     assert_eq!(d1.sequence, 1);
     assert_eq!(d1.visibility.as_ref().unwrap().applied, 2);
     d1.validate().unwrap();
+    let marker = state.last_applied_log;
+    drop(state);
+    drop(sm);
+    let sm = StateMachine::open(directory.path()).unwrap();
+    assert_eq!(
+        sm.participant_history_status(7, 1, [7; 16]).await.unwrap(),
+        (cut, 2)
+    );
+    assert_eq!(sm.applied().await, marker);
+    assert_eq!(
+        sm.participant_status(7, 1, [7; 16], id(2)).await.unwrap(),
+        Status::Aborted
+    );
+    assert_eq!(
+        sm.state
+            .read()
+            .await
+            .d1
+            .as_ref()
+            .unwrap()
+            .participant
+            .as_ref()
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

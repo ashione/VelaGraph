@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[path = "journal_history.rs"]
 mod history;
+pub(crate) use history::MAX_HISTORY_EVENTS;
 pub use history::{HistoryCursor, HistoryPage, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_EVENTS};
 
 pub const MAX_TRANSACTIONS: usize = 1024;
@@ -204,6 +205,25 @@ impl Journal {
 
     pub fn request(&self, id: [u8; 16]) -> Option<&RequestRecord> {
         self.requests.iter().find(|r| r.id == id)
+    }
+
+    /// Borrow original retained commands without serializing an archive.
+    pub(crate) fn events(&self) -> &[Command] {
+        &self.events
+    }
+
+    /// Strict replay on an unpublished candidate. A failure may have changed
+    /// the candidate, which must then be discarded. Exact retry no-ops are not
+    /// events and are rejected, just like a malformed archived history.
+    pub(crate) fn replay_event(&mut self, command: Command) -> Result<(), Error> {
+        self.replay_event_with_limit(command, MAX_JOURNAL_BYTES)
+    }
+
+    fn replay_event_with_limit(&mut self, command: Command, limit: usize) -> Result<(), Error> {
+        if !self.append(command, limit)? {
+            return Err(Error::InvalidJournal);
+        }
+        Ok(())
     }
 
     pub(crate) fn requests(&self) -> &[RequestRecord] {
@@ -492,9 +512,7 @@ impl Journal {
         }
         let mut result = Self::new(encoded.authority)?;
         for command in encoded.events {
-            if !result.append(command, limit)? {
-                return Err(Error::InvalidJournal);
-            }
+            result.replay_event_with_limit(command, limit)?;
         }
         if encoded.version != result.encoding_version() {
             return Err(Error::InvalidJournal);

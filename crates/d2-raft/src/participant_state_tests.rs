@@ -286,7 +286,7 @@ async fn pending_ownership_change_is_rejected_by_snapshot_and_reopen() {
         .as_ref()
         .unwrap()
         .db
-        .put(D1_KEY, d1_metadata_bytes(&decoded.d1).unwrap())
+        .put(D1_KEY, d1_metadata_bytes(&decoded.d1, None).unwrap())
         .unwrap();
     drop(sm);
     assert!(StateMachine::open(dir.path()).is_err());
@@ -345,7 +345,7 @@ async fn participant_metadata_v6_golden_and_old_shape_rejection() {
     let mut sm = Arc::new(StateMachine::default());
     setup(&mut sm).await;
     let state = sm.state.read().await;
-    let bytes = d1_metadata_bytes(state.d1.as_ref().unwrap()).unwrap();
+    let bytes = d1_metadata_bytes(state.d1.as_ref().unwrap(), None).unwrap();
     let ones = vec!["1"; 16].join(",");
     let nines = vec!["9"; 16].join(",");
     let expected=format!("{{\"version\":6,\"state\":{{\"version\":5,\"managed\":{{\"mode_id\":[{ones}],\"activated_sequence\":1}},\"participant\":{{\"authority\":{{\"shard\":9,\"mode\":[{nines}]}},\"activated_sequence\":1,\"records\":[]}},\"shard\":7,\"epoch\":3,\"sequence\":1,\"dedup\":[]}}}}");

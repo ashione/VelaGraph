@@ -1,8 +1,6 @@
 //! Bounded transfers of exact retained journal events. Cursors are integrity
 //! commitments, not authentication. The full replayed Journal remains authority.
-use super::{
-    Cohort, Command, Error, Journal, MAX_JOURNAL_BYTES, MAX_PARTICIPANTS, MAX_TRANSACTIONS,
-};
+use super::{Cohort, Command, Error, Journal, MAX_PARTICIPANTS, MAX_TRANSACTIONS};
 use crate::participant_writes::Authority;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,7 +12,7 @@ pub const MAX_HISTORY_PAGE_EVENTS: usize = 32;
 /// Maximum sum of canonical command JSON byte lengths in one history page.
 /// The complete transport frame has its own, separate bound.
 pub const MAX_HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_HISTORY_EVENTS: u64 = (MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2) + 1) as u64;
+pub(crate) const MAX_HISTORY_EVENTS: u64 = (MAX_TRANSACTIONS * (MAX_PARTICIPANTS + 2) + 1) as u64;
 const VERSION: u32 = 1;
 const IDENTITY_DOMAIN: &[u8] = b"d2-raft/journal-history/v1\0";
 const EVENT_DOMAIN: &[u8] = b"d2-raft/journal-history/event/v1\0";
@@ -78,6 +76,26 @@ impl HistoryCursor {
             return Err(Error::IncompatibleHistory);
         }
         Ok(())
+    }
+
+    /// Extend the existing v1 chain once per original event. Semantic replay is
+    /// the caller's responsibility; no independently invented ledger hash exists.
+    pub(crate) fn extend(&self, events: &[Command]) -> Result<Self, Error> {
+        self.validate()?;
+        let event_count = self
+            .event_count
+            .checked_add(events.len() as u64)
+            .filter(|count| *count <= MAX_HISTORY_EVENTS)
+            .ok_or(Error::InvalidJournal)?;
+        let mut root = self.root;
+        for (offset, event) in events.iter().enumerate() {
+            root = event_root(root, self.event_count + offset as u64 + 1, event)?;
+        }
+        Ok(Self {
+            event_count,
+            root,
+            ..self.clone()
+        })
     }
 
     /// Check the complete authority and ordered cohort against a trusted target.
@@ -152,12 +170,8 @@ impl HistoryPage {
         for event in &self.events {
             bytes += event_size(event, MAX_HISTORY_PAGE_BYTES - bytes)?;
         }
-        let mut root = self.base.root;
-        for (offset, event) in self.events.iter().enumerate() {
-            root = event_root(root, self.base.event_count + offset as u64 + 1, event)?;
-        }
-        if root != self.end.root
-            || (self.end.event_count == self.cut.event_count && self.end != self.cut)
+        let end = self.base.extend(&self.events)?;
+        if end != self.end || (self.end.event_count == self.cut.event_count && self.end != self.cut)
         {
             return Err(Error::IncompatibleHistory);
         }
@@ -380,8 +394,8 @@ impl Journal {
                 if existing != event {
                     return Err(Error::IncompatibleHistory);
                 }
-            } else if !candidate.append(event.clone(), MAX_JOURNAL_BYTES)? {
-                return Err(Error::InvalidJournal);
+            } else {
+                candidate.replay_event(event.clone())?;
             }
         }
         candidate.validate_history_cursor(&page.end)?;
@@ -398,9 +412,7 @@ impl Journal {
         self.validate_history_cursor(cut)?;
         let mut prefix = Self::new(self.authority)?;
         for event in self.events.iter().take(cut.event_count as usize) {
-            if !prefix.append(event.clone(), MAX_JOURNAL_BYTES)? {
-                return Err(Error::InvalidJournal);
-            }
+            prefix.replay_event(event.clone())?;
         }
         Ok(prefix)
     }

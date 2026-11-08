@@ -1,5 +1,10 @@
 # Durable terminal decision segments
 
+Subsequent live-storage format: [authoritative event ledger](AUTHORITATIVE_EVENT_LEDGER.md)
+replaces embedded bound Journal disk headers with v11/v12 raw-event authority.
+The original slice below documents its historical formats; logical full-history
+retention, snapshots and all lifetime limits still apply.
+
 Status: a bounded storage/read foundation after A2.1. The complete Journal is
 still the sole decision authority. The existing **256 external requests, 1,024
 transactions and 16 MiB Journal including resolution reservations** remain.

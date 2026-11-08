@@ -1164,7 +1164,7 @@ async fn visibility(
         .state_machine
         .participant_visibility_info(target.shard, target.epoch, target.mode)
         .await
-        .map_err(Error::Application)?;
+        .map_err(application_error)?;
     if info.baseline_sequence != 0
         || info.cohort.is_none()
         || pinned.is_some_and(|p| {
@@ -1190,7 +1190,7 @@ async fn checked_journal(
         .state_machine
         .coordinator_journal(authority.shard, epoch, authority.mode)
         .await
-        .map_err(Error::Application)?;
+        .map_err(application_error)?;
     if pinned.is_none() && journal.cohort().is_none() {
         return Ok(journal);
     }
@@ -1199,6 +1199,15 @@ async fn checked_journal(
         return Err(Error::Identity);
     }
     Ok(journal)
+}
+// Disk format errors do not expand the v4 wire enum. Peers already understand
+// history mismatch and transient unavailability; the ledger stays private.
+fn application_error(error: D1Error) -> Error {
+    match error {
+        D1Error::EventLedgerHistory => Error::Application(D1Error::VisibilityHistory),
+        D1Error::EventLedgerUnavailable => Error::Unavailable,
+        other => Error::Application(other),
+    }
 }
 async fn submit(
     node: &WorkNode,
@@ -1215,7 +1224,7 @@ async fn submit(
         .data
         .d1
         .ok_or(Error::Protocol)?
-        .map_err(Error::Application)
+        .map_err(application_error)
 }
 struct WorkNode {
     raft: crate::network::Raft,
@@ -1276,7 +1285,7 @@ async fn execute(
                 .state_machine
                 .participant_history_status(target.shard, target.epoch, target.mode)
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             let status = HistoryStatus {
                 cursor,
                 applied_prefix,
@@ -1309,7 +1318,7 @@ async fn execute(
                     cut.as_ref(),
                 )
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             check_history_page(&page, &base, cut.as_ref())?;
             Ok(Value::HistoryPage(page))
         }
@@ -1395,7 +1404,7 @@ async fn execute(
                 .state_machine
                 .coordinator_summary(authority.shard, epoch, authority.mode)
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             check_summary(&value, &authority, epoch)?;
             if pinned.is_some_and(|p| {
                 p.role != Role::Coordinator
@@ -1416,7 +1425,7 @@ async fn execute(
                 .state_machine
                 .coordinator_terminal_prefix(authority.shard, epoch, authority.mode, version)
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             if proof.authority() != authority.mode
                 || proof.cohort().coordinator_shard != authority.shard
                 || proof.cohort().coordinator_epoch != epoch
@@ -1440,7 +1449,7 @@ async fn execute(
                 .state_machine
                 .coordinator_request(authority.shard, epoch, authority.mode, id)
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             check_request(&value, &authority, epoch, id)?;
             if pinned.is_some_and(|p| {
                 p.role != Role::Coordinator
@@ -1582,7 +1591,7 @@ async fn execute(
                 .state_machine
                 .participant_terminal_prefix(target.shard, target.epoch, target.mode, &proof)
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             Ok(Value::Evidence(retained))
         }
         Operation::Read {
@@ -1600,7 +1609,7 @@ async fn execute(
                 .state_machine
                 .certified_terminal_read(target.shard, target.epoch, target.mode, limit, &proof)
                 .await
-                .map_err(Error::Application)?;
+                .map_err(application_error)?;
             Ok(Value::Snapshot(snapshot.into(), retained))
         }
     }
