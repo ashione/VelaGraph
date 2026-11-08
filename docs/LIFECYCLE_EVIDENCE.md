@@ -163,3 +163,92 @@ The already locked official `rustix = 1.1.6` (Apache-2.0 OR Apache-2.0 WITH
 LLVM-exception OR MIT) enables filesystem APIs only as a dev dependency. No new
 package version, production dependency, installed toolchain or downloaded source
 is introduced.
+
+## Same-run build handoff and CI scheduling
+
+[Issue #126](https://github.com/ashione/VelaGraph/issues/126) separates release
+compilation from the fresh lifecycle runtime. `lifecycle-build` has a 90-minute
+job budget and produces an immutable artifact; `lifecycle` depends on it and
+keeps its own unchanged 90-minute budget. The independent CoreHR scenario still
+has 90 minutes. The serial build-plus-runtime budget is therefore up to 180
+minutes, with another five minutes for the aggregate, excluding queue time.
+This is a scheduling/budget change, not faster writes, an expected duration,
+or a guarantee that runtime finishes. All 1,025 writes, durable checkpoints,
+fsyncs, old-ID/Plan/old-V assertions, ACK loss, reopen and snapshot phases and
+15/60-second request budgets are unchanged.
+
+The existing `managed_lifecycle_ci.py` has explicit `--mode build` and
+`--mode runtime --handoff PATH` entrypoints. The old combined entrypoint is
+retired. Runtime has no Cargo installation, build, cache restore or fallback.
+It reaches the existing exact-test and complete-checkpoint validators only
+after validating the required builder's handoff. Its output directory and the
+lifecycle directory must be new. A zero-test, ignored, interrupted or incomplete
+run is never acceptance. The stable `CoreHR 200k people / 5k departments` check
+runs with `always()` and requires build, lifecycle runtime and scenario to all
+be `success`; failed, cancelled and skipped jobs fail it.
+
+The trust route is GitHub Actions, not a manifest's claim:
+
+1. Both checkouts use the immutable `github.sha`, including the merge candidate
+   SHA for pull requests, and independently verify clean tracked source and Git
+   commit/tree. The builder runs the same exact locked release Cargo command.
+2. `actions/upload-artifact@v4` uploads only `handoff.zip`. Explicit build-job
+   outputs carry its immutable artifact ID and the inner ZIP's SHA-256 and byte
+   length. The name includes the current run ID and attempt.
+3. Runtime uses read-only Actions API calls to check the artifact's repository,
+   run and head SHA, plus the current attempt's workflow path, event and repository.
+   API `head_sha` is checked against the platform event's PR head for PRs, not
+   confused with the tested merge SHA; both are separately bound in the handoff.
+   Only the workflow's existing PR/push/schedule/manual events are accepted.
+   The runtime adds only `actions: read` to the existing `contents: read` scope.
+4. `actions/download-artifact@v4` receives only the build job's artifact ID and
+   uses its current-run default. There is no URL, repository, token or run-ID
+   override. Missing metadata, failed API/download or a different attempt fails
+   closed. **Re-run all jobs** after a failed runtime: “re-run failed jobs” cannot
+   reuse a successful builder from an earlier attempt.
+5. Before any chmod or executable invocation, runtime independently compares
+   current source and Cargo inputs, validates the closed archive and all declared
+   lengths/hashes, and selects exactly the recorded optimized `managed_process`
+   compiler artifact. Absolute Cargo paths are checked against the declared build
+   root, not the runtime runner's path or an arbitrary basename. Only the validated
+   Linux x86_64 `managed_process` ELF becomes executable.
+
+The version-1 handoff contains exactly `handoff.json`, `source.json`, full
+`build.jsonl`, `dependencies.json`, `managed_process`, `Cargo.lock`, and three
+workspace manifests (`cargo-root.toml`, `cargo-d2-raft.toml`,
+`cargo-replicated-graph.toml`). It binds repository/run/attempt/event/PR head,
+checkout SHA/tree, source digest, exact build command and compiler artifact.
+Every payload has an exact byte length and SHA-256. The dependency manifest
+records observed compiled package IDs, versions/sources, profiles and features,
+cross-checked against the independently checked-in lockfile and workspace Cargo
+manifests. The lockfile retains the dependency graph; unused target-specific
+packages need not have compiled artifacts. Required `d2-raft` library release
+profile and `default,test-hooks` features are checked. This is not a bundle of
+all external/system libraries or proof against a compromised builder.
+
+ZIP members have fixed ASCII flat names, stored/uncompressed data and regular
+non-executable modes. Missing/extra/duplicate names, traversal, links, nonregular
+files, unsupported flags/compression, malformed headers, comments and trailing
+data are rejected. Member lengths are bounded before reads: 1 MiB for the handoff
+and each Cargo input, 16 MiB for source, 64 MiB each for Cargo output/dependencies,
+and 512 MiB for the ELF; total archive size is bounded by those limits plus 64 KiB
+of ZIP headers. Extraction never uses archive-controlled paths or permissions.
+Generated build/runtime output, target files and Python bytecode are excluded
+from source hashing. The runtime retains the validated API provenance and handoff
+alongside execution evidence; partial failures still retain logs, `progress.json`,
+`progress.json.tmp` and the complete `artifacts/**` reference closure.
+
+Runtime requires the runner image's `libstdc++6`, `libgcc-s1` and `libc6`
+(including libm and the Linux loader), not libclang or a shared RocksDB library.
+Read-only `readelf` inspection of the retained prior ELF found only those runtime
+libraries; its runner log installed/updated none of them. This verifies the prior
+image, not every future `ubuntu-latest` image. A missing/incompatible runtime
+library fails the fresh test rather than triggering a build or install fallback.
+
+The configured Rust cache prefix, main-only save condition and failure policy
+are unchanged. Moving the cache step from job `lifecycle` to `lifecycle-build`
+can change the cache action's implicit job-derived key and cause an initial miss;
+no shared-key workaround or cache-policy change is introduced. Cache reuse only
+accelerates Cargo dependencies and never substitutes a previous run's executable
+or acceptance evidence. SHA-256 checks content integrity; the supported same-run
+artifact route supplies provenance, not adversarial-build attestation.

@@ -7,6 +7,10 @@ import json
 import os
 import pathlib
 import subprocess
+import stat
+import struct
+import warnings
+import zipfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,8 +23,12 @@ def artifact(root):
             'manifest_path': str(root / 'crates/replicated-graph/Cargo.toml'),
             'target': {'name': 'managed_process', 'kind': ['test'], 'test': True,
                        'src_path': str(root / 'crates/replicated-graph/tests/managed_process.rs')},
-            'profile': {'test': True, 'debug_assertions': False, 'opt_level': '3'},
-            'executable': str(root / 'target/release/deps/managed_process-fixture')}
+            'profile': {'test': True, 'debug_assertions': False, 'opt_level': '3',
+                        'debuginfo': 0, 'overflow_checks': False},
+            'features': [],
+            'package_id': 'path+' + (root / 'crates/replicated-graph').as_uri() + '#0.1.0',
+            'filenames': [str(root / 'target/release/deps/managed_process-abcdef')],
+            'executable': str(root / 'target/release/deps/managed_process-abcdef')}
 
 
 def output(name=gate.TEST, result='ok', passed=1, ignored=0, running=1):
@@ -314,15 +322,117 @@ class ValidatorTests(unittest.TestCase):
                 self.assertIn({'path': 'tracked.rs', 'kind': 'deleted'}, deleted['files'])
 
 
+class HandoffFixture:
+    # Synthetic ELF header only, never execute it. All subprocesses are mocked.
+    def __init__(self, root):
+        self.root = root
+        self.build = root / 'target/build-results'
+        self.download = root / 'target/download'
+        self.download.mkdir(parents=True)
+        self.archive = self.download / 'handoff.zip'
+        self.selected = artifact(root)
+        self.binary = pathlib.Path(self.selected['executable'])
+        self.binary.parent.mkdir(parents=True)
+        header = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + b'\0' * 9,
+                             3, 62, 1, 0, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+        self.binary.write_bytes(header + b'\0' * 56)
+        self.binary.chmod(0o755)
+        self.records = []
+        files = {'source.rs': 'synthetic project source\n'}
+        lock = 'version = 4\n'
+        for name, path in [('rocksdb-sql-table', 'Cargo.toml'),
+                           ('d2-raft', 'crates/d2-raft/Cargo.toml'),
+                           ('replicated-graph', 'crates/replicated-graph/Cargo.toml')]:
+            files[path] = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
+            lock += f'\n[[package]]\nname = "{name}"\nversion = "0.1.0"\n'
+            row = copy.deepcopy(self.selected)
+            row.update(package_id='path+' + (root / path).parent.as_uri() + f'#{name}@0.1.0',
+                       manifest_path=str(root / path), executable=None,
+                       features=['default', 'test-hooks'] if name == 'd2-raft' else [])
+            row['target'].update(name=name.replace('-', '_'), kind=['lib'], src_path=str((root / path).parent / 'src/lib.rs'))
+            row['profile']['test'] = False
+            self.records.append(row)
+        files['Cargo.lock'] = lock
+        for path, data in files.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(data)
+        self.files = b'\0'.join(path.encode() for path in sorted(files)) + b'\0'
+        self.records += [self.selected, {'reason': 'build-finished', 'success': True}]
+        self.env = {'GITHUB_REPOSITORY': 'owner/project', 'GITHUB_REPOSITORY_ID': '23',
+                    'GITHUB_RUN_ID': '42', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a' * 40,
+                    'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_REF': 'refs/pull/117/merge',
+                    'LIFECYCLE_EVENT_HEAD_SHA': 'c' * 40, 'GITHUB_WORKFLOW': 'CoreHR full scale',
+                    'GITHUB_JOB': gate.BUILD_JOB, 'GITHUB_OUTPUT': str(root / 'target/github-output'),
+                    'LIFECYCLE_BUILD_RESULT': 'success', 'LIFECYCLE_ARTIFACT_ID': '123',
+                    'LIFECYCLE_ARTIFACT_METADATA': str(root / 'target/api.json'), 'CARGO_TARGET_DIR': 'target'}
+        self.provenance = {'artifact': {'id': 123, 'name': 'managed-lifecycle-build-42-2', 'expired': False,
+                                       'workflow_run': {'id': 42, 'repository_id': 23, 'head_sha': 'c' * 40}},
+                           'run': {'id': 42, 'run_attempt': 2, 'head_sha': 'c' * 40, 'event': 'pull_request',
+                                   'path': '.github/workflows/corehr.yml',
+                                   'repository': {'id': 23, 'full_name': 'owner/project'}}}
+        pathlib.Path(self.env['LIFECYCLE_ARTIFACT_METADATA']).write_text(json.dumps(self.provenance))
+
+    @contextlib.contextmanager
+    def context(self):
+        with patch.dict(os.environ, self.env), \
+                patch.object(gate, 'checkout_identity', return_value={'commit': 'a' * 40, 'tree': 'b' * 40}), \
+                patch.object(gate.subprocess, 'check_output', return_value=self.files), \
+                contextlib.redirect_stdout(io.StringIO()):
+            yield
+
+    def prepare(self):
+        self.build.mkdir()
+        with self.context():
+            source = gate.source_snapshot(self.root, self.build)
+            (self.build / 'source.json').write_text(json.dumps(source))
+            (self.build / 'build.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in self.records))
+            shutil.copyfile(self.binary, self.build / 'managed_process')
+            gate.write_handoff(self.root, self.build, source, self.selected, self.records)
+        self.download_build()
+        return self
+
+    def download_build(self):
+        shutil.copyfile(self.build / 'handoff.zip', self.archive)
+        self.bind_archive()
+
+    def bind_archive(self):
+        self.env.update(LIFECYCLE_BUNDLE_SHA256=gate.sha256(self.archive),
+                        LIFECYCLE_BUNDLE_LENGTH=str(self.archive.stat().st_size))
+
+    def rewrite(self, change):
+        payloads = gate.read_handoff_archive(self.archive)
+        change(payloads)
+        with zipfile.ZipFile(self.archive, 'w') as bundle:
+            for name, data in sorted(payloads.items()):
+                entry = zipfile.ZipInfo(name)
+                entry.create_system = 3
+                entry.external_attr = (stat.S_IFREG | 0o644) << 16
+                bundle.writestr(entry, data)
+        self.bind_archive()
+
+    def change_manifest(self, change):
+        def mutate(payloads):
+            manifest = gate.unique_json(payloads['handoff.json'])
+            change(manifest)
+            payloads['handoff.json'] = encoded(manifest)
+        self.rewrite(mutate)
+
+    def change_payload(self, name, change):
+        def mutate(payloads):
+            payloads[name] = change(payloads[name])
+            manifest = gate.unique_json(payloads['handoff.json'])
+            manifest['files'][name] = {'byte_length': len(payloads[name]),
+                                       'sha256': hashlib.sha256(payloads[name]).hexdigest()}
+            payloads['handoff.json'] = encoded(manifest)
+        self.rewrite(mutate)
+
+
 class GateTests(unittest.TestCase):
     def run_fixture(self, root, out, test_output=None, exit_code=0, mutate=None,
                     build_exit=0, artifact_mutate=None, mutate_artifacts=None):
-        selected = artifact(root)
-        (root / 'source.rs').write_text('synthetic project source\n')
-        binary = pathlib.Path(selected['executable'])
-        binary.parent.mkdir(parents=True)
-        binary.write_bytes(b'\x7fELFsynthetic test fixture; never executed')
-        binary.chmod(0o755)
+        fixture = HandoffFixture(root)
+        selected, binary = fixture.selected, fixture.binary
         calls = []
 
         def fake_run(command, cwd, env, stdout, stderr):
@@ -330,8 +440,8 @@ class GateTests(unittest.TestCase):
             if command == gate.BUILD:
                 if artifact_mutate:
                     artifact_mutate(selected)
-                stdout.write(json.dumps(selected) + '\n')
-                stdout.write(json.dumps({'reason': 'build-finished', 'success': build_exit == 0}) + '\n')
+                fixture.records[-1]['success'] = build_exit == 0
+                stdout.write(''.join(json.dumps(row) + '\n' for row in fixture.records))
                 return subprocess.CompletedProcess(command, build_exit)
             self.assertEqual(command, [str(out / 'managed_process'), gate.TEST, '--exact',
                                       '--nocapture', '--test-threads=1', '--format=pretty', '--color=never'])
@@ -349,10 +459,11 @@ class GateTests(unittest.TestCase):
             stderr.write('synthetic child stderr\n')
             return subprocess.CompletedProcess(command, exit_code)
 
-        with patch.object(gate.subprocess, 'run', side_effect=fake_run), \
-                patch.object(gate.subprocess, 'check_output', return_value=b'source.rs\0'), \
-                contextlib.redirect_stdout(io.StringIO()):
-            gate.run_gate(root, out)
+        with fixture.context(), patch.object(gate.subprocess, 'run', side_effect=fake_run):
+            gate.run_gate(root, fixture.build, 'build')
+        fixture.download_build()
+        with fixture.context(), patch.object(gate.subprocess, 'run', side_effect=fake_run):
+            gate.run_gate(root, out, 'runtime', fixture.archive)
         return calls
 
     def test_fresh_complete_run_preserves_exact_frozen_elf_and_metadata(self):
@@ -390,8 +501,9 @@ class GateTests(unittest.TestCase):
                 out = root / 'results'
                 with self.assertRaises((ValueError, OSError)):
                     self.run_fixture(root, out, **scenario)
-                self.assertEqual(json.loads((out / 'execution.json').read_text())['status'], 'INCOMPLETE')
-                self.assertTrue((out / 'summary.md').read_text().startswith('Managed lifecycle INCOMPLETE:'))
+                evidence = out if out.exists() else root / 'target/build-results'
+                self.assertEqual(json.loads((evidence / 'execution.json').read_text())['status'], 'INCOMPLETE')
+                self.assertTrue((evidence / 'summary.md').read_text().startswith('Managed lifecycle INCOMPLETE:'))
 
     def test_existing_success_evidence_is_not_reused_or_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -401,16 +513,318 @@ class GateTests(unittest.TestCase):
             summary = out / 'summary.md'
             summary.write_text('old evidence')
             with patch.object(gate.subprocess, 'run') as run, self.assertRaises(FileExistsError):
-                gate.run_gate(root, out)
+                gate.run_gate(root, out, 'runtime', root / 'handoff.zip')
             run.assert_not_called()
             self.assertEqual(summary.read_text(), 'old evidence')
 
     def test_cli_failure_is_nonzero_and_says_incomplete(self):
         with patch.object(gate, 'run_gate', side_effect=ValueError('synthetic failure')), \
-                patch.object(gate.sys, 'argv', ['managed_lifecycle_ci.py']), \
+                patch.object(gate.sys, 'argv', ['managed_lifecycle_ci.py', '--mode', 'build']), \
                 contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(gate.main(), 1)
         self.assertIn('INCOMPLETE: synthetic failure', stderr.getvalue())
+
+
+class HandoffTests(unittest.TestCase):
+    def assert_rejected_before_execution(self, fixture):
+        out = fixture.root / 'results'
+        with fixture.context(), patch.object(gate.subprocess, 'run') as run, \
+                patch.object(pathlib.Path, 'chmod') as chmod, self.assertRaises(Exception):
+            gate.run_gate(fixture.root, out, 'runtime', fixture.archive)
+        self.assertFalse(run.called, 'invalid handoff reached execution')
+        chmod.assert_not_called()
+        self.assertFalse((out / 'managed_process').exists())
+        self.assertEqual(json.loads((out / 'execution.json').read_text())['status'], 'INCOMPLETE')
+
+    def test_matching_handoff_is_valid_without_rebuilding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+            out = fixture.root / 'results'
+            out.mkdir()
+            with fixture.context(), patch.object(gate.subprocess, 'run') as run:
+                source = gate.source_snapshot(fixture.root, out)
+                (out / 'source.json').write_text(json.dumps(source))
+                selected, executable, digest = gate.accept_handoff(fixture.root, out, fixture.archive, source)
+            run.assert_not_called()
+            self.assertEqual(selected, fixture.selected)
+            self.assertEqual(executable.read_bytes(), fixture.binary.read_bytes())
+            self.assertEqual(digest, gate.sha256(fixture.binary))
+            self.assertEqual({p.name for p in out.iterdir()}, set(gate.HANDOFF_LIMITS) | {'artifact-service.json'})
+            self.assertEqual({p.name for p in out.iterdir() if p.stat().st_mode & 0o111}, {'managed_process'})
+
+    def test_build_and_runtime_checkout_paths_may_differ_without_rebinding_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory)
+            build = HandoffFixture(parent / 'builder').prepare()
+            runtime = HandoffFixture(parent / 'runtime')
+            shutil.copyfile(build.archive, runtime.archive)
+            runtime.bind_archive()
+            out = runtime.root / 'results'
+            out.mkdir()
+            with runtime.context(), patch.object(gate.subprocess, 'run') as run:
+                source = gate.source_snapshot(runtime.root, out)
+                (out / 'source.json').write_text(json.dumps(source))
+                selected, _, _ = gate.accept_handoff(runtime.root, out, runtime.archive, source)
+            self.assertFalse(run.called)
+            self.assertEqual(selected['target']['src_path'], str(build.root / 'crates/replicated-graph/tests/managed_process.rs'))
+            self.assertNotEqual(build.root, runtime.root)
+
+    def test_handoff_manifest_identity_and_closure_fail_closed(self):
+        changes = [lambda m: m.pop('commit'), lambda m: m.update(commit='d' * 40),
+                   lambda m: m.pop('tree'), lambda m: m.update(tree='d' * 40),
+                   lambda m: m.update(format=True), lambda m: m.update(format=2),
+                   lambda m: m.update(producer_job='other-job'), lambda m: m.update(build_root='../old'),
+                   lambda m: m['context'].update(GITHUB_RUN_ID='41'),
+                   lambda m: m['context'].update(GITHUB_RUN_ATTEMPT='1'),
+                   lambda m: m['context'].update(GITHUB_SHA='c' * 40),
+                   lambda m: m['context'].update(LIFECYCLE_EVENT_HEAD_SHA='a' * 40),
+                   lambda m: m['context'].update(GITHUB_REPOSITORY='other/repository'),
+                   lambda m: m['context'].update(GITHUB_EVENT_NAME='workflow_run'),
+                   lambda m: m.update(source_sha256='d' * 64),
+                   lambda m: m['files'].pop('managed_process'),
+                   lambda m: m['files']['managed_process'].update(sha256='d' * 64),
+                   lambda m: m['files']['managed_process'].update(byte_length=True),
+                   lambda m: m['files']['managed_process'].update(byte_length=1),
+                   lambda m: m['files'].update(extra={}),
+                   lambda m: m['artifact']['profile'].update(opt_level='0'),
+                   lambda m: m['build_command'].append('--features=unapproved')]
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                fixture.change_manifest(change)
+                self.assert_rejected_before_execution(fixture)
+
+    def test_missing_or_wrong_trusted_job_outputs_fail_closed(self):
+        for key, bad in [('LIFECYCLE_BUILD_RESULT', 'cancelled'), ('LIFECYCLE_BUILD_RESULT', 'skipped'),
+                         ('LIFECYCLE_BUILD_RESULT', 'failure'), ('LIFECYCLE_ARTIFACT_ID', ''),
+                         ('LIFECYCLE_ARTIFACT_ID', '124'), ('LIFECYCLE_BUNDLE_SHA256', ''),
+                         ('LIFECYCLE_BUNDLE_SHA256', 'f' * 64), ('LIFECYCLE_BUNDLE_LENGTH', ''),
+                         ('LIFECYCLE_BUNDLE_LENGTH', '1'), ('GITHUB_SHA', ''),
+                         ('GITHUB_EVENT_NAME', 'workflow_run'), ('GITHUB_RUN_ATTEMPT', '3')]:
+            with self.subTest(key=key, bad=bad), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                fixture.env[key] = bad
+                self.assert_rejected_before_execution(fixture)
+
+    def test_api_provenance_cannot_be_replaced_by_bundle_self_claims(self):
+        changes = [lambda p: p.pop('run'), lambda p: p['artifact'].pop('workflow_run'),
+                   lambda p: p['artifact'].update(id=122), lambda p: p['artifact'].update(expired=True),
+                   lambda p: p['artifact'].update(name='managed-lifecycle-build-42-1'),
+                   lambda p: p['artifact']['workflow_run'].update(id=41),
+                   lambda p: p['artifact']['workflow_run'].update(repository_id=24),
+                   lambda p: p['artifact']['workflow_run'].update(head_sha='a' * 40),
+                   lambda p: p['run'].update(id=41), lambda p: p['run'].update(run_attempt=1),
+                   lambda p: p['run'].update(head_sha='a' * 40),
+                   lambda p: p['run'].update(event='push'), lambda p: p['run'].update(path='.github/workflows/ci.yml'),
+                   lambda p: p['run']['repository'].update(id=24),
+                   lambda p: p['run']['repository'].update(full_name='other/repo')]
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                change(fixture.provenance)
+                pathlib.Path(fixture.env['LIFECYCLE_ARTIFACT_METADATA']).write_text(json.dumps(fixture.provenance))
+                self.assert_rejected_before_execution(fixture)
+
+    def test_independent_source_cargo_dependency_and_elf_checks(self):
+        def change_json(change):
+            def mutate(raw):
+                value = gate.unique_json(raw)
+                change(value)
+                return encoded(value)
+            return mutate
+        cases = [('source.json', change_json(lambda v: v.update(sha256='f' * 64))),
+                 ('Cargo.lock', lambda raw: raw + b'\n# changed\n'),
+                 ('cargo-root.toml', lambda raw: raw.replace(b'0.1.0', b'0.1.1')),
+                 ('cargo-replicated-graph.toml', lambda raw: raw + b'\n# changed\n'),
+                 ('dependencies.json', change_json(lambda v: v['compiled'].pop())),
+                 ('dependencies.json', change_json(lambda v: v.update(lock_sha256='f' * 64))),
+                 ('dependencies.json', change_json(lambda v: v['compiled'][0].update(features=['extra']))),
+                 ('managed_process', lambda raw: b'not an ELF'),
+                 ('managed_process', lambda raw: raw[:4]),
+                 ('managed_process', lambda raw: raw[:18] + b'\x03\x00' + raw[20:])]
+        for name, change in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                fixture.change_payload(name, change)  # Rebind hashes to test semantic validation too.
+                self.assert_rejected_before_execution(fixture)
+
+    def test_cargo_profile_features_dependency_or_path_forgery_rejected(self):
+        changes = [lambda rows: rows[-2]['profile'].update(debug_assertions=True),
+                   lambda rows: rows[-2]['profile'].update(opt_level='0'),
+                   lambda rows: rows[-2]['profile'].update(debuginfo=2),
+                   lambda rows: rows[-2]['profile'].update(debuginfo=False),
+                   lambda rows: rows[-2].update(features=['extra']),
+                   lambda rows: rows[-2].update(executable='/old/managed_process-abcdef'),
+                   lambda rows: rows[-2].update(filenames=['/old/managed_process-abcdef']),
+                   lambda rows: rows[-2]['target'].update(src_path='/different/managed_process.rs'),
+                   lambda rows: rows[-2].update(manifest_path='/different/Cargo.toml'),
+                   lambda rows: rows[0].update(package_id='registry+unknown#unknown@1.0.0'),
+                   lambda rows: rows[0].update(package_id=rows[0]['package_id'].replace('0.1.0', '0.2.0')),
+                   lambda rows: rows[1].update(features=['default']),
+                   lambda rows: rows[1]['profile'].update(opt_level='0'),
+                   lambda rows: rows[1]['target'].update(src_path='/wrong/lib.rs'),
+                   lambda rows: rows[1].update(package_id='path+file:///wrong#0.1.0'),
+                   lambda rows: rows.pop(1), lambda rows: rows.insert(0, copy.deepcopy(rows[0])),
+                   lambda rows: rows.pop(), lambda rows: rows[-1].update(success=False)]
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                def mutate(payloads):
+                    rows = [gate.unique_json(line) for line in payloads['build.jsonl'].splitlines()]
+                    change(rows)
+                    payloads['build.jsonl'] = b''.join(encoded(row) + b'\n' for row in rows)
+                    manifest = gate.unique_json(payloads['handoff.json'])
+                    # Forge self-consistent fields; independent validation must still reject.
+                    manifest['artifact'] = next(row for row in rows if row.get('target', {}).get('name') == 'managed_process')
+                    manifest['files']['build.jsonl'] = {'byte_length': len(payloads['build.jsonl']),
+                        'sha256': hashlib.sha256(payloads['build.jsonl']).hexdigest()}
+                    payloads['handoff.json'] = encoded(manifest)
+                fixture.rewrite(mutate)
+                self.assert_rejected_before_execution(fixture)
+
+    def test_zip_closure_names_modes_and_formats_reject_before_execute(self):
+        cases = ['missing', 'extra', 'duplicate', 'traversal', 'absolute', 'backslash', 'symlink',
+                 'directory', 'fifo', 'executable', 'deflate', 'extra-field', 'comment', 'trailing',
+                 'truncated', 'nul-name', 'encrypted', 'bad-crc', 'outer-extra', 'archive-link', 'archive-hardlink']
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                original = fixture.archive.read_bytes()
+                payloads = gate.read_handoff_archive(fixture.archive)
+                if case in ('trailing', 'truncated', 'nul-name', 'encrypted', 'bad-crc'):
+                    bad = original
+                    if case == 'trailing':
+                        bad += b'extra'
+                    elif case == 'truncated':
+                        bad = bad[:-1]
+                    elif case == 'nul-name':
+                        bad = bad.replace(b'managed_process', b'managed\0process')
+                    elif case == 'encrypted':
+                        bad = bad[:6] + b'\x01\x00' + bad[8:]
+                    else:
+                        bad = bad[:40] + bytes([bad[40] ^ 1]) + bad[41:]
+                    fixture.archive.write_bytes(bad)
+                elif case == 'outer-extra':
+                    (fixture.download / 'unexpected').write_text('extra')
+                elif case in ('archive-link', 'archive-hardlink'):
+                    original_path = fixture.root / 'target/original.zip'
+                    fixture.archive.rename(original_path)
+                    if case == 'archive-link':
+                        fixture.archive.symlink_to(original_path)
+                    else:
+                        os.link(original_path, fixture.archive)
+                else:
+                    with warnings.catch_warnings(), zipfile.ZipFile(fixture.archive, 'w') as bundle:
+                        warnings.simplefilter('ignore', UserWarning)
+                        for name, data in payloads.items():
+                            if case == 'missing' and name == 'managed_process':
+                                continue
+                            entry = zipfile.ZipInfo(name)
+                            entry.create_system = 3
+                            entry.external_attr = (stat.S_IFREG | 0o644) << 16
+                            if name == 'managed_process':
+                                if case in ('traversal', 'absolute', 'backslash'):
+                                    entry.filename = {'traversal': '../managed_process', 'absolute': '/managed_process',
+                                                      'backslash': '..\\managed_process'}[case]
+                                if case in ('symlink', 'directory', 'fifo', 'executable'):
+                                    entry.external_attr = {'symlink': stat.S_IFLNK | 0o777,
+                                                           'directory': stat.S_IFDIR | 0o755,
+                                                           'fifo': stat.S_IFIFO | 0o644,
+                                                           'executable': stat.S_IFREG | 0o755}[case] << 16
+                                if case == 'deflate':
+                                    entry.compress_type = zipfile.ZIP_DEFLATED
+                                if case == 'extra-field':
+                                    entry.extra = b'\x01\x00\x00\x00'
+                                if case == 'comment':
+                                    entry.comment = b'comment'
+                            bundle.writestr(entry, data)
+                        if case in ('extra', 'duplicate'):
+                            bundle.writestr('extra' if case == 'extra' else 'managed_process', b'extra')
+                fixture.bind_archive()
+                self.assert_rejected_before_execution(fixture)
+
+    def test_archive_replacement_during_read_rejected_before_execute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+            original = gate.read_owned
+            def replace_after_read(fd, name, limit):
+                data = original(fd, name, limit)
+                if name == 'handoff.zip':
+                    replacement = fixture.root / 'target/replacement.zip'
+                    replacement.write_bytes(data)
+                    replacement.replace(fixture.archive)
+                return data
+            with patch.object(gate, 'read_owned', side_effect=replace_after_read):
+                self.assert_rejected_before_execution(fixture)
+
+    def test_member_bounds_enforced_before_materialization(self):
+        for name in ('handoff.json', 'managed_process', 'dependencies.json', 'build.jsonl'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                fixture = HandoffFixture(pathlib.Path(directory)).prepare()
+                # Tiny test bound, no allocation or CPU-heavy zip bomb needed.
+                with patch.dict(gate.HANDOFF_LIMITS, {name: 1}):
+                    self.assert_rejected_before_execution(fixture)
+
+    def test_aggregate_rejects_every_non_success_result(self):
+        gate.validate_results('success', 'success', 'success')
+        for index in range(3):
+            for result in ('failure', 'cancelled', 'skipped', '', None):
+                results = ['success'] * 3
+                results[index] = result
+                with self.subTest(results=results), self.assertRaises(ValueError):
+                    gate.validate_results(*results)
+
+    def test_clean_checkout_and_event_sha_are_independently_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            (root / 'source').write_text('one')
+            subprocess.run(['git', '-C', str(root), 'add', 'source'], check=True)
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                            'commit', '-qm', 'fixture'], check=True)
+            sha = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD']).decode().strip()
+            env = {'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_REPOSITORY_ID': '23', 'GITHUB_RUN_ID': '42',
+                   'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': sha, 'LIFECYCLE_EVENT_HEAD_SHA': sha,
+                   'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW': 'CoreHR full scale'}
+            with patch.dict(os.environ, env):
+                self.assertEqual(gate.checkout_identity(root)['commit'], sha)
+                (root / 'generated').write_text('ignored by clean tracked check, included by source_snapshot')
+                gate.checkout_identity(root)
+                (root / 'source').write_text('dirty')
+                with self.assertRaises(ValueError):
+                    gate.checkout_identity(root)
+                (root / 'source').write_text('one')
+                with patch.dict(os.environ, {'GITHUB_SHA': 'f' * 40, 'LIFECYCLE_EVENT_HEAD_SHA': 'f' * 40}), self.assertRaises(ValueError):
+                    gate.checkout_identity(root)
+
+    def test_workflow_routes_only_required_current_run_artifact_and_preserves_gates(self):
+        text = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()
+        builder = text.split('  lifecycle-build:', 1)[1].split('  lifecycle:', 1)[0]
+        runtime = text.split('  lifecycle:', 1)[1].split('  scenario:', 1)[0]
+        aggregate = text.split('  full-scale:', 1)[1]
+        self.assertIn('needs: [lifecycle-build]', runtime)
+        self.assertIn('timeout-minutes: 90', runtime)
+        self.assertIn('artifact-id: ${{ steps.upload_handoff.outputs.artifact-id }}', builder)
+        self.assertIn('bundle-sha256: ${{ steps.build_handoff.outputs.bundle-sha256 }}', builder)
+        self.assertIn('bundle-length: ${{ steps.build_handoff.outputs.bundle-length }}', builder)
+        self.assertIn('getArtifact', runtime)
+        self.assertIn('getWorkflowRunAttempt', runtime)
+        self.assertLess(runtime.index('--mode verify-provenance'), runtime.index('uses: actions/download-artifact@v4'))
+        download = runtime.split('uses: actions/download-artifact@v4', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('artifact-ids: ${{ needs.lifecycle-build.outputs.artifact-id }}', download)
+        for forbidden in ('run-id:', 'repository:', 'github-token:', 'url:', 'name:'):
+            self.assertNotIn(forbidden, '\n'.join(line for line in download.splitlines() if not line.lstrip().startswith('#')))
+        for forbidden in ('cargo ', 'rust-cache', 'rust-toolchain', 'apt-get', 'continue-on-error'):
+            self.assertNotIn(forbidden, runtime)
+        self.assertIn('managed-lifecycle-ci-results/Cargo.lock', runtime)
+        self.assertIn('managed-lifecycle-ci-results/cargo-*.toml', runtime)
+        self.assertIn('managed-lifecycle-ci-results/lifecycle/artifacts/**', runtime)
+        self.assertIn('managed-lifecycle-ci-results/lifecycle/progress.json.tmp', runtime)
+        self.assertIn('name: CoreHR 200k people / 5k departments', aggregate)
+        self.assertIn('needs: [lifecycle-build, lifecycle, scenario]', aggregate)
+        self.assertIn('if: always()', aggregate)
+        self.assertIn('--mode aggregate', aggregate)
+        self.assertNotIn('continue-on-error', text)
 
 
 if __name__ == '__main__':
