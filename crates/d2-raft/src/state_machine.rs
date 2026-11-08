@@ -25,10 +25,12 @@ const DEDUP_PREFIX: &[u8] = b"sm/dedup/";
 const DEDUP_PREFIX_END: &[u8] = b"sm/dedup0";
 
 #[path = "event_ledger.rs"]
-mod event_ledger;
+pub(crate) mod event_ledger;
 #[path = "state_codec.rs"]
 mod state_codec;
 use state_codec::d1_metadata_bytes;
+#[path = "member_apply.rs"]
+mod member_apply;
 #[cfg(test)]
 use state_codec::{D1MetadataV2, D1MetadataV3, D1MetadataV4};
 
@@ -244,11 +246,11 @@ fn is_active_metadata(bytes: &[u8]) -> bool {
     struct Version {
         version: u32,
     }
-    serde_json::from_slice::<Version>(bytes).is_ok_and(|header| header.version == 16)
+    serde_json::from_slice::<Version>(bytes).is_ok_and(|header| matches!(header.version, 16 | 17))
 }
 
-/// Drop complete coordinator authority only after the exact candidate has
-/// supplied the private cut. This conversion never changes logical history.
+/// Drop complete authority only after the exact candidate has supplied its
+/// private cut. The same immutable checkpoint is shared with the published cut.
 fn compact_coordinator(
     state: Option<&mut D1State>,
     cut: Option<&event_ledger::PublishedArchiveCut>,
@@ -256,15 +258,17 @@ fn compact_coordinator(
     let Some(state) = state else {
         return Ok(());
     };
-    let Some(coordinator) = &state.coordinator else {
-        return Ok(());
+    let history = match (&mut state.coordinator, &mut state.visibility) {
+        (Some(history), _) => history,
+        (None, Some(visibility)) => &mut visibility.journal,
+        _ => return Ok(()),
     };
-    if coordinator.cohort().is_none() {
+    if history.cohort().is_none() {
         return Ok(());
     }
     let cut =
-        cut.ok_or_else(|| anyhow::anyhow!("bound coordinator lacks validated publication cut"))?;
-    let checkpoint = match coordinator {
+        cut.ok_or_else(|| anyhow::anyhow!("bound history lacks validated publication cut"))?;
+    let checkpoint = match history {
         Coordinator::Full(journal) => ActiveCheckpoint::from_journal(journal)
             .map_err(|error| anyhow::anyhow!("checkpoint derivation: {error:?}"))?,
         Coordinator::Active(checkpoint) => checkpoint.as_ref().clone(),
@@ -273,7 +277,7 @@ fn compact_coordinator(
         &checkpoint == cut.checkpoint(),
         "checkpoint differs from publication cut"
     );
-    state.coordinator = Some(Coordinator::Active(cut.checkpoint_arc().clone()));
+    *history = Coordinator::Active(cut.checkpoint_arc().clone());
     Ok(())
 }
 
@@ -464,7 +468,15 @@ impl StateMachine {
         }
         let archive_cut = match (&d1, &opened_ledger) {
             (Some(state), Some(ledger))
-                if state.coordinator.is_some()
+                if (state.coordinator.is_some()
+                    || is_active_metadata(
+                        storage
+                            .metadata
+                            .lock()
+                            .unwrap()
+                            .as_deref()
+                            .unwrap_or_default(),
+                    ))
                     && !storage.request_indexed.load(Ordering::Relaxed) =>
             {
                 Some(Arc::new(
@@ -638,6 +650,25 @@ impl StateMachine {
                             .map_err(|e| anyhow::anyhow!("checkpoint reconstruction: {e:?}"))?,
                     )));
                 }
+                if current
+                    .visibility
+                    .as_ref()
+                    .is_some_and(|v| v.journal.active().is_some())
+                {
+                    let visibility = actual
+                        .visibility
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("durable member role changed"))?;
+                    let journal = visibility
+                        .journal
+                        .full()
+                        .ok_or_else(|| anyhow::anyhow!("durable member lacks full replay"))?;
+                    visibility.journal = Coordinator::Active(Arc::new(
+                        ActiveCheckpoint::from_journal(journal).map_err(|e| {
+                            anyhow::anyhow!("member checkpoint reconstruction: {e:?}")
+                        })?,
+                    ));
+                }
                 anyhow::ensure!(
                     actual == expected,
                     "durable state differs from published cut"
@@ -671,7 +702,7 @@ impl StateMachine {
             .as_deref()
             .map(|bytes| {
                 serde_json::from_slice::<Version>(bytes)
-                    .map(|header| matches!(header.version, 15 | 16))
+                    .map(|header| matches!(header.version, 15..=17))
             })
             .transpose()
             .map_err(|_| D1Error::EventLedgerHistory)?
@@ -746,9 +777,22 @@ impl StateMachine {
     }
     fn decision_prefix(
         &self,
+        state: &StateMachineData,
         d1: &D1State,
         version: u64,
     ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+        // Full terminal proof is an explicit compatibility boundary in S3.
+        // Member ordinary apply/status/grant paths never call this materializer.
+        let complete = if d1
+            .visibility
+            .as_ref()
+            .is_some_and(|v| v.journal.active().is_some())
+        {
+            blocking_section(|| self.load_disk_state(state)).map_err(ledger_read_error)?
+        } else {
+            None
+        };
+        let d1 = complete.as_ref().map_or(d1, |loaded| &loaded.state);
         let storage = self
             .storage
             .as_ref()
@@ -775,6 +819,7 @@ impl StateMachine {
     }
     fn certified_decision_prefix(
         &self,
+        published: &StateMachineData,
         d1: &D1State,
         expected: &crate::terminal_prefix::TerminalPrefix,
     ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
@@ -788,7 +833,7 @@ impl StateMachine {
         if state.baseline_sequence != 0 {
             return Err(D1Error::VisibilityHistory);
         }
-        let retained = self.decision_prefix(d1, expected.version())?;
+        let retained = self.decision_prefix(published, d1, expected.version())?;
         if &retained != expected {
             return Err(D1Error::VisibilityHistory);
         }
@@ -804,25 +849,30 @@ impl StateMachine {
         mode_id: [u8; 16],
     ) -> Result<crate::cohort_reads::VisibilityInfo, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        let visibility = d1
-            .visibility
-            .as_ref()
-            .ok_or(D1Error::VisibilityNotEnabled)?;
-        Ok(crate::cohort_reads::VisibilityInfo {
-            authority: d1.participant.as_ref().unwrap().authority.clone(),
-            baseline_sequence: visibility.baseline_sequence,
-            cohort: visibility.journal.cohort().cloned(),
-            applied_prefix: if visibility.journal.cohort().is_some() {
-                self.decision_frontier(d1)?
-            } else {
-                visibility.applied
-            },
+        self.coordinator_operation(|| {
+            let verified = blocking_section(|| self.verified_member(&state))?;
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            let visibility = d1
+                .visibility
+                .as_ref()
+                .ok_or(D1Error::VisibilityNotEnabled)?;
+            Ok(crate::cohort_reads::VisibilityInfo {
+                authority: d1.participant.as_ref().unwrap().authority.clone(),
+                baseline_sequence: visibility.baseline_sequence,
+                cohort: visibility.journal.cohort().cloned(),
+                // Active verification already binds A and every terminal row
+                // to this snapshot; do not read a second live manifest.
+                applied_prefix: if verified.is_some() || visibility.journal.cohort().is_none() {
+                    visibility.applied
+                } else {
+                    self.decision_frontier(d1)?
+                },
+            })
         })
     }
 
@@ -836,25 +886,42 @@ impl StateMachine {
         mode_id: [u8; 16],
     ) -> Result<(crate::transaction_decisions::HistoryCursor, u64), D1Error> {
         let state = self.state.read().await;
-        let persisted =
-            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
-        let d1 = persisted
-            .as_ref()
-            .map(|loaded| &loaded.state)
-            .or(state.d1.as_ref())
-            .ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        let visibility = d1
-            .visibility
-            .as_ref()
-            .ok_or(D1Error::VisibilityNotEnabled)?;
-        let cursor = blocking_section(|| visibility.journal.history_cursor())
+        self.coordinator_operation(|| {
+            if let Some(verified) = blocking_section(|| self.verified_member(&state))? {
+                let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+                d1.check_shard(shard)?;
+                d1.check_epoch(epoch)?;
+                if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                    return Err(D1Error::ManagedModeConflict);
+                }
+                return Ok((verified.head(), d1.visibility.as_ref().unwrap().applied));
+            }
+            let persisted =
+                blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+            let d1 = persisted
+                .as_ref()
+                .map(|loaded| &loaded.state)
+                .or(state.d1.as_ref())
+                .ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            let visibility = d1
+                .visibility
+                .as_ref()
+                .ok_or(D1Error::VisibilityNotEnabled)?;
+            let cursor = blocking_section(|| {
+                visibility
+                    .journal
+                    .full()
+                    .ok_or(crate::transaction_decisions::Error::InvalidJournal)?
+                    .history_cursor()
+            })
             .map_err(|_| D1Error::VisibilityHistory)?;
-        Ok((cursor, self.decision_frontier(d1)?))
+            Ok((cursor, self.decision_frontier(d1)?))
+        })
     }
 
     /// Leader-barrier callers inspect the actual persisted immutable binding.
@@ -868,60 +935,68 @@ impl StateMachine {
         cohort: &crate::transaction_decisions::Cohort,
     ) -> Result<crate::transaction_decisions::MemberCapacityGrant, D1Error> {
         let state = self.state.read().await;
-        let persisted =
-            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
-        let d1 = persisted
-            .as_ref()
-            .map(|loaded| &loaded.state)
-            .or(state.d1.as_ref())
-            .ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1
-            .managed
-            .as_ref()
-            .is_none_or(|mode| mode.mode_id != mode_id)
-            || d1
-                .participant
+        self.coordinator_operation(|| {
+            let verified = blocking_section(|| self.verified_member(&state))?;
+            let persisted = if verified.is_none() {
+                blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?
+            } else {
+                None
+            };
+            let d1 = persisted
                 .as_ref()
-                .is_none_or(|p| &p.authority != authority)
-            || cohort.profile != crate::transaction_decisions::CapacityProfile::ByteBound16MiBV1
-            || cohort.validate().is_err()
-            || cohort.coordinator_shard != authority.shard
-        {
-            return Err(D1Error::VisibilityHistory);
-        }
-        let member = cohort
-            .members
-            .iter()
-            .find(|member| member.shard == shard && member.epoch == epoch && member.mode == mode_id)
-            .ok_or(D1Error::VisibilityHistory)?;
-        let Some(visibility) = &d1.visibility else {
-            if d1.sequence != 0
-                || !d1.dedup.is_empty()
+                .map(|loaded| &loaded.state)
+                .or(state.d1.as_ref())
+                .ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1
+                .managed
+                .as_ref()
+                .is_none_or(|mode| mode.mode_id != mode_id)
                 || d1
                     .participant
                     .as_ref()
-                    .is_none_or(|p| p.activated_sequence != 0 || !p.records.is_empty())
+                    .is_none_or(|p| &p.authority != authority)
+                || cohort.profile != crate::transaction_decisions::CapacityProfile::ByteBound16MiBV1
+                || cohort.validate().is_err()
+                || cohort.coordinator_shard != authority.shard
             {
                 return Err(D1Error::VisibilityHistory);
             }
-            return Err(D1Error::VisibilityNotEnabled);
-        };
-        if visibility.journal.cohort() != Some(cohort)
-            || visibility.journal.authority() != authority.mode
-        {
-            return Err(D1Error::VisibilityHistory);
-        }
-        d1.validate_capacity_activation(state.last_applied_log)
-            .map_err(|_| D1Error::VisibilityHistory)?;
-        let activation = visibility
-            .activation
-            .clone()
-            .ok_or(D1Error::VisibilityHistory)?;
-        Ok(crate::transaction_decisions::MemberCapacityGrant {
-            member: member.clone(),
-            activation,
+            let member = cohort
+                .members
+                .iter()
+                .find(|member| {
+                    member.shard == shard && member.epoch == epoch && member.mode == mode_id
+                })
+                .ok_or(D1Error::VisibilityHistory)?;
+            let Some(visibility) = &d1.visibility else {
+                if d1.sequence != 0
+                    || !d1.dedup.is_empty()
+                    || d1
+                        .participant
+                        .as_ref()
+                        .is_none_or(|p| p.activated_sequence != 0 || !p.records.is_empty())
+                {
+                    return Err(D1Error::VisibilityHistory);
+                }
+                return Err(D1Error::VisibilityNotEnabled);
+            };
+            if visibility.journal.cohort() != Some(cohort)
+                || visibility.journal.authority() != authority.mode
+            {
+                return Err(D1Error::VisibilityHistory);
+            }
+            d1.validate_capacity_activation(state.last_applied_log)
+                .map_err(|_| D1Error::VisibilityHistory)?;
+            let activation = visibility
+                .activation
+                .clone()
+                .ok_or(D1Error::VisibilityHistory)?;
+            Ok(crate::transaction_decisions::MemberCapacityGrant {
+                member: member.clone(),
+                activation,
+            })
         })
     }
 
@@ -935,36 +1010,57 @@ impl StateMachine {
         incoming: &crate::transaction_decisions::Journal,
     ) -> Result<crate::transaction_decisions::HistoryCursor, D1Error> {
         let state = self.state.read().await;
-        let persisted =
-            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
-        let d1 = persisted
-            .as_ref()
-            .map(|loaded| &loaded.state)
-            .or(state.d1.as_ref())
-            .ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1
-            .managed
-            .as_ref()
-            .is_none_or(|mode| mode.mode_id != mode_id)
-        {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        d1.check_cohort(incoming)?;
-        let journal = &d1
-            .visibility
-            .as_ref()
-            .ok_or(D1Error::VisibilityNotEnabled)?
-            .journal;
-        if journal.validate_successor(incoming).is_err()
-            && incoming.validate_successor(journal).is_err()
-        {
-            return Err(D1Error::VisibilityHistory);
-        }
-        journal
-            .history_cursor()
-            .map_err(|_| D1Error::VisibilityHistory)
+        self.coordinator_operation(|| {
+            if let Some(verified) = blocking_section(|| self.verified_member(&state))? {
+                let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+                d1.check_shard(shard)?;
+                d1.check_epoch(epoch)?;
+                if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                    return Err(D1Error::ManagedModeConflict);
+                }
+                d1.check_cohort(incoming)?;
+                blocking_section(|| verified.member_overlay().compatible_journal(incoming))
+                    .map_err(|error| {
+                        if error.is::<rocksdb::Error>() {
+                            D1Error::EventLedgerUnavailable
+                        } else {
+                            D1Error::VisibilityHistory
+                        }
+                    })?;
+                return Ok(verified.head());
+            }
+            let persisted =
+                blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+            let d1 = persisted
+                .as_ref()
+                .map(|loaded| &loaded.state)
+                .or(state.d1.as_ref())
+                .ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1
+                .managed
+                .as_ref()
+                .is_none_or(|mode| mode.mode_id != mode_id)
+            {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            d1.check_cohort(incoming)?;
+            let journal = &d1
+                .visibility
+                .as_ref()
+                .ok_or(D1Error::VisibilityNotEnabled)?
+                .journal;
+            let journal = journal.full().ok_or(D1Error::VisibilityHistory)?;
+            if journal.validate_successor(incoming).is_err()
+                && incoming.validate_successor(journal).is_err()
+            {
+                return Err(D1Error::VisibilityHistory);
+            }
+            journal
+                .history_cursor()
+                .map_err(|_| D1Error::VisibilityHistory)
+        })
     }
 
     /// Verify one retained terminal cut without materializing graph payloads.
@@ -998,7 +1094,10 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        let visibility = d1
+        let complete =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let history_state = complete.as_ref().map_or(d1, |loaded| &loaded.state);
+        let visibility = history_state
             .visibility
             .as_ref()
             .ok_or(D1Error::VisibilityNotEnabled)?;
@@ -1007,12 +1106,20 @@ impl StateMachine {
         }
         if journal.cohort().is_none()
             || visibility.baseline_sequence != 0
-            || !visibility.journal.same_terminal_prefix(journal, version)
+            || !visibility
+                .journal
+                .full()
+                .ok_or(D1Error::VisibilityHistory)?
+                .same_terminal_prefix(journal, version)
         {
             return Err(D1Error::VisibilityHistory);
         }
-        self.decision_prefix(d1, version)?;
-        Ok(visibility.journal.clone())
+        self.decision_prefix(&state, d1, version)?;
+        Ok(visibility
+            .journal
+            .full()
+            .ok_or(D1Error::VisibilityHistory)?
+            .clone())
     }
 
     /// Same-lock proof that the retained local cut equals a trusted coordinator
@@ -1058,7 +1165,10 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        let visibility = d1
+        let complete =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let history_state = complete.as_ref().map_or(d1, |loaded| &loaded.state);
+        let visibility = history_state
             .visibility
             .as_ref()
             .ok_or(D1Error::VisibilityNotEnabled)?;
@@ -1067,13 +1177,24 @@ impl StateMachine {
         }
         if journal.cohort().is_none()
             || visibility.baseline_sequence != 0
-            || !visibility.journal.same_terminal_prefix(journal, version)
+            || !visibility
+                .journal
+                .full()
+                .ok_or(D1Error::VisibilityHistory)?
+                .same_terminal_prefix(journal, version)
         {
             return Err(D1Error::VisibilityHistory);
         }
-        self.decision_prefix(d1, version)?;
+        self.decision_prefix(&state, d1, version)?;
         let snapshot = d1.read_at(version, limit)?;
-        Ok((snapshot, visibility.journal.clone()))
+        Ok((
+            snapshot,
+            visibility
+                .journal
+                .full()
+                .ok_or(D1Error::VisibilityHistory)?
+                .clone(),
+        ))
     }
 
     /// Same-lock exact terminal evidence without copying request/Plan archives.
@@ -1091,7 +1212,7 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        self.certified_decision_prefix(d1, expected)
+        self.certified_decision_prefix(&state, d1, expected)
     }
 
     /// Both returned rows and evidence come from the same participant state lock.
@@ -1117,7 +1238,7 @@ impl StateMachine {
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
-        let retained = self.certified_decision_prefix(d1, expected)?;
+        let retained = self.certified_decision_prefix(&state, d1, expected)?;
         Ok((d1.read_at(expected.version(), limit)?, retained))
     }
 
@@ -1131,26 +1252,40 @@ impl StateMachine {
         id: [u8; 16],
     ) -> Result<crate::participant_writes::Status, D1Error> {
         let state = self.state.read().await;
-        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
-        d1.check_shard(shard)?;
-        d1.check_epoch(epoch)?;
-        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-            return Err(D1Error::ManagedModeConflict);
-        }
-        let participant = d1
-            .participant
-            .as_ref()
-            .ok_or(D1Error::ParticipantNotEnabled)?;
-        if let Some(visibility) = &d1.visibility {
-            if visibility.journal.transaction(id).is_some_and(|tx| {
-                tx.ordinal <= visibility.applied
-                    && tx.decision == Some(crate::transaction_decisions::Decision::Abort)
-                    && tx.participants.iter().any(|p| p.shard == shard)
-            }) {
-                return Ok(crate::participant_writes::Status::Aborted);
+        self.coordinator_operation(|| {
+            let verified = blocking_section(|| self.verified_member(&state))?;
+            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
             }
-        }
-        Ok(participant.status(id))
+            let participant = d1
+                .participant
+                .as_ref()
+                .ok_or(D1Error::ParticipantNotEnabled)?;
+            if let Some(visibility) = &d1.visibility {
+                let tx = if let Some(verified) = &verified {
+                    use crate::versioned_reads::MemberHistory;
+                    blocking_section(|| verified.member_overlay().transaction(id))?
+                } else {
+                    visibility
+                        .journal
+                        .full()
+                        .ok_or(D1Error::VisibilityHistory)?
+                        .transaction(id)
+                        .cloned()
+                };
+                if tx.is_some_and(|tx| {
+                    tx.ordinal <= visibility.applied
+                        && tx.decision == Some(crate::transaction_decisions::Decision::Abort)
+                        && tx.participants.iter().any(|p| p.shard == shard)
+                }) {
+                    return Ok(crate::participant_writes::Status::Aborted);
+                }
+            }
+            Ok(participant.status(id))
+        })
     }
 
     /// Local decision status only. Distributed callers must establish a leader
@@ -1400,7 +1535,7 @@ impl StateMachine {
         if version > journal.resolved_prefix() {
             return Err(D1Error::VisibilityUnresolved);
         }
-        self.decision_prefix(d1, version)
+        self.decision_prefix(&state, d1, version)
     }
 
     /// Local diagnostic metadata, not a linearizable distributed read.
@@ -1486,6 +1621,8 @@ impl StateMachine {
         }
         let domain = &verified.descriptor().domain;
         let identity = crate::decision_segments::CheckpointIdentity {
+            role: crate::decision_segments::Role::Coordinator,
+            authority: domain.authority.clone(),
             shard: domain.shard,
             epoch: domain.epoch,
             mode: domain.mode,
@@ -1770,6 +1907,14 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 if sm
                     .d1
                     .as_ref()
+                    .and_then(|d1| d1.visibility.as_ref())
+                    .is_some_and(|visibility| visibility.journal.active().is_some())
+                {
+                    return self.apply_member_entries(&mut sm, entries);
+                }
+                if sm
+                    .d1
+                    .as_ref()
                     .and_then(|d1| d1.coordinator.as_ref())
                     .is_some_and(|coordinator| coordinator.active().is_some())
                 {
@@ -1824,8 +1969,9 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
 
                 if let Some(storage) = &self.storage {
                     // Migration checks the complete old namespace, including absence
-                    // for pre-index v5 or a newly activated coordinator. No normal
-                    // write may publish disk16 alongside an unnoticed orphan row.
+                    // for pre-index v5 or a newly activated bound history. No
+                    // normal write may mint disk16/17 and its private cut beside
+                    // an unnoticed orphan, including a legacy member migration.
                     if storage.request_indexed.load(Ordering::Relaxed) {
                         crate::request_index::validate(
                             &storage.db,
@@ -1834,11 +1980,13 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                             true,
                         )
                         .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
-                    } else if next
-                        .d1
-                        .as_ref()
-                        .is_some_and(|state| state.coordinator.is_some())
-                    {
+                    } else if next.d1.as_ref().is_some_and(|state| {
+                        state.coordinator.is_some()
+                            || state
+                                .visibility
+                                .as_ref()
+                                .is_some_and(|visibility| visibility.journal.cohort().is_some())
+                    }) {
                         crate::request_index::reject_retired_namespace(&storage.db)
                             .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
                     }
@@ -2101,10 +2249,40 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             }
             if let Some(visibility) = &current.visibility {
                 if incoming.epoch != current.epoch
-                    || !incoming
-                        .visibility
-                        .as_ref()
-                        .is_some_and(|next| visibility.validate_successor(next))
+                    || !incoming.visibility.as_ref().is_some_and(|next| {
+                        if let Some(checkpoint) = visibility.journal.active_arc() {
+                            let Some(cut) = sm.archive_cut.as_deref() else {
+                                return false;
+                            };
+                            if !Arc::ptr_eq(checkpoint, cut.checkpoint_arc()) {
+                                return false;
+                            }
+                            let Some(journal) = next.journal.full() else {
+                                return false;
+                            };
+                            let descriptor = cut.descriptor();
+                            let Ok(cursor) = journal.history_cursor_at(descriptor.event_count)
+                            else {
+                                return false;
+                            };
+                            let prefix_matches = cursor.authority == descriptor.domain.authority
+                                && cursor.cohort == descriptor.domain.cohort
+                                && cursor.root == descriptor.head_root
+                                && journal
+                                    .history_prefix(&cursor)
+                                    .ok()
+                                    .and_then(|prefix| ActiveCheckpoint::from_journal(&prefix).ok())
+                                    .is_some_and(|prefix| &prefix == checkpoint.as_ref());
+                            prefix_matches
+                                && visibility.activation == next.activation
+                                && visibility.epoch == next.epoch
+                                && visibility.baseline_sequence == next.baseline_sequence
+                                && next.applied >= visibility.applied
+                                && next.commits.starts_with(&visibility.commits)
+                        } else {
+                            visibility.validate_successor(next)
+                        }
+                    })
                 {
                     return Err(StorageIOError::read_snapshot(
                         Some(meta.signature()),
@@ -2259,8 +2437,9 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     }
 }
 
-// Bound coordinator writes stage disk16. Members and unbound legacy
-// coordinators do not have an archive-backed point-recovery witness.
+// Bound coordinator/member writes stage disk16/disk17 respectively. The full
+// cold/migration candidate mints the private archive cut before compaction.
+// Unbound legacy histories have no staged archive and retain Full.
 fn staged_archive_cut(
     state: Option<&D1State>,
     staged: Option<&event_ledger::Staged<'_>>,
@@ -2268,14 +2447,11 @@ fn staged_archive_cut(
     decision_manifest: Option<&[u8]>,
 ) -> anyhow::Result<Option<Arc<event_ledger::PublishedArchiveCut>>> {
     match (state, staged) {
-        (Some(state), Some(staged)) if state.coordinator.is_some() => Ok(Some(Arc::new(
-            staged.published_cut(
-                state,
-                metadata.ok_or_else(|| anyhow::anyhow!("missing staged archive metadata"))?,
-                decision_manifest
-                    .ok_or_else(|| anyhow::anyhow!("missing staged decision manifest"))?,
-            )?,
-        ))),
+        (Some(state), Some(staged)) => Ok(Some(Arc::new(staged.published_cut(
+            state,
+            metadata.ok_or_else(|| anyhow::anyhow!("missing staged archive metadata"))?,
+            decision_manifest.ok_or_else(|| anyhow::anyhow!("missing staged decision manifest"))?,
+        )?))),
         _ => Ok(None),
     }
 }
@@ -2292,6 +2468,17 @@ fn coordinator_metadata_bytes(
             let checkpoint = ActiveCheckpoint::from_journal(journal)
                 .map_err(|e| anyhow::anyhow!("checkpoint derivation: {e:?}"))?;
             return state_codec::active_metadata_bytes(
+                state,
+                staged.descriptor_for(state)?,
+                &checkpoint,
+            );
+        }
+    }
+    if let (Some(visibility), Some(staged)) = (&state.visibility, staged) {
+        if let Some(journal) = visibility.journal.full().filter(|j| j.cohort().is_some()) {
+            let checkpoint = ActiveCheckpoint::from_journal(journal)
+                .map_err(|e| anyhow::anyhow!("member checkpoint derivation: {e:?}"))?;
+            return state_codec::active_member_metadata_bytes(
                 state,
                 staged.descriptor_for(state)?,
                 &checkpoint,
@@ -2461,7 +2648,7 @@ fn enable_visibility(
         baseline_sequence: d1.sequence,
         epoch: d1.epoch,
         applied: 0,
-        journal,
+        journal: journal.into(),
         commits: Vec::new(),
         activation,
     });
@@ -3896,3 +4083,11 @@ mod archive_recovery_tests;
 #[cfg(test)]
 #[path = "active_checkpoint_state_tests.rs"]
 mod active_checkpoint_state_tests;
+
+#[cfg(test)]
+#[path = "member_checkpoint_tests.rs"]
+mod member_checkpoint_tests;
+
+#[cfg(test)]
+#[path = "member_network_tests.rs"]
+mod member_network_tests;

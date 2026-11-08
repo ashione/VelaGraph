@@ -40,19 +40,27 @@ fn max_encoded_bytes(profile: CapacityProfile) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) enum Role {
+pub(crate) enum Role {
     Coordinator,
     Member,
 }
+impl Role {
+    pub(super) fn decision_role(self) -> crate::decision_segments::Role {
+        match self {
+            Self::Coordinator => crate::decision_segments::Role::Coordinator,
+            Self::Member => crate::decision_segments::Role::Member,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Domain {
-    pub(super) role: Role,
-    pub(super) shard: u64,
-    pub(super) epoch: u64,
-    pub(super) mode: [u8; 16],
-    pub(super) authority: Authority,
-    pub(super) cohort: Cohort,
+pub(crate) struct Domain {
+    pub(crate) role: Role,
+    pub(crate) shard: u64,
+    pub(crate) epoch: u64,
+    pub(crate) mode: [u8; 16],
+    pub(crate) authority: Authority,
+    pub(crate) cohort: Cohort,
 }
 impl Domain {
     fn validate(&self) -> anyhow::Result<()> {
@@ -101,15 +109,15 @@ impl Domain {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Descriptor {
-    pub(super) version: u32,
-    pub(super) domain: Domain,
-    pub(super) event_count: u64,
-    pub(super) segment_count: u64,
-    pub(super) encoded_bytes: u64,
-    pub(super) head_root: [u8; 32],
+pub(crate) struct Descriptor {
+    pub(crate) version: u32,
+    pub(crate) domain: Domain,
+    pub(crate) event_count: u64,
+    pub(crate) segment_count: u64,
+    pub(crate) encoded_bytes: u64,
+    pub(crate) head_root: [u8; 32],
     #[serde(deserialize_with = "required_applied")]
-    pub(super) applied: Option<LogId<NodeId>>,
+    pub(crate) applied: Option<LogId<NodeId>>,
 }
 fn required_applied<'de, D: Deserializer<'de>>(
     deserializer: D,
@@ -158,7 +166,7 @@ impl<'a> View<'a> {
     fn of(state: &'a D1State) -> Option<Self> {
         let (role, journal) = match &state.coordinator {
             Some(coordinator) => (Role::Coordinator, coordinator.full()?),
-            None => (Role::Member, &state.visibility.as_ref()?.journal),
+            None => (Role::Member, state.visibility.as_ref()?.journal.full()?),
         };
         let cohort = journal.cohort()?.clone();
         Some(Self {
@@ -428,7 +436,7 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
 }
 
 /// An integrity expectation minted from one strictly validated, published
-/// coordinator state. It contains no Journal, events or drained transaction collection,
+/// coordinator or member state. It contains no Journal, events or drained transaction collection,
 /// is not serializable, and has no descriptor-only or public constructor.
 /// SHA-256 equality proves integrity relative to this cut, not authentication.
 #[derive(Debug)]
@@ -437,6 +445,7 @@ pub(super) struct PublishedArchiveCut {
     metadata: Vec<u8>,
     decision_manifest: Vec<u8>,
     resolved_prefix: u64,
+    terminal_through: u64,
     checkpoint: Arc<ActiveCheckpoint>,
 }
 impl Loaded {
@@ -464,18 +473,22 @@ impl Staged<'_> {
         decision_manifest: &[u8],
     ) -> anyhow::Result<PublishedArchiveCut> {
         let descriptor = self.descriptor_for(state)?;
-        anyhow::ensure!(
-            descriptor.domain.role == Role::Coordinator,
-            "archive recovery cut requires a bound coordinator"
-        );
-        let journal = state
-            .coordinator
-            .as_ref()
-            .and_then(|coordinator| coordinator.full())
-            .ok_or_else(|| anyhow::anyhow!("missing coordinator archive"))?;
+        let journal = View::of(state)
+            .ok_or_else(|| anyhow::anyhow!("missing full archive"))?
+            .journal;
         let checkpoint = ActiveCheckpoint::from_journal(journal).map_err(history_error)?;
         if super::state_codec::d1_metadata_bytes(state, Some(self))? != metadata {
-            super::state_codec::validate_active_metadata(metadata, descriptor, &checkpoint)?;
+            match descriptor.domain.role {
+                Role::Coordinator => {
+                    super::state_codec::validate_active_metadata(metadata, descriptor, &checkpoint)?
+                }
+                Role::Member => super::state_codec::validate_active_member_metadata(
+                    metadata,
+                    descriptor,
+                    &checkpoint,
+                    state,
+                )?,
+            }
         }
         anyhow::ensure!(
             crate::decision_segments::manifest_bytes(state, descriptor.applied)?
@@ -486,6 +499,10 @@ impl Staged<'_> {
             descriptor: descriptor.clone(),
             metadata: metadata.to_vec(),
             decision_manifest: decision_manifest.to_vec(),
+            terminal_through: state
+                .visibility
+                .as_ref()
+                .map_or(journal.resolved_prefix(), |v| v.applied),
             resolved_prefix: journal.resolved_prefix(),
             checkpoint: Arc::new(checkpoint),
         })
@@ -559,8 +576,56 @@ pub(super) fn verify_active<'db, 'cut>(
     cut.checkpoint
         .validate()
         .map_err(|_| D1Error::EventLedgerHistory)?;
-    let tail =
-        walk(&snapshot, &cut.descriptor, |_, _, _| Ok(())).map_err(super::ledger_read_error)?;
+    let tail = if cut.descriptor.domain.role == Role::Member {
+        let domain = &cut.descriptor.domain;
+        let identity = crate::decision_segments::CheckpointIdentity {
+            role: domain.role.decision_role(),
+            authority: domain.authority.clone(),
+            shard: domain.shard,
+            epoch: domain.epoch,
+            mode: domain.mode,
+            cohort: domain.cohort.clone(),
+        };
+        let decision_error = |error: anyhow::Error| {
+            if error.is::<rocksdb::Error>() {
+                D1Error::DecisionIndexUnavailable
+            } else {
+                D1Error::DecisionIndexHistory
+            }
+        };
+        let mut rows = crate::decision_segments::CheckpointRows::new(
+            &identity,
+            cut.terminal_through,
+            cut.descriptor.applied,
+            &cut.decision_manifest,
+            snapshot.iterator(IteratorMode::From(
+                crate::decision_segments::PREFIX,
+                Direction::Forward,
+            )),
+        )
+        .map_err(decision_error)?;
+        let mut projection = OrderedTerminals::new(domain.cohort.profile);
+        let mut failed_decision = None;
+        let result = walk(&snapshot, &cut.descriptor, |event, _, _| {
+            projection.observe(&event, &mut |tx| {
+                rows.observe(&tx).map_err(|error| {
+                    failed_decision = Some(error);
+                    anyhow::anyhow!("derived decision verification failed")
+                })
+            })
+        });
+        if let Some(error) = failed_decision {
+            return Err(decision_error(error));
+        }
+        let tail = result.map_err(super::ledger_read_error)?;
+        projection
+            .matches(&cut.checkpoint)
+            .map_err(super::ledger_read_error)?;
+        rows.finish().map_err(decision_error)?;
+        tail
+    } else {
+        walk(&snapshot, &cut.descriptor, |_, _, _| Ok(())).map_err(super::ledger_read_error)?
+    };
     Ok(VerifiedArchive {
         snapshot,
         cut,
@@ -568,7 +633,268 @@ pub(super) fn verify_active<'db, 'cut>(
     })
 }
 
-impl VerifiedArchive<'_, '_> {
+/// Immutable operation-local semantic witness. Only strict original-event
+/// extensions can mint a successor; clones share the same accepted state.
+#[derive(Clone)]
+pub(super) struct MemberOverlay<'operation, 'db, 'cut> {
+    archive: &'operation VerifiedArchive<'db, 'cut>,
+    checkpoint: Arc<ActiveCheckpoint>,
+    commands: Arc<Vec<Command>>,
+}
+impl<'operation, 'db, 'cut> MemberOverlay<'operation, 'db, 'cut> {
+    pub(super) fn checkpoint_arc(&self) -> &Arc<ActiveCheckpoint> {
+        &self.checkpoint
+    }
+    pub(super) fn commands(&self) -> &[Command] {
+        self.commands.as_slice()
+    }
+    pub(super) fn head(&self) -> anyhow::Result<HistoryCursor> {
+        self.archive
+            .head()
+            .extend(self.commands())
+            .map_err(history_error)
+    }
+    pub(super) fn validate_candidate(
+        &self,
+        archive: &VerifiedArchive<'db, 'cut>,
+        checkpoint: &Arc<ActiveCheckpoint>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            std::ptr::eq(self.archive, archive) && Arc::ptr_eq(&self.checkpoint, checkpoint),
+            "member overlay belongs to a different snapshot or checkpoint"
+        );
+        Ok(())
+    }
+    pub(super) fn lookup(&self, key: LookupKey) -> anyhow::Result<LookupResult> {
+        self.archive.lookup(key, self.commands())
+    }
+    pub(super) fn transaction_at(&self, ordinal: u64) -> anyhow::Result<Transaction> {
+        self.archive
+            .transactions(ordinal, ordinal, self.commands())?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing retained transaction ordinal"))
+    }
+    fn append(&self, events: &[Command]) -> anyhow::Result<Self> {
+        if events.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut candidate = self.checkpoint.as_ref().clone();
+        let mut accepted = self.commands.as_ref().clone();
+        for event in events {
+            let mut failure = None;
+            let result = candidate.apply(event.clone(), &mut |key| {
+                self.archive.lookup(key, &accepted).map_err(|error| {
+                    failure = Some(error);
+                    crate::transaction_decisions::Error::InvalidJournal
+                })
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            anyhow::ensure!(
+                result.map_err(history_error)?.accepted.as_ref() == Some(event),
+                "member history does not append an original command"
+            );
+            accepted.push(event.clone());
+        }
+        self.archive.check_overlay(&accepted)?;
+        Ok(Self {
+            archive: self.archive,
+            checkpoint: Arc::new(candidate),
+            commands: Arc::new(accepted),
+        })
+    }
+    pub(super) fn merge_compatibility_journal(&self, incoming: &Journal) -> anyhow::Result<Self> {
+        self.compatible_journal(incoming)?;
+        let skip = usize::try_from(self.checkpoint.event_count())
+            .map_err(|_| anyhow::anyhow!("local history event offset overflow"))?
+            .min(incoming.events().len());
+        self.append(&incoming.events()[skip..])
+    }
+
+    fn walk_overlay(
+        &self,
+        mut observe: impl FnMut(&Command, &HistoryCursor) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        walk(
+            &self.archive.snapshot,
+            &self.archive.cut.descriptor,
+            |event, cursor, _| observe(&event, cursor),
+        )?;
+        let mut cursor = self.archive.head();
+        for event in self.commands() {
+            cursor = cursor
+                .extend(std::slice::from_ref(event))
+                .map_err(history_error)?;
+            observe(event, &cursor)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn compatible_journal(&self, incoming: &Journal) -> anyhow::Result<()> {
+        let domain = &self.archive.cut.descriptor.domain;
+        anyhow::ensure!(
+            incoming.authority() == domain.authority.mode
+                && incoming.cohort() == Some(&domain.cohort),
+            "incompatible full history domain"
+        );
+        let incoming_cut = incoming.history_cursor().map_err(history_error)?;
+        incoming_cut
+            .validate_identity(&domain.authority, &domain.cohort)
+            .map_err(history_error)?;
+        let compare = |event: &Command, cursor: &HistoryCursor| -> anyhow::Result<()> {
+            if cursor.event_count <= incoming_cut.event_count {
+                let offset = usize::try_from(cursor.event_count - 1)
+                    .map_err(|_| anyhow::anyhow!("incoming history offset overflow"))?;
+                anyhow::ensure!(
+                    incoming.events().get(offset) == Some(event),
+                    "full history overlap changed original command"
+                );
+                if cursor.event_count == incoming_cut.event_count {
+                    anyhow::ensure!(cursor == &incoming_cut, "full history root mismatch");
+                }
+            }
+            Ok(())
+        };
+        self.walk_overlay(compare)
+    }
+
+    pub(super) fn request_for_transaction(
+        &self,
+        id: [u8; 16],
+    ) -> anyhow::Result<Option<RequestRecord>> {
+        let mut result = None;
+        self.walk_overlay(|event, _| {
+            if let Command::AdmitRequest {
+                id: request_id,
+                request,
+                payload,
+                transaction_id,
+                ..
+            } = event
+            {
+                if *transaction_id == id {
+                    anyhow::ensure!(result.is_none(), "duplicate retained transaction binding");
+                    result = Some(RequestRecord {
+                        id: *request_id,
+                        request: request.clone(),
+                        payload: payload.clone(),
+                        transaction_id: *transaction_id,
+                    });
+                }
+            }
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    /// Freeze the first-target resolution predicate at exactly the supplied
+    /// cursor, then finish all later closure before returning any evidence.
+    pub(super) fn prove_resolved(&self, cut: &HistoryCursor, target: u64) -> anyhow::Result<bool> {
+        let domain = &self.archive.cut.descriptor.domain;
+        cut.validate_identity(&domain.authority, &domain.cohort)
+            .map_err(history_error)?;
+        let zero = domain.zero_cursor()?;
+        let mut frozen = (cut.event_count == 0 && cut == &zero).then_some(false);
+        let mut admitted = 0u64;
+        let mut unresolved = std::collections::BTreeSet::new();
+        self.walk_overlay(|event, cursor| {
+            if cursor.event_count <= cut.event_count {
+                match event {
+                    Command::Begin { id, .. }
+                    | Command::AdmitRequest {
+                        transaction_id: id, ..
+                    } => {
+                        admitted = admitted
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("ordinal overflow"))?;
+                        if admitted <= target {
+                            anyhow::ensure!(
+                                unresolved.len() < domain.cohort.profile.max_transactions(),
+                                "frozen proof exceeds transaction bound"
+                            );
+                            anyhow::ensure!(
+                                unresolved.insert(*id),
+                                "duplicate unresolved admission"
+                            );
+                        }
+                    }
+                    Command::Decide { id, .. } => {
+                        unresolved.remove(id);
+                    }
+                    _ => {}
+                }
+                if cursor.event_count == cut.event_count {
+                    anyhow::ensure!(cursor == cut, "frozen history cut mismatch");
+                    frozen = Some(target != 0 && admitted >= target && unresolved.is_empty());
+                }
+            }
+            Ok(())
+        })?;
+        frozen.ok_or_else(|| anyhow::anyhow!("frozen history cut is not retained"))
+    }
+
+    pub(super) fn merge_history_page(&self, page: &HistoryPage) -> anyhow::Result<Self> {
+        page.validate().map_err(history_error)?;
+        let domain = &self.archive.cut.descriptor.domain;
+        page.base
+            .validate_identity(&domain.authority, &domain.cohort)
+            .map_err(history_error)?;
+        anyhow::ensure!(
+            page.base.event_count <= self.checkpoint.event_count(),
+            "history page base beyond local observation"
+        );
+        let zero = domain.zero_cursor()?;
+        let mut base_seen = page.base == zero;
+        let mut end_seen = page.end == zero;
+        let mut cut_seen = page.cut == zero;
+        self.walk_overlay(|event, cursor| {
+            if cursor.event_count == page.base.event_count {
+                base_seen = cursor == &page.base;
+            }
+            if cursor.event_count == page.end.event_count {
+                end_seen = cursor == &page.end;
+            }
+            if cursor.event_count == page.cut.event_count {
+                cut_seen = cursor == &page.cut;
+            }
+            if cursor.event_count > page.base.event_count
+                && cursor.event_count <= page.end.event_count
+            {
+                let index = (cursor.event_count - page.base.event_count - 1) as usize;
+                anyhow::ensure!(
+                    page.events.get(index) == Some(event),
+                    "history overlap changed original command"
+                );
+            }
+            Ok(())
+        })?;
+        anyhow::ensure!(base_seen, "history page base mismatch");
+        if page.end.event_count <= self.checkpoint.event_count() {
+            anyhow::ensure!(end_seen, "history page end mismatch");
+        }
+        if page.cut.event_count <= self.checkpoint.event_count() {
+            anyhow::ensure!(cut_seen, "history page cut mismatch");
+        }
+        let skip = usize::try_from(self.checkpoint.event_count() - page.base.event_count)
+            .map_err(|_| anyhow::anyhow!("history page offset overflow"))?
+            .min(page.events.len());
+        self.append(&page.events[skip..])
+    }
+}
+
+impl<'db, 'cut> VerifiedArchive<'db, 'cut> {
+    pub(super) fn member_overlay(&self) -> MemberOverlay<'_, 'db, 'cut> {
+        MemberOverlay {
+            archive: self,
+            checkpoint: Arc::clone(&self.cut.checkpoint),
+            commands: Arc::new(Vec::new()),
+        }
+    }
+    pub(super) fn head(&self) -> HistoryCursor {
+        self.cut.head()
+    }
+
     pub(super) fn checkpoint(&self) -> &ActiveCheckpoint {
         &self.cut.checkpoint
     }
@@ -702,6 +1028,207 @@ impl VerifiedArchive<'_, '_> {
     }
 }
 
+/// A semantic projection of an already published original sequence. Only the
+/// unresolved contiguous interval (R,N] and an active-only ID index survive each
+/// event. No retired IDs, Plans, requests or Commands are retained.
+struct OrderedTerminals {
+    active_bytes: usize,
+    profile: CapacityProfile,
+    admitted: u64,
+    resolved: u64,
+    order: std::collections::VecDeque<[u8; 16]>,
+    active: std::collections::BTreeMap<[u8; 16], Transaction>,
+}
+impl OrderedTerminals {
+    // Borrow every variable-width field so admission is sized before allocating
+    // resident participants/prepared bits or inserting either active index entry.
+    fn record_bytes(
+        id: [u8; 16],
+        ordinal: u64,
+        participants: &[crate::transaction_decisions::Participant],
+        prepared: &[bool],
+        decision: Option<crate::transaction_decisions::Decision>,
+    ) -> anyhow::Result<usize> {
+        #[derive(Serialize)]
+        struct Record<'a> {
+            id: [u8; 16],
+            ordinal: u64,
+            participants: &'a [crate::transaction_decisions::Participant],
+            prepared: &'a [bool],
+            decision: Option<crate::transaction_decisions::Decision>,
+        }
+        crate::capacity_policy::canonical_size(
+            &Record {
+                id,
+                ordinal,
+                participants,
+                prepared,
+                decision,
+            },
+            crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES,
+        )
+        .map_err(history_error)?
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("active projection record byte overflow"))
+    }
+    fn tx_bytes(tx: &Transaction) -> anyhow::Result<usize> {
+        Self::record_bytes(
+            tx.id,
+            tx.ordinal,
+            &tx.participants,
+            &tx.prepared,
+            tx.decision,
+        )
+    }
+    fn replace_bytes(total: usize, old: usize, new: usize) -> anyhow::Result<usize> {
+        total
+            .checked_sub(old)
+            .and_then(|n| n.checked_add(new))
+            .filter(|n| *n <= crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES)
+            .ok_or_else(|| {
+                anyhow::anyhow!("active projection canonical bytes exceed checkpoint bound")
+            })
+    }
+    fn new(profile: CapacityProfile) -> Self {
+        Self {
+            active_bytes: 0,
+            profile,
+            admitted: 0,
+            resolved: 0,
+            order: std::collections::VecDeque::new(),
+            active: std::collections::BTreeMap::new(),
+        }
+    }
+    fn observe(
+        &mut self,
+        event: &Command,
+        emit: &mut impl FnMut(Transaction) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        match event {
+            Command::Begin { id, participants }
+            | Command::AdmitRequest {
+                transaction_id: id,
+                participants,
+                ..
+            } => {
+                anyhow::ensure!(
+                    self.admitted < self.profile.max_transactions() as u64
+                        && self.order.len() < self.profile.max_transactions()
+                        && !participants.is_empty()
+                        && participants.len() <= crate::transaction_decisions::MAX_PARTICIPANTS,
+                    "ordered projection exceeds original profile bounds"
+                );
+                anyhow::ensure!(!self.active.contains_key(id), "duplicate active admission");
+                let next = self
+                    .admitted
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("active admission ordinal overflow"))?;
+                let prepared = [false; crate::transaction_decisions::MAX_PARTICIPANTS];
+                let bytes = Self::record_bytes(
+                    *id,
+                    next,
+                    participants,
+                    &prepared[..participants.len()],
+                    None,
+                )?;
+                self.active_bytes = Self::replace_bytes(self.active_bytes, 0, bytes)?;
+                self.admitted = next;
+                self.active.insert(
+                    *id,
+                    Transaction {
+                        id: *id,
+                        ordinal: self.admitted,
+                        participants: participants.clone(),
+                        prepared: vec![false; participants.len()],
+                        decision: None,
+                    },
+                );
+                self.order.push_back(*id);
+            }
+            Command::Prepared { id, participant } => {
+                let tx = self
+                    .active
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow::anyhow!("prepare outside active interval"))?;
+                let old = Self::tx_bytes(tx)?;
+                let mut prepared = [false; crate::transaction_decisions::MAX_PARTICIPANTS];
+                prepared[..tx.prepared.len()].copy_from_slice(&tx.prepared);
+                if let Some(index) = tx.participants.iter().position(|p| p == participant) {
+                    prepared[index] = true;
+                }
+                let new = Self::record_bytes(
+                    tx.id,
+                    tx.ordinal,
+                    &tx.participants,
+                    &prepared[..tx.prepared.len()],
+                    tx.decision,
+                )?;
+                let total = Self::replace_bytes(self.active_bytes, old, new)?;
+                anyhow::ensure!(
+                    tx.record_prepared(participant).map_err(history_error)?,
+                    "duplicate retained prepare"
+                );
+                self.active_bytes = total;
+            }
+            Command::Decide { id, decision } => {
+                let tx = self
+                    .active
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow::anyhow!("decision outside active interval"))?;
+                let old = Self::tx_bytes(tx)?;
+                let new = Self::record_bytes(
+                    tx.id,
+                    tx.ordinal,
+                    &tx.participants,
+                    &tx.prepared,
+                    Some(*decision),
+                )?;
+                let total = Self::replace_bytes(self.active_bytes, old, new)?;
+                anyhow::ensure!(
+                    tx.record_decision(*decision).map_err(history_error)?,
+                    "duplicate retained decision"
+                );
+                self.active_bytes = total;
+            }
+            _ => {}
+        }
+        // Same contiguous-front reduction as ActiveCheckpoint::apply: never
+        // jump over a hole, and release a record only after a terminal outcome.
+        while let Some(id) = self.order.front().copied() {
+            let tx = self
+                .active
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("active projection index mismatch"))?;
+            let Some(next) =
+                crate::transaction_decisions::checkpoint::next_resolved(self.resolved, tx)
+                    .map_err(history_error)?
+            else {
+                break;
+            };
+            self.active_bytes = Self::replace_bytes(self.active_bytes, Self::tx_bytes(tx)?, 0)?;
+            let tx = self.active.remove(&id).unwrap();
+            self.order.pop_front();
+            self.resolved = next;
+            emit(tx)?;
+        }
+        Ok(())
+    }
+    fn matches(&self, checkpoint: &ActiveCheckpoint) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.admitted == checkpoint.transaction_count() as u64
+                && self.resolved == checkpoint.resolved_prefix()
+                && self.order.len() == checkpoint.active_transactions().len()
+                && self
+                    .order
+                    .iter()
+                    .zip(checkpoint.active_transactions())
+                    .all(|(id, tx)| self.active.get(id) == Some(tx)),
+            "ordered raw projection differs from published checkpoint"
+        );
+        Ok(())
+    }
+}
+
 /// One requested binding or transaction plus its absolute admission ordinal.
 /// This projection performs no admissions and is not an alternate authority.
 struct Projection {
@@ -802,12 +1329,189 @@ impl Projection {
 /// the shared checkpoint transition implementation. No Journal is constructed.
 pub(super) struct StagedActive<'a> {
     candidate: &'a ActiveCheckpoint,
+    base_checkpoint: Arc<ActiveCheckpoint>,
+    base_descriptor: Descriptor,
+    base_terminal_through: u64,
     descriptor: Descriptor,
     // Operation-local output of the exact shared transitions below. These
     // records are handed to terminal staging and never retained by the cut.
     drained: Vec<Transaction>,
 }
+/// Private operation-local member witness. It owns only newly consumed terminals,
+/// not the previously applied history, and borrows the exact metadata candidate.
+pub(crate) struct StagedMemberTerminals<'a> {
+    state: &'a D1State,
+    descriptor: &'a Descriptor,
+    previous: u64,
+    previous_manifest: Vec<u8>,
+    through: u64,
+    records: Vec<Transaction>,
+}
+impl<'a> StagedMemberTerminals<'a> {
+    pub(crate) fn state(&self) -> &'a D1State {
+        self.state
+    }
+    pub(crate) fn descriptor(&self) -> &'a Descriptor {
+        self.descriptor
+    }
+    pub(crate) fn previous(&self) -> u64 {
+        self.previous
+    }
+    pub(crate) fn previous_manifest(&self) -> &[u8] {
+        &self.previous_manifest
+    }
+    pub(crate) fn through(&self) -> u64 {
+        self.through
+    }
+    pub(crate) fn records(&self) -> &[Transaction] {
+        &self.records
+    }
+}
+
 impl StagedActive<'_> {
+    /// Bind exact original terminal projections to the already staged suffix and
+    /// candidate. A caller cannot supply replacement terminal transaction data.
+    pub(super) fn member_terminals<'a>(
+        &'a self,
+        before: &VerifiedArchive<'_, '_>,
+        suffix: &[Command],
+        state: &'a D1State,
+    ) -> anyhow::Result<StagedMemberTerminals<'a>> {
+        anyhow::ensure!(
+            self.descriptor.domain.role == Role::Member
+                && before.cut.descriptor.domain == self.descriptor.domain
+                && self.base_descriptor == before.cut.descriptor
+                && Arc::ptr_eq(&self.base_checkpoint, &before.cut.checkpoint)
+                && self.base_terminal_through == before.cut.terminal_through,
+            "member terminal witness has a different prior cut"
+        );
+        let visibility = state
+            .visibility
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing member visibility"))?;
+        let active = visibility
+            .journal
+            .active_arc()
+            .ok_or_else(|| anyhow::anyhow!("member witness requires active history"))?;
+        self.descriptor_for(active.as_ref())?;
+        anyhow::ensure!(
+            state.coordinator.is_none()
+                && state.shard == self.descriptor.domain.shard
+                && state.epoch == self.descriptor.domain.epoch
+                && state
+                    .managed
+                    .as_ref()
+                    .is_some_and(|mode| mode.mode_id == self.descriptor.domain.mode),
+            "member terminal witness local identity mismatch"
+        );
+        let previous = before.cut.terminal_through;
+        let through = visibility.applied;
+        anyhow::ensure!(
+            through >= previous
+                && through <= self.candidate.resolved_prefix()
+                && through <= self.descriptor.domain.cohort.profile.max_transactions() as u64,
+            "member terminal witness frontier mismatch"
+        );
+        before.check_overlay(suffix)?;
+        let head = before.head().extend(suffix).map_err(history_error)?;
+        anyhow::ensure!(
+            head.event_count == self.descriptor.event_count
+                && head.root == self.descriptor.head_root,
+            "member terminal witness suffix differs from staged raw history"
+        );
+        let mut records = Vec::new();
+        if through > previous {
+            let mut projection = OrderedTerminals::new(self.descriptor.domain.cohort.profile);
+            let mut emit = |tx: Transaction| -> anyhow::Result<()> {
+                if tx.ordinal > previous && tx.ordinal <= through {
+                    anyhow::ensure!(
+                        tx.ordinal == previous + records.len() as u64 + 1
+                            && (records.len() as u64) < through - previous,
+                        "member terminal projection ordinal mismatch"
+                    );
+                    records.push(tx);
+                }
+                Ok(())
+            };
+            walk(&before.snapshot, &before.cut.descriptor, |event, _, _| {
+                projection.observe(&event, &mut emit)
+            })?;
+            for event in suffix {
+                projection.observe(event, &mut emit)?;
+            }
+            projection.matches(self.candidate)?;
+        }
+        anyhow::ensure!(
+            records.len() as u64 == through - previous,
+            "incomplete member terminal projection"
+        );
+        Ok(StagedMemberTerminals {
+            state,
+            descriptor: &self.descriptor,
+            previous,
+            previous_manifest: before.cut.decision_manifest.clone(),
+            through,
+            records,
+        })
+    }
+
+    pub(super) fn published_member_cut(
+        &self,
+        state: &D1State,
+        checkpoint: &Arc<ActiveCheckpoint>,
+        metadata: &[u8],
+        decision_manifest: &crate::decision_segments::StagedMemberCheckpointManifest<'_>,
+    ) -> anyhow::Result<PublishedArchiveCut> {
+        let descriptor = self.descriptor_for(checkpoint.as_ref())?;
+        anyhow::ensure!(
+            std::ptr::eq(state, decision_manifest.state())
+                && std::ptr::eq(descriptor, decision_manifest.descriptor()),
+            "member terminal manifest belongs to a different state candidate"
+        );
+        anyhow::ensure!(
+            descriptor.domain.role == Role::Member,
+            "member archive role mismatch"
+        );
+        super::state_codec::validate_active_member_metadata(
+            metadata, descriptor, checkpoint, state,
+        )?;
+        let visibility = state
+            .visibility
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing member visibility"))?;
+        let active = visibility
+            .journal
+            .active_arc()
+            .ok_or_else(|| anyhow::anyhow!("member publication requires active history"))?;
+        anyhow::ensure!(
+            Arc::ptr_eq(active, checkpoint),
+            "member publication does not share candidate checkpoint"
+        );
+        let through = visibility.applied;
+        let bytes = decision_manifest.bytes();
+        crate::decision_segments::validate_checkpoint_manifest(
+            &crate::decision_segments::CheckpointIdentity {
+                role: descriptor.domain.role.decision_role(),
+                authority: descriptor.domain.authority.clone(),
+                shard: descriptor.domain.shard,
+                epoch: descriptor.domain.epoch,
+                mode: descriptor.domain.mode,
+                cohort: descriptor.domain.cohort.clone(),
+            },
+            through,
+            descriptor.applied,
+            bytes,
+        )?;
+        Ok(PublishedArchiveCut {
+            descriptor: descriptor.clone(),
+            metadata: metadata.to_vec(),
+            decision_manifest: bytes.to_vec(),
+            terminal_through: through,
+            resolved_prefix: checkpoint.resolved_prefix(),
+            checkpoint: Arc::clone(checkpoint),
+        })
+    }
+
     pub(super) fn drained(&self) -> &[Transaction] {
         &self.drained
     }
@@ -834,6 +1538,8 @@ impl StagedActive<'_> {
         super::state_codec::validate_active_metadata(metadata, descriptor, checkpoint)?;
         crate::decision_segments::validate_checkpoint_manifest(
             &crate::decision_segments::CheckpointIdentity {
+                role: descriptor.domain.role.decision_role(),
+                authority: descriptor.domain.authority.clone(),
                 shard: descriptor.domain.shard,
                 epoch: descriptor.domain.epoch,
                 mode: descriptor.domain.mode,
@@ -847,6 +1553,7 @@ impl StagedActive<'_> {
             descriptor: descriptor.clone(),
             metadata: metadata.to_vec(),
             decision_manifest: decision_manifest.to_vec(),
+            terminal_through: checkpoint.resolved_prefix(),
             resolved_prefix: checkpoint.resolved_prefix(),
             checkpoint: Arc::clone(checkpoint),
         })
@@ -905,6 +1612,9 @@ pub(super) fn stage_active<'a>(
     if suffix.is_empty() {
         return Ok(StagedActive {
             candidate,
+            base_checkpoint: Arc::clone(&before.cut.checkpoint),
+            base_descriptor: before.cut.descriptor.clone(),
+            base_terminal_through: before.cut.terminal_through,
             descriptor: Descriptor {
                 applied,
                 ..old.clone()
@@ -970,6 +1680,9 @@ pub(super) fn stage_active<'a>(
     );
     Ok(StagedActive {
         candidate,
+        base_checkpoint: Arc::clone(&before.cut.checkpoint),
+        base_descriptor: before.cut.descriptor.clone(),
+        base_terminal_through: before.cut.terminal_through,
         descriptor,
         drained,
     })
@@ -1620,6 +2333,275 @@ mod tests {
         cut
     }
 
+    #[test]
+    fn ordered_projection_checks_bytes_before_retention_and_releases_only_contiguous_front() {
+        let mut projection = OrderedTerminals::new(CapacityProfile::LegacyCountV1);
+        projection.active_bytes =
+            crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES;
+        assert!(projection.observe(&begin(1), &mut |_| Ok(())).is_err());
+        assert!(projection.order.is_empty());
+        assert!(projection.active.is_empty());
+        assert_eq!(projection.admitted, 0);
+        let mut projection = OrderedTerminals::new(CapacityProfile::LegacyCountV1);
+        let mut emitted = Vec::new();
+        for n in 1..=33 {
+            projection
+                .observe(&begin(n), &mut |tx| {
+                    emitted.push(tx);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for n in 2..=33 {
+            projection
+                .observe(&decide(n, Decision::Abort), &mut |tx| {
+                    emitted.push(tx);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(emitted.is_empty());
+        assert_eq!(projection.active.len(), 33);
+        let expected: usize = projection
+            .active
+            .values()
+            .map(|tx| serde_json::to_vec(tx).unwrap().len() + 1)
+            .sum();
+        assert_eq!(projection.active_bytes, expected);
+        projection
+            .observe(
+                &Command::Prepared {
+                    id: id(1),
+                    participant: participant(),
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        let expected: usize = projection
+            .active
+            .values()
+            .map(|tx| serde_json::to_vec(tx).unwrap().len() + 1)
+            .sum();
+        assert_eq!(projection.active_bytes, expected);
+        projection
+            .observe(&decide(1, Decision::Abort), &mut |tx| {
+                emitted.push(tx);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(emitted.len(), 33);
+        assert_eq!(projection.resolved, 33);
+        assert_eq!(projection.active_bytes, 0);
+        assert!(projection.active.is_empty());
+        assert!(projection.order.is_empty());
+    }
+
+    #[test]
+    fn frozen_resolution_does_not_borrow_later_hole_closure_or_overlay_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let mut j = bound();
+        j.replay_event(begin(1)).unwrap();
+        j.replay_event(begin(2)).unwrap();
+        j.replay_event(decide(2, Decision::Abort)).unwrap();
+        let before_hole = j.history_cursor().unwrap();
+        let old = state(j.clone());
+        let cut = persist_archive(&db, &old, marker(10));
+        let archive = verify_active(&db, &cut).unwrap();
+        j.replay_event(decide(1, Decision::Abort)).unwrap();
+        let resolved = j.history_cursor().unwrap();
+        let overlay = archive
+            .member_overlay()
+            .merge_compatibility_journal(&j)
+            .unwrap();
+        crate::transaction_decisions::without_full_journal(|| {
+            assert!(!overlay.prove_resolved(&before_hole, 2).unwrap());
+            assert!(!overlay.prove_resolved(&before_hole, 1).unwrap());
+            assert!(overlay.prove_resolved(&resolved, 2).unwrap());
+            assert!(!overlay.prove_resolved(&resolved, 3).unwrap());
+            let mut forged = before_hole.clone();
+            forged.root[0] ^= 1;
+            assert!(overlay.prove_resolved(&forged, 2).is_err());
+            let events = vec![decide(1, Decision::Abort)];
+            let end = resolved.extend(&events).unwrap();
+            let duplicate = HistoryPage {
+                version: resolved.version,
+                base: resolved.clone(),
+                end: end.clone(),
+                cut: end,
+                events,
+            };
+            assert!(overlay.merge_history_page(&duplicate).is_err());
+        });
+    }
+
+    #[test]
+    fn active_page_merge_preserves_newer_observation_and_original_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let old = archive_state(CapacityProfile::LegacyCountV1, 2);
+        let journal = old.coordinator.as_ref().unwrap().full().unwrap();
+        let base = HistoryCursor::empty(
+            Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
+            journal.cohort().unwrap().clone(),
+        )
+        .unwrap();
+        let page = journal.history_page(&base, None).unwrap();
+        let cut = persist_archive(&db, &old, marker(10));
+        let archive = verify_active(&db, &cut).unwrap();
+        let mut later = journal.clone();
+        later.replay_event(decide(999, Decision::Abort)).unwrap();
+        let overlay = archive
+            .member_overlay()
+            .merge_compatibility_journal(&later)
+            .unwrap();
+        crate::transaction_decisions::without_full_journal(|| {
+            let merged = overlay.merge_history_page(&page).unwrap();
+            assert!(Arc::ptr_eq(&merged.checkpoint, &overlay.checkpoint));
+            assert!(Arc::ptr_eq(&merged.commands, &overlay.commands));
+            let expected = &journal.requests()[0];
+            assert_eq!(
+                merged
+                    .request_for_transaction(expected.transaction_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(expected)
+            );
+            assert_eq!(
+                merged.transaction_at(1).unwrap().decision,
+                Some(Decision::Abort)
+            );
+            let mut changed = page.clone();
+            changed.cut.root[0] ^= 1;
+            assert!(overlay.merge_history_page(&changed).is_err());
+        });
+    }
+
+    #[test]
+    fn member_overlay_rejects_equal_count_substitution_and_other_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let original = state(bound());
+        let cut = persist_archive(&db, &original, marker(10));
+        let archive = verify_active(&db, &cut).unwrap();
+        let other_snapshot = verify_active(&db, &cut).unwrap();
+        let empty = archive.member_overlay();
+        empty
+            .validate_candidate(&archive, empty.checkpoint_arc())
+            .unwrap();
+        assert!(empty
+            .validate_candidate(&other_snapshot, empty.checkpoint_arc())
+            .is_err());
+        let other_cut = persist_archive(&db, &original, marker(11));
+        let other_archive = verify_active(&db, &other_cut).unwrap();
+        assert!(empty
+            .validate_candidate(&other_archive, empty.checkpoint_arc())
+            .is_err());
+        let mut first = bound();
+        first.replay_event(begin(1)).unwrap();
+        first.replay_event(decide(1, Decision::Abort)).unwrap();
+        let mut second = bound();
+        second.replay_event(begin(2)).unwrap();
+        second.replay_event(decide(2, Decision::Abort)).unwrap();
+        let first_active = empty
+            .merge_compatibility_journal(
+                &first
+                    .history_prefix(&first.history_cursor_at(2).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let second_active = empty
+            .merge_compatibility_journal(
+                &second
+                    .history_prefix(&second.history_cursor_at(2).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            first_active.commands().len(),
+            second_active.commands().len()
+        );
+        assert_ne!(
+            first_active.checkpoint_arc().as_ref(),
+            second_active.checkpoint_arc().as_ref()
+        );
+        assert!(first_active
+            .validate_candidate(&archive, second_active.checkpoint_arc())
+            .is_err());
+        let first = empty.merge_compatibility_journal(&first).unwrap();
+        let second = empty.merge_compatibility_journal(&second).unwrap();
+        assert_eq!(first.commands().len(), second.commands().len());
+        assert_eq!(
+            first.checkpoint_arc().as_ref(),
+            second.checkpoint_arc().as_ref()
+        );
+        assert_ne!(first.commands(), second.commands());
+        assert_ne!(first.head().unwrap(), second.head().unwrap());
+        assert!(first
+            .validate_candidate(&archive, second.checkpoint_arc())
+            .is_err());
+        let equal_value = Arc::new(first.checkpoint_arc().as_ref().clone());
+        assert!(first.validate_candidate(&archive, &equal_value).is_err());
+        assert!(empty.commands().is_empty());
+        assert_eq!(empty.head().unwrap(), archive.head());
+    }
+
+    #[test]
+    fn member_overlay_failed_extension_preserves_witness_and_no_tail_shares_arcs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let original = state(bound());
+        let cut = persist_archive(&db, &original, marker(10));
+        let archive = verify_active(&db, &cut).unwrap();
+        let empty = archive.member_overlay();
+        let base = empty.head().unwrap();
+        for events in [
+            vec![begin(1), begin(1)],
+            vec![
+                Command::Prepared {
+                    id: id(2),
+                    participant: participant(),
+                },
+                begin(2),
+            ],
+        ] {
+            let end = base.extend(&events).unwrap();
+            let bad = HistoryPage {
+                version: base.version,
+                base: base.clone(),
+                end: end.clone(),
+                cut: end,
+                events,
+            };
+            assert!(empty.merge_history_page(&bad).is_err());
+            assert!(empty.commands().is_empty());
+            assert_eq!(empty.checkpoint_arc().event_count(), base.event_count);
+            assert_eq!(
+                empty.lookup(LookupKey::Transaction(id(1))).unwrap(),
+                LookupResult::Transaction(None)
+            );
+        }
+        let mut accepted = bound();
+        accepted.replay_event(begin(3)).unwrap();
+        accepted.replay_event(decide(3, Decision::Abort)).unwrap();
+        let successor = empty
+            .merge_history_page(&accepted.history_page(&base, None).unwrap())
+            .unwrap();
+        assert_eq!(successor.transaction_at(1).unwrap().id, id(3));
+        let reused = successor.merge_compatibility_journal(&accepted).unwrap();
+        assert!(Arc::ptr_eq(&successor.checkpoint, &reused.checkpoint));
+        assert!(Arc::ptr_eq(&successor.commands, &reused.commands));
+        let older = reused.merge_compatibility_journal(&bound()).unwrap();
+        assert!(Arc::ptr_eq(&reused.checkpoint, &older.checkpoint));
+        assert!(Arc::ptr_eq(&reused.commands, &older.commands));
+        let clone = older.clone();
+        assert!(Arc::ptr_eq(&clone.commands, &older.commands));
+        assert!(Arc::ptr_eq(&clone.checkpoint, &older.checkpoint));
+    }
+
     fn stage_active_terminals(
         batch: &mut WriteBatch,
         verified: &VerifiedArchive<'_, '_>,
@@ -1629,6 +2611,8 @@ mod tests {
     ) -> crate::decision_segments::StagedCheckpointManifest {
         let descriptor = verified.descriptor();
         let identity = crate::decision_segments::CheckpointIdentity {
+            role: crate::decision_segments::Role::Coordinator,
+            authority: descriptor.domain.authority.clone(),
             shard: descriptor.domain.shard,
             epoch: descriptor.domain.epoch,
             mode: descriptor.domain.mode,

@@ -851,6 +851,7 @@ async fn actual_disk15_migration_is_atomic_preserves_old_ids_plans_and_versions(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn actual_managed_tcp_commands_use_no_journal_preflight_and_raft_apply() {
+    let _resources = crate::managed_rpc::test_resource_guard().await;
     use crate::managed_rpc::{Client, Identity, NodeRef, Role, Server};
     use crate::versioned_reads::Target;
     use std::time::Duration;

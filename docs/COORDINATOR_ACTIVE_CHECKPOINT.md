@@ -5,7 +5,8 @@ current source, not a published capacity increase or measured performance result
 The [S1 ledger contract](AUTHORITATIVE_EVENT_LEDGER.md) remains the historical
 contract for actual disk-v15 migration inputs. S2 writes coordinator disk **v16**;
 member disk v12/v14, raw formats 1/2, logical SnapshotV1 and managed RPC v5 stay
-unchanged. Tracking: https://github.com/ashione/VelaGraph/issues/108 and
+unchanged in S2. The follow-on [S3 member checkpoint](MEMBER_ACTIVE_CHECKPOINT.md)
+now writes member v17 while preserving actual v12/v14 migration readers. Tracking: https://github.com/ashione/VelaGraph/issues/108 and
 https://github.com/ashione/VelaGraph/issues/109.
 
 ## Replacement and authority

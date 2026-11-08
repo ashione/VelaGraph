@@ -566,6 +566,7 @@ async fn corrupt_partial_tail_cannot_be_repaired_by_an_ordinary_apply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_rpc_source_and_certified_reads_use_persisted_segments() {
+    let _resources = crate::managed_rpc::test_resource_guard().await;
     use crate::managed_rpc::{Client, Error, Identity, NodeRef, Role, Server};
     for (member, raw) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
@@ -897,9 +898,11 @@ async fn exact_segment_key_row_manifest_and_bound_member_metadata_goldens() {
     let mut member = Arc::new(StateMachine::open(member_dir.path()).unwrap());
     setup(&mut member, true).await;
     let state = member.state.read().await;
-    let d1 = state.d1.as_ref().unwrap();
+    // Explicit materialization of the real legacy migration input.
+    let complete = member.load_disk_state(&state).unwrap().unwrap();
+    let d1 = &complete.state;
     // v10 remains a readable full-state migration input; new bound writes
-    // use the journal-less v12 metadata covered by the codec goldens.
+    // use disk17 while actual v12 metadata remains covered by codec goldens.
     let legacy = serde_json::json!({"version":10,"state":d1.stage()});
     assert_eq!(
         legacy["state"]["visibility"]["journal"],
