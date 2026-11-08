@@ -688,7 +688,7 @@ Managed fixed-cohort reads now use [exact segmented terminal-prefix evidence](do
 at the chosen V rather than transferring the original request/Plan archive. This
 keeps old-V evidence independent of later archive growth without changing durable
 retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
-boundary. Internal managed peers now require protocol v5; evidence remains O(V).
+boundary. Internal managed peers now require protocol v6; evidence remains O(V).
 
 [Durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) returns one exact
 original external-ID/Plan binding without transferring the full Journal. Bound
@@ -725,10 +725,15 @@ precede admission; original IDs/Plans and old read versions remain retained.
 This profile replaces the legacy 256/1,024 count quotas with byte-derived guards,
 while the 16 MiB reserved Journal, local D1 limits, complete replay/snapshots and
 whole-frame bounds remain. Existing/default cohorts stay legacy; there is no
-online conversion or unlimited-lifetime claim. New managed peers require RPC v5.
+online conversion or unlimited-lifetime claim. New managed peers require RPC v6; see the [retained gateway control contract](docs/RETAINED_GATEWAY_CONTROL.md).
 
 The draft [consumed member checkpoint](docs/MEMBER_ACTIVE_CHECKPOINT.md) replaces
 bound durable member resident/ordinary-apply Journal with shared observed active
 state and exact original raw projections. It keeps every existing capacity limit
 and full SnapshotV1/legacy compatibility boundary; acceptance and higher-lifetime
 capacity are not claimed.
+
+The [retained gateway control slice](docs/RETAINED_GATEWAY_CONTROL.md) replaces
+actual managed graph full-Journal control and Prepare with anchored point evidence
+and deterministic retained-cut preparation. Existing finite profiles and full
+terminal-proof/SnapshotV1 boundaries remain; no capacity increase is claimed.

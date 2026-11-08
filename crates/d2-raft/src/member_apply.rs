@@ -335,6 +335,19 @@ impl StateMachine {
                     .map_err(ledger_read_error)?;
                 candidate.advance_member_transaction(tx, &accepted, base.d1.as_ref())?
             }
+            D1Command::PrepareRetained(prepare) => {
+                candidate.check_retained_prepare(&prepare)?;
+                let target = accepted
+                    .target_at_cut(&prepare.cut, prepare.request.request_id)
+                    .map_err(history_error)?;
+                let answer = candidate.prepare_retained_with_evidence(
+                    &prepare,
+                    target,
+                    base.d1.as_ref(),
+                    &accepted,
+                )?;
+                (answer, None)
+            }
             D1Command::PrepareParticipant {
                 authority,
                 participant,
@@ -407,5 +420,154 @@ impl StateMachine {
             apply_operations(base, next, batch, request.operations);
         }
         Ok(answer)
+    }
+}
+
+#[cfg(test)]
+mod retained_prepare_atomicity {
+    use super::*;
+    use crate::participant_writes::{Authority, Status};
+    use crate::retained_prepare::RetainedPrepare;
+    use crate::transaction_decisions::{Cohort, Command, Journal, Member, Participant};
+
+    fn entry(index: u64, command: D1Command) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(LogCommand::D1V1(command)),
+        }
+    }
+    #[tokio::test]
+    async fn failed_sync_cannot_publish_strict_prepare_or_observed_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        let authority = Authority {
+            shard: 9,
+            mode: [9; 16],
+        };
+        let cohort = Cohort {
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            profile: Default::default(),
+            members: vec![Member {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+            }],
+        };
+        let mut journal = Journal::new([9; 16]).unwrap();
+        journal.apply(Command::BindCohort { cohort }).unwrap();
+        let commands = vec![
+            D1Command::Activate { shard: 7, epoch: 1 },
+            D1Command::EnableManagedWrites {
+                shard: 7,
+                epoch: 1,
+                expected_sequence: 0,
+                mode_id: [7; 16],
+            },
+            D1Command::EnableParticipant {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                authority: authority.clone(),
+            },
+            D1Command::EnableVersionedReads {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                journal: journal.clone(),
+            },
+        ];
+        for result in sm
+            .apply(
+                commands
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| entry(i as u64 + 1, c)),
+            )
+            .await
+            .unwrap()
+        {
+            result.d1.unwrap().unwrap();
+        }
+        sm.forbid_coordinator_journal(true);
+        let base = journal.history_cursor().unwrap();
+        let participant = Participant {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+            intent: [3; 32],
+        };
+        journal
+            .apply(Command::Begin {
+                id: [2; 16],
+                participants: vec![participant.clone()],
+            })
+            .unwrap();
+        let cut = journal.history_cursor().unwrap();
+        let prepare = RetainedPrepare {
+            version: 1,
+            authority: authority.clone(),
+            participant,
+            request: crate::D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [2; 16],
+                expected_sequence: Some(0),
+                operations: vec![WriteOp::put("x", "value")],
+            },
+            cut,
+        };
+        let commands = vec![
+            entry(
+                5,
+                D1Command::SyncHistory {
+                    authority,
+                    shard: 7,
+                    epoch: 1,
+                    mode_id: [7; 16],
+                    page: Box::new(journal.history_page(&base, None).unwrap()),
+                },
+            ),
+            entry(6, D1Command::PrepareRetained(Box::new(prepare))),
+        ];
+        let disk = |sm: &StateMachine| {
+            sm.storage
+                .as_ref()
+                .unwrap()
+                .db
+                .iterator(rocksdb::IteratorMode::Start)
+                .map(|row| {
+                    let (k, v) = row.unwrap();
+                    (k.to_vec(), v.to_vec())
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = disk(&sm);
+        let before_state = sm.state.read().await.d1.clone();
+        let before_marker = sm.applied().await;
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm.apply(commands.clone()).await.is_err());
+        assert_eq!(disk(&sm), before);
+        assert_eq!(sm.state.read().await.d1, before_state);
+        assert_eq!(sm.applied().await, before_marker);
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        sm.forbid_coordinator_journal(true);
+        assert_eq!(disk(&sm), before);
+        assert_eq!(
+            sm.participant_history_status(7, 1, [7; 16]).await.unwrap(),
+            (base, 0)
+        );
+        let results = sm.apply(commands).await.unwrap();
+        assert!(results[0].d1.as_ref().unwrap().is_ok());
+        assert_eq!(
+            results[1].d1,
+            Some(Ok(D1Result::Participant(Status::Prepared)))
+        );
+        assert_eq!(sm.get_raw(b"x").await, None);
     }
 }

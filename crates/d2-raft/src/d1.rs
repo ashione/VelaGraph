@@ -98,6 +98,8 @@ pub enum D1Command {
         mode_id: [u8; 16],
         authority: crate::participant_writes::Authority,
     },
+    /// Strict preparation against an independently verified retained event cut.
+    PrepareRetained(Box<crate::retained_prepare::RetainedPrepare>),
     PrepareParticipant {
         authority: crate::participant_writes::Authority,
         participant: crate::transaction_decisions::Participant,

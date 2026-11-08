@@ -4,6 +4,7 @@
 use crate::d1::D1State;
 use crate::participant_writes::Authority;
 use crate::request_index::{RecoveredRequest, RequestLookup};
+use crate::target_evidence::{TargetEvidence, TargetRecord};
 use crate::transaction_decisions::checkpoint::{ActiveCheckpoint, LookupKey, LookupResult};
 use crate::transaction_decisions::{
     CapacityProfile, Cohort, Command, HistoryCursor, HistoryPage, Journal, RequestRecord,
@@ -417,7 +418,7 @@ fn walk(
 /// validates every semantic transition. A self-consistent forged descriptor is
 /// never a substitute for this validation and cannot mint a published cut.
 pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     crate::transaction_decisions::assert_full_journal_allowed();
     let snapshot = db.snapshot();
     let mut journal = journal(descriptor.domain.authority.mode)?;
@@ -759,33 +760,45 @@ impl<'operation, 'db, 'cut> MemberOverlay<'operation, 'db, 'cut> {
         self.walk_overlay(compare)
     }
 
+    /// Freeze this target at the exact retained event cut. Later admissions or
+    /// decisions cannot supply old authorization, but all later rows still close.
+    pub(super) fn target_at_cut(
+        &self,
+        cut: &HistoryCursor,
+        id: [u8; 16],
+    ) -> anyhow::Result<Option<TargetRecord>> {
+        let domain = &self.archive.cut.descriptor.domain;
+        cut.validate_identity(&domain.authority, &domain.cohort)
+            .map_err(history_error)?;
+        let mut matched = cut == &domain.zero_cursor()?;
+        let mut projection = Projection::new(LookupKey::Transaction(id));
+        self.walk_overlay(|event, cursor| {
+            if cursor.event_count <= cut.event_count {
+                projection.observe(event)?;
+            }
+            if cursor.event_count == cut.event_count {
+                anyhow::ensure!(cursor == cut, "target cut differs from retained history");
+                matched = true;
+            }
+            Ok(())
+        })?;
+        anyhow::ensure!(matched, "target cut is not retained");
+        let result = projection.finish_target()?;
+        if let Some(record) = &result {
+            record
+                .validate(&domain.authority, &domain.cohort)
+                .map_err(history_error)?;
+        }
+        Ok(result)
+    }
+
     pub(super) fn request_for_transaction(
         &self,
         id: [u8; 16],
     ) -> anyhow::Result<Option<RequestRecord>> {
-        let mut result = None;
-        self.walk_overlay(|event, _| {
-            if let Command::AdmitRequest {
-                id: request_id,
-                request,
-                payload,
-                transaction_id,
-                ..
-            } = event
-            {
-                if *transaction_id == id {
-                    anyhow::ensure!(result.is_none(), "duplicate retained transaction binding");
-                    result = Some(RequestRecord {
-                        id: *request_id,
-                        request: request.clone(),
-                        payload: payload.clone(),
-                        transaction_id: *transaction_id,
-                    });
-                }
-            }
-            Ok(())
-        })?;
-        Ok(result)
+        Ok(self
+            .target_at_cut(&self.head()?, id)?
+            .and_then(|target| target.request))
     }
 
     /// Freeze the first-target resolution predicate at exactly the supplied
@@ -1262,7 +1275,9 @@ impl Projection {
                 transaction_id,
                 participants,
             } => {
-                if matches!(&self.key, LookupKey::Request(wanted) if wanted == id) {
+                if matches!(&self.key, LookupKey::Request(wanted) if wanted == id)
+                    || matches!(&self.key, LookupKey::Transaction(wanted) if wanted == transaction_id)
+                {
                     anyhow::ensure!(self.request.is_none(), "duplicate retained request");
                     self.request = Some(RequestRecord {
                         id: *id,
@@ -1270,8 +1285,6 @@ impl Projection {
                         payload: payload.clone(),
                         transaction_id: *transaction_id,
                     });
-                }
-                if matches!(&self.key, LookupKey::Transaction(wanted) if wanted == transaction_id) {
                     self.admit(*transaction_id, participants)?;
                 }
             }
@@ -1315,6 +1328,28 @@ impl Projection {
             decision: None,
         });
         Ok(())
+    }
+
+    fn finish_target(self) -> anyhow::Result<Option<TargetRecord>> {
+        match self.transaction {
+            Some(transaction) => {
+                anyhow::ensure!(
+                    transaction.ordinal <= self.ordinal,
+                    "target exceeds cut admissions"
+                );
+                Ok(Some(TargetRecord {
+                    transaction,
+                    request: self.request,
+                }))
+            }
+            None => {
+                anyhow::ensure!(
+                    self.request.is_none(),
+                    "binding has no retained transaction"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn finish(self) -> LookupResult {
@@ -1735,6 +1770,53 @@ fn write_active_row(
     Ok(())
 }
 
+/// Exact current transaction from the same anchored cut as its E/R metadata.
+/// Complete namespace closure precedes both present and absent results.
+pub(super) fn lookup_target(
+    db: &DB,
+    cut: &PublishedArchiveCut,
+    id: [u8; 16],
+) -> Result<TargetEvidence, D1Error> {
+    // Coordinator cuts require raw closure, not member terminal-row replay.
+    // Keep the same private metadata/manifest/namespace anchor and perform that
+    // closure in the target projection's single walk of this one snapshot.
+    if cut.descriptor.domain.role != Role::Coordinator {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    let snapshot = cut.snapshot(db)?;
+    cut.checkpoint
+        .validate()
+        .map_err(|_| D1Error::EventLedgerHistory)?;
+    if cut.checkpoint.authority() != cut.descriptor.domain.authority.mode
+        || cut.checkpoint.cohort() != Some(&cut.descriptor.domain.cohort)
+        || cut.checkpoint.event_count() != cut.descriptor.event_count
+        || cut.checkpoint.resolved_prefix() != cut.resolved_prefix
+    {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    let mut projection = Projection::new(LookupKey::Transaction(id));
+    walk(&snapshot, &cut.descriptor, |event, _, _| {
+        projection.observe(&event)
+    })
+    .map_err(super::ledger_read_error)?;
+    if projection.ordinal != cut.checkpoint.transaction_count() as u64
+        || cut.resolved_prefix > projection.ordinal
+    {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    let result = TargetEvidence {
+        version: 1,
+        cut: cut.head(),
+        resolved_prefix: cut.resolved_prefix,
+        id,
+        record: projection
+            .finish_target()
+            .map_err(super::ledger_read_error)?,
+    };
+    result.validate().map_err(|_| D1Error::EventLedgerHistory)?;
+    Ok(result)
+}
+
 /// Recover only one original external-ID binding and its exact transaction.
 /// The ordinal counts admissions (Begin/AdmitRequest), never binding/grant
 /// events. Full structural closure still checks every later raw row on absence,
@@ -1745,75 +1827,21 @@ pub(super) fn lookup_request(
     id: [u8; 16],
 ) -> Result<RequestLookup, D1Error> {
     let snapshot = cut.snapshot(db)?;
-    let mut ordinal = 0u64;
-    let mut record: Option<RecoveredRequest> = None;
+    let mut projection = Projection::new(LookupKey::Request(id));
     walk(&snapshot, &cut.descriptor, |event, _, _| {
-        if matches!(&event, Command::Begin { .. } | Command::AdmitRequest { .. }) {
-            ordinal = ordinal
-                .checked_add(1)
-                .filter(|n| *n <= cut.descriptor.domain.cohort.profile.max_transactions() as u64)
-                .ok_or_else(|| anyhow::anyhow!("archive transaction ordinal exceeds bound"))?;
-        }
-        match event {
-            Command::AdmitRequest {
-                id: event_id,
-                request,
-                payload,
-                transaction_id,
-                participants,
-            } if event_id == id => {
-                anyhow::ensure!(record.is_none(), "duplicate retained external request");
-                anyhow::ensure!(
-                    !request.is_empty()
-                        && request.len() <= crate::transaction_decisions::MAX_REQUEST_BYTES
-                        && !payload.is_empty()
-                        && payload.len() <= crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES,
-                    "retained request exceeds original bounds"
-                );
-                let prepared = vec![false; participants.len()];
-                record = Some(RecoveredRequest {
-                    record: RequestRecord {
-                        id,
-                        request,
-                        payload,
-                        transaction_id,
-                    },
-                    transaction: Transaction {
-                        id: transaction_id,
-                        ordinal,
-                        participants,
-                        prepared,
-                        decision: None,
-                    },
-                });
-            }
-            Command::Prepared { id, participant } => {
-                if let Some(found) = record.as_mut().filter(|found| found.transaction.id == id) {
-                    anyhow::ensure!(
-                        found
-                            .transaction
-                            .record_prepared(&participant)
-                            .map_err(history_error)?,
-                        "duplicate retained prepare"
-                    );
-                }
-            }
-            Command::Decide { id, decision } => {
-                if let Some(found) = record.as_mut().filter(|found| found.transaction.id == id) {
-                    anyhow::ensure!(
-                        found
-                            .transaction
-                            .record_decision(decision)
-                            .map_err(history_error)?,
-                        "duplicate retained decision"
-                    );
-                }
-            }
-            _ => {}
-        }
-        Ok(())
+        projection.observe(&event)
     })
     .map_err(super::ledger_read_error)?;
+    let record = match projection
+        .finish_target()
+        .map_err(super::ledger_read_error)?
+    {
+        Some(found) => Some(RecoveredRequest {
+            record: found.request.ok_or(D1Error::RequestIndexHistory)?,
+            transaction: found.transaction,
+        }),
+        None => None,
+    };
     let result = RequestLookup {
         authority: cut.descriptor.domain.authority.clone(),
         cohort: cut.descriptor.domain.cohort.clone(),
@@ -2331,6 +2359,71 @@ mod tests {
         options.set_sync(true);
         db.write_opt(batch, &options).unwrap();
         cut
+    }
+
+    #[test]
+    fn target_projection_covers_direct_admitted_holes_and_complete_absence() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let state = archive_state(profile, 3);
+            let journal = state.coordinator.as_ref().unwrap().full().unwrap();
+            let cut = persist_archive(&db, &state, marker(20));
+            let expected: Vec<_> = [id(999), [1; 16], [2; 16], [3; 16], [200; 16]]
+                .into_iter()
+                .map(|id| TargetEvidence::from_journal(journal, id).unwrap())
+                .collect();
+            crate::transaction_decisions::without_full_journal(|| {
+                for target in &expected {
+                    assert_eq!(lookup_target(&db, &cut, target.id).unwrap(), *target);
+                }
+            });
+            assert!(expected[0].record.as_ref().unwrap().request.is_none());
+            assert!(expected[1].record.as_ref().unwrap().request.is_some());
+            assert_eq!(expected[1].resolved_prefix, 0);
+            // Corruption outside the selected target still invalidates positives
+            // and absence; no cursor or cached result can replace full closure.
+            db.put([PREFIX, b"foreign"].concat(), b"{}").unwrap();
+            for target in &expected {
+                assert!(lookup_target(&db, &cut, target.id).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn target_old_cut_never_borrows_later_admission_or_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let mut journal = bound();
+        let before = journal.history_cursor().unwrap();
+        journal.replay_event(begin(1)).unwrap();
+        let pending = journal.history_cursor().unwrap();
+        let cut = persist_archive(&db, &state(journal.clone()), marker(10));
+        let archive = verify_active(&db, &cut).unwrap();
+        journal.replay_event(decide(1, Decision::Abort)).unwrap();
+        journal.replay_event(begin(2)).unwrap();
+        let latest = journal.history_cursor().unwrap();
+        let overlay = archive
+            .member_overlay()
+            .merge_compatibility_journal(&journal)
+            .unwrap();
+        crate::transaction_decisions::without_full_journal(|| {
+            assert!(overlay.target_at_cut(&before, id(1)).unwrap().is_none());
+            assert!(overlay.target_at_cut(&pending, id(2)).unwrap().is_none());
+            let old = overlay.target_at_cut(&pending, id(1)).unwrap().unwrap();
+            assert_eq!(old.transaction.ordinal, 1);
+            assert_eq!(old.transaction.decision, None);
+            let current = overlay.target_at_cut(&latest, id(1)).unwrap().unwrap();
+            assert_eq!(current.transaction.decision, Some(Decision::Abort));
+            let mut forged = pending.clone();
+            forged.root[0] ^= 1;
+            assert!(overlay.target_at_cut(&forged, id(1)).is_err());
+            let future = latest.extend(&[begin(3)]).unwrap();
+            assert!(overlay.target_at_cut(&future, id(3)).is_err());
+        });
     }
 
     #[test]
@@ -2911,6 +3004,10 @@ mod tests {
             );
             assert!(expected.last().unwrap().record.is_none());
             assert!(expected.iter().all(|found| found.resolved_prefix == 0));
+            let targets: Vec<_> = [id(999), [1; 16], [2; 16], [3; 16], [4; 16], [200; 16]]
+                .into_iter()
+                .map(|id| TargetEvidence::from_journal(journal, id).unwrap())
+                .collect();
             let mut pages = Vec::new();
             for base in [0, 1, 31, 32, 33] {
                 for end in [base, 33, journal.events().len() as u64] {
@@ -2938,6 +3035,9 @@ mod tests {
                         lookup_request(&db, &reopened, expected.id).unwrap(),
                         expected
                     );
+                }
+                for target in targets {
+                    assert_eq!(lookup_target(&db, &reopened, target.id).unwrap(), target);
                 }
                 for page in pages {
                     assert_eq!(
@@ -3101,6 +3201,14 @@ mod tests {
                         "absent fault {fault}"
                     );
                     assert!(
+                        lookup_target(&db, &cut, [1; 16]).is_err(),
+                        "target fault {fault}"
+                    );
+                    assert!(
+                        lookup_target(&db, &cut, [200; 16]).is_err(),
+                        "absent target fault {fault}"
+                    );
+                    assert!(
                         history_page(&db, &cut, &zero, Some(&old_cut)).is_err(),
                         "page fault {fault}"
                     );
@@ -3115,6 +3223,8 @@ mod tests {
             let next = persist_archive(&db, &state, marker(9));
             assert!(lookup_request(&db, &cut, [65; 16]).is_err());
             assert!(history_page(&db, &cut, &zero, None).is_err());
+            assert!(lookup_target(&db, &cut, [1; 16]).is_err());
+            assert!(lookup_target(&db, &next, [1; 16]).is_ok());
             assert!(lookup_request(&db, &next, [65; 16]).is_ok());
         }
     }
