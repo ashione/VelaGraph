@@ -26,7 +26,7 @@ struct Domain {
     cohort: Cohort,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Role {
+pub(crate) enum Role {
     Coordinator,
     Member,
 }
@@ -63,7 +63,7 @@ impl<'a> View<'a> {
             )
         } else {
             let visibility = state.visibility.as_ref()?;
-            (Role::Member, &visibility.journal, visibility.applied)
+            (Role::Member, visibility.journal.full()?, visibility.applied)
         };
         let cohort = journal.cohort()?.clone();
         Some(Self {
@@ -127,7 +127,10 @@ pub(crate) fn enabled(state: &D1State) -> bool {
         .coordinator
         .as_ref()
         .is_some_and(|coordinator| coordinator.cohort().is_some())
-        || View::of(state).is_some()
+        || state
+            .visibility
+            .as_ref()
+            .is_some_and(|v| v.journal.cohort().is_some())
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,9 +308,11 @@ pub(crate) fn stage(
     Ok(Some(manifest))
 }
 
-/// Full immutable identity of a bound coordinator. The authority mode is the
-/// coordinator's managed mode; no separately supplied authority is accepted.
+/// Full immutable role, local identity and original coordinator authority.
+/// Member terminal frontiers are A; coordinator terminal frontiers are R.
 pub(crate) struct CheckpointIdentity {
+    pub(crate) role: Role,
+    pub(crate) authority: Authority,
     pub(crate) shard: u64,
     pub(crate) epoch: u64,
     pub(crate) mode: [u8; 16],
@@ -315,20 +320,42 @@ pub(crate) struct CheckpointIdentity {
 }
 impl CheckpointIdentity {
     fn domain(&self) -> anyhow::Result<Domain> {
+        self.cohort
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid decision cohort: {e:?}"))?;
+        let role = match self.role {
+            Role::Coordinator => {
+                anyhow::ensure!(
+                    self.shard == self.cohort.coordinator_shard
+                        && self.epoch == self.cohort.coordinator_epoch
+                        && self.authority.shard == self.shard
+                        && self.authority.mode == self.mode,
+                    "decision coordinator identity mismatch"
+                );
+                Role::Coordinator
+            }
+            Role::Member => {
+                anyhow::ensure!(
+                    self.cohort.members.iter().any(|m| m.shard == self.shard
+                        && m.epoch == self.epoch
+                        && m.mode == self.mode),
+                    "decision member identity mismatch"
+                );
+                Role::Member
+            }
+        };
         anyhow::ensure!(
-            self.shard == self.cohort.coordinator_shard
-                && self.epoch == self.cohort.coordinator_epoch,
-            "decision checkpoint identity mismatch"
+            self.mode != [0; 16]
+                && self.authority.mode != [0; 16]
+                && self.authority.shard == self.cohort.coordinator_shard,
+            "decision authority mismatch"
         );
         Ok(Domain {
-            role: Role::Coordinator,
+            role,
             shard: self.shard,
             epoch: self.epoch,
             mode: self.mode,
-            authority: Authority {
-                shard: self.shard,
-                mode: self.mode,
-            },
+            authority: self.authority.clone(),
             cohort: self.cohort.clone(),
         })
     }
@@ -403,6 +430,109 @@ pub(crate) fn validate_checkpoint_manifest(
         "decision manifest disagrees with published checkpoint"
     );
     Ok(())
+}
+
+/// Incremental comparison of a drained raw prefix with the complete derived
+/// namespace. At most one bounded terminal row is resident.
+pub(crate) struct CheckpointRows<I> {
+    rows: I,
+    manifest: Manifest,
+    current: Option<Row>,
+    next_ordinal: u64,
+    count: u64,
+    encoded: u64,
+}
+impl<I> CheckpointRows<I>
+where
+    I: Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>>,
+{
+    pub(crate) fn new(
+        identity: &CheckpointIdentity,
+        through: u64,
+        applied: Option<LogId<NodeId>>,
+        published: &[u8],
+        rows: I,
+    ) -> anyhow::Result<Self> {
+        validate_checkpoint_manifest(identity, through, applied, published)?;
+        Ok(Self {
+            rows,
+            manifest: serde_json::from_slice(published)?,
+            current: None,
+            next_ordinal: 1,
+            count: 0,
+            encoded: 0,
+        })
+    }
+
+    pub(crate) fn observe(&mut self, tx: &Transaction) -> anyhow::Result<()> {
+        if tx.ordinal > self.manifest.through {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tx.ordinal == self.next_ordinal,
+            "decision projection ordinal gap"
+        );
+        if self.current.is_none() {
+            anyhow::ensure!(
+                self.count < self.manifest.segments,
+                "extra decision projection"
+            );
+            let (key, value) = self
+                .rows
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing decision row"))??;
+            let first = self.next_ordinal;
+            anyhow::ensure!(
+                key.as_ref() == self.manifest.domain.key(first),
+                "foreign or missing decision row"
+            );
+            let row = Row::decode(&value)?;
+            let length = (self.manifest.through - first + 1).min(SEGMENT_TRANSACTIONS as u64);
+            anyhow::ensure!(
+                row.version == self.manifest.version
+                    && row.domain == self.manifest.domain
+                    && row.first == first
+                    && row.records.len() as u64 == length,
+                "decision row header or length mismatch"
+            );
+            self.encoded = self
+                .encoded
+                .checked_add((key.len() + value.len()) as u64)
+                .ok_or_else(|| anyhow::anyhow!("decision encoded overflow"))?;
+            anyhow::ensure!(
+                self.encoded <= self.manifest.encoded_bytes,
+                "extra decision encoded bytes"
+            );
+            self.count += 1;
+            self.current = Some(row);
+        }
+        let row = self.current.as_ref().unwrap();
+        let offset = (tx.ordinal - row.first) as usize;
+        anyhow::ensure!(
+            row.records.get(offset) == Some(&terminal(tx, tx.ordinal)?),
+            "decision row disagrees with original archive"
+        );
+        self.next_ordinal += 1;
+        if offset + 1 == row.records.len() {
+            self.current = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.next_ordinal - 1 == self.manifest.through
+                && self.current.is_none()
+                && self.count == self.manifest.segments
+                && self.encoded == self.manifest.encoded_bytes,
+            "incomplete decision namespace"
+        );
+        if let Some(item) = self.rows.next() {
+            let (key, _) = item?;
+            anyhow::ensure!(!key.starts_with(PREFIX), "extra or foreign decision row");
+        }
+        Ok(())
+    }
 }
 
 /// Check the old partial tail against exact transactions projected from the raw
@@ -546,6 +676,65 @@ pub(crate) fn stage_checkpoint(
     Ok(StagedCheckpointManifest { bytes })
 }
 
+/// A member manifest is bound to the exact state and raw staging witness, not
+/// merely its A/checkpoint values. Only the member witness writer can mint it.
+pub(crate) struct StagedMemberCheckpointManifest<'a> {
+    manifest: StagedCheckpointManifest,
+    state: &'a D1State,
+    descriptor: &'a crate::state_machine::event_ledger::Descriptor,
+}
+impl<'a> StagedMemberCheckpointManifest<'a> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.manifest.bytes()
+    }
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.manifest.into_bytes()
+    }
+    pub(crate) fn state(&self) -> &'a D1State {
+        self.state
+    }
+    pub(crate) fn descriptor(&self) -> &'a crate::state_machine::event_ledger::Descriptor {
+        self.descriptor
+    }
+}
+
+/// Member terminals advance through applied A, independently of observed R.
+/// Accept only exact projections privately bound to the staged raw candidate.
+pub(crate) fn stage_member_checkpoint<'a>(
+    batch: &mut WriteBatch,
+    before: &CheckedCheckpointTail,
+    consumed: &crate::state_machine::event_ledger::StagedMemberTerminals<'a>,
+    applied: Option<LogId<NodeId>>,
+) -> anyhow::Result<StagedMemberCheckpointManifest<'a>> {
+    let domain = &before.manifest.domain;
+    let descriptor = consumed.descriptor();
+    anyhow::ensure!(
+        domain.role == Role::Member
+            && consumed.previous() == before.manifest.through
+            && serde_json::to_vec(&before.manifest)? == consumed.previous_manifest()
+            && descriptor.domain.role == crate::state_machine::event_ledger::Role::Member
+            && descriptor.domain.shard == domain.shard
+            && descriptor.domain.epoch == domain.epoch
+            && descriptor.domain.mode == domain.mode
+            && descriptor.domain.authority == domain.authority
+            && descriptor.domain.cohort == domain.cohort
+            && descriptor.applied == applied,
+        "member terminal checkpoint does not match raw witness"
+    );
+    let manifest = stage_checkpoint(
+        batch,
+        before,
+        consumed.records(),
+        consumed.through(),
+        applied,
+    )?;
+    Ok(StagedMemberCheckpointManifest {
+        manifest,
+        state: consumed.state(),
+        descriptor,
+    })
+}
+
 fn checked_manifest(db: &DB, cached: &[u8], view: &View<'_>) -> Result<Manifest, D1Error> {
     if db
         .get(MANIFEST_KEY)
@@ -567,11 +756,51 @@ fn checked_manifest(db: &DB, cached: &[u8], view: &View<'_>) -> Result<Manifest,
 }
 /// Summary reads the atomically published manifest, without fetching any segment.
 pub(crate) fn frontier(state: &D1State, index: Option<(&DB, &[u8])>) -> Result<u64, D1Error> {
-    let view = View::of(state).ok_or(D1Error::DecisionIndexHistory)?;
-    match index {
-        Some((db, cached)) => Ok(checked_manifest(db, cached, &view)?.through),
-        None => Ok(view.through), // Only explicit legacy or memory-only callers.
+    let (history, role, through) = if let Some(history) = &state.coordinator {
+        (history, Role::Coordinator, history.resolved_prefix())
+    } else {
+        let visibility = state
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::DecisionIndexHistory)?;
+        (&visibility.journal, Role::Member, visibility.applied)
+    };
+    let identity = CheckpointIdentity {
+        role,
+        shard: state.shard,
+        epoch: state.epoch,
+        mode: state
+            .managed
+            .as_ref()
+            .ok_or(D1Error::DecisionIndexHistory)?
+            .mode_id,
+        authority: Authority {
+            shard: history
+                .cohort()
+                .ok_or(D1Error::DecisionIndexHistory)?
+                .coordinator_shard,
+            mode: history.authority(),
+        },
+        cohort: history
+            .cohort()
+            .ok_or(D1Error::DecisionIndexHistory)?
+            .clone(),
+    };
+    if let Some((db, cached)) = index {
+        if db
+            .get(MANIFEST_KEY)
+            .map_err(|_| D1Error::DecisionIndexUnavailable)?
+            .as_deref()
+            != Some(cached)
+        {
+            return Err(D1Error::DecisionIndexHistory);
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(cached).map_err(|_| D1Error::DecisionIndexHistory)?;
+        validate_checkpoint_manifest(&identity, through, manifest.applied, cached)
+            .map_err(|_| D1Error::DecisionIndexHistory)?;
     }
+    Ok(through)
 }
 /// Fetch only segments intersecting 1..=version, checking every loaded row against
 /// that exact authority. An old partial tail is trimmed without changing old V.
@@ -701,6 +930,8 @@ mod tests {
 
     fn checkpoint_identity(view: &View<'_>) -> CheckpointIdentity {
         CheckpointIdentity {
+            role: Role::Coordinator,
+            authority: view.domain.authority.clone(),
             shard: view.domain.shard,
             epoch: view.domain.epoch,
             mode: view.domain.mode,

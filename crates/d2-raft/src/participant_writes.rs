@@ -55,8 +55,16 @@ impl Intent {
 pub(crate) struct State {
     pub authority: Authority,
     pub activated_sequence: u64,
+    #[serde(deserialize_with = "deserialize_intents")]
     pub records: Vec<Intent>,
 }
+fn deserialize_intents<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Intent>, D::Error> {
+    crate::capacity_policy::deserialize_bounded_vec(
+        d,
+        crate::transaction_decisions::CapacityProfile::ByteBound16MiBV1.max_intents(),
+    )
+}
+
 impl State {
     pub fn pending(&self) -> bool {
         self.records.iter().any(|r| r.decision.is_none())
@@ -249,9 +257,40 @@ impl D1State {
         request: D1WriteRequest,
         history: Option<&Self>,
     ) -> Result<D1Result, D1Error> {
+        self.prepare_participant_inner(authority, descriptor, request, history, None)
+    }
+
+    pub(crate) fn prepare_participant_with_evidence(
+        &mut self,
+        authority: &Authority,
+        descriptor: Participant,
+        request: D1WriteRequest,
+        history: Option<&Self>,
+        evidence: &dyn crate::versioned_reads::MemberHistory,
+    ) -> Result<D1Result, D1Error> {
+        self.prepare_participant_inner(authority, descriptor, request, history, Some(evidence))
+    }
+
+    fn prepare_participant_inner(
+        &mut self,
+        authority: &Authority,
+        descriptor: Participant,
+        request: D1WriteRequest,
+        history: Option<&Self>,
+        evidence: Option<&dyn crate::versioned_reads::MemberHistory>,
+    ) -> Result<D1Result, D1Error> {
         self.check_participant(authority, &descriptor)?;
         request.validate()?;
-        self.check_capacity_prepare(&descriptor, request.request_id, Some(&request))?;
+        if let Some(evidence) = evidence {
+            self.check_capacity_prepare_with_evidence(
+                &descriptor,
+                request.request_id,
+                Some(&request),
+                evidence,
+            )?;
+        } else {
+            self.check_capacity_prepare(&descriptor, request.request_id, Some(&request))?;
+        }
         if request.request_id == [0; 16]
             || request.shard != descriptor.shard
             || request.epoch != descriptor.epoch
@@ -268,7 +307,16 @@ impl D1State {
             return Ok(D1Result::Participant(record.status()));
         }
         if let Some(visibility) = &self.visibility {
-            if let Some(tx) = visibility.journal.transaction(request.request_id) {
+            let tx = match evidence {
+                Some(evidence) => evidence.transaction(request.request_id)?,
+                None => visibility
+                    .journal
+                    .full()
+                    .ok_or(D1Error::VisibilityHistory)?
+                    .transaction(request.request_id)
+                    .cloned(),
+            };
+            if let Some(tx) = tx {
                 if !tx.participants.contains(&descriptor) {
                     return Err(D1Error::IdempotencyConflict);
                 }
@@ -402,5 +450,421 @@ impl D1State {
                 None
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod active_member_tests {
+    use super::*;
+    use crate::coordinator_state::History;
+    use crate::transaction_decisions::{
+        checkpoint::ActiveCheckpoint, CapacityActivation, CapacityProfile, Cohort, Command,
+        Journal, Member, MemberCapacityGrant,
+    };
+    use std::sync::Arc;
+
+    fn authority() -> Authority {
+        Authority {
+            shard: 9,
+            mode: [9; 16],
+        }
+    }
+    fn descriptor() -> Participant {
+        Participant {
+            shard: 1,
+            epoch: 1,
+            mode: [1; 16],
+            intent: [1; 32],
+        }
+    }
+    fn request(id: u8, sequence: u64) -> D1WriteRequest {
+        D1WriteRequest {
+            shard: 1,
+            epoch: 1,
+            request_id: [id; 16],
+            expected_sequence: Some(sequence),
+            operations: vec![crate::WriteOp::put("x", "value")],
+        }
+    }
+    fn observe(state: &mut D1State, journal: &Journal) {
+        state.visibility.as_mut().unwrap().journal =
+            History::Active(Arc::new(ActiveCheckpoint::from_journal(journal).unwrap()));
+    }
+    fn fixture(profile: CapacityProfile) -> (D1State, Journal) {
+        let cohort = Cohort {
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: vec![Member {
+                shard: 1,
+                epoch: 1,
+                mode: [1; 16],
+            }],
+            profile,
+        };
+        let activation = CapacityActivation {
+            nonce: [7; 32],
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+        };
+        let mut journal = Journal::new([9; 16]).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: cohort.clone(),
+            })
+            .unwrap();
+        if !profile.is_legacy() {
+            journal
+                .apply(Command::ConfirmCohortCapacity {
+                    cohort: cohort.clone(),
+                    grants: vec![MemberCapacityGrant {
+                        member: cohort.members[0].clone(),
+                        activation: activation.clone(),
+                    }],
+                })
+                .unwrap();
+        }
+        let mut state = D1State::new(1, 1);
+        state.enable_managed(1, 1, 0, [1; 16]).unwrap();
+        state.participant = Some(State {
+            authority: authority(),
+            activated_sequence: 0,
+            records: vec![],
+        });
+        state.version = if profile.is_legacy() { 6 } else { 7 };
+        state.visibility = Some(crate::versioned_reads::State {
+            baseline_sequence: 0,
+            epoch: 1,
+            applied: 0,
+            journal: journal.clone().into(),
+            commits: vec![],
+            activation: (!profile.is_legacy()).then_some(activation),
+        });
+        observe(&mut state, &journal);
+        (state, journal)
+    }
+    fn admit(journal: &mut Journal, request: &D1WriteRequest) {
+        let plan = crate::request_plans::Plan {
+            version: 1,
+            id: request.request_id,
+            authority: authority(),
+            cohort: journal.cohort().unwrap().clone(),
+            validation_version: 0,
+            parts: vec![crate::request_plans::Part {
+                descriptor: descriptor(),
+                request: request.clone(),
+            }],
+        };
+        journal
+            .apply(Command::AdmitRequest {
+                id: request.request_id,
+                request: vec![1],
+                payload: plan.encode().unwrap(),
+                transaction_id: request.request_id,
+                participants: vec![descriptor()],
+            })
+            .unwrap();
+    }
+    fn prepare(
+        state: &mut D1State,
+        request: D1WriteRequest,
+        journal: &Journal,
+    ) -> Result<D1Result, D1Error> {
+        state.prepare_participant_with_evidence(&authority(), descriptor(), request, None, journal)
+    }
+
+    // A verified operation can project its target without looking up untouched
+    // resident IDs or Plans. Any accidental historical point lookup fails here.
+    struct TargetOnlyEvidence<'a>(&'a Journal);
+    impl crate::versioned_reads::MemberHistory for TargetOnlyEvidence<'_> {
+        fn transaction(
+            &self,
+            _: [u8; 16],
+        ) -> Result<Option<crate::transaction_decisions::Transaction>, D1Error> {
+            panic!("untouched resident transaction was projected")
+        }
+        fn request_for_transaction(
+            &self,
+            _: [u8; 16],
+        ) -> Result<Option<crate::transaction_decisions::RequestRecord>, D1Error> {
+            panic!("untouched resident original Plan was projected")
+        }
+        fn transaction_at(
+            &self,
+            ordinal: u64,
+        ) -> Result<Option<crate::transaction_decisions::Transaction>, D1Error> {
+            Ok(self.0.transaction_at(ordinal).cloned())
+        }
+    }
+
+    #[test]
+    fn changed_pending_descriptor_conflicts_without_advancing_visibility() {
+        let (mut state, mut journal) = fixture(CapacityProfile::LegacyCountV1);
+        prepare(&mut state, request(2, 0), &journal).unwrap();
+        let mut conflicting = descriptor();
+        conflicting.intent = [2; 32];
+        let event = Command::Begin {
+            id: [2; 16],
+            participants: vec![conflicting],
+        };
+        journal.apply(event.clone()).unwrap();
+        observe(&mut state, &journal);
+        assert_eq!(
+            state.validate_member_history_changes(&journal, &[event]),
+            Err(D1Error::VisibilityHistory)
+        );
+        assert_eq!(state.visibility.as_ref().unwrap().applied, 0);
+        assert_eq!(state.sequence, 0);
+    }
+
+    #[test]
+    fn unchanged_records_need_no_point_or_plan_projection() {
+        let (mut state, mut journal) = fixture(CapacityProfile::ByteBound16MiBV1);
+        let original = request(2, 0);
+        admit(&mut journal, &original);
+        observe(&mut state, &journal);
+        prepare(&mut state, original, &journal).unwrap();
+        let previous_events = journal.events().len();
+        admit(&mut journal, &request(3, 0));
+        observe(&mut state, &journal);
+        state
+            .validate_member_history_changes(
+                &TargetOnlyEvidence(&journal),
+                &journal.events()[previous_events..],
+            )
+            .unwrap();
+        state
+            .validate_member_history_changes(&TargetOnlyEvidence(&journal), &[])
+            .unwrap();
+        let decision = Command::Decide {
+            id: [2; 16],
+            decision: Decision::Abort,
+        };
+        journal.apply(decision.clone()).unwrap();
+        observe(&mut state, &journal);
+        state
+            .validate_member_history_changes(&journal, &[decision])
+            .unwrap();
+        assert_eq!(state.visibility.as_ref().unwrap().applied, 0);
+        state
+            .advance_member_transaction(
+                journal.transaction_at(1).unwrap().clone(),
+                &TargetOnlyEvidence(&journal),
+                None,
+            )
+            .unwrap();
+        assert_eq!(state.visibility.as_ref().unwrap().applied, 1);
+        assert_eq!(state.sequence, 0);
+        state
+            .visibility
+            .as_mut()
+            .unwrap()
+            .activation
+            .as_mut()
+            .unwrap()
+            .nonce = [8; 32];
+        assert_eq!(
+            state.validate_member_history_changes(&TargetOnlyEvidence(&journal), &[]),
+            Err(D1Error::VisibilityHistory)
+        );
+    }
+
+    #[test]
+    fn touched_terminal_identity_rechecks_exact_local_decision() {
+        let (mut state, mut journal) = fixture(CapacityProfile::LegacyCountV1);
+        let original = request(2, 0);
+        journal
+            .apply(Command::Begin {
+                id: original.request_id,
+                participants: vec![descriptor()],
+            })
+            .unwrap();
+        let mut conflicting = journal.clone();
+        observe(&mut state, &journal);
+        prepare(&mut state, original, &journal).unwrap();
+        journal
+            .apply(Command::Decide {
+                id: [2; 16],
+                decision: Decision::Abort,
+            })
+            .unwrap();
+        observe(&mut state, &journal);
+        state
+            .advance_member_transaction(journal.transaction_at(1).unwrap().clone(), &journal, None)
+            .unwrap();
+        conflicting
+            .apply(Command::Prepared {
+                id: [2; 16],
+                participant: descriptor(),
+            })
+            .unwrap();
+        let event = Command::Decide {
+            id: [2; 16],
+            decision: Decision::Commit,
+        };
+        conflicting.apply(event.clone()).unwrap();
+        assert_eq!(
+            state.validate_member_history_changes(&conflicting, &[event]),
+            Err(D1Error::VisibilityHistory)
+        );
+        assert_eq!(
+            state.participant.as_ref().unwrap().status([2; 16]),
+            Status::Aborted
+        );
+        assert_eq!(state.visibility.as_ref().unwrap().applied, 1);
+    }
+
+    #[test]
+    fn drained_byte_abort_requires_original_plan_and_consumption_without_tombstone() {
+        let (mut state, mut journal) = fixture(CapacityProfile::ByteBound16MiBV1);
+        let original = request(2, 0);
+        admit(&mut journal, &original);
+        journal
+            .apply(Command::Decide {
+                id: original.request_id,
+                decision: Decision::Abort,
+            })
+            .unwrap();
+        observe(&mut state, &journal);
+        assert_eq!(
+            prepare(&mut state, original.clone(), &journal),
+            Err(D1Error::VisibilityUnresolved)
+        );
+        let tx = journal.transaction_at(1).unwrap().clone();
+        state
+            .advance_member_transaction(tx.clone(), &journal, None)
+            .unwrap();
+        assert_eq!(
+            prepare(&mut state, original.clone(), &journal),
+            Ok(D1Result::Participant(Status::Aborted))
+        );
+        let mut changed = original.clone();
+        changed.operations = vec![crate::WriteOp::put("x", "changed")];
+        assert_eq!(
+            prepare(&mut state, changed, &journal),
+            Err(D1Error::IdempotencyConflict)
+        );
+        let mut wrong = descriptor();
+        wrong.intent = [2; 32];
+        assert_eq!(
+            state.prepare_participant_with_evidence(
+                &authority(),
+                wrong,
+                original.clone(),
+                None,
+                &journal
+            ),
+            Err(D1Error::ParticipantIdentity)
+        );
+        assert!(state.participant.as_ref().unwrap().records.is_empty());
+        state
+            .advance_member_transaction(tx, &journal, None)
+            .unwrap();
+        assert_eq!(state.visibility.as_ref().unwrap().applied, 1);
+        state
+            .visibility
+            .as_mut()
+            .unwrap()
+            .activation
+            .as_mut()
+            .unwrap()
+            .nonce = [8; 32];
+        assert_eq!(
+            prepare(&mut state, original, &journal),
+            Err(D1Error::VisibilityHistory)
+        );
+    }
+
+    #[test]
+    fn prepared_byte_retry_checks_plan_before_idempotent_status() {
+        let (mut state, mut journal) = fixture(CapacityProfile::ByteBound16MiBV1);
+        let mut incompatible = journal.clone();
+        let original = request(2, 0);
+        admit(&mut journal, &original);
+        observe(&mut state, &journal);
+        assert_eq!(
+            prepare(&mut state, original.clone(), &journal),
+            Ok(D1Result::Participant(Status::Prepared))
+        );
+        let mut changed = original.clone();
+        changed.expected_sequence = Some(1);
+        assert_eq!(
+            prepare(&mut state, changed, &journal),
+            Err(D1Error::IdempotencyConflict)
+        );
+        assert_eq!(
+            prepare(&mut state, original.clone(), &journal),
+            Ok(D1Result::Participant(Status::Prepared))
+        );
+        let mut changed_plan = original;
+        changed_plan.operations = vec![crate::WriteOp::put("x", "different original Plan")];
+        admit(&mut incompatible, &changed_plan);
+        assert_eq!(
+            state.validate_member_history(&incompatible),
+            Err(D1Error::IdempotencyConflict)
+        );
+        assert_eq!(state.visibility.as_ref().unwrap().applied, 0);
+        assert_eq!(state.sequence, 0);
+    }
+
+    #[test]
+    fn full_intent_bytes_do_not_strand_unknown_abort() {
+        let (mut state, mut journal) = fixture(CapacityProfile::LegacyCountV1);
+        let mut large = request(2, 0);
+        large.operations = vec![crate::WriteOp::put(
+            "big",
+            vec![0; MAX_INTENT_BYTES - 256 - 128 - 64 - 3],
+        )];
+        journal
+            .apply(Command::Begin {
+                id: large.request_id,
+                participants: vec![descriptor()],
+            })
+            .unwrap();
+        observe(&mut state, &journal);
+        prepare(&mut state, large.clone(), &journal).unwrap();
+        journal
+            .apply(Command::Prepared {
+                id: large.request_id,
+                participant: descriptor(),
+            })
+            .unwrap();
+        journal
+            .apply(Command::Decide {
+                id: large.request_id,
+                decision: Decision::Commit,
+            })
+            .unwrap();
+        observe(&mut state, &journal);
+        state
+            .advance_member_transaction(journal.transaction_at(1).unwrap().clone(), &journal, None)
+            .unwrap();
+        let late = request(3, 1);
+        journal
+            .apply(Command::Begin {
+                id: late.request_id,
+                participants: vec![descriptor()],
+            })
+            .unwrap();
+        observe(&mut state, &journal);
+        assert_eq!(
+            prepare(&mut state, late.clone(), &journal),
+            Err(D1Error::ParticipantCapacity)
+        );
+        journal
+            .apply(Command::Decide {
+                id: late.request_id,
+                decision: Decision::Abort,
+            })
+            .unwrap();
+        observe(&mut state, &journal);
+        state
+            .advance_member_transaction(journal.transaction_at(2).unwrap().clone(), &journal, None)
+            .unwrap();
+        assert_eq!(
+            prepare(&mut state, late, &journal),
+            Ok(D1Result::Participant(Status::Aborted))
+        );
+        assert_eq!(state.participant.as_ref().unwrap().records.len(), 1);
+        assert_eq!(state.visibility.as_ref().unwrap().commits.len(), 1);
+        assert_eq!(state.sequence, 1);
     }
 }

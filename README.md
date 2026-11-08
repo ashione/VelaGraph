@@ -726,3 +726,9 @@ This profile replaces the legacy 256/1,024 count quotas with byte-derived guards
 while the 16 MiB reserved Journal, local D1 limits, complete replay/snapshots and
 whole-frame bounds remain. Existing/default cohorts stay legacy; there is no
 online conversion or unlimited-lifetime claim. New managed peers require RPC v5.
+
+The draft [consumed member checkpoint](docs/MEMBER_ACTIVE_CHECKPOINT.md) replaces
+bound durable member resident/ordinary-apply Journal with shared observed active
+state and exact original raw projections. It keeps every existing capacity limit
+and full SnapshotV1/legacy compatibility boundary; acceptance and higher-lifetime
+capacity are not claimed.

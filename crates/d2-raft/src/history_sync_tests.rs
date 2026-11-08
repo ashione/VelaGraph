@@ -178,7 +178,14 @@ async fn sync_all(sm: &mut Arc<StateMachine>, journal: &Journal) -> HistoryCurso
     }
 }
 async fn d1_bytes(sm: &StateMachine) -> Vec<u8> {
-    serde_json::to_vec(sm.state.read().await.d1.as_ref().unwrap()).unwrap()
+    let state = sm.state.read().await;
+    let mut complete = sm
+        .load_disk_state(&state)
+        .unwrap()
+        .map(|loaded| loaded.state)
+        .unwrap_or_else(|| state.d1.as_ref().unwrap().clone());
+    complete.dedup = state.d1.as_ref().unwrap().dedup.clone();
+    serde_json::to_vec(&complete).unwrap()
 }
 fn limit() -> ReadLimit {
     ReadLimit {
@@ -630,14 +637,16 @@ async fn synced_original_request_and_plan_survive_abort_retry_reopen_and_snapsho
     drop(sm);
     let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
     let state = sm.state.read().await;
-    let retained = &state
-        .d1
-        .as_ref()
-        .unwrap()
+    let complete = sm.load_disk_state(&state).unwrap().unwrap();
+    let retained = complete
+        .state
         .visibility
         .as_ref()
         .unwrap()
-        .journal;
+        .journal
+        .full()
+        .unwrap();
+
     assert_eq!(retained.request([1; 16]), Some(&original));
     assert_eq!(retained.encode().unwrap(), j.encode().unwrap());
     drop(state);
@@ -657,6 +666,8 @@ async fn synced_original_request_and_plan_survive_abort_retry_reopen_and_snapsho
             .as_ref()
             .unwrap()
             .journal
+            .full()
+            .unwrap()
             .request([1; 16]),
         Some(&original)
     );
@@ -746,7 +757,19 @@ async fn full_intent_abort(byte_profile: bool) {
     assert_eq!(d1.participant.as_ref().unwrap().records.len(), 1);
     assert_eq!(d1.sequence, 1);
     assert_eq!(d1.visibility.as_ref().unwrap().applied, 2);
-    d1.validate().unwrap();
+    // The resident active checkpoint deliberately cannot stand in for complete
+    // validation. Exercise the real cold materialization boundary, then retain
+    // the original full D1 invariant and compare both observed and applied cuts.
+    let mut complete = sm.load_disk_state(&state).unwrap().unwrap().state;
+    complete.dedup = d1.dedup.clone();
+    let cold_visibility = complete.visibility.as_ref().unwrap();
+    let resident_visibility = d1.visibility.as_ref().unwrap();
+    assert_eq!(cold_visibility.applied, resident_visibility.applied);
+    assert_eq!(
+        &ActiveCheckpoint::from_journal(cold_visibility.journal.full().unwrap()).unwrap(),
+        resident_visibility.journal.active().unwrap()
+    );
+    complete.validate().unwrap();
     let marker = state.last_applied_log;
     drop(state);
     drop(sm);
@@ -1170,7 +1193,7 @@ mod byte_capacity {
         }
         state.sequence = crate::MAX_DEDUP_REQUESTS as u64;
         state.visibility.as_mut().unwrap().applied = state.sequence;
-        state.visibility.as_mut().unwrap().journal = journal.clone();
+        state.visibility.as_mut().unwrap().journal = journal.clone().into();
         state.validate().unwrap();
         let first_request = state.dedup[0].request.clone();
         let mut image = origin.build_snapshot().await.unwrap();

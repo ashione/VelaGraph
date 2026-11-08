@@ -6,6 +6,16 @@ use crate::capacity_policy::BYTE_MAX_TRANSACTIONS;
 pub(crate) const MAX_ACTIVE_CHECKPOINT_BYTES: usize =
     (4 * MAX_JOURNAL_BYTES).div_ceil(3) + 64 * 1024;
 
+/// Shared contiguous-front reduction for compact apply and validated-history
+/// projections. A terminal beyond an earlier hole never advances the prefix.
+pub(crate) fn next_resolved(resolved: u64, tx: &Transaction) -> Result<Option<u64>, Error> {
+    let next = resolved.checked_add(1).ok_or(Error::Capacity)?;
+    if tx.ordinal != next {
+        return Err(Error::InvalidJournal);
+    }
+    Ok(tx.decision.is_some().then_some(next))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LookupKey {
     Request([u8; 16]),
@@ -466,12 +476,10 @@ impl ActiveCheckpoint {
     pub(crate) fn capacity_profile(&self) -> CapacityProfile {
         self.header.profile()
     }
-    #[cfg(test)]
     pub(crate) fn transaction_count(&self) -> usize {
         // validate bounds this by the profile's usize count ceiling.
         self.header.transactions as usize
     }
-    #[cfg(test)]
     pub(crate) fn capacity_grants(&self) -> Option<&[MemberCapacityGrant]> {
         self.header.capacity_grants.as_deref()
     }
@@ -497,7 +505,6 @@ impl ActiveCheckpoint {
     pub(crate) fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
-    #[cfg(test)]
     pub(crate) fn active_transactions(&self) -> &[Transaction] {
         &self.active
     }
@@ -641,17 +648,15 @@ impl ActiveCheckpoint {
                     .ok_or(Error::InvalidJournal)? = tx;
             }
         }
-        let count = candidate
-            .active
-            .iter()
-            .take_while(|tx| tx.decision.is_some())
-            .count();
+        let mut count = 0;
+        for tx in &candidate.active {
+            let Some(next) = next_resolved(candidate.header.resolved, tx)? else {
+                break;
+            };
+            candidate.header.resolved = next;
+            count += 1;
+        }
         let drained = candidate.active.drain(..count).collect();
-        candidate.header.resolved = candidate
-            .header
-            .resolved
-            .checked_add(u64::try_from(count).map_err(|_| Error::Capacity)?)
-            .ok_or(Error::Capacity)?;
         candidate.validate()?;
         *self = candidate;
         Ok(AppliedTransition {

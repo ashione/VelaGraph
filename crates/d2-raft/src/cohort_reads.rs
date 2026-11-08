@@ -464,6 +464,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_cohort_same_version_survives_continuing_writes_and_refuses_partial_apply() {
+        let _resources = crate::managed_rpc::test_resource_guard().await;
         let cluster = Cluster::new();
         let mut j = Journal::new([9; 16]).unwrap();
         j.apply(Command::BindCohort { cohort: cohort() }).unwrap();

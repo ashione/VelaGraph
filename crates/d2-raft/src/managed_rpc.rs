@@ -342,6 +342,17 @@ fn outbound_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOTS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENCY)))
 }
+// Test fixtures using these process-global budgets must not consume one
+// another's admission. Only top-level tests lock this guard, before deadlines;
+// all clients, spawned work and internal concurrency retain production pools.
+#[cfg(test)]
+pub(crate) async fn test_resource_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static TESTS: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    TESTS
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 // The permit lives in the blocking closure, including after a caller times out.
 async fn cpu<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, Error> + Send + 'static,
@@ -2342,6 +2353,7 @@ mod tests {
     }
     #[tokio::test]
     async fn oversized_length_is_rejected_before_payload() {
+        let _resources = test_resource_guard().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let writer = tokio::spawn(async move {
@@ -2409,6 +2421,7 @@ mod tests {
     }
     #[tokio::test]
     async fn forged_replies_and_slow_input_fail_closed() {
+        let _resources = test_resource_guard().await;
         for wrong in 0..5 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Client::new(
@@ -2475,6 +2488,7 @@ mod tests {
     }
     #[tokio::test]
     async fn server_rejects_unready_state_and_wrong_node_at_startup() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let node = Arc::new(cluster.in_group(9).start(1).await.unwrap());
         let mut wrong = identity();
@@ -2517,6 +2531,56 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&a.slots, &b.slots));
     }
+    #[tokio::test]
+    async fn global_outbound_saturation_rejects_fifth_call_then_recovers() {
+        let _resources = test_resource_guard().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let a = Client::new(
+            listener.local_addr().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let b = Client::new(
+            listener.local_addr().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&a.slots, &b.slots));
+        assert!(Arc::ptr_eq(&a.slots, outbound_slots()));
+        let held: Vec<_> = (0..CONCURRENCY)
+            .map(|_| a.slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(a.slots.available_permits(), 0);
+        assert!(matches!(
+            b.call(Operation::Journal {
+                authority: identity().authority,
+                epoch: 1
+            })
+            .await,
+            Err(Error::Capacity)
+        ));
+        assert!(listener
+            .accept()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock));
+        drop(held);
+        assert_eq!(b.slots.available_permits(), CONCURRENCY);
+        let (recovered, peer) = fake_value(identity(), Value::Journal(terminal_journal(1))).await;
+        assert!(Arc::ptr_eq(&a.slots, &recovered.slots));
+        assert_eq!(
+            NodeRef::Remote(&recovered)
+                .journal(&identity().authority, 1)
+                .await
+                .unwrap()
+                .transaction_count(),
+            1
+        );
+        peer.await.unwrap();
+        assert_eq!(a.slots.available_permits(), CONCURRENCY);
+    }
+
     #[test]
     fn terminal_proof_is_encoded_once_and_detects_other_histories() {
         let id = identity();
@@ -2673,6 +2737,7 @@ mod tests {
     }
     #[tokio::test]
     async fn point_request_rejects_invalid_outbound_identity_without_connecting() {
+        let _resources = test_resource_guard().await;
         let mut participant = identity();
         participant.role = Role::Participant;
         participant.target = Target {
@@ -2710,6 +2775,7 @@ mod tests {
     }
     #[tokio::test]
     async fn point_request_returns_exact_record_or_absence_without_journal() {
+        let _resources = test_resource_guard().await;
         for present in [true, false] {
             let mut lookup = request_lookup();
             if !present {
@@ -2728,6 +2794,7 @@ mod tests {
     }
     #[tokio::test]
     async fn point_request_rejects_substituted_and_malformed_evidence() {
+        let _resources = test_resource_guard().await;
         for fault in 0..25 {
             let mut value = serde_json::to_value(request_lookup()).unwrap();
             match fault {
@@ -2935,6 +3002,7 @@ mod tests {
     }
     #[tokio::test]
     async fn matching_envelopes_cannot_substitute_history_status_or_sync_cursor() {
+        let _resources = test_resource_guard().await;
         let journal = terminal_journal(1);
         let base = journal.history_cursor_at(1).unwrap();
         let page = journal.history_page(&base, None).unwrap();
@@ -2999,6 +3067,7 @@ mod tests {
     }
     #[tokio::test]
     async fn matching_envelopes_cannot_substitute_history_page_base_cut_or_chain() {
+        let _resources = test_resource_guard().await;
         let journal = terminal_journal(1);
         let base = journal.history_cursor_at(1).unwrap();
         let page = journal.history_page(&base, None).unwrap();
@@ -3019,14 +3088,12 @@ mod tests {
                 _ => changed = journal.history_page(&page.end, Some(&page.cut)).unwrap(),
             }
             let (client, peer) = fake_value(identity(), Value::HistoryPage(changed)).await;
+            let actual = NodeRef::Remote(&client)
+                .history_page(&identity().authority, 1, &base, Some(&page.cut))
+                .await;
             assert!(
-                matches!(
-                    NodeRef::Remote(&client)
-                        .history_page(&identity().authority, 1, &base, Some(&page.cut))
-                        .await,
-                    Err(Error::Identity | Error::Protocol)
-                ),
-                "fault {fault}"
+                matches!(actual, Err(Error::Identity | Error::Protocol)),
+                "fault {fault}: {actual:?}"
             );
             peer.await.unwrap();
         }
@@ -3055,6 +3122,7 @@ mod tests {
     }
     #[tokio::test]
     async fn matching_envelopes_cannot_substitute_journal_visibility_or_read_evidence() {
+        let _resources = test_resource_guard().await;
         let observed = terminal_journal(1);
         let mut wrong_cohort = identity().cohort;
         wrong_cohort.members[0].epoch = 2;
@@ -3152,6 +3220,7 @@ mod tests {
     }
     #[tokio::test]
     async fn acquisition_requests_only_summary_and_chosen_cut_not_full_archive() {
+        let _resources = test_resource_guard().await;
         async fn sequence(id: Identity, values: Vec<Value>) -> (Client, JoinHandle<Vec<u8>>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client =
@@ -3251,6 +3320,7 @@ mod tests {
     }
     #[tokio::test]
     async fn summary_and_terminal_reply_identity_and_version_are_not_certificates() {
+        let _resources = test_resource_guard().await;
         for fault in 0..5 {
             let mut summary = CoordinatorSummary {
                 authority: identity().authority,
@@ -3333,6 +3403,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_server_bounds_incomplete_input_and_remains_available() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let node = Arc::new(cluster.in_group(9).start(1).await.unwrap());
         node.raft
@@ -3452,6 +3523,7 @@ mod tests {
     }
     #[tokio::test]
     async fn wrong_fixed_target_mode_role_and_history_never_connect() {
+        let _resources = test_resource_guard().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut id = identity();
         id.role = Role::Participant;
@@ -3713,6 +3785,7 @@ mod tests {
     }
     #[tokio::test]
     async fn matching_envelopes_cannot_substitute_capacity_binding_or_generation_shape() {
+        let _resources = test_resource_guard().await;
         let id = byte_member_identity(7);
         for fault in 0..8 {
             let mut status = CapacityGrantStatus {
@@ -3770,6 +3843,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn activation_entropy_failure_and_lost_ack_retry_preserve_first_generation() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let id = byte_member_identity(7);
         let node = capacity_node(&cluster, &id).await;
@@ -3846,6 +3920,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn actual_coordinator_owns_all_grants_and_retains_confirmation_offline() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let id = byte_identity();
         let coordinator = capacity_node(&cluster, &id).await;
@@ -4147,6 +4222,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actual_grant_status_checks_pinned_group_node_and_profile() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let id = byte_member_identity(7);
         let node = capacity_node(&cluster, &id).await;
@@ -4228,6 +4304,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn actual_quorum_loss_bounds_activation_submit_and_releases_cpu_permit() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let id = byte_member_identity(7);
         let group = cluster.in_group(id.group);
@@ -4326,6 +4403,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stopped_leader_confirmation_fails_closed_with_bounded_deadline() {
+        let _resources = test_resource_guard().await;
         let cluster = crate::Cluster::new();
         let id = byte_identity();
         let coordinator = capacity_node(&cluster, &id).await;

@@ -230,6 +230,158 @@ type MemberHeader = MemberMetadata<
     Descriptor,
 >;
 
+// Disk17 has its own member envelope. The existing 16 MiB logical Intent
+// budget can expand to nearly 64 MiB in byte-array JSON; it is NOT bounded by
+// the coordinator shell or one raw event row. Four encoded bytes cover every
+// byte and the existing fixed per-operation/request/intent charges cover JSON
+// punctuation and maximum-width scalar/identity fields. Each commit is <256
+// encoded bytes, at most MAX_DEDUP_REQUESTS; the remaining shell is <16 KiB.
+const MAX_ACTIVE_MEMBER_METADATA_BYTES: usize = 4 * crate::participant_writes::MAX_INTENT_BYTES
+    + 256 * MAX_DEDUP_REQUESTS
+    + crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES
+    + MAX_ACTIVE_METADATA_OVERHEAD;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveMemberMetadata<M, P, C, L, A> {
+    version: u32,
+    shard: u64,
+    epoch: u64,
+    sequence: u64,
+    #[serde(deserialize_with = "required_option")]
+    dedup_bytes_limit: Option<usize>,
+    managed: M,
+    participant: P,
+    visibility: VisibilityMetadata<C>,
+    ledger: L,
+    checkpoint: A,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct BoundedCommits(
+    #[serde(deserialize_with = "crate::versioned_reads::deserialize_commits")]
+    Vec<crate::versioned_reads::CommitVersion>,
+);
+type ActiveMemberHeader = ActiveMemberMetadata<
+    D1ManagedMode,
+    crate::participant_writes::State,
+    BoundedCommits,
+    Descriptor,
+    ActiveCheckpoint,
+>;
+
+pub(super) fn active_member_metadata_bytes(
+    state: &D1State,
+    descriptor: &Descriptor,
+    checkpoint: &ActiveCheckpoint,
+) -> anyhow::Result<Vec<u8>> {
+    let visibility = state
+        .visibility
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("active member lacks visibility"))?;
+    let participant = state
+        .participant
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("active member lacks participant"))?;
+    let managed = state
+        .managed
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("active member lacks managed mode"))?;
+    anyhow::ensure!(
+        state.coordinator.is_none(),
+        "active member has coordinator role"
+    );
+    match &visibility.journal {
+        Coordinator::Full(journal) => anyhow::ensure!(
+            ActiveCheckpoint::from_journal(journal)
+                .map_err(|e| anyhow::anyhow!("checkpoint derivation: {e:?}"))?
+                == *checkpoint,
+            "member checkpoint differs from full candidate"
+        ),
+        Coordinator::Active(active) => anyhow::ensure!(
+            active.as_ref() == checkpoint,
+            "member checkpoint differs from active candidate"
+        ),
+    }
+    validate_disk_profile(17, Role::Member, descriptor)?;
+    validate_common(
+        state.shard,
+        state.epoch,
+        state.sequence,
+        state.dedup_bytes_limit,
+        managed,
+        descriptor,
+        Role::Member,
+    )?;
+    validate_member_checkpoint(descriptor, checkpoint)?;
+    anyhow::ensure!(
+        visibility.applied <= checkpoint.resolved_prefix()
+            && visibility.commits.len() <= MAX_DEDUP_REQUESTS
+            && visibility.epoch == state.epoch
+            && state.version
+                == if checkpoint.capacity_profile() == CapacityProfile::LegacyCountV1 {
+                    6
+                } else {
+                    7
+                },
+        "invalid active member visibility"
+    );
+    state.validate_capacity_activation(descriptor.applied)?;
+    let bytes = serde_json::to_vec(&ActiveMemberMetadata {
+        version: 17,
+        shard: state.shard,
+        epoch: state.epoch,
+        sequence: state.sequence,
+        dedup_bytes_limit: state.dedup_bytes_limit,
+        managed,
+        participant,
+        visibility: VisibilityMetadata {
+            baseline_sequence: visibility.baseline_sequence,
+            epoch: visibility.epoch,
+            applied: visibility.applied,
+            commits: &visibility.commits,
+            activation: visibility.activation.clone(),
+        },
+        ledger: descriptor,
+        checkpoint,
+    })?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_ACTIVE_MEMBER_METADATA_BYTES,
+        "active member metadata exceeds structural byte bound"
+    );
+    Ok(bytes)
+}
+
+pub(super) fn validate_active_member_metadata(
+    bytes: &[u8],
+    descriptor: &Descriptor,
+    checkpoint: &ActiveCheckpoint,
+    state: &D1State,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        active_member_metadata_bytes(state, descriptor, checkpoint)? == bytes,
+        "member metadata differs from exact checkpoint candidate"
+    );
+    Ok(())
+}
+
+fn validate_member_checkpoint(
+    descriptor: &Descriptor,
+    checkpoint: &ActiveCheckpoint,
+) -> anyhow::Result<()> {
+    checkpoint
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid member checkpoint: {e:?}"))?;
+    anyhow::ensure!(
+        descriptor.domain.role == Role::Member
+            && checkpoint.authority() == descriptor.domain.authority.mode
+            && checkpoint.cohort() == Some(&descriptor.domain.cohort)
+            && checkpoint.event_count() == descriptor.event_count,
+        "member checkpoint differs from raw authority domain/count"
+    );
+    Ok(())
+}
+
 // An Option normally accepts a missing JSON field. New headers require the
 // explicit null-or-capacity field, so missing and duplicate fields both fail.
 fn required_option<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
@@ -304,7 +456,7 @@ fn validate_disk_profile(version: u32, role: Role, descriptor: &Descriptor) -> a
     let expected = match (version, role) {
         (11, Role::Coordinator) | (12, Role::Member) => CapacityProfile::LegacyCountV1,
         (13, Role::Coordinator) | (14, Role::Member) => CapacityProfile::ByteBound16MiBV1,
-        (15 | 16, Role::Coordinator) => {
+        (15 | 16, Role::Coordinator) | (17, Role::Member) => {
             match (descriptor.domain.cohort.profile, descriptor.version) {
                 (CapacityProfile::LegacyCountV1, 1) => CapacityProfile::LegacyCountV1,
                 (CapacityProfile::ByteBound16MiBV1, 2) => CapacityProfile::ByteBound16MiBV1,
@@ -339,7 +491,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
     let mut request_indexed = false;
     let mut decision_indexed = false;
     let mut ledger = None;
-    if !matches!(version, 11..=16) {
+    if !matches!(version, 11..=17) {
         event_ledger::reject_orphans(db)?;
     }
     let state = match version {
@@ -507,6 +659,64 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             decision_indexed = true;
             state
         }
+        17 => {
+            anyhow::ensure!(
+                bytes.len() <= MAX_ACTIVE_MEMBER_METADATA_BYTES,
+                "active member metadata exceeds structural byte bound"
+            );
+            let meta: ActiveMemberHeader = decode_new(&bytes)?;
+            validate_disk_profile(17, Role::Member, &meta.ledger)?;
+            validate_common(
+                meta.shard,
+                meta.epoch,
+                meta.sequence,
+                meta.dedup_bytes_limit,
+                &meta.managed,
+                &meta.ledger,
+                Role::Member,
+            )?;
+            validate_member_checkpoint(&meta.ledger, &meta.checkpoint)?;
+            anyhow::ensure!(
+                meta.ledger.applied == applied,
+                "member applied marker mismatch"
+            );
+            crate::request_index::reject_retired_namespace(db)?;
+            let loaded = event_ledger::load(db, &meta.ledger)?;
+            let derived = ActiveCheckpoint::from_journal(loaded.journal())
+                .map_err(|e| anyhow::anyhow!("member checkpoint replay: {e:?}"))?;
+            anyhow::ensure!(
+                derived == meta.checkpoint,
+                "persisted member checkpoint disagrees with strict raw replay"
+            );
+            let state = D1State {
+                version: if meta.ledger.domain.cohort.profile == CapacityProfile::LegacyCountV1 {
+                    6
+                } else {
+                    7
+                },
+                dedup_bytes_limit: meta.dedup_bytes_limit,
+                managed: Some(meta.managed),
+                coordinator: None,
+                participant: Some(meta.participant),
+                visibility: Some(crate::versioned_reads::State {
+                    baseline_sequence: meta.visibility.baseline_sequence,
+                    epoch: meta.visibility.epoch,
+                    applied: meta.visibility.applied,
+                    journal: loaded.journal().clone().into(),
+                    commits: meta.visibility.commits.0,
+                    activation: meta.visibility.activation,
+                }),
+                shard: meta.shard,
+                epoch: meta.epoch,
+                sequence: meta.sequence,
+                dedup: Vec::new(),
+            };
+            validate_active_member_metadata(&bytes, &meta.ledger, &meta.checkpoint, &state)?;
+            loaded.validate_hydrated_state(&state)?;
+            ledger = Some(loaded);
+            decision_indexed = true;
+            state
+        }
         12 | 14 => {
             let meta: MemberHeader = decode_new(&bytes)?;
             validate_disk_profile(version, Role::Member, &meta.ledger)?;
@@ -538,7 +748,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                     baseline_sequence: meta.visibility.baseline_sequence,
                     epoch: meta.visibility.epoch,
                     applied: meta.visibility.applied,
-                    journal: loaded.journal().clone(),
+                    journal: loaded.journal().clone().into(),
                     commits: meta.visibility.commits,
                     activation: meta.visibility.activation,
                 }),
@@ -560,7 +770,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                 .coordinator
                 .iter()
                 .filter_map(Coordinator::full)
-                .chain(state.visibility.iter().map(|v| &v.journal))
+                .chain(state.visibility.iter().filter_map(|v| v.journal.full()))
                 .all(|j| j.capacity_profile() == CapacityProfile::LegacyCountV1)
                 && state
                     .visibility
@@ -594,7 +804,7 @@ pub(super) fn d1_metadata_bytes(
             state
                 .visibility
                 .iter()
-                .map(|visibility| &visibility.journal),
+                .filter_map(|visibility| visibility.journal.full()),
         )
         .any(|journal| journal.cohort().is_some());
     anyhow::ensure!(
@@ -810,7 +1020,7 @@ mod tests {
                 baseline_sequence: 0,
                 epoch,
                 applied: 0,
-                journal,
+                journal: journal.into(),
                 commits: Vec::new(),
                 activation: None,
             });
@@ -825,7 +1035,7 @@ mod tests {
     fn byte_state(member: bool, confirmed: bool) -> D1State {
         let mut state = state(member, false);
         let old = if member {
-            &state.visibility.as_ref().unwrap().journal
+            state.visibility.as_ref().unwrap().journal.full().unwrap()
         } else {
             state.coordinator.as_ref().unwrap().full().unwrap()
         };
@@ -857,7 +1067,7 @@ mod tests {
         if member {
             state.version = 7;
             let visibility = state.visibility.as_mut().unwrap();
-            visibility.journal = journal;
+            visibility.journal = journal.into();
             visibility.activation = Some(activation);
         } else {
             state.coordinator = Some(journal.into());
@@ -886,7 +1096,13 @@ mod tests {
     fn state_journal_mut(state: &mut D1State) -> &mut Journal {
         match &mut state.coordinator {
             Some(journal) => journal.full_mut().unwrap(),
-            None => &mut state.visibility.as_mut().unwrap().journal,
+            None => state
+                .visibility
+                .as_mut()
+                .unwrap()
+                .journal
+                .full_mut()
+                .unwrap(),
         }
     }
 
@@ -1007,7 +1223,8 @@ mod tests {
                     coordinator
                 } else {
                     let mut participant = state(true, false);
-                    participant.visibility.as_mut().unwrap().journal = loaded.journal().clone();
+                    participant.visibility.as_mut().unwrap().journal =
+                        loaded.journal().clone().into();
                     participant
                 };
                 assert!(loaded.validate_hydrated_state(&foreign_role).is_err());
@@ -1189,6 +1406,40 @@ mod tests {
         .unwrap();
         assert!(
             bytes.len() - serde_json::to_vec(&checkpoint).unwrap().len()
+                <= MAX_ACTIVE_METADATA_OVERHEAD
+        );
+        descriptor.domain.role = Role::Member;
+        let member_bytes = serde_json::to_vec(&ActiveMemberMetadata {
+            version: 17,
+            shard: u64::MAX,
+            epoch: u64::MAX,
+            sequence: u64::MAX,
+            dedup_bytes_limit: Some(usize::MAX),
+            managed: wide.managed.as_ref().unwrap(),
+            participant: crate::participant_writes::State {
+                authority: Authority {
+                    shard: u64::MAX,
+                    mode: [255; 16],
+                },
+                activated_sequence: u64::MAX,
+                records: Vec::new(),
+            },
+            visibility: VisibilityMetadata {
+                baseline_sequence: u64::MAX,
+                epoch: u64::MAX,
+                applied: u64::MAX,
+                commits: Vec::<crate::versioned_reads::CommitVersion>::new(),
+                activation: Some(CapacityActivation {
+                    nonce: [255; 32],
+                    log_id: LogId::new(CommittedLeaderId::new(u64::MAX, u64::MAX), u64::MAX),
+                }),
+            },
+            ledger: &descriptor,
+            checkpoint: &checkpoint,
+        })
+        .unwrap();
+        assert!(
+            member_bytes.len() - serde_json::to_vec(&checkpoint).unwrap().len()
                 <= MAX_ACTIVE_METADATA_OVERHEAD
         );
     }
@@ -1790,11 +2041,135 @@ mod tests {
             metadata.dedup_bytes_limit,
             Some(crate::EXTENDED_DEDUP_BYTES)
         );
+        let checkpoint = ActiveCheckpoint::from_journal(
+            state.visibility.as_ref().unwrap().journal.full().unwrap(),
+        )
+        .unwrap();
+        let active_bytes = active_member_metadata_bytes(
+            &state,
+            descriptor.descriptor_for(&state).unwrap(),
+            &checkpoint,
+        )
+        .unwrap();
+        assert!(active_bytes.len() > 60 * 1024 * 1024);
+        assert!(active_bytes.len() <= MAX_ACTIVE_MEMBER_METADATA_BYTES);
+        let active: ActiveMemberHeader = decode_new(&active_bytes).unwrap();
+        assert_eq!(active.participant, *state.participant.as_ref().unwrap());
+        drop(active);
+        drop(active_bytes);
         // Existing participant Option fields stay unchanged in logical formats,
         // but an omitted null in a new disk header is not canonical metadata.
         let missing = String::from_utf8(bytes)
             .unwrap()
             .replacen("\"decision\":null,", "", 1);
         assert!(decode_new::<MemberHeader>(missing.as_bytes()).is_err());
+    }
+    #[test]
+    fn disk17_member_golden_and_strict_fields() {
+        let state = state(true, false);
+        let mut batch = WriteBatch::default();
+        let staged = event_ledger::stage(&mut batch, None, Some(&state), applied(), false)
+            .unwrap()
+            .unwrap();
+        let checkpoint = ActiveCheckpoint::from_journal(
+            state.visibility.as_ref().unwrap().journal.full().unwrap(),
+        )
+        .unwrap();
+        let descriptor = staged.descriptor_for(&state).unwrap();
+        let bytes = active_member_metadata_bytes(&state, descriptor, &checkpoint).unwrap();
+        assert_eq!(
+            bytes,
+            include_bytes!("../tests/fixtures/active-member-metadata-bound-v17.json")
+        );
+        validate_active_member_metadata(&bytes, descriptor, &checkpoint, &state).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for field in [
+            "version",
+            "shard",
+            "epoch",
+            "sequence",
+            "dedup_bytes_limit",
+            "managed",
+            "participant",
+            "visibility",
+            "ledger",
+            "checkpoint",
+        ] {
+            let mut value = original.clone();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(
+                decode_new::<ActiveMemberHeader>(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "{field}"
+            );
+        }
+        let duplicate = std::str::from_utf8(&bytes).unwrap().replacen(
+            "\"version\":17",
+            "\"version\":17,\"version\":17",
+            1,
+        );
+        assert!(decode_new::<ActiveMemberHeader>(duplicate.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn member_intent_and_commit_max_width_codecs_fit_existing_charges() {
+        use crate::versioned_reads::CommitVersion;
+        let commit = CommitVersion {
+            ordinal: u64::MAX,
+            id: [255; 16],
+            sequence: u64::MAX,
+        };
+        assert!(serde_json::to_vec(&commit).unwrap().len() < 256);
+        for operations in [
+            vec![],
+            vec![crate::WriteOp::put(vec![255; 257], vec![255; 1024])],
+            vec![crate::WriteOp::delete(Vec::new()); 100],
+        ] {
+            let request = crate::D1WriteRequest {
+                shard: u64::MAX,
+                epoch: u64::MAX,
+                request_id: [255; 16],
+                expected_sequence: Some(u64::MAX),
+                operations,
+            };
+            for decision in [
+                None,
+                Some(crate::transaction_decisions::Decision::Commit),
+                Some(crate::transaction_decisions::Decision::Abort),
+            ] {
+                let intent = Intent {
+                    id: [255; 16],
+                    participant: Participant {
+                        shard: u64::MAX,
+                        epoch: u64::MAX,
+                        mode: [255; 16],
+                        intent: [255; 32],
+                    },
+                    request: Some(request.clone()),
+                    decision,
+                    sequence: Some(u64::MAX),
+                };
+                assert!(
+                    serde_json::to_vec(&intent).unwrap().len()
+                        < 4 * (crate::capacity_policy::INTENT_FIXED_BYTES
+                            + request.retained_size())
+                );
+            }
+        }
+        let intent = Intent {
+            id: [255; 16],
+            participant: Participant {
+                shard: u64::MAX,
+                epoch: u64::MAX,
+                mode: [255; 16],
+                intent: [255; 32],
+            },
+            request: None,
+            decision: Some(crate::transaction_decisions::Decision::Abort),
+            sequence: None,
+        };
+        assert!(
+            serde_json::to_vec(&intent).unwrap().len()
+                < 4 * crate::capacity_policy::INTENT_FIXED_BYTES
+        );
     }
 }

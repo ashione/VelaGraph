@@ -142,7 +142,8 @@ async fn incremental_member_history_and_application_publish_one_atomic_cut() {
         prefix(&member, 0, true).await,
         source.terminal_prefix(0).unwrap()
     );
-    assert_eq!(metadata(&member)["version"], 12);
+    assert_eq!(metadata(&member)["version"], 17);
+    assert!(metadata(&member).get("checkpoint").is_some());
     assert!(metadata(&member)["visibility"].get("journal").is_none());
     assert!(member
         .participant_read_at(7, 1, [7; 16], 1, limit())
@@ -337,7 +338,7 @@ async fn published_v9_v10_migrate_atomically_and_reject_mixed_authorities() {
         assert!(sm.apply([entry(index, command.clone())]).await.is_err());
         assert_eq!(disk(&sm), before);
         apply(&mut sm, vec![command]).await;
-        assert_eq!(metadata(&sm)["version"], if member { 12 } else { 16 });
+        assert_eq!(metadata(&sm)["version"], if member { 17 } else { 16 });
         assert_eq!(prefix(&sm, 1, member).await, old);
         assert_eq!(ledger_rows(&sm).len(), 1);
         drop(sm);

@@ -525,7 +525,7 @@ async fn unknown_abort_cannot_cross_participant_ownership_identity() {
         let image = sm.build_snapshot().await.unwrap();
         let mut decoded: SnapshotV1 = serde_json::from_slice(image.snapshot.get_ref()).unwrap();
         let visibility = decoded.d1.visibility.as_mut().unwrap();
-        visibility.journal = j;
+        visibility.journal = j.into();
         visibility.applied = 1;
         let mut fresh = Arc::new(StateMachine::default());
         assert!(fresh
@@ -739,7 +739,7 @@ async fn old_versioned_modes_cannot_be_relabelled_as_certified_empty_baselines()
         );
         let image = sm.build_snapshot().await.unwrap();
         let mut forged: SnapshotV1 = serde_json::from_slice(image.snapshot.get_ref()).unwrap();
-        forged.d1.visibility.as_mut().unwrap().journal = bound_journal();
+        forged.d1.visibility.as_mut().unwrap().journal = bound_journal().into();
         let mut meta = image.meta;
         meta.last_log_id = Some(LogId::new(CommittedLeaderId::new(1, 1), 100));
         assert!(sm

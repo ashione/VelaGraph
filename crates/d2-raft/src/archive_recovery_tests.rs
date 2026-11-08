@@ -973,6 +973,7 @@ async fn close_reports_timeout_if_an_owner_is_not_released() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn managed_tcp_archive_reads_reject_damaged_tail_and_recover_exact_evidence() {
+    let _resource_guard = crate::managed_rpc::test_resource_guard().await;
     use crate::managed_rpc::{Client, Identity, NodeRef, Role, Server};
     use crate::versioned_reads::Target;
     use std::time::Duration;
@@ -1230,15 +1231,327 @@ async fn ordinary_member_apply_does_not_silently_repair_request_orphans() {
             ],
         )
         .await;
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &sm.storage
+                .as_ref()
+                .unwrap()
+                .db
+                .get(D1_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["version"], 17);
         let key = b"sm/request/orphan";
         sm.storage.as_ref().unwrap().db.put(key, b"bad").unwrap();
-        let next = sm.applied().await.unwrap().index + 1;
-        sm.apply([blank(next)]).await.unwrap();
+        let marker = sm.applied().await;
+        let next = marker.unwrap().index + 1;
+        let before_disk = disk(&sm);
+        let before_state = sm.state.read().await.d1.clone();
+        let before_cut = sm.state.read().await.archive_cut.clone().unwrap();
+        // Active member operations close the entire anchored namespace, even
+        // for Blank. Corruption is a whole-batch storage error, never repair.
+        assert_eq!(
+            sm.participant_history_status(8, 1, [3; 16]).await,
+            Err(D1Error::RequestIndexHistory)
+        );
+        assert!(sm.apply([blank(next)]).await.is_err());
+        assert_eq!(sm.applied().await, marker);
+        assert_eq!(disk(&sm), before_disk);
+        assert_eq!(sm.state.read().await.d1, before_state);
+        assert!(Arc::ptr_eq(
+            sm.state.read().await.archive_cut.as_ref().unwrap(),
+            &before_cut
+        ));
         assert_eq!(
             sm.storage.as_ref().unwrap().db.get(key).unwrap().as_deref(),
             Some(b"bad".as_slice())
         );
         drop(sm);
         assert!(StateMachine::open(dir.path()).is_err());
+    }
+}
+
+// Construct actual published member 12/14 bytes through the retained typed
+// writer and original raw descriptor. This is a cold fixture boundary, not an
+// ordinary-operation fallback or a version-label rewrite of member disk17.
+async fn legacy_member_fixture(path: &Path, profile: CapacityProfile) -> Vec<u8> {
+    let mut sm = Arc::new(StateMachine::open(path).unwrap());
+    let mut journal = Journal::new(authority().mode).unwrap();
+    journal
+        .apply(Command::BindCohort {
+            cohort: cohort(profile),
+        })
+        .unwrap();
+    let enable = if profile.is_legacy() {
+        D1Command::EnableVersionedReads {
+            shard: 8,
+            epoch: 1,
+            mode_id: [3; 16],
+            journal,
+        }
+    } else {
+        D1Command::EnableByteBoundReads {
+            shard: 8,
+            epoch: 1,
+            mode_id: [3; 16],
+            journal,
+            generation_nonce: [17; 32],
+        }
+    };
+    apply(
+        &mut sm,
+        vec![
+            D1Command::Activate { shard: 8, epoch: 1 },
+            D1Command::EnableManagedWrites {
+                shard: 8,
+                epoch: 1,
+                expected_sequence: 0,
+                mode_id: [3; 16],
+            },
+            D1Command::EnableParticipant {
+                shard: 8,
+                epoch: 1,
+                mode_id: [3; 16],
+                authority: authority(),
+            },
+            enable,
+        ],
+    )
+    .await;
+    let raw = rows(&sm, event_ledger::PREFIX);
+    assert!(!raw.is_empty());
+    let metadata = {
+        let state = sm.state.read().await;
+        let full = sm.load_disk_state(&state).unwrap().unwrap();
+        assert!(full
+            .state
+            .visibility
+            .as_ref()
+            .unwrap()
+            .journal
+            .full()
+            .is_some());
+        let mut batch = WriteBatch::default();
+        let staged = event_ledger::stage(
+            &mut batch,
+            full.ledger.as_ref(),
+            Some(&full.state),
+            state.last_applied_log,
+            false,
+        )
+        .unwrap();
+        let metadata = state_codec::d1_metadata_bytes(&full.state, staged.as_ref()).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+        assert_eq!(header["version"], if profile.is_legacy() { 12 } else { 14 });
+        assert!(header.get("checkpoint").is_none());
+        batch.put(D1_KEY, &metadata);
+        sm.storage.as_ref().unwrap().write_sync(batch).unwrap();
+        metadata
+    };
+    assert_eq!(rows(&sm, event_ledger::PREFIX), raw);
+    assert!(rows(&sm, PREFIX).is_empty());
+    assert!(sm
+        .storage
+        .as_ref()
+        .unwrap()
+        .db
+        .get(MANIFEST_KEY)
+        .unwrap()
+        .is_none());
+    // This fixture owns the only StateMachine Arc. Close it exactly once before
+    // the caller's independent old-reader open; no retry can hide a leaked owner.
+    assert_eq!(Arc::strong_count(&sm), 1);
+    drop(sm);
+    metadata
+}
+
+#[tokio::test]
+async fn actual_disk12_disk14_member_migration_rejects_request_orphans() {
+    for profile in profiles() {
+        for orphan_key in [
+            None,
+            Some(b"sm/request/orphan".as_slice()),
+            Some(MANIFEST_KEY),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let old_metadata = legacy_member_fixture(dir.path(), profile).await;
+            let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+            let marker = sm.applied().await;
+            let next = marker.unwrap().index + 1;
+            let before_state = sm.state.read().await.d1.clone();
+            assert!(before_state
+                .as_ref()
+                .unwrap()
+                .visibility
+                .as_ref()
+                .unwrap()
+                .journal
+                .full()
+                .is_some());
+            assert!(sm.state.read().await.archive_cut.is_none());
+            assert_eq!(
+                sm.storage
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .get(D1_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some(old_metadata.as_slice())
+            );
+            let old_raw = rows(&sm, event_ledger::PREFIX);
+            let old_disk = disk(&sm);
+            assert_eq!(
+                sm.participant_history_status(8, 1, [3; 16])
+                    .await
+                    .unwrap()
+                    .1,
+                0
+            );
+            // Even healthy old-reader migration must not publish a partial v17
+            // generation when the one atomic write fails before synchronization.
+            sm.storage
+                .as_ref()
+                .unwrap()
+                .fail_next_write
+                .store(true, Ordering::Relaxed);
+            assert!(sm.apply([blank(next)]).await.is_err());
+            assert_eq!(disk(&sm), old_disk);
+            assert_eq!(sm.applied().await, marker);
+            assert_eq!(sm.state.read().await.d1, before_state);
+            assert!(sm.state.read().await.archive_cut.is_none());
+            assert_eq!(Arc::strong_count(&sm), 1);
+            drop(sm);
+            let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+            assert_eq!(disk(&sm), old_disk);
+            assert!(sm
+                .state
+                .read()
+                .await
+                .d1
+                .as_ref()
+                .unwrap()
+                .visibility
+                .as_ref()
+                .unwrap()
+                .journal
+                .full()
+                .is_some());
+            if let Some(key) = orphan_key {
+                // Inject online only after independently confirming a healthy
+                // real legacy reader. Generic Blank must reject, never retire
+                // this foreign namespace while opportunistically writing v17.
+                sm.storage
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .put(key, b"foreign request namespace")
+                    .unwrap();
+                let corrupt_disk = disk(&sm);
+                assert!(sm.apply([blank(next)]).await.is_err());
+                assert_eq!(disk(&sm), corrupt_disk);
+                assert_eq!(sm.applied().await, marker);
+                assert_eq!(sm.state.read().await.d1, before_state);
+                assert!(sm.state.read().await.archive_cut.is_none());
+                assert!(sm
+                    .state
+                    .read()
+                    .await
+                    .d1
+                    .as_ref()
+                    .unwrap()
+                    .visibility
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .full()
+                    .is_some());
+                assert_eq!(rows(&sm, event_ledger::PREFIX), old_raw);
+                assert_eq!(
+                    sm.storage
+                        .as_ref()
+                        .unwrap()
+                        .db
+                        .get(D1_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some(old_metadata.as_slice())
+                );
+                assert_eq!(
+                    sm.storage.as_ref().unwrap().db.get(key).unwrap().as_deref(),
+                    Some(b"foreign request namespace".as_slice())
+                );
+                assert_eq!(Arc::strong_count(&sm), 1);
+                drop(sm);
+                assert!(StateMachine::open(dir.path()).is_err());
+            } else {
+                sm.apply([blank(next)]).await.unwrap();
+                let metadata: serde_json::Value = serde_json::from_slice(
+                    &sm.storage
+                        .as_ref()
+                        .unwrap()
+                        .db
+                        .get(D1_KEY)
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(metadata["version"], 17);
+                assert_eq!(rows(&sm, event_ledger::PREFIX), old_raw);
+                assert_eq!(
+                    sm.applied().await,
+                    Some(LogId::new(marker.unwrap().leader_id, next))
+                );
+                assert!(sm
+                    .state
+                    .read()
+                    .await
+                    .d1
+                    .as_ref()
+                    .unwrap()
+                    .visibility
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .active()
+                    .is_some());
+                assert!(sm.state.read().await.archive_cut.is_some());
+                let migrated = disk(&sm);
+                assert_eq!(Arc::strong_count(&sm), 1);
+                drop(sm);
+                let sm = StateMachine::open(dir.path()).unwrap();
+                assert_eq!(disk(&sm), migrated);
+                assert!(sm
+                    .state
+                    .read()
+                    .await
+                    .d1
+                    .as_ref()
+                    .unwrap()
+                    .visibility
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .active()
+                    .is_some());
+                assert_eq!(
+                    sm.participant_history_status(8, 1, [3; 16])
+                        .await
+                        .unwrap()
+                        .1,
+                    0
+                );
+                assert!(rows(&sm, PREFIX).is_empty());
+                assert!(sm
+                    .storage
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .get(MANIFEST_KEY)
+                    .unwrap()
+                    .is_none());
+            }
+        }
     }
 }
