@@ -810,6 +810,31 @@ impl StateMachine {
         })
     }
 
+    /// Durable observed event cursor and applied ordinal from one state view.
+    /// Distributed callers must first establish a leader barrier. Observed
+    /// resolved decisions do not advance this returned applied watermark.
+    pub async fn participant_history_status(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<(crate::transaction_decisions::HistoryCursor, u64), D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let visibility = d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?;
+        let cursor = blocking_section(|| visibility.journal.history_cursor())
+            .map_err(|_| D1Error::VisibilityHistory)?;
+        Ok((cursor, self.decision_frontier(d1)?))
+    }
+
     /// Verify one retained terminal cut without materializing graph payloads.
     /// Establish a leader barrier before using this as visibility evidence.
     pub async fn participant_prefix_applied(
@@ -1016,6 +1041,32 @@ impl StateMachine {
             return Err(D1Error::ManagedModeConflict);
         }
         d1.coordinator.clone().ok_or(D1Error::CoordinatorNotEnabled)
+    }
+
+    /// Read a bounded raw-event suffix at a frozen cut, not an ordinal range.
+    /// The source recomputes both anchors from its retained authoritative Journal.
+    /// Distributed callers must first establish a leader barrier.
+    pub async fn coordinator_history_page(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        base: &crate::transaction_decisions::HistoryCursor,
+        cut: Option<&crate::transaction_decisions::HistoryCursor>,
+    ) -> Result<crate::transaction_decisions::HistoryPage, D1Error> {
+        let state = self.state.read().await;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let journal = d1
+            .coordinator
+            .as_ref()
+            .ok_or(D1Error::CoordinatorNotEnabled)?;
+        self.decision_frontier(d1)?;
+        blocking_section(|| journal.history_page(base, cut)).map_err(|_| D1Error::VisibilityHistory)
     }
 
     /// Local point recovery; distributed callers must first establish a leader barrier.
@@ -1754,6 +1805,60 @@ fn apply_d1(
             let mut candidate = d1.clone();
             let (result, request) =
                 candidate.advance_visibility(ordinal, journal, base.d1.as_ref())?;
+            *d1 = candidate;
+            if let Some(request) = request {
+                apply_operations(base, next, batch, request.operations);
+            }
+            Ok(result)
+        }
+        D1Command::SyncHistory {
+            authority,
+            shard,
+            epoch,
+            mode_id,
+            page,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            if d1
+                .participant
+                .as_ref()
+                .is_none_or(|p| p.authority != authority)
+            {
+                return Err(D1Error::ParticipantAuthority);
+            }
+            let mut candidate = d1.clone();
+            let result = candidate.sync_history(&page, base.d1.as_ref())?;
+            *d1 = candidate;
+            Ok(result)
+        }
+        D1Command::AdvanceRetained {
+            authority,
+            shard,
+            epoch,
+            mode_id,
+            ordinal,
+            cut,
+        } => {
+            let d1 = next.d1.as_mut().ok_or(D1Error::NotActivated)?;
+            d1.check_shard(shard)?;
+            d1.check_epoch(epoch)?;
+            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                return Err(D1Error::ManagedModeConflict);
+            }
+            if d1
+                .participant
+                .as_ref()
+                .is_none_or(|p| p.authority != authority)
+            {
+                return Err(D1Error::ParticipantAuthority);
+            }
+            let mut candidate = d1.clone();
+            let (result, request) = candidate.advance_retained(ordinal, &cut, base.d1.as_ref())?;
             *d1 = candidate;
             if let Some(request) = request {
                 apply_operations(base, next, batch, request.operations);
@@ -3059,3 +3164,7 @@ mod request_index_tests;
 #[cfg(test)]
 #[path = "decision_segment_tests.rs"]
 mod decision_segment_tests;
+
+#[cfg(test)]
+#[path = "history_sync_tests.rs"]
+mod history_sync_tests;

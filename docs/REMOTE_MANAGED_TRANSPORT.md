@@ -141,3 +141,10 @@ protocol and A1 proof format are unchanged. Coordinator disk metadata v8 migrate
 legacy v5 atomically and snapshots rebuild its derived index. Full Journals remain
 in command validation, execute/status, prepare/advance and authoritative storage.
 The 256-request, 1,024-transaction and 16 MiB Journal caps are unchanged.
+
+### Incremental catch-up (RPC v4)
+
+[Bounded history suffixes](INCREMENTAL_DECISION_CONSUMPTION.md) now replace
+archive-bearing Advance in managed graph catch-up. The full replayed Journal
+remains durable authority, existing caps remain, and all cohort members must use
+v4 before enabling the flow. v3 has no automatic fallback.
