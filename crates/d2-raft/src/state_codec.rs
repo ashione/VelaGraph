@@ -174,6 +174,11 @@ fn validate_disk_profile(version: u32, role: Role, descriptor: &Descriptor) -> a
     let expected = match (version, role) {
         (11, Role::Coordinator) | (12, Role::Member) => CapacityProfile::LegacyCountV1,
         (13, Role::Coordinator) | (14, Role::Member) => CapacityProfile::ByteBound16MiBV1,
+        (15, Role::Coordinator) => match (descriptor.domain.cohort.profile, descriptor.version) {
+            (CapacityProfile::LegacyCountV1, 1) => CapacityProfile::LegacyCountV1,
+            (CapacityProfile::ByteBound16MiBV1, 2) => CapacityProfile::ByteBound16MiBV1,
+            _ => anyhow::bail!("unsupported disk-15 ledger profile/format"),
+        },
         _ => anyhow::bail!("invalid role for D1 disk version"),
     };
     anyhow::ensure!(
@@ -202,7 +207,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
     let mut request_indexed = false;
     let mut decision_indexed = false;
     let mut ledger = None;
-    if !matches!(version, 11..=14) {
+    if !matches!(version, 11..=15) {
         event_ledger::reject_orphans(db)?;
     }
     let state = match version {
@@ -294,7 +299,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             decision_indexed = meta.version == 10;
             meta.state
         }
-        11 | 13 => {
+        11 | 13 | 15 => {
             let meta: CoordinatorHeader = decode_new(&bytes)?;
             validate_disk_profile(version, Role::Coordinator, &meta.ledger)?;
             validate_common(
@@ -311,6 +316,9 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
                 meta.ledger.applied == applied,
                 "ledger applied marker mismatch"
             );
+            if version == 15 {
+                crate::request_index::reject_retired_namespace(db)?;
+            }
             let loaded = event_ledger::load(db, &meta.ledger)?;
             let state = D1State {
                 version: 4,
@@ -326,7 +334,7 @@ pub(super) fn load(db: &DB, applied: Option<LogId<NodeId>>) -> anyhow::Result<Op
             };
             loaded.validate_hydrated_state(&state)?;
             ledger = Some(loaded);
-            request_indexed = true;
+            request_indexed = version != 15;
             decision_indexed = true;
             state
         }
@@ -437,6 +445,7 @@ pub(super) fn d1_metadata_bytes(
                     && state.dedup.is_empty(),
                 "invalid coordinator metadata"
             );
+            validate_disk_profile(15, Role::Coordinator, descriptor)?;
             validate_common(
                 state.shard,
                 state.epoch,
@@ -447,10 +456,7 @@ pub(super) fn d1_metadata_bytes(
                 Role::Coordinator,
             )?;
             return Ok(serde_json::to_vec(&CoordinatorMetadata {
-                version: match descriptor.domain.cohort.profile {
-                    CapacityProfile::LegacyCountV1 => 11,
-                    CapacityProfile::ByteBound16MiBV1 => 13,
-                },
+                version: 15,
                 shard: state.shard,
                 epoch: state.epoch,
                 sequence: state.sequence,
@@ -513,14 +519,18 @@ pub(super) fn d1_metadata_bytes(
         "unbound metadata cannot contain a capacity activation"
     );
     // Only genuinely unbound/non-versioned modes reach the legacy writer.
-    // Versions 5/9/10 are readers only; no compatibility-only writer remains.
+    // Versions 5/9/10/11/13 are readers only; no bound legacy writer remains.
     if state.visibility.is_some() || state.participant.is_some() {
         return Ok(serde_json::to_vec(&LegacyMetadata {
             version: if state.visibility.is_some() { 7 } else { 6 },
             state: state.stage(),
         })?);
     }
-    if state.coordinator.is_some() {
+    if let Some(journal) = &state.coordinator {
+        anyhow::ensure!(
+            journal.cohort().is_none() && journal.requests().is_empty(),
+            "unbound coordinator cannot contain a cohort or external requests"
+        );
         return Ok(serde_json::to_vec(&LegacyMetadata { version: 8, state })?);
     }
     if let Some(managed) = &state.managed {
@@ -894,7 +904,14 @@ mod tests {
             let db = DB::open_default(dir.path()).unwrap();
             let state = state(member, admitted);
             let (_, bytes) = persist(&db, &state);
-            assert_eq!(bytes, golden);
+            if member {
+                assert_eq!(bytes, golden);
+            } else {
+                // Preserve published v11 bytes as an actual legacy fixture.
+                // The new header changes only its storage-version contract.
+                let suffix = golden.strip_prefix(b"{\"version\":11,").unwrap();
+                assert_eq!(bytes, [b"{\"version\":15,".as_slice(), suffix].concat());
+            }
             for forbidden in [
                 "\"coordinator\":",
                 "\"journal\":",
@@ -910,7 +927,7 @@ mod tests {
             assert_eq!(loaded.state, state);
             assert_eq!(loaded.metadata_bytes, bytes);
             assert!(!loaded.legacy_dedup);
-            assert_eq!(loaded.request_indexed, !member);
+            assert!(!loaded.request_indexed);
             assert!(loaded.decision_indexed);
             assert!(loaded.ledger.is_some());
             loaded.state.validate().unwrap();
@@ -931,7 +948,7 @@ mod tests {
                     let (descriptor, bytes) = persist(&db, &state);
                     assert_eq!(descriptor.version, 2);
                     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                    assert_eq!(value["version"], if member { 14 } else { 13 });
+                    assert_eq!(value["version"], if member { 14 } else { 15 });
                     assert_eq!(
                         value["ledger"]["domain"]["cohort"]["profile"],
                         "ByteBound16MiBV1"
@@ -963,9 +980,199 @@ mod tests {
                 assert_eq!(loaded.state, state);
                 assert_eq!(loaded.metadata_bytes, bytes);
                 assert!(loaded.decision_indexed);
-                assert_eq!(loaded.request_indexed, !member);
+                assert!(!loaded.request_indexed);
                 assert!(loaded.ledger.is_some());
             }
+        }
+    }
+
+    #[test]
+    fn published_coordinator_headers_keep_strict_legacy_index_contracts() {
+        // Derive this fixture from the admitted cohort, not the distinct
+        // bound-only golden (whose member identities intentionally differ).
+        let mut byte = state(false, true);
+        let original = byte.coordinator.take().unwrap();
+        let mut cohort = original.cohort().unwrap().clone();
+        cohort.profile = CapacityProfile::ByteBound16MiBV1;
+        let mut history = Journal::new(original.authority()).unwrap();
+        history
+            .replay_event(Command::BindCohort {
+                cohort: cohort.clone(),
+            })
+            .unwrap();
+        history
+            .replay_event(Command::ConfirmCohortCapacity {
+                cohort: cohort.clone(),
+                grants: cohort
+                    .members
+                    .iter()
+                    .cloned()
+                    .map(|member| MemberCapacityGrant {
+                        member,
+                        activation: CapacityActivation {
+                            nonce: [3; 32],
+                            log_id: applied().unwrap(),
+                        },
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        byte.coordinator = Some(history);
+        for event in &original.events()[1..] {
+            let mut event = event.clone();
+            if let Command::AdmitRequest { payload, .. } = &mut event {
+                let mut plan = crate::request_plans::Plan::decode(payload).unwrap();
+                plan.cohort = cohort.clone();
+                *payload = plan.encode().unwrap();
+            }
+            byte.coordinator
+                .as_mut()
+                .unwrap()
+                .replay_event(event)
+                .unwrap();
+        }
+        for (state, version) in [(state(false, true), 11), (byte, 13)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let (_, bytes) = persist(&db, &state);
+            let mut header: CoordinatorHeader = decode_new(&bytes).unwrap();
+            header.version = version;
+            let legacy_bytes = serde_json::to_vec(&header).unwrap();
+            if version == 11 {
+                assert_eq!(legacy_bytes, COORDINATOR_ADMITTED);
+            }
+            let mut batch = WriteBatch::default();
+            crate::request_index::stage(&mut batch, None, Some(&state), applied(), false, true)
+                .unwrap();
+            batch.put(D1_KEY, &legacy_bytes);
+            db.write(batch).unwrap();
+            let loaded = load(&db, applied()).unwrap().unwrap();
+            assert_eq!(loaded.state, state);
+            assert!(loaded.request_indexed);
+            assert!(loaded.decision_indexed);
+            crate::request_index::validate(&db, Some(&loaded.state), applied(), true).unwrap();
+            let record = &state.coordinator.as_ref().unwrap().requests()[0];
+            db.delete(crate::request_index::key(&state, record.id))
+                .unwrap();
+            assert!(
+                crate::request_index::validate(&db, Some(&loaded.state), applied(), true).is_err()
+            );
+            // Reinterpretation as disk 15 cannot conceal the remaining manifest.
+            header.version = 15;
+            db.put(D1_KEY, serde_json::to_vec(&header).unwrap())
+                .unwrap();
+            assert!(load(&db, applied()).is_err());
+        }
+    }
+
+    #[test]
+    fn disk15_rejects_request_residue_under_both_unchanged_profiles() {
+        for state in [state(false, true), byte_state(false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let (_, bytes) = persist(&db, &state);
+            let header: CoordinatorHeader = decode_new(&bytes).unwrap();
+            assert_eq!(header.version, 15);
+            assert!(!load(&db, applied()).unwrap().unwrap().request_indexed);
+            for key in [
+                crate::request_index::PREFIX,
+                b"sm/request/foreign-row".as_slice(),
+                crate::request_index::MANIFEST_KEY,
+            ] {
+                db.put(key, b"not a valid index record").unwrap();
+                assert!(load(&db, applied()).is_err());
+                db.delete(key).unwrap();
+                assert!(!load(&db, applied()).unwrap().unwrap().request_indexed);
+            }
+        }
+    }
+
+    #[test]
+    fn disk15_requires_typed_bound_coordinator_and_exact_profile_domain_marker() {
+        for state in [state(false, false), byte_state(false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let (_, bytes) = persist(&db, &state);
+            for fault in 0..10 {
+                let mut meta: CoordinatorHeader = decode_new(&bytes).unwrap();
+                match fault {
+                    0 => meta.ledger.version = 3,
+                    1 => meta.ledger.version = if meta.ledger.version == 1 { 2 } else { 1 },
+                    2 => meta.ledger.domain.role = Role::Member,
+                    3 => meta.ledger.domain.shard += 1,
+                    4 => meta.ledger.domain.epoch += 1,
+                    5 => meta.ledger.domain.mode[0] ^= 1,
+                    6 => meta.ledger.domain.authority.mode[0] ^= 1,
+                    7 => meta.ledger.domain.cohort.members[0].epoch += 1,
+                    8 => meta.ledger.applied = Some(LogId::new(CommittedLeaderId::new(3, 3), 17)),
+                    9 => meta.sequence = 1,
+                    _ => unreachable!(),
+                }
+                db.put(D1_KEY, serde_json::to_vec(&meta).unwrap()).unwrap();
+                assert!(load(&db, applied()).is_err(), "fault {fault}");
+            }
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for field in value.as_object().unwrap().keys() {
+                let mut missing = value.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                db.put(D1_KEY, serde_json::to_vec(&missing).unwrap())
+                    .unwrap();
+                assert!(load(&db, applied()).is_err(), "missing {field}");
+            }
+            for field in [
+                "state",
+                "coordinator",
+                "journal",
+                "participant",
+                "visibility",
+                "extra",
+            ] {
+                let mut mixed = value.clone();
+                mixed[field] = serde_json::json!({});
+                db.put(D1_KEY, serde_json::to_vec(&mixed).unwrap()).unwrap();
+                assert!(load(&db, applied()).is_err(), "mixed {field}");
+            }
+            for field in ["domain", "applied", "head_root"] {
+                let mut missing = value.clone();
+                missing["ledger"].as_object_mut().unwrap().remove(field);
+                db.put(D1_KEY, serde_json::to_vec(&missing).unwrap())
+                    .unwrap();
+                assert!(load(&db, applied()).is_err(), "missing ledger {field}");
+            }
+            let duplicate = String::from_utf8(bytes.clone()).unwrap().replacen(
+                "\"version\":15",
+                "\"version\":15,\"version\":15",
+                1,
+            );
+            db.put(D1_KEY, duplicate).unwrap();
+            assert!(load(&db, applied()).is_err());
+            db.put(D1_KEY, &bytes).unwrap();
+            assert!(load(&db, None).is_err());
+            assert_eq!(load(&db, applied()).unwrap().unwrap().state, state);
+            let mut legacy = state.clone();
+            legacy.coordinator =
+                Some(Journal::new(state.managed.as_ref().unwrap().mode_id).unwrap());
+            db.put(
+                D1_KEY,
+                serde_json::to_vec(&LegacyMetadata {
+                    version: 15,
+                    state: legacy,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(load(&db, applied()).is_err());
+        }
+        // A valid member header cannot be accepted by merely changing its version.
+        for state in [state(true, false), byte_state(true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let (_, bytes) = persist(&db, &state);
+            let mut header: MemberHeader = decode_new(&bytes).unwrap();
+            header.version = 15;
+            db.put(D1_KEY, serde_json::to_vec(&header).unwrap())
+                .unwrap();
+            assert!(load(&db, applied()).is_err());
         }
     }
 
@@ -1201,7 +1408,8 @@ mod tests {
         for version in 1..=10 {
             let mut state = match version {
                 1..=3 => D1State::new(9, 7),
-                4 | 5 | 8 | 9 => state(false, false),
+                4 | 5 => state(false, false),
+                8 | 9 => state(false, true),
                 _ => state(true, false),
             };
             if version == 3 {
@@ -1229,12 +1437,34 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = DB::open_default(dir.path()).unwrap();
             db.put(D1_KEY, bytes).unwrap();
+            if matches!(version, 8 | 9) {
+                let mut batch = WriteBatch::default();
+                crate::request_index::stage(&mut batch, None, Some(&state), applied(), false, true)
+                    .unwrap();
+                db.write(batch).unwrap();
+            }
             let loaded = load(&db, applied()).unwrap().unwrap();
             assert_eq!(loaded.state, state);
             assert_eq!(loaded.legacy_dedup, version == 1);
             assert_eq!(loaded.request_indexed, matches!(version, 8 | 9));
             assert_eq!(loaded.decision_indexed, matches!(version, 9 | 10));
             assert!(loaded.ledger.is_none());
+            crate::request_index::validate(
+                &db,
+                Some(&loaded.state),
+                applied(),
+                loaded.request_indexed,
+            )
+            .unwrap();
+            if loaded.request_indexed {
+                let record = &state.coordinator.as_ref().unwrap().requests()[0];
+                db.delete(crate::request_index::key(&state, record.id))
+                    .unwrap();
+                assert!(
+                    crate::request_index::validate(&db, Some(&loaded.state), applied(), true,)
+                        .is_err()
+                );
+            }
         }
         let mut unbound = state(false, false);
         unbound.coordinator = Some(Journal::new([9; 16]).unwrap());

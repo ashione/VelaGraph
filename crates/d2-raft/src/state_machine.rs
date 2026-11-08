@@ -124,6 +124,10 @@ pub struct StateMachineData {
     pub data: BTreeMap<Vec<u8>, Vec<u8>>,
     #[serde(default)]
     pub(crate) d1: Option<D1State>,
+    // A non-serializable witness minted only by strict load/staging. It shares
+    // the state publication lock and never owns the retained Journal.
+    #[serde(skip)]
+    archive_cut: Option<Arc<event_ledger::PublishedArchiveCut>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -325,7 +329,10 @@ impl StateMachine {
                 .store(loaded.decision_indexed, Ordering::Relaxed);
             *storage.metadata.lock().unwrap() = Some(loaded.metadata_bytes.clone());
         }
-        let mut d1 = loaded.map(|loaded| loaded.state);
+        let (mut d1, opened_ledger) = match loaded {
+            Some(loaded) => (Some(loaded.state), loaded.ledger),
+            None => (None, None),
+        };
         for item in storage
             .db
             .iterator(IteratorMode::From(DEDUP_PREFIX, Direction::Forward))
@@ -398,6 +405,26 @@ impl StateMachine {
                 "managed disk data differs from committed history"
             );
         }
+        let archive_cut = match (&d1, &opened_ledger) {
+            (Some(state), Some(ledger))
+                if state.coordinator.is_some()
+                    && !storage.request_indexed.load(Ordering::Relaxed) =>
+            {
+                Some(Arc::new(
+                    ledger.published_cut(
+                        state,
+                        storage.metadata.lock().unwrap().as_deref().unwrap(),
+                        storage
+                            .decision_manifest
+                            .lock()
+                            .unwrap()
+                            .as_deref()
+                            .unwrap(),
+                    )?,
+                ))
+            }
+            _ => None,
+        };
         let current_snapshot = load_snapshot(&storage.db)?;
 
         let snapshot_idx = current_snapshot
@@ -411,6 +438,7 @@ impl StateMachine {
                 last_membership,
                 data,
                 d1,
+                archive_cut,
             }),
             snapshot_idx: AtomicU64::new(snapshot_idx),
             current_snapshot: RwLock::new(current_snapshot),
@@ -533,6 +561,39 @@ impl StateMachine {
         Ok(loaded)
     }
 
+    // Inspect the already-published small header, never the untrusted disk
+    // discriminator. Disk15 cannot silently take the legacy Journal path if its
+    // witness is missing. The actual read checks these bytes in one DB snapshot.
+    fn archive_cut<'a>(
+        &self,
+        state: &'a StateMachineData,
+    ) -> Result<Option<&'a event_ledger::PublishedArchiveCut>, D1Error> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        #[derive(Deserialize)]
+        struct Version {
+            version: u32,
+        }
+        let metadata = storage
+            .metadata
+            .lock()
+            .map_err(|_| D1Error::EventLedgerUnavailable)?;
+        let is_archive = metadata
+            .as_deref()
+            .map(|bytes| {
+                serde_json::from_slice::<Version>(bytes).map(|header| header.version == 15)
+            })
+            .transpose()
+            .map_err(|_| D1Error::EventLedgerHistory)?
+            .unwrap_or(false);
+        match (is_archive, state.archive_cut.as_deref()) {
+            (true, Some(cut)) => Ok(Some(cut)),
+            (false, None) => Ok(None),
+            _ => Err(D1Error::EventLedgerHistory),
+        }
+    }
+
     /// Local historical capture. Distributed callers must establish a leader
     /// barrier and verify authority/routing. This is not global admission.
     pub async fn participant_read_at(
@@ -553,12 +614,30 @@ impl StateMachine {
         d1.read_at(version, limit)
     }
 
+    // Even range-backed V0/summary reads cannot accept a retired request
+    // namespace beside disk15. This checks keys, not unrelated raw/terminal rows.
+    fn check_retired_coordinator_index(&self, d1: &D1State) -> Result<(), D1Error> {
+        if let Some(storage) = self.storage.as_ref().filter(|storage| {
+            d1.coordinator.is_some() && !storage.request_indexed.load(Ordering::Relaxed)
+        }) {
+            crate::request_index::reject_retired_namespace(&storage.db).map_err(|error| {
+                if error.is::<rocksdb::Error>() {
+                    D1Error::RequestIndexUnavailable
+                } else {
+                    D1Error::RequestIndexHistory
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     fn decision_frontier(&self, d1: &D1State) -> Result<u64, D1Error> {
         let storage = self
             .storage
             .as_ref()
             .filter(|s| s.decision_indexed.load(Ordering::Relaxed));
         blocking_section(|| {
+            self.check_retired_coordinator_index(d1)?;
             if let Some(storage) = storage {
                 let manifest = storage
                     .decision_manifest
@@ -586,6 +665,7 @@ impl StateMachine {
             .as_ref()
             .filter(|s| s.decision_indexed.load(Ordering::Relaxed));
         blocking_section(|| {
+            self.check_retired_coordinator_index(d1)?;
             if let Some(storage) = storage {
                 let manifest = storage
                     .decision_manifest
@@ -1013,7 +1093,8 @@ impl StateMachine {
     }
 
     /// Read a bounded raw-event suffix at a frozen cut, not an ordinal range.
-    /// The source recomputes both anchors from its retained authoritative Journal.
+    /// Disk15 scans the raw archive without reconstructing a Journal. Actual
+    /// legacy formats retain their replay path until an atomic successful apply.
     /// Distributed callers must first establish a leader barrier.
     pub async fn coordinator_history_page(
         &self,
@@ -1024,18 +1105,20 @@ impl StateMachine {
         cut: Option<&crate::transaction_decisions::HistoryCursor>,
     ) -> Result<crate::transaction_decisions::HistoryPage, D1Error> {
         let state = self.state.read().await;
-        let persisted =
-            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
-        let d1 = persisted
-            .as_ref()
-            .map(|loaded| &loaded.state)
-            .or(state.d1.as_ref())
-            .ok_or(D1Error::NotActivated)?;
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
         d1.check_shard(shard)?;
         d1.check_epoch(epoch)?;
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
         }
+        if let Some(published) = self.archive_cut(&state)? {
+            return blocking_section(|| {
+                event_ledger::history_page(&self.storage.as_ref().unwrap().db, published, base, cut)
+            });
+        }
+        let persisted =
+            blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
+        let d1 = persisted.as_ref().map_or(d1, |loaded| &loaded.state);
         let journal = d1
             .coordinator
             .as_ref()
@@ -1045,7 +1128,7 @@ impl StateMachine {
     }
 
     /// Local point recovery; distributed callers must first establish a leader barrier.
-    /// Disk index and original transaction are sampled under the same state lock.
+    /// Raw archive and its private validated cut share one publication lock.
     pub async fn coordinator_request(
         &self,
         shard: u64,
@@ -1059,6 +1142,11 @@ impl StateMachine {
         d1.check_epoch(epoch)?;
         if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
             return Err(D1Error::ManagedModeConflict);
+        }
+        if let Some(published) = self.archive_cut(&state)? {
+            return blocking_section(|| {
+                event_ledger::lookup_request(&self.storage.as_ref().unwrap().db, published, id)
+            });
         }
         let db = self
             .storage
@@ -1314,6 +1402,25 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             }
 
             if let Some(storage) = &self.storage {
+                // Migration checks the complete old namespace, including absence
+                // for pre-index v5 or a newly activated coordinator. No normal
+                // write may publish disk15 alongside an unnoticed orphan row.
+                if storage.request_indexed.load(Ordering::Relaxed) {
+                    crate::request_index::validate(
+                        &storage.db,
+                        sm.d1.as_ref(),
+                        sm.last_applied_log,
+                        true,
+                    )
+                    .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                } else if next
+                    .d1
+                    .as_ref()
+                    .is_some_and(|state| state.coordinator.is_some())
+                {
+                    crate::request_index::reject_retired_namespace(&storage.db)
+                        .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                }
                 // Only explicit snapshot replacement may rebuild a damaged
                 // derived manifest; ordinary apply must not conceal corruption.
                 let expected = storage.request_manifest.lock().unwrap();
@@ -1373,13 +1480,11 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 } else {
                     batch.delete(D1_KEY);
                 }
-                let request_manifest = crate::request_index::stage(
+                let request_manifest = crate::request_index::stage_unbound_or_retire(
                     &mut batch,
-                    sm.d1.as_ref(),
                     next.d1.as_ref(),
                     next.last_applied_log,
                     storage.request_indexed.load(Ordering::Relaxed),
-                    false,
                 )
                 .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
                 let decision_manifest = crate::decision_segments::stage(
@@ -1391,21 +1496,28 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                     false,
                 )
                 .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+                let archive_cut = staged_archive_cut(
+                    next.d1.as_ref(),
+                    descriptor.as_ref(),
+                    metadata.as_deref(),
+                    decision_manifest.as_deref(),
+                )
+                .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
                 batch.put(APPLIED_KEY, applied);
                 batch.put(MEMBERSHIP_KEY, membership);
                 storage.write_sync(batch)?;
+                next.archive_cut = archive_cut;
                 *storage.metadata.lock().unwrap() = metadata;
                 storage.legacy_d1.store(false, Ordering::Relaxed);
+                storage
+                    .request_indexed
+                    .store(request_manifest.is_some(), Ordering::Relaxed);
                 *storage.request_manifest.lock().unwrap() = request_manifest;
                 *storage.decision_manifest.lock().unwrap() = decision_manifest;
                 storage.decision_indexed.store(
                     next.d1
                         .as_ref()
                         .is_some_and(crate::decision_segments::enabled),
-                    Ordering::Relaxed,
-                );
-                storage.request_indexed.store(
-                    next.d1.as_ref().is_some_and(|s| s.coordinator.is_some()),
                     Ordering::Relaxed,
                 );
             }
@@ -1578,11 +1690,12 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 .into());
             }
         }
-        let next = StateMachineData {
+        let mut next = StateMachineData {
             last_applied_log: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
             data,
             d1,
+            archive_cut: None,
         };
         let stored = StoredSnapshot {
             meta: meta.clone(),
@@ -1621,12 +1734,10 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             } else {
                 batch.delete(D1_KEY);
             }
-            let request_manifest = crate::request_index::stage(
+            let request_manifest = crate::request_index::stage_unbound_or_retire(
                 &mut batch,
-                sm.d1.as_ref(),
                 next.d1.as_ref(),
                 next.last_applied_log,
-                storage.request_indexed.load(Ordering::Relaxed),
                 true,
             )
             .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
@@ -1639,22 +1750,29 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 true,
             )
             .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
+            let archive_cut = staged_archive_cut(
+                next.d1.as_ref(),
+                descriptor.as_ref(),
+                metadata.as_deref(),
+                decision_manifest.as_deref(),
+            )
+            .map_err(|e| write_error(std::io::Error::other(e.to_string())))?;
             batch.put(APPLIED_KEY, applied);
             batch.put(MEMBERSHIP_KEY, membership);
             put_snapshot(&mut batch, &stored)?;
             storage.write_sync(batch)?;
+            next.archive_cut = archive_cut;
             *storage.metadata.lock().unwrap() = metadata;
             storage.legacy_d1.store(false, Ordering::Relaxed);
+            storage
+                .request_indexed
+                .store(request_manifest.is_some(), Ordering::Relaxed);
             *storage.request_manifest.lock().unwrap() = request_manifest;
             *storage.decision_manifest.lock().unwrap() = decision_manifest;
             storage.decision_indexed.store(
                 next.d1
                     .as_ref()
                     .is_some_and(crate::decision_segments::enabled),
-                Ordering::Relaxed,
-            );
-            storage.request_indexed.store(
-                next.d1.as_ref().is_some_and(|s| s.coordinator.is_some()),
                 Ordering::Relaxed,
             );
         }
@@ -1688,6 +1806,27 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
     }
 }
 
+// Bound coordinator writes always stage disk15. Members and unbound legacy
+// coordinators do not have an archive-backed point-recovery witness.
+fn staged_archive_cut(
+    state: Option<&D1State>,
+    staged: Option<&event_ledger::Staged<'_>>,
+    metadata: Option<&[u8]>,
+    decision_manifest: Option<&[u8]>,
+) -> anyhow::Result<Option<Arc<event_ledger::PublishedArchiveCut>>> {
+    match (state, staged) {
+        (Some(state), Some(staged)) if state.coordinator.is_some() => Ok(Some(Arc::new(
+            staged.published_cut(
+                state,
+                metadata.ok_or_else(|| anyhow::anyhow!("missing staged archive metadata"))?,
+                decision_manifest
+                    .ok_or_else(|| anyhow::anyhow!("missing staged decision manifest"))?,
+            )?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
 /// An apply-call overlay. Only changed keys and newly accepted retry identities
 /// are owned here; the published state remains untouched until sync succeeds.
 struct ApplyDelta {
@@ -1696,6 +1835,7 @@ struct ApplyDelta {
     d1: Option<D1State>,
     data: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     data_len: usize,
+    archive_cut: Option<Arc<event_ledger::PublishedArchiveCut>>,
 }
 
 impl ApplyDelta {
@@ -1706,6 +1846,7 @@ impl ApplyDelta {
             d1: state.d1.as_ref().map(D1State::stage),
             data: BTreeMap::new(),
             data_len: state.data.len(),
+            archive_cut: None,
         }
     }
 
@@ -1737,6 +1878,7 @@ impl ApplyDelta {
         }
         state.last_applied_log = self.last_applied_log;
         state.last_membership = self.last_membership;
+        state.archive_cut = self.archive_cut;
     }
 }
 
@@ -3262,3 +3404,7 @@ mod decision_segment_tests;
 #[cfg(test)]
 #[path = "history_sync_tests.rs"]
 mod history_sync_tests;
+
+#[cfg(test)]
+#[path = "archive_recovery_tests.rs"]
+mod archive_recovery_tests;

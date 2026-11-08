@@ -410,7 +410,7 @@ Unsupported boundary are unchanged. See [contract](TERMINAL_PREFIX_EVIDENCE.md).
 
 ### Durable request point recovery (A2.1)
 
-外部请求 ID/原 Plan 增加同库派生索引，恢复与 admission 回读只取单个绑定，
+原 A2.1 版本为外部请求 ID/原 Plan 增加同库派生索引，恢复与 admission 回读只取单个绑定，
 索引、Journal、applied marker 同批持久化；旧 v5 原子迁移到 v8，snapshot
 原子重建索引，内部 RPC 升至 v3。仍保留 256 请求、1024 事务、16 MiB Journal
 上限以及完整历史，不代表无限写入、GC、MVCC 或大规模动态一致查询完成。
@@ -450,7 +450,7 @@ segments. Open/apply/source reads reconstruct authority from those rows; one syn
 batch publishes the descriptor, new tail, data and indexes. Legacy migration and
 full logical snapshots remain atomic. This removes the live full-archive rewrite,
 not complete replay/memory/snapshot work or lifetime caps. Shared codec/replay
-replaces duplicated paths; full-cohort pre-admission capacity and lazy exact-ID
+replaces duplicated paths; full-cohort pre-admission capacity and bounded retained-state
 recovery remain required before safely lifting limits.
 
 ### Immutable byte-budget cohort capacity
@@ -463,3 +463,28 @@ counts; original Plans, holes, old V, local D1 limits and complete recovery rema
 Existing cohorts cannot be retagged. Shared policy/codec/validation paths avoid a
 second persistence engine. This is a bounded lifecycle extension, not unlimited
 writes, lazy retained archives or a performance milestone.
+
+### Archive-backed coordinator recovery reads (S1)
+
+Bound coordinator disk v15 uses the shared raw namespace walker for actual
+LookupRequest and HistoryPage operations. It retains one exact original ID/Plan
+and transaction or one bounded event page, not all IDs. Every successful found,
+absent or old-cut response first verifies the complete raw SHA-256 chain against
+a private cut published with validated state under the state lock. Cold open
+still performs strict semantic replay; the cut is not a self-certified disk root.
+
+The same slice retires the derived bound request index. Old v11/v13 (and earlier
+published coordinator formats) retain actual legacy reads until successful apply;
+full old-index validation precedes atomic migration. Disk v15 rejects request
+rows/manifests, while genuinely unbound disk v8 retains only its empty manifest.
+Explicit validated snapshot repair remains available. See the
+[ledger contract](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1).
+
+The full Journal remains in writer/member state, cold replay, logical snapshots
+and other client/control paths. Reads are O(total history); the 16 MiB budget,
+D1 historical-data limits, complete-cohort grants, RPC/deadlines and both profiles
+are unchanged. No performance or removed-limit claim is made. Subsequent slices
+must remove remaining decide/status/Prepare dependencies, bound active state and
+full-cohort capacity, and close retained-archive checkpoint/snapshot recovery.
+Fresh frozen-source correctness, process-crash, 1,025-write release and remote CI
+gates remain required; this entry does not claim they have passed for S1.

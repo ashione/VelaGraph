@@ -205,6 +205,17 @@ async fn downgrade(sm: &StateMachine, member: bool) {
         "state": state.d1.as_ref().unwrap().stage(),
     });
     let mut batch = WriteBatch::default();
+    if !member {
+        crate::request_index::stage(
+            &mut batch,
+            None,
+            state.d1.as_ref(),
+            state.last_applied_log,
+            false,
+            true,
+        )
+        .unwrap();
+    }
     batch.put(D1_KEY, serde_json::to_vec(&metadata).unwrap());
     batch.delete_range(PREFIX, PREFIX_END);
     batch.delete(MANIFEST_KEY);

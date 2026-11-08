@@ -690,11 +690,13 @@ keeps old-V evidence independent of later archive growth without changing durabl
 retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
 boundary. Internal managed peers now require protocol v5; evidence remains O(V).
 
-[A2.1 durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) now returns
-one exact original external-ID/Plan binding without transferring the full Journal.
-The derived index shares the admission/applied-marker sync batch and is rebuilt
-atomically on snapshot install. All 256-request, 1,024-transaction and 16 MiB
-Journal limits remain; this does not provide unlimited write lifetime or GC.
+[Durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) returns one exact
+original external-ID/Plan binding without transferring the full Journal. Bound
+coordinator disk v15 now projects LookupRequest and HistoryPage directly from raw
+history, with bounded retained results and full namespace verification against a
+private, previously validated published cut. The duplicate request index is
+retired atomically after strict legacy validation. Every read still scans the
+whole history; this is not a speed or unlimited-lifetime claim.
 
 The bounded [durable terminal-segment index](docs/DURABLE_DECISION_SEGMENTS.md) now
 backs coordinator proofs and certified participant reads with exact absolute-ordinal
@@ -706,11 +708,13 @@ consumption](docs/INCREMENTAL_DECISION_CONSUMPTION.md) for every cohort member.
 Original event history remains durable authority, SHA-256 anchors have an explicit
 integrity assumption, and the 256 / 1,024 / 16 MiB lifetime limits remain unchanged.
 
-The [authoritative event ledger](docs/AUTHORITATIVE_EVENT_LEDGER.md) now stores
-fixed-cohort Commands as the sole live decision authority in disk v11/v12.
-Ordinary apply no longer rewrites a full Journal archive in state metadata.
-Open, apply and history-source reads strictly replay the raw segments; complete
-memory history/snapshots and all 256/1,024/16 MiB lifetime limits remain.
+The [authoritative event ledger](docs/AUTHORITATIVE_EVENT_LEDGER.md) stores
+fixed-cohort Commands as the sole live decision authority. Bound coordinators
+write disk v15; members keep v12/v14. Open, apply, snapshot and other full-history
+paths still strictly replay raw segments and retain complete Journals. The two
+archive readers do not remove writer/member/snapshot residency, the 16 MiB
+lifetime budget, profile-specific bounds or local D1 limits. Wire formats,
+capacity grants and managed RPC v5 are unchanged by this reader slice.
 
 New empty cohorts can explicitly select the [immutable byte-budget capacity
 profile](docs/COHORT_CAPACITY_PROFILE.md). Actual durable grants from every member
