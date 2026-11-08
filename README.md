@@ -688,7 +688,7 @@ Managed fixed-cohort reads now use [exact segmented terminal-prefix evidence](do
 at the chosen V rather than transferring the original request/Plan archive. This
 keeps old-V evidence independent of later archive growth without changing durable
 retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
-boundary. Internal managed peers now require protocol v3; evidence remains O(V).
+boundary. Internal managed peers now require protocol v4; evidence remains O(V).
 
 [A2.1 durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) now returns
 one exact original external-ID/Plan binding without transferring the full Journal.
@@ -700,3 +700,8 @@ The bounded [durable terminal-segment index](docs/DURABLE_DECISION_SEGMENTS.md) 
 backs coordinator proofs and certified participant reads with exact absolute-ordinal
 disk segments. Full Journal authority, all lifetime caps and whole snapshots remain;
 this is a recovery/read foundation, not unlimited writes or a performance claim.
+
+Managed decision catch-up now uses [bounded event suffixes and retained ordinal
+consumption](docs/INCREMENTAL_DECISION_CONSUMPTION.md) for every cohort member.
+Full Journals remain durable authority, SHA-256 anchors have an explicit integrity
+assumption, and the 256 / 1,024 / 16 MiB lifetime limits remain unchanged.

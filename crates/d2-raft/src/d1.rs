@@ -66,6 +66,23 @@ pub enum D1Command {
         ordinal: u64,
         journal: crate::transaction_decisions::Journal,
     },
+    /// Retain a verified, bounded event suffix without publishing graph data.
+    SyncHistory {
+        authority: crate::participant_writes::Authority,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        page: Box<crate::transaction_decisions::HistoryPage>,
+    },
+    /// Apply one ordinal from locally retained history, bound to an exact cut.
+    AdvanceRetained {
+        authority: crate::participant_writes::Authority,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+        ordinal: u64,
+        cut: crate::transaction_decisions::HistoryCursor,
+    },
     EnableParticipant {
         shard: u64,
         epoch: u64,
@@ -117,6 +134,10 @@ pub enum D1WriteStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum D1Result {
+    HistorySynced {
+        cursor: crate::transaction_decisions::HistoryCursor,
+        applied_prefix: u64,
+    },
     Visibility {
         applied_prefix: u64,
     },

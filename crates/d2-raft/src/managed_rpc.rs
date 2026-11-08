@@ -6,7 +6,9 @@ use crate::cohort_reads::VisibilityInfo;
 use crate::participant_writes::{Authority, Status};
 use crate::request_index::RequestLookup;
 use crate::terminal_prefix::TerminalPrefix;
-use crate::transaction_decisions::{Cohort, Command, Journal, Participant};
+use crate::transaction_decisions::{
+    Cohort, Command, HistoryCursor, HistoryPage, Journal, Participant, MAX_TRANSACTIONS,
+};
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
 use crate::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, NodeHandle};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -23,7 +25,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const CONCURRENCY: usize = 4;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,6 +100,15 @@ pub struct CoordinatorSummary {
     pub resolved_prefix: u64,
 }
 
+/// Leader-observed durable history position and applied watermark from one lock.
+/// The cursor is a consistency commitment, not an authenticated certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryStatus {
+    pub cursor: HistoryCursor,
+    pub applied_prefix: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -109,6 +120,28 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    HistoryStatus {
+        authority: Authority,
+        target: Target,
+        cohort: Cohort,
+    },
+    HistoryPage {
+        authority: Authority,
+        epoch: u64,
+        base: HistoryCursor,
+        cut: Option<HistoryCursor>,
+    },
+    SyncHistory {
+        authority: Authority,
+        target: Target,
+        page: HistoryPage,
+    },
+    AdvanceRetained {
+        authority: Authority,
+        target: Target,
+        ordinal: u64,
+        cut: HistoryCursor,
+    },
     LookupRequest {
         authority: Authority,
         epoch: u64,
@@ -161,6 +194,10 @@ impl Operation {
     fn tag(&self) -> u8 {
         match self {
             Self::LookupRequest { .. } => 10,
+            Self::HistoryStatus { .. } => 11,
+            Self::HistoryPage { .. } => 12,
+            Self::SyncHistory { .. } => 13,
+            Self::AdvanceRetained { .. } => 14,
             Self::Journal { .. } => 1,
             Self::Command { .. } => 2,
             Self::Visibility { .. } => 3,
@@ -185,6 +222,10 @@ struct Reply {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Value {
+    HistoryStatus(HistoryStatus),
+    HistoryPage(HistoryPage),
+    HistorySynced(HistoryStatus),
+    RetainedPrefix(u64),
     Request(RequestLookup),
     Journal(Journal),
     Unit,
@@ -371,6 +412,51 @@ impl Client {
                 && journal.cohort() == Some(&self.identity.cohort)
         };
         let valid = match operation {
+            Operation::HistoryStatus {
+                authority,
+                target,
+                cohort,
+            } => {
+                participant(target)
+                    && *authority == self.identity.authority
+                    && *cohort == self.identity.cohort
+            }
+            Operation::HistoryPage {
+                authority,
+                epoch,
+                base,
+                cut,
+            } => {
+                self.identity.role == Role::Coordinator
+                    && self.identity.authority == *authority
+                    && self.identity.target.epoch == *epoch
+                    && base.authority == *authority
+                    && base.cohort == self.identity.cohort
+                    && cut.as_ref().is_none_or(|c| {
+                        c.authority == *authority && c.cohort == self.identity.cohort
+                    })
+            }
+            Operation::SyncHistory {
+                authority,
+                target,
+                page,
+            } => {
+                participant(target)
+                    && self.identity.authority == *authority
+                    && page.base.authority == *authority
+                    && page.base.cohort == self.identity.cohort
+            }
+            Operation::AdvanceRetained {
+                authority,
+                target,
+                cut,
+                ..
+            } => {
+                participant(target)
+                    && self.identity.authority == *authority
+                    && cut.authority == *authority
+                    && cut.cohort == self.identity.cohort
+            }
             Operation::Journal { authority, epoch }
             | Operation::LookupRequest {
                 authority, epoch, ..
@@ -474,6 +560,24 @@ pub enum NodeRef<'a> {
     Remote(&'a Client),
 }
 impl NodeRef<'_> {
+    // Cover preflight and post-reply page hashing with the same total budget.
+    async fn bounded<T>(
+        self,
+        work: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let timeout = match self {
+            Self::Local(_) => LOCAL_TIMEOUT,
+            Self::Remote(client) => client.timeout,
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_| Error::Unavailable)??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable);
+        }
+        Ok(result)
+    }
     async fn call(self, build: impl FnOnce() -> Operation) -> Result<Value, Error> {
         let duration = match self {
             Self::Local(_) => LOCAL_TIMEOUT,
@@ -666,6 +770,133 @@ impl NodeRef<'_> {
             _ => Err(Error::Protocol),
         }
     }
+    /// Observe the member's exact retained event position, independent of applied V.
+    pub async fn history_status(
+        self,
+        authority: &Authority,
+        target: &Target,
+        cohort: &Cohort,
+    ) -> Result<HistoryStatus, Error> {
+        match self
+            .call(|| Operation::HistoryStatus {
+                authority: authority.clone(),
+                target: target.clone(),
+                cohort: cohort.clone(),
+            })
+            .await?
+        {
+            Value::HistoryStatus(status) => {
+                check_history_status(&status, authority, target, cohort)?;
+                Ok(status)
+            }
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Pin a source cut once, then fetch bounded pages against that exact cut.
+    pub async fn history_page(
+        self,
+        authority: &Authority,
+        epoch: u64,
+        base: &HistoryCursor,
+        cut: Option<&HistoryCursor>,
+    ) -> Result<HistoryPage, Error> {
+        self.bounded(async {
+            check_history_request(authority, epoch, base, cut)?;
+            match self
+                .call(|| Operation::HistoryPage {
+                    authority: authority.clone(),
+                    epoch,
+                    base: base.clone(),
+                    cut: cut.cloned(),
+                })
+                .await?
+            {
+                Value::HistoryPage(page) => {
+                    let base = base.clone();
+                    let cut = cut.cloned();
+                    cpu(move || {
+                        check_history_page(&page, &base, cut.as_ref())?;
+                        Ok(page)
+                    })
+                    .await
+                }
+                _ => Err(Error::Protocol),
+            }
+        })
+        .await
+    }
+
+    /// Replicate only observed history. This does not advance read visibility.
+    pub async fn sync_history(
+        self,
+        authority: &Authority,
+        target: &Target,
+        page: &HistoryPage,
+    ) -> Result<HistoryStatus, Error> {
+        self.bounded(async {
+            let page = page.clone();
+            let page = cpu(move || {
+                page.validate().map_err(|_| Error::Identity)?;
+                Ok(page)
+            })
+            .await?;
+            check_member_cursor(&page.base, authority, target, &page.base.cohort)?;
+            let end = page.end.clone();
+            match self
+                .call(|| Operation::SyncHistory {
+                    authority: authority.clone(),
+                    target: target.clone(),
+                    page,
+                })
+                .await?
+            {
+                Value::HistorySynced(status) => {
+                    check_history_status(&status, authority, target, &end.cohort)?;
+                    if status.cursor.event_count < end.event_count
+                        || (status.cursor.event_count == end.event_count && status.cursor != end)
+                    {
+                        return Err(Error::Identity);
+                    }
+                    Ok(status)
+                }
+                _ => Err(Error::Protocol),
+            }
+        })
+        .await
+    }
+
+    /// Consume one retained ordinal against an exact already-transferred cut.
+    pub async fn advance_retained(
+        self,
+        authority: &Authority,
+        target: &Target,
+        ordinal: u64,
+        cut: &HistoryCursor,
+    ) -> Result<u64, Error> {
+        check_member_cursor(cut, authority, target, &cut.cohort)?;
+        if ordinal == 0 || ordinal > MAX_TRANSACTIONS as u64 {
+            return Err(Error::Identity);
+        }
+        match self
+            .call(|| Operation::AdvanceRetained {
+                authority: authority.clone(),
+                target: target.clone(),
+                ordinal,
+                cut: cut.clone(),
+            })
+            .await?
+        {
+            Value::RetainedPrefix(applied)
+                if applied >= ordinal && applied <= MAX_TRANSACTIONS as u64 =>
+            {
+                Ok(applied)
+            }
+            Value::RetainedPrefix(_) => Err(Error::Identity),
+            _ => Err(Error::Protocol),
+        }
+    }
+    /// Explicit full-archive compatibility helper. Managed catch-up uses
+    /// history_status/history_page/sync_history/advance_retained instead.
     pub async fn advance(
         self,
         authority: &Authority,
@@ -817,6 +1048,75 @@ impl NodeRef<'_> {
     }
 }
 
+fn check_member_cursor(
+    cursor: &HistoryCursor,
+    authority: &Authority,
+    target: &Target,
+    cohort: &Cohort,
+) -> Result<(), Error> {
+    cursor.validate().map_err(|_| Error::Identity)?;
+    if cursor.event_count == 0
+        || cursor.authority != *authority
+        || cursor.cohort != *cohort
+        || !cohort
+            .members
+            .iter()
+            .any(|m| m.shard == target.shard && m.epoch == target.epoch && m.mode == target.mode)
+    {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+fn check_history_status(
+    status: &HistoryStatus,
+    authority: &Authority,
+    target: &Target,
+    cohort: &Cohort,
+) -> Result<(), Error> {
+    check_member_cursor(&status.cursor, authority, target, cohort)?;
+    // Every consumed ordinal needs an admission/Begin and terminal decision,
+    // in addition to the initial BindCohort. A cursor alone does not prove V.
+    if status.applied_prefix > MAX_TRANSACTIONS as u64
+        || status.applied_prefix > (status.cursor.event_count - 1) / 2
+    {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+fn check_history_request(
+    authority: &Authority,
+    epoch: u64,
+    base: &HistoryCursor,
+    cut: Option<&HistoryCursor>,
+) -> Result<(), Error> {
+    base.validate().map_err(|_| Error::Identity)?;
+    if base.authority != *authority || base.cohort.coordinator_epoch != epoch {
+        return Err(Error::Identity);
+    }
+    if let Some(cut) = cut {
+        cut.validate().map_err(|_| Error::Identity)?;
+        if cut.authority != *authority
+            || cut.cohort != base.cohort
+            || cut.event_count < base.event_count
+            || (cut.event_count == base.event_count && cut != base)
+        {
+            return Err(Error::Identity);
+        }
+    }
+    Ok(())
+}
+fn check_history_page(
+    page: &HistoryPage,
+    base: &HistoryCursor,
+    cut: Option<&HistoryCursor>,
+) -> Result<(), Error> {
+    page.validate().map_err(|_| Error::Identity)?;
+    if page.base != *base || cut.is_some_and(|cut| page.cut != *cut) {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+
 fn check_summary(
     value: &CoordinatorSummary,
     authority: &Authority,
@@ -963,6 +1263,133 @@ async fn execute(
         return Err(Error::Unavailable);
     }
     match op {
+        Operation::HistoryStatus {
+            authority,
+            target,
+            cohort,
+        } => {
+            let info = visibility(node, &target, pinned).await?;
+            if info.authority != authority || info.cohort.as_ref() != Some(&cohort) {
+                return Err(Error::Identity);
+            }
+            let (cursor, applied_prefix) = node
+                .state_machine
+                .participant_history_status(target.shard, target.epoch, target.mode)
+                .await
+                .map_err(Error::Application)?;
+            let status = HistoryStatus {
+                cursor,
+                applied_prefix,
+            };
+            check_history_status(&status, &authority, &target, &cohort)?;
+            Ok(Value::HistoryStatus(status))
+        }
+        Operation::HistoryPage {
+            authority,
+            epoch,
+            base,
+            cut,
+        } => {
+            check_history_request(&authority, epoch, &base, cut.as_ref())?;
+            if pinned.is_some_and(|p| {
+                p.role != Role::Coordinator
+                    || p.authority != authority
+                    || p.target.epoch != epoch
+                    || p.cohort != base.cohort
+            }) {
+                return Err(Error::Identity);
+            }
+            let page = node
+                .state_machine
+                .coordinator_history_page(
+                    authority.shard,
+                    epoch,
+                    authority.mode,
+                    &base,
+                    cut.as_ref(),
+                )
+                .await
+                .map_err(Error::Application)?;
+            check_history_page(&page, &base, cut.as_ref())?;
+            Ok(Value::HistoryPage(page))
+        }
+        Operation::SyncHistory {
+            authority,
+            target,
+            page,
+        } => {
+            page.validate().map_err(|_| Error::Identity)?;
+            let info = visibility(node, &target, pinned).await?;
+            check_member_cursor(&page.base, &authority, &target, &page.base.cohort)?;
+            if info.authority != authority || info.cohort.as_ref() != Some(&page.base.cohort) {
+                return Err(Error::Identity);
+            }
+            let end = page.end.clone();
+            match submit(
+                node,
+                deadline,
+                D1Command::SyncHistory {
+                    authority: authority.clone(),
+                    shard: target.shard,
+                    epoch: target.epoch,
+                    mode_id: target.mode,
+                    page: Box::new(page),
+                },
+            )
+            .await?
+            {
+                D1Result::HistorySynced {
+                    cursor,
+                    applied_prefix,
+                } => {
+                    let status = HistoryStatus {
+                        cursor,
+                        applied_prefix,
+                    };
+                    check_history_status(&status, &authority, &target, &end.cohort)?;
+                    if status.cursor.event_count < end.event_count
+                        || (status.cursor.event_count == end.event_count && status.cursor != end)
+                    {
+                        return Err(Error::Identity);
+                    }
+                    Ok(Value::HistorySynced(status))
+                }
+                _ => Err(Error::Protocol),
+            }
+        }
+        Operation::AdvanceRetained {
+            authority,
+            target,
+            ordinal,
+            cut,
+        } => {
+            let info = visibility(node, &target, pinned).await?;
+            check_member_cursor(&cut, &authority, &target, &cut.cohort)?;
+            if info.authority != authority || info.cohort.as_ref() != Some(&cut.cohort) {
+                return Err(Error::Identity);
+            }
+            match submit(
+                node,
+                deadline,
+                D1Command::AdvanceRetained {
+                    authority,
+                    shard: target.shard,
+                    epoch: target.epoch,
+                    mode_id: target.mode,
+                    ordinal,
+                    cut,
+                },
+            )
+            .await?
+            {
+                D1Result::Visibility { applied_prefix }
+                    if applied_prefix >= ordinal && applied_prefix <= MAX_TRANSACTIONS as u64 =>
+                {
+                    Ok(Value::RetainedPrefix(applied_prefix))
+                }
+                _ => Err(Error::Protocol),
+            }
+        }
         Operation::Summary { authority, epoch } => {
             let value = node
                 .state_machine
@@ -1394,7 +1821,7 @@ mod tests {
                     1 => reply.nonce += 1,
                     2 => reply.operation += 1,
                     3 => reply.version += 1,
-                    _ => reply.version = 2,
+                    _ => reply.version = 3,
                 }
                 send(&mut stream, &encode(reply).await.unwrap())
                     .await
@@ -1825,6 +2252,196 @@ mod tests {
             .unwrap();
         journal
     }
+    fn participant_identity() -> Identity {
+        let mut id = identity();
+        id.role = Role::Participant;
+        id.target = Target {
+            shard: 7,
+            epoch: 1,
+            mode: [7; 16],
+        };
+        id
+    }
+    #[test]
+    fn history_wire_v4_operation_tags_are_explicit() {
+        let journal = terminal_journal(1);
+        let base = journal.history_cursor_at(1).unwrap();
+        let page = journal.history_page(&base, None).unwrap();
+        let id = participant_identity();
+        let operations = [
+            Operation::HistoryStatus {
+                authority: id.authority.clone(),
+                target: id.target.clone(),
+                cohort: id.cohort.clone(),
+            },
+            Operation::HistoryPage {
+                authority: id.authority.clone(),
+                epoch: 1,
+                base: base.clone(),
+                cut: Some(page.cut.clone()),
+            },
+            Operation::SyncHistory {
+                authority: id.authority.clone(),
+                target: id.target.clone(),
+                page: page.clone(),
+            },
+            Operation::AdvanceRetained {
+                authority: id.authority.clone(),
+                target: id.target.clone(),
+                ordinal: 1,
+                cut: page.cut,
+            },
+        ];
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(operations.each_ref().map(Operation::tag), [11, 12, 13, 14]);
+        for (operation, name) in operations.into_iter().zip([
+            "HistoryStatus",
+            "HistoryPage",
+            "SyncHistory",
+            "AdvanceRetained",
+        ]) {
+            let request = Request {
+                version: PROTOCOL_VERSION,
+                identity: id.clone(),
+                nonce: 17,
+                operation,
+            };
+            let bytes = encode_sync(&request).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(wire["version"], 4);
+            assert_eq!(wire["nonce"], 17);
+            assert_eq!(
+                wire["operation"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
+                vec![name]
+            );
+            let decoded: Request = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded.operation.tag(), request.operation.tag());
+        }
+    }
+    #[tokio::test]
+    async fn matching_envelopes_cannot_substitute_history_status_or_sync_cursor() {
+        let journal = terminal_journal(1);
+        let base = journal.history_cursor_at(1).unwrap();
+        let page = journal.history_page(&base, None).unwrap();
+        let id = participant_identity();
+        for fault in 0..7 {
+            let mut status = HistoryStatus {
+                cursor: page.end.clone(),
+                applied_prefix: 1,
+            };
+            match fault {
+                0 => status.cursor.authority.mode = [8; 16],
+                1 => status.cursor.authority.shard = 8,
+                2 => status.cursor.cohort.members[0].epoch = 2,
+                3 => status.cursor.version = 2,
+                4 => status.cursor.event_count = 0,
+                5 => status.cursor.event_count = u64::MAX,
+                _ => status.applied_prefix = MAX_TRANSACTIONS as u64 + 1,
+            }
+            let (client, peer) = fake_value(id.clone(), Value::HistoryStatus(status)).await;
+            assert!(
+                matches!(
+                    NodeRef::Remote(&client)
+                        .history_status(&id.authority, &id.target, &id.cohort)
+                        .await,
+                    Err(Error::Identity | Error::Protocol)
+                ),
+                "fault {fault}"
+            );
+            peer.await.unwrap();
+        }
+        for fault in 0..4 {
+            let mut status = HistoryStatus {
+                cursor: page.end.clone(),
+                applied_prefix: 0,
+            };
+            match fault {
+                0 => status.cursor.root[0] ^= 1,
+                1 => status.cursor = base.clone(),
+                2 => status.cursor.cohort.members[0].mode = [8; 16],
+                _ => status.applied_prefix = 2,
+            }
+            let (client, peer) = fake_value(id.clone(), Value::HistorySynced(status)).await;
+            assert!(
+                matches!(
+                    NodeRef::Remote(&client)
+                        .sync_history(&id.authority, &id.target, &page)
+                        .await,
+                    Err(Error::Identity | Error::Protocol)
+                ),
+                "fault {fault}"
+            );
+            peer.await.unwrap();
+        }
+        let (client, peer) = fake_value(id.clone(), Value::RetainedPrefix(0)).await;
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .advance_retained(&id.authority, &id.target, 1, &page.cut)
+                .await,
+            Err(Error::Identity)
+        );
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn matching_envelopes_cannot_substitute_history_page_base_cut_or_chain() {
+        let journal = terminal_journal(1);
+        let base = journal.history_cursor_at(1).unwrap();
+        let page = journal.history_page(&base, None).unwrap();
+        for fault in 0..9 {
+            let mut changed = page.clone();
+            match fault {
+                0 => changed.base.root[0] ^= 1,
+                1 => changed.end.root[0] ^= 1,
+                2 => changed.cut.root[0] ^= 1,
+                3 => changed.end.event_count += 1,
+                4 => changed.events.reverse(),
+                5 => {
+                    let _ = changed.events.pop();
+                }
+                6 => changed.cut.cohort.members[0].mode = [8; 16],
+                7 => changed.version = 2,
+                // This is a valid page for a different base, despite matching envelope.
+                _ => changed = journal.history_page(&page.end, Some(&page.cut)).unwrap(),
+            }
+            let (client, peer) = fake_value(identity(), Value::HistoryPage(changed)).await;
+            assert!(
+                matches!(
+                    NodeRef::Remote(&client)
+                        .history_page(&identity().authority, 1, &base, Some(&page.cut))
+                        .await,
+                    Err(Error::Identity | Error::Protocol)
+                ),
+                "fault {fault}"
+            );
+            peer.await.unwrap();
+        }
+        // A valid longer cut must not replace the frozen source cut.
+        let mut later = journal.clone();
+        later
+            .apply(Command::Begin {
+                id: [2; 16],
+                participants: vec![Participant {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                    intent: [2; 32],
+                }],
+            })
+            .unwrap();
+        let changed = later.history_page(&base, None).unwrap();
+        let (client, peer) = fake_value(identity(), Value::HistoryPage(changed)).await;
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .history_page(&identity().authority, 1, &base, Some(&page.cut))
+                .await,
+            Err(Error::Identity)
+        );
+        peer.await.unwrap();
+    }
     #[tokio::test]
     async fn matching_envelopes_cannot_substitute_journal_visibility_or_read_evidence() {
         let observed = terminal_journal(1);
@@ -2184,7 +2801,7 @@ mod tests {
         send(
             &mut legacy,
             &encode_sync(&Request {
-                version: 2,
+                version: 3,
                 identity: identity(),
                 nonce: 1,
                 operation: Operation::Journal {

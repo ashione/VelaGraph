@@ -183,6 +183,62 @@ impl D1State {
         }
         Ok(())
     }
+    /// Observe exact events without making their decisions readable. Called only
+    /// on an unpublished candidate; a failed merge or intent check publishes none.
+    pub(crate) fn sync_history(
+        &mut self,
+        page: &crate::transaction_decisions::HistoryPage,
+        history: Option<&Self>,
+    ) -> Result<D1Result, D1Error> {
+        let journal = self
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?
+            .journal
+            .merge_history_page(page)
+            .map_err(|_| D1Error::VisibilityHistory)?;
+        self.check_cohort(&journal)?;
+        self.visibility.as_mut().unwrap().journal = journal;
+        // ApplyDelta retains only newly accepted D1 retry records. Reconstitute
+        // the complete validation view, including pending local identities and
+        // applied unknown-Abort negative evidence, without publishing that copy.
+        let mut checked = self.clone();
+        if let Some(history) = history {
+            checked.dedup.splice(0..0, history.dedup.iter().cloned());
+        }
+        checked.validate().map_err(|_| D1Error::VisibilityHistory)?;
+        let observed = self.visibility.as_ref().unwrap();
+        Ok(D1Result::HistorySynced {
+            cursor: observed
+                .journal
+                .history_cursor()
+                .map_err(|_| D1Error::VisibilityHistory)?,
+            applied_prefix: observed.applied,
+        })
+    }
+
+    /// Verify the requested frozen cut against the complete local authority,
+    /// then preserve any later observation while consuming exactly one ordinal.
+    pub(crate) fn advance_retained(
+        &mut self,
+        ordinal: u64,
+        cut: &crate::transaction_decisions::HistoryCursor,
+        history: Option<&Self>,
+    ) -> Result<(D1Result, Option<crate::D1WriteRequest>), D1Error> {
+        let journal = &self
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?
+            .journal;
+        let prefix = journal
+            .history_prefix(cut)
+            .map_err(|_| D1Error::VisibilityHistory)?;
+        if ordinal == 0 || ordinal > prefix.resolved_prefix() {
+            return Err(D1Error::VisibilityUnresolved);
+        }
+        self.advance_visibility(ordinal, journal.clone(), history)
+    }
+
     /// Stage only on an unpublished candidate. Caller publishes data and this
     /// watermark in the same sync batch. Exactly one decision advances at a time.
     pub(crate) fn advance_visibility(

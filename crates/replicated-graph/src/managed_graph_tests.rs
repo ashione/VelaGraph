@@ -1001,3 +1001,328 @@ async fn admitted_plan_never_refreshes_a_stale_validation_sequence() {
         node.raft.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_history_catches_up_every_member_after_observed_only_page() {
+    let cluster = Cluster::new();
+    let c = start(&cluster, 9).await;
+    let a = start(&cluster, 7).await;
+    let b = start(&cluster, 8).await;
+    let graph = self::graph(&c, &a, &b);
+    let old = snapshot(&graph).await;
+    let mut last = None;
+    for id in 1..=20 {
+        let plan = old.prepare_vertex(7, &Vertex::new(id)).unwrap();
+        assert_eq!(
+            graph.decide(&plan, true).await.unwrap(),
+            (id, Decision::Abort)
+        );
+        last = Some(plan);
+    }
+    let initial = NodeRef::Local(&a)
+        .history_status(&authority(), &target(7), &binding())
+        .await
+        .unwrap();
+    assert_eq!(initial.cursor.event_count, 1);
+    let page = NodeRef::Local(&c)
+        .history_page(&authority(), 1, &initial.cursor, None)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 32);
+    assert!(page.end.event_count < page.cut.event_count);
+    let observed = NodeRef::Local(&a)
+        .sync_history(&authority(), &target(7), &page)
+        .await
+        .unwrap();
+    assert_eq!(observed.cursor, page.end);
+    assert_eq!(observed.applied_prefix, 0);
+    assert_eq!(snapshot(&graph).await.version().unwrap(), 0);
+
+    graph.advance_to(&last.unwrap(), 20).await.unwrap();
+    for (node, shard) in [(&a, 7), (&b, 8)] {
+        let status = NodeRef::Local(node)
+            .history_status(&authority(), &target(shard), &binding())
+            .await
+            .unwrap();
+        assert_eq!(status.cursor, page.cut);
+        assert_eq!(status.applied_prefix, 20);
+    }
+    // Shard 8 never participated or prepared, but has consumed every Abort.
+    assert_eq!(snapshot(&graph).await.version().unwrap(), 20);
+    vertex(&graph, 7, 21).await;
+    assert!(old
+        .vertex(VertexRef {
+            partition: 7,
+            id: 21
+        })
+        .unwrap()
+        .is_none());
+    assert!(snapshot(&graph)
+        .await
+        .vertex(VertexRef {
+            partition: 7,
+            id: 21
+        })
+        .unwrap()
+        .is_some());
+    for node in [&c, &a, &b] {
+        node.raft.shutdown().await.unwrap();
+    }
+}
+
+/// Raw scripted peers verify the real managed wire path without permitting an
+/// accidental full Journal/Advance fallback, including lost acknowledgements.
+async fn history_peer(
+    identity: managed_rpc::Identity,
+    steps: Vec<(serde_json::Value, Option<serde_json::Value>)>,
+) -> (managed_rpc::Client, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = managed_rpc::Client::new(
+        listener.local_addr().unwrap(),
+        identity,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let peer = tokio::spawn(async move {
+        for (expected, result) in steps {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let length = stream.read_u32().await.unwrap() as usize;
+            assert!(length <= managed_rpc::MAX_FRAME_BYTES);
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["version"], 4);
+            assert!(request["operation"].get("Journal").is_none());
+            assert!(request["operation"].get("Advance").is_none());
+            assert_eq!(request["operation"], expected);
+            let Some(result) = result else {
+                continue;
+            };
+            let tag = match expected
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .as_str()
+            {
+                "Terminal" => 9,
+                "HistoryStatus" => 11,
+                "HistoryPage" => 12,
+                "SyncHistory" => 13,
+                "AdvanceRetained" => 14,
+                "Prefix" => 6,
+                other => panic!("unexpected catch-up operation {other}"),
+            };
+            let reply = serde_json::json!({
+                "version": 4, "operation": tag, "identity": request["identity"],
+                "nonce": request["nonce"], "result": result,
+            });
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            stream.write_u32(bytes.len() as u32).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    (client, peer)
+}
+fn history_identity(shard: u64) -> managed_rpc::Identity {
+    managed_rpc::Identity {
+        group: shard,
+        node: 1,
+        target: target(shard),
+        role: if shard == 9 {
+            managed_rpc::Role::Coordinator
+        } else {
+            managed_rpc::Role::Participant
+        },
+        authority: authority(),
+        cohort: binding(),
+    }
+}
+fn history_plan() -> Plan {
+    Plan {
+        id: [20; 16],
+        authority: authority(),
+        cohort: binding(),
+        version: 0,
+        parts: vec![Part {
+            descriptor: Participant {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+                intent: [20; 32],
+            },
+            request: D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [20; 16],
+                expected_sequence: Some(0),
+                operations: vec![d2_raft::WriteOp::put("key", "value")],
+            },
+        }],
+    }
+}
+fn history_journal() -> Journal {
+    let mut journal = Journal::new(authority().mode).unwrap();
+    journal
+        .apply(Command::BindCohort { cohort: binding() })
+        .unwrap();
+    for id in 1..=20 {
+        journal
+            .apply(Command::Begin {
+                id: [id; 16],
+                participants: vec![Participant {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                    intent: [id; 32],
+                }],
+            })
+            .unwrap();
+        journal
+            .apply(Command::Decide {
+                id: [id; 16],
+                decision: Decision::Abort,
+            })
+            .unwrap();
+    }
+    journal
+}
+#[tokio::test]
+async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_commands() {
+    use serde_json::json;
+    let journal = history_journal();
+    let base = journal.history_cursor_at(1).unwrap();
+    let first = journal.history_page(&base, None).unwrap();
+    let second = journal.history_page(&first.end, Some(&first.cut)).unwrap();
+    let cut = first.cut.clone();
+    let proof = journal.terminal_prefix(20).unwrap();
+    let mut later = journal.clone();
+    later
+        .apply(Command::Begin {
+            id: [21; 16],
+            participants: history_plan()
+                .parts
+                .into_iter()
+                .map(|p| p.descriptor)
+                .collect(),
+        })
+        .unwrap();
+    later
+        .apply(Command::Decide {
+            id: [21; 16],
+            decision: Decision::Abort,
+        })
+        .unwrap();
+    let ahead = later.history_cursor().unwrap();
+    let terminal = json!({"Terminal": {"authority": authority(), "epoch": 1, "version": 20}});
+    let page_first =
+        json!({"HistoryPage": {"authority": authority(), "epoch": 1, "base": base, "cut": null}});
+    let page_second = json!({"HistoryPage": {"authority": authority(), "epoch": 1, "base": first.end, "cut": cut}});
+    let (coordinator, coordinator_peer) = history_peer(
+        history_identity(9),
+        vec![
+            (terminal, Some(json!({"Ok": {"Evidence": proof}}))),
+            (
+                page_first.clone(),
+                Some(json!({"Ok": {"HistoryPage": first}})),
+            ),
+            (
+                page_second.clone(),
+                Some(json!({"Ok": {"HistoryPage": second}})),
+            ),
+            (page_first, Some(json!({"Ok": {"HistoryPage": first}}))),
+            (page_second, Some(json!({"Ok": {"HistoryPage": second}}))),
+        ],
+    )
+    .await;
+    let mut clients = Vec::new();
+    let mut peers = Vec::new();
+    for shard in [7, 8] {
+        let status = json!({"HistoryStatus": {"authority": authority(), "target": target(shard), "cohort": binding()}});
+        let sync_first = json!({"SyncHistory": {"authority": authority(), "target": target(shard), "page": first}});
+        let sync_second = json!({"SyncHistory": {"authority": authority(), "target": target(shard), "page": second}});
+        let mut steps = vec![(
+            status,
+            Some(json!({"Ok": {"HistoryStatus": {"cursor": base, "applied_prefix": 0}}})),
+        )];
+        if shard == 7 {
+            // Drop the first durable-sync ACK; the complete request must repeat.
+            steps.push((sync_first.clone(), None));
+        }
+        let returned = if shard == 7 { &ahead } else { &first.end };
+        steps.push((
+            sync_first,
+            Some(json!({"Ok": {"HistorySynced": {"cursor": returned, "applied_prefix": 0}}})),
+        ));
+        steps.push((sync_second, Some(json!({"Ok": {"HistorySynced": {"cursor": if shard == 7 { &ahead } else { &cut }, "applied_prefix": 0}}}))));
+        for ordinal in 1..=if shard == 7 { 1 } else { 20 } {
+            let advance = json!({"AdvanceRetained": {"authority": authority(), "target": target(shard), "ordinal": ordinal, "cut": cut}});
+            if shard == 7 {
+                steps.push((advance.clone(), None));
+            }
+            // Concurrent consumption may have advanced beyond the requested V.
+            steps.push((
+                advance,
+                Some(json!({"Ok": {"RetainedPrefix": if shard == 7 { 21 } else { ordinal }}})),
+            ));
+        }
+        steps.push((
+            json!({"Prefix": {"target": target(shard), "proof": proof}}),
+            Some(json!({"Ok": {"Evidence": proof}})),
+        ));
+        let (client, peer) = history_peer(history_identity(shard), steps).await;
+        clients.push(client);
+        peers.push(peer);
+    }
+    let graph = GraphCohort::from_endpoints(
+        NodeRef::Remote(&coordinator),
+        authority(),
+        1,
+        vec![
+            (NodeRef::Remote(&clients[0]), target(7)),
+            (NodeRef::Remote(&clients[1]), target(8)),
+        ],
+    );
+    graph.advance_to(&history_plan(), 20).await.unwrap();
+    coordinator_peer.await.unwrap();
+    for peer in peers {
+        peer.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
+    use serde_json::json;
+    let journal = history_journal();
+    let base = journal.history_cursor_at(1).unwrap();
+    let proof = journal.terminal_prefix(20).unwrap();
+    let (coordinator, c_peer) = history_peer(history_identity(9), vec![
+        (json!({"Terminal": {"authority": authority(), "epoch": 1, "version": 20}}), Some(json!({"Ok": {"Evidence": proof}}))),
+        (json!({"HistoryPage": {"authority": authority(), "epoch": 1, "base": base, "cut": null}}), Some(json!({"Err": "Protocol"}))),
+    ]).await;
+    let (member, m_peer) = history_peer(history_identity(7), vec![
+        (json!({"HistoryStatus": {"authority": authority(), "target": target(7), "cohort": binding()}}),
+            Some(json!({"Ok": {"HistoryStatus": {"cursor": base, "applied_prefix": 0}}}))),
+    ]).await;
+    // The second member is never contacted after the source rejects v4 paging.
+    let graph = GraphCohort::from_endpoints(
+        NodeRef::Remote(&coordinator),
+        authority(),
+        1,
+        vec![
+            (NodeRef::Remote(&member), target(7)),
+            (NodeRef::Remote(&member), target(8)),
+        ],
+    );
+    assert!(matches!(
+        graph.advance_to(&history_plan(), 20).await,
+        Err(Error::Identity)
+    ));
+    c_peer.await.unwrap();
+    m_peer.await.unwrap();
+}

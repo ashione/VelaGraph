@@ -399,7 +399,8 @@ impl<'a> GraphCohort<'a> {
                 .collect(),
         )
     }
-    /// Pin fixed trusted endpoints; no discovery or automatic retry/failover.
+    /// Pin fixed trusted endpoints; no discovery or failover. Catch-up retries
+    /// uncertain history writes once with the identical page or cut.
     pub fn from_endpoints(
         coordinator: NodeRef<'a>,
         authority: Authority,
@@ -542,7 +543,12 @@ impl<'a> GraphCohort<'a> {
         self.check_cohort(&plan.cohort)
     }
     fn check_cohort(&self, cohort: &Cohort) -> Result<()> {
-        if cohort.coordinator_epoch != self.epoch || self.members.len() != cohort.members.len() {
+        if cohort.validate().is_err()
+            || self.authority.mode == [0; 16]
+            || cohort.coordinator_shard != self.authority.shard
+            || cohort.coordinator_epoch != self.epoch
+            || self.members.len() != cohort.members.len()
+        {
             return Err(Error::Identity);
         }
         for ((_, target), member) in self.members.iter().zip(&cohort.members) {
@@ -717,27 +723,74 @@ impl<'a> GraphCohort<'a> {
         Err(Error::Uncertain)
     }
     async fn advance_to(&self, plan: &Plan, ordinal: u64) -> Result<()> {
-        let journal = self.journal().await?;
-        self.check_plan(plan, &journal)?;
+        // Validate the immutable local plan without requesting its full archive.
+        self.check_cohort(&plan.cohort)?;
+        if plan.authority != self.authority || ordinal == 0 {
+            return Err(Error::Identity);
+        }
+        let proof = self
+            .coordinator
+            .terminal(&self.authority, self.epoch, ordinal)
+            .await?;
+        if proof.cohort() != &plan.cohort {
+            return Err(Error::Identity);
+        }
         for (node, target) in &self.members {
-            let info = node.visibility(target).await?;
-            if info.authority != plan.authority
-                || info.cohort.as_ref() != Some(&plan.cohort)
-                || info.baseline_sequence != 0
-            {
-                return Err(Error::Identity);
-            }
-            let mut applied = info.applied_prefix;
-            while applied < ordinal {
-                let next = node
-                    .advance(&plan.authority, target, applied + 1, &journal)
-                    .await?;
-                if next <= applied || next > journal.resolved_prefix() {
+            let status = node
+                .history_status(&self.authority, target, &plan.cohort)
+                .await?;
+            let mut applied = status.applied_prefix;
+            let mut base = status.cursor;
+            // Pin only after observing this member, which may already retain
+            // events beyond its applied watermark or beyond another member's cut.
+            let mut page = self
+                .coordinator
+                .history_page(&self.authority, self.epoch, &base, None)
+                .await?;
+            let cut = page.cut.clone();
+            loop {
+                // An uncertain ACK retries the identical page before any new
+                // cursor/cut is selected. One retry and the outer deadline bound it.
+                let result = node.sync_history(&self.authority, target, &page).await;
+                let synced = match result {
+                    Err(managed_rpc::Error::Unavailable) => {
+                        node.sync_history(&self.authority, target, &page).await?
+                    }
+                    other => other?,
+                };
+                if synced.applied_prefix < applied {
                     return Err(Error::Identity);
                 }
-                applied = next;
+                applied = synced.applied_prefix;
+                // Concurrent sync may have advanced the member farther. Continue
+                // from this checked page end, retaining this exact source cut;
+                // subsequent pages are verified exact overlapping retries locally.
+                base = page.end;
+                if base == cut {
+                    break;
+                }
+                page = self
+                    .coordinator
+                    .history_page(&self.authority, self.epoch, &base, Some(&cut))
+                    .await?;
             }
-            node.prefix(target, ordinal, &journal).await?;
+            // Each successful consume strictly increases applied, bounded by the
+            // admitted transaction cap. Concurrent consumption can already be ahead.
+            while applied < ordinal {
+                let requested = applied + 1;
+                let result = node
+                    .advance_retained(&self.authority, target, requested, &cut)
+                    .await;
+                applied = match result {
+                    Err(managed_rpc::Error::Unavailable) => {
+                        node.advance_retained(&self.authority, target, requested, &cut)
+                            .await?
+                    }
+                    other => other?,
+                };
+            }
+            // A watermark or hash root alone is never the final V certificate.
+            node.prefix_terminal(target, &proof).await?;
         }
         Ok(())
     }

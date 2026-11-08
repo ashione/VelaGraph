@@ -103,7 +103,9 @@ are checked on reopen. Real TCP tests delete target segments while nodes remain
 running and prove Terminal/Prefix/Read return DecisionIndexHistory, without
 in-memory fallback. Summary itself does not claim to certify terminal contents.
 
-Internal managed RPC remains version 3: operations and proof schemas are unchanged.
+This segment-index slice used managed RPC version 3 without changing proof schemas.
+[Incremental consumption](INCREMENTAL_DECISION_CONSUMPTION.md) subsequently advances
+the internal wire to v4; the A1 proof schema remains unchanged.
 New typed errors DecisionIndexHistory and DecisionIndexUnavailable report corrupt
 or unavailable index storage. Older strict clients may reject these new error
 variants as protocol errors; they must not reinterpret them as absence or Abort.
@@ -140,8 +142,10 @@ fault and retention tests, not scale/performance claims.
 
 ## Next contract, not implemented here
 
-Prepare and Advance still carry and retain the full authoritative Journal. Moving
-to incremental authoritative ledger consumption requires a separately versioned
+Prepare still carries the full authoritative Journal. The subsequent
+[incremental catch-up flow](INCREMENTAL_DECISION_CONSUMPTION.md) transfers bounded
+event suffixes but still retains that complete authority. Moving
+to incremental authoritative ledger storage requires a separately versioned
 archive/event ledger, event sequence distinct from transaction ordinal, exact
 extension anchors, bounded range transfer, original-Plan lookup, durable pending
 states and snapshot closure. This derived index alone cannot certify erased or

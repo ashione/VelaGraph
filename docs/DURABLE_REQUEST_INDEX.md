@@ -70,7 +70,8 @@ procedure is supplied.
 
 ## Point-recovery RPC
 
-The trusted internal managed RPC protocol is now **version 3**. Version-1/2
+The request-index slice introduced trusted internal managed RPC **version 3**.
+[Incremental consumption](INCREMENTAL_DECISION_CONSUMPTION.md) now requires v4. Version-1/2
 messages are rejected, not retried through an older or weaker operation. The
 external managed graph envelope version, request schema and canonical application
 command codec are unchanged. Two new typed D1 errors, RequestIndexHistory and

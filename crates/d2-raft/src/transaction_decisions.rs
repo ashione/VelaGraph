@@ -5,6 +5,10 @@
 //! must eventually come from a fenced participant protocol, not an arbitrary caller.
 use serde::{Deserialize, Serialize};
 
+#[path = "journal_history.rs"]
+mod history;
+pub use history::{HistoryCursor, HistoryPage, MAX_HISTORY_PAGE_BYTES, MAX_HISTORY_PAGE_EVENTS};
+
 pub const MAX_TRANSACTIONS: usize = 1024;
 pub const MAX_PARTICIPANTS: usize = 64;
 pub const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
