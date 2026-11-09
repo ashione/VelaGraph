@@ -364,7 +364,11 @@ The bounded [global scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md)
 extends this with an ordered scan-filter/dedup/limit prefix then out/in, filters,
 limit, dedup and terminal count/selected valueMap. It preserves separate scan
 and traversal budgets on the same sessions. Joined results have no implicit
-100-row truncation. Global E/path/values remain Unsupported. No-hop map/dedup follow the server global scan contract below. One bounded
+100-row truncation. Global E/path remain Unsupported. Terminal single-key values after at least one
+out/in/repeat is supported: absent properties emit no row, present Null emits Null,
+and ordered bag multiplicity plus qualified source identity are preserved. Limits
+remain at their original vertex-stream position. No-hop values and all scalar
+post-processing on this global composition remain Unsupported. No-hop map/dedup follow the server global scan contract below. One bounded
 repeat is now admitted after the global scan prefix with the same combined
 32-depth check and cumulative traversal budget.
 

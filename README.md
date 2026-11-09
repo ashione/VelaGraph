@@ -740,3 +740,9 @@ The [retained gateway control slice](docs/RETAINED_GATEWAY_CONTROL.md) replaces
 actual managed graph full-Journal control and Prepare with anchored point evidence
 and deterministic retained-cut preparation. Existing finite profiles and full
 terminal-proof/SnapshotV1 boundaries remain; no capacity increase is claimed.
+
+Global scan-to-traversal queries also accept terminal single-key `values(key)`
+after out/in or bounded repeat. Ordered bags, qualified scalar provenance and
+missing/Null semantics use the same retained shard sessions and budgets; no-hop
+values and scalar post-processing remain unsupported. See the
+[composition contract](docs/GLOBAL_VERTEX_TRAVERSAL.md).

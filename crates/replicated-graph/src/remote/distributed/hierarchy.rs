@@ -150,7 +150,7 @@ mod tests {
             "g.V().hasLabel('missing').repeat(__.out()).times(0)",
             "g.V().hasLabel('missing').repeat(__.out()).times(2).repeat(__.in()).times(2)",
             "g.V().hasLabel('missing').repeat(__.out()).times(2).path()",
-            "g.V().hasLabel('missing').repeat(__.out()).times(2).values('x')",
+            "g.V().hasLabel('missing').repeat(__.out()).times(2).values('x').count()",
         ] {
             assert_eq!(
                 plan(&req(text)).unwrap_err(),

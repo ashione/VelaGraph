@@ -63,7 +63,8 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
             | Step::Existing(GremlinStep::Limit(_))
             | Step::Dedup
             | Step::Repeat { .. } => {}
-            Step::Existing(GremlinStep::Count) if index + 1 == query.steps().len() => {}
+            Step::Existing(GremlinStep::Count | GremlinStep::Values(_))
+                if index + 1 == query.steps().len() => {}
             Step::ValueMap(keys) if index + 1 == query.steps().len() => {
                 projection::validate_keys(keys)?
             }
@@ -341,8 +342,11 @@ mod tests {
         for text in [
             "g.V().values('x').out()",
             "g.V().valueMap('x').out()",
-            "g.V().out().values('x')",
+            "g.V().out().values('x').count()",
             "g.V().hasLabel('absent').valueMap('x').count()",
+            "g.V().hasLabel('absent').out().values('x').limit(1)",
+            "g.V().out().values('x','y')",
+            "g.V().out().values('x').in()",
         ] {
             let query = GremlinQuery::parse(text);
             assert!(
@@ -356,6 +360,8 @@ mod tests {
     fn joined_plan_preserves_prefix_and_has_no_implicit_limit() {
         for text in [
             "g.V().out().count()",
+            "g.V().out().values('x')",
+            "g.V().repeat(__.in()).times(2).emit().dedup().values('x')",
             "g.V().out().repeat(__.in()).times(2)",
             "g.V().has('x').repeat(__.out()).times(32).emit().count()",
             "g.V().has('x').limit(3).in('r').dedup().valueMap('other')",
@@ -379,7 +385,7 @@ mod tests {
         assert!(filter_steps(&q.steps()[..join_at(&q).unwrap().unwrap()])
             .unwrap()
             .is_empty());
-        for text in ["g.V().out().values('x')", "g.V().out().path()"] {
+        for text in ["g.V().out().values('x').dedup()", "g.V().out().path()"] {
             let q = GremlinQuery::parse(text).unwrap();
             assert!(join_at(&q).is_err(), "{text}");
         }
