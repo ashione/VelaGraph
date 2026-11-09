@@ -1798,3 +1798,6 @@ async fn submission_timing_cancellation_full_and_disconnected_sink_do_not_write(
     g.shutdown().await;
     f.stop().await;
 }
+
+#[path = "managed_submission_timing_tests.rs"]
+mod submission_timing_tests;

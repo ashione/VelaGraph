@@ -72,7 +72,12 @@ Tests cover enabled/disabled success, exact retry identity, old-version reads,
 identity mismatch, validation rejection, stale preparation rejection preserving
 the original durable request and Pending status, explicit Abort, and terminal
 retry. Cancellation at the existing queue boundary and full/disconnected sinks
-exercise diagnostic lifetime and loss without relaxing write assertions. Existing
+exercise diagnostic lifetime and loss without relaxing write assertions. Real managed
+RPC servers also cover remote enabled/disabled success, exact original-ID retry,
+identity rejection and old-version reads. A bounded forwarding proxy holds the
+first target lookup after actual durable admission; canceling that handler records
+Interrupted and closes the reached phases, while the original request/Plan remains
+recoverable and its retry commits without a new snapshot or admission. Existing
 wire golden vectors remain unchanged.
 
 This is the instrumentation/model review slice of #127. Owned-process resource
