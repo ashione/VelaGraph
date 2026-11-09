@@ -218,3 +218,12 @@ checkpoint. Every pending/verified durable boundary, exact original comparison
 and mandatory release acceptance remains. Strict same-identity v1 migration never
 resets progress or rebinds old source/ELF evidence. Diagnostic work counters are
 not a runtime performance claim and do not change production storage formats.
+
+The unignored `byte_bound_independent_processes_small_lifecycle_recovery` test
+adds four sequential gateway writes with a separate coordinator, writer and
+nonparticipant process. It preserves first/last original IDs and Plan bytes,
+V0/V1/V4 proofs and Gremlin data through real final-ACK loss, process reopen and
+fresh-state snapshot restore for all three roles. Immutable member grants and
+the nonparticipant's zero local sequence are checked after recovery. This small
+ordinary-test case does not replace the unchanged release 1,025-write lifecycle
+or CoreHR gates, cross the 256/1,024 history boundaries, or establish throughput.
