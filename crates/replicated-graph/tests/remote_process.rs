@@ -18,11 +18,21 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-struct Process(Child);
+#[path = "support/remote_evidence.rs"]
+mod remote_evidence;
+struct Process {
+    child: Child,
+    index: usize,
+    evidence: Option<Arc<remote_evidence::Evidence>>,
+}
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(evidence) = &self.evidence {
+            remote_evidence::cleanup_observed(&mut self.child, self.index, evidence);
+        } else {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -32,6 +42,29 @@ async fn three_independent_processes_graph_roundtrip() -> anyhow::Result<()> {
 }
 
 async fn scenario() -> anyhow::Result<()> {
+    let evidence = remote_evidence::Evidence::prepare()?.map(Arc::new);
+    let result = scenario_with_evidence(evidence.clone()).await;
+    if let Some(evidence) = &evidence {
+        evidence.record(
+            "scenario-result.json",
+            serde_json::json!({"success":result.is_ok()}),
+        );
+        let verified = evidence.verify();
+        if result.is_ok() {
+            verified?;
+        } else if verified.is_err() {
+            evidence.record(
+                "provenance-incomplete.json",
+                serde_json::json!({"verified":false}),
+            );
+        }
+    }
+    result
+}
+
+async fn scenario_with_evidence(
+    evidence: Option<Arc<remote_evidence::Evidence>>,
+) -> anyhow::Result<()> {
     let mut reservations = Vec::new();
     for _ in 0..9 {
         reservations.push(TcpListener::bind("127.0.0.1:0").await?);
@@ -71,12 +104,27 @@ async fn scenario() -> anyhow::Result<()> {
         if i == 0 {
             command.args(["--bootstrap", &members]);
         }
-        processes.push(Process(
-            command
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()?,
-        ));
+        let (stdout, stderr) = if let Some(evidence) = &evidence {
+            let (out, err) = evidence
+                .streams(i + 1)
+                .context("create child evidence streams")?;
+            command.env("VELAGRAPH_REMOTE_DIAGNOSTICS", "1");
+            (Stdio::from(out), Stdio::from(err))
+        } else {
+            (Stdio::null(), Stdio::inherit())
+        };
+        let child = command.stdout(stdout).stderr(stderr).spawn()?;
+        if let Some(evidence) = &evidence {
+            evidence.record(
+                &format!("node-{}-launch.json", i + 1),
+                serde_json::json!({"pid":child.id(),"node":i + 1,"graph":addresses[3 * i + 2]}),
+            );
+        }
+        processes.push(Process {
+            child,
+            index: i + 1,
+            evidence: evidence.clone(),
+        });
     }
     let leader = timeout(Duration::from_secs(35), async {
         loop {
@@ -198,7 +246,16 @@ async fn scenario() -> anyhow::Result<()> {
     ));
     let other = RemoteStorageNode::new(addresses[3 * leader + 2], 99, Duration::from_secs(2))?;
     assert!(run_blocking(move || other.read_view()).await?.is_err());
-    paged_snapshot_roundtrip(addresses[3 * leader + 2]).await?;
+    let paged = paged_snapshot_roundtrip(addresses[3 * leader + 2], evidence.as_deref()).await;
+    if paged.is_err() {
+        if let Some(evidence) = &evidence {
+            evidence.record(
+                "paged-roundtrip-failed.json",
+                serde_json::json!({"phase":"paged_snapshot_roundtrip"}),
+            );
+        }
+    }
+    paged?;
     drop(graph);
     drop(processes);
     Ok(())
@@ -207,7 +264,10 @@ async fn scenario() -> anyhow::Result<()> {
 // This stays inside the real three-process fixture: no mock responses, automatic
 // failover, or transport-security claims. The graph contains >4 MiB of payload,
 // so a 2 MiB page budget necessarily requires at least three nonempty pages.
-async fn paged_snapshot_roundtrip(endpoint: std::net::SocketAddr) -> anyhow::Result<()> {
+async fn paged_snapshot_roundtrip(
+    endpoint: std::net::SocketAddr,
+    evidence: Option<&remote_evidence::Evidence>,
+) -> anyhow::Result<()> {
     use replicated_graph::remote::{close_snapshot, open_snapshot, paged_snapshot, snapshot_page};
     const PAGE_BYTES: usize = 2 * 1024 * 1024;
     const PAYLOAD_BYTES: usize = 64 * 1024;
@@ -261,6 +321,14 @@ async fn paged_snapshot_roundtrip(endpoint: std::net::SocketAddr) -> anyhow::Res
     }
     let before = paged_snapshot(endpoint, 7, budget)
         .await
+        .inspect_err(|_| {
+            if let Some(evidence) = evidence {
+                evidence.record(
+                    "initial-download-failed.json",
+                    serde_json::json!({"phase":"initial_paged_download"}),
+                );
+            }
+        })
         .context("initial paged download")?;
     let descriptor = open_snapshot(endpoint, None, 7, budget)
         .await
