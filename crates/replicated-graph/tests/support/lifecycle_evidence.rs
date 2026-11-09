@@ -192,9 +192,30 @@ struct OpenArtifact {
     file: File,
     reference: ArtifactRef,
 }
+// A writer's lifetime ends when its lease drops, even if a concurrent process
+// launch temporarily retains a duplicate of the same open-file description.
+struct WriterLease {
+    file: File,
+}
+impl WriterLease {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        let file = open_directory(path)?;
+        rfs::flock(&file, FlockOperation::NonBlockingLockExclusive)
+            .context("lifecycle already has a writer")?;
+        Ok(Self { file })
+    }
+}
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // Never panic during cleanup. File close remains the fallback if unlock
+        // fails, but alone cannot release a lock while a duplicate still lives.
+        let _ = rfs::flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
 struct Store {
     path: PathBuf,
-    root: File,
+    root: WriterLease,
     owns_lock: bool,
     artifacts: Option<File>,
     directory_synced: bool,
@@ -278,11 +299,11 @@ fn read_bounded(file: &mut File, limit: usize) -> anyhow::Result<Vec<u8>> {
 
 impl Store {
     fn open(path: &Path, metrics: Metrics) -> anyhow::Result<Self> {
-        let root = open_directory(path)?;
-        rfs::flock(&root, FlockOperation::NonBlockingLockExclusive)
-            .context("lifecycle already has a writer")?;
+        Self::from_lease(path, WriterLease::open(path)?, metrics)
+    }
+    fn from_lease(path: &Path, root: WriterLease, metrics: Metrics) -> anyhow::Result<Self> {
         let artifacts = match rfs::openat(
-            &root,
+            &root.file,
             "artifacts",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
@@ -309,19 +330,24 @@ impl Store {
         self.metrics.work("store.owner_metadata_checks", 0);
         let current = open_directory(&self.path)?;
         ensure!(
-            same_file(&self.root, &current)?,
+            same_file(&self.root.file, &current)?,
             "lifecycle directory replaced"
         );
         // A second open-file description must be unable to take our lock. If it
         // succeeds, ownership was lost; do not silently reacquire and continue.
         match rfs::flock(&current, FlockOperation::NonBlockingLockExclusive) {
             Err(rustix::io::Errno::WOULDBLOCK) => {}
-            Ok(()) => bail!("lifecycle writer lock lost"),
+            Ok(()) => {
+                // This probe must never become a replacement writer lease.
+                // Explicit release also covers a temporarily duplicated probe.
+                let _ = rfs::flock(&current, FlockOperation::Unlock);
+                bail!("lifecycle writer lock lost");
+            }
             Err(error) => return Err(error.into()),
         }
         if let Some(directory) = &self.artifacts {
             let current: File = rfs::openat(
-                &self.root,
+                &self.root.file,
                 "artifacts",
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
@@ -337,16 +363,16 @@ impl Store {
     #[cfg(test)]
     fn lose_ownership(&mut self) -> anyhow::Result<()> {
         self.owns_lock = false; // irreversible; never silently reacquire
-        rfs::flock(&self.root, FlockOperation::Unlock)?;
+        rfs::flock(&self.root.file, FlockOperation::Unlock)?;
         Ok(())
     }
     fn ensure_artifacts(&mut self) -> anyhow::Result<()> {
         self.check_owner()?;
         if self.artifacts.is_none() {
             self.fault.check("artifacts", Boundary::Create, false)?;
-            rfs::mkdirat(&self.root, "artifacts", Mode::RWXU)?;
+            rfs::mkdirat(&self.root.file, "artifacts", Mode::RWXU)?;
             let directory = rfs::openat(
-                &self.root,
+                &self.root.file,
                 "artifacts",
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
@@ -357,7 +383,7 @@ impl Store {
         if !self.directory_synced {
             self.fault
                 .check("artifacts", Boundary::DirectorySync, false)?;
-            self.root.sync_all()?;
+            self.root.file.sync_all()?;
             self.metrics.work("artifact.directory_creation_sync", 0);
             self.fault
                 .check("artifacts", Boundary::DirectorySync, true)?;
@@ -831,7 +857,7 @@ impl LifecycleCheckpoint {
             metrics,
         };
         let limit = Self::legacy_limit(&expected)?;
-        if let Some(mut file) = open_file(&result.store.root, "progress.json")? {
+        if let Some(mut file) = open_file(&result.store.root.file, "progress.json")? {
             let bytes = read_bounded(&mut file, limit)?;
             #[derive(Deserialize)]
             struct Version {
@@ -1140,7 +1166,7 @@ impl LifecycleCheckpoint {
         };
         self.metrics.work("checkpoint.encoded", bytes.len());
         self.store.write(
-            &self.store.root,
+            &self.store.root.file,
             "progress.json",
             &bytes,
             false,
@@ -1574,6 +1600,47 @@ mod tests {
             before
         );
     }
+    #[test]
+    fn writer_lease_drop_releases_duplicated_description_without_unlocking_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = Store::open(directory.path(), Metrics::default()).unwrap();
+        let duplicate = current.root.file.try_clone().unwrap();
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        drop(current);
+        let replacement = Store::open(directory.path(), Metrics::default()).unwrap();
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        drop(duplicate);
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        drop(replacement);
+
+        // An already-lost old lease must not unlock a distinct successor's OFD.
+        let mut old = Store::open(directory.path(), Metrics::default()).unwrap();
+        let duplicate = old.root.file.try_clone().unwrap();
+        old.lose_ownership().unwrap();
+        let replacement = Store::open(directory.path(), Metrics::default()).unwrap();
+        drop(old);
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        drop(duplicate);
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        replacement.check_owner().unwrap();
+    }
+
+    #[test]
+    fn writer_lease_construction_error_releases_duplicated_description() {
+        let directory = tempfile::tempdir().unwrap();
+        // Force the actual fallible artifacts open after successful acquisition.
+        fs::write(directory.path().join("artifacts"), b"not a directory").unwrap();
+        let lease = WriterLease::open(directory.path()).unwrap();
+        let duplicate = lease.file.try_clone().unwrap();
+        assert!(Store::from_lease(directory.path(), lease, Metrics::default()).is_err());
+        fs::remove_file(directory.path().join("artifacts")).unwrap();
+        let replacement = Store::open(directory.path(), Metrics::default()).unwrap();
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        drop(duplicate);
+        assert!(Store::open(directory.path(), Metrics::default()).is_err());
+        replacement.check_owner().unwrap();
+    }
+
     #[test]
     fn owner_loss_and_directory_replacement_prevent_publication() {
         let directory = tempfile::tempdir().unwrap();
