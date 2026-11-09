@@ -12,6 +12,7 @@ mod adapter;
 pub mod catalog;
 pub mod managed_gateway;
 pub mod managed_graph;
+pub mod managed_submission_timing;
 pub mod remote;
 pub mod remote_storage;
 pub use remote_storage::RemoteStorageNode;

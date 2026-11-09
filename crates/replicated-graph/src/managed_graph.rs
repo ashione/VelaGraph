@@ -1,5 +1,6 @@
 //! Opt-in trusted local/remote graph/v2 transactions over an empty fixed cohort.
 //! No remote Global Gremlin admission. Plans are immutable in-memory retry values.
+use crate::managed_submission_timing::{Phase, Recorder};
 use d2_raft::participant_writes::Authority;
 use d2_raft::request_index::RequestLookup;
 use d2_raft::target_evidence::TargetEvidence;
@@ -381,6 +382,7 @@ impl GraphSnapshot {
 /// Explicit fixed handle set; no discovery, ownership migration, or failover.
 pub struct GraphCohort<'a> {
     coordinator: NodeRef<'a>,
+    timing: Recorder,
     authority: Authority,
     epoch: u64,
     members: Vec<(NodeRef<'a>, versioned_reads::Target)>,
@@ -412,10 +414,15 @@ impl<'a> GraphCohort<'a> {
     ) -> Self {
         Self {
             coordinator,
+            timing: Recorder::default(),
             authority,
             epoch,
             members,
         }
+    }
+    pub(crate) fn with_timing(mut self, timing: Recorder) -> Self {
+        self.timing = timing;
+        self
     }
     pub async fn snapshot(
         &self,
@@ -632,6 +639,7 @@ impl<'a> GraphCohort<'a> {
         self.run(plan, true).await
     }
     async fn run(&self, plan: &Plan, abort: bool) -> Result<Outcome> {
+        let _span = self.timing.span(Phase::Execute);
         let decision = tokio::time::timeout(Duration::from_secs(30), self.decide(plan, abort))
             .await
             .map_err(|_| Error::Uncertain)??;
@@ -647,6 +655,7 @@ impl<'a> GraphCohort<'a> {
         })
     }
     async fn decide(&self, plan: &Plan, abort: bool) -> Result<Transaction> {
+        let _span = self.timing.span(Phase::Decision);
         let target = self.target(plan).await?;
         if let Some(found) = target.record {
             if found.transaction.decision.is_some() {
@@ -691,6 +700,7 @@ impl<'a> GraphCohort<'a> {
                 .find(|(_, target)| target.shard == part.descriptor.shard)
                 .ok_or(Error::Identity)?;
             let prepared = async {
+                let _span = self.timing.span(Phase::Prepare);
                 let evidence = self.target(plan).await?;
                 let tx = &evidence.record.as_ref().ok_or(Error::Identity)?.transaction;
                 // A concurrent decision is recovered below rather than issuing
@@ -754,6 +764,7 @@ impl<'a> GraphCohort<'a> {
         member: &versioned_reads::Target,
         cut: &HistoryCursor,
     ) -> Result<()> {
+        let _span = self.timing.span(Phase::HistorySync);
         let status = node
             .history_status(&self.authority, member, &cut.cohort)
             .await?;
@@ -789,6 +800,7 @@ impl<'a> GraphCohort<'a> {
         Err(Error::Capacity)
     }
     async fn advance_to(&self, plan: &Plan, transaction: &Transaction) -> Result<()> {
+        let _span = self.timing.span(Phase::Cohort);
         let ordinal = transaction.ordinal;
         // The exact terminal target is retained from decide; do not combine a
         // different target with a numerically equal later proof.
@@ -808,6 +820,7 @@ impl<'a> GraphCohort<'a> {
             return Err(Error::Identity);
         }
         for (node, target) in &self.members {
+            let history = self.timing.span(Phase::HistorySync);
             let status = node
                 .history_status(&self.authority, target, &plan.cohort)
                 .await?;
@@ -846,6 +859,8 @@ impl<'a> GraphCohort<'a> {
                     .history_page(&self.authority, self.epoch, &base, Some(&cut))
                     .await?;
             }
+            drop(history);
+            let consume = self.timing.span(Phase::Consume);
             // Each successful consume strictly increases applied, bounded by the
             // admitted transaction cap. Concurrent consumption can already be ahead.
             while applied < ordinal {
@@ -861,6 +876,8 @@ impl<'a> GraphCohort<'a> {
                     other => other?,
                 };
             }
+            drop(consume);
+            let _visibility = self.timing.span(Phase::Visibility);
             // A watermark or hash root alone is never the final V certificate.
             node.prefix_terminal(target, &proof).await?;
         }

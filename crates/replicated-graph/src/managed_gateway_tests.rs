@@ -864,70 +864,83 @@ async fn persistent_restart_recovers_original_partial_plan_and_rejects_old_token
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_admitted_request_remains_pending_until_explicit_abort() {
     let _test = TEST_GATE.lock().await;
-    let f = Fixture::new().await;
-    let g = f.gateway().await;
-    let config = OwnedConfig::from(f.config());
-    let graph = config.graph();
-    let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
-    let stale = create(1, 7, 1);
-    let stale_plan = stale.mutation.prepare(&snapshot).unwrap();
-    committed(&call(&g, Operation::Submit(create(2, 7, 2))).await.unwrap());
-    graph
-        .admit_request(
-            stale.external_id,
-            canonical(&bound(), &stale.mutation).unwrap(),
-            &stale_plan,
-        )
-        .await
-        .unwrap();
-    let record = journal(&f)
-        .await
-        .request(stale.external_id)
-        .unwrap()
-        .clone();
-    assert_eq!(
-        call(&g, Operation::Submit(stale.clone())).await,
-        Err(Error::Rejected)
-    );
-    assert!(
-        matches!(call(&g,Operation::Status(stale.clone())).await.unwrap(),Reply::Write { transaction_id:Some(id),status:WriteStatus::Pending,.. } if id==stale_plan.id())
-    );
-    assert_eq!(
-        journal(&f).await.request(stale.external_id).unwrap(),
-        &record
-    );
-    assert!(matches!(
-        call(&g, Operation::Abort(stale.clone())).await.unwrap(),
-        Reply::Write {
-            status: WriteStatus::Aborted { visible: true, .. },
-            ..
-        }
-    ));
-    assert!(matches!(
-        call(&g, Operation::Submit(stale)).await.unwrap(),
-        Reply::Write {
-            status: WriteStatus::Aborted { visible: true, .. },
-            ..
-        }
-    ));
-    let before = journal(&f).await.resolved_prefix();
-    for operation in [
-        Operation::Status(create(3, 7, 3)),
-        Operation::Abort(create(3, 7, 3)),
-    ] {
+    for enabled in [false, true] {
+        let f = Fixture::new().await;
+        let (g, reports) = timing_gateway(&f, enabled).await;
+        let config = OwnedConfig::from(f.config());
+        let graph = config.graph();
+        let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+        let stale = create(1, 7, 1);
+        let stale_plan = stale.mutation.prepare(&snapshot).unwrap();
+        committed(&call(&g, Operation::Submit(create(2, 7, 2))).await.unwrap());
+        graph
+            .admit_request(
+                stale.external_id,
+                canonical(&bound(), &stale.mutation).unwrap(),
+                &stale_plan,
+            )
+            .await
+            .unwrap();
+        let record = journal(&f)
+            .await
+            .request(stale.external_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            call(&g, Operation::Submit(stale.clone())).await,
+            Err(Error::Rejected)
+        );
+        assert!(
+            matches!(call(&g,Operation::Status(stale.clone())).await.unwrap(),Reply::Write { transaction_id:Some(id),status:WriteStatus::Pending,.. } if id==stale_plan.id())
+        );
+        assert_eq!(
+            journal(&f).await.request(stale.external_id).unwrap(),
+            &record
+        );
         assert!(matches!(
-            call(&g, operation).await.unwrap(),
+            call(&g, Operation::Abort(stale.clone())).await.unwrap(),
             Reply::Write {
-                transaction_id: None,
-                status: WriteStatus::Absent,
+                status: WriteStatus::Aborted { visible: true, .. },
                 ..
             }
         ));
+        assert!(matches!(
+            call(&g, Operation::Submit(stale)).await.unwrap(),
+            Reply::Write {
+                status: WriteStatus::Aborted { visible: true, .. },
+                ..
+            }
+        ));
+        let before = journal(&f).await.resolved_prefix();
+        for operation in [
+            Operation::Status(create(3, 7, 3)),
+            Operation::Abort(create(3, 7, 3)),
+        ] {
+            assert!(matches!(
+                call(&g, operation).await.unwrap(),
+                Reply::Write {
+                    transaction_id: None,
+                    status: WriteStatus::Absent,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(journal(&f).await.resolved_prefix(), before);
+        if let Some(reports) = reports {
+            let reports: Vec<_> = reports.try_iter().collect();
+            assert_eq!(reports.len(), 3);
+            assert_eq!(reports[1].completion, Completion::Error);
+            assert_eq!(reports[1].phases[Phase::Prepare as usize].calls, 1);
+            assert_eq!(reports[1].phases[Phase::HistorySync as usize].calls, 1);
+            assert_eq!(reports[1].phases[Phase::Cohort as usize].calls, 0);
+            assert_eq!(reports[2].completion, Completion::Returned);
+            assert_eq!(reports[2].phases[Phase::Prepare as usize].calls, 0);
+            assert_eq!(reports[2].phases[Phase::Visibility as usize].calls, 2);
+        }
+        g.shutdown().await;
+        drop(config);
+        f.stop().await;
     }
-    assert_eq!(journal(&f).await.resolved_prefix(), before);
-    g.shutdown().await;
-    drop(config);
-    f.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1650,3 +1663,141 @@ async fn legacy_typed_read_wire_is_rejected_instead_of_translated() {
 
 #[path = "managed_gateway_traversal_tests.rs"]
 mod traversal_tests;
+
+async fn timing_gateway(f: &Fixture, enabled: bool) -> (Gateway, Option<timing::Reports>) {
+    if enabled {
+        let (gateway, reports) = Gateway::bind_with_timing(
+            f.config(),
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        (gateway, Some(reports))
+    } else {
+        let gateway = f.gateway().await;
+        assert!(gateway.state.timing.is_none());
+        (gateway, None)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submission_timing_preserves_success_retry_errors_and_old_version() {
+    let _test = TEST_GATE.lock().await;
+    for enabled in [false, true] {
+        let f = Fixture::new().await;
+        let (g, reports) = timing_gateway(&f, enabled).await;
+        let old = open(&g, Some(0)).await;
+        let start = Instant::now();
+        let write = create(41, 7, 1);
+        let first = call(&g, Operation::Submit(write.clone())).await.unwrap();
+        assert_eq!(committed(&first).1, 1);
+        let retry = call(&g, Operation::Submit(write.clone())).await.unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(
+            call(&g, Operation::Submit(create(41, 7, 2))).await,
+            Err(Error::Identity)
+        );
+        assert_eq!(
+            call(&g, Operation::Submit(create(42, 7, 1))).await,
+            Err(Error::Rejected)
+        );
+        assert_eq!(
+            call(&g, Operation::Submit(create(0, 7, 2))).await,
+            Err(Error::Identity)
+        );
+        eprintln!("submission timing enabled={enabled}: five attempts {:?} (functional observation, not an overhead benchmark)", start.elapsed());
+        assert_eq!(journal(&f).await.resolved_prefix(), 1);
+        assert_eq!(read(&g, &old, query(7, "g.V(1)")).await, vec![]);
+        let current = open(&g, Some(1)).await;
+        assert_eq!(read(&g, &current, query(7, "g.V(1)")).await, vec![v(7, 1)]);
+        if let Some(reports) = reports {
+            let reports: Vec<_> = reports.try_iter().collect();
+            assert_eq!(reports.len(), 5);
+            let first = &reports[0];
+            assert_eq!(first.external_id, write.external_id);
+            assert_eq!(first.completion, Completion::Returned);
+            for phase in [
+                Phase::Queue,
+                Phase::Canonical,
+                Phase::Recovery,
+                Phase::Snapshot,
+                Phase::Validation,
+                Phase::Admission,
+                Phase::Execute,
+                Phase::Decision,
+                Phase::Prepare,
+            ] {
+                assert_eq!(first.phases[phase as usize].calls, 1, "{phase:?}");
+            }
+            assert_eq!(first.phases[Phase::HistorySync as usize].calls, 3);
+            assert_eq!(first.phases[Phase::Consume as usize].calls, 2);
+            assert_eq!(first.phases[Phase::Visibility as usize].calls, 2);
+            for phase in [
+                Phase::Snapshot,
+                Phase::Validation,
+                Phase::Admission,
+                Phase::Prepare,
+            ] {
+                assert_eq!(reports[1].phases[phase as usize].calls, 0);
+            }
+            assert!(reports[2..]
+                .iter()
+                .all(|r| r.completion == Completion::Error));
+            assert_eq!(reports[2].phases[Phase::Recovery as usize].calls, 1);
+            assert_eq!(reports[3].phases[Phase::Validation as usize].calls, 1);
+            assert_eq!(reports[3].phases[Phase::Admission as usize].calls, 0);
+        }
+        g.shutdown().await;
+        f.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submission_timing_cancellation_full_and_disconnected_sink_do_not_write() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let (g, reports) = timing_gateway(&f, true).await;
+    let reports = reports.unwrap();
+    {
+        let _serial = g.state.submit.lock().await;
+        let work = Arc::new(g.state.connections.clone().try_acquire_owned().unwrap());
+        let mut pending = Box::pin(g.state.execute(
+            Operation::Submit(create(1, 7, 1)),
+            work,
+            Instant::now() + Duration::from_secs(15),
+        ));
+        assert!(matches!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        drop(pending);
+    }
+    let cancelled = reports.try_recv().unwrap();
+    assert_eq!(cancelled.completion, Completion::Interrupted);
+    assert_eq!(cancelled.phases[Phase::Queue as usize].calls, 1);
+    assert_eq!(cancelled.phases[Phase::Recovery as usize].calls, 0);
+    assert_eq!(journal(&f).await.resolved_prefix(), 0);
+    // Fill the diagnostic queue with rejected requests. Overflow must not change errors.
+    for _ in 0..timing::REPORT_CAPACITY + 1 {
+        assert_eq!(
+            call(&g, Operation::Submit(create(0, 7, 1))).await,
+            Err(Error::Identity)
+        );
+    }
+    // A full sink must also permit a real successful commit.
+    committed(&call(&g, Operation::Submit(create(2, 7, 2))).await.unwrap());
+    assert_eq!(reports.try_iter().count(), timing::REPORT_CAPACITY);
+    drop(reports);
+    committed(&call(&g, Operation::Submit(create(3, 7, 3))).await.unwrap());
+    assert_eq!(journal(&f).await.resolved_prefix(), 2);
+    g.shutdown().await;
+    f.stop().await;
+}
+
+#[path = "managed_submission_timing_tests.rs"]
+mod submission_timing_tests;

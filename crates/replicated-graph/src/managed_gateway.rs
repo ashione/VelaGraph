@@ -3,6 +3,7 @@
 //! remote Global Gremlin API, authenticated access, multi-host Raft placement,
 //! discovery, or a durable read lease.
 use crate::managed_graph::{self, GraphCohort, GraphSnapshot, Outcome, Plan};
+use crate::managed_submission_timing::{self as timing, Attempt, Completion, Phase};
 use crate::remote::query::{QueryCompleteness, QueryFailure, QueryRow};
 use d2_raft::{
     cohort_reads,
@@ -490,6 +491,7 @@ struct State {
     memory: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     submit: tokio::sync::Mutex<()>,
+    timing: Option<timing::Sender>,
 }
 impl State {
     fn expire(&self) {
@@ -575,42 +577,66 @@ impl State {
         before_deadline(end)?;
         match operation {
             Operation::Submit(write) => {
-                // Only admitted connections wait for this lock; no detached write
-                // queues. Status, Abort and reads never acquire this mutex.
-                let _serial = self.submit.lock().await;
-                before_deadline(end)?;
-                let bytes = canonical(&self.config.binding, &write.mutation)?;
-                if write.external_id == [0; 16] {
-                    return Err(Error::Identity);
-                }
-                let graph = self.config.graph();
-                let plan = match graph.recover_request(write.external_id, &bytes).await? {
-                    Some(plan) => plan,
-                    None => {
-                        before_deadline(end)?;
-                        let snapshot = self.capture(None, MAX_TTL, work.clone()).await?;
-                        before_deadline(end)?;
-                        let mutation = write.mutation;
-                        let candidate = tokio::task::spawn_blocking(move || {
-                            let _work = work;
-                            mutation.prepare(&snapshot.snapshot)
-                        })
-                        .await
-                        .map_err(|_| Error::Unknown)??;
-                        before_deadline(end)?;
-                        graph
-                            .admit_request(write.external_id, bytes, &candidate)
-                            .await?
+                let mut attempt = Attempt::new(self.timing.as_ref(), write.external_id);
+                let trace = &attempt.recorder;
+                let result = async {
+                    // Only admitted connections wait for this lock; no detached write
+                    // queues. Status, Abort and reads never acquire this mutex.
+                    let queue = trace.span(Phase::Queue);
+                    let _serial = self.submit.lock().await;
+                    drop(queue);
+                    let canonical_span = trace.span(Phase::Canonical);
+                    before_deadline(end)?;
+                    let bytes = canonical(&self.config.binding, &write.mutation)?;
+                    if write.external_id == [0; 16] {
+                        return Err(Error::Identity);
                     }
+                    drop(canonical_span);
+                    let graph = self.config.graph().with_timing(trace.clone());
+                    let recovery = trace.span(Phase::Recovery);
+                    let recovered = graph.recover_request(write.external_id, &bytes).await?;
+                    drop(recovery);
+                    let plan = match recovered {
+                        Some(plan) => plan,
+                        None => {
+                            before_deadline(end)?;
+                            let snapshot_span = trace.span(Phase::Snapshot);
+                            let snapshot = self.capture(None, MAX_TTL, work.clone()).await?;
+                            before_deadline(end)?;
+                            drop(snapshot_span);
+                            let validation = trace.span(Phase::Validation);
+                            let mutation = write.mutation;
+                            let candidate = tokio::task::spawn_blocking(move || {
+                                let _work = work;
+                                mutation.prepare(&snapshot.snapshot)
+                            })
+                            .await
+                            .map_err(|_| Error::Unknown)??;
+                            before_deadline(end)?;
+                            drop(validation);
+                            let _admission = trace.span(Phase::Admission);
+                            graph
+                                .admit_request(write.external_id, bytes, &candidate)
+                                .await?
+                        }
+                    };
+                    before_deadline(end)?;
+                    let status = graph.execute(&plan).await?.into();
+                    Ok(Reply::Write {
+                        external_id: write.external_id,
+                        transaction_id: Some(plan.id()),
+                        status,
+                    })
+                }
+                .await;
+                attempt.completion = if result.is_ok() {
+                    Completion::Returned
+                } else {
+                    Completion::Error
                 };
-                before_deadline(end)?;
-                let status = graph.execute(&plan).await?.into();
-                Ok(Reply::Write {
-                    external_id: write.external_id,
-                    transaction_id: Some(plan.id()),
-                    status,
-                })
+                result
             }
+
             operation @ (Operation::Status(_) | Operation::Abort(_)) => {
                 let abort = matches!(operation, Operation::Abort(_));
                 let write = match operation {
@@ -736,7 +762,7 @@ pub struct Gateway {
 }
 impl Gateway {
     pub async fn bind(config: Config, bind: SocketAddr, deadline: Duration) -> Result<Self> {
-        Self::bind_config(config.into(), bind, deadline).await
+        Self::bind_config(config.into(), bind, deadline, None).await
     }
     /// Serve the unchanged graph protocol over fixed trusted internal endpoints.
     pub async fn bind_remote(
@@ -744,17 +770,39 @@ impl Gateway {
         bind: SocketAddr,
         deadline: Duration,
     ) -> Result<Self> {
-        Self::bind_config(config.into(), bind, deadline).await
+        Self::bind_config(config.into(), bind, deadline, None).await
+    }
+    /// Opt in to bounded local phase reports; draining/dropping them never gates writes.
+    pub async fn bind_with_timing(
+        config: Config,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<(Self, timing::Reports)> {
+        let (sender, reports) = timing::channel();
+        let gateway = Self::bind_config(config.into(), bind, deadline, Some(sender)).await?;
+        Ok((gateway, reports))
+    }
+    /// Same diagnostics with fixed remote participant/coordinator endpoints.
+    pub async fn bind_remote_with_timing(
+        config: RemoteConfig,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<(Self, timing::Reports)> {
+        let (sender, reports) = timing::channel();
+        let gateway = Self::bind_config(config.into(), bind, deadline, Some(sender)).await?;
+        Ok((gateway, reports))
     }
     async fn bind_config(
         config: OwnedConfig,
         bind: SocketAddr,
         deadline: Duration,
+        timing: Option<timing::Sender>,
     ) -> Result<Self> {
         check_deadline(deadline)?;
         config.validate()?;
         let state = Arc::new(State {
             config,
+            timing,
             incarnation: random()?,
             sessions: Mutex::new(BTreeMap::new()),
             memory: Arc::new(Semaphore::new(MAX_SESSIONS)),
