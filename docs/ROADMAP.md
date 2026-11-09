@@ -13,7 +13,7 @@
 - **实验查询**：显式 ID 跨分片 in/out、多跳、去重、过滤、计数与终结 valueMap；全局 V() 属性扫描及有界扫描→out/in→过滤/去重/count/valueMap 组合；有界原生层级 repeat；增量层级计数、实际顶点结果分页和所选属性分页。
 - **验收**：CoreHR 20 万人、5000 部门，人员/部门上下级和一人多部门，固定生成器与独立关系/属性 oracle，PR/main 全量 CI。此场景运行在同一云端机器的独立进程，每数据分片一个副本，不是多机吞吐、全局快照或高可用证明。
 
-**当前已接通**通用全局属性筛选 → 有界跨片 out/in → 过滤、limit、去重及终结 count/values/valueMap，具体范围见[组合契约](GLOBAL_VERTEX_TRAVERSAL.md)。扫描与遍历使用独立累计预算、同一固定会话和原截止时间，组合结果不默认截取 100 条。全局筛选后的单个有界 repeat（总深度≤32）现已接通；更广的组合（如全局起点 path、无跳转 values）仍未开放；大结果分页仍只适用于文档列出的层级 job 形状，不是任意查询分页。
+**当前已接通**通用全局属性筛选 → 有界跨片 out/in → 过滤、limit、去重及终结 count/values/valueMap，具体范围见[组合契约](GLOBAL_VERTEX_TRAVERSAL.md)。扫描与遍历使用独立累计预算、同一固定会话和原截止时间，组合结果不默认截取 100 条。全局筛选后的单个有界 repeat（总深度≤32）现已接通；更广的组合（如全局起点 path、无显式 limit 的无跳转 values）仍未开放；大结果分页仍只适用于文档列出的层级 job 形状，不是任意查询分页。
 
 实验 graph/v2 的跨片边写入仍分阶段执行、不是原子事务；查询始终返回 **Unverified** 和实际各分片快照向量，**不是全局原子快照**。无完整邻接证明、无跨片事务、无自动故障切换承诺。参见 [README](../README.md)、[查询规范](QUERY_SPEC.md)及各 API 的单独契约。
 
@@ -521,5 +521,12 @@ explicit full-proof/snapshot boundaries. Test presence does not claim acceptance
 
 全局筛选后 out/in/有界 repeat 支持终端单字段 `values(key)`，复用固定分片会话与属性 fragment。
 保留有序 bag、限定分区的来源身份及 missing/Null 区别，不默认截取100条。
-无跳 values、标量后处理及全局原子快照仍未开放；预算和存储格式不变。
+无显式 limit 的无跳 values、标量后处理及全局原子快照仍未开放；预算和存储格式不变。
 见 [组合契约](GLOBAL_VERTEX_TRAVERSAL.md)。
+
+### Explicitly limited global scan values
+
+无跳全局扫描支持显式顶点 limit 后终端单字段 values，保留过滤/limit 顺序、
+限定分区的来源身份、等值 bag 和 missing/Null 区别；missing 不补扫以填满 limit。
+复用原固定会话与标量执行器，扫描/遍历预算独立累计，无格式或一致性变化。
+无显式 limit 的 values、标量后处理仍拒绝。见 [扫描契约](SERVER_GLOBAL_SCAN.md)。

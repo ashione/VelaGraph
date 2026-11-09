@@ -608,6 +608,31 @@ impl Execution<'_> {
         }
         Ok(next)
     }
+    // Shared scalar projection for explicit-ID, joined and bounded scan roots.
+    async fn values(
+        &mut self,
+        rows: Vec<Traverser>,
+        key: &str,
+    ) -> Result<Vec<Traverser>, QueryFailure> {
+        let mut next = Vec::new();
+        for mut row in rows {
+            let FragmentValue::Value(value) = self
+                .fragment(Fragment::Values {
+                    vertex: row.vertex,
+                    key: key.to_owned(),
+                })
+                .await?
+            else {
+                return Err(QueryFailure::IncompleteOrCorrupt);
+            };
+            if let Some(value) = value {
+                row.value = Some(value);
+                row.path.clear();
+                push(&mut next, row, &mut self.cost)?;
+            }
+        }
+        Ok(next)
+    }
     async fn run(
         &mut self,
         request: &DistributedRequest,
@@ -711,24 +736,7 @@ impl Execution<'_> {
                     rows = next;
                 }
                 Step::Existing(GremlinStep::Values(key)) => {
-                    let mut next = Vec::new();
-                    for mut row in rows {
-                        let FragmentValue::Value(value) = self
-                            .fragment(Fragment::Values {
-                                vertex: row.vertex,
-                                key: key.clone(),
-                            })
-                            .await?
-                        else {
-                            return Err(QueryFailure::IncompleteOrCorrupt);
-                        };
-                        if let Some(value) = value {
-                            row.value = Some(value);
-                            row.path.clear();
-                            push(&mut next, row, &mut self.cost)?;
-                        }
-                    }
-                    rows = next;
+                    rows = self.values(rows, key).await?;
                 }
                 Step::ValueMap(_) => {}
                 Step::Existing(GremlinStep::Path) | Step::Existing(GremlinStep::Count) => {}
@@ -1127,6 +1135,10 @@ fn validate_output(
             .iter()
             .map(|row| match row {
                 QueryRow::Element(QualifiedElement::Vertex { partition, id })
+                | QueryRow::Value {
+                    source: Some(QualifiedElement::Vertex { partition, id }),
+                    ..
+                }
                 | QueryRow::PropertyMap {
                     source: QualifiedElement::Vertex { partition, id },
                     ..

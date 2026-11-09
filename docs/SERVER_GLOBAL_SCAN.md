@@ -123,3 +123,29 @@ its ordered roots exactly and limits keep their positions. This does not dedup
 subsequent traversers: parallel edges, convergence and repeat emission preserve
 bag multiplicity unless a separate downstream dedup is explicitly present.
 No extra scan, budget, refresh or default truncation is introduced.
+
+## Explicitly limited scalar projection
+
+Scan-only queries accept terminal single-key `values(key)` when at least one
+explicit vertex `limit(n)` precedes it, for example
+`g.V().has('active',true).limit(129).values('name')`.
+The limit is a vertex-stream operation at its original position: a missing
+property may produce fewer than n scalar rows and does not cause additional
+vertices to be scanned to fill the result. `limit(2).has('x').values('x')` and
+`has('x').limit(2).values('x')` therefore need not agree. Present Null emits a
+Null row; missing properties emit no row. Equal values from distinct vertices
+remain separate, with qualified vertex provenance in (partition,ID) scan order.
+Vertex dedup before projection preserves that multiplicity.
+
+Admission rejects no-limit values, multiple-key values and any step after values,
+even on empty input. Zero and out-of-range limits remain InvalidArgument.
+The implicit default 100 vertex cap is not substituted for an explicit scalar-output contract. Explicit limits remain
+1..1000; there is no default truncation on this admitted projection.
+
+Values shares the existing explicit-ID/joined scalar executor and Values fragment.
+Scan IDs and scalar reads use the same retained sessions and original deadline.
+Scan records/IDs and final encoding charge the scan budget; retained traversers,
+property fragment work/transport and scalar buffers charge the existing traversal
+budget. Neither budget resets or borrows from the other. The 2 MiB response bound,
+resource failures, corruption checks and Unverified consistency are unchanged.
+No wire or disk format changes; older coordinators reject the new query shape.

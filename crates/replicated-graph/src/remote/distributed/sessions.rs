@@ -1620,7 +1620,51 @@ mod epoch_tests {
             work = used.work;
             assert_eq!(ordinary_session.node.end, ordinary_end);
         }
+        // Scan-only scalar projection must use the same pre-deletion view and
+        // cumulative projection budget, including reads of missing properties.
+        let scalar = |key: &str| FragmentRequest {
+            descriptor: ordinary.clone(),
+            fragment: Fragment::Values {
+                vertex: source,
+                key: key.into(),
+            },
+            remaining: CEILING,
+        };
+        let scan_used = *ordinary_session.scan_used.lock().unwrap();
+        for (key, expected) in [
+            ("姓名", Some(Value::Text("员工".into()))),
+            ("null", Some(Value::Null)),
+            ("missing", None),
+        ] {
+            let Reply::QueryFragment(Ok(output)) = sessions
+                .fragment(&state, identity, 7, scalar(key), end)
+                .await
+                .unwrap()
+            else {
+                panic!("scalar reads retain the scanned view");
+            };
+            assert_eq!(output.descriptor, ordinary);
+            let FragmentValue::Value(value) = output.value else {
+                panic!("scalar expected");
+            };
+            assert_eq!(value, expected);
+            let used = *ordinary_session.used.lock().unwrap();
+            assert!(used.work > work);
+            work = used.work;
+            assert_eq!(ordinary_session.node.end, ordinary_end);
+            assert_eq!(
+                ordinary_session.scan_used.lock().unwrap().work,
+                scan_used.work
+            );
+        }
         *ordinary_session.used.lock().unwrap() = CEILING;
+        assert!(matches!(
+            sessions
+                .fragment(&state, identity, 7, scalar("missing"), end)
+                .await
+                .unwrap(),
+            Reply::QueryFragment(Err(QueryFailure::ResourceExhausted))
+        ));
         assert!(matches!(
             sessions
                 .fragment(&state, identity, 7, request, end)
