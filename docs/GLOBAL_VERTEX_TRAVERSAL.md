@@ -10,7 +10,7 @@ adjacency or repeat step. There is no schema-, label-, population- or answer-spe
 - Start: `g.V()` over the immutable startup catalog.
 - Scan prefix: any supported `has`, `hasLabel`, vertex `dedup` and `limit`, in their original order.
 - Traversal suffix: `out`/`in` (up to three total), `has`, `hasLabel`, `limit`,
-  vertex-identity `dedup`, and optionally terminal `count` or selected `valueMap`.
+  vertex-identity `dedup`, and optionally terminal `count`, single-key `values`, or selected `valueMap`.
 - One native `repeat(single out/in).times(1..32)` with optional post-emit is
   admitted, including before/after ordinary hops. Combined ordinary/repeated
   depth is at most 32; the separate ordinary three-hop bound is unchanged.
@@ -25,7 +25,14 @@ Examples:
 - `g.V().limit(4).has('active',true).out().in().dedup()`
 
 At least one out/in or repeat step is required for this additive surface. Global `E`,
-`path`, `values`, `both`, and other unsupported steps fail explicitly.
+`path`, `both`, and other unsupported steps fail explicitly.
+Terminal `values(key)` emits one scalar per traverser with that property, preserving
+ordered bag multiplicity and qualified vertex provenance. Missing properties emit
+no row; present Null emits Null. Equal scalars are not deduplicated. Filters and
+limits preceding values retain their original vertex-stream positions.
+No-hop values, multiple keys and any step following values remain Unsupported.
+Values uses the existing fixed-session property fragment and traversal charges;
+there is no new budget, implicit 100-row truncation, session refresh or wire format.
 No-hop `dedup`/`valueMap` follow the separate [scan-only contract](SERVER_GLOBAL_SCAN.md).
 Explicit-ID contracts stay intact.
 

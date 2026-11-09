@@ -28,6 +28,7 @@ enum Op {
     Dedup,
     Count,
     Map,
+    Values(&'static str),
 }
 fn text(ops: &[Op]) -> String {
     let mut text = String::from("g.V()");
@@ -53,6 +54,7 @@ fn text(ops: &[Op]) -> String {
             ),
             Op::Dedup => ".dedup()".into(),
             Op::Count => ".count()".into(),
+            Op::Values(key) => format!(".values('{key}')"),
             Op::Map => ".valueMap('name','nullable','absent')".into(),
         });
     }
@@ -127,10 +129,14 @@ fn evaluate(model: &Model, mut ids: Vec<Id>, ops: &[Op]) -> Vec<QueryRow> {
                 ids.retain(|id| seen.insert(*id));
             }
             Op::Count => return vec![QueryRow::Count(ids.len() as u64)],
-            Op::Map => {}
+            Op::Map | Op::Values(_) => {}
         }
     }
     ids.into_iter()
+        .filter(|id| match ops.last() {
+            Some(Op::Values(key)) => model.vertices[id].properties.contains_key(*key),
+            _ => true,
+        })
         .map(|id| {
             let source = vertex(id.0, id.1);
             if matches!(ops.last(), Some(Op::Map)) {
@@ -145,6 +151,11 @@ fn evaluate(model: &Model, mut ids: Vec<Id>, ops: &[Op]) -> Vec<QueryRow> {
                                 .map(|v| (k.to_string(), vec![v.clone()]))
                         })
                         .collect(),
+                }
+            } else if let Some(Op::Values(key)) = ops.last() {
+                QueryRow::Value {
+                    source: Some(source),
+                    value: model.vertices[&id].properties[*key].clone(),
                 }
             } else {
                 QueryRow::Element(source)
@@ -455,6 +466,32 @@ fn cases() -> Vec<Vec<Op>> {
             Count,
         ],
     ]);
+    // Scalar expectations derive only from input properties and ordered edges.
+    // Include >100 equal scalars, missing versus Null, and both limit positions.
+    for key in ["name", "nullable", "absent", "typed", "active"] {
+        for prefix in [
+            vec![Hop(false, Some("many"))],
+            vec![Label("node"), Hop(false, None)],
+            vec![Label("node"), Hop(true, None), Dedup],
+            vec![Label("none"), Hop(false, None)],
+            vec![
+                Limit(7),
+                Has("active", Some(Value::Boolean(true))),
+                Hop(false, None),
+            ],
+            vec![
+                Has("active", Some(Value::Boolean(true))),
+                Limit(7),
+                Hop(false, None),
+            ],
+            vec![Label("node"), Hop(false, None), Limit(2)],
+            vec![Label("node"), Limit(2), Repeat(false, Some("a"), 3, true)],
+        ] {
+            let mut case = prefix;
+            case.push(Values(key));
+            cases.push(case);
+        }
+    }
     cases
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -612,6 +649,7 @@ async fn global_join_late_corruption_is_not_hidden_by_filter_or_limit() -> anyho
         let direction = if missing_source { "in" } else { "out" };
         for query in [
             format!("g.V().hasLabel('node').{direction}().count()"),
+            format!("g.V().hasLabel('node').{direction}().values('absent')"),
             format!(
                 "g.V().hasLabel('page').repeat(__.{direction}()).times(2).emit().limit(1).count()"
             ),
