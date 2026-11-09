@@ -138,3 +138,11 @@ bounded to 1,000 entries and 1 MiB accounted payload; oversize returns an error.
 The source journals and data history remain retained, with existing capacity
 admission rather than GC. No indefinite write availability, durable distributed
 pin, authenticated remote access, cluster failover or ownership migration is added.
+
+## Retained control upgrade
+
+The [S4 retained-control contract](RETAINED_GATEWAY_CONTROL.md) now governs actual
+execute/status/retry/abort and Prepare: exact bounded target evidence, paged
+history, strict old-cut apply and complete proof-target equality. Managed wire6
+requires a same-version upgrade; older Raft binaries cannot replay the new
+PrepareRetained command. The existing profiles and public query format remain.

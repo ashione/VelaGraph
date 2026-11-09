@@ -5,6 +5,11 @@ edition = "2021"
 description = "D2 in-process Raft prototype for the graph storage kernel"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+# Fail-only node-local diagnostics for downstream integration tests.
+test-hooks = []
+
 [dependencies]
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 rocksdb = { version = "0.25.0", default-features = false }

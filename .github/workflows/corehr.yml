@@ -21,13 +21,19 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: '0'
   CARGO_BUILD_JOBS: '2'
   TOKIO_WORKER_THREADS: '2'
+  # API run head is the PR head; github.sha remains the tested merge candidate.
+  LIFECYCLE_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
-# These are independent acceptance gates, not stages of one scenario.
-# Each runner invokes Cargo against the same immutable event commit; cache hits
-# accelerate compilation, never replace fresh test execution or evidence.
+# Build time is outside the unchanged 90-minute lifecycle runtime budget.
+# This scheduling separation does not improve writes or promise a shorter chain.
+# Scenario remains independent; all three jobs are required by the stable gate.
 jobs:
-  lifecycle:
-    name: Retained 1025-write release lifecycle
+  lifecycle-build:
+    name: Build retained lifecycle release artifact
+    outputs:
+      artifact-id: ${{ steps.upload_handoff.outputs.artifact-id }}
+      bundle-sha256: ${{ steps.build_handoff.outputs.bundle-sha256 }}
+      bundle-length: ${{ steps.build_handoff.outputs.bundle-length }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -55,9 +61,84 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python3 -m unittest discover -s scripts -p 'test_managed_lifecycle_ci.py'
+      - name: Build and bind release lifecycle handoff
+        id: build_handoff
+        run: python3 scripts/managed_lifecycle_ci.py managed-lifecycle-build-results --mode build
+      - name: Upload this job's immutable handoff
+        id: upload_handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-lifecycle-build-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+          path: managed-lifecycle-build-results/handoff.zip
+      - name: Retain build diagnostics, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-lifecycle-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            managed-lifecycle-build-results/*.json
+            managed-lifecycle-build-results/*.jsonl
+            managed-lifecycle-build-results/*.stderr
+            managed-lifecycle-build-results/*.md
+
+  lifecycle:
+    name: Retained 1025-write release lifecycle
+    needs: [lifecycle-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    env:
+      LIFECYCLE_BUILD_RESULT: ${{ needs.lifecycle-build.result }}
+      LIFECYCLE_ARTIFACT_ID: ${{ needs.lifecycle-build.outputs.artifact-id }}
+      LIFECYCLE_BUNDLE_SHA256: ${{ needs.lifecycle-build.outputs.bundle-sha256 }}
+      LIFECYCLE_BUNDLE_LENGTH: ${{ needs.lifecycle-build.outputs.bundle-length }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact event commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Read artifact provenance from Actions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            core.exportVariable('LIFECYCLE_ARTIFACT_METADATA',
+              require('path').join(process.env.RUNNER_TEMP, 'managed-lifecycle-artifact-service.json'));
+            const id = process.env.LIFECYCLE_ARTIFACT_ID;
+            if (!/^[1-9][0-9]*$/.test(id || '') || !Number.isSafeInteger(Number(id))) {
+              throw new Error('Missing required build-job artifact ID');
+            }
+            const { data: artifact } = await github.rest.actions.getArtifact({
+              ...context.repo, artifact_id: Number(id)
+            });
+            const { data: run } = await github.rest.actions.getWorkflowRunAttempt({
+              ...context.repo, run_id: context.runId,
+              attempt_number: Number(process.env.GITHUB_RUN_ATTEMPT)
+            });
+            fs.writeFileSync(process.env.LIFECYCLE_ARTIFACT_METADATA,
+              JSON.stringify({ artifact, run }), { flag: 'wx', mode: 0o600 });
+      - name: Verify artifact repository, run, attempt and event head
+        run: python3 scripts/managed_lifecycle_ci.py --mode verify-provenance
+      - name: Download only the required builder's current-run artifact
+        uses: actions/download-artifact@v4
+        with:
+          # No token, URL, repository or run-id override: current run only.
+          artifact-ids: ${{ needs.lifecycle-build.outputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/managed-lifecycle-handoff
       - name: Verify retained 1025-write lifecycle in release
         id: managed_lifecycle
-        run: python3 scripts/managed_lifecycle_ci.py managed-lifecycle-ci-results
+        run: >-
+          python3 scripts/managed_lifecycle_ci.py managed-lifecycle-ci-results
+          --mode runtime --handoff "$RUNNER_TEMP/managed-lifecycle-handoff/handoff.zip"
       - name: Publish measured summary
         if: always()
         run: |
@@ -80,7 +161,11 @@ jobs:
             managed-lifecycle-ci-results/*.stderr
             managed-lifecycle-ci-results/*.md
             managed-lifecycle-ci-results/managed_process
+            managed-lifecycle-ci-results/Cargo.lock
+            managed-lifecycle-ci-results/cargo-*.toml
             managed-lifecycle-ci-results/lifecycle/progress.json
+            managed-lifecycle-ci-results/lifecycle/artifacts/**
+            managed-lifecycle-ci-results/lifecycle/progress.json.tmp
 
   scenario:
     name: CoreHR full-scale scenario
@@ -144,16 +229,20 @@ jobs:
   # accidentally accept the scenario while missing a failed/skipped lifecycle.
   full-scale:
     name: CoreHR 200k people / 5k departments
-    needs: [lifecycle, scenario]
+    needs: [lifecycle-build, lifecycle, scenario]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require both acceptance gates
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require build and both acceptance gates
         env:
+          LIFECYCLE_BUILD_RESULT: ${{ needs.lifecycle-build.result }}
           LIFECYCLE_RESULT: ${{ needs.lifecycle.result }}
           COREHR_RESULT: ${{ needs.scenario.result }}
         run: |
-          printf 'Lifecycle: %s\nCoreHR: %s\n' "$LIFECYCLE_RESULT" "$COREHR_RESULT" >> "$GITHUB_STEP_SUMMARY"
-          test "$LIFECYCLE_RESULT" = success
-          test "$COREHR_RESULT" = success
+          printf 'Build: %s\nLifecycle: %s\nCoreHR: %s\n' "$LIFECYCLE_BUILD_RESULT" "$LIFECYCLE_RESULT" "$COREHR_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/managed_lifecycle_ci.py --mode aggregate
