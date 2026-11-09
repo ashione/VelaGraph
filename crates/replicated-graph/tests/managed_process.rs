@@ -1619,12 +1619,7 @@ fn canonical_write(write: &Write) -> anyhow::Result<Vec<u8>> {
 mod lifecycle_evidence;
 use lifecycle_evidence::LifecycleCheckpoint;
 
-async fn retain_original(
-    coordinator: &Client,
-    ordinal: u64,
-    checkpoint: &mut LifecycleCheckpoint,
-) -> anyhow::Result<()> {
-    let _span = checkpoint.metrics.span("milestone.original_request_plan");
+async fn original_request(coordinator: &Client, ordinal: u64) -> anyhow::Result<RequestRecord> {
     let write = extended_write(ordinal);
     let found = NodeRef::Remote(coordinator)
         .request(&authority(), 1, write.external_id)
@@ -1642,13 +1637,23 @@ async fn retain_original(
     assert_eq!(plan.parts.len(), 1);
     assert_eq!(plan.parts[0].descriptor.shard, 7);
     assert_eq!(plan.parts[0].request.expected_sequence, Some(ordinal - 1));
+    Ok(found.record)
+}
+
+async fn retain_original(
+    coordinator: &Client,
+    ordinal: u64,
+    checkpoint: &mut LifecycleCheckpoint,
+) -> anyhow::Result<()> {
+    let _span = checkpoint.metrics.span("milestone.original_request_plan");
+    let record = original_request(coordinator, ordinal).await?;
     if let Some(original) = checkpoint.originals.get(&ordinal) {
         assert_eq!(
-            &found.record, original,
+            &record, original,
             "original request/Plan changed at {ordinal}"
         );
     } else {
-        checkpoint.originals.insert(ordinal, found.record);
+        checkpoint.originals.insert(ordinal, record);
     }
     Ok(())
 }
@@ -1906,6 +1911,327 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
     tokio::time::timeout(BUDGET, proxy).await???;
     assert_eq!(result, Err(gateway::Error::Unknown));
     Ok(())
+}
+
+// Ordinary independent-process coverage, not a reduced 1025-write acceptance run.
+const SMALL_LIFECYCLE_WRITES: u64 = 4;
+
+#[derive(Debug, PartialEq)]
+struct SmallVersionEvidence {
+    proof: Vec<u8>,
+    rows: Vec<Vec<QueryRow>>,
+}
+
+async fn small_version_evidence(
+    g: &Gateway,
+    coordinator: &Client,
+    version: u64,
+) -> anyhow::Result<SmallVersionEvidence> {
+    let proof = NodeRef::Remote(coordinator)
+        .terminal(&authority(), 1, version)
+        .await?;
+    assert_complete_commits(&proof, version)?;
+    let session = open_bound(g, byte_binding(), Some(version)).await?;
+    assert_eq!(session.version, version);
+    let mut rows = Vec::new();
+    // Explicit standard Gremlin reads cover every written ID and the unused ID
+    // of the fresh candidate below, including absent later data at V0 and V1.
+    for partition in [7, 8] {
+        for id in 1..=SMALL_LIFECYCLE_WRITES + 1 {
+            let found = read_bound(
+                g,
+                byte_binding(),
+                &session,
+                partition,
+                &format!("g.V({id})"),
+            )
+            .await?;
+            assert_eq!(
+                found,
+                if partition == 7 && id <= version {
+                    vec![row(7, id)]
+                } else {
+                    vec![]
+                }
+            );
+            rows.push(found);
+        }
+    }
+    call_bound(g, byte_binding(), Operation::Close { session }).await?;
+    Ok(SmallVersionEvidence {
+        proof: serde_json::to_vec(&proof)?,
+        rows,
+    })
+}
+
+async fn verify_small_lifecycle(
+    g: &Gateway,
+    coordinator: &Client,
+    members: [&Client; 2],
+    grants: &[MemberCapacityGrant],
+    originals: &BTreeMap<u64, (Write, RequestRecord)>,
+    evidence: &BTreeMap<u64, SmallVersionEvidence>,
+) -> anyhow::Result<()> {
+    let c = NodeRef::Remote(coordinator);
+    let summary = c.summary(&authority(), 1).await?;
+    assert_eq!(summary.cohort, byte_binding().cohort);
+    assert_eq!(summary.resolved_prefix, SMALL_LIFECYCLE_WRITES);
+    assert_eq!(c.confirm_capacity(&authority(), 1).await?, grants);
+    assert_eq!(originals.keys().copied().collect::<Vec<_>>(), [1, 4]);
+    assert_eq!(evidence.keys().copied().collect::<Vec<_>>(), [0, 1, 4]);
+    let proof = c.terminal(&authority(), 1, SMALL_LIFECYCLE_WRITES).await?;
+    assert_complete_commits(&proof, SMALL_LIFECYCLE_WRITES)?;
+    for (client, shard, sequence) in [(members[0], 7, SMALL_LIFECYCLE_WRITES), (members[1], 8, 0)] {
+        let member = NodeRef::Remote(client);
+        assert_eq!(
+            member.visibility(&target(shard)).await?.applied_prefix,
+            SMALL_LIFECYCLE_WRITES
+        );
+        let snapshot = member
+            .read_terminal(&target(shard), limit(), &proof)
+            .await?;
+        assert_eq!(snapshot.applied_prefix, SMALL_LIFECYCLE_WRITES);
+        assert_eq!(snapshot.local_sequence, sequence);
+        if shard == 8 {
+            assert!(
+                snapshot.entries.is_empty(),
+                "nonparticipant wrote local data"
+            );
+        }
+        assert_eq!(
+            member
+                .grant_status(&authority(), &target(shard), &byte_binding().cohort)
+                .await?,
+            *grants
+                .iter()
+                .find(|grant| grant.member.shard == shard)
+                .unwrap()
+        );
+    }
+    let graph = GraphCohort::from_endpoints(
+        c,
+        authority(),
+        1,
+        vec![
+            (NodeRef::Remote(members[0]), target(7)),
+            (NodeRef::Remote(members[1]), target(8)),
+        ],
+    );
+    let snapshot = graph
+        .snapshot(
+            Some(SMALL_LIFECYCLE_WRITES),
+            limit(),
+            Duration::from_secs(60),
+        )
+        .await?;
+    for (ordinal, (write, original)) in originals {
+        assert_eq!(original_request(coordinator, *ordinal).await?, *original);
+        let first_plan = graph
+            .recover_request(original.id, &original.request)
+            .await?
+            .context("saved original Plan missing")?;
+        assert_eq!(first_plan.id(), original.transaction_id);
+        assert_eq!(first_plan.validation_version(), ordinal - 1);
+        let candidate = snapshot.prepare_vertex(
+            7,
+            &rocksdb_sql_table::Vertex::new(SMALL_LIFECYCLE_WRITES + 1),
+        )?;
+        assert_ne!(candidate, first_plan);
+        assert_ne!(candidate.id(), original.transaction_id);
+        assert_eq!(
+            graph
+                .admit_request(original.id, original.request.clone(), &candidate)
+                .await?,
+            first_plan,
+            "fresh candidate replaced the complete first Plan"
+        );
+        assert_eq!(
+            committed(call_bound(g, byte_binding(), Operation::Submit(write.clone())).await?),
+            (original.transaction_id, *ordinal)
+        );
+        let mut changed = write.clone();
+        if let Mutation::CreateVertex { vertex, .. } = &mut changed.mutation {
+            vertex.labels = vec!["changed".into()];
+        }
+        assert_eq!(
+            call_bound(g, byte_binding(), Operation::Submit(changed)).await,
+            Err(gateway::Error::Identity)
+        );
+        assert_eq!(original_request(coordinator, *ordinal).await?, *original);
+    }
+    drop(snapshot);
+    // Compare immutable pre-crash observations, never replace an expectation
+    // with data recovered after a restart or snapshot installation.
+    for (version, original) in evidence {
+        assert_eq!(
+            small_version_evidence(g, coordinator, *version).await?,
+            *original
+        );
+    }
+    let current = open_bound(g, byte_binding(), None).await?;
+    assert_eq!(current.version, SMALL_LIFECYCLE_WRITES);
+    call_bound(g, byte_binding(), Operation::Close { session: current }).await?;
+    assert_eq!(
+        c.journal(&authority(), 1).await?.transaction_count(),
+        SMALL_LIFECYCLE_WRITES as usize,
+        "same-ID retries or fresh candidates added a second admission"
+    );
+    assert_eq!(
+        c.summary(&authority(), 1).await?.resolved_prefix,
+        SMALL_LIFECYCLE_WRITES
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(240), async {
+        let config = ProcessConfig {
+            cohort: byte_binding().cohort,
+            members: vec![],
+        };
+        let mut a = Process::configured(7, FixtureDirectory::temporary()?, config.clone()).await?;
+        let mut b = Process::configured(8, FixtureDirectory::temporary()?, config).await?;
+        let mut coordinator = Process::configured(
+            9,
+            FixtureDirectory::temporary()?,
+            ProcessConfig {
+                cohort: byte_binding().cohort,
+                members: vec![(7, a.address), (8, b.address)],
+            },
+        )
+        .await?;
+        assert_eq!(
+            BTreeSet::from([
+                std::process::id(),
+                coordinator.child.id(),
+                a.child.id(),
+                b.child.id(),
+            ])
+            .len(),
+            4
+        );
+        let c_client = coordinator.client()?;
+        let a_client = a.client()?;
+        let b_client = b.client()?;
+        let grants = NodeRef::Remote(&c_client)
+            .confirm_capacity(&authority(), 1)
+            .await?;
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.member.clone())
+                .collect::<Vec<_>>(),
+            byte_binding().cohort.members
+        );
+        for grant in &grants {
+            grant
+                .activation
+                .validate()
+                .map_err(|e| anyhow!("invalid initial grant: {e:?}"))?;
+        }
+        let g = Gateway::bind_remote(
+            RemoteConfig {
+                coordinator: c_client.clone(),
+                binding: byte_binding(),
+                members: vec![a_client.clone(), b_client.clone()],
+            },
+            "127.0.0.1:0".parse()?,
+            BUDGET,
+        )
+        .await?;
+        assert_eq!(
+            BTreeSet::from([g.local_addr(), coordinator.address, a.address, b.address]).len(),
+            4
+        );
+        let mut originals = BTreeMap::new();
+        let mut evidence = BTreeMap::from([(0, small_version_evidence(&g, &c_client, 0).await?)]);
+        for ordinal in 1..=SMALL_LIFECYCLE_WRITES {
+            let write = extended_write(ordinal);
+            if ordinal == SMALL_LIFECYCLE_WRITES {
+                // The real final gateway response is discarded, so the caller
+                // sees Unknown. Capture its admitted original before crashing.
+                discard_gateway_ack(&g, write.clone()).await?;
+            } else {
+                let (id, committed_ordinal) = committed(
+                    call_bound(&g, byte_binding(), Operation::Submit(write.clone())).await?,
+                );
+                assert_eq!(committed_ordinal, ordinal);
+                assert_eq!(
+                    original_request(&c_client, ordinal).await?.transaction_id,
+                    id
+                );
+            }
+            if [1, SMALL_LIFECYCLE_WRITES].contains(&ordinal) {
+                originals.insert(
+                    ordinal,
+                    (write, original_request(&c_client, ordinal).await?),
+                );
+                evidence.insert(
+                    ordinal,
+                    small_version_evidence(&g, &c_client, ordinal).await?,
+                );
+            }
+        }
+        b.stop()?;
+        coordinator.stop()?;
+        coordinator.reopen().await?;
+        b.reopen().await?;
+        // Retry the unknown last request first, with its exact saved ID/bytes.
+        let (last_write, last_record) = &originals[&SMALL_LIFECYCLE_WRITES];
+        assert_eq!(
+            original_request(&c_client, SMALL_LIFECYCLE_WRITES).await?,
+            *last_record
+        );
+        assert_eq!(
+            committed(call_bound(&g, byte_binding(), Operation::Submit(last_write.clone())).await?),
+            (last_record.transaction_id, SMALL_LIFECYCLE_WRITES)
+        );
+        verify_small_lifecycle(
+            &g,
+            &c_client,
+            [&a_client, &b_client],
+            &grants,
+            &originals,
+            &evidence,
+        )
+        .await?;
+        a.stop()?;
+        a.reopen().await?;
+        verify_small_lifecycle(
+            &g,
+            &c_client,
+            [&a_client, &b_client],
+            &grants,
+            &originals,
+            &evidence,
+        )
+        .await?;
+        // Each role exports complete state, closes, then installs into a fresh
+        // state.db. The original DB remains beside it as fixture evidence.
+        for process in [&mut a, &mut b, &mut coordinator] {
+            assert!(!process.directory.path().join("snapshot.restored").exists());
+            process.snapshot_restore().await?;
+            assert!(process.directory.path().join("snapshot.restored").exists());
+            assert!(process
+                .directory
+                .path()
+                .join("data/state.before-snapshot.db")
+                .exists());
+        }
+        verify_small_lifecycle(
+            &g,
+            &c_client,
+            [&a_client, &b_client],
+            &grants,
+            &originals,
+            &evidence,
+        )
+        .await?;
+        g.shutdown().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
