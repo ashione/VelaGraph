@@ -24,6 +24,7 @@ pub const MAX_IN_FLIGHT: usize = 16;
 const VERSION: u32 = 1;
 /// Largest accepted client or server operation budget.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
+mod diagnostic;
 pub mod distributed;
 pub mod managed;
 mod paged;
@@ -200,15 +201,28 @@ impl GraphService {
             let mut cleanup = tokio::time::interval(Duration::from_millis(100));
             let mut handlers = JoinSet::new();
             loop {
-                while handlers.try_join_next().is_some() {}
+                while let Some(result) = handlers.try_join_next() {
+                    if let Err(error) = result {
+                        diagnostic::failure(format_args!(
+                            "phase=handler_join panic={} cancelled={}",
+                            error.is_panic(),
+                            error.is_cancelled()
+                        ));
+                    }
+                }
                 let accepted = tokio::select! {
                     _ = stopped.changed() => break,
                     _ = cleanup.tick() => { sessions.expire(); query_sessions.expire(); continue; },
-                    _ = handlers.join_next(), if !handlers.is_empty() => continue,
+                    result = handlers.join_next(), if !handlers.is_empty() => { if let Some(Err(error)) = result { diagnostic::failure(format_args!("phase=handler_join panic={} cancelled={}", error.is_panic(), error.is_cancelled())); } continue; },
                     result = listener.accept() => result,
                 };
-                let Ok((mut socket, _)) = accepted else { break };
+                let Ok((mut socket, peer)) = accepted else {
+                    break;
+                };
                 let Ok(permit) = admission.clone().try_acquire_owned() else {
+                    diagnostic::failure(format_args!(
+                        "phase=server_admission peer={peer} reason=resource_exhausted"
+                    ));
                     continue;
                 };
                 let raft = raft.clone();
@@ -223,8 +237,15 @@ impl GraphService {
                             .await
                         {
                             Ok(Ok(request)) => request,
-                            _ => return,
+                            _ => {
+                                diagnostic::failure(format_args!(
+                                    "phase=server_request_read peer={peer} expired={}",
+                                    Instant::now() >= end
+                                ));
+                                return;
+                            }
                         };
+                    let op = diagnostic::operation(&request.operation);
                     let request = match request {
                         Request {
                             version: VERSION,
@@ -264,6 +285,9 @@ impl GraphService {
                     // Dropping the waiting future at the deadline does not undo
                     // a command already submitted to Raft.
                     if Instant::now() >= end {
+                        diagnostic::failure(format_args!(
+                            "phase=server_before_execute op={op} peer={peer} expired=true"
+                        ));
                         return;
                     }
                     let result = match tokio::time::timeout_at(
@@ -281,14 +305,35 @@ impl GraphService {
                     .await
                     {
                         Ok(result) => result,
-                        Err(_) => return,
+                        Err(_) => {
+                            diagnostic::failure(format_args!(
+                                "phase=server_execute op={op} peer={peer} reason=deadline"
+                            ));
+                            return;
+                        }
                     };
+                    if let Err(error) = &result {
+                        diagnostic::failure(format_args!(
+                            "phase=server_execute op={op} peer={peer} reason={}",
+                            diagnostic::kind(error)
+                        ));
+                    }
                     let response = Response {
                         version: VERSION,
                         result,
                     };
-                    let _ = tokio::time::timeout_at(end, write_frame(&mut socket, &response, end))
-                        .await;
+                    match tokio::time::timeout_at(end, write_frame(&mut socket, &response, end))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => diagnostic::failure(format_args!(
+                            "phase=server_response op={op} peer={peer} reason={}",
+                            diagnostic::kind(&error)
+                        )),
+                        Err(_) => diagnostic::failure(format_args!(
+                            "phase=server_response op={op} peer={peer} reason=deadline"
+                        )),
+                    }
                 });
             }
             handlers.abort_all();
@@ -400,7 +445,22 @@ async fn execute(
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
             }
-            raft.ensure_linearizable().await.map_err(|e| {
+            let mut phase = diagnostic::Phase::new("open_snapshot_barrier", None, end);
+            let barrier = raft.ensure_linearizable().await.map_err(|e| {
+                use openraft::error::{CheckIsLeaderError, Fatal, RaftError};
+                let reason = match &e {
+                    RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_)) => {
+                        "forward_to_leader"
+                    }
+                    RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_)) => {
+                        "quorum_not_enough"
+                    }
+                    RaftError::Fatal(Fatal::StorageError(_)) => "raft_storage",
+                    RaftError::Fatal(Fatal::Panicked) => "raft_panicked",
+                    RaftError::Fatal(Fatal::Stopped) => "raft_stopped",
+                };
+                diagnostic::failure(format_args!("phase=open_snapshot_barrier reason={reason}"));
+
                 if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
                     RemoteError::NotLeader {
                         leader: hint.leader_id,
@@ -408,16 +468,28 @@ async fn execute(
                 } else {
                     RemoteError::Unavailable
                 }
-            })?;
-            sessions
+            });
+            if barrier.is_err() {
+                phase.finish(&barrier);
+            }
+            barrier?;
+            phase.stage("open_snapshot_capture");
+            let result = sessions
                 .open(&state, identity, shard, end)
                 .await
-                .map(Reply::OpenSnapshot)
+                .map(Reply::OpenSnapshot);
+            phase.finish(&result);
+            result
         }
-        Operation::SnapshotPage { descriptor, cursor } => sessions
-            .page(&state, identity, shard, descriptor, cursor, end)
-            .await
-            .map(Reply::SnapshotPage),
+        Operation::SnapshotPage { descriptor, cursor } => {
+            let mut phase = diagnostic::Phase::new("snapshot_page_materialize", None, end);
+            let result = sessions
+                .page(&state, identity, shard, descriptor, cursor, end)
+                .await
+                .map(Reply::SnapshotPage);
+            phase.finish(&result);
+            result
+        }
         Operation::CloseSnapshot { descriptor } => {
             sessions.close(identity, shard, &descriptor)?;
             Ok(Reply::CloseSnapshot)
@@ -708,6 +780,7 @@ async fn rpc(
     id: Option<[u8; 16]>,
 ) -> Result<Reply, RemoteError> {
     let end = checked_deadline(duration, id)?;
+    let op = diagnostic::operation(&operation);
     let response_limit = if matches!(
         &operation,
         Operation::Query(_)
@@ -725,9 +798,14 @@ async fn rpc(
         .try_acquire()
         .map_err(|_| RemoteError::ResourceExhausted)?;
     tokio::time::timeout_at(end, async {
-        let mut stream = TcpStream::connect(endpoint)
-            .await
-            .map_err(|_| RemoteError::Unavailable)?;
+        let mut stream = TcpStream::connect(endpoint).await.map_err(|e| {
+            diagnostic::failure(format_args!(
+                "phase=connect op={op} peer={endpoint} io_kind={:?} os={:?}",
+                e.kind(),
+                e.raw_os_error()
+            ));
+            RemoteError::Unavailable
+        })?;
         write_frame(
             &mut stream,
             &Request {
@@ -746,9 +824,15 @@ async fn rpc(
     })
     .await
     .unwrap_or(Err(RemoteError::Timeout { request_id: id }))
-    .map_err(|error| match error {
-        RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
-        other => other,
+    .map_err(|error| {
+        diagnostic::failure(format_args!(
+            "phase=client_rpc op={op} peer={endpoint} reason={}",
+            diagnostic::kind(&error)
+        ));
+        match error {
+            RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
+            other => other,
+        }
     })
 }
 
@@ -807,6 +891,7 @@ async fn write_frame<T: Serialize>(
     value: &T,
     end: Instant,
 ) -> Result<(), RemoteError> {
+    let mut phase = diagnostic::Phase::new("encode", Some(stream), end);
     let buffer = blocking_json(|| {
         let mut buffer = BoundedWriter(Vec::new(), end);
         {
@@ -822,18 +907,26 @@ async fn write_frame<T: Serialize>(
                 })?;
         }
         Ok::<_, RemoteError>(buffer)
-    })?;
+    });
+    if buffer.is_err() {
+        phase.finish(&buffer);
+    }
+    let buffer = buffer?;
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
-    stream
-        .write_u32(buffer.0.len() as u32)
-        .await
-        .map_err(|_| RemoteError::Unavailable)?;
-    stream
-        .write_all(&buffer.0)
-        .await
-        .map_err(|_| RemoteError::Unavailable)
+    phase.stage("write_header");
+    stream.write_u32(buffer.0.len() as u32).await.map_err(|e| {
+        phase.io(&e);
+        RemoteError::Unavailable
+    })?;
+    phase.stage("write_body");
+    let result = stream.write_all(&buffer.0).await.map_err(|e| {
+        phase.io(&e);
+        RemoteError::Unavailable
+    });
+    phase.finish(&result);
+    result
 }
 async fn read_frame<T: DeserializeOwned>(
     stream: &mut TcpStream,
@@ -846,25 +939,30 @@ async fn read_frame_limited<T: DeserializeOwned>(
     end: Instant,
     limit: usize,
 ) -> Result<T, RemoteError> {
-    let size = stream
-        .read_u32()
-        .await
-        .map_err(|_| RemoteError::Unavailable)? as usize;
+    let mut phase = diagnostic::Phase::new("read_header", Some(stream), end);
+    let size = stream.read_u32().await.map_err(|e| {
+        phase.io(&e);
+        RemoteError::Unavailable
+    })? as usize;
     if size == 0 || size > limit {
+        phase.finish(&Err::<(), _>(RemoteError::ResourceExhausted));
         return Err(RemoteError::ResourceExhausted);
     }
     let mut bytes = vec![0; size];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|_| RemoteError::Unavailable)?;
+    phase.stage("read_body");
+    stream.read_exact(&mut bytes).await.map_err(|e| {
+        phase.io(&e);
+        RemoteError::Unavailable
+    })?;
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
+    phase.stage("decode");
     let result = decode_frame_json(&bytes).map_err(|_| RemoteError::Protocol);
     if Instant::now() >= end {
         return Err(RemoteError::Timeout { request_id: None });
     }
+    phase.finish(&result);
     result
 }
 

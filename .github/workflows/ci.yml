@@ -72,8 +72,45 @@ jobs:
           prefix-key: v2-no-debug-rust
           cache-on-failure: false
 
+      - name: Record ordinary test provenance
+        env:
+          REMOTE_EVENT_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p remote-process-evidence
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path("remote-process-evidence")
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          source = {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in files if name}
+          metadata = {key: os.environ.get(key) for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "GITHUB_SHA", "REMOTE_EVENT_HEAD", "CARGO_BUILD_JOBS", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")}
+          metadata.update(head=git("rev-parse", "HEAD"), tree=git("rev-parse", "HEAD^{tree}"), source_sha256=source)
+          metadata["rustc"] = subprocess.check_output(["rustc", "-Vv"], text=True)
+          metadata["nproc"] = subprocess.check_output(["nproc"], text=True).strip()
+          for name in ("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/memory.max", "/proc/meminfo"):
+              try:
+                  metadata[name] = pathlib.Path(name).read_text()
+              except OSError:
+                  metadata[name] = "unavailable"
+          (root / "source-provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          PYTHON
+
       - name: Run tests
+        env:
+          VELAGRAPH_REMOTE_DIAGNOSTICS: "1"
+          VELAGRAPH_REMOTE_EVIDENCE_DIR: ${{ github.workspace }}/remote-process-evidence
         run: cargo test --locked
+
+      - name: Retain ordinary remote process evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-process-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: remote-process-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
 
   clippy:
     name: Clippy

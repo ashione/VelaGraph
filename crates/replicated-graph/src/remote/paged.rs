@@ -491,7 +491,13 @@ async fn download(
         shard,
         end.saturating_duration_since(Instant::now()),
     )
-    .await?;
+    .await
+    .inspect_err(|error| {
+        diagnostic::failure(format_args!(
+            "phase=download_open reason={}",
+            diagnostic::kind(error)
+        ));
+    })?;
     // Keep aggregate memory admission until Close has finished and the complete
     // snapshot is handed to the caller, not merely until assembly completes.
     let memory = DOWNLOAD_BYTES
@@ -508,6 +514,7 @@ async fn download(
         let mut entries = Vec::new();
         let mut bytes = 0usize;
         let mut cursor = None;
+        let mut ordinal = 0usize;
         loop {
             check_time(end)?;
             let page = snapshot_page(
@@ -517,7 +524,14 @@ async fn download(
                 cursor,
                 end.saturating_duration_since(Instant::now()),
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                diagnostic::failure(format_args!(
+                    "phase=download_page ordinal={ordinal} reason={}",
+                    diagnostic::kind(error)
+                ));
+            })?;
+            ordinal += 1;
             for (key, value) in page.entries {
                 check_time(end)?;
                 if entries.last().is_some_and(|(last, _)| last >= &key) {
