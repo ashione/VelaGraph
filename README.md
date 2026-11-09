@@ -43,8 +43,11 @@ The restricted managed gateway additionally offers [fixed-version traversals and
 complete-result pages](docs/MANAGED_FIXED_TRAVERSALS.md), reusing the bounded
 routing-v3 Gremlin executor over one certified cohort snapshot. This does not
 enable the unrestricted GlobalCommittedSnapshot API or certify arbitrary writers,
-nonempty baselines or dynamic routing. The new managed-path validation uses small
-cross-process personnel graphs, not the full-scale CoreHR fixture.
+nonempty baselines or dynamic routing. Optional
+[submission phase timing](docs/MANAGED_SUBMISSION_TIMING.md) provides bounded,
+process-local diagnostics; it is disabled by default. The new managed-path
+validation uses small cross-process personnel graphs, not the full-scale CoreHR
+fixture.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.
