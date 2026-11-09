@@ -594,6 +594,7 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
     let mut owners: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut scalar = false;
     let mut label = false;
+    let mut id_projection = false;
     let mut count = false;
     let mut path = false;
     for step in parsed.steps() {
@@ -622,6 +623,10 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
                 shape.extend([true, false]);
             }
             Step::Existing(GremlinStep::Values(_)) => scalar = true,
+            Step::Existing(GremlinStep::Id) => {
+                scalar = true;
+                id_projection = true;
+            }
             Step::Existing(GremlinStep::Label) => {
                 scalar = true;
                 label = true;
@@ -665,6 +670,14 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
                 && (shape.len() != 1 || valid_start(e))
                 && !matches!(value, Value::Real(v) if !v.is_finite())
                 && (!label || matches!(value, Value::Text(_)))
+                && (!id_projection || {
+                    let id = match e {
+                        QualifiedElement::Vertex { id, .. } | QualifiedElement::Edge { id, .. } => {
+                            *id
+                        }
+                    };
+                    matches!(value, Value::Integer(n) if i64::try_from(id).ok() == Some(*n))
+                })
         }
         QueryRow::Path(elements) if path => {
             elements.len() == shape.len()

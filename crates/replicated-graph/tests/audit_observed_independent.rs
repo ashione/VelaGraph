@@ -181,6 +181,34 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             frozen.observed_gremlin_v3(99, "g.E().count()")?.rows,
             vec![R3::Count(0)]
         );
+        let value = |source, id| R3::Value {
+            source,
+            value: rocksdb_sql_table::Value::Integer(id),
+        };
+        assert_eq!(
+            s.observed_gremlin_v3(99, "g.V().id()")?.rows,
+            [1, 2, 3].map(|p| value(Element::Vertex(vr(p)), 7))
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(99, "g.E().id()")?.rows,
+            [(1, 9), (2, 9), (1, 10), (1, 11), (1, 12)]
+                .map(|(p, id)| value(Element::Edge(er(p, id)), id as i64))
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(9,9).bothV().id()")?.rows,
+            [1, 2, 1, 2].map(|p| value(Element::Vertex(vr(p)), 7))
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).outE().id().limit(2)")?
+                .rows,
+            [9, 10].map(|id| value(Element::Edge(er(1, id)), id as i64))
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.E(9,9).id().count()")?.rows,
+            vec![R3::Count(2)]
+        );
+        assert!(s.observed_gremlin_v3(1, "g.V(999).id()")?.rows.is_empty());
+        assert!(s.observed_gremlin_v3(1, "g.V(999).id().out()").is_err());
         let all_edges = s.observed_gremlin_v3(99, "g.E()")?;
         assert_eq!(
             all_edges.rows,
@@ -260,7 +288,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             "g.E(999).in()",
             "g.E().limit(0).both()",
             "g.E().outE()",
-            "g.E().id()",
+            "g.E().id().label()",
             "g.E().values('missing').path()",
             "g.E().label().has('x')",
         ] {
