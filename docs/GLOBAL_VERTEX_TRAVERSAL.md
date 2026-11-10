@@ -95,8 +95,9 @@ from fixture inputs, including 101 returned identities/maps without an implicit
 cap. Missing reverse/canonical records remain whole-query failures, including
 when a later filter or limit would otherwise hide them.
 
-The CoreHR fixture now contains 110 cases, including 20 global-composition cases:
-18 successful shapes (seven samples each) and two expected Unsupported shapes.
+The CoreHR fixture now contains 122 query cases, including six bidirectional
+cases and the existing global-composition cases. Supported server queries use
+seven samples each; unsupported shapes retain explicit rejection expectations.
 Eight repeat shapes cover named ancestors, selected ancestor properties, exact
 depth, descendants, overlapping roots with bag/dedup, a membership hop before
 department ancestors, and empty roots. These expectations use input edges only.
