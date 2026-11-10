@@ -148,7 +148,10 @@ qualified source ID. No new protocol, storage or consistency contract is added.
 ## Qualified element deduplication
 
 Standard no-argument `dedup()` now applies to vertex or edge streams in the
-shared routing-v3 executor and managed Traverse/TraversePage. Identity is
+shared routing-v3 executor and managed Traverse/TraversePage. The single-partition
+V2Observed server-query entrypoint also uses that executor and admits the same
+element dedup step within its unchanged partition scope; V1 server queries still
+reject it. Identity is
 `(partition, local ID)`; an edge belongs to its source partition. Same-number
 vertices/edges in different partitions remain distinct, and parallel edges with
 different IDs remain distinct. The first occurrence retains its complete path

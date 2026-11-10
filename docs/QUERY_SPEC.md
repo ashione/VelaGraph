@@ -533,7 +533,9 @@ the first qualified identity, path and order. Scalar/path dedup and modulators
 remain unsupported, even on empty input. Every input is charged as work and every
 retained identity is admitted before allocation under the existing cumulative
 budgets; upstream errors cannot be hidden. See MANAGED_FIXED_TRAVERSALS.md for
-the identity, limit-position and memory-accounting contract.
+the identity, limit-position and memory-accounting contract. Single-partition
+V2Observed server queries share this extension and retain their original scope
+fencing; V1 server queries are unchanged (see REMOTE_QUERY.md).
 
 Every primitive uses the same V. Pagination fully evaluates and bounds the
 result, then validates all page envelopes before emitting the first page. One
