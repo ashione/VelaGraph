@@ -1,5 +1,10 @@
 # CoreHR global vertex-scan validation
 
+Historical measurements below describe the tested revisions, not the current
+client subset. As of the qualified-element dedup change (2026-11-10), routing-v3
+also supports element `dedup()`; see [the current contract](EXPERIMENTAL_CROSS_EDGES.md).
+The original measurements and rejection counts are preserved unchanged.
+
 This report adds a global-scan experiment to the earlier [incoming](COREHR_INCOMING_RESULTS.md) and [dedup](COREHR_DEDUP_RESULTS.md) runs. It does not replace their historical measurements. All data is synthetic and deterministic.
 
 ## Exact tested integration

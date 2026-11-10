@@ -614,9 +614,6 @@ impl Model {
                 case.as_object_mut().unwrap().remove("expected");
                 case.as_object_mut().unwrap().remove("client_expected");
             }
-            if case["query"].as_str().unwrap().contains(".dedup()") {
-                case["client_expect_unsupported"] = json!(true);
-            }
             let name = case["name"].as_str().unwrap();
             if name.starts_with("direct_reports_")
                 || [
@@ -664,6 +661,49 @@ fn dedup_oracle_is_nonvacuous() {
     let q = m.queries();
     assert_eq!(q.len(), 113);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
+    // Fixed-version v3 now supports element dedup. Keep these independent
+    // relationship-list oracles enabled instead of masking them as rejections.
+    for name in [
+        "dedup_join",
+        "unique_colleague_count",
+        "active_unique_colleague_count",
+        "limit_before_dedup",
+        "limit_after_dedup",
+        "duplicate_starts_dedup",
+        "duplicate_memberships_unique_count",
+        "empty_dedup_count",
+        "dedup_first_path",
+        "batch_people_unique_departments",
+        "batch_department_unique_members",
+        "batch_department_active_unique_members",
+        "global_scan_dedup_count",
+        "global_prefix_dedup_manager_bag_count",
+        "global_join_filtered_manager_unique_count",
+        "global_join_two_hop_unique_colleagues",
+    ] {
+        assert_ne!(get(name)["client_expect_unsupported"], true, "{name}");
+        assert_ne!(get(name)["expect_error"], true, "{name}");
+        assert!(get(name).get("expected").is_some(), "{name}");
+    }
+    // Dedup does not expand the fixed-version client's repeat or valueMap
+    // grammar. Scalar dedup is still explicitly rejected.
+    for name in [
+        "native_duplicate_ancestor_dedup_paths",
+        "project_unique_departments",
+        "global_join_department_maps",
+    ] {
+        assert_eq!(get(name)["client_expect_unsupported"], true, "{name}");
+    }
+    assert_eq!(get("global_scan_reject_scalar_dedup")["expect_error"], true);
+    let global_path = get("global_join_reject_path");
+    assert_ne!(global_path["expect_error"], true);
+    assert_ne!(global_path["client_expect_unsupported"], true);
+    assert!(!global_path["client_expected"]["paths"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(global_path["server_supported"], false);
+    assert_eq!(global_path["server_expected_error"], "Unsupported");
     assert!(
         get("unique_colleague_count")["expected"]["count"]
             .as_u64()

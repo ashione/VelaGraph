@@ -462,6 +462,56 @@ async fn scenario() -> anyhow::Result<()> {
                 },
             ])],
         ),
+        (
+            "g.V(1,1).outE('knows').dedup().inV().path()",
+            vec![QueryRow::Path(vec![
+                QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 1,
+                },
+                QualifiedElement::Edge {
+                    partition: 0,
+                    id: 9,
+                },
+                QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 2,
+                },
+            ])],
+        ),
+        (
+            "g.V(2,1,2).dedup()",
+            vec![
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 2,
+                }),
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 1,
+                }),
+            ],
+        ),
+        (
+            "g.E(9,9).dedup()",
+            vec![QueryRow::Element(QualifiedElement::Edge {
+                partition: 0,
+                id: 9,
+            })],
+        ),
+        (
+            "g.V(1,1).dedup().out('knows').count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            "g.V(2,2,1).limit(2).dedup().count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            "g.V(2,2,1).dedup().limit(2).count()",
+            vec![QueryRow::Count(2)],
+        ),
+        ("g.V(999999).dedup().count()", vec![QueryRow::Count(0)]),
         ("g.V().count()", vec![QueryRow::Count(3)]),
         ("g.V(999999).count()", vec![QueryRow::Count(0)]),
     ] {
@@ -473,7 +523,13 @@ async fn scenario() -> anyhow::Result<()> {
         assert_stamp(&output, identity, sequence);
         assert!(bytes < 4096);
     }
-    for text in ["g.V(2).out('cross')", "g.E(10)", "g.E().count()"] {
+    for text in [
+        "g.V(2).out('cross')",
+        "g.E(10)",
+        "g.E().count()",
+        "g.V(2).out('cross').dedup().limit(1)",
+        "g.E(10,10).dedup()",
+    ] {
         assert_eq!(
             query(
                 endpoint,
@@ -489,13 +545,42 @@ async fn scenario() -> anyhow::Result<()> {
     for mode in [QueryMode::V1, QueryMode::V2Observed] {
         for (text, failure) in [
             ("g.V(", QueryFailure::Parse),
-            ("g.V().dedup()", QueryFailure::Unsupported),
+            ("g.V().valueMap('name')", QueryFailure::Unsupported),
         ] {
             assert_eq!(
                 query(endpoint, Some(identity), request(mode, text), BUDGET).await?,
                 Err(failure)
             );
         }
+    }
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V1, "g.V().dedup()"),
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::Unsupported),
+        "the shared v3 extension does not expand v1"
+    );
+    for text in [
+        "g.V(999999).id().dedup()",
+        "g.E(999999).label().dedup()",
+        "g.V(999999).dedup('x')",
+        "g.V(999999).dedup().by('name')",
+    ] {
+        assert!(
+            query(
+                endpoint,
+                Some(identity),
+                request(QueryMode::V2Observed, text),
+                BUDGET
+            )
+            .await?
+            .is_err(),
+            "accepted {text}"
+        );
     }
     for mode in [QueryMode::V1, QueryMode::V2Observed] {
         let complex = format!("g.V({}1)", "1,".repeat(64));

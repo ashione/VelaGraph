@@ -1,5 +1,10 @@
 # CoreHR unique-membership validation
 
+Historical measurements below describe the tested revisions, not the current
+client subset. As of the qualified-element dedup change (2026-11-10), routing-v3
+also supports element `dedup()`; see [the current contract](EXPERIMENTAL_CROSS_EDGES.md).
+The original measurements and rejection counts are preserved unchanged.
+
 This is a follow-up to [the incoming-query run](COREHR_INCOMING_RESULTS.md), not a rewrite of its historical results. All people and departments are synthetic. The dataset is unchanged: 200,000 people, 5,000 departments, 454,998 edges, 40,000 people in multiple departments, and 303,483 cross-partition edges.
 
 ## Tested version and environment

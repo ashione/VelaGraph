@@ -371,8 +371,8 @@ There is no completeness, failover, repair, TLS or global-snapshot claim.
 adds `E()` / `E(ids)` followed by `has`, `hasLabel`, `values(key)`, `label`,
 `limit`, `path`, and `count`. The additive official-AST adapter also supports the edge and endpoint
 steps below. Edge streams reject vertex adjacency (`out`/`in`/`both` and
-`outE`/`inE`/`bothE`); vertex streams reject endpoint steps, and `id` remains
-unsupported. Validation precedes acquisition, even on empty input. Only limit/count may follow a scalar projection. The older
+`outE`/`inE`/`bothE`); vertex streams reject endpoint steps. Qualified `id()`
+projection is supported with checked i64 conversion. Validation precedes acquisition, even on empty input. Only limit/count may follow a scalar projection. The older
 `observed_gremlin` and `observed_gremlin_v2` APIs still reject edge starts;
 their public enums and Eq/PartialEq contracts are unchanged.
 
@@ -592,3 +592,18 @@ integrity/coordination design.
 Storage keys, live record envelopes and property encoding are unchanged; no data
 migration or new format version is needed for vertex properties. Existing edge
 tombstone upgrade/downgrade restrictions still apply independently.
+
+### Qualified element deduplication in v3
+
+The shared routing-v3 executor additionally accepts no-argument `dedup()` on
+vertex/edge streams. It retains the first partition-qualified identity and full
+path in input order; filters/limits remain in place, and subsequent adjacency
+can produce repeated traversers again. Different partitions' equal local IDs
+and distinct parallel edges never collapse. Scalars, paths, scopes, arguments
+and by modulators remain unsupported, including empty input. One work unit is
+charged per input; each new identity costs 128 logical bytes before insertion,
+plus the existing retained row/path fee. All upstream validation and cumulative
+budgets remain in force. The old observed v1/v2 entrypoints are unchanged.
+See [shared contract](MANAGED_FIXED_TRAVERSALS.md#qualified-element-deduplication)
+for managed fixed-V behavior and complete-result paging. No storage/wire format
+or observed completeness guarantee changes.

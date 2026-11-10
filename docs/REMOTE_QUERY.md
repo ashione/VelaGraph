@@ -18,7 +18,8 @@ one shard and one partition. It does not consult a placement catalog.
 - `QueryMode::V1` reuses `GraphRecordStore::execute_gremlin`, the official-grammar
   parser, and the complete existing v1 interpreter and resource accounting.
 - `QueryMode::V2Observed` reuses `observed_gremlin_v3`, including edge starts,
-  edge/vertex projections, tombstone validation, qualified paths, and all its
+  edge/vertex projections, partition-qualified element `dedup()`, tombstone
+  validation, qualified paths, and all its
   work/decode limits. Its private scope contains exactly the requested partition.
   If execution encounters a referenced partition outside that scope, including
   another partition on the same physical shard, it fails `UnsupportedScope`.
@@ -141,3 +142,14 @@ functional evidence, not crash/failover, latency or throughput benchmarking.
 The separately opt-in [distributed observed query slice](DISTRIBUTED_QUERY.md)
 adds its own coordinator and fragment-session protocol. It does not widen this
 single-partition RPC or change its validation and consistency contract.
+
+### Shared v3 element deduplication
+
+V2Observed server queries also accept the shared executor's no-argument vertex
+and edge `dedup()`. The first qualified identity/path is retained in input order;
+filter and limit positions, cumulative work/bytes, and the single-partition
+snapshot remain unchanged. It cannot hide an out-of-scope reference or upstream
+integrity failure. V1 still rejects dedup, and scalar/path dedup, arguments,
+scopes and by modulators remain unsupported, including empty input. This does
+not add cross-partition execution or enlarge the separate distributed coordinator.
+See the [shared contract](MANAGED_FIXED_TRAVERSALS.md#qualified-element-deduplication).
