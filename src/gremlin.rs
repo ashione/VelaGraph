@@ -96,6 +96,7 @@ const RULE_METHOD_HAS: usize = 79;
 const RULE_METHOD_HAS_LABEL: usize = 82;
 const RULE_METHOD_ID: usize = 85;
 const RULE_METHOD_IN: usize = 87;
+const RULE_METHOD_IS: usize = 93;
 const RULE_METHOD_LABEL: usize = 95;
 const RULE_METHOD_LIMIT: usize = 97;
 const RULE_METHOD_OUT: usize = 117;
@@ -146,6 +147,8 @@ pub enum ObservedGremlinStep {
     Existing(GremlinStep),
     /// Element/scalar deduplication; each executor admits its own subset.
     Dedup,
+    /// Strict literal equality on scalar streams; each executor admits its own subset.
+    Is(Value),
     /// Selected vertex properties; executed only by prepared hierarchy result jobs.
     ValueMap(Vec<String>),
     /// One incoming/outgoing vertex adjacency repeated a bounded number of times.
@@ -1094,6 +1097,14 @@ fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {
         .ok_or_else(|| Error::UnsupportedGremlinStep(node.text()))?;
     let (name, args) = method_parts(specific)?;
     match rule_index(specific).expect("specific rule has an index") {
+        RULE_METHOD_IS => {
+            if args.len() != 1 {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "is requires exactly one scalar literal".into(),
+                ));
+            }
+            Ok(ObservedGremlinStep::Is(parse_literal(&args[0])?))
+        }
         RULE_METHOD_VALUE_MAP => {
             if !(1..=8).contains(&args.len()) {
                 return Err(Error::UnsupportedGremlinArgument(
@@ -1909,5 +1920,60 @@ mod value_map_parser_tests {
         assert!(
             ObservedGremlinQuery::parse("g.V(1).valueMap('a','b','c','d','e','f','g','h')").is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod scalar_filter_parser_tests {
+    use super::*;
+
+    #[test]
+    fn observed_is_maps_official_literal_ast_without_coercion() {
+        for (literal, value) in [
+            ("null", Value::Null),
+            ("false", Value::Boolean(false)),
+            ("true", Value::Boolean(true)),
+            ("1", Value::Integer(1)),
+            ("-9223372036854775808L", Value::Integer(i64::MIN)),
+            ("9223372036854775807L", Value::Integer(i64::MAX)),
+            ("1.0", Value::Real(1.0)),
+            ("-0.0", Value::Real(-0.0)),
+            ("'同值'", Value::Text("同值".into())),
+            ("'a,b'", Value::Text("a,b".into())),
+        ] {
+            let text = format!("g.V().values('x').is({literal})");
+            let query = ObservedGremlinQuery::parse(&text).unwrap();
+            assert_eq!(query.steps().last(), Some(&ObservedGremlinStep::Is(value)));
+            assert!(matches!(
+                GremlinQuery::parse(&text),
+                Err(Error::UnsupportedGremlinStep(_))
+            ));
+        }
+        assert!(
+            ObservedGremlinQuery::parse("g.E().id().is(1).dedup().is(1).limit(2).count()").is_ok()
+        );
+    }
+
+    #[test]
+    fn observed_is_rejects_predicates_collections_modulators_and_nonfinite() {
+        for suffix in [
+            "is()",
+            "is(1,2)",
+            "is(eq(1))",
+            "is(P.eq(1))",
+            "is(gt(1))",
+            "is(within(1,2))",
+            "is([1,2])",
+            "is(1e999)",
+            "is(9223372036854775808L)",
+            "is(1).by('x')",
+            "count().is(1)",
+        ] {
+            let text = format!("g.V(999).id().{suffix}");
+            assert!(
+                ObservedGremlinQuery::parse(&text).is_err(),
+                "accepted {text}"
+            );
+        }
     }
 }

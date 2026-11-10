@@ -600,3 +600,14 @@ PropertyMap 结果。qualified 来源、有序 bag、missing/Null、默认结果
 2 KiB 单 map、累计 work/bytes、TTL 和生命周期限制不变。#157 只补齐通用
 多属性查询组合，不完成 data-local fixed-V 容量或 #110/#111 全量验收。
 见[契约](MANAGED_FIXED_TRAVERSALS.md#selected-vertex-property-maps)。
+
+
+### Shared strict scalar filtering
+
+The routing-v3 / managed fixed-V / single-partition V2Observed executor accepts
+standard `is(literal)` after scalar projection, with strict typed equality and
+in-place is/dedup/limit/count composition. An explicit shared stream-kind
+preflight preserves empty-input rejection and each entrypoint's consistency
+boundary. This adds functionality without increasing materialized query capacity,
+changing session lifetime or claiming data-local fixed-V execution. See
+[the contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering).

@@ -6,6 +6,8 @@ mod batch_relationships;
 mod bidirectional;
 #[path = "global_relationships.rs"]
 mod global_relationships;
+#[path = "scalar_filter.rs"]
+mod scalar_filter;
 #[path = "sync_projection.rs"]
 mod sync_projection;
 pub struct Edge {
@@ -672,6 +674,7 @@ impl Model {
         q.extend(batch_relationships::queries(self));
         q.extend(sync_projection::queries(self));
         q.extend(global_relationships::queries(self));
+        q.extend(scalar_filter::queries(self));
         q
     }
 }
@@ -698,7 +701,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 126);
+    assert_eq!(q.len(), 132);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     // Fixed-version v3 now supports element dedup. Keep these independent
     // relationship-list oracles enabled instead of masking them as rejections.
@@ -981,7 +984,7 @@ fn client_repeat_phases_are_fixed_complete_and_ordered() {
         ]
     );
     let legacy = phase_names("legacy");
-    assert_eq!(legacy.len(), 97);
+    assert_eq!(legacy.len(), 103);
     for name in [
         "recursive_repeat",
         "native_zero_depth",

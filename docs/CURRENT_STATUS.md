@@ -43,6 +43,9 @@ fail explicitly. Public graph mutations here are typed APIs, not Gremlin scripts
   scalar dedup after values/label/id, retaining the first equal value and source;
   path dedup and modulators reject. See the
   [scalar contract](MANAGED_FIXED_TRAVERSALS.md#scalar-deduplication).
+  Standard `is(literal)` also filters scalar streams in place with strict typed
+  equality, preserving ordered bags and source provenance; predicates remain
+  rejected ([contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering)).
   The same shared executor supplies single-partition V2Observed server queries.
   These additions do not change legacy v1/v2 or the original smaller managed Read;
   each retains its existing subset.

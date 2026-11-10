@@ -461,6 +461,86 @@ async fn scenario() -> anyhow::Result<()> {
     };
     for (text, expected) in [
         (
+            "g.V(2,1,2).values('typed').is(1)",
+            vec![scalar(vertex(1), Value::Integer(1))],
+        ),
+        (
+            "g.V(2,1,2).values('typed').is(1.0)",
+            vec![scalar(vertex(2), Value::Real(1.0)); 2],
+        ),
+        ("g.V(2,1,2).values('typed').is('1')", vec![]),
+        (
+            "g.V(2,1,2).values('flag').is(true)",
+            vec![scalar(vertex(1), Value::Boolean(true))],
+        ),
+        (
+            "g.V(2,1,2).values('flag').is('true')",
+            vec![scalar(vertex(2), Value::Text("true".into())); 2],
+        ),
+        (
+            "g.V(2,1,2).values('zero').is(-0.0)",
+            vec![
+                scalar(vertex(2), Value::Real(0.0)),
+                scalar(vertex(1), Value::Real(-0.0)),
+                scalar(vertex(2), Value::Real(0.0)),
+            ],
+        ),
+        (
+            "g.V(2,1,2).values('zero').is(0.0).dedup()",
+            vec![scalar(vertex(2), Value::Real(0.0))],
+        ),
+        (
+            "g.V(2,1,2).values('unicode').is('é')",
+            vec![scalar(vertex(1), Value::Text("é".into()))],
+        ),
+        (
+            "g.V(70,2,1).values('nullable').is(null)",
+            vec![
+                scalar(vertex(2), Value::Null),
+                scalar(vertex(1), Value::Null),
+            ],
+        ),
+        (
+            "g.V(2,1,2).id().is(2).limit(1).is(2)",
+            vec![scalar(vertex(2), Value::Integer(2))],
+        ),
+        (
+            "g.V(2,1,2).id().limit(1).is(1).count()",
+            vec![QueryRow::Count(0)],
+        ),
+        (
+            "g.V(2,1,2).id().is(1).limit(1).count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            "g.V(2,1,2).id().is(2).dedup().count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            "g.V(2,1,2).label().is('person')",
+            vec![
+                scalar(vertex(2), Value::Text("person".into())),
+                scalar(vertex(1), Value::Text("person".into())),
+                scalar(vertex(2), Value::Text("person".into())),
+            ],
+        ),
+        (
+            "g.E(9,9).values('since').is(2026)",
+            vec![scalar(edge(9), Value::Integer(2026)); 2],
+        ),
+        (
+            "g.E(9,9).id().is(9).dedup()",
+            vec![scalar(edge(9), Value::Integer(9))],
+        ),
+        (
+            "g.E(9,9).label().dedup().is('knows')",
+            vec![scalar(edge(9), Value::Text("knows".into()))],
+        ),
+        (
+            "g.V(999999).values('missing').is(null).count()",
+            vec![QueryRow::Count(0)],
+        ),
+        (
             "g.V(2,1,2).valueMap('name','missing')",
             vec![
                 property_map(
@@ -689,6 +769,8 @@ async fn scenario() -> anyhow::Result<()> {
         for (text, failure) in [
             ("g.V(", QueryFailure::Parse),
             ("g.E().valueMap('name')", QueryFailure::Unsupported),
+            // Element-to-scalar filtering is invalid even on an empty root.
+            ("g.V(999999).is(1)", QueryFailure::Unsupported),
         ] {
             assert_eq!(
                 query(endpoint, Some(identity), request(mode, text), BUDGET).await?,
@@ -716,6 +798,16 @@ async fn scenario() -> anyhow::Result<()> {
         .await?,
         Err(QueryFailure::Unsupported),
         "the shared v3 extension does not expand v1"
+    );
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V1, "g.V(1).id().is(1)"),
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::Unsupported)
     );
     let loop_vertex = QualifiedElement::Vertex {
         partition: 0,
@@ -786,6 +878,14 @@ async fn scenario() -> anyhow::Result<()> {
         Err(QueryFailure::Unsupported)
     );
     for text in [
+        "g.V(999999).is(1)",
+        "g.E(999999).is(1)",
+        "g.V(999999).id().is(1).out()",
+        "g.E(999999).label().is('missing').inV()",
+        "g.V(999999).values('missing').is(null).path()",
+        "g.V(1).id().is(0).hasLabel('person')",
+        "g.V(999999).id().is(eq(1))",
+        "g.V(999999).id().is(gt(1))",
         "g.V(999999).id().dedup().out()",
         "g.E(999999).label().dedup().inV()",
         "g.V(999999).values('missing').dedup().path()",
@@ -850,6 +950,20 @@ async fn scenario() -> anyhow::Result<()> {
         assert_eq!(bounded.rows, vec![QueryRow::Count(22)]);
         assert_stamp(&bounded, identity, sequence);
     }
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(
+                QueryMode::V2Observed,
+                "g.V(70).out().out().out().id().is(-1)"
+            ),
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::ResourceExhausted),
+        "a nonmatching scalar filter must not hide upstream traversal exhaustion"
+    );
     let large = query(
         endpoint,
         Some(identity),

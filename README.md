@@ -35,6 +35,8 @@ executor, including qualified vertex/edge `id()`, element `dedup()` and scalar
 one materialized cohort snapshot. Repeat supports exact-depth and post-body
 emission with combined depth at most 32 and unchanged cumulative resource limits.
 Terminal selected vertex `valueMap` returns bounded multi-property rows at the same V.
+Standard `is(literal)` filters projected values, labels and IDs with strict typed
+equality, composing with dedup, positional limits and terminal count.
 They do not yet support data-local hierarchy jobs. The original gateway `Read` has its own smaller subset.
 
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still

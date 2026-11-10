@@ -236,6 +236,41 @@ impl Model {
                     .collect(),
             ),
             ("g.V().hasLabel('model').values('marker')", scalar.clone()),
+            (
+                "g.V().hasLabel('model').values('marker').is(42)",
+                scalar
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row,
+                            QueryRow::Value {
+                                value: Value::Integer(42),
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+            (
+                "g.V().hasLabel('model').values('marker').is(null).dedup()",
+                distinct(
+                    scalar
+                        .iter()
+                        .filter(|row| {
+                            matches!(
+                                row,
+                                QueryRow::Value {
+                                    value: Value::Null,
+                                    ..
+                                }
+                            )
+                        })
+                        .cloned()
+                        .collect(),
+                    true,
+                ),
+            ),
             (SCALAR_QUERY, distinct(scalar, true)),
             (
                 "g.E().hasLabel('model').values('weight')",
