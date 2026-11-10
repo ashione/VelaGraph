@@ -12,6 +12,7 @@ fn properties(m: &Model, id: u64) -> Value {
     let mut map = serde_json::Map::from_iter([
         ("name".into(), json!([{"Text":name}])),
         ("active".into(), json!([{"Boolean":active(id)}])),
+        ("nullable".into(), json!(["Null"])),
     ]);
     if id <= m.people {
         map.insert(
@@ -28,10 +29,10 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         result.push(
             json!({"name":name,"partition":partition(start),"query":text,
             "expected":{"maps":ids.into_iter().map(|id| properties(m,id)).collect::<Vec<_>>()},
-            "server_supported":true,"client_expect_unsupported":true}),
+            "server_supported":true}),
         );
     };
-    let projection = ".valueMap('name','active','multi_department','missing')";
+    let projection = ".valueMap('name','active','multi_department','nullable','missing')";
     add(
         "project_batch_people",
         20,
@@ -81,6 +82,22 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         format!("g.V(20).out('member_of').in('member_of').dedup().limit(25){projection}"),
         unique,
     );
+    // Empty streams and empty maps are distinct: one row survives per input
+    // vertex even when none of the selected properties exists.
+    result.push(
+        json!({"name":"project_missing_properties_bag","partition":partition(20),
+        "query":"g.V(20,23,20).valueMap('missing')",
+        "expected":{"maps":[
+            {"source":[partition(20),20],"properties":{}},
+            {"source":[partition(23),23],"properties":{}},
+            {"source":[partition(20),20],"properties":{}}
+        ]},"server_supported":true}),
+    );
+    result.push(
+        json!({"name":"project_empty_stream","partition":partition(20),
+        "query":"g.V(20).has('name','NoSuchEmployee').valueMap('name','nullable','missing')",
+        "expected":{"maps":[]},"server_supported":true}),
+    );
     result
 }
 #[test]
@@ -88,10 +105,35 @@ fn batch_projection_oracle_preserves_bags_and_omits_missing_properties() {
     for (people, departments) in [(2000, 50), (200000, 5000)] {
         let m = Model::new(people, departments);
         let q = queries(&m);
-        assert_eq!(q.len(), 5);
+        assert_eq!(q.len(), 7);
+        for case in &q {
+            assert_ne!(case["client_expect_unsupported"], true);
+            assert_eq!(case["server_supported"], true);
+            assert!(case["expected"]["maps"].is_array());
+        }
         let maps = q[0]["expected"]["maps"].as_array().unwrap();
         assert_eq!(maps.len(), 4);
         assert_eq!(maps[0], maps[3]);
+        assert_eq!(
+            maps,
+            &vec![
+                properties(&m, 20),
+                properties(&m, 23),
+                properties(&m, 26),
+                properties(&m, 20)
+            ]
+        );
+        assert!(maps
+            .iter()
+            .all(|row| row["properties"]["nullable"] == json!(["Null"])));
+        assert_eq!(q[5]["expected"]["maps"].as_array().unwrap().len(), 3);
+        assert_eq!(q[5]["expected"]["maps"][0], q[5]["expected"]["maps"][2]);
+        assert!(q[5]["expected"]["maps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["properties"] == json!({})));
+        assert_eq!(q[6]["expected"], json!({"maps":[]}));
         assert!(maps
             .iter()
             .all(|row| row["properties"].get("missing").is_none()));

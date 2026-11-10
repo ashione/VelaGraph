@@ -112,6 +112,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .push(if id <= people { "person" } else { "department" }.into());
         v.properties
             .insert("active".into(), Value::Boolean(model::active(id)));
+        v.properties.insert("nullable".into(), Value::Null);
         v.properties.insert(
             "country".into(),
             Value::Text(
