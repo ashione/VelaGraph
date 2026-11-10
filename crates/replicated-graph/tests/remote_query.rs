@@ -743,6 +743,8 @@ async fn scenario() -> anyhow::Result<()> {
         assert!(bytes < 4096);
     }
     for text in [
+        "g.V(2).out('cross').range(0,0)",
+        "g.E(10).range(0,0)",
         "g.V(2).out('cross')",
         "g.V(2).out('cross').valueMap('name')",
         "g.E(10).inV().valueMap('name')",
@@ -808,6 +810,85 @@ async fn scenario() -> anyhow::Result<()> {
         )
         .await?,
         Err(QueryFailure::Unsupported)
+    );
+    for text in ["g.V(999999).range(0,0)", "g.V(1).range(0,1)"] {
+        assert_eq!(
+            query(
+                endpoint,
+                Some(identity),
+                request(QueryMode::V1, text),
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::Unsupported)
+        );
+    }
+    for (text, expected) in [
+        (
+            "g.V(2,1,2).range(1,3)",
+            vec![
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 1,
+                }),
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 2,
+                }),
+            ],
+        ),
+        (
+            "g.E(9,9).range(1,2)",
+            vec![QueryRow::Element(QualifiedElement::Edge {
+                partition: 0,
+                id: 9,
+            })],
+        ),
+        (
+            "g.V(70).out().out().range(0,150)",
+            vec![
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 70
+                });
+                150
+            ],
+        ),
+        (
+            "g.V(70).out().out().limit(150).range(0,150)",
+            vec![
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 0,
+                    id: 70
+                });
+                150
+            ],
+        ),
+        ("g.V(999999).range(0,0).count()", vec![QueryRow::Count(0)]),
+    ] {
+        let output = query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V2Observed, text),
+            BUDGET,
+        )
+        .await??;
+        assert_eq!(output.rows, expected, "{text}");
+        assert_eq!(output.completeness, QueryCompleteness::Unverified);
+        assert_stamp(&output, identity, sequence);
+    }
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(
+                QueryMode::V2Observed,
+                "g.V(70).out().out().out().range(0,0)"
+            ),
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::ResourceExhausted)
     );
     let loop_vertex = QualifiedElement::Vertex {
         partition: 0,

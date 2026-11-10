@@ -101,6 +101,7 @@ const RULE_METHOD_LABEL: usize = 95;
 const RULE_METHOD_LIMIT: usize = 97;
 const RULE_METHOD_OUT: usize = 117;
 const RULE_METHOD_PATH: usize = 121;
+const RULE_METHOD_RANGE: usize = 129;
 const RULE_METHOD_REPEAT: usize = 131;
 const RULE_METHOD_TIMES: usize = 148;
 const RULE_INTEGER_LITERAL: usize = 292;
@@ -149,6 +150,11 @@ pub enum ObservedGremlinStep {
     Dedup,
     /// Strict literal equality on scalar streams; each executor admits its own subset.
     Is(Value),
+    /// Bounded half-open positional range; each executor admits its own subset.
+    Range {
+        low: usize,
+        high: usize,
+    },
     /// Selected vertex properties; executed only by prepared hierarchy result jobs.
     ValueMap(Vec<String>),
     /// One incoming/outgoing vertex adjacency repeated a bounded number of times.
@@ -355,9 +361,13 @@ fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQ
             }
         )));
     }
-    let explicit_limit = steps
-        .iter()
-        .any(|step| matches!(step, ObservedGremlinStep::Existing(GremlinStep::Limit(_))));
+    let explicit_limit = steps.iter().any(|step| {
+        matches!(
+            step,
+            ObservedGremlinStep::Existing(GremlinStep::Limit(_))
+                | ObservedGremlinStep::Range { .. }
+        )
+    });
 
     Ok(ObservedGremlinQuery {
         start,
@@ -1097,6 +1107,29 @@ fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {
         .ok_or_else(|| Error::UnsupportedGremlinStep(node.text()))?;
     let (name, args) = method_parts(specific)?;
     match rule_index(specific).expect("specific rule has an index") {
+        RULE_METHOD_RANGE => {
+            if args.len() != 2 {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "range requires exactly two integer literals".into(),
+                ));
+            }
+            let (Value::Integer(low), Value::Integer(high)) =
+                (parse_literal(&args[0])?, parse_literal(&args[1])?)
+            else {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "range requires integer literals".into(),
+                ));
+            };
+            if low < 0 || high < low || high > MAX_GREMLIN_LIMIT as i64 {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "range requires 0 <= low <= high <= 1000".into(),
+                ));
+            }
+            Ok(ObservedGremlinStep::Range {
+                low: low as usize,
+                high: high as usize,
+            })
+        }
         RULE_METHOD_IS => {
             if args.len() != 1 {
                 return Err(Error::UnsupportedGremlinArgument(
@@ -1970,6 +2003,68 @@ mod scalar_filter_parser_tests {
             "count().is(1)",
         ] {
             let text = format!("g.V(999).id().{suffix}");
+            assert!(
+                ObservedGremlinQuery::parse(&text).is_err(),
+                "accepted {text}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod range_parser_tests {
+    use super::*;
+
+    #[test]
+    fn observed_range_maps_official_halfopen_ast_without_legacy_expansion() {
+        for (low, high) in [(0, 0), (0, 1), (1, 1), (2, 8), (0, 1000), (1000, 1000)] {
+            let text = format!("g.V().range({low}L,{high}L)");
+            let query = ObservedGremlinQuery::parse(&text).unwrap();
+            assert_eq!(query.steps(), &[ObservedGremlinStep::Range { low, high }]);
+            assert!(query.explicit_limit);
+            assert!(matches!(
+                GremlinQuery::parse(&text),
+                Err(Error::UnsupportedGremlinStep(_))
+            ));
+        }
+        for text in [
+            "g.E().range(1,2).inV().id().range(0,1).count()",
+            "g.V().range(0,0).out().path()",
+            "g.V().id().range(0,1000).is(1).dedup().limit(1)",
+            "g.V().range(0,1000).valueMap('name')",
+        ] {
+            assert!(ObservedGremlinQuery::parse(text).is_ok(), "rejected {text}");
+        }
+    }
+
+    #[test]
+    fn observed_range_rejects_unbounded_scoped_and_invalid_arguments() {
+        for suffix in [
+            "range()",
+            "range(1)",
+            "range(1,2,3)",
+            "range(local,0,1)",
+            "range(global,0,1)",
+            "range(Scope.global,0,1)",
+            "range(-1,1)",
+            "range(0,-1)",
+            "range(2,1)",
+            "range(0,1001)",
+            "range(1001,1001)",
+            "range(0,9223372036854775807L)",
+            "range(0,9223372036854775808L)",
+            "range(0.0,1)",
+            "range(0,1.0)",
+            "range('0',1)",
+            "range(0,true)",
+            "range(0,null)",
+            "range(0,1).by('x')",
+            "count().range(0,1)",
+            "path().range(0,1)",
+            "valueMap('x').range(0,1)",
+            "repeat(out().range(0,1)).times(2)",
+        ] {
+            let text = format!("g.V(999).{suffix}");
             assert!(
                 ObservedGremlinQuery::parse(&text).is_err(),
                 "accepted {text}"

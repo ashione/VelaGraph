@@ -43,6 +43,8 @@ async fn empty_fixed_snapshot_validates_every_step_before_execution() {
         "g.V(1).id()",
         "g.V(1).repeat(__.in()).emit().times(32).path()",
         "g.E(1).bothV().repeat(__.out()).times(32).dedup().id()",
+        "g.V().range(0,0)",
+        "g.E().id().range(1,2)",
     ] {
         assert!(traverse(&g, &session, text).await.unwrap().is_empty());
     }
@@ -52,6 +54,8 @@ async fn empty_fixed_snapshot_validates_every_step_before_execution() {
     );
     for (text, expected) in [
         ("g.V(1).inV()", QueryFailure::Unsupported),
+        ("g.V(1).range(0,0).inV()", QueryFailure::Unsupported),
+        ("g.V(1).id().range(0,0).out()", QueryFailure::Unsupported),
         ("g.E(1).outE()", QueryFailure::Unsupported),
         ("g.V(1).values('x').out()", QueryFailure::Unsupported),
         ("g.V(1).id().out()", QueryFailure::Unsupported),
@@ -610,6 +614,7 @@ async fn id_projection_keeps_fixed_version_bags_pages_and_overflow_errors() {
         "g.V().id().limit(1)",
         "g.V().id().is(-1).count()",
         "g.V().id().is(1).limit(1)",
+        "g.V().id().range(0,0)",
     ] {
         assert_eq!(
             traverse(&g, &fresh, query).await,
@@ -1256,4 +1261,144 @@ async fn selected_value_maps_enforce_whole_row_cap_without_retaining_partial_pag
     g.shutdown().await;
     drop(config);
     f.stop().await;
+}
+
+#[test]
+fn range_reply_bounds_follow_positions_expansions_and_explicit_default_override() {
+    for (text, maximum) in [
+        ("g.V().range(0,150)", 150),
+        ("g.V().range(900,1000)", 100),
+        ("g.V(1,2,1).range(1,3)", 2),
+        ("g.V(1,2,1).range(1,9)", 2),
+        ("g.V(1,2,1).range(8,9)", 0),
+        ("g.V().range(1000,1000)", 0),
+        ("g.V().range(0,0).out()", 0),
+        ("g.V().range(0,1).out()", 1000),
+        ("g.E().range(1,3).bothV()", 4),
+        ("g.V().out().range(1,3).id()", 2),
+        ("g.V().range(0,150).valueMap('name')", 150),
+        ("g.V().range(0,150).limit(120).range(10,115)", 105),
+        ("g.V().range(0,1).repeat(out()).times(2)", 10_000),
+        ("g.V().repeat(out()).times(2).range(2,5)", 3),
+    ] {
+        assert!(
+            super::query::valid_traversal_total(&query(7, text), maximum),
+            "{text}"
+        );
+        assert!(
+            !super::query::valid_traversal_total(&query(7, text), maximum + 1),
+            "{text}"
+        );
+    }
+    let session = synthetic_session();
+    for (text, count, accepted) in [
+        ("g.V(1,1,1).range(1,3).count()", 2, true),
+        ("g.V(1,1,1).range(1,3).count()", 3, false),
+        ("g.V().range(0,0).count()", 0, true),
+        ("g.V().range(0,0).count()", 1, false),
+    ] {
+        let op = Operation::Traverse {
+            session: session.clone(),
+            query: query(7, text),
+        };
+        let reply = Reply::Traverse {
+            session: session.clone(),
+            query: query(7, text),
+            data: QueryData {
+                rows: vec![QueryRow::Count(count)],
+                completeness: QueryCompleteness::Unverified,
+            },
+        };
+        assert_eq!(synthetic(op, reply).is_ok(), accepted, "{text}: {count}");
+    }
+    let text = "g.V().range(0,150)";
+    let rows = (0..150)
+        .map(|id| QueryRow::Element(Q::Vertex { partition: 7, id }))
+        .collect();
+    let reply = Reply::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+        data: QueryData {
+            rows,
+            completeness: QueryCompleteness::Unverified,
+        },
+    };
+    assert_eq!(
+        synthetic(
+            Operation::Traverse {
+                session: session.clone(),
+                query: query(7, text)
+            },
+            reply.clone()
+        )
+        .unwrap(),
+        reply
+    );
+}
+
+#[test]
+fn range_page_envelopes_enforce_explicit_full_result_cardinality() {
+    let session = synthetic_session();
+    let text = "g.V().range(0,150)";
+    let operation = paged(&session, text, None, 1);
+    let original = Reply::TraversePage {
+        session: session.clone(),
+        query: query(7, text),
+        cursor: None,
+        page_size: 1,
+        page: QueryPage {
+            data: QueryData {
+                rows: vec![QueryRow::Element(Q::Vertex {
+                    partition: 7,
+                    id: 1,
+                })],
+                completeness: QueryCompleteness::Unverified,
+            },
+            next: Some(PageCursor { token: [3; 32] }),
+            offset: 0,
+            total: 150,
+        },
+    };
+    assert_eq!(
+        synthetic(operation.clone(), original.clone()).unwrap(),
+        original
+    );
+    let mut impossible = original;
+    let Reply::TraversePage { page, .. } = &mut impossible else {
+        unreachable!()
+    };
+    page.total = 151;
+    assert_eq!(synthetic(operation, impossible), Err(Error::Identity));
+
+    let text = "g.V().range(1000,1000)";
+    let operation = paged(&session, text, None, 1);
+    let original = Reply::TraversePage {
+        session: session.clone(),
+        query: query(7, text),
+        cursor: None,
+        page_size: 1,
+        page: QueryPage {
+            data: QueryData {
+                rows: vec![],
+                completeness: QueryCompleteness::Unverified,
+            },
+            next: None,
+            offset: 0,
+            total: 0,
+        },
+    };
+    assert_eq!(
+        synthetic(operation.clone(), original.clone()).unwrap(),
+        original
+    );
+    let mut impossible = original;
+    let Reply::TraversePage { page, .. } = &mut impossible else {
+        unreachable!()
+    };
+    page.total = 1;
+    page.data.rows = vec![QueryRow::Element(Q::Vertex {
+        partition: 7,
+        id: 1,
+    })];
+    assert_eq!(synthetic(operation, impossible), Err(Error::Identity));
 }

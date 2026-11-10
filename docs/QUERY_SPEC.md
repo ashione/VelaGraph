@@ -526,7 +526,7 @@ limit, terminal path/count. The official parser and whole-stream-type validation
 run before even empty input. Repeated traversers, qualified edge/vertex paths,
 parallel edges and deterministic `(ID, partition)` ordering preserve existing
 v3 semantics. `id()` emits Integer(i64) with qualified vertex/edge provenance;
-only is/dedup/limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
+only is/dedup/limit/range/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
 (mapped to Unsupported by the managed gateway), without wrapping or partial rows.
 A later limit/count cannot hide overflow; an earlier limit restricts the input
 at its original position. Terminal selected vertex valueMap follows the shared contract below; other unsupported steps reject.
@@ -610,7 +610,7 @@ with the existing one-to-eight bounded distinct-key AST. Edge and scalar inputs,
 all-key/token maps and post-processing reject before reads, including empty
 streams. Ordered bags and qualified source identities are preserved; values are
 strict singleton lists, missing keys are omitted and stored Null remains `[Null]`.
-Without an explicit limit the first-100 default precedes terminal projection,
+Without an explicit limit or range the first-100 default precedes terminal projection,
 after upstream traversal checks. Maps reuse the 2 KiB tagged-flat-property cap
 and shared validator, while all work, response, fixed-V and immutable paging
 bounds stay unchanged. See the [complete contract](MANAGED_FIXED_TRAVERSALS.md#selected-vertex-property-maps).
@@ -620,7 +620,7 @@ Local/v1, legacy observed v1/v2 and original managed Read remain unchanged.
 ### Fixed-version strict scalar is filters
 
 Shared routing-v3, single-partition V2Observed server and managed Traverse/Page
-accept `is(literal)` after values/label/id, composing with is/dedup/limit and
+accept `is(literal)` after values/label/id, composing with is/dedup/limit/range and
 terminal count. Equality uses strict Value types (including Null and equal finite
 signed zeros), preserving each matching row's value, source and ordered bag
 multiplicity. Missing values remain absent. Predicates, collections, modulators,
@@ -632,3 +632,19 @@ parser and resource bounds remain unchanged. See the
 [complete contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering).
 Legacy local/v1, observed v1/v2, original managed Read and server-coordinator
 query/job subsets are unchanged.
+
+
+### Fixed-version bounded positional ranges
+
+Shared routing-v3, single-partition V2Observed server and managed Traverse/Page
+accept `range(low, high)` with two integer literals, `0 <= low <= high <= 1000`.
+It selects zero-based half-open positions from the current vertex/edge/scalar
+stream, preserving ordered bags, qualified source and paths. Equal bounds and
+offsets beyond the input produce no rows. Range composes in written order with
+the existing steps and suppresses the implicit first-100 cap like an explicit
+limit; it cannot follow terminal path/count/valueMap. Unbounded, scoped or
+invalid forms reject before reads even on empty streams. There is no range
+pushdown: upstream integrity/resource errors remain errors, and every current
+row is visited and charged, including discarded rows. Existing limits, V,
+complete-page/cursor semantics and legacy/coordinator/job rejection boundaries
+are unchanged. See the [complete contract](MANAGED_FIXED_TRAVERSALS.md#bounded-positional-ranges).

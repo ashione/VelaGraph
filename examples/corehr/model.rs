@@ -6,6 +6,8 @@ mod batch_relationships;
 mod bidirectional;
 #[path = "global_relationships.rs"]
 mod global_relationships;
+#[path = "range.rs"]
+mod range;
 #[path = "scalar_filter.rs"]
 mod scalar_filter;
 #[path = "sync_projection.rs"]
@@ -323,7 +325,24 @@ impl Model {
             ("sort", "g.V(1).in('reports_to').order()"),
             ("predicate", "g.V(1).has('level',gt(2))"),
         ] {
-            q.push(json!({"name":name,"partition":partition(1),"query":query,"expect_error":true}));
+            if name == "offset_pagination" {
+                // This existing case is now admitted only by routing-v3. Keep
+                // its name, query, and position; derive rows from input edges.
+                let vertices: Vec<_> = self
+                    .hop(&[1], "reports_to", false)
+                    .into_iter()
+                    .skip(2)
+                    .take(3)
+                    .map(|id| json!([partition(id), id]))
+                    .collect();
+                q.push(json!({"name":name,"partition":partition(1),"query":query,
+                    "client_expected":{"vertices":vertices},"server_supported":false,
+                    "server_expected_error":"Unsupported"}));
+            } else {
+                q.push(
+                    json!({"name":name,"partition":partition(1),"query":query,"expect_error":true}),
+                );
+            }
         }
         q.push(json!({"name":"global_count","partition":1,"query":"g.V().count()","expected":{"count":self.people+self.departments},"server_supported":true}));
         // Two public APIs intentionally use different qualified ordering.
@@ -675,6 +694,7 @@ impl Model {
         q.extend(sync_projection::queries(self));
         q.extend(global_relationships::queries(self));
         q.extend(scalar_filter::queries(self));
+        q.extend(range::queries(self));
         q
     }
 }
@@ -701,7 +721,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 132);
+    assert_eq!(q.len(), 140);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     // Fixed-version v3 now supports element dedup. Keep these independent
     // relationship-list oracles enabled instead of masking them as rejections.
@@ -984,7 +1004,29 @@ fn client_repeat_phases_are_fixed_complete_and_ordered() {
         ]
     );
     let legacy = phase_names("legacy");
-    assert_eq!(legacy.len(), 103);
+    assert_eq!(legacy.len(), 111);
+    // Original phase membership and order remain an unchanged prefix. Range
+    // cases are appended to the default phase, never moved from repeat phases.
+    let prior_legacy: Vec<_> = queries[..132]
+        .iter()
+        .filter(|case| case["client_phase"].as_str().unwrap_or("legacy") == "legacy")
+        .map(|case| case["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(prior_legacy.len(), 103);
+    assert_eq!(&legacy[..103], prior_legacy.as_slice());
+    assert_eq!(
+        &legacy[103..],
+        &[
+            "range_explicit_bag",
+            "range_before_dedup",
+            "range_after_dedup",
+            "range_scalar_filter",
+            "range_repeat_paths",
+            "range_limit_maps",
+            "range_equal_empty",
+            "range_overrun_empty",
+        ]
+    );
     for name in [
         "recursive_repeat",
         "native_zero_depth",

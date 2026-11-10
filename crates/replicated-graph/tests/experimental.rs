@@ -811,6 +811,27 @@ async fn scenario() -> anyhow::Result<()> {
         ));
         let unknown_source = current.prepare_edge(&edge(30, 2, 1))?;
         let unknown_reverse = current.prepare_edge(&edge(31, 1, 2))?;
+        // Range never changes upstream validation, even if it returns no rows.
+        assert!(matches!(current.observed_gremlin_v3(1, "g.V(7).out().range(0,0)"), Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(_)))));
+        for (text, expected) in [
+            ("g.V(7).out('K').range(1,3)", vec![ObservedRowV3::Vertex(vr(2)), ObservedRowV3::Vertex(vr(3))]),
+            ("g.V(7).out('K').range(0,2).dedup()", vec![ObservedRowV3::Vertex(vr(2))]),
+            ("g.V(7).out('K').dedup().range(0,2)", vec![ObservedRowV3::Vertex(vr(2)), ObservedRowV3::Vertex(vr(3))]),
+            ("g.V(7).out('K').values('typed').is(1.0).range(1,2)", vec![scalar(2, Value::Real(1.0))]),
+            ("g.V(7).out('K').range(1,2).values('typed').is(1).count()", vec![ObservedRowV3::Count(0)]),
+            ("g.V(7).out('K').range(2,2)", vec![]),
+            ("g.V(7).out('K').range(9,10)", vec![]),
+            ("g.V(7).repeat(out('K')).times(2).range(1,3).count()", vec![ObservedRowV3::Count(2)]),
+        ] {
+            let result = session.observed_gremlin_v3(1, text)?;
+            assert_eq!(result.rows, expected, "{text}");
+            assert_eq!(result.snapshots, session.snapshots);
+            assert_eq!(result.metadata_sequence, session.metadata_sequence);
+        }
+        for text in ["g.V(7).range(0,1)", "g.V(999).range(0,0)"] {
+            assert!(session.observed_gremlin(1, text).is_err());
+            assert!(session.observed_gremlin_v2(1, text).is_err());
+        }
         // Run new expensive resource probes only after every pre-existing
         // retained-view assertion. Their work must not consume those leases.
         // One full-width resource case is sufficient at this transport layer;

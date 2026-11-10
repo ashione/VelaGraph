@@ -43,6 +43,9 @@ fail explicitly. Public graph mutations here are typed APIs, not Gremlin scripts
   scalar dedup after values/label/id, retaining the first equal value and source;
   path dedup and modulators reject. See the
   [scalar contract](MANAGED_FIXED_TRAVERSALS.md#scalar-deduplication).
+  Bounded `range(low, high)` selects positions on vertex/edge/scalar streams at
+  the same V, preserving ordered bags and qualified provenance. This is not
+  source-scan pushdown or a capacity expansion.
   Standard `is(literal)` also filters scalar streams in place with strict typed
   equality, preserving ordered bags and source provenance; predicates remain
   rejected ([contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering)).

@@ -147,8 +147,8 @@ fn scalar_filter_matrix_is_appended_without_replacing_prior_cases() {
     let m = Model::new(2000, 50);
     let all = m.queries();
     let added = queries(&m);
-    assert_eq!(all.len(), 126 + added.len());
-    assert_eq!(&all[126..], added.as_slice());
+    assert_eq!(all.len(), 126 + added.len() + 8);
+    assert_eq!(&all[126..132], added.as_slice());
     assert!(all[..126]
         .iter()
         .all(|case| !case["name"].as_str().unwrap().starts_with("scalar_is_")));

@@ -41,7 +41,7 @@ The external query is ordinary Gremlin text plus partition routing context:
   semantics. Missing properties produce no value; stored Null remains a value.
   Vertex label selects the first stored label, or empty text. Limits execute in
   place. Count runs before the implicit default result cap.
-- With no explicit limit, non-count results have the existing default cap of
+- With no explicit limit or range, non-count results have the existing default cap of
   100. Explicit limits are 1..=1000. Internal caps never produce partial success.
 - Terminal selected vertex valueMap is described below. Mutations and unsupported compositions reject
   before data reads, including empty streams. The original smaller `Read` API,
@@ -143,7 +143,7 @@ The shared routing-v3 executor additionally accepts standard `id()` on vertex or
 edge streams, including scans, adjacency and endpoint compositions. It preserves
 ordered bags and qualified source provenance while projecting the local ID to
 Integer(i64). IDs greater than i64::MAX fail explicitly; a later limit/count does
-not suppress that failure. Only is/dedup/limit/count may follow scalar projection, checked
+not suppress that failure. Only is/dedup/limit/range/count may follow scalar projection, checked
 before even empty input. Existing work/bytes, result and session limits remain.
 The same fixed V supplies elements and IDs; scalar result pages retain the existing
 immutable result and cursor rules. Clients validate each integer against its exact
@@ -195,7 +195,7 @@ compare equal, while the first value's original sign is retained. Non-finite
 reals are already rejected by record validation. Missing properties still emit
 no row and are not converted to Null. This does not use SQL comparison/coercion.
 
-Only literal is filters, further no-argument dedup, positional limit and terminal
+Only literal is filters, further no-argument dedup, positional limit/range and terminal
 count may follow a scalar projection. Whole-AST validation rejects paths, element steps, scopes,
 arguments and modulators before reads, including empty streams. Repeated dedup
 is supported; `limit(2).dedup()` can differ from `dedup().limit(2)`. Count counts
@@ -317,7 +317,7 @@ singleton lists. Missing fields are omitted, explicit Null is `[Null]`, and a
 vertex with none of the selected fields yields an empty map. All five strict
 Value types, Unicode and escaping are preserved without coercion. Input order,
 bag multiplicity and positional filters/dedup/limits are unchanged. With no
-explicit limit, the ordinary default first-100 cap applies before terminal
+explicit limit or range, the ordinary default first-100 cap applies before terminal
 property materialization, after all upstream traversal validation. A projection
 never bypasses prior integrity failures or consumed work.
 
@@ -382,3 +382,56 @@ local/v1, observed v1/v2, original managed Read, server-coordinator and hierarch
 job subsets are not expanded. The additive public ObservedGremlinStep::Is variant
 requires Rust exhaustive matches to handle it; there is no wire or stored-format
 change, and older executors explicitly reject the new query shape.
+
+## Bounded positional ranges
+
+Shared routing-v3, managed Traverse/TraversePage and single-partition V2Observed
+queries accept standard `range(low, high)` on vertex, edge and scalar streams.
+Both arguments must be integer literals with `0 <= low <= high <= 1000`.
+The existing official AST and literal decoder supply these values. The range is
+zero-based and half-open: retain positions low through high minus one from the
+current stream. Equal bounds and offsets at or beyond the input length produce
+an empty stream. Bounds beyond the available rows do not fabricate rows.
+Unbounded high=-1, negative or reversed bounds, explicit scopes, modulators and
+range inside a repeat body remain unsupported. Whole-AST stream validation
+runs before reads, including on empty input. Terminal path/count/valueMap still
+cannot be followed by another step.
+
+Ranges execute in written order alongside filters, dedup, limits, scalar is and
+bounded repeat. For example `g.V(3,1,3,2).range(1,3)` retains vertices 1 and 3;
+`range(1,3).dedup()` can differ from `dedup().range(1,3)`. Every retained row keeps
+its exact qualified source, value and path, and duplicate inputs remain a bag.
+Ranges preserve whichever deterministic order their upstream step established;
+they introduce no sort. A range is an explicit result bound, so it suppresses
+the implicit first-100 cap just as an explicit limit does, including before a
+terminal selected property map. Later expansion is still governed by the usual
+intermediate row/work/byte limits rather than being capped at the earlier range.
+Count reports the post-range bag cardinality.
+
+The shared row-selection helper moves existing rows for scalar is and range
+without cloning values or paths. It visits every current input row, even the
+unselected suffix, checking the original deadline and charging one work unit.
+Each retained row is charged `128 + path_length * size_of(ObservedPathElement)`
+before output allocation. Existing upstream charges remain cumulative. Source
+scans and traversals are completed using their existing bounded contract before
+a range is applied: there is no range pushdown. Thus a range, including
+`range(0,0)`, cannot hide an earlier malformed edge, ID overflow, out-of-scope
+reference or exhausted budget. A leading explicit limit retains its existing
+bounded-source behavior; this slice does not alter that separate contract.
+Each range pass terminates after at most the existing 10,000 bounded rows, and
+the unchanged cumulative 10,000-work budget can reject multi-step queries sooner
+than a row cap. Parser admission bounds the number of steps.
+
+All data reads retain the same provider and managed V. Complete-result pages
+still require the entire query and every page envelope to succeed before the
+first page, retain an immutable result, and replay exactly through later writes.
+Ranges do not renew a session, retry a query or increase any timeout, resource
+cap or full-result/page size. They are positional selection within the bounded
+query, not unbounded streaming or a replacement for cursor identity.
+
+The original managed Read, local/v1, legacy observed v1/v2, server-coordinator and
+hierarchy-job subsets still reject range. The public ObservedGremlinStep gains
+an additive Range variant, requiring exhaustive Rust matches to handle it; wire
+and disk formats are unchanged. Older executors reject the new text shape.
+This generic query slice does not expand managed acquisition capacity or complete
+#110/#111, and makes no performance or multi-host availability claim.
