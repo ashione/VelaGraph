@@ -1492,6 +1492,39 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     let expectations = vec![
         (
             7,
+            "g.E(101).bothV().id().is(101)",
+            vec![
+                id_value(element(7, 101), 101),
+                id_value(element(8, 101), 101),
+            ],
+        ),
+        (
+            7,
+            "g.V(101).out('reports').values('name').is('Bob').dedup()",
+            vec![value(8, 101, "Bob")],
+        ),
+        (
+            7,
+            "g.V(101).out('member').label().is('department').count()",
+            vec![QueryRow::Count(2)],
+        ),
+        (
+            7,
+            "g.V(101,102).values('nullable').is(null).count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            7,
+            "g.V(101,101,102).id().limit(2).is(102).count()",
+            vec![QueryRow::Count(0)],
+        ),
+        (
+            7,
+            "g.V(101,101,102).id().is(102).limit(2).count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            7,
             "g.E(101).bothV().id().dedup()",
             vec![id_value(element(7, 101), 101)],
         ),
@@ -1750,6 +1783,14 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         .is_err());
     call(g, Operation::Close { session: another }).await?;
     for unsupported in [
+        "g.V(999).is(1)",
+        "g.E(999).is(1)",
+        "g.V(999).values('missing').is(null).out()",
+        "g.E(999).id().is(1).inV()",
+        "g.V(999).label().is('person').path()",
+        "g.V(101).id().is(0).hasLabel('person')",
+        "g.V(999).id().is(eq(1))",
+        "g.V(999).id().is(gt(1))",
         "g.V(101).id().out()",
         "g.V(999).values('missing').dedup().out()",
         "g.E(999).id().dedup().inV()",
@@ -1974,6 +2015,21 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
             traverse(g, &fresh, 7, scalar_query).await?,
             vec![value(7, 101, "Alice"), value(8, 101, name)]
         );
+        // The old V still observes Bob after the later rename, while fresh V
+        // rejects the renamed value. Both old parallel occurrences survive.
+        let filtered_query = "g.E(101,101).bothV().values('name').is('Bob')";
+        assert_eq!(
+            traverse(g, &old, 7, filtered_query).await?,
+            vec![value(8, 101, "Bob"); 2]
+        );
+        assert_eq!(
+            traverse(g, &fresh, 7, filtered_query).await?,
+            if phase == 0 {
+                vec![value(8, 101, "Bob"); 2]
+            } else {
+                vec![]
+            }
+        );
         let multiplicity = if phase < 2 { 2 } else { 1 };
         assert_eq!(
             traverse(g, &fresh, 7, "g.V(101).out('reports').values('name')").await?,
@@ -2021,6 +2077,52 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         g,
         Operation::Close {
             session: scalar_session,
+        },
+    )
+    .await?;
+    // Reuse released capacity, not a renewed session: materialize the original
+    // historical V after the writes above. The live old session was also checked
+    // with is() through every write; this separate session checks page replay.
+    let filtered_session = open(g, Some(old.version)).await?;
+    let filtered_query = "g.E(101,101).bothV().values('name').is('Bob')";
+    let filtered_first = page(g, &filtered_session, 7, filtered_query, None, 1).await?;
+    assert_eq!(filtered_first.offset, 0);
+    assert_eq!(filtered_first.total, 2);
+    assert_eq!(filtered_first.data.rows, vec![value(8, 101, "Bob")]);
+    let filtered_cursor = filtered_first.next.clone().context("two matching values")?;
+    let filtered_last = page(
+        g,
+        &filtered_session,
+        7,
+        filtered_query,
+        Some(filtered_cursor.clone()),
+        1,
+    )
+    .await?;
+    assert_eq!(filtered_last.offset, 1);
+    assert_eq!(filtered_last.total, 2);
+    assert_eq!(filtered_last.data.rows, vec![value(8, 101, "Bob")]);
+    assert!(filtered_last.next.is_none());
+    assert_eq!(
+        page(g, &filtered_session, 7, filtered_query, None, 1).await?,
+        filtered_first
+    );
+    assert_eq!(
+        page(
+            g,
+            &filtered_session,
+            7,
+            filtered_query,
+            Some(filtered_cursor),
+            1
+        )
+        .await?,
+        filtered_last
+    );
+    call(
+        g,
+        Operation::Close {
+            session: filtered_session,
         },
     )
     .await?;

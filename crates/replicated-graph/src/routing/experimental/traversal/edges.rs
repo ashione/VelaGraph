@@ -148,37 +148,68 @@ fn dedup_rows(
     }
     Ok(next)
 }
+// Filtering moves existing rows without cloning values or provenance. The
+// cumulative work and retained-row charges apply even when later steps discard
+// these rows; an empty result never suppresses an upstream failure.
+fn filter_scalars(
+    rows: Vec<ElementRow>,
+    wanted: &Value,
+    work: &mut Work,
+    mut check: impl FnMut() -> ExperimentalResult<()>,
+) -> ExperimentalResult<Vec<ElementRow>> {
+    let mut next = Vec::new();
+    for row in rows {
+        check()?;
+        work.visit()?;
+        if row.value.as_ref() == Some(wanted) {
+            push_element(&mut next, row, work)?;
+        }
+    }
+    Ok(next)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Vertex,
+    Edge,
+    Scalar,
+}
+
 /// Validate stream types before acquisition, including empty streams. No runtime
 /// row can turn an invalid vertex/edge transition into an apparent success.
 pub(crate) fn validate_steps(
     query: &rocksdb_sql_table::ObservedGremlinQuery,
 ) -> ExperimentalResult<()> {
     use rocksdb_sql_table::ObservedGremlinStep as Step;
-    let mut edge_stream = matches!(query.start(), GremlinStart::Edges(_));
-    let mut scalar = false;
+    let mut stream = match query.start() {
+        GremlinStart::Vertices(_) => StreamKind::Vertex,
+        GremlinStart::Edges(_) => StreamKind::Edge,
+    };
     let mut depth = 0usize;
     for (index, step) in query.steps().iter().enumerate() {
-        if scalar
+        if stream == StreamKind::Scalar
             && !matches!(
                 step,
-                Step::Dedup | Step::Existing(GremlinStep::Limit(_) | GremlinStep::Count)
+                Step::Is(_)
+                    | Step::Dedup
+                    | Step::Existing(GremlinStep::Limit(_) | GremlinStep::Count)
             )
         {
             // Preserve the error variant of the former v3 -> v2 vertex dispatch.
             if matches!(query.start(), GremlinStart::Vertices(_)) {
                 return Err(ExperimentalRouteError::Query(
                     rocksdb_sql_table::Error::UnsupportedGremlinArgument(
-                        "only dedup/limit/count may follow a v2 scalar projection".into(),
+                        "only is/dedup/limit/count may follow a v2 scalar projection".into(),
                     ),
                 ));
             }
             return Err(ExperimentalRouteError::Unsupported(
-                "only dedup/limit/count may follow a v3 scalar projection",
+                "only is/dedup/limit/count may follow a v3 scalar projection",
             ));
         }
         match step {
             Step::ValueMap(keys) => {
-                if edge_stream || index + 1 != query.steps().len() {
+                if stream != StreamKind::Vertex || index + 1 != query.steps().len() {
                     return Err(ExperimentalRouteError::Unsupported(
                         "v3 valueMap requires a terminal vertex stream",
                     ));
@@ -191,9 +222,16 @@ pub(crate) fn validate_steps(
                     )
                 })?;
             }
+            Step::Is(_) => {
+                if stream != StreamKind::Scalar {
+                    return Err(ExperimentalRouteError::Unsupported(
+                        "v3 is requires a scalar stream",
+                    ));
+                }
+            }
             Step::Dedup => {}
             Step::Repeat { times, .. } => {
-                if edge_stream {
+                if stream != StreamKind::Vertex {
                     return Err(ExperimentalRouteError::Unsupported(
                         "v3 repeat requires vertices",
                     ));
@@ -201,24 +239,24 @@ pub(crate) fn validate_steps(
                 depth += times;
             }
             Step::OutE(_) | Step::InE(_) | Step::BothE(_) => {
-                if edge_stream {
+                if stream != StreamKind::Vertex {
                     return Err(ExperimentalRouteError::Unsupported(
                         "v3 adjacency requires vertices",
                     ));
                 }
-                edge_stream = true;
+                stream = StreamKind::Edge;
                 depth += 1;
             }
             Step::InV | Step::OutV | Step::BothV => {
-                if !edge_stream {
+                if stream != StreamKind::Edge {
                     return Err(ExperimentalRouteError::Unsupported(
                         "v3 endpoints require edges",
                     ));
                 }
-                edge_stream = false;
+                stream = StreamKind::Vertex;
             }
             Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Both(_)) => {
-                if edge_stream {
+                if stream != StreamKind::Vertex {
                     return Err(ExperimentalRouteError::Unsupported(
                         "v3 adjacency requires vertices",
                     ));
@@ -226,7 +264,7 @@ pub(crate) fn validate_steps(
                 depth += 1;
             }
             Step::Existing(GremlinStep::Values(_) | GremlinStep::Label | GremlinStep::Id) => {
-                scalar = true
+                stream = StreamKind::Scalar
             }
             Step::Existing(
                 GremlinStep::HasLabel(_)
@@ -548,6 +586,9 @@ pub(crate) trait TraversalRead {
         for step in query.steps() {
             self.check()?;
             match step {
+                Step::Is(value) => {
+                    rows = filter_scalars(rows, value, &mut work, || self.check())?;
+                }
                 Step::Dedup => rows = dedup_rows(rows, &mut work, || self.check())?,
                 Step::Repeat {
                     incoming,
@@ -860,6 +901,120 @@ mod tests {
             path: Vec::new(),
             value: Some(value),
         }
+    }
+
+    #[test]
+    fn scalar_filter_preflights_entire_stream() {
+        for text in [
+            "g.V(999).values('missing').is(null).dedup().count()",
+            "g.E(999).id().is(1).limit(1).is(1)",
+            "g.V().repeat(out()).times(2).label().is('same')",
+        ] {
+            validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
+        }
+        for text in [
+            "g.V(999).is(1)",
+            "g.E(999).is(1)",
+            "g.V(999).id().is(1).path()",
+            "g.V(999).id().is(1).out()",
+            "g.E(999).label().is('same').inV()",
+            "g.V(999).values('missing').is(null).valueMap('x')",
+            "g.V(999).id().is(1).values('x')",
+        ] {
+            assert!(
+                validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap())
+                    .is_err(),
+                "accepted {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_filter_keeps_strict_bags_provenance_and_signed_zero() {
+        let values = [
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Integer(1),
+            Value::Real(1.0),
+            Value::Text("1".into()),
+            Value::Real(-0.0),
+            Value::Real(0.0),
+            Value::Integer(0),
+            Value::Text("é".into()),
+            Value::Text("e\u{301}".into()),
+            Value::Text("同值".into()),
+            Value::Null,
+        ];
+        for wanted in &values {
+            let expected: Vec<_> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| *value == wanted)
+                .map(|(id, value)| (id as u64, value.clone()))
+                .collect();
+            let rows = values
+                .iter()
+                .enumerate()
+                .map(|(id, value)| scalar_row(id as u64, value.clone()))
+                .collect();
+            let mut work = Work {
+                visits: 0,
+                bytes: 0,
+            };
+            let actual = filter_scalars(rows, wanted, &mut work, || Ok(())).unwrap();
+            assert_eq!(work.visits, values.len());
+            assert_eq!(work.bytes, expected.len() * 128);
+            let actual: Vec<_> = actual
+                .into_iter()
+                .map(|row| (row.element.order().0, row.value.unwrap()))
+                .collect();
+            assert_eq!(actual, expected);
+            if *wanted == Value::Real(0.0) {
+                let Value::Real(zero) = actual[0].1 else {
+                    panic!("expected real")
+                };
+                assert_eq!(zero.to_bits(), (-0.0f64).to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_filter_charges_rejected_inputs_and_retention_before_allocation() {
+        let mut work = Work {
+            visits: 9_999,
+            bytes: 0,
+        };
+        assert!(filter_scalars(
+            vec![scalar_row(1, Value::Null), scalar_row(2, Value::Null)],
+            &Value::Integer(1),
+            &mut work,
+            || Ok(())
+        )
+        .is_err());
+        let mut work = Work {
+            visits: 0,
+            bytes: 64 * 1024 * 1024 - 127,
+        };
+        assert!(filter_scalars(
+            vec![scalar_row(1, Value::Null)],
+            &Value::Null,
+            &mut work,
+            || Ok(())
+        )
+        .is_err());
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        assert!(filter_scalars(
+            vec![scalar_row(1, Value::Null)],
+            &Value::Null,
+            &mut work,
+            || Err(limit("expired"))
+        )
+        .is_err());
+        assert_eq!((work.visits, work.bytes), (0, 0));
     }
 
     #[test]

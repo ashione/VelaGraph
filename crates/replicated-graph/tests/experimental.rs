@@ -5,8 +5,8 @@ use replicated_graph::{
     routing::{
         experimental::{
             AdjacencyCompleteness, EdgeMutationKind, ExperimentalReadSession,
-            ExperimentalRouteError, MutationAcknowledgement, ObservedPathElement, ObservedRow,
-            ObservedRowV2, ObservedRowV3, Stage, StageOutcome,
+            ExperimentalRouteError, MutationAcknowledgement, ObservedElementRef,
+            ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3, Stage, StageOutcome,
         },
         RemoteReplica, RouteError, RouteResolver,
     },
@@ -272,6 +272,32 @@ async fn scenario() -> anyhow::Result<()> {
         let vr = |partition| VertexRef { partition, id: 7 };
         let v = |p| ObservedPathElement::Vertex(vr(p));
         let e = |partition, id| ObservedPathElement::Edge(EdgeRef { partition, id });
+        let scalar = |partition, value| ObservedRowV3::Value {
+            source: ObservedElementRef::Vertex(vr(partition)), value,
+        };
+        for (text, expected) in [
+            ("g.V(7).out('K').values('typed').is(1.0)", vec![scalar(2, Value::Real(1.0)); 2]),
+            ("g.V(7).out('K').values('typed').is(1)", vec![scalar(1, Value::Integer(1))]),
+            ("g.V(7).out('K').values('typed').is('1')", vec![scalar(3, Value::Text("1".into()))]),
+            ("g.V(7).out('K').values('nullable').is(null)", vec![scalar(2, Value::Null), scalar(2, Value::Null), scalar(1, Value::Null)]),
+            ("g.V(7).out('K').id().is(7)", vec![scalar(2, Value::Integer(7)), scalar(2, Value::Integer(7)), scalar(3, Value::Integer(7)), scalar(1, Value::Integer(7))]),
+            ("g.V(7).out('K').id().is(7).dedup().is(7).count()", vec![ObservedRowV3::Count(1)]),
+            ("g.V(7).out('K').values('typed').limit(1).is(1).count()", vec![ObservedRowV3::Count(0)]),
+            ("g.V(7).out('K').values('typed').is(1).limit(1).count()", vec![ObservedRowV3::Count(1)]),
+            ("g.V(999).values('missing').is(null).count()", vec![ObservedRowV3::Count(0)]),
+        ] {
+            let result = session.observed_gremlin_v3(1, text)?;
+            assert_eq!(result.rows, expected, "{text}");
+            assert_eq!(result.snapshots, session.snapshots);
+            assert_eq!(result.metadata_sequence, session.metadata_sequence);
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+        }
+        for text in ["g.V(999).is(7)", "g.E(999).is(7)", "g.V(999).id().is(7).out()", "g.V(999).label().is('P1').path()", "g.E(999).id().is(7).inV()", "g.V(999).id().is(eq(7))", "g.V(999).id().is(gt(7))"] {
+            assert!(session.observed_gremlin_v3(1, text).is_err(), "accepted {text}");
+        }
+        let filter = "g.V(7).id().is(7)";
+        assert!(session.observed_gremlin(1, filter).is_err());
+        assert!(session.observed_gremlin_v2(1, filter).is_err());
         // Independent explicit oracle: parallel edges 9/10, a cross-shard
         // cycle, and self-loop 12. Emission is level-major, never DFS order.
         let first_level = vec![
@@ -745,7 +771,7 @@ async fn scenario() -> anyhow::Result<()> {
                 Direction::Out
             )
             .is_err());
-        for suffix in [".count()", ".dedup().limit(1)", ".has('missing').count()"] {
+        for suffix in [".count()", ".dedup().limit(1)", ".has('missing').count()", ".id().is(-1).count()"] {
             let text = format!("g.V(7).repeat(out('K')).times(2){suffix}");
             assert!(matches!(
                 current.observed_gremlin_v3(1, &text),

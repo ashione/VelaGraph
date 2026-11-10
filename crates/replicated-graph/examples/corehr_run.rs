@@ -132,11 +132,14 @@ fn summary(mut xs: Vec<f64>) -> Value {
     xs.sort_by(f64::total_cmp);
     json!({"n":xs.len(),"p50_ms":xs[xs.len()/2],"p95_ms":xs[(xs.len()*95).div_ceil(100)-1],"min_ms":xs[0],"max_ms":xs[xs.len()-1]})
 }
-fn observed(rows: &[ObservedRowV3], map_projection: bool) -> Value {
+fn observed(rows: &[ObservedRowV3], map_projection: bool, scalar_projection: bool) -> Value {
     // A zero-row response carries no row variant. The fixture supplies only
     // that empty shape hint; all nonempty results are decoded from actual rows.
     if rows.is_empty() && map_projection {
         return json!({"maps":[]});
+    }
+    if rows.is_empty() && scalar_projection {
+        return json!({"values":[]});
     }
     if matches!(rows.first(), Some(ObservedRowV3::PropertyMap { .. })) {
         return json!({"maps": rows.iter().map(|r| match r {
@@ -448,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
                             ensure!(!expect_error, "unexpected success {query}");
                             ensure!(output.completeness == AdjacencyCompleteness::Unverified);
                             let expected = c.get("client_expected").unwrap_or(&c["expected"]);
-                            let actual = observed(&output.rows, expected.get("maps").is_some());
+                            let actual = observed(&output.rows, expected.get("maps").is_some(), expected.get("values").is_some());
                             ensure!(actual == *expected, "client oracle mismatch {query}: {actual} != {expected}");
                             json!({"correct":true,"rows":output.rows.len()})
                         },
@@ -625,6 +628,42 @@ mod projection_tests {
     use rocksdb_sql_table::{experimental_graph::VertexRef, Value as PropertyValue};
 
     #[test]
+    fn scalar_empty_hint_does_not_retype_nonempty_rows() {
+        assert_eq!(observed(&[], false, true), json!({"values":[]}));
+        assert_eq!(observed(&[], false, false), json!({"vertices":[]}));
+        assert_eq!(observed(&[], true, false), json!({"maps":[]}));
+        assert_eq!(
+            observed(
+                &[ObservedRowV3::Vertex(VertexRef {
+                    partition: 3,
+                    id: 20
+                })],
+                false,
+                true,
+            ),
+            json!({"vertices":[[3,20]]})
+        );
+        assert_eq!(
+            observed(
+                &[ObservedRowV3::PropertyMap {
+                    source: VertexRef {
+                        partition: 3,
+                        id: 20
+                    },
+                    properties: BTreeMap::new(),
+                }],
+                false,
+                true,
+            ),
+            json!({"maps":[{"source":[3,20],"properties":{}}]})
+        );
+        assert_eq!(
+            observed(&[ObservedRowV3::Count(0)], false, true),
+            json!({"count":0})
+        );
+    }
+
+    #[test]
     fn map_normalization_preserves_qualified_bags_null_and_empty_maps() {
         let properties = BTreeMap::from([
             ("name".into(), vec![PropertyValue::Text("same".into())]),
@@ -661,11 +700,11 @@ mod projection_tests {
             {"source":[3,20],"properties":{"name":[{"Text":"same"}],"nullable":["Null"]}},
             {"source":[2,23],"properties":{}}
         ]});
-        assert_eq!(observed(&client, true), expected);
+        assert_eq!(observed(&client, true, false), expected);
         assert_eq!(server_rows(&server, true), expected);
-        assert_eq!(observed(&[], true), json!({"maps":[]}));
+        assert_eq!(observed(&[], true, false), json!({"maps":[]}));
         assert_eq!(server_rows(&[], true), json!({"maps":[]}));
-        assert_eq!(observed(&[], false), json!({"vertices":[]}));
+        assert_eq!(observed(&[], false, false), json!({"vertices":[]}));
         assert_eq!(server_rows(&[], false), json!({"vertices":[]}));
         // The empty-result shape hint must never conceal a wrong nonempty type.
         assert_eq!(
@@ -674,7 +713,8 @@ mod projection_tests {
                     partition: 3,
                     id: 20
                 })],
-                true
+                true,
+                false
             ),
             json!({"vertices":[[3,20]]})
         );
@@ -708,6 +748,7 @@ mod projection_tests {
                 }),
             ],
             true,
+            false,
         );
     }
 

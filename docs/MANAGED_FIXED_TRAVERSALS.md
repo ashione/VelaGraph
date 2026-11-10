@@ -143,7 +143,7 @@ The shared routing-v3 executor additionally accepts standard `id()` on vertex or
 edge streams, including scans, adjacency and endpoint compositions. It preserves
 ordered bags and qualified source provenance while projecting the local ID to
 Integer(i64). IDs greater than i64::MAX fail explicitly; a later limit/count does
-not suppress that failure. Only dedup/limit/count may follow scalar projection, checked
+not suppress that failure. Only is/dedup/limit/count may follow scalar projection, checked
 before even empty input. Existing work/bytes, result and session limits remain.
 The same fixed V supplies elements and IDs; scalar result pages retain the existing
 immutable result and cursor rules. Clients validate each integer against its exact
@@ -195,8 +195,8 @@ compare equal, while the first value's original sign is retained. Non-finite
 reals are already rejected by record validation. Missing properties still emit
 no row and are not converted to Null. This does not use SQL comparison/coercion.
 
-Only further no-argument dedup, positional limit and terminal count may follow a
-scalar projection. Whole-AST validation rejects paths, element steps, scopes,
+Only literal is filters, further no-argument dedup, positional limit and terminal
+count may follow a scalar projection. Whole-AST validation rejects paths, element steps, scopes,
 arguments and modulators before reads, including empty streams. Repeated dedup
 is supported; `limit(2).dedup()` can differ from `dedup().limit(2)`. Count counts
 distinct values before the existing implicit non-count default cap.
@@ -234,9 +234,9 @@ snapshot reducer or traversal helpers. The fixture includes cross-partition ID
 ties, local and cross-shard edges, parallel edges, a cycle, a self-loop, strict
 typed values, and missing properties distinct from stored Null.
 
-Thirteen query shapes compare complete ordered rows and provenance at every new
+Fifteen query shapes compare complete ordered rows and provenance at every new
 version. They cover global identities, properties, both-direction bags,
-dedup/limit ordering, two-hop paths, edge endpoints, property filters and counts.
+dedup/limit ordering, two-hop paths, edge endpoints, property/scalar filters and counts.
 Two retained versions also replay complete path/scalar pages while later
 submissions run. Each page's offset, total, row, end marker and replayed token
 are checked against the model, with a loop bounded by the expected row count.
@@ -343,3 +343,42 @@ wire version, disk format, snapshot or consistency claim is introduced. Rust
 callers exhaustively matching ObservedRowV3 must handle its additive PropertyMap
 variant. This generic #157 slice does not complete #110's data-local capacity or
 full-scale managed acceptance.
+
+## Strict scalar filtering
+
+Standard `is(literal)` accepts one Null, Boolean, Integer, finite Real or Text
+literal after `values(key)`, `label()` or `id()` in shared routing-v3, managed
+Traverse/TraversePage and single-partition V2Observed server queries. The official
+TinkerPop AST supplies the method and the existing strict literal decoder supplies
+its value; no query rewrite or second parser is used. Equality is the same strict
+Value equality as `has` and scalar dedup: no type coercion or Unicode normalization,
+finite signed zeros compare equal, and missing properties remain absent rather
+than becoming Null. Each matching row keeps its exact value and qualified source,
+including the original sign of a real zero, in original bag order.
+
+For example `g.V(1,2,1).id().is(1)` returns both occurrences of ID 1, while a
+following dedup keeps only its first source. Repeated is filters, dedup and limits
+execute in written order; `limit(1).is(2)` need not match `is(2).limit(1)`.
+Terminal count counts the filtered rows before the implicit non-count default cap.
+Predicates such as `is(eq(1))`/`is(gt(1))`, collections, modulators and element or
+path inputs are unsupported. Full stream validation rejects invalid transitions
+before reads, even when the input would be empty.
+
+The shared preflight now represents vertex, edge and scalar streams explicitly
+instead of independent flags. The executor filters existing rows without cloning
+their values or provenance. Each inspected input consumes one cumulative work
+unit; every retained output consumes the existing 128-byte row charge before
+allocation (projected scalar paths are already empty). Dropped rows never refund
+prior charges. Existing row/work/logical-byte/parser/frame/deadline/session bounds
+remain unchanged. A nonmatching filter cannot hide earlier overflow, malformed
+adjacency or resource errors. No predicates are pushed before earlier steps.
+
+Managed queries retain the same V through later writes. Complete result pages
+use the unchanged immutable result and cursor contract; filtering adds no session
+refresh or retry. Tests preserve existing paged dedup-across-write coverage,
+compare filtered old-V queries during writes, and reacquire the historical V for
+filtered page/replay checks afterward. Observed reads remain Unverified. Legacy
+local/v1, observed v1/v2, original managed Read, server-coordinator and hierarchy
+job subsets are not expanded. The additive public ObservedGremlinStep::Is variant
+requires Rust exhaustive matches to handle it; there is no wire or stored-format
+change, and older executors explicitly reject the new query shape.

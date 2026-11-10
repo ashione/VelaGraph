@@ -604,7 +604,13 @@ async fn id_projection_keeps_fixed_version_bags_pages_and_overflow_errors() {
             value: Value::Integer(i64::MAX)
         }]
     );
-    for query in ["g.V().id()", "g.V().id().count()", "g.V().id().limit(1)"] {
+    for query in [
+        "g.V().id()",
+        "g.V().id().count()",
+        "g.V().id().limit(1)",
+        "g.V().id().is(-1).count()",
+        "g.V().id().is(1).limit(1)",
+    ] {
         assert_eq!(
             traverse(&g, &fresh, query).await,
             Err(Error::Query(QueryFailure::Unsupported))

@@ -190,3 +190,14 @@ property cap and unchanged cumulative work/response bounds. Single-partition
 scope remains enforced, including edge endpoint and adjacency reads. V1/legacy
 observed query surfaces and Unverified consistency are unchanged. Upgrade the
 executor and client together; older clients reject these map replies.
+
+
+### Strict scalar is filtering
+
+V2Observed queries additionally share `is(literal)` after values/id/label, with
+strict typed equality, original bag order/provenance and positional is/dedup/limit
+composition followed optionally by count. Element inputs, predicates and invalid
+post-scalar transitions reject before reads, even on empty input. Existing
+single-partition fencing and all work/deadline/response bounds remain unchanged;
+V1 and server-coordinator queries still reject this extension. See the
+[shared contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering).
