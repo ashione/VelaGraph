@@ -3,6 +3,7 @@
 //! remote Global Gremlin API, authenticated access, multi-host Raft placement,
 //! discovery, or a durable read lease.
 use crate::managed_graph::{self, GraphCohort, GraphSnapshot, Outcome, Plan};
+pub use crate::managed_graph::{PropertyCondition, PropertyConditions};
 use crate::managed_submission_timing::{self as timing, Attempt, Completion, Phase};
 use crate::remote::query::{QueryCompleteness, QueryFailure, QueryRow};
 use d2_raft::{
@@ -68,6 +69,8 @@ pub enum Error {
     Capacity,
     #[error("request rejected; an admitted request may remain pending, inspect or explicitly abort the same identity")]
     Rejected,
+    #[error("property precondition did not match; this attempt did not admit a candidate, not a durable Abort")]
+    PreconditionFailed,
     #[error("outcome unknown; retry or inspect the same external identity and command")]
     Unknown,
     #[error("session closed, expired, or from another gateway incarnation")]
@@ -80,6 +83,8 @@ impl From<managed_graph::Error> for Error {
             managed_graph::Error::Identity => Self::Identity,
             managed_graph::Error::Uncertain => Self::Unknown,
             managed_graph::Error::Capacity => Self::Capacity,
+            managed_graph::Error::InvalidConditions => Self::Protocol,
+            managed_graph::Error::PreconditionFailed => Self::PreconditionFailed,
             managed_graph::Error::Snapshot(cohort_reads::Error::Unavailable) => Self::Unknown,
             managed_graph::Error::Snapshot(cohort_reads::Error::Expired) => {
                 Self::SessionUnavailable
@@ -189,11 +194,34 @@ pub struct Patch {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Mutation {
-    CreateVertex { partition: u32, vertex: VertexData },
-    CreateEdge { edge: EdgeData },
-    PatchVertex { vertex: Entity, patch: Patch },
-    PatchEdge { edge: Entity, patch: Patch },
-    DeleteEdge { edge: Entity },
+    CreateVertex {
+        partition: u32,
+        vertex: VertexData,
+    },
+    CreateEdge {
+        edge: EdgeData,
+    },
+    PatchVertex {
+        vertex: Entity,
+        patch: Patch,
+    },
+    PatchEdge {
+        edge: Entity,
+        patch: Patch,
+    },
+    PatchVertexIf {
+        vertex: Entity,
+        conditions: PropertyConditions,
+        patch: Patch,
+    },
+    PatchEdgeIf {
+        edge: Entity,
+        conditions: PropertyConditions,
+        patch: Patch,
+    },
+    DeleteEdge {
+        edge: Entity,
+    },
 }
 impl Mutation {
     fn prepare(&self, snapshot: &GraphSnapshot) -> managed_graph::Result<Plan> {
@@ -222,13 +250,40 @@ impl Mutation {
                 },
             ),
             Self::DeleteEdge { edge } => snapshot.prepare_edge_delete(edge.edge()),
+            Self::PatchVertexIf {
+                vertex,
+                conditions,
+                patch,
+            } => snapshot.prepare_vertex_properties_if(
+                vertex.vertex(),
+                conditions,
+                &VertexPropertyPatch {
+                    set: patch.set.clone(),
+                    remove: patch.remove.clone(),
+                },
+            ),
+            Self::PatchEdgeIf {
+                edge,
+                conditions,
+                patch,
+            } => snapshot.prepare_edge_properties_if(
+                edge.edge(),
+                conditions,
+                &EdgePropertyPatch {
+                    set: patch.set.clone(),
+                    remove: patch.remove.clone(),
+                },
+            ),
         }
     }
     fn validate(&self) -> Result<()> {
         let values = match self {
             Self::CreateVertex { vertex, .. } => Some(&vertex.properties),
             Self::CreateEdge { edge } => Some(&edge.properties),
-            Self::PatchVertex { patch, .. } | Self::PatchEdge { patch, .. } => Some(&patch.set),
+            Self::PatchVertex { patch, .. }
+            | Self::PatchEdge { patch, .. }
+            | Self::PatchVertexIf { patch, .. }
+            | Self::PatchEdgeIf { patch, .. } => Some(&patch.set),
             Self::DeleteEdge { .. } => None,
         };
         if values.is_some_and(|m| {
@@ -236,6 +291,10 @@ impl Mutation {
                 .any(|v| matches!(v, Value::Real(f) if !f.is_finite()))
         }) {
             return Err(Error::Protocol);
+        }
+        if let Self::PatchVertexIf { conditions, .. } | Self::PatchEdgeIf { conditions, .. } = self
+        {
+            managed_graph::validate_property_conditions(conditions)?;
         }
         Ok(())
     }

@@ -37,7 +37,8 @@ TraversePage operation below has a separate immutable-result cursor protocol.
 
 Submit accepts a nonzero external 128-bit request ID and one of:
 
-- CreateVertex, CreateEdge, PatchVertex, PatchEdge, DeleteEdge.
+- CreateVertex, CreateEdge, PatchVertex, PatchEdge, DeleteEdge, and the additive
+  conditional PatchVertexIf / PatchEdgeIf described below.
 - Property values are tagged Null/Integer/Real/Text/Boolean. Integer 1 and real
   1.0 remain different commands. Non-finite real values are invalid.
 - Patch set/remove semantics reuse the existing graph/v2 validators; endpoint,
@@ -76,6 +77,64 @@ An application rejection can leave an admitted transaction Pending. Inspect it
 and explicitly Abort if appropriate. Never abort another client's unresolved ID
 or silently replace a stale CAS. Pending earlier ordinals can block later global
 visibility; there is no automatic orphan recovery policy.
+
+## Conditional property patches
+
+PatchVertexIf and PatchEdgeIf add `conditions` to the existing qualified entity
+and property patch fields. The nonempty, sorted property map contains explicit
+`Missing` or `Value` expectations. Every condition must match the same certified
+snapshot used to prepare the mutation. Conditions can cover properties the patch
+does not change. Existing set/remove behavior, including stored Null versus
+removal, is unchanged; the patch still must be nonempty.
+
+Comparison is exact stored-value identity: Missing differs from Null; Integer
+and Real differ; finite Real values compare by IEEE bits, so -0.0 differs from
++0.0; text and booleans compare exactly. This agrees with Gremlin `has` on presence
+and type distinctions, but is deliberately stricter for signed zero (Gremlin
+value equality treats both zeros as equal). These are typed write preconditions,
+not a new Gremlin predicate or query-language surface.
+
+Native and remote conditions admit 1–1024 entries and at most 64 KiB of logical
+key/value bytes: UTF-8 key length plus text length, eight bytes per other Value,
+or one byte for Missing. Non-finite reals are invalid. Validation occurs before
+reading a graph element or cloning condition values. Empty property names remain
+legal, as in the existing property record format. The gateway's unchanged 64 KiB
+**encoded whole-request** cap may reject smaller logical inputs because it also
+includes JSON escaping, binding, identity and the patch. No quota is increased.
+
+A mismatch returns PreconditionFailed before this attempt admits a candidate.
+A missing vertex/live edge still returns Rejected. This does not persist a failed
+condition or an Abort: another in-flight request may already have admitted or
+may admit later. Status can report Absent only at its own observation. Treat an
+unknown result exactly as before: retain the original ID and complete command.
+A new condition or patch requires a new external ID after resolving any uncertain
+prior request; do not use a new identity to bypass an unknown outcome.
+
+The check is not a best-effort read followed by a blind write. Preparation retains
+the checked snapshot's original shard sequence CAS, and participant preparation
+and intent locking protect that sequence through decision/application. Edge
+patches retain the canonical source CAS **and** the target reverse guard; a
+same-shard edge combines both into one participant. Any intervening shard write,
+including an ABA change that restores the original property or an unrelated
+target-shard write, can conservatively reject the old candidate. An admitted
+conflict stays Pending until explicitly resolved; it is never silently prepared
+again against fresh data. Successful execution therefore cannot commit a patch
+whose checked state was invalidated between validation and preparation.
+
+Every condition is included in the existing canonical command identity. Submit
+recovers admitted requests **before** reading/rechecking conditions. Exact retry
+after later changes or restart returns the original Plan/decision; a changed
+condition under the same external ID conflicts. Existing mutation canonical
+bytes, Plan format, disk/Raft formats and protocol version remain unchanged.
+Older gateways reject the new mutation variants; deploy supporting gateway
+binaries before using them. This is not a mixed-version availability guarantee.
+
+Tests cover the type/presence matrix, signed zero, canonical identity, strict
+wire fields and bounds; retained old V; one winner among competing updates;
+deterministic stale/ABA and target-only guard conflicts with explicit Abort;
+same-shard self-loops; a lost final response; and original partial-prepare Plan
+recovery after durable coordinator/participant reopen. The trust, managed
+capacity and production limitations elsewhere in this contract still apply.
 
 ## Fixed-version read sessions
 

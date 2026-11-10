@@ -370,6 +370,11 @@ apply, restart, identity and resource failure paths. This is not multi-host Raft
 placement, auth/TLS, remote GlobalCommittedSnapshot Gremlin, indexed MVCC, GC or
 full D4/D5 production completion. See [gateway contract](MANAGED_GRAPH_GATEWAY.md).
 
+The gateway additionally supports bounded [conditional property patches](MANAGED_GRAPH_GATEWAY.md#conditional-property-patches) for vertices and edges.
+Exact stored-value conditions share the prepared snapshot and its original
+participant CAS/edge reverse guard; retries recover the admitted Plan rather
+than checking fresh state. This does not expand lifetime or snapshot capacity.
+
 ### Fixed remote managed-node transport
 
 The managed gateway can now pin coordinator and participant RPC endpoints in
