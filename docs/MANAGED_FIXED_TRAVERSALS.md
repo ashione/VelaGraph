@@ -36,13 +36,13 @@ The external query is ordinary Gremlin text plus partition routing context:
   preserve bag multiplicity. Both directions emit a self-loop once per input.
 - inV/outV/bothV produce edge endpoints; bothV emits source then target, including
   twice for a self-loop. Paths retain qualified vertices and canonical edges.
-- has/hasLabel, values/label, limit, terminal path/count use the existing v3
+- has/hasLabel, values/label/id, limit, terminal path/count use the existing v3
   semantics. Missing properties produce no value; stored Null remains a value.
   Vertex label selects the first stored label, or empty text. Limits execute in
   place. Count runs before the implicit default result cap.
 - With no explicit limit, non-count results have the existing default cap of
   100. Explicit limits are 1..=1000. Internal caps never produce partial success.
-- Repeat, dedup, valueMap, id, mutations, and unsupported compositions reject
+- Repeat, dedup, valueMap, mutations, and unsupported compositions reject
   before data reads, including empty streams. The original smaller `Read` API,
   including its id projection, is unchanged. This is not a second query dialect.
 
@@ -132,3 +132,15 @@ identity tampering and restart invalidation. These are small functional
 counterexamples, not a full CoreHR scale run, multi-host performance measurement,
 HA proof or production-security validation. Shared legacy traversal tests remain
 part of the regression gate; full workspace CI is required before merge.
+
+## Qualified ID scalars
+
+The shared routing-v3 executor additionally accepts standard `id()` on vertex or
+edge streams, including scans, adjacency and endpoint compositions. It preserves
+ordered bags and qualified source provenance while projecting the local ID to
+Integer(i64). IDs greater than i64::MAX fail explicitly; a later limit/count does
+not suppress that failure. Only limit/count may follow scalar projection, checked
+before even empty input. Existing work/bytes, result and session limits remain.
+The same fixed V supplies elements and IDs; scalar result pages retain the existing
+immutable result and cursor rules. Clients validate each integer against its exact
+qualified source ID. No new protocol, storage or consistency contract is added.

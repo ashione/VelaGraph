@@ -136,7 +136,9 @@ pub(crate) fn validate_steps(
                     ));
                 }
             }
-            Step::Existing(GremlinStep::Values(_) | GremlinStep::Label) => scalar = true,
+            Step::Existing(GremlinStep::Values(_) | GremlinStep::Label | GremlinStep::Id) => {
+                scalar = true
+            }
             Step::Existing(
                 GremlinStep::HasLabel(_)
                 | GremlinStep::Has { .. }
@@ -402,7 +404,8 @@ pub(crate) trait TraversalRead {
                     step @ (GremlinStep::HasLabel(_)
                     | GremlinStep::Has { .. }
                     | GremlinStep::Values(_)
-                    | GremlinStep::Label),
+                    | GremlinStep::Label
+                    | GremlinStep::Id),
                 ) => {
                     let mut next = Vec::new();
                     for mut row in rows {
@@ -434,6 +437,18 @@ pub(crate) trait TraversalRead {
                             GremlinStep::Values(key) => {
                                 row.value = properties.remove(key);
                                 row.value.is_some()
+                            }
+                            GremlinStep::Id => {
+                                row.value = Some(Value::Integer(
+                                    i64::try_from(row.element.order().0).map_err(|_| {
+                                        ExperimentalRouteError::Query(
+                                            rocksdb_sql_table::Error::UnsupportedGremlinValue(
+                                                "id exceeds i64".into(),
+                                            ),
+                                        )
+                                    })?,
+                                ));
+                                true
                             }
                             GremlinStep::Label => {
                                 row.value = Some(Value::Text(

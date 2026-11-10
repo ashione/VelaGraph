@@ -392,6 +392,11 @@ Data-local fragment/hierarchy job integration, larger managed bounds and full-sc
 CoreHR CI on this new path remain future work. See
 [contract](MANAGED_FIXED_TRAVERSALS.md); no unrestricted Global admission is enabled.
 
+The routing-v3 and managed Traverse/TraversePage paths additionally support
+qualified vertex/edge `id()` scalar projection, with checked i64 conversion,
+ordered bag semantics and unchanged fixed-version/session budgets. This does not
+extend the separate distributed server coordinator or complete managed capacity.
+
 ### Exact terminal read evidence
 
 Managed fixed-cohort acquisition now fixes V using bounded metadata and compares

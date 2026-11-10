@@ -518,11 +518,15 @@ are specified in [MANAGED_GRAPH_GATEWAY.md](MANAGED_GRAPH_GATEWAY.md).
 The separate `Traverse` and `TraversePage` operations now reuse the routing-v3
 executor over the session's certified GraphSnapshot instead of extending the
 small `Read` operation above. They accept V/E explicit starts or full-cohort
-scans, out/in/both, outE/inE/bothE, inV/outV/bothV, has/hasLabel, values/label,
+scans, out/in/both, outE/inE/bothE, inV/outV/bothV, has/hasLabel, values/label/id,
 limit, terminal path/count. The official parser and whole-stream-type validation
 run before even empty input. Repeated traversers, qualified edge/vertex paths,
 parallel edges and deterministic `(ID, partition)` ordering preserve existing
-v3 semantics. Repeat/dedup/valueMap/id and other unsupported steps reject.
+v3 semantics. `id()` emits Integer(i64) with qualified vertex/edge provenance;
+only limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
+(mapped to Unsupported by the managed gateway), without wrapping or partial rows.
+A later limit/count cannot hide overflow; an earlier limit restricts the input
+at its original position. Repeat/dedup/valueMap and other unsupported steps reject.
 
 Every primitive uses the same V. Pagination fully evaluates and bounds the
 result, then validates all page envelopes before emitting the first page. One

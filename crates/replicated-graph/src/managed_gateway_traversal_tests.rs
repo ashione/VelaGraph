@@ -36,7 +36,12 @@ async fn empty_fixed_snapshot_validates_every_step_before_execution() {
     let f = Fixture::new().await;
     let g = f.gateway().await;
     let session = open(&g, Some(0)).await;
-    for text in ["g.V()", "g.E()", "g.V(1).outE().inV().path()"] {
+    for text in [
+        "g.V()",
+        "g.E()",
+        "g.V(1).outE().inV().path()",
+        "g.V(1).id()",
+    ] {
         assert!(traverse(&g, &session, text).await.unwrap().is_empty());
     }
     assert_eq!(
@@ -47,7 +52,7 @@ async fn empty_fixed_snapshot_validates_every_step_before_execution() {
         ("g.V(1).inV()", QueryFailure::Unsupported),
         ("g.E(1).outE()", QueryFailure::Unsupported),
         ("g.V(1).values('x').out()", QueryFailure::Unsupported),
-        ("g.V(1).id()", QueryFailure::Unsupported),
+        ("g.V(1).id().out()", QueryFailure::Unsupported),
     ] {
         assert_eq!(
             traverse(&g, &session, text).await,
@@ -531,6 +536,104 @@ fn forged_page_offsets_cursors_cardinality_and_echoes_fail_closed() {
                 next: (total > 1).then_some(PageCursor { token: [3; 32] }),
                 offset: 0,
                 total,
+            },
+        };
+        assert_eq!(synthetic(operation.clone(), reply), Err(Error::Identity));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_projection_keeps_fixed_version_bags_pages_and_overflow_errors() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    committed(&call(&g, Operation::Submit(create(1, 7, 1))).await.unwrap());
+    let old = open(&g, None).await;
+    let text = "g.V(1,1).id()";
+    let row = QueryRow::Value {
+        source: Some(Q::Vertex {
+            partition: 7,
+            id: 1,
+        }),
+        value: Value::Integer(1),
+    };
+    assert_eq!(
+        traverse(&g, &old, text).await.unwrap(),
+        vec![row.clone(), row.clone()]
+    );
+    let first = page(call(&g, paged(&old, text, None, 1)).await.unwrap());
+    assert_eq!(first.data.rows, vec![row.clone()]);
+    committed(
+        &call(&g, Operation::Submit(create(3, 7, i64::MAX as u64)))
+            .await
+            .unwrap(),
+    );
+    committed(
+        &call(&g, Operation::Submit(create(2, 7, i64::MAX as u64 + 1)))
+            .await
+            .unwrap(),
+    );
+    let next = page(call(&g, paged(&old, text, first.next, 1)).await.unwrap());
+    assert_eq!(next.data.rows, vec![row.clone()]);
+    assert!(next.next.is_none());
+    assert_eq!(
+        traverse(&g, &old, "g.V().id()").await.unwrap(),
+        vec![row.clone()]
+    );
+    let fresh = open(&g, None).await;
+    assert_eq!(
+        traverse(&g, &fresh, &format!("g.V({}).id()", i64::MAX))
+            .await
+            .unwrap(),
+        vec![QueryRow::Value {
+            source: Some(Q::Vertex {
+                partition: 7,
+                id: i64::MAX as u64
+            }),
+            value: Value::Integer(i64::MAX)
+        }]
+    );
+    for query in ["g.V().id()", "g.V().id().count()", "g.V().id().limit(1)"] {
+        assert_eq!(
+            traverse(&g, &fresh, query).await,
+            Err(Error::Query(QueryFailure::Unsupported))
+        );
+    }
+    assert_eq!(
+        traverse(&g, &fresh, "g.V().limit(1).id()").await.unwrap(),
+        vec![row]
+    );
+    close(&g, old).await;
+    close(&g, fresh).await;
+    g.shutdown().await;
+    f.stop().await;
+}
+
+#[test]
+fn forged_id_values_must_match_qualified_source() {
+    let session = synthetic_session();
+    let operation = Operation::Traverse {
+        session: session.clone(),
+        query: query(7, "g.V(1).id()"),
+    };
+    for value in [
+        Value::Integer(2),
+        Value::Integer(-1),
+        Value::Text("1".into()),
+        Value::Null,
+    ] {
+        let reply = Reply::Traverse {
+            session: session.clone(),
+            query: query(7, "g.V(1).id()"),
+            data: QueryData {
+                rows: vec![QueryRow::Value {
+                    source: Some(Q::Vertex {
+                        partition: 7,
+                        id: 1,
+                    }),
+                    value,
+                }],
+                completeness: QueryCompleteness::Unverified,
             },
         };
         assert_eq!(synthetic(operation.clone(), reply), Err(Error::Identity));

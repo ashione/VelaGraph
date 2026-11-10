@@ -1226,7 +1226,51 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     let path_query = "g.V(101).out('reports').out('reports').out('reports').path()";
     // Reference expectations are fixture-derived, not obtained from the query
     // engine under test. In particular, no dedup is allowed on the four paths.
+    let id_value = |source, id| QueryRow::Value {
+        source: Some(source),
+        value: Value::Integer(id),
+    };
     let expectations = vec![
+        (7, "g.V(101).id()", vec![id_value(element(7, 101), 101)]),
+        (
+            7,
+            "g.V(101).out('reports').id()",
+            vec![id_value(element(8, 101), 101); 2],
+        ),
+        (
+            7,
+            "g.V().hasLabel('person').id()",
+            vec![
+                // The recovery scenario created person 1 in both partitions
+                // before adding this traversal fixture.
+                id_value(element(7, 1), 1),
+                id_value(element(8, 1), 1),
+                id_value(element(7, 101), 101),
+                id_value(element(8, 101), 101),
+            ],
+        ),
+        (
+            7,
+            "g.E(101).id()",
+            vec![id_value(
+                QualifiedElement::Edge {
+                    partition: 7,
+                    id: 101,
+                },
+                101,
+            )],
+        ),
+        (
+            8,
+            "g.E(101).id()",
+            vec![id_value(
+                QualifiedElement::Edge {
+                    partition: 8,
+                    id: 101,
+                },
+                101,
+            )],
+        ),
         (7, path_query, paths.clone()),
         (
             7,
@@ -1333,7 +1377,7 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         .is_err());
     call(g, Operation::Close { session: another }).await?;
     for unsupported in [
-        "g.V(101).id()",
+        "g.V(101).id().out()",
         "g.V(101).dedup()",
         "g.V(101).valueMap('name')",
         "g.V(101).repeat(out()).times(2)",
