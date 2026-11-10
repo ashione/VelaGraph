@@ -64,7 +64,10 @@ The small workload exercises the broader client-side observed Gremlin surface:
 manager/direct reports, three-hop ancestry, two-hop descendants, memberships,
 filtered members, colleagues through departments (bag semantics), count,
 projection and explicit limits. Unsupported recursive `repeat`, sorting,
-predicates, `range` pagination and deduplication must reject explicitly.
+predicates and `range` pagination must reject explicitly. Fixed-version v3
+element `dedup()` now runs against the same independent relationship-list
+oracles, including first-path and limit-placement checks. Scalar dedup remains
+unsupported.
 Department member queries use an explicit 1,000-row limit; no claim is made that
 this is an unbounded membership listing. Paged storage verification does not
 mean Gremlin supports continuation tokens or offset pagination.
@@ -73,7 +76,7 @@ This integrated harness additionally includes the incoming-query implementation
 from the separately reviewed incoming-query candidate; its exact production-file hashes are recorded with the
 experiment. See `COREHR_HIERARCHY_RESULTS.md` for native bounded-repeat validation,
 `COREHR_GLOBAL_RESULTS.md` for bounded global-scan validation,
-`COREHR_DEDUP_RESULTS.md` for the later server-only unique-membership
+`COREHR_DEDUP_RESULTS.md` for the historical server-only unique-membership
 validation, `COREHR_INCOMING_RESULTS.md` for incoming-query measurements, and
 `COREHR_RESULTS.md` for the earlier outgoing-only baseline.
 
@@ -81,7 +84,9 @@ At full scale the broad client session is expected to reject its **200,000 KV /
 16 MiB aggregate snapshot limit**. Storage snapshots separately cap each shard
 at 1,000,000 KV / 64 MiB. The server distributed executor supports explicit starts
 and up to three mixed **outgoing/incoming** hops with filters, projections,
-count, limit and server-only vertex `dedup()`. Global vertex starts now have a separate bounded filter/limit/count scan,
+count, limit and vertex `dedup()`. The client v3 shared executor also supports
+qualified vertex/edge dedup; see `EXPERIMENTAL_CROSS_EDGES.md` for its current
+contract. Global vertex starts now have a separate bounded filter/limit/count scan,
 with server order (partition ID, local ID), distinct from the legacy client
 order (local ID, partition ID). Global adjacency and other global operators
 remain explicitly unsupported; see `SERVER_GLOBAL_SCAN.md`. The full run checks

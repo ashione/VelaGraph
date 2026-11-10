@@ -48,43 +48,35 @@ pub fn queries(model: &Model) -> Vec<Value> {
         "g.V({},{},{})",
         department_roots[0], department_roots[1], department_roots[2]
     );
-    for (name, query, count, dedup) in [
+    for (name, query, count) in [
         (
             "batch_people_membership_count",
             "g.V(20,23,26,20).out('member_of').count()".into(),
             departments.len(),
-            false,
         ),
         (
             "batch_people_unique_departments",
             "g.V(20,23,26,20).out('member_of').dedup().count()".into(),
             unique(&departments).len(),
-            true,
         ),
         (
             "batch_department_members_bag_count",
             format!("{department_query}.in('member_of').count()"),
             members.len(),
-            false,
         ),
         (
             "batch_department_unique_members",
             format!("{department_query}.in('member_of').dedup().count()"),
             unique(&members).len(),
-            true,
         ),
         (
             "batch_department_active_unique_members",
             format!("{department_query}.in('member_of').dedup().has('active',true).count()"),
             unique(&members).iter().filter(|id| active(**id)).count(),
-            true,
         ),
     ] {
-        let mut case = json!({"name":name,"partition":if name.starts_with("batch_people") {partition(20)} else {partition(department_roots[0])},
+        let case = json!({"name":name,"partition":if name.starts_with("batch_people") {partition(20)} else {partition(department_roots[0])},
             "query":query,"expected":{"count":count},"server_supported":true});
-        if dedup {
-            case["client_expect_unsupported"] = json!(true);
-        }
         cases.push(case);
     }
     // 21 exists, but in partition(21), not partition(20). This API must not
