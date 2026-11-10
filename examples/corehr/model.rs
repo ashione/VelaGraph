@@ -1,9 +1,9 @@
 //! Deterministic synthetic CoreHR ground truth. No database reads in this oracle.
 use serde_json::{json, Value};
-#[path = "bidirectional.rs"]
-mod bidirectional;
 #[path = "batch_relationships.rs"]
 mod batch_relationships;
+#[path = "bidirectional.rs"]
+mod bidirectional;
 #[path = "global_relationships.rs"]
 mod global_relationships;
 #[path = "sync_projection.rs"]
