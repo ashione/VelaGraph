@@ -1202,7 +1202,14 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         relation_write(28, 104, (7, 101), (8, 102), "member"),
         relation_write(29, 102, (8, 101), (8, 102), "member"),
     ];
-    for write in fixture {
+    for mut write in fixture {
+        // Reuse the personnel records: explicit Null is a value; departments
+        // omit this property and must not produce scalar rows.
+        if let Mutation::CreateVertex { vertex, .. } = &mut write.mutation {
+            if vertex.id == 101 {
+                vertex.properties.insert("nullable".into(), Value::Null);
+            }
+        }
         committed(call(g, Operation::Submit(write)).await?);
     }
     let old = open(g, None).await?;
@@ -1241,6 +1248,71 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         value: Value::Integer(id),
     };
     let expectations = vec![
+        (
+            7,
+            "g.E(101).bothV().id().dedup()",
+            vec![id_value(element(7, 101), 101)],
+        ),
+        (
+            8,
+            "g.E(101).bothV().id().dedup()",
+            vec![id_value(element(8, 101), 101)],
+        ),
+        (
+            7,
+            "g.V(101).bothE('reports').id().dedup()",
+            vec![
+                id_value(
+                    QualifiedElement::Edge {
+                        partition: 7,
+                        id: 101,
+                    },
+                    101,
+                ),
+                id_value(
+                    QualifiedElement::Edge {
+                        partition: 7,
+                        id: 102,
+                    },
+                    102,
+                ),
+            ],
+        ),
+        (
+            7,
+            "g.E(101).bothV().label().dedup()",
+            vec![value(7, 101, "person")],
+        ),
+        (
+            7,
+            "g.V(101).out('reports').values('name').dedup()",
+            vec![value(8, 101, "Bob")],
+        ),
+        (
+            7,
+            "g.V(101,102).values('nullable').dedup()",
+            vec![QueryRow::Value {
+                source: Some(element(7, 101)),
+                value: Value::Null,
+            }],
+        ),
+        (
+            7,
+            "g.E(101).bothV().values('nullable').dedup().count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            7,
+            "g.V(101,101,102).id().limit(2).dedup().count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            7,
+            "g.V(101,101,102).id().dedup().limit(2).count()",
+            vec![QueryRow::Count(2)],
+        ),
+        (7, "g.V(999).values('missing').dedup()", vec![]),
+        (7, "g.E(999).id().dedup()", vec![]),
         (
             7,
             "g.V(101,101).dedup().out('reports').count()",
@@ -1437,8 +1509,10 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     call(g, Operation::Close { session: another }).await?;
     for unsupported in [
         "g.V(101).id().out()",
-        "g.V(999).values('missing').dedup()",
-        "g.E(999).id().dedup()",
+        "g.V(999).values('missing').dedup().out()",
+        "g.E(999).id().dedup().inV()",
+        "g.V(999).label().dedup().path()",
+        "g.V(101).values('name').dedup().hasLabel('person')",
         "g.V(999).dedup('a')",
         "g.V(999).dedup().by('name')",
         "g.V(101).valueMap('name')",
@@ -1459,6 +1533,14 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     let distinct_first = page(g, &distinct_session, 7, distinct_query, None, 1).await?;
     assert_eq!(distinct_first.total, 3);
     assert_eq!(distinct_first.data.rows, distinct_rows[..1]);
+    let scalar_session = open(g, Some(old.version)).await?;
+    let scalar_query = "g.E(101,101).bothV().values('name').dedup()";
+    let scalar_rows = vec![value(7, 101, "Alice"), value(8, 101, "Bob")];
+    let scalar_first = page(g, &scalar_session, 7, scalar_query, None, 1).await?;
+    assert_eq!(scalar_first.offset, 0);
+    assert_eq!(scalar_first.total, 2);
+    assert_eq!(scalar_first.data.rows, scalar_rows[..1]);
+    let scalar_cursor = scalar_first.next.clone().context("two scalar values")?;
     let writes = vec![
         person_write(30, 8, 103, "person", "Cara"),
         Write {
@@ -1607,12 +1689,49 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
             distinct_cursor = next.next;
         }
         assert_eq!(distinct_collected, distinct_rows);
+        assert_eq!(
+            traverse(g, &scalar_session, 7, scalar_query).await?,
+            scalar_rows
+        );
+        assert_eq!(
+            page(g, &scalar_session, 7, scalar_query, None, 1).await?,
+            scalar_first
+        );
+        let scalar_last = page(
+            g,
+            &scalar_session,
+            7,
+            scalar_query,
+            Some(scalar_cursor.clone()),
+            1,
+        )
+        .await?;
+        assert_eq!(scalar_last.offset, 1);
+        assert_eq!(scalar_last.total, 2);
+        assert_eq!(scalar_last.data.rows, scalar_rows[1..]);
+        assert!(scalar_last.next.is_none());
+        assert_eq!(
+            scalar_last,
+            page(
+                g,
+                &scalar_session,
+                7,
+                scalar_query,
+                Some(scalar_cursor.clone()),
+                1
+            )
+            .await?
+        );
         let fresh = open(g, Some(version)).await?;
         assert_eq!(
             traverse(g, &fresh, 8, "g.V(103).values('name')").await?,
             vec![value(8, 103, "Cara")]
         );
         let name = if phase == 0 { "Bob" } else { "Robert" };
+        assert_eq!(
+            traverse(g, &fresh, 7, scalar_query).await?,
+            vec![value(7, 101, "Alice"), value(8, 101, name)]
+        );
         let multiplicity = if phase < 2 { 2 } else { 1 };
         assert_eq!(
             traverse(g, &fresh, 7, "g.V(101).out('reports').values('name')").await?,
@@ -1653,6 +1772,13 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         g,
         Operation::Close {
             session: distinct_session,
+        },
+    )
+    .await?;
+    call(
+        g,
+        Operation::Close {
+            session: scalar_session,
         },
     )
     .await?;

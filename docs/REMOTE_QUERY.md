@@ -149,7 +149,17 @@ V2Observed server queries also accept the shared executor's no-argument vertex
 and edge `dedup()`. The first qualified identity/path is retained in input order;
 filter and limit positions, cumulative work/bytes, and the single-partition
 snapshot remain unchanged. It cannot hide an out-of-scope reference or upstream
-integrity failure. V1 still rejects dedup, and scalar/path dedup, arguments,
+integrity failure. V1 still rejects dedup, and path dedup, arguments,
 scopes and by modulators remain unsupported, including empty input. This does
 not add cross-partition execution or enlarge the separate distributed coordinator.
 See the [shared contract](MANAGED_FIXED_TRAVERSALS.md#qualified-element-deduplication).
+
+### Shared v3 scalar deduplication
+
+V2Observed additionally accepts `dedup()` after values/label/id. Equality is
+strictly typed with equal finite real signed zeros and exact text; first source
+and value are retained. Positional limits/count and the single-partition fence
+remain. The shared implementation charges each input and unique key/text before
+retention; upstream integrity and resource errors still fail the whole query.
+This does not expand V1, the separate distributed coordinator or hierarchy jobs.
+See the [scalar contract](MANAGED_FIXED_TRAVERSALS.md#scalar-deduplication).

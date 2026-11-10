@@ -142,7 +142,7 @@ The shared routing-v3 executor additionally accepts standard `id()` on vertex or
 edge streams, including scans, adjacency and endpoint compositions. It preserves
 ordered bags and qualified source provenance while projecting the local ID to
 Integer(i64). IDs greater than i64::MAX fail explicitly; a later limit/count does
-not suppress that failure. Only limit/count may follow scalar projection, checked
+not suppress that failure. Only dedup/limit/count may follow scalar projection, checked
 before even empty input. Existing work/bytes, result and session limits remain.
 The same fixed V supplies elements and IDs; scalar result pages retain the existing
 immutable result and cursor rules. Clients validate each integer against its exact
@@ -162,7 +162,7 @@ and input position. Filters, limits and dedup execute where written; expansion
 after dedup produces ordinary bags again. A self-loop's two bothV endpoints
 collapse only when an explicit downstream dedup is present.
 
-Scalar/path dedup, scopes, arguments and by modulators remain unsupported,
+Path dedup, scopes, arguments and by modulators remain unsupported,
 including empty streams. The old Read operation and legacy observed v1/v2
 entrypoints are unchanged. Parser admission, hop count, defaults and all existing
 row/work/byte/deadline limits remain. Each input consumes one work unit, and each
@@ -175,3 +175,43 @@ Managed execution and all pages use the same retained V and complete-result
 cursor rules. Observed results remain Unverified. This adds no wire or disk
 variant, refresh, retry or capacity increase. Older executors explicitly reject
 these query compositions; upgrade the executor to use them.
+
+## Scalar deduplication
+
+Standard no-argument `dedup()` also accepts scalar streams after `values(key)`,
+`label()` or `id()` in the shared routing-v3, single-partition V2Observed server
+and managed Traverse/TraversePage paths. It compares only the projected value,
+not source identity, and retains the first row's exact value and qualified source
+in input order. For example, two vertices `(7, 101)` and `(8, 101)` remain distinct
+under element dedup, but their `id().dedup()` result is one Integer(101) with the
+first source. Source provenance is metadata, not part of scalar equality.
+
+Equality follows the existing strict graph Value equality used by `has`:
+Null equals Null; booleans, integers and finite reals compare within their own
+types; Text compares exact contents with no Unicode normalization. Integer(1),
+Real(1.0), Text("1") and Boolean(true) remain distinct. Finite real signed zeros
+compare equal, while the first value's original sign is retained. Non-finite
+reals are already rejected by record validation. Missing properties still emit
+no row and are not converted to Null. This does not use SQL comparison/coercion.
+
+Only further no-argument dedup, positional limit and terminal count may follow a
+scalar projection. Whole-AST validation rejects paths, element steps, scopes,
+arguments and modulators before reads, including empty streams. Repeated dedup
+is supported; `limit(2).dedup()` can differ from `dedup().limit(2)`. Count counts
+distinct values before the existing implicit non-count default cap.
+
+Every inspected input consumes one work unit. Each new scalar key consumes 128
+accounted bytes plus UTF-8 text payload bytes before text is cloned; duplicate
+text lookups borrow the existing input. Retaining the first output row consumes
+the existing row charge too. Keys and input rows are bounded by the existing
+10,000-row/work and 64 MiB cumulative logical-byte limits. Charges are never
+refunded, and a downstream dedup cannot erase earlier integrity, ID overflow or
+resource failures. All deadlines, result/frame/page/session budgets remain.
+
+Managed execution and all replayed pages stay at the original retained V through
+later writes. Observed reads retain Unverified and the original snapshot vector.
+No wire/disk variant, stored format, refresh, retry or capacity change is added.
+The original managed Read, local/v1 queries, legacy observed v1/v2 APIs and
+server-coordinator global/hierarchy query shapes are not expanded by this slice.
+Older shared executors reject the new scalar compositions; upgrade the executor
+to use them.

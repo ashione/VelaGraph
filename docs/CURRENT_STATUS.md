@@ -39,7 +39,10 @@ fail explicitly. Public graph mutations here are typed APIs, not Gremlin scripts
 - Shared routing-v3 and managed Traverse/TraversePage support qualified vertex/edge
   `id()` ([#139](https://github.com/ashione/VelaGraph/pull/139)) and no-argument
   element `dedup()` ([#142](https://github.com/ashione/VelaGraph/pull/142)). Dedup
-  preserves the first path and step order; scalar/path dedup and modulators reject.
+  preserves the first path and step order. The shared executor also supports
+  scalar dedup after values/label/id, retaining the first equal value and source;
+  path dedup and modulators reject. See the
+  [scalar contract](MANAGED_FIXED_TRAVERSALS.md#scalar-deduplication).
   The same shared executor supplies single-partition V2Observed server queries.
   These additions do not change legacy v1/v2 or the original smaller managed Read;
   each retains its existing subset.

@@ -524,16 +524,21 @@ limit, terminal path/count. The official parser and whole-stream-type validation
 run before even empty input. Repeated traversers, qualified edge/vertex paths,
 parallel edges and deterministic `(ID, partition)` ordering preserve existing
 v3 semantics. `id()` emits Integer(i64) with qualified vertex/edge provenance;
-only limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
+only dedup/limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
 (mapped to Unsupported by the managed gateway), without wrapping or partial rows.
 A later limit/count cannot hide overflow; an earlier limit restricts the input
 at its original position. Repeat/valueMap and other unsupported steps reject.
 Standard no-argument dedup is supported on vertex and edge streams, preserving
-the first qualified identity, path and order. Scalar/path dedup and modulators
-remain unsupported, even on empty input. Every input is charged as work and every
-retained identity is admitted before allocation under the existing cumulative
-budgets; upstream errors cannot be hidden. See MANAGED_FIXED_TRAVERSALS.md for
-the identity, limit-position and memory-accounting contract. Single-partition
+the first qualified identity, path and order. After values/label/id, scalar dedup
+compares strict typed Values, preserving the first value and source. Null equals
+Null; integers, finite reals, booleans and text do not coerce across types. Real
+signed zeros compare equal; text has no Unicode normalization. Missing properties
+emit no row. Path dedup and modulators remain unsupported, even on empty input.
+Every input is charged as work and every retained key is admitted before allocation,
+including text payload bytes, under the existing cumulative budgets; upstream
+errors cannot be hidden. See
+[MANAGED_FIXED_TRAVERSALS.md](MANAGED_FIXED_TRAVERSALS.md#scalar-deduplication) for
+the identity/value, limit-position and memory-accounting contract. Single-partition
 V2Observed server queries share this extension and retain their original scope
 fencing; V1 server queries are unchanged (see REMOTE_QUERY.md).
 
