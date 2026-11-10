@@ -698,7 +698,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 124);
+    assert_eq!(q.len(), 126);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     // Fixed-version v3 now supports element dedup. Keep these independent
     // relationship-list oracles enabled instead of masking them as rejections.
@@ -724,10 +724,9 @@ fn dedup_oracle_is_nonvacuous() {
         assert_ne!(get(name)["expect_error"], true, "{name}");
         assert!(get(name).get("expected").is_some(), "{name}");
     }
-    // valueMap stays unsupported. Native repeat and scalar dedup are now
-    // supported by the client without expanding the coordinator subset.
+    // Terminal selected vertex maps now have complete client oracles.
     for name in ["project_unique_departments", "global_join_department_maps"] {
-        assert_eq!(get(name)["client_expect_unsupported"], true, "{name}");
+        assert_ne!(get(name)["client_expect_unsupported"], true, "{name}");
     }
     for name in [
         "global_scan_reject_scalar_dedup",
@@ -912,7 +911,7 @@ fn native_repeat_client_oracles_match_the_new_support_boundary() {
         "project_unique_departments",
         "global_repeat_filtered_ancestor_maps",
     ] {
-        assert_eq!(get(name)["client_expect_unsupported"], true);
+        assert_ne!(get(name)["client_expect_unsupported"], true);
     }
 }
 
@@ -972,6 +971,7 @@ fn client_repeat_phases_are_fixed_complete_and_ordered() {
         phase_names("repeat_global"),
         vec![
             "global_repeat_named_ancestors",
+            "global_repeat_filtered_ancestor_maps",
             "global_repeat_exact_depth",
             "global_repeat_named_descendant_count",
             "global_repeat_multi_root_bag",
@@ -981,17 +981,16 @@ fn client_repeat_phases_are_fixed_complete_and_ordered() {
         ]
     );
     let legacy = phase_names("legacy");
-    assert_eq!(legacy.len(), 96);
+    assert_eq!(legacy.len(), 97);
     for name in [
         "recursive_repeat",
         "native_zero_depth",
         "native_depth33",
         "native_combined_depth33",
         "client_edge_repeat_without_endpoint",
-        "global_repeat_filtered_ancestor_maps",
         "project_batch_people",
     ] {
-        assert!(legacy.contains(&name), "moved legacy rejection {name}");
+        assert!(legacy.contains(&name), "moved legacy case {name}");
     }
     let all: Vec<_> = ["legacy", "repeat_explicit", "repeat_global"]
         .into_iter()

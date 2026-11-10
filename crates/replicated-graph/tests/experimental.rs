@@ -322,6 +322,26 @@ async fn scenario() -> anyhow::Result<()> {
             assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
         }
         for (text, partitions) in [
+            ("g.V(7,7).valueMap('typed','nullable','missing')", vec![1, 1]),
+            ("g.V(7).out('K').valueMap('typed','nullable','missing')", vec![2, 2, 3, 1]),
+            ("g.V(7).out('K').dedup().valueMap('typed','nullable','missing')", vec![2, 3, 1]),
+            ("g.E(9).bothV().valueMap('typed','nullable','missing')", vec![1, 2]),
+            ("g.V(7).repeat(out('K')).times(2).emit().dedup().valueMap('typed','nullable','missing')", vec![2, 3, 1]),
+        ] {
+            let expected = partitions.into_iter().map(|partition| {
+                let mut properties = BTreeMap::from([("typed".into(), vec![match partition { 1 => Value::Integer(1), 2 => Value::Real(1.0), _ => Value::Text("1".into()) }])]);
+                if partition != 3 { properties.insert("nullable".into(), vec![Value::Null]); }
+                ObservedRowV3::PropertyMap { source: vr(partition), properties }
+            }).collect::<Vec<_>>();
+            let result = session.observed_gremlin_v3(1, text)?;
+            assert_eq!(result.rows, expected, "{text}");
+            assert_eq!(result.snapshots, session.snapshots);
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+        }
+        assert!(session.observed_gremlin(1, "g.V(7).valueMap('typed')").is_err());
+        assert!(session.observed_gremlin_v2(1, "g.V(7).valueMap('typed')").is_err());
+        assert!(matches!(session.observed_gremlin_v3(1, "g.V(99).valueMap('blob')"), Err(ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(_)))));
+        for (text, partitions) in [
             ("g.V(7).repeat(in('K')).times(2)", vec![1, 1, 2, 1]),
             (
                 "g.V(7).out('K').repeat(in('K')).times(1)",

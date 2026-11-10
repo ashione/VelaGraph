@@ -177,3 +177,16 @@ V2Observed long paths have at most 66 elements, including an edge start and its
 endpoint; clients and executor should be upgraded together. Local/v1 and legacy
 observed v1/v2 remain unchanged. See the
 [complete shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-native-repeat).
+
+
+### Shared selected vertex property maps
+
+The shared routing-v3 executor and single-partition V2Observed server queries
+support terminal selected vertex `valueMap` with one to eight bounded keys.
+Qualified source, singleton values, missing/Null distinctions and input bags
+follow the [shared contract](MANAGED_FIXED_TRAVERSALS.md#selected-vertex-property-maps).
+The same frozen provider supplies fields; maps use the shared 2 KiB flat tagged
+property cap and unchanged cumulative work/response bounds. Single-partition
+scope remains enforced, including edge endpoint and adjacency reads. V1/legacy
+observed query surfaces and Unverified consistency are unchanged. Upgrade the
+executor and client together; older clients reject these map replies.

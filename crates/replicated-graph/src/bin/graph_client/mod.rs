@@ -382,6 +382,10 @@ fn observed_row(row: ObservedRowV3) -> Json {
         ObservedRowV3::Vertex(v) => element("vertex", v.partition, v.id),
         ObservedRowV3::Edge(e) => element("edge", e.partition, e.id),
         ObservedRowV3::Count(n) => json!({"type":"count","value":n}),
+        ObservedRowV3::PropertyMap { source, properties } => json!({
+            "type": "property_map", "source": element("vertex", source.partition, source.id),
+            "properties": properties,
+        }),
         ObservedRowV3::Value { source, value } => {
             let source = match source {
                 ObservedElementRef::Vertex(v) => element("vertex", v.partition, v.id),
@@ -708,6 +712,19 @@ mod tests {
                 value: Value::Integer(i64::MAX)
             }),
             json!({"type":"value","source":{"type":"edge","partition":10,"id":u64::MAX},"value":{"Integer":i64::MAX}})
+        );
+        assert_eq!(
+            observed_row(ObservedRowV3::PropertyMap {
+                source: VertexRef {
+                    partition: 20,
+                    id: 1
+                },
+                properties: BTreeMap::from([
+                    ("name".into(), vec![Value::Text("界".into())]),
+                    ("nullable".into(), vec![Value::Null]),
+                ]),
+            }),
+            json!({"type":"property_map","source":{"type":"vertex","partition":20,"id":1},"properties":{"name":[{"Text":"界"}],"nullable":["Null"]}})
         );
         assert_eq!(
             v1_row(20, GremlinRow::Vertex(1)),

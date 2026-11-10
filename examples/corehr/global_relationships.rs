@@ -44,14 +44,16 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         }
         cases.push(row);
     };
-    let selected_people: Vec<_> = source(m, true)
-        .into_iter()
-        .filter(|id| *id <= m.people && active(*id))
-        .take(25)
-        .collect();
+    let selected_people = |server| {
+        source(m, server)
+            .into_iter()
+            .filter(|id| *id <= m.people && active(*id))
+            .take(25)
+            .collect::<Vec<_>>()
+    };
     add("global_scan_selected_maps",
         "g.V().hasLabel('person').has('active',true).dedup().limit(25).valueMap('name','active','missing')".into(),
-        maps(m, &selected_people), None);
+        maps(m, &selected_people(true)), Some(maps(m, &selected_people(false))));
     add(
         "global_scan_dedup_count",
         "g.V().dedup().count()".into(),
@@ -98,16 +100,22 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         json!({"count":unique(server).len()}),
         Some(json!({"count":unique(client).len()})),
     );
-    let memberships = unique(m.hop(&selected(true), "member_of", true));
-    add("global_join_department_maps", "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).out('member_of').dedup().valueMap('name','active','missing')".into(), maps(m,&memberships), None);
+    let memberships = |server| unique(m.hop(&selected(server), "member_of", true));
+    add("global_join_department_maps", "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).out('member_of').dedup().valueMap('name','active','missing')".into(), maps(m,&memberships(true)), Some(maps(m,&memberships(false))));
     let dept = m.people + 2;
-    let members: Vec<_> = m
-        .hop(&[dept], "member_of", false)
-        .into_iter()
-        .filter(|id| active(*id))
-        .take(25)
-        .collect();
-    add("global_join_named_department_members", format!("g.V().has('name','Department-{dept:06}').limit(1).in('member_of').has('active',true).limit(25).valueMap('name','active','missing')"), maps(m,&members), None);
+    let members = |server| {
+        let roots: Vec<_> = source(m, server)
+            .into_iter()
+            .filter(|id| *id == dept)
+            .take(1)
+            .collect();
+        m.hop(&roots, "member_of", false)
+            .into_iter()
+            .filter(|id| active(*id))
+            .take(25)
+            .collect::<Vec<_>>()
+    };
+    add("global_join_named_department_members", format!("g.V().has('name','Department-{dept:06}').limit(1).in('member_of').has('active',true).limit(25).valueMap('name','active','missing')"), maps(m,&members(true)), Some(maps(m,&members(false))));
     let colleagues = unique(m.hop(&named, "member_of", false));
     add("global_join_two_hop_unique_colleagues", "g.V().has('name','Employee-000020').limit(1).out('member_of').in('member_of').dedup().count()".into(), json!({"count":colleagues.len()}), Some(json!({"count":colleagues.len()})));
     add(
@@ -179,13 +187,19 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         vertices(&ancestors),
         Some(vertices(&ancestors)),
     );
-    let filtered: Vec<_> = ancestors
-        .iter()
-        .copied()
-        .filter(|id| active(*id))
-        .take(3)
-        .collect();
-    add("global_repeat_filtered_ancestor_maps", format!("{prefix}.repeat(__.out('reports_to')).emit().times(32).has('active',true).limit(3).valueMap('name','active','missing')"), maps(m,&filtered), None);
+    let filtered = |server| {
+        let roots: Vec<_> = source(m, server)
+            .into_iter()
+            .filter(|id| *id == start)
+            .take(1)
+            .collect();
+        repeat(&roots, "reports_to", true, 32, true)
+            .into_iter()
+            .filter(|id| active(*id))
+            .take(3)
+            .collect::<Vec<_>>()
+    };
+    add("global_repeat_filtered_ancestor_maps", format!("{prefix}.repeat(__.out('reports_to')).emit().times(32).has('active',true).limit(3).valueMap('name','active','missing')"), maps(m,&filtered(true)), Some(maps(m,&filtered(false))));
     let exact = repeat(&[start], "reports_to", true, 4, false);
     add(
         "global_repeat_exact_depth",
@@ -292,6 +306,7 @@ fn global_relationship_oracles_are_nonvacuous() {
         assert_eq!(q.len(), 26);
         for name in [
             "global_repeat_named_ancestors",
+            "global_repeat_filtered_ancestor_maps",
             "global_repeat_exact_depth",
             "global_repeat_named_descendant_count",
             "global_repeat_multi_root_bag",
@@ -304,10 +319,32 @@ fn global_relationship_oracles_are_nonvacuous() {
             assert!(case.get("client_expected").is_some(), "{name}");
             assert_eq!(case["server_supported"], true, "{name}");
         }
+        for name in [
+            "global_scan_selected_maps",
+            "global_join_department_maps",
+            "global_join_named_department_members",
+            "global_repeat_filtered_ancestor_maps",
+        ] {
+            let case = get(name);
+            assert_ne!(case["client_expect_unsupported"], true, "{name}");
+            let rows = case["client_expected"]["maps"].as_array().unwrap();
+            assert!(!rows.is_empty(), "{name}");
+            assert!(rows
+                .iter()
+                .all(|row| row["properties"].get("missing").is_none()));
+        }
+        let client_people: Vec<_> = (1..=m.people).filter(|id| active(*id)).take(25).collect();
         assert_eq!(
-            get("global_repeat_filtered_ancestor_maps")["client_expect_unsupported"],
-            true
+            get("global_scan_selected_maps")["client_expected"],
+            maps(&m, &client_people)
         );
+        for name in ["global_scan_selected_maps", "global_join_department_maps"] {
+            assert_ne!(
+                get(name)["expected"],
+                get(name)["client_expected"],
+                "{name}"
+            );
+        }
         // The client roots are selected in local-ID order, not the coordinator's
         // partition-first order. Recompute only from fixture IDs and edges.
         let mut frontier: Vec<_> = (1..=m.people)

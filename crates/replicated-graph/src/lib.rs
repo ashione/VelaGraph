@@ -15,6 +15,7 @@ pub mod managed_graph;
 pub mod managed_submission_timing;
 pub mod remote;
 pub mod remote_storage;
+mod selected_properties;
 pub use remote_storage::RemoteStorageNode;
 #[cfg(target_os = "linux")]
 pub mod gateway;

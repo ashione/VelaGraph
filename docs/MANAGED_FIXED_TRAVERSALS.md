@@ -43,7 +43,7 @@ The external query is ordinary Gremlin text plus partition routing context:
   place. Count runs before the implicit default result cap.
 - With no explicit limit, non-count results have the existing default cap of
   100. Explicit limits are 1..=1000. Internal caps never produce partial success.
-- ValueMap, mutations, and unsupported compositions reject
+- Terminal selected vertex valueMap is described below. Mutations and unsupported compositions reject
   before data reads, including empty streams. The original smaller `Read` API,
   including its id projection, is unchanged. This is not a second query dialect.
 
@@ -293,9 +293,53 @@ before the first page; no continuation acquires another version.
 
 Nested/multiple repeats, unbounded or conditional termination, times(0),
 pre-body emit, repeat-body both/edge steps, multi-step bodies, scoped/named loops,
-modulators and valueMap remain unsupported. Older executors reject the new
+modulators and nonterminal/edge/scalar valueMap remain unsupported. Older executors reject the new
 composition; upgrade the executor and its client together for long paths.
 No wire/disk variant or persistent format changes. The original managed Read,
 local/v1 and legacy observed v1/v2 APIs retain their previous rejection boundary.
 This is a generic semantic addition under #155/#110, not a data-local fixed-V
 query engine, capacity expansion, full managed CoreHR or multi-host HA result.
+
+
+## Selected vertex property maps
+
+Shared routing-v3, single-partition V2Observed server queries and managed
+Traverse/TraversePage accept terminal standard `valueMap('key', ...)` on a vertex
+stream, including vertices reached through edge endpoints or bounded repeat.
+The existing official AST requires one to eight distinct, nonempty UTF-8 keys,
+each at most 64 bytes. Full-shape admission runs before reads even on an empty
+stream. Edge/scalar input, all-property/token maps, map post-processing and
+modulators remain unsupported. The original managed Read, local/v1 and legacy
+observed v1/v2 query subsets are unchanged.
+
+Each row retains its qualified vertex source and a canonical key-ordered map of
+singleton lists. Missing fields are omitted, explicit Null is `[Null]`, and a
+vertex with none of the selected fields yields an empty map. All five strict
+Value types, Unicode and escaping are preserved without coercion. Input order,
+bag multiplicity and positional filters/dedup/limits are unchanged. With no
+explicit limit, the ordinary default first-100 cap applies before terminal
+property materialization, after all upstream traversal validation. A projection
+never bypasses prior integrity failures or consumed work.
+
+Each selected map uses the existing coordinator/hierarchy contract: at most
+2 KiB of tagged flat-property JSON, excluding singleton-list and source-envelope
+syntax. The complete result/frame limits still apply to the actual encoded rows.
+A shared private helper measures exact tagged JSON without an encoded copy and
+validates bounded singleton maps without cloning their payloads. Each inspected
+vertex consumes one work unit and existing full-record logical bytes; map
+retention adds `encoded_flat_bytes + 128 * field_count + 256` bytes. Output
+backing storage is admitted before allocation. The loops are bounded by the
+existing 10,000 rows/work units and eight selected keys. None of the cumulative
+64 MiB, adjacency, copied snapshot, request/response, TTL or page limits changes.
+
+The same retained provider supplies every property. Managed pages admit the
+whole query and every page envelope before the first page, retain one immutable
+result at V, and replay exactly through later writes. The existing strict managed
+wire decoder now accepts the established PropertyMap row; query-aware client
+validation rejects wrong source kinds/partitions, unrequested keys, non-singleton
+lists, non-finite values, oversized maps and incompatible result shapes.
+Older managed clients reject these map replies; upgrade both endpoints. No new
+wire version, disk format, snapshot or consistency claim is introduced. Rust
+callers exhaustively matching ObservedRowV3 must handle its additive PropertyMap
+variant. This generic #157 slice does not complete #110's data-local capacity or
+full-scale managed acceptance.

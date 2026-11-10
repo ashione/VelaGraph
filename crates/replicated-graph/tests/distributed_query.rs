@@ -676,6 +676,10 @@ fn legacy_oracle(
                     id: e.id,
                 }),
                 ObservedRowV3::Count(n) => QueryRow::Count(n),
+                ObservedRowV3::PropertyMap { source, properties } => QueryRow::PropertyMap {
+                    source: vertex(source.partition, source.id),
+                    properties,
+                },
                 ObservedRowV3::Path(path) => QueryRow::Path(
                     path.into_iter()
                         .map(|e| match e {

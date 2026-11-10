@@ -166,3 +166,10 @@ and `--query`. They do not consult the catalog, retry or download the shard.
 See [REMOTE_QUERY.md](REMOTE_QUERY.md) for the explicit scope, typed output,
 limits, examples and Unverified v2 semantics. Existing query commands keep their
 client-side execution and JSON shape.
+
+
+The experimental observed-v3 query command also supports terminal selected
+vertex `valueMap` under the [shared bounded contract](MANAGED_FIXED_TRAVERSALS.md#selected-vertex-property-maps).
+Its JSON row has `type: "property_map"`, a qualified vertex `source`, and
+canonical `properties` containing singleton lists of tagged Values. Missing keys
+are omitted; explicit Null remains `["Null"]`. The result remains Unverified.

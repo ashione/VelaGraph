@@ -529,7 +529,7 @@ v3 semantics. `id()` emits Integer(i64) with qualified vertex/edge provenance;
 only dedup/limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
 (mapped to Unsupported by the managed gateway), without wrapping or partial rows.
 A later limit/count cannot hide overflow; an earlier limit restricts the input
-at its original position. ValueMap and other unsupported steps reject.
+at its original position. Terminal selected vertex valueMap follows the shared contract below; other unsupported steps reject.
 One native single-out/in repeat with times(1..32) and optional post-body emit is
 supported on vertex streams. Combined ordinary and repeated depth is at most 32;
 exact-depth frontiers or increasing-depth emitted bags retain qualified paths,
@@ -600,3 +600,18 @@ Each both counts toward the existing three ordinary hops and combined depth 32;
 repeat-body both and global path remain rejected. This changes no local/v1,
 managed, routing-v3 or hierarchy-job subset. See the
 [complete contract](DISTRIBUTED_QUERY.md#bidirectional-vertex-adjacency).
+
+
+### Fixed-version selected vertex maps
+
+The shared routing-v3, single-partition V2Observed server and managed
+Traverse/TraversePage paths accept terminal selected `valueMap` on vertex streams
+with the existing one-to-eight bounded distinct-key AST. Edge and scalar inputs,
+all-key/token maps and post-processing reject before reads, including empty
+streams. Ordered bags and qualified source identities are preserved; values are
+strict singleton lists, missing keys are omitted and stored Null remains `[Null]`.
+Without an explicit limit the first-100 default precedes terminal projection,
+after upstream traversal checks. Maps reuse the 2 KiB tagged-flat-property cap
+and shared validator, while all work, response, fixed-V and immutable paging
+bounds stay unchanged. See the [complete contract](MANAGED_FIXED_TRAVERSALS.md#selected-vertex-property-maps).
+Local/v1, legacy observed v1/v2 and original managed Read remain unchanged.

@@ -132,7 +132,18 @@ fn summary(mut xs: Vec<f64>) -> Value {
     xs.sort_by(f64::total_cmp);
     json!({"n":xs.len(),"p50_ms":xs[xs.len()/2],"p95_ms":xs[(xs.len()*95).div_ceil(100)-1],"min_ms":xs[0],"max_ms":xs[xs.len()-1]})
 }
-fn observed(rows: &[ObservedRowV3]) -> Value {
+fn observed(rows: &[ObservedRowV3], map_projection: bool) -> Value {
+    // A zero-row response carries no row variant. The fixture supplies only
+    // that empty shape hint; all nonempty results are decoded from actual rows.
+    if rows.is_empty() && map_projection {
+        return json!({"maps":[]});
+    }
+    if matches!(rows.first(), Some(ObservedRowV3::PropertyMap { .. })) {
+        return json!({"maps": rows.iter().map(|r| match r {
+            ObservedRowV3::PropertyMap { source, properties } => json!({"source":[source.partition,source.id],"properties":properties}),
+            _ => panic!("mixed projected rows"),
+        }).collect::<Vec<_>>()});
+    }
     if matches!(rows.first(), Some(ObservedRowV3::Path(_))) {
         return json!({"paths": rows.iter().map(|r| match r { ObservedRowV3::Path(p) => p.iter().map(|e| match e { ObservedPathElement::Vertex(v) => json!(["v",v.partition,v.id]), ObservedPathElement::Edge(e) => json!(["e",e.partition,e.id]) }).collect::<Vec<_>>(), _ => panic!("mixed path rows") }).collect::<Vec<_>>()});
     }
@@ -145,7 +156,10 @@ fn observed(rows: &[ObservedRowV3]) -> Value {
     }
     json!({"vertices":rows.iter().map(|r|match r{ObservedRowV3::Vertex(v)=>json!([v.partition,v.id]),_=>json!(format!("{r:?}"))}).collect::<Vec<_>>()})
 }
-fn server_rows(rows: &[QueryRow]) -> Value {
+fn server_rows(rows: &[QueryRow], map_projection: bool) -> Value {
+    if rows.is_empty() && map_projection {
+        return json!({"maps":[]});
+    }
     if matches!(rows.first(), Some(QueryRow::PropertyMap { .. })) {
         return json!({"maps": rows.iter().map(|r| match r {
             QueryRow::PropertyMap { source: QualifiedElement::Vertex { partition, id }, properties } => json!({"source":[partition,id],"properties":properties}),
@@ -433,8 +447,8 @@ async fn main() -> anyhow::Result<()> {
                         Ok(output) => {
                             ensure!(!expect_error, "unexpected success {query}");
                             ensure!(output.completeness == AdjacencyCompleteness::Unverified);
-                            let actual = observed(&output.rows);
                             let expected = c.get("client_expected").unwrap_or(&c["expected"]);
+                            let actual = observed(&output.rows, expected.get("maps").is_some());
                             ensure!(actual == *expected, "client oracle mismatch {query}: {actual} != {expected}");
                             json!({"correct":true,"rows":output.rows.len()})
                         },
@@ -517,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(o) => {
                     ensure!(supported, "unexpected server success {}", c["name"]);
                     ensure!(o.completeness == QueryCompleteness::Unverified);
-                    let actual = server_rows(&o.rows);
+                    let actual = server_rows(&o.rows, c["expected"].get("maps").is_some());
                     ensure!(
                         actual == c["expected"],
                         "server oracle mismatch {}: {actual} != {}",
@@ -603,4 +617,118 @@ async fn main() -> anyhow::Result<()> {
         "supported queries had {query_failures} failures"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use rocksdb_sql_table::{experimental_graph::VertexRef, Value as PropertyValue};
+
+    #[test]
+    fn map_normalization_preserves_qualified_bags_null_and_empty_maps() {
+        let properties = BTreeMap::from([
+            ("name".into(), vec![PropertyValue::Text("same".into())]),
+            ("nullable".into(), vec![PropertyValue::Null]),
+        ]);
+        let sources = [(3, 20), (1, 20), (3, 20), (2, 23)];
+        let client: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, &(partition, id))| ObservedRowV3::PropertyMap {
+                source: VertexRef { partition, id },
+                properties: if i == 3 {
+                    BTreeMap::new()
+                } else {
+                    properties.clone()
+                },
+            })
+            .collect();
+        let server: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, &(partition, id))| QueryRow::PropertyMap {
+                source: QualifiedElement::Vertex { partition, id },
+                properties: if i == 3 {
+                    BTreeMap::new()
+                } else {
+                    properties.clone()
+                },
+            })
+            .collect();
+        let expected = json!({"maps":[
+            {"source":[3,20],"properties":{"name":[{"Text":"same"}],"nullable":["Null"]}},
+            {"source":[1,20],"properties":{"name":[{"Text":"same"}],"nullable":["Null"]}},
+            {"source":[3,20],"properties":{"name":[{"Text":"same"}],"nullable":["Null"]}},
+            {"source":[2,23],"properties":{}}
+        ]});
+        assert_eq!(observed(&client, true), expected);
+        assert_eq!(server_rows(&server, true), expected);
+        assert_eq!(observed(&[], true), json!({"maps":[]}));
+        assert_eq!(server_rows(&[], true), json!({"maps":[]}));
+        assert_eq!(observed(&[], false), json!({"vertices":[]}));
+        assert_eq!(server_rows(&[], false), json!({"vertices":[]}));
+        // The empty-result shape hint must never conceal a wrong nonempty type.
+        assert_eq!(
+            observed(
+                &[ObservedRowV3::Vertex(VertexRef {
+                    partition: 3,
+                    id: 20
+                })],
+                true
+            ),
+            json!({"vertices":[[3,20]]})
+        );
+        assert_eq!(
+            server_rows(
+                &[QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 3,
+                    id: 20
+                })],
+                true
+            ),
+            json!({"vertices":[[3,20]]})
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mixed projected rows")]
+    fn client_map_normalization_rejects_mixed_rows() {
+        observed(
+            &[
+                ObservedRowV3::PropertyMap {
+                    source: VertexRef {
+                        partition: 3,
+                        id: 20,
+                    },
+                    properties: BTreeMap::new(),
+                },
+                ObservedRowV3::Vertex(VertexRef {
+                    partition: 3,
+                    id: 20,
+                }),
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mixed projected rows")]
+    fn server_map_normalization_rejects_mixed_rows() {
+        server_rows(
+            &[
+                QueryRow::PropertyMap {
+                    source: QualifiedElement::Vertex {
+                        partition: 3,
+                        id: 20,
+                    },
+                    properties: BTreeMap::new(),
+                },
+                QueryRow::Element(QualifiedElement::Vertex {
+                    partition: 3,
+                    id: 20,
+                }),
+            ],
+            true,
+        );
+    }
 }

@@ -1108,7 +1108,60 @@ async fn scenario() -> anyhow::Result<()> {
         },
     )
     .await?;
+    fixed_version_value_map_scenario(&recovered).await?;
     recovered.shutdown().await;
+    Ok(())
+}
+
+// Isolated post-reopen TCP phase. No earlier session lifetime is extended.
+async fn fixed_version_value_map_scenario(g: &Gateway) -> anyhow::Result<()> {
+    let session = open(g, None).await?;
+    let map = |partition, name: &str| QueryRow::PropertyMap {
+        source: element(partition, 101),
+        properties: BTreeMap::from([
+            ("name".into(), vec![Value::Text(name.into())]),
+            ("nullable".into(), vec![Value::Null]),
+        ]),
+    };
+    let alice = map(7, "Alice");
+    let robert = map(8, "Robert");
+    assert_eq!(
+        traverse(
+            g,
+            &session,
+            7,
+            "g.E(101).bothV().valueMap('nullable','missing','name')"
+        )
+        .await?,
+        vec![alice, robert.clone()]
+    );
+    let text = "g.V(101,101).out('reports').valueMap('name','nullable','missing')";
+    let first = page(g, &session, 7, text, None, 1).await?;
+    assert_eq!((first.offset, first.total), (0, 2));
+    assert_eq!(first.data.rows, vec![robert.clone()]);
+    assert_eq!(page(g, &session, 7, text, None, 1).await?, first);
+    let last = page(g, &session, 7, text, first.next.clone(), 1).await?;
+    assert_eq!((last.offset, last.total), (1, 2));
+    assert_eq!(last.data.rows, vec![robert]);
+    assert!(last.next.is_none());
+    assert_eq!(page(g, &session, 7, text, first.next, 1).await?, last);
+    assert_eq!(
+        call(
+            g,
+            Operation::Traverse {
+                session: session.clone(),
+                query: Query {
+                    partition: 7,
+                    text: "g.E(101).valueMap('name')".into()
+                },
+            }
+        )
+        .await,
+        Err(gateway::Error::Query(
+            replicated_graph::remote::query::QueryFailure::Unsupported
+        ))
+    );
+    call(g, Operation::Close { session }).await?;
     Ok(())
 }
 
@@ -1704,7 +1757,7 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         "g.V(101).values('name').dedup().hasLabel('person')",
         "g.V(999).dedup('a')",
         "g.V(999).dedup().by('name')",
-        "g.V(101).valueMap('name')",
+        "g.V(101).valueMap('name').count()",
         "g.V(101).repeat(both()).times(2)",
         "g.V(101).out().out().out().out()",
     ] {

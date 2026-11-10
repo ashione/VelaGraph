@@ -118,7 +118,7 @@ pub async fn query(
     let end = checked_deadline(deadline, None)?;
     request.validate()?;
     let expected = (request.shard, request.partition, request.mode);
-    let repeated_path = admits_repeated_path(&request);
+    let (repeated_path, map_keys) = admitted_extensions(&request);
     match rpc(
         endpoint,
         identity,
@@ -130,7 +130,14 @@ pub async fn query(
     {
         Reply::Query(response) => {
             if let Ok(output) = &response {
-                validate_output(output, expected, identity, repeated_path, end)?;
+                validate_output(
+                    output,
+                    expected,
+                    identity,
+                    repeated_path,
+                    map_keys.as_ref(),
+                    end,
+                )?;
             }
             if Instant::now() >= end {
                 return Err(RemoteError::Timeout { request_id: None });
@@ -141,18 +148,52 @@ pub async fn query(
     }
 }
 
-fn admits_repeated_path(request: &QueryRequest) -> bool {
+struct MapShape {
+    keys: Vec<String>,
+    // None after a graph transition; an empty ID list denotes a scan.
+    start_ids: Option<Vec<u64>>,
+}
+fn admitted_extensions(request: &QueryRequest) -> (bool, Option<MapShape>) {
+    use rocksdb_sql_table::{ObservedGremlinQuery, ObservedGremlinStep as Step};
     if request.mode != QueryMode::V2Observed {
-        return false;
+        return (false, None);
     }
-    let Ok(parsed) = rocksdb_sql_table::ObservedGremlinQuery::parse(&request.text) else {
-        return false;
+    let Ok(parsed) = ObservedGremlinQuery::parse(&request.text) else {
+        return (false, None);
     };
-    crate::routing::experimental::validate_traversal(&parsed).is_ok()
-        && parsed
-            .steps()
-            .iter()
-            .any(|step| matches!(step, rocksdb_sql_table::ObservedGremlinStep::Repeat { .. }))
+    if crate::routing::experimental::validate_traversal(&parsed).is_err() {
+        return (false, None);
+    }
+    let repeated = parsed
+        .steps()
+        .iter()
+        .any(|step| matches!(step, Step::Repeat { .. }));
+    let keys = match parsed.steps().last() {
+        Some(Step::ValueMap(keys)) => Some(MapShape {
+            keys: keys.clone(),
+            start_ids: match parsed.start() {
+                rocksdb_sql_table::GremlinStart::Vertices(ids)
+                    if parsed.steps().iter().all(|step| {
+                        matches!(
+                            step,
+                            Step::ValueMap(_)
+                                | Step::Dedup
+                                | Step::Existing(
+                                    rocksdb_sql_table::GremlinStep::HasLabel(_)
+                                        | rocksdb_sql_table::GremlinStep::Has { .. }
+                                        | rocksdb_sql_table::GremlinStep::Limit(_)
+                                )
+                        )
+                    }) =>
+                {
+                    Some(ids.clone())
+                }
+                _ => None,
+            },
+        }),
+        _ => None,
+    };
+    (repeated, keys)
 }
 
 fn validate_output(
@@ -160,6 +201,7 @@ fn validate_output(
     expected: (u64, u32, QueryMode),
     identity: Option<RemoteIdentity>,
     repeated_path: bool,
+    map_keys: Option<&MapShape>,
     end: Instant,
 ) -> Result<(), RemoteError> {
     if (output.snapshot.shard, output.partition, output.mode) != expected
@@ -195,14 +237,22 @@ fn validate_output(
                 !path.is_empty() && path.len() <= maximum && path.iter().all(valid_element)
             }
             QueryRow::Count(_) => true,
-            QueryRow::PropertyMap { .. } => false,
+            QueryRow::PropertyMap { source, properties } => {
+                output.mode == QueryMode::V2Observed
+                    && matches!(source, QualifiedElement::Vertex { .. })
+                    && valid_element(source)
+                    && map_keys.is_some_and(|shape| {
+                        crate::selected_properties::valid_map(properties, &shape.keys)
+                            && shape.start_ids.as_ref().is_none_or(|ids| ids.is_empty() || matches!(source, QualifiedElement::Vertex { id, .. } if ids.contains(id)))
+                    })
+            }
             QueryRow::Value { source, value } => {
                 source.as_ref().is_none_or(valid_element)
                     && source.is_some() == (output.mode == QueryMode::V2Observed)
                     && !matches!(value, Value::Real(n) if !n.is_finite())
             }
         };
-        if !valid {
+        if !valid || (map_keys.is_some() && !matches!(row, QueryRow::PropertyMap { .. })) {
             return Err(RemoteError::Protocol);
         }
     }
@@ -552,6 +602,7 @@ mod tests {
                 (7, 10, QueryMode::V2Observed),
                 Some(good.snapshot.identity),
                 false,
+                None,
                 end,
             )
         };
@@ -604,7 +655,7 @@ mod tests {
                     timeout_millis: 1000,
                 };
                 assert_eq!(
-                    admits_repeated_path(&request),
+                    admitted_extensions(&request).0,
                     mode == QueryMode::V2Observed && supported,
                     "{text}"
                 );
@@ -636,7 +687,7 @@ mod tests {
                     length
                 ])];
                 assert_eq!(
-                    validate_output(&out, (7, 10, mode), None, repeated_path, end).is_ok(),
+                    validate_output(&out, (7, 10, mode), None, repeated_path, None, end).is_ok(),
                     length == maximum
                 );
             }
@@ -648,10 +699,97 @@ mod tests {
                 maximum
             ])];
             assert!(matches!(
-                validate_output(&out, (7, 10, mode), None, repeated_path, end),
+                validate_output(&out, (7, 10, mode), None, repeated_path, None, end),
                 Err(RemoteError::Protocol)
             ));
         }
+    }
+
+    #[test]
+    fn selected_map_replies_require_admitted_vertex_shape_and_bounded_values() {
+        let request = |text: &str, mode| QueryRequest {
+            shard: 7,
+            partition: 10,
+            mode,
+            text: text.into(),
+            timeout_millis: 1000,
+        };
+        let (_, shape) = admitted_extensions(&request(
+            "g.V(1).valueMap('name','absent')",
+            QueryMode::V2Observed,
+        ));
+        let validate = |out: &QueryOutput, shape: Option<&MapShape>| {
+            validate_output(
+                out,
+                (7, 10, QueryMode::V2Observed),
+                None,
+                false,
+                shape,
+                Instant::now() + MAX_QUERY_DEADLINE,
+            )
+        };
+        let source = QualifiedElement::Vertex {
+            partition: 10,
+            id: 1,
+        };
+        let mut out = output();
+        out.rows = vec![QueryRow::PropertyMap {
+            source,
+            properties: BTreeMap::from([("name".into(), vec![Value::Null])]),
+        }];
+        assert!(validate(&out, shape.as_ref()).is_ok());
+        assert!(validate(&out, None).is_err());
+        for (text, mode) in [
+            ("g.V(1)", QueryMode::V2Observed),
+            ("g.E(1).valueMap('name')", QueryMode::V2Observed),
+            ("g.V(1).valueMap('name')", QueryMode::V1),
+        ] {
+            assert!(admitted_extensions(&request(text, mode)).1.is_none());
+        }
+        for change in 0..8 {
+            let mut bad = out.clone();
+            let QueryRow::PropertyMap { source, properties } = &mut bad.rows[0] else {
+                unreachable!()
+            };
+            match change {
+                0 => {
+                    *source = QualifiedElement::Vertex {
+                        partition: 11,
+                        id: 1,
+                    }
+                }
+                1 => {
+                    *source = QualifiedElement::Edge {
+                        partition: 10,
+                        id: 1,
+                    }
+                }
+                2 => {
+                    *source = QualifiedElement::Vertex {
+                        partition: 10,
+                        id: 2,
+                    }
+                }
+                3 => {
+                    properties.insert("unselected".into(), vec![Value::Null]);
+                }
+                4 => {
+                    properties.insert("name".into(), vec![]);
+                }
+                5 => {
+                    properties.insert("name".into(), vec![Value::Null, Value::Null]);
+                }
+                6 => {
+                    properties.insert("name".into(), vec![Value::Real(f64::NAN)]);
+                }
+                _ => {
+                    properties.insert("name".into(), vec![Value::Text("x".repeat(2048))]);
+                }
+            }
+            assert!(validate(&bad, shape.as_ref()).is_err(), "{change}");
+        }
+        out.rows = vec![QueryRow::Element(source)];
+        assert!(validate(&out, shape.as_ref()).is_err());
     }
 
     #[test]
@@ -679,6 +817,7 @@ mod tests {
                 (7, 10, QueryMode::V2Observed),
                 None,
                 false,
+                None,
                 Instant::now() + MAX_QUERY_DEADLINE
             ),
             Err(RemoteError::ResourceExhausted)
