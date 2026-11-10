@@ -1,7 +1,7 @@
 # Bounded global vertex scan into traversal
 
 The experimental server coordinator accepts a global vertex-filter prefix and
-then bounded out/in and repeat steps, without downloading shard snapshots or
+then bounded out/in/both and repeat steps, without downloading shard snapshots or
 re-parsing rewritten query text. The official Gremlin AST is split at its first
 adjacency or repeat step. There is no schema-, label-, population- or answer-specific path.
 
@@ -9,7 +9,7 @@ adjacency or repeat step. There is no schema-, label-, population- or answer-spe
 
 - Start: `g.V()` over the immutable startup catalog.
 - Scan prefix: any supported `has`, `hasLabel`, vertex `dedup` and `limit`, in their original order.
-- Traversal suffix: `out`/`in` (up to three total), `has`, `hasLabel`, `limit`,
+- Traversal suffix: `out`/`in`/`both` (up to three total), `has`, `hasLabel`, `limit`,
   vertex-identity `dedup`, and optionally terminal `count`, single-key `values`, or selected `valueMap`.
 - One native `repeat(single out/in).times(1..32)` with optional post-emit is
   admitted, including before/after ordinary hops. Combined ordinary/repeated
@@ -24,8 +24,8 @@ Examples:
 - `g.V().has('name','Operations').in('member_of').has('active',true).limit(20).valueMap('name','country')`
 - `g.V().limit(4).has('active',true).out().in().dedup()`
 
-At least one out/in or repeat step is required for this additive surface. Global `E`,
-`path`, `both`, and other unsupported steps fail explicitly.
+At least one out/in/both or repeat step is required for this additive surface. Global `E`,
+`path`, and other unsupported steps fail explicitly.
 Terminal `values(key)` emits one scalar per traverser with that property, preserving
 ordered bag multiplicity and qualified vertex provenance. Missing properties emit
 no row; present Null emits Null. Equal scalars are not deduplicated. Filters and
@@ -95,8 +95,9 @@ from fixture inputs, including 101 returned identities/maps without an implicit
 cap. Missing reverse/canonical records remain whole-query failures, including
 when a later filter or limit would otherwise hide them.
 
-The CoreHR fixture now contains 110 cases, including 20 global-composition cases:
-18 successful shapes (seven samples each) and two expected Unsupported shapes.
+The CoreHR fixture now contains 122 query cases, including six bidirectional
+cases and the existing global-composition cases. Supported server queries use
+seven samples each; unsupported shapes retain explicit rejection expectations.
 Eight repeat shapes cover named ancestors, selected ancestor properties, exact
 depth, descendants, overlapping roots with bag/dedup, a membership hop before
 department ancestors, and empty roots. These expectations use input edges only.
@@ -112,3 +113,12 @@ its ordered roots exactly and limits keep their positions. This does not dedup
 subsequent traversers: parallel edges, convergence and repeat emission preserve
 bag multiplicity unless a separate downstream dedup is explicitly present.
 No extra scan, budget, refresh or default truncation is introduced.
+
+
+Ordinary `both()` / `both(label)` also joins at the first adjacency step. It
+merges the two validated directions per input by `(edge ID, source partition)`,
+emitting an exact self-loop once while preserving parallel-edge and repeated-root
+bags. Global path and repeat-body both remain unsupported. The existing three
+ordinary-hop / 32 combined-depth limits include both; fixed sessions, complete
+result semantics and separate cumulative budgets are unchanged. See the
+[bidirectional contract](DISTRIBUTED_QUERY.md#bidirectional-vertex-adjacency).

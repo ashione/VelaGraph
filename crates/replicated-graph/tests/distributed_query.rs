@@ -38,6 +38,8 @@ use tokio::{
     sync::Notify,
     time::{sleep, timeout},
 };
+#[path = "distributed_query/both.rs"]
+mod both;
 #[path = "distributed_query/byte_batches.rs"]
 mod byte_batches;
 #[path = "distributed_query/consistency.rs"]

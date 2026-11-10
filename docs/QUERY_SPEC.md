@@ -337,7 +337,7 @@ for upgrade restrictions, bounds and attempt-local retry outcomes.
 ## Experimental server-coordinated observed traversal
 
 The separately typed [distributed query API](DISTRIBUTED_QUERY.md) accepts an
-explicit V(ids) start, up to three combined out/in steps (the official parser hop limit),
+explicit V(ids) start, up to three combined out/in/both steps (the official parser hop limit),
 ordered has/hasLabel/limit, terminal path/count and values followed by
 limit/count. It uses this official parser and strict value semantics, but an
 independently documented static-catalog scope and conservative cumulative
@@ -362,7 +362,7 @@ stable order is (partition ID, local ID), distinct from the older client global
 scan order. It uses data-local pages and fixed per-shard sessions, explicit
 scan budgets and Unverified results, never a global atomic snapshot claim.
 The bounded [global scan-to-traversal composition](GLOBAL_VERTEX_TRAVERSAL.md)
-extends this with an ordered scan-filter/dedup/limit prefix then out/in, filters,
+extends this with an ordered scan-filter/dedup/limit prefix then out/in/both, filters,
 limit, dedup and terminal count/selected valueMap. It preserves separate scan
 and traversal budgets on the same sessions. Joined results have no implicit
 100-row truncation. Global E/path remain Unsupported. Terminal single-key values after at least one
@@ -577,3 +577,16 @@ no row without refilling the vertex limit, present Null emits Null, and equal
 values retain separate qualified source rows in scan order. No-limit values,
 multi-key values and scalar post-processing are rejected before execution.
 The existing fixed-session scan and traversal budgets apply independently.
+
+
+### Server-coordinated bidirectional adjacency
+
+The experimental coordinator accepts zero-argument or single-label `both` for
+explicit V starts and global scan-to-traversal compositions. It merges verified
+out/in edges per input by `(edge ID, canonical source partition)`, coalescing only
+an exact self-loop. Qualified identities, bag multiplicity, path ownership,
+positional filters/limits and all cumulative resource limits are preserved.
+Each both counts toward the existing three ordinary hops and combined depth 32;
+repeat-body both and global path remain rejected. This changes no local/v1,
+managed, routing-v3 or hierarchy-job subset. See the
+[complete contract](DISTRIBUTED_QUERY.md#bidirectional-vertex-adjacency).

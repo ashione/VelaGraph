@@ -45,6 +45,7 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
             step,
             Step::Existing(GremlinStep::Out(_))
                 | Step::Existing(GremlinStep::In(_))
+                | Step::Existing(GremlinStep::Both(_))
                 | Step::Repeat { .. }
         )
     }) else {
@@ -58,6 +59,7 @@ pub(super) fn join_at(query: &GremlinQuery) -> Result<Option<usize>, QueryFailur
         match step {
             Step::Existing(GremlinStep::Out(_))
             | Step::Existing(GremlinStep::In(_))
+            | Step::Existing(GremlinStep::Both(_))
             | Step::Existing(GremlinStep::Has { .. })
             | Step::Existing(GremlinStep::HasLabel(_))
             | Step::Existing(GremlinStep::Limit(_))

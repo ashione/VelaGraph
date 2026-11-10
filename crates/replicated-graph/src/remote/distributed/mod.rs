@@ -7,6 +7,8 @@ use rocksdb_sql_table::{
     Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
+mod adjacency;
+use adjacency::Direction;
 pub(in crate::remote) mod channel;
 pub mod consistency;
 mod hierarchy;
@@ -362,6 +364,7 @@ fn plan(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
             // steps. All hops share this execution's sessions, deadline and cost.
             Step::Existing(GremlinStep::Out(_))
             | Step::Existing(GremlinStep::In(_))
+            | Step::Existing(GremlinStep::Both(_))
             | Step::Dedup
             | Step::Repeat { .. } => {}
             Step::Existing(GremlinStep::Has { .. })
@@ -551,63 +554,6 @@ impl Execution<'_> {
         Ok(edges)
     }
 
-    async fn expand(
-        &mut self,
-        rows: Vec<Traverser>,
-        incoming: bool,
-        label: Option<&str>,
-    ) -> Result<Vec<Traverser>, QueryFailure> {
-        let mut next = Vec::new();
-        for row in rows {
-            let edges = if incoming {
-                self.incoming(row.vertex, label).await?
-            } else {
-                let FragmentValue::Edges(edges) = self.fragment(Fragment::Out(row.vertex)).await?
-                else {
-                    return Err(QueryFailure::IncompleteOrCorrupt);
-                };
-                edges
-            };
-            if edges.len() > 1000
-                || edges
-                    .windows(2)
-                    .any(|w| (w[0].id, w[0].from.partition) >= (w[1].id, w[1].from.partition))
-            {
-                return Err(QueryFailure::IncompleteOrCorrupt);
-            }
-            for edge in edges {
-                if (if incoming { edge.to } else { edge.from }) != row.vertex {
-                    return Err(QueryFailure::IncompleteOrCorrupt);
-                }
-                // Incoming validation already checked both sides before
-                // filtering. Outgoing expansion still needs target verification.
-                if !incoming && !self.boolean(Fragment::VerifyReverse(edge.clone())).await? {
-                    return Err(QueryFailure::IncompleteOrCorrupt);
-                }
-                if label.is_some_and(|l| l != edge.label) {
-                    continue;
-                }
-                self.cost.charge(row.path.len() * 32, 0, self.ceiling)?;
-                let mut path = row.path.clone();
-                path.push(QualifiedElement::Edge {
-                    partition: edge.from.partition,
-                    id: edge.id,
-                });
-                let vertex = if incoming { edge.from } else { edge.to };
-                path.push(vertex.element());
-                push(
-                    &mut next,
-                    Traverser {
-                        vertex,
-                        path,
-                        value: None,
-                    },
-                    &mut self.cost,
-                )?;
-            }
-        }
-        Ok(next)
-    }
     // Shared scalar projection for explicit-ID, joined and bounded scan roots.
     async fn values(
         &mut self,
@@ -694,11 +640,12 @@ impl Execution<'_> {
                     rows = dedup_vertices(rows, &mut self.cost, self.end)?;
                 }
                 Step::Existing(GremlinStep::Out(label))
-                | Step::Existing(GremlinStep::In(label)) => {
+                | Step::Existing(GremlinStep::In(label))
+                | Step::Existing(GremlinStep::Both(label)) => {
                     rows = self
                         .expand(
                             rows,
-                            matches!(step, Step::Existing(GremlinStep::In(_))),
+                            Direction::from_step(step).ok_or(QueryFailure::Unsupported)?,
                             label.as_deref(),
                         )
                         .await?;
@@ -1181,11 +1128,11 @@ fn validate_output(
                 matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
                     && directions.iter().any(|directions| {
                         p.len() == 1 + 2 * directions.len()
-                        && p.windows(3).step_by(2).zip(directions).all(|(hop, incoming)| {
+                        && p.windows(3).step_by(2).zip(directions).all(|(hop, direction)| {
                             matches!(hop,
                                 [QualifiedElement::Vertex { partition: source, .. },
                                  QualifiedElement::Edge { partition: owner, .. },
-                                 QualifiedElement::Vertex { partition: target, .. }] if owner == if *incoming { target } else { source })
+                                 QualifiedElement::Vertex { partition: target, .. }] if direction.admits_owner(*owner, *source, *target))
                         })
                     })
             }
@@ -1254,7 +1201,9 @@ mod tests {
     fn plan_is_validated_before_empty_stream_can_hide_unsupported_steps() {
         for text in [
             "g.E(1)",
-            "g.V(999).both()",
+            "g.V(999).both('a','b')",
+            "g.V(999).values('a').both()",
+            "g.V(999).repeat(__.both()).times(2)",
             "g.V(999).values('a').has('a')",
             "g.V(999).id()",
             "g.V(999).values('a').dedup()",
@@ -1267,6 +1216,10 @@ mod tests {
             assert!(plan(&request(text)).is_err(), "{text}");
         }
         for text in [
+            "g.V(999).both()",
+            "g.V(1,1).both('a').path()",
+            "g.V(1).both().in().both().path()",
+            "g.V(1).both().repeat(__.in()).times(31).path()",
             "g.V(1,1).out('a').path()",
             "g.V(1).out().out().out().path()",
             "g.V(1).in().out().in().path()",
@@ -1281,6 +1234,8 @@ mod tests {
     #[test]
     fn hop_admission_is_bounded_even_for_empty_or_limited_queries() {
         for text in [
+            "g.V(999).both().both().both().both().count()",
+            "g.V(999).both().repeat(__.in()).times(32).count()",
             "g.V(999).out().out().out().out().count()",
             "g.V(1).limit(1).out().out().out().out()",
         ] {

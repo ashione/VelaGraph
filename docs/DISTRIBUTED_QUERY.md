@@ -15,16 +15,16 @@ not report or imply a metadata sequence. Restart/reconfigure the service to
 change its routes; this prototype is not online migration or automatic discovery.
 
 The client sends `DistributedRequest { start_partition, text, timeout_millis }`.
-The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` / `in()`
+The bounded subset accepts explicit `g.V(id, ...)` starts, up to three `out()` / `in()` / `both()`
 steps, each optionally label-filtered, order-preserving `hasLabel`, `has`, `limit`, vertex-identity `dedup()`, terminal `path` or
 `count`, and `values(key)` followed only by `limit`/`count`. Unsupported start and
 step forms fail explicitly through the official parser. A separately specified
 [native bounded hierarchy repeat](SERVER_HIERARCHY.md) adds one repeated
 single-adjacency body, mandatory depth 1..32, and optional post-emit. A separate [global vertex scan](SERVER_GLOBAL_SCAN.md) supports `g.V()` with
 filters/limit/count and its own explicit bounded budget; its
-[bounded composition](GLOBAL_VERTEX_TRAVERSAL.md) can feed out/in with
+[bounded composition](GLOBAL_VERTEX_TRAVERSAL.md) can feed out/in/both with
 filters, limits, dedup and terminal count/valueMap. No global E scan,
-`both()`, mutation, alternate query dialect or textual
+mutation, alternate query dialect or textual
 query rewriting is provided by this slice.
 
 Examples:
@@ -120,7 +120,7 @@ Parallel edges and duplicate input IDs retain multiplicity unless an explicit
 retain qualified vertex and edge identities at every hop, so equal local IDs in
 different partitions remain distinct. Cycles and revisiting a shard are allowed:
 each hop uses the original retained session, never a newly acquired snapshot.
-The official parser rejects more than three ordinary unrolled incoming/outgoing
+The official parser rejects more than three ordinary unrolled incoming/outgoing/bidirectional
 hops before any session is opened, even for a missing start or a preceding
 `limit(1)`. The explicit bounded-repeat extension has its separately documented
 maximum expanded depth of 32; it does not enlarge traversal resource budgets.
@@ -294,3 +294,39 @@ response. Batch starts remain scoped to `start_partition`; join results may
 cross shards. Each vertex uses one multi-field Project leaf on its already
 retained snapshot. This is sequential bounded fetching, not a new cross-shard
 parallel projection executor. See [normative map semantics](QUERY_SPEC.md#distributed-synchronous-selected-property-maps).
+
+## Bidirectional vertex adjacency
+
+Standard `both()` / `both(label)` uses the same data-local Out/In fragments and
+canonical/reverse/endpoint verification as out/in. Explicit-ID and global scan
+compositions support it before/after filters, limits, vertex dedup, ordinary
+hops and one existing out/in repeat. The three ordinary-hop cap and combined
+32-depth cap include each both step once. Repeat-body both, global path, edge
+starts, and scalar dedup remain unsupported before any session is opened.
+
+For each input vertex, outgoing and incoming lists merge by `(edge ID, canonical
+source partition)`. Only the same exact self-loop is coalesced once per input.
+Distinct parallel edges and same-number edges under different source partitions
+remain separate; repeated input traversers repeat their full ordered expansion.
+Paths retain the canonical owner even when walking an incoming edge. Qualified
+vertex dedup, filters, limits and projections keep their original positions.
+Both directions are validated before label selection; even an excluded edge can
+fail with corruption, and later limit/count/dedup cannot suppress that error.
+
+Each direction retains the existing 1,000-entry/1 MiB primitive bound. Both may
+therefore inspect at most 2,000 entries per input, further limited by cumulative
+query work and bytes. The merge consumes these bounded, already accounted lists
+without a concatenated buffer or identity set; each merge iteration consumes at
+least one entry and charges one work unit. The ordinary row/path charges apply
+to every retained traverser. Cumulative charges are never refunded. The original
+five-second deadline, fixed sessions, default cap, 10,000 rows/work units and
+64 MiB traversal allowance are unchanged. Global scans keep their separate
+allowance and no implicit final cap.
+
+This is an additive coordinator execution capability with no new wire or disk
+variant. Upgrade coordinator and validating client together; older coordinators
+reject both and older clients reject responses to locally unsupported query
+shapes. Existing data-node fragments are reused unchanged. Results remain
+Unverified observations, not certified managed V or multi-host HA evidence.
+Independent process tests compare fixture-derived ordered identities and paths,
+self-loops/parallel edges/owner ties, corruption and cumulative failure paths.

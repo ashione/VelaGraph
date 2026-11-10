@@ -2,6 +2,8 @@
 use serde_json::{json, Value};
 #[path = "batch_relationships.rs"]
 mod batch_relationships;
+#[path = "bidirectional.rs"]
+mod bidirectional;
 #[path = "global_relationships.rs"]
 mod global_relationships;
 #[path = "sync_projection.rs"]
@@ -630,6 +632,7 @@ impl Model {
                 case["server_supported"] = json!(true);
             }
         }
+        q.extend(bidirectional::queries(self));
         q.extend(batch_relationships::queries(self));
         q.extend(sync_projection::queries(self));
         q.extend(global_relationships::queries(self));
@@ -659,7 +662,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 116);
+    assert_eq!(q.len(), 122);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     // Fixed-version v3 now supports element dedup. Keep these independent
     // relationship-list oracles enabled instead of masking them as rejections.
