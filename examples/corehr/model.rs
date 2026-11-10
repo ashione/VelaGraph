@@ -659,7 +659,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 113);
+    assert_eq!(q.len(), 116);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     // Fixed-version v3 now supports element dedup. Keep these independent
     // relationship-list oracles enabled instead of masking them as rejections.
@@ -686,7 +686,7 @@ fn dedup_oracle_is_nonvacuous() {
         assert!(get(name).get("expected").is_some(), "{name}");
     }
     // Dedup does not expand the fixed-version client's repeat or valueMap
-    // grammar. Scalar dedup is still explicitly rejected.
+    // grammar. Scalar dedup is supported by the client but not the coordinator.
     for name in [
         "native_duplicate_ancestor_dedup_paths",
         "project_unique_departments",
@@ -694,7 +694,19 @@ fn dedup_oracle_is_nonvacuous() {
     ] {
         assert_eq!(get(name)["client_expect_unsupported"], true, "{name}");
     }
-    assert_eq!(get("global_scan_reject_scalar_dedup")["expect_error"], true);
+    for name in [
+        "global_scan_reject_scalar_dedup",
+        "client_scalar_name_dedup",
+        "client_scalar_id_dedup",
+        "client_scalar_label_dedup",
+    ] {
+        let scalar = get(name);
+        assert_ne!(scalar["expect_error"], true, "{name}");
+        assert_ne!(scalar["client_expect_unsupported"], true, "{name}");
+        assert!(scalar.get("client_expected").is_some(), "{name}");
+        assert_eq!(scalar["server_supported"], false, "{name}");
+        assert_eq!(scalar["server_expected_error"], "Unsupported", "{name}");
+    }
     let global_path = get("global_join_reject_path");
     assert_ne!(global_path["expect_error"], true);
     assert_ne!(global_path["client_expect_unsupported"], true);

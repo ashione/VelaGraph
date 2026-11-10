@@ -219,9 +219,38 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
     cases.push(
         json!({"name":"global_scan_reject_scalar_dedup","partition":1,
         "query":"g.V().hasLabel('person').limit(1).values('name').dedup().count()",
-        "expect_error":true,"client_expect_unsupported":false,
+        "client_expected":{"count":usize::from(m.people > 0)},
         "server_supported":false,"server_expected_error":"Unsupported"}),
     );
+    // These explicit starts are all in one partition. Derive the complete
+    // first-occurrence scalar result from the input IDs, never engine output.
+    let starts = [26, 20, 26, 23];
+    assert!(starts.iter().all(|id| partition(*id) == partition(20)));
+    let ids = unique(starts.to_vec());
+    for (name, projection, values) in [
+        (
+            "client_scalar_name_dedup",
+            "values('name')",
+            ids.iter()
+                .map(|id| json!({"Text":format!("Employee-{id:06}")}))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "client_scalar_id_dedup",
+            "id()",
+            ids.iter().map(|id| json!({"Integer":id})).collect(),
+        ),
+        (
+            "client_scalar_label_dedup",
+            "label()",
+            vec![json!({"Text":"person"})],
+        ),
+    ] {
+        cases.push(json!({"name":name,"partition":partition(20),
+            "query":format!("g.V(26,20,26,23).{projection}.dedup()"),
+            "client_expected":{"values":values},
+            "server_supported":false,"server_expected_error":"Unsupported"}));
+    }
     // Global paths remain outside the coordinator subset, but are supported by
     // fixed-version v3. Derive the client path from source order and input edges.
     let first = source(m, false)
@@ -256,11 +285,38 @@ fn global_relationship_oracles_are_nonvacuous() {
         let m = Model::new(people, departments);
         let q = queries(&m);
         let get = |name: &str| q.iter().find(|r| r["name"] == name).unwrap();
-        assert_eq!(q.len(), 23);
-        assert_eq!(get("global_scan_reject_scalar_dedup")["expect_error"], true);
+        assert_eq!(q.len(), 26);
+        for name in [
+            "global_scan_reject_scalar_dedup",
+            "client_scalar_name_dedup",
+            "client_scalar_id_dedup",
+            "client_scalar_label_dedup",
+        ] {
+            let case = get(name);
+            assert_ne!(case["expect_error"], true);
+            assert_ne!(case["client_expect_unsupported"], true);
+            assert_eq!(case["server_supported"], false);
+            assert_eq!(case["server_expected_error"], "Unsupported");
+        }
         assert_eq!(
-            get("global_scan_reject_scalar_dedup")["client_expect_unsupported"],
-            false
+            get("global_scan_reject_scalar_dedup")["client_expected"],
+            json!({"count":1})
+        );
+        assert_eq!(
+            get("client_scalar_name_dedup")["client_expected"],
+            json!({"values":[
+                {"Text":"Employee-000026"}, {"Text":"Employee-000020"}, {"Text":"Employee-000023"}
+            ]})
+        );
+        assert_eq!(
+            get("client_scalar_id_dedup")["client_expected"],
+            json!({"values":[
+                {"Integer":26}, {"Integer":20}, {"Integer":23}
+            ]})
+        );
+        assert_eq!(
+            get("client_scalar_label_dedup")["client_expected"],
+            json!({"values":[{"Text":"person"}]})
         );
         assert!(
             get("global_repeat_named_ancestors")["expected"]["vertices"]

@@ -66,8 +66,11 @@ filtered members, colleagues through departments (bag semantics), count,
 projection and explicit limits. Unsupported recursive `repeat`, sorting,
 predicates and `range` pagination must reject explicitly. Fixed-version v3
 element `dedup()` now runs against the same independent relationship-list
-oracles, including first-path and limit-placement checks. Scalar dedup remains
-unsupported.
+oracles, including first-path and limit-placement checks. The client v3 path
+also checks scalar values/label/id dedup against complete input-derived results,
+including repeated starts and first-occurrence order. The separate server
+coordinator retains explicit Unsupported for those same scalar compositions;
+its smaller subset is not expanded by the shared routing-v3 implementation.
 Department member queries use an explicit 1,000-row limit; no claim is made that
 this is an unbounded membership listing. Paged storage verification does not
 mean Gremlin supports continuation tokens or offset pagination.
