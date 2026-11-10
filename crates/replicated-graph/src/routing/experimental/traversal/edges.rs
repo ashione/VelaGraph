@@ -80,6 +80,29 @@ fn start_row(element: ObservedElementRef) -> ElementRow {
         value: None,
     }
 }
+fn dedup_elements(
+    rows: Vec<ElementRow>,
+    work: &mut Work,
+    mut check: impl FnMut() -> ExperimentalResult<()>,
+) -> ExperimentalResult<Vec<ElementRow>> {
+    // Whole-AST validation guarantees one element kind. Preserve the first
+    // row/path, not set iteration order; the key includes the owning partition.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut next = Vec::new();
+    for row in rows {
+        check()?;
+        work.visit()?;
+        let identity = row.element.order();
+        if !seen.contains(&identity) {
+            // Admit identity retention before allocating a tree entry. Charges
+            // are cumulative and are not refunded when duplicates are removed.
+            work.charge(128)?;
+            seen.insert(identity);
+            push_element(&mut next, row, work)?;
+        }
+    }
+    Ok(next)
+}
 /// Validate stream types before acquisition, including empty streams. No runtime
 /// row can turn an invalid vertex/edge transition into an apparent success.
 pub(crate) fn validate_steps(
@@ -108,6 +131,7 @@ pub(crate) fn validate_steps(
             ));
         }
         match step {
+            Step::Dedup => {}
             Step::Repeat { .. } => {
                 return Err(ExperimentalRouteError::Unsupported(
                     "repeat is only supported by the server coordinator",
@@ -303,6 +327,7 @@ pub(crate) trait TraversalRead {
         for step in query.steps() {
             self.check()?;
             match step {
+                Step::Dedup => rows = dedup_elements(rows, &mut work, || self.check())?,
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
                 Step::Existing(GremlinStep::Path | GremlinStep::Count) => {}
                 Step::OutE(label)
@@ -570,6 +595,72 @@ impl ExperimentalReadSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_preflights_element_and_scalar_streams() {
+        for text in [
+            "g.V().dedup().out().dedup().path()",
+            "g.E().dedup().bothV().dedup().count()",
+            "g.V(999).outE().dedup().id()",
+        ] {
+            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            validate_steps(&query).unwrap();
+        }
+        for text in [
+            "g.V(999).values('missing').dedup()",
+            "g.E(999).label().dedup()",
+            "g.V(999).id().dedup()",
+        ] {
+            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            assert!(validate_steps(&query).is_err(), "{text}");
+        }
+        for text in [
+            "g.V().dedup('a')",
+            "g.V().dedup(local)",
+            "g.V().dedup().by('name')",
+            "g.V().path().dedup()",
+        ] {
+            assert!(
+                rocksdb_sql_table::ObservedGremlinQuery::parse(text).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_charges_duplicates_retention_and_cancellation() {
+        let row = || {
+            start_row(ObservedElementRef::Vertex(VertexRef {
+                partition: 1,
+                id: 7,
+            }))
+        };
+        let mut work = Work {
+            visits: 9_998,
+            bytes: 0,
+        };
+        let result = dedup_elements(vec![row(), row()], &mut work, || Ok(())).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(work.visits, 10_000);
+        assert_eq!(work.bytes, 256 + std::mem::size_of::<ObservedPathElement>());
+        assert!(matches!(
+            dedup_elements(vec![row()], &mut work, || Ok(())),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        let mut work = Work {
+            visits: 0,
+            bytes: 64 * 1024 * 1024 - 1,
+        };
+        assert!(dedup_elements(vec![row()], &mut work, || Ok(())).is_err());
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        assert!(dedup_elements(vec![row()], &mut work, || Err(limit("expired"))).is_err());
+        assert_eq!(work.visits, 0);
+    }
 
     #[test]
     fn client_observed_executor_rejects_server_only_repeat_before_reads() {

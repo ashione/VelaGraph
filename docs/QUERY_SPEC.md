@@ -350,7 +350,8 @@ standard no-argument `dedup()` on vertex streams. It compares partition-qualifie
 identity, retains the first traverser/path in input order, and permits subsequent
 vertex steps or terminal `count()`. Scalar/path/edge deduplication, scopes,
 arguments and `by()` are explicitly unsupported. This additive observed AST step
-does not enlarge the v0 subset table or client-side observed executor. All
+does not enlarge the v0 subset table. The routing-v3 extension is described
+below; older observed executors remain unchanged. All
 upstream validation and cumulative resource limits still apply before dedup.
 
 ### Experimental server global V scan
@@ -526,7 +527,13 @@ v3 semantics. `id()` emits Integer(i64) with qualified vertex/edge provenance;
 only limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
 (mapped to Unsupported by the managed gateway), without wrapping or partial rows.
 A later limit/count cannot hide overflow; an earlier limit restricts the input
-at its original position. Repeat/dedup/valueMap and other unsupported steps reject.
+at its original position. Repeat/valueMap and other unsupported steps reject.
+Standard no-argument dedup is supported on vertex and edge streams, preserving
+the first qualified identity, path and order. Scalar/path dedup and modulators
+remain unsupported, even on empty input. Every input is charged as work and every
+retained identity is admitted before allocation under the existing cumulative
+budgets; upstream errors cannot be hidden. See MANAGED_FIXED_TRAVERSALS.md for
+the identity, limit-position and memory-accounting contract.
 
 Every primitive uses the same V. Pagination fully evaluates and bounds the
 result, then validates all page envelopes before emitting the first page. One

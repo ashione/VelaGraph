@@ -535,3 +535,12 @@ explicit full-proof/snapshot boundaries. Test presence does not claim acceptance
 限定分区的来源身份、等值 bag 和 missing/Null 区别；missing 不补扫以填满 limit。
 复用原固定会话与标量执行器，扫描/遍历预算独立累计，无格式或一致性变化。
 无显式 limit 的 values、标量后处理仍拒绝。见 [扫描契约](SERVER_GLOBAL_SCAN.md)。
+
+### Qualified element dedup in fixed-version traversals
+
+Shared routing-v3 and managed Traverse/TraversePage now support no-argument
+vertex/edge `dedup()`, preserving qualified identity, first path and ordered
+filter/limit placement. Scalar dedup and modulators remain unsupported. Existing
+work/bytes, fixed-V and complete-result cursor limits remain; this is a general
+query composition, not a managed-capacity, storage or recovery change. See
+[contract](MANAGED_FIXED_TRAVERSALS.md#qualified-element-deduplication).

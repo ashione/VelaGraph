@@ -42,7 +42,7 @@ The external query is ordinary Gremlin text plus partition routing context:
   place. Count runs before the implicit default result cap.
 - With no explicit limit, non-count results have the existing default cap of
   100. Explicit limits are 1..=1000. Internal caps never produce partial success.
-- Repeat, dedup, valueMap, mutations, and unsupported compositions reject
+- Repeat, valueMap, mutations, and unsupported compositions reject
   before data reads, including empty streams. The original smaller `Read` API,
   including its id projection, is unchanged. This is not a second query dialect.
 
@@ -144,3 +144,28 @@ before even empty input. Existing work/bytes, result and session limits remain.
 The same fixed V supplies elements and IDs; scalar result pages retain the existing
 immutable result and cursor rules. Clients validate each integer against its exact
 qualified source ID. No new protocol, storage or consistency contract is added.
+
+## Qualified element deduplication
+
+Standard no-argument `dedup()` now applies to vertex or edge streams in the
+shared routing-v3 executor and managed Traverse/TraversePage. Identity is
+`(partition, local ID)`; an edge belongs to its source partition. Same-number
+vertices/edges in different partitions remain distinct, and parallel edges with
+different IDs remain distinct. The first occurrence retains its complete path
+and input position. Filters, limits and dedup execute where written; expansion
+after dedup produces ordinary bags again. A self-loop's two bothV endpoints
+collapse only when an explicit downstream dedup is present.
+
+Scalar/path dedup, scopes, arguments and by modulators remain unsupported,
+including empty streams. The old Read operation and legacy observed v1/v2
+entrypoints are unchanged. Parser admission, hop count, defaults and all existing
+row/work/byte/deadline limits remain. Each input consumes one work unit, and each
+new identity consumes 128 accounted bytes before insertion, plus the existing
+row/path charge for retaining its first row. At most 10,000 input rows and keys
+can be inspected/retained by a step, further limited by remaining cumulative
+budgets. No upstream integrity or resource failure is erased by dedup.
+
+Managed execution and all pages use the same retained V and complete-result
+cursor rules. Observed results remain Unverified. This adds no wire or disk
+variant, refresh, retry or capacity increase. Older executors explicitly reject
+these query compositions; upgrade the executor to use them.

@@ -41,7 +41,8 @@ and certification of a common initial baseline remain unfinished.
 
 The restricted managed gateway additionally offers [fixed-version traversals and
 complete-result pages](docs/MANAGED_FIXED_TRAVERSALS.md), reusing the bounded
-routing-v3 Gremlin executor over one certified cohort snapshot. This does not
+routing-v3 Gremlin executor over one certified cohort snapshot, including
+partition-qualified vertex/edge `dedup()` with first-path preservation. This does not
 enable the unrestricted GlobalCommittedSnapshot API or certify arbitrary writers,
 nonempty baselines or dynamic routing. Optional
 [submission phase timing](docs/MANAGED_SUBMISSION_TIMING.md) provides bounded,
