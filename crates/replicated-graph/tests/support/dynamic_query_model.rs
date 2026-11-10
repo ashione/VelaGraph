@@ -492,6 +492,29 @@ pub(super) async fn scenario(
             retained.query,
         )
         .await?;
+        assert_ne!(new.session.incarnation, retained.session.incarnation);
+        // The old descriptor may also have expired during history replay.
+        // Isolate incarnation fencing with a live new token/V and new cursor,
+        // changing only the incarnation. This cannot pass merely due to expiry
+        // of the original retained session; the live session is checked below.
+        let mut wrong_incarnation = new.session.clone();
+        wrong_incarnation.incarnation = retained.session.incarnation;
+        assert_eq!(
+            call(
+                &restarted,
+                Operation::TraversePage {
+                    session: wrong_incarnation,
+                    query: Query {
+                        partition: 7,
+                        text: new.query.into()
+                    },
+                    cursor: new.first.next.clone(),
+                    page_size: 1,
+                }
+            )
+            .await,
+            Err(gateway::Error::SessionUnavailable)
+        );
         assert_eq!(
             call(
                 &restarted,

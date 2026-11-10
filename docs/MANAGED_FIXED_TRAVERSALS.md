@@ -244,7 +244,10 @@ No assertion assumes a particular internal write/read scheduling order.
 All 22 model versions, including the empty model before construction, are
 reacquired and compared before and after restarting the gateway and all three
 children. Old sessions and transplanted old-incarnation cursors must reject;
-fresh historical sessions still reproduce the model. This exercises durable
+fresh historical sessions still reproduce the model. To distinguish incarnation
+fencing from an old session's possible TTL expiry, a live new session/token and
+cursor with only the old incarnation substituted must reject, while the
+unchanged new session succeeds. This exercises durable
 reopen, not snapshot installation, purge safety, partial-apply fault injection
 or full-scale capacity. Existing separate tests retain their fault/recovery
 coverage. This small same-host semantic test does not complete #110/#111 or
