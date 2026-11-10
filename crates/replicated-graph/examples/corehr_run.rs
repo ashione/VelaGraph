@@ -404,7 +404,11 @@ async fn main() -> anyhow::Result<()> {
                 let t = Instant::now();
                 let result = s.observed_gremlin_v3(c["partition"].as_u64().unwrap() as u32, query);
                 let client_unsupported = c["client_expect_unsupported"].as_bool() == Some(true);
-                let expect_error = c["expect_error"].as_bool() == Some(true) || client_unsupported;
+                // Explicit client results can differ from a server budget
+                // rejection; never infer the client's budget from the server.
+                let expect_error = c.get("client_expected").is_none()
+                    && (c["expect_error"].as_bool() == Some(true) || client_unsupported
+                        || c.get("client_expected_error").is_some());
                 let report = match result {
                     Ok(output) => {
                         ensure!(!expect_error, "unexpected success {query}");
@@ -416,6 +420,17 @@ async fn main() -> anyhow::Result<()> {
                     },
                     Err(e) => {
                         ensure!(expect_error, "unexpected client error {query}: {e:?}");
+                        if let Some(expected) = c["client_expected_error"].as_str() {
+                            let category = match &e {
+                                ExperimentalRouteError::Unsupported(_)
+                                | ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
+                                    | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
+                                    | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)) => "Unsupported",
+                                ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(_)) => "ResourceExhausted",
+                                _ => "Unexpected",
+                            };
+                            ensure!(category == expected, "client error category {category} != {expected}: {query}: {e:?}");
+                        }
                         if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "server-only client case must explicitly reject Unsupported: {e:?}"); }
                         ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
                             ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)

@@ -174,7 +174,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         "global_repeat_named_ancestors",
         format!("{prefix}.repeat(__.out('reports_to')).times(32).emit()"),
         vertices(&ancestors),
-        None,
+        Some(vertices(&ancestors)),
     );
     let filtered: Vec<_> = ancestors
         .iter()
@@ -188,33 +188,34 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         "global_repeat_exact_depth",
         format!("{prefix}.repeat(__.out('reports_to')).times(4)"),
         vertices(&exact),
-        None,
+        Some(vertices(&exact)),
     );
     let descendants = repeat(&[1], "reports_to", false, 3, true);
-    add("global_repeat_named_descendant_count", "g.V().has('name','Employee-000001').limit(1).repeat(__.in('reports_to')).times(3).emit().count()".into(), json!({"count":descendants.len()}), None);
+    add("global_repeat_named_descendant_count", "g.V().has('name','Employee-000001').limit(1).repeat(__.in('reports_to')).times(3).emit().count()".into(), json!({"count":descendants.len()}), Some(json!({"count":descendants.len()})));
     let roots = selected(true);
     let shared = repeat(&roots, "reports_to", true, 4, true);
+    let client_shared = repeat(&selected(false), "reports_to", true, 4, true);
     let prefix = "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).repeat(__.out('reports_to')).times(4).emit()";
     add(
         "global_repeat_multi_root_bag",
         format!("{prefix}.count()"),
         json!({"count":shared.len()}),
-        None,
+        Some(json!({"count":client_shared.len()})),
     );
     add(
         "global_repeat_multi_root_unique",
         format!("{prefix}.dedup().count()"),
         json!({"count":unique(shared).len()}),
-        None,
+        Some(json!({"count":unique(client_shared).len()})),
     );
     let departments = m.hop(&[20], "member_of", true);
     let parents = unique(repeat(&departments, "parent_department", true, 4, true));
-    add("global_repeat_membership_then_department_hierarchy", "g.V().has('name','Employee-000020').limit(1).out('member_of').repeat(__.out('parent_department')).times(4).emit().dedup()".into(), vertices(&parents), None);
+    add("global_repeat_membership_then_department_hierarchy", "g.V().has('name','Employee-000020').limit(1).out('member_of').repeat(__.out('parent_department')).times(4).emit().dedup()".into(), vertices(&parents), Some(vertices(&parents)));
     add(
         "global_repeat_missing_root",
         "g.V().has('name','NoSuchEmployee').repeat(__.out()).times(32).count()".into(),
         json!({"count":0}),
-        None,
+        Some(json!({"count":0})),
     );
     cases.push(
         json!({"name":"global_scan_reject_scalar_dedup","partition":1,
@@ -286,6 +287,44 @@ fn global_relationship_oracles_are_nonvacuous() {
         let q = queries(&m);
         let get = |name: &str| q.iter().find(|r| r["name"] == name).unwrap();
         assert_eq!(q.len(), 26);
+        for name in [
+            "global_repeat_named_ancestors",
+            "global_repeat_exact_depth",
+            "global_repeat_named_descendant_count",
+            "global_repeat_multi_root_bag",
+            "global_repeat_multi_root_unique",
+            "global_repeat_membership_then_department_hierarchy",
+            "global_repeat_missing_root",
+        ] {
+            let case = get(name);
+            assert_ne!(case["client_expect_unsupported"], true, "{name}");
+            assert!(case.get("client_expected").is_some(), "{name}");
+            assert_eq!(case["server_supported"], true, "{name}");
+        }
+        assert_eq!(
+            get("global_repeat_filtered_ancestor_maps")["client_expect_unsupported"],
+            true
+        );
+        // The client roots are selected in local-ID order, not the coordinator's
+        // partition-first order. Recompute only from fixture IDs and edges.
+        let mut frontier: Vec<_> = (1..=m.people)
+            .filter(|id| active(*id) && mix(*id ^ 0x434f554e545259).is_multiple_of(5))
+            .take(12)
+            .collect();
+        let mut emitted = Vec::new();
+        for _ in 0..4 {
+            frontier = m.hop(&frontier, "reports_to", true);
+            emitted.extend(frontier.iter().copied());
+        }
+        assert_eq!(
+            get("global_repeat_multi_root_bag")["client_expected"],
+            json!({"count":emitted.len()})
+        );
+        assert_eq!(
+            get("global_repeat_multi_root_unique")["client_expected"],
+            json!({"count":unique(emitted).len()})
+        );
+
         for name in [
             "global_scan_reject_scalar_dedup",
             "client_scalar_name_dedup",

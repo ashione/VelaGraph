@@ -424,6 +424,12 @@ fn observed(rows: &[ObservedRowV3]) -> Value {
     json!({"vertices":rows.iter().map(|r|match r{ObservedRowV3::Vertex(v)=>json!([v.partition,v.id]),_=>json!(format!("{r:?}"))}).collect::<Vec<_>>()})
 }
 fn server_rows(rows: &[QueryRow]) -> Value {
+    if matches!(rows.first(), Some(QueryRow::PropertyMap { .. })) {
+        return json!({"maps": rows.iter().map(|r| match r {
+            QueryRow::PropertyMap { source: QualifiedElement::Vertex { partition, id }, properties } => json!({"source":[partition,id],"properties":properties}),
+            _ => panic!("mixed projected rows"),
+        }).collect::<Vec<_>>()});
+    }
     if matches!(rows.first(), Some(QueryRow::Path(_))) {
         return json!({"paths": rows.iter().map(|r| match r { QueryRow::Path(p) => p.iter().map(|e| match e { QualifiedElement::Vertex{partition,id} => json!(["v",partition,id]), QualifiedElement::Edge{partition,id} => json!(["e",partition,id]) }).collect::<Vec<_>>(), _ => panic!("mixed path rows") }).collect::<Vec<_>>()});
     }
@@ -680,7 +686,11 @@ async fn main() -> anyhow::Result<()> {
                 let t = Instant::now();
                 let result = s.observed_gremlin_v3(c["partition"].as_u64().unwrap() as u32, query);
                 let client_unsupported = c["client_expect_unsupported"].as_bool() == Some(true);
-                let expect_error = c["expect_error"].as_bool() == Some(true) || client_unsupported;
+                // Explicit client results can differ from a server budget
+                // rejection; never infer the client's budget from the server.
+                let expect_error = c.get("client_expected").is_none()
+                    && (c["expect_error"].as_bool() == Some(true) || client_unsupported
+                        || c.get("client_expected_error").is_some());
                 let report = match result {
                     Ok(output) => {
                         ensure!(!expect_error, "unexpected success {query}");
@@ -692,6 +702,17 @@ async fn main() -> anyhow::Result<()> {
                     },
                     Err(e) => {
                         ensure!(expect_error, "unexpected client error {query}: {e:?}");
+                        if let Some(expected) = c["client_expected_error"].as_str() {
+                            let category = match &e {
+                                ExperimentalRouteError::Unsupported(_)
+                                | ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
+                                    | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
+                                    | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)) => "Unsupported",
+                                ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(_)) => "ResourceExhausted",
+                                _ => "Unexpected",
+                            };
+                            ensure!(category == expected, "client error category {category} != {expected}: {query}: {e:?}");
+                        }
                         if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "server-only client case must explicitly reject Unsupported: {e:?}"); }
                         ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
                             ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
@@ -876,4 +897,65 @@ async fn main() -> anyhow::Result<()> {
         "supported queries had {query_failures} failures"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocksdb_sql_table::Value as GraphValue;
+
+    #[test]
+    fn server_property_maps_preserve_qualified_sources_properties_and_bags() {
+        let properties = BTreeMap::from([
+            ("name".into(), vec![GraphValue::Text("Ada".into())]),
+            ("active".into(), vec![GraphValue::Boolean(true)]),
+            ("nullable".into(), vec![GraphValue::Null]),
+        ]);
+        let first = QueryRow::PropertyMap {
+            source: QualifiedElement::Vertex {
+                partition: 7,
+                id: 20,
+            },
+            properties,
+        };
+        let other_partition = QueryRow::PropertyMap {
+            source: QualifiedElement::Vertex {
+                partition: 8,
+                id: 20,
+            },
+            properties: BTreeMap::new(),
+        };
+        let expected_first = json!({
+            "source":[7,20],
+            "properties":{
+                "active":[{"Boolean":true}],
+                "name":[{"Text":"Ada"}],
+                "nullable":["Null"]
+            }
+        });
+        let output = server_rows(&[first.clone(), other_partition, first]);
+        assert_eq!(
+            output,
+            json!({"maps":[
+                expected_first.clone(), {"source":[8,20],"properties":{}}, expected_first
+            ]})
+        );
+        assert!(output["maps"][0]["properties"].get("missing").is_none());
+        assert_eq!(output["maps"][0], output["maps"][2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "mixed projected rows")]
+    fn server_property_maps_do_not_hide_mixed_rows() {
+        server_rows(&[
+            QueryRow::PropertyMap {
+                source: QualifiedElement::Vertex {
+                    partition: 7,
+                    id: 20,
+                },
+                properties: BTreeMap::new(),
+            },
+            QueryRow::Count(1),
+        ]);
+    }
 }

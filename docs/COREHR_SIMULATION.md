@@ -63,7 +63,9 @@ snapshot or cross-shard transaction is claimed.
 The small workload exercises the broader client-side observed Gremlin surface:
 manager/direct reports, three-hop ancestry, two-hop descendants, memberships,
 filtered members, colleagues through departments (bag semantics), count,
-projection and explicit limits. Unsupported recursive `repeat`, sorting,
+projection and explicit limits. Bounded native `repeat(out/in).times(1..32)`
+with optional post-body `emit()` now runs on client v3 against independently
+derived path and result oracles. Unbounded or unsupported repeat forms, sorting,
 predicates and `range` pagination must reject explicitly. Fixed-version v3
 element `dedup()` now runs against the same independent relationship-list
 oracles, including first-path and limit-placement checks. The client v3 path
