@@ -1801,3 +1801,6 @@ async fn submission_timing_cancellation_full_and_disconnected_sink_do_not_write(
 
 #[path = "managed_submission_timing_tests.rs"]
 mod submission_timing_tests;
+
+#[path = "managed_gateway_condition_tests.rs"]
+mod condition_tests;
