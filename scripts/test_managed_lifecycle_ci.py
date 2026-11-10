@@ -844,5 +844,20 @@ class HandoffTests(unittest.TestCase):
         self.assertNotIn('continue-on-error', text)
 
 
+class RunnerMetadataTests(unittest.TestCase):
+    def test_counter_units_and_unknown_telemetry(self):
+        with patch.object(gate.os, 'sysconf', side_effect=[100, 4096]):
+            info = gate.runner_metadata()
+            self.assertEqual(info['clock_ticks_per_second'], 100)
+            self.assertEqual(info['page_bytes'], 4096)
+        for values in ([ValueError(), OSError()], [-1, 0], [AttributeError(), ValueError()]):
+            with self.subTest(values=values), patch.object(gate.os, 'sysconf', side_effect=values), \
+                    patch.object(gate.os, 'cpu_count', return_value=None):
+                info = gate.runner_metadata()
+                self.assertIsNone(info['clock_ticks_per_second'])
+                self.assertIsNone(info['page_bytes'])
+                self.assertIsNone(info['logical_cpus'])
+
+
 if __name__ == '__main__':
     unittest.main()
