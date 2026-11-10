@@ -159,6 +159,29 @@ fn fixture() -> anyhow::Result<(Export, Vec<Vec<QueryRow>>)> {
         let mut v = Vertex::new(id);
         v.labels.push("person".into());
         v.properties.insert("name".into(), Value::Text(name.into()));
+        v.properties.insert("nullable".into(), Value::Null);
+        v.properties.insert(
+            "typed".into(),
+            if id == 1 {
+                Value::Integer(1)
+            } else {
+                Value::Real(1.0)
+            },
+        );
+        v.properties
+            .insert("zero".into(), Value::Real(if id == 1 { -0.0 } else { 0.0 }));
+        v.properties.insert(
+            "flag".into(),
+            if id == 1 {
+                Value::Boolean(true)
+            } else {
+                Value::Text("true".into())
+            },
+        );
+        v.properties.insert(
+            "unicode".into(),
+            Value::Text(if id == 1 { "é" } else { "e\u{301}" }.into()),
+        );
         v2.prepare_vertex(&v)?.submit(&node)?;
     }
     outside.prepare_vertex(&Vertex::new(3))?.submit(&node)?;
@@ -424,7 +447,86 @@ async fn scenario() -> anyhow::Result<()> {
         assert_eq!(output.completeness, QueryCompleteness::SinglePartition);
         assert!(bytes < 4096, "query returned {bytes} wire bytes for {text}");
     }
+    let scalar = |source, value| QueryRow::Value {
+        source: Some(source),
+        value,
+    };
+    let vertex = |id| QualifiedElement::Vertex { partition: 0, id };
+    let edge = |id| QualifiedElement::Edge { partition: 0, id };
     for (text, expected) in [
+        (
+            "g.V(1,2,1).values('typed').dedup()",
+            vec![
+                scalar(vertex(1), Value::Integer(1)),
+                scalar(vertex(2), Value::Real(1.0)),
+            ],
+        ),
+        (
+            "g.V(1,2,1).values('flag').dedup()",
+            vec![
+                scalar(vertex(1), Value::Boolean(true)),
+                scalar(vertex(2), Value::Text("true".into())),
+            ],
+        ),
+        (
+            "g.V(2,1,2).values('zero').dedup()",
+            vec![scalar(vertex(2), Value::Real(0.0))],
+        ),
+        (
+            "g.V(2,1,2).values('unicode').dedup()",
+            vec![
+                scalar(vertex(2), Value::Text("e\u{301}".into())),
+                scalar(vertex(1), Value::Text("é".into())),
+            ],
+        ),
+        (
+            "g.V(2,1,2).id().dedup()",
+            vec![
+                scalar(vertex(2), Value::Integer(2)),
+                scalar(vertex(1), Value::Integer(1)),
+            ],
+        ),
+        (
+            "g.V(2,1,2).values('name').dedup()",
+            vec![
+                scalar(vertex(2), Value::Text("bob".into())),
+                scalar(vertex(1), Value::Text("alice".into())),
+            ],
+        ),
+        (
+            "g.V(2,1,2).label().dedup()",
+            vec![scalar(vertex(2), Value::Text("person".into()))],
+        ),
+        (
+            "g.V(70,2,1).values('nullable').dedup()",
+            vec![scalar(vertex(2), Value::Null)],
+        ),
+        (
+            "g.E(9,9).values('since').dedup()",
+            vec![scalar(edge(9), Value::Integer(2026))],
+        ),
+        (
+            "g.E(9,9).id().dedup()",
+            vec![scalar(edge(9), Value::Integer(9))],
+        ),
+        (
+            "g.E(9,9).label().dedup()",
+            vec![scalar(edge(9), Value::Text("knows".into()))],
+        ),
+        (
+            "g.V(2,2,1).id().limit(2).dedup().count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            "g.V(2,2,1).id().dedup().limit(2).count()",
+            vec![QueryRow::Count(2)],
+        ),
+        ("g.V(999999).id().dedup()", vec![]),
+        ("g.E(999999).label().dedup()", vec![]),
+        (
+            "g.V(70).values('missing').dedup().count()",
+            vec![QueryRow::Count(0)],
+        ),
         (
             "g.V(1).out('knows').values('name')",
             vec![QueryRow::Value {
@@ -529,6 +631,7 @@ async fn scenario() -> anyhow::Result<()> {
         "g.E().count()",
         "g.V(2).out('cross').dedup().limit(1)",
         "g.E(10,10).dedup()",
+        "g.V(2).out('cross').id().dedup().limit(1)",
     ] {
         assert_eq!(
             query(
@@ -565,8 +668,10 @@ async fn scenario() -> anyhow::Result<()> {
         "the shared v3 extension does not expand v1"
     );
     for text in [
-        "g.V(999999).id().dedup()",
-        "g.E(999999).label().dedup()",
+        "g.V(999999).id().dedup().out()",
+        "g.E(999999).label().dedup().inV()",
+        "g.V(999999).values('missing').dedup().path()",
+        "g.V(1).values('name').dedup().hasLabel('person')",
         "g.V(999999).dedup('x')",
         "g.V(999999).dedup().by('name')",
     ] {

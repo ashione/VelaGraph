@@ -144,7 +144,7 @@ pub struct GremlinQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObservedGremlinStep {
     Existing(GremlinStep),
-    /// Qualified element identity deduplication; each executor admits its own subset.
+    /// Element/scalar deduplication; each executor admits its own subset.
     Dedup,
     /// Selected vertex properties; executed only by prepared hierarchy result jobs.
     ValueMap(Vec<String>),

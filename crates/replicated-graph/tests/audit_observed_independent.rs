@@ -255,8 +255,8 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             ])]
         );
         for query in [
-            "g.V(999).values('missing').dedup()",
-            "g.E(999).id().dedup()",
+            "g.V(999).values('missing').dedup().out()",
+            "g.E(999).id().dedup().inV()",
             "g.V(999).dedup('x')",
             "g.V(999).dedup().by('name')",
         ] {
@@ -290,6 +290,78 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
         );
         assert!(s.observed_gremlin_v3(1, "g.V(999).id()")?.rows.is_empty());
         assert!(s.observed_gremlin_v3(1, "g.V(999).id().out()").is_err());
+        for (text, expected) in [
+            ("g.V().id().dedup()", vec![value(Element::Vertex(vr(1)), 7)]),
+            (
+                "g.E().id().dedup()",
+                [9, 10, 11, 12]
+                    .map(|id| value(Element::Edge(er(1, id)), id as i64))
+                    .to_vec(),
+            ),
+            (
+                "g.E(9,9).bothV().id().dedup()",
+                vec![value(Element::Vertex(vr(1)), 7)],
+            ),
+            (
+                "g.E(9,9,10).id().limit(2).dedup()",
+                vec![value(Element::Edge(er(1, 9)), 9)],
+            ),
+            (
+                "g.E(9,9,10).id().dedup().limit(2)",
+                [9, 10]
+                    .map(|id| value(Element::Edge(er(1, id)), id as i64))
+                    .to_vec(),
+            ),
+            ("g.V(999).values('missing').dedup()", vec![]),
+            ("g.E(999).id().dedup()", vec![]),
+            ("g.E().id().dedup().dedup().count()", vec![R3::Count(4)]),
+            (
+                "g.E().values('missing').dedup().count()",
+                vec![R3::Count(0)],
+            ),
+        ] {
+            assert_eq!(s.observed_gremlin_v3(1, text)?.rows, expected, "{text}");
+        }
+        for (text, expected) in [
+            (
+                "g.E().values('x').dedup()",
+                vec![
+                    (9, rocksdb_sql_table::Value::Null),
+                    (10, rocksdb_sql_table::Value::Integer(1)),
+                ],
+            ),
+            (
+                "g.E().values('text').dedup()",
+                vec![(9, rocksdb_sql_table::Value::Text("同值".into()))],
+            ),
+            (
+                "g.E().values('real').dedup()",
+                vec![(9, rocksdb_sql_table::Value::Real(-0.0))],
+            ),
+            (
+                "g.E().values('bool').dedup()",
+                vec![(9, rocksdb_sql_table::Value::Boolean(true))],
+            ),
+            (
+                "g.E().label().dedup()",
+                vec![(9, rocksdb_sql_table::Value::Text("K".into()))],
+            ),
+        ] {
+            let actual = s.observed_gremlin_v3(1, text)?;
+            assert_eq!(
+                actual.rows,
+                expected
+                    .into_iter()
+                    .map(|(id, value)| R3::Value {
+                        source: Element::Edge(er(1, id)),
+                        value,
+                    })
+                    .collect::<Vec<_>>(),
+                "{text}"
+            );
+            assert_eq!(actual.snapshots, s.snapshots);
+            assert_eq!(actual.completeness, AdjacencyCompleteness::Unverified);
+        }
         let all_edges = s.observed_gremlin_v3(99, "g.E()")?;
         assert_eq!(
             all_edges.rows,
@@ -701,6 +773,8 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             "g.V(7).outE('Missing').count()",
             "g.V(7).bothE().dedup().limit(1)",
             "g.E().dedup().count()",
+            "g.E().id().dedup().count()",
+            "g.E().label().dedup().limit(1)",
             "g.E(99).inV()",
             "g.E(99).outV()",
             "g.E(99).bothV().count()",
@@ -878,6 +952,8 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
         for query in [
             "g.V().values('x').limit(0).count()",
             "g.V().values('x').out()",
+            "g.V().values('x').dedup()",
+            "g.V(999).label().dedup()",
             "g.V(999).label().has('x')",
             "g.V().values('missing').values('x')",
             "g.V().limit(0).label().path()",
@@ -960,6 +1036,12 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
         );
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({ids}).values('blob').limit(1)")),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        assert!(matches!(
+            edges.observed_gremlin_v3(1, &format!("g.E({ids}).values('blob').dedup().limit(1)")),
             Err(ExperimentalRouteError::Query(
                 rocksdb_sql_table::Error::TraversalLimitExceeded(_)
             ))

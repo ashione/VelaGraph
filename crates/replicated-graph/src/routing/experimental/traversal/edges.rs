@@ -80,24 +80,61 @@ fn start_row(element: ObservedElementRef) -> ElementRow {
         value: None,
     }
 }
-fn dedup_elements(
+// Non-text keys are allocation-free. Text keys use their own set so duplicate
+// lookups borrow str and unique payloads are charged before cloning.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum DedupKey {
+    Vertex(u64, u32),
+    Edge(u64, u32),
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Real(u64),
+}
+fn dedup_rows(
     rows: Vec<ElementRow>,
     work: &mut Work,
     mut check: impl FnMut() -> ExperimentalResult<()>,
 ) -> ExperimentalResult<Vec<ElementRow>> {
-    // Whole-AST validation guarantees one element kind. Preserve the first
-    // row/path, not set iteration order; the key includes the owning partition.
     let mut seen = std::collections::BTreeSet::new();
+    let mut text_seen = std::collections::BTreeSet::<String>::new();
     let mut next = Vec::new();
     for row in rows {
         check()?;
         work.visit()?;
-        let identity = row.element.order();
-        if !seen.contains(&identity) {
-            // Admit identity retention before allocating a tree entry. Charges
-            // are cumulative and are not refunded when duplicates are removed.
-            work.charge(128)?;
-            seen.insert(identity);
+        let fresh = if let Some(Value::Text(text)) = &row.value {
+            if text_seen.contains(text.as_str()) {
+                false
+            } else {
+                work.charge(128 + text.len())?;
+                text_seen.insert(text.clone());
+                true
+            }
+        } else {
+            let key = match &row.value {
+                None => match row.element {
+                    ObservedElementRef::Vertex(v) => DedupKey::Vertex(v.id, v.partition),
+                    ObservedElementRef::Edge(e) => DedupKey::Edge(e.id, e.partition),
+                },
+                Some(Value::Null) => DedupKey::Null,
+                Some(Value::Boolean(v)) => DedupKey::Boolean(*v),
+                Some(Value::Integer(v)) => DedupKey::Integer(*v),
+                // Records admit only finite reals. Preserve strict Value equality,
+                // including equal signed zeros, without coercing Integer to Real.
+                Some(Value::Real(v)) => DedupKey::Real(if *v == 0.0 { 0 } else { v.to_bits() }),
+                Some(Value::Text(_)) => unreachable!("text handled above"),
+            };
+            if seen.contains(&key) {
+                false
+            } else {
+                work.charge(128)?;
+                seen.insert(key);
+                true
+            }
+        };
+        if fresh {
+            // Keep the first complete row/provenance, never set iteration order.
+            // Charges are cumulative; removed duplicates do not refund budgets.
             push_element(&mut next, row, work)?;
         }
     }
@@ -115,19 +152,19 @@ pub(crate) fn validate_steps(
         if scalar
             && !matches!(
                 step,
-                Step::Existing(GremlinStep::Limit(_) | GremlinStep::Count)
+                Step::Dedup | Step::Existing(GremlinStep::Limit(_) | GremlinStep::Count)
             )
         {
             // Preserve the error variant of the former v3 -> v2 vertex dispatch.
             if matches!(query.start(), GremlinStart::Vertices(_)) {
                 return Err(ExperimentalRouteError::Query(
                     rocksdb_sql_table::Error::UnsupportedGremlinArgument(
-                        "only limit/count may follow a v2 scalar projection".into(),
+                        "only dedup/limit/count may follow a v2 scalar projection".into(),
                     ),
                 ));
             }
             return Err(ExperimentalRouteError::Unsupported(
-                "only limit/count may follow a v3 scalar projection",
+                "only dedup/limit/count may follow a v3 scalar projection",
             ));
         }
         match step {
@@ -327,7 +364,7 @@ pub(crate) trait TraversalRead {
         for step in query.steps() {
             self.check()?;
             match step {
-                Step::Dedup => rows = dedup_elements(rows, &mut work, || self.check())?,
+                Step::Dedup => rows = dedup_rows(rows, &mut work, || self.check())?,
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
                 Step::Existing(GremlinStep::Path | GremlinStep::Count) => {}
                 Step::OutE(label)
@@ -602,14 +639,17 @@ mod tests {
             "g.V().dedup().out().dedup().path()",
             "g.E().dedup().bothV().dedup().count()",
             "g.V(999).outE().dedup().id()",
+            "g.V(999).values('missing').dedup()",
+            "g.E(999).label().dedup().dedup().count()",
+            "g.V(999).id().limit(2).dedup().limit(1)",
         ] {
             let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
             validate_steps(&query).unwrap();
         }
         for text in [
-            "g.V(999).values('missing').dedup()",
-            "g.E(999).label().dedup()",
-            "g.V(999).id().dedup()",
+            "g.V(999).values('missing').dedup().out()",
+            "g.E(999).label().dedup().hasLabel('x')",
+            "g.V(999).id().dedup().path()",
         ] {
             let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
             assert!(validate_steps(&query).is_err(), "{text}");
@@ -639,12 +679,12 @@ mod tests {
             visits: 9_998,
             bytes: 0,
         };
-        let result = dedup_elements(vec![row(), row()], &mut work, || Ok(())).unwrap();
+        let result = dedup_rows(vec![row(), row()], &mut work, || Ok(())).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(work.visits, 10_000);
         assert_eq!(work.bytes, 256 + std::mem::size_of::<ObservedPathElement>());
         assert!(matches!(
-            dedup_elements(vec![row()], &mut work, || Ok(())),
+            dedup_rows(vec![row()], &mut work, || Ok(())),
             Err(ExperimentalRouteError::Query(
                 rocksdb_sql_table::Error::TraversalLimitExceeded(_)
             ))
@@ -653,13 +693,125 @@ mod tests {
             visits: 0,
             bytes: 64 * 1024 * 1024 - 1,
         };
-        assert!(dedup_elements(vec![row()], &mut work, || Ok(())).is_err());
+        assert!(dedup_rows(vec![row()], &mut work, || Ok(())).is_err());
         let mut work = Work {
             visits: 0,
             bytes: 0,
         };
-        assert!(dedup_elements(vec![row()], &mut work, || Err(limit("expired"))).is_err());
+        assert!(dedup_rows(vec![row()], &mut work, || Err(limit("expired"))).is_err());
         assert_eq!(work.visits, 0);
+    }
+
+    fn scalar_row(id: u64, value: Value) -> ElementRow {
+        ElementRow {
+            element: ObservedElementRef::Vertex(VertexRef { partition: 1, id }),
+            path: Vec::new(),
+            value: Some(value),
+        }
+    }
+
+    #[test]
+    fn scalar_dedup_matches_strict_linear_oracle_and_first_provenance() {
+        let values = [
+            Value::Null,
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Integer(0),
+            Value::Integer(1),
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
+            Value::Real(-0.0),
+            Value::Real(0.0),
+            Value::Real(1.0),
+            Value::Real(f64::MIN_POSITIVE),
+            Value::Real(f64::MAX),
+            Value::Text(String::new()),
+            Value::Text("1".into()),
+            Value::Text("同值".into()),
+            Value::Text("é".into()),
+            Value::Text("e\u{301}".into()),
+        ];
+        let mut seed = 37u64;
+        for _ in 0..64 {
+            let mut expected: Vec<(ObservedElementRef, Value)> = Vec::new();
+            let mut rows = Vec::new();
+            for id in 0..80 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let value = values[(seed >> 32) as usize % values.len()].clone();
+                let row = scalar_row(id, value.clone());
+                // Independent linear equality oracle, not production key encoding.
+                if !expected.iter().any(|(_, previous)| *previous == value) {
+                    expected.push((row.element, value));
+                }
+                rows.push(row);
+            }
+            let mut work = Work {
+                visits: 0,
+                bytes: 0,
+            };
+            let actual: Vec<_> = dedup_rows(rows, &mut work, || Ok(()))
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.element, row.value.unwrap()))
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(work.visits, 80);
+        }
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        let actual = dedup_rows(
+            vec![
+                scalar_row(4, Value::Real(-0.0)),
+                scalar_row(5, Value::Real(0.0)),
+            ],
+            &mut work,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(actual.len(), 1);
+        let Some(Value::Real(zero)) = actual[0].value else {
+            panic!("expected real")
+        };
+        assert_eq!(zero.to_bits(), (-0.0f64).to_bits());
+    }
+
+    #[test]
+    fn scalar_dedup_charges_unique_text_before_retention_and_every_input() {
+        let value = Value::Text("同值".into());
+        let cost = 128 + "同值".len() + 128;
+        let mut work = Work {
+            visits: 9_998,
+            bytes: 64 * 1024 * 1024 - cost,
+        };
+        let rows = dedup_rows(
+            vec![scalar_row(1, value.clone()), scalar_row(2, value.clone())],
+            &mut work,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(work.visits, 10_000);
+        assert_eq!(work.bytes, 64 * 1024 * 1024);
+        assert!(dedup_rows(vec![scalar_row(3, value.clone())], &mut work, || Ok(())).is_err());
+        let mut work = Work {
+            visits: 0,
+            bytes: 64 * 1024 * 1024 - 128,
+        };
+        assert!(dedup_rows(vec![scalar_row(1, value.clone())], &mut work, || Ok(())).is_err());
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        assert!(
+            dedup_rows(vec![scalar_row(1, value)], &mut work, || Err(limit(
+                "expired"
+            )))
+            .is_err()
+        );
+        assert_eq!(work.visits, 0);
+        assert_eq!(work.bytes, 0);
     }
 
     #[test]
