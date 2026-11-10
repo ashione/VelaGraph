@@ -6,8 +6,11 @@ The separate [replicated graph adapter](REPLICATED_GRAPH.md) now wires
 `GraphRecordStore` through these commands in-process; `GraphEngine` is not wired
 through Raft. The independent
 `d2-raft` crate has no dependency on the local D1 crate; opaque graph/v1 bytes
-are unchanged. Transport security, routing, placement, bounded remote reads,
-client deadlines/retry policy and cross-shard transactions remain separate work.
+are unchanged. Separate [remote graph](REMOTE_GRAPH.md),
+[static routing](REMOTE_ROUTING.md) and [managed-cohort](MANAGED_GRAPH_TRANSACTIONS.md)
+contracts now cover those higher layers. Their supported reads, deadlines and
+retry rules do not change this D1 contract. Production security, dynamic placement
+and general cross-shard transactions remain unfinished.
 
 ## Commands and replies
 

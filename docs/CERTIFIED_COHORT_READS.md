@@ -1,8 +1,9 @@
 # Fixed-cohort empty-baseline snapshot sessions
 
-Status: experimental trusted in-process KV snapshot primitive, layered on the
-participant versioned reads. This does **not** enable GlobalCommittedSnapshot in
-the remote graph API, certify imported nonempty graphs, implement indexed MVCC,
+Status: experimental trusted KV snapshot primitive, layered on participant
+versioned reads. `acquire` accepts local handles; `acquire_endpoints` shares the
+algorithm with [fixed remote managed nodes](REMOTE_MANAGED_TRANSPORT.md). This does
+**not** enable GlobalCommittedSnapshot in the remote graph API, certify imported nonempty graphs, implement indexed MVCC,
 or add a durable distributed GC lease.
 
 ## Persistent graph boundary
@@ -32,15 +33,18 @@ because the embedded journal is independently versioned. No downgrade is supplie
 2. Enable participant and versioned modes on every member, using that initial
    bound journal. Each member must have sequence zero: no prior data writes,
    even if later deleted. It must match the binding and coordinator authority.
-3. Only after activation, submit ordinary managed participant transactions through
-   the existing coordinator/prepare/decision/advance protocol.
+3. For an explicitly selected [ByteBound16MiBV1 cohort](COHORT_CAPACITY_PROFILE.md),
+   obtain and durably confirm every member's capacity grant before admission.
+   Existing/default LegacyCountV1 cohorts retain their original activation path.
+4. Only after the required activation/confirmation, submit managed participant
+   transactions through the coordinator/prepare/decision/advance protocol.
 
 An old unbound versioned participant cannot be relabelled as bound, including by
 snapshot replacement. Nonempty baselines remain usable with the old participant
 API but cannot join these certified sessions. Identical values or local sequence
 numbers do not certify independently imported databases.
 
-The certificate here is a checked contract across trusted in-process Raft handles,
+The certificate here is a checked contract across trusted local/remote Raft nodes,
 not a cryptographic signature or adversarial-client authentication scheme. Restoring
 an entire old coordinator directory, cloning its identity into another cluster, or
 untrusted direct command forgery requires external identity/fencing controls; this
@@ -106,4 +110,7 @@ before reclaiming historical source state.
 The current acquisition uses [versioned exact terminal-prefix evidence](TERMINAL_PREFIX_EVIDENCE.md)
 without transporting request/Plan archives. It first fixes V from summary/readiness,
 then obtains and compares the complete segmented projection at V on every member.
-Full durable journals, their recovery checks and all capture limits remain unchanged.
+Complete authoritative history, strict recovery checks and all capture limits
+remain. Bound durable runtime state uses [S2/S3 checkpoints](CURRENT_STATUS.md#storage-and-protocol-boundaries),
+not resident full Journals; cold recovery and complete snapshots still materialize
+history.

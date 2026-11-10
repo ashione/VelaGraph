@@ -3,10 +3,12 @@
 VelaGraph's new, explicitly selected `ByteBound16MiBV1` profile extends the
 fixed-cohort lifetime beyond the legacy 256 external IDs and 1,024 transactions.
 It does not provide unlimited writes. Complete original Command history, exact
-external-ID/Plan bindings and full snapshots remain retained. The draft
-[S2 active checkpoint](COORDINATOR_ACTIVE_CHECKPOINT.md) replaces only durable
-bound-coordinator resident/ordinary-candidate Journals; acceptance is pending.
-Member history and explicit full-history materialization remain.
+external-ID/Plan bindings and full snapshots remain retained. Merged
+[S2 coordinator](COORDINATOR_ACTIVE_CHECKPOINT.md) and
+[S3 member checkpoints](MEMBER_ACTIVE_CHECKPOINT.md) replace bound durable
+resident/ordinary-candidate Journals. [S4 retained control](RETAINED_GATEWAY_CONTROL.md)
+removes ordinary gateway full-Journal control/Prepare exchanges. Cold replay,
+explicit full-history operations and complete SnapshotV1 materialization remain.
 
 Existing cohorts and the default remain `LegacyCountV1`. Only a genuinely empty,
 unbound fixed cohort can select the new profile. There is no online conversion,
@@ -118,11 +120,15 @@ terminal prefix and data; V0 does not acquire future records.
 The shared codec/replay implementation uses explicit profile gates:
 
 - Journal v4, history cursor/page v2 and TerminalPrefix v2 for the new profile.
-- Managed RPC v5, with no v4 fallback and no public query-format change.
-- Raw ledger/terminal-index format 2 and member disk v14. The draft S2 bound
-  coordinator writes disk v16; S1 disk v15 and former coordinator v13 remain
-  actual legacy migration inputs. See the [archive-reader contract](AUTHORITATIVE_EVENT_LEDGER.md)
-  and [active checkpoint contract](COORDINATOR_ACTIVE_CHECKPOINT.md).
+- The profile originally introduced managed RPC v5; current peers require
+  [S4 RPC v6](RETAINED_GATEWAY_CONTROL.md), with no older-version fallback.
+  External gateway framing remains v1.
+- Raw ledger/terminal-index format 2; current bound coordinator/member disk
+  versions are v16/v17. Earlier v13/v15 coordinators and v14 members remain
+  strict migration inputs, not alternative current writers. See the
+  [archive-reader](AUTHORITATIVE_EVENT_LEDGER.md),
+  [coordinator checkpoint](COORDINATOR_ACTIVE_CHECKPOINT.md) and
+  [member checkpoint](MEMBER_ACTIVE_CHECKPOINT.md) contracts.
 - Member logical D1 version 7 carries its immutable activation nonce/LogId.
 - Legacy Journal v1/v2/v3, history/proof v1, raw/index format 1 and disk v11/v12
   retain their published count-bound meanings. Earlier published migration readers

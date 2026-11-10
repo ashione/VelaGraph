@@ -16,9 +16,11 @@ unmanaged behavior is unchanged; no graph workload enables this automatically.
 
 Once activated, ordinary D1 Write, legacy TxnBatch and ManagedWrite cannot modify
 participant data. Direct replicated commands hit the same checks. The only data
-publication path is a prepared participant Commit. Existing graph mutation
-wrappers therefore fail explicitly on an opted-in participant until a later
-managed graph client is implemented; there is no fallback. Reads remain available.
+publication path is a prepared participant Commit. Unmanaged graph mutation
+wrappers therefore fail explicitly on an opted-in participant; there is no
+fallback. The separate [managed graph client](MANAGED_GRAPH_TRANSACTIONS.md) and
+[gateway](MANAGED_GRAPH_GATEWAY.md) now supply compatible typed writes for a
+certified fixed cohort. Reads remain available.
 
 ## Prepare and conflicts
 
@@ -96,7 +98,9 @@ A separate [versioned participant mode](VERSIONED_PARTICIPANT_READS.md) fences
 legacy Resolve and publishes through contiguous applied coordinator ordinals.
 It provides bounded historical reads and uses the applied journal as the negative
 identity for unknown Abort, without extra tombstone quota. Participant-only mode
-retains the behavior described above. Global query admission is still absent.
+retains the behavior described above. The later
+[fixed-cohort session layer](CERTIFIED_COHORT_READS.md) adds restricted common-V
+admission; the older unrestricted Global API still rejects it.
 
 ## Verified boundary and next work
 
@@ -107,8 +111,10 @@ A real in-process coordinator plus two independent Raft groups exercises the rel
 after resolving only the first participant, fresh reads can see new/old values.
 That counterexample is intentional: this slice has no unified visibility barrier.
 
-Remaining: remote coordinator/participant driver, graph mutation planning and
-managed writer integration, explicit recovery scheduling, wider conflict tracking,
-MVCC plus global readable-prefix admission, retention/GC and full end-to-end
-CoreHR concurrent-write validation. Existing full CoreHR CI is a regression gate,
-not proof that its graph writers use this new protocol.
+Subsequent merged slices provide managed graph planning, durable original-Plan
+recovery, [fixed remote transport](REMOTE_MANAGED_TRANSPORT.md) and certified
+fixed-cohort read sessions. Remaining general-purpose work includes automatic
+recovery scheduling, finer conflict tracking, indexed MVCC, retention/GC,
+dynamic/nonempty-baseline certification and full-scale managed CoreHR validation
+([#111](https://github.com/ashione/VelaGraph/issues/111)). Existing full observed
+CoreHR CI is a regression gate, not proof that its writers use this protocol.

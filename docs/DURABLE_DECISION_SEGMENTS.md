@@ -1,9 +1,12 @@
 # Durable terminal decision segments
 
-Subsequent live-storage format: [authoritative event ledger](AUTHORITATIVE_EVENT_LEDGER.md)
-replaces embedded bound Journal disk headers with v11/v12 raw-event authority.
-The original slice below documents its historical formats; logical full-history
-retention, snapshots and all lifetime limits still apply.
+Current bound durable storage uses original raw-Command authority and
+[S2/S3 active checkpoints](CURRENT_STATUS.md#storage-and-protocol-boundaries),
+with coordinator/member disk v16/v17 and internal managed RPC v6. The
+[byte profile](COHORT_CAPACITY_PROFILE.md) replaces only legacy count caps.
+The sections below preserve this slice's historical formats and limits; they do
+not describe all current writers. Complete history and the 16 MiB lifetime budget
+remain retained.
 
 Status: a bounded storage/read foundation after A2.1. The complete Journal is
 still the sole decision authority. The existing **256 external requests, 1,024

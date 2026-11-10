@@ -2,7 +2,9 @@
 
 Status: a durable **single-shard write fence and atomic batch identity**, not a
 distributed transaction coordinator, MVCC, global version, complete graph view,
-or production security. GlobalCommittedSnapshot remains Unsupported everywhere.
+or production security. The older GlobalCommittedSnapshot API remains
+Unsupported. Later [managed fixed-cohort layers](CURRENT_STATUS.md) supply
+coordinated graph writes and certified sessions through separate APIs.
 
 ## Why this layer
 

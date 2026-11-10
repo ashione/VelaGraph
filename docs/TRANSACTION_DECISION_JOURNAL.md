@@ -1,27 +1,27 @@
 # Transaction decision journal protocol prototype
 
-Status: **experimental Raft-backed decision ledger**. The opt-in
-[participant state and trusted in-process relay](PARTICIPANT_WRITES.md) now use
-its decisions; existing graph writers and global query admission are not wired.
-`GlobalCommittedSnapshot` remains Unsupported. Existing graph writes and reads
-are unchanged. This document is not a declaration that D4 is complete.
+Status: **experimental Raft-backed decision ledger**. Its decisions now underpin
+[participant intents](PARTICIPANT_WRITES.md),
+[managed graph transactions](MANAGED_GRAPH_TRANSACTIONS.md) and the separate
+[managed TCP gateway](MANAGED_GRAPH_GATEWAY.md), including fixed remote nodes.
+The unrestricted `GlobalCommittedSnapshot` API remains Unsupported. Existing
+unmanaged graph APIs are not silently enrolled; this is not complete D4.
 
-Current storage/read extension: the [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md)
-writes disk v16 for bound coordinators. S1 disk v15 and older formats remain actual
-legacy-reader/migration inputs. S1's derived bound request index remains retired.
-The [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
-continue to use original raw Commands.
-LookupRequest and HistoryPage project bounded results from the complete raw
-namespace against a private, previously strict-validated published cut. Their
-reader helpers do not require a Journal. S2 also replaces the durable bound
-coordinator resident/ordinary apply-candidate Journal with a consumed checkpoint,
-while checking complete raw closure. Cold open, explicit control/Terminal paths,
-member state and full snapshot materialization still use Journals. Shared
-transitions preserve decision semantics and exact reservations; draining the
-checkpoint refunds no historical bytes. S2 acceptance is pending, with no
-performance or lifetime increase claimed. This changes neither semantics nor the
-16 MiB budget. The [opt-in byte profile](COHORT_CAPACITY_PROFILE.md) replaces only legacy
-count quotas; the original prototype formats/limits below remain legacy contracts.
+Current bound durable storage uses merged [S2 coordinator](COORDINATOR_ACTIVE_CHECKPOINT.md)
+and [S3 member checkpoints](MEMBER_ACTIVE_CHECKPOINT.md), disk v16/v17, and original
+raw Commands. [S4 retained control](RETAINED_GATEWAY_CONTROL.md) removes ordinary
+managed execute/status/retry/abort and Prepare full-Journal exchanges and requires
+internal managed RPC v6. LookupRequest/HistoryPage project bounded results only
+after complete raw-namespace verification against a private published cut.
+Cold replay, explicit full-history/terminal-proof operations and complete
+SnapshotV1 still materialize history. Checkpoints refund no historical bytes.
+The [byte profile](COHORT_CAPACITY_PROFILE.md) replaces only legacy count caps,
+not the 16 MiB reserved history budget or independent intent/D1 limits.
+
+The sections below preserve the original decision-ledger protocol and legacy
+formats. Their integration checklist records the requirements that motivated
+later slices; the [current status index](CURRENT_STATUS.md) identifies delivered
+restricted paths and the remaining general-purpose work.
 
 The next atomicity layer needs a durable decision authority. A transaction ID,
 ordered participant set, each participant's shard/ownership epoch/managed mode,
@@ -75,7 +75,15 @@ upgrade or downgrade is supported. The same empty shard cannot later become a
 data shard. This is a trusted development protocol, not an authorization system.
 The pure Journal API does no I/O; only its D2 command adapter persists results.
 
-## Required integration before global transaction support
+## Original integration requirements and subsequent delivery
+
+The participant/managed layers now cover intents, decisions and atomic local
+publication in requirements 3–5. They provide requirement 6's common-V admission
+and process-local pins only for an explicitly activated, fixed empty-baseline
+cohort, using retained-history reads rather than indexed MVCC. Durable GC/retention
+leases and general routing are not implemented. Requirement 7 remains incomplete
+for arbitrary writers/routing and full-scale managed CoreHR. These requirements do not enable unrestricted Global
+admission merely because the restricted layers are merged.
 
 1. Implemented prerequisite: an explicit, irreversible coordinator role on a dedicated Raft group.
    Every raw `TxnBatch`, D1 Write and ManagedWrite entry must be rejected in that

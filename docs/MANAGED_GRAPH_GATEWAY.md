@@ -1,15 +1,17 @@
 # Trusted managed graph TCP gateway
 
-Status: experimental managed TCP facade over server-owned, in-process real Raft
-handles. This is an additive restricted API, not a new Gremlin dialect or a
-production distributed graph deployment. Existing remote GlobalCommittedSnapshot
+Status: experimental managed TCP facade over server-owned real Raft handles
+or explicitly configured [remote managed-node endpoints](REMOTE_MANAGED_TRANSPORT.md).
+This is an additive restricted API, not a new Gremlin dialect or a production
+distributed graph deployment. Existing remote GlobalCommittedSnapshot
 Gremlin remains Unsupported. Ordinary current/observed reads are not relabelled
 as certified reads.
 
 ## Configuration and trust
 
-`replicated_graph::managed_gateway::Gateway` owns `Arc<NodeHandle>` for one
-coordinator and every member of one explicitly configured fixed cohort. The
+`replicated_graph::managed_gateway::Gateway` uses local `Arc<NodeHandle>` values
+(`Config`/`bind`) or fixed remote node capabilities (`RemoteConfig`/`bind_remote`)
+for one coordinator and every member of one explicitly configured fixed cohort. The
 persisted empty-baseline contract is validated before accepting connections. No
 remote client can activate roles, change ownership, choose participants, supply
 raw Plan/KV bytes, import a baseline, or redirect a partition. Partition `u32`
@@ -214,10 +216,11 @@ already received cannot be revoked.
   the separate 1 MiB encoded response bound. A later limit does not bypass complete bounded adjacency validation.
   No automatic chunking or resource-limit truncation.
 
-The durable coordinator journal retains at most 256 external requests and has
-its existing 16 MiB capacity budget. IDs are never evicted/reused and source
-history is not garbage-collected. Read tokens are process-local materialized
-pins, not durable GC leases, indexed MVCC, or an indefinite availability claim.
+LegacyCountV1 retains at most 256 external requests/1,024 transactions. The
+opt-in ByteBound16MiBV1 profile below replaces only those count caps; both retain
+the 16 MiB reserved history budget and separate intent/D1 limits. IDs are never
+evicted/reused and source history is not garbage-collected. Read tokens are
+process-local materialized pins, not durable GC leases, indexed MVCC, or an indefinite availability claim.
 
 ## Validation scope
 
@@ -261,6 +264,7 @@ for a new empty fixed cohort. Its explicit `ByteBound16MiBV1` tag is part of Coh
 inside Binding, canonical mutation identity, sessions and internal proofs. Legacy
 Binding bytes are unchanged. Gateway framing/operations remain v1; old strict
 peers reject the new profile tag, and new bindings cannot be substituted for old
-ones. Internal managed peers require v5 and durable full-cohort confirmation.
+ones. Current internal managed peers require [S4 RPC v6](RETAINED_GATEWAY_CONTROL.md)
+and durable full-cohort confirmation; the byte-profile slice originally used v5.
 No Gremlin mutation syntax, partial result fallback or unlimited write contract is
 introduced. Existing cohorts cannot be retagged or reset to select this profile.

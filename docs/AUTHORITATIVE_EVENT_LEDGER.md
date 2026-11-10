@@ -1,10 +1,12 @@
 # Authoritative event ledger
 
-Current source status: [S2 active checkpoint](COORDINATOR_ACTIVE_CHECKPOINT.md)
-replaces the durable bound coordinator runtime and ordinary apply candidate with
-a consumed checkpoint and writes disk v16. Raw Commands remain sole authority;
-profiles, grants, member formats and RPC v5 are unchanged. This is a draft
-implementation, with acceptance still pending.
+Current source status: merged [S2 coordinator](COORDINATOR_ACTIVE_CHECKPOINT.md)
+and [S3 member checkpoints](MEMBER_ACTIVE_CHECKPOINT.md) replace bound durable
+resident/ordinary apply-candidate Journals and write disk v16/v17. Original raw
+Commands remain sole authority. [S4 retained control](RETAINED_GATEWAY_CONTROL.md)
+uses internal managed RPC v6. Profiles, grants and lifetime byte budgets are
+unchanged; cold replay and complete SnapshotV1 still materialize history. See
+[the current status index](CURRENT_STATUS.md) for remaining work and merge references.
 
 The sections below preserve the **historical S1 / disk-v15 contract**, including
 its full-writer replay and resident-Journal limitations; those are not descriptions

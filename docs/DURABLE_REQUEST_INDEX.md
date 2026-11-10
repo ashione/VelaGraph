@@ -1,6 +1,6 @@
 # Durable request point recovery (A2.1)
 
-Current storage contract: the [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md) writes
+Current storage contract: the merged [S2 checkpoint](COORDINATOR_ACTIVE_CHECKPOINT.md) writes
 bound coordinator disk v16, retaining the [archive-backed coordinator reads](AUTHORITATIVE_EVENT_LEDGER.md#archive-backed-coordinator-reads-s1)
 and absence of duplicate request rows/manifests introduced in S1 disk v15. Actual
 LookupRequest and HistoryPage read raw Commands through the strict loader's shared
@@ -27,10 +27,12 @@ The original A2.1 sections below document historical indexed formats, not a live
 bound-writer alternative. S2 consumes an active checkpoint instead of a resident
 or ordinary apply-candidate full Journal on the disk-v16 coordinator path; it still
 checks complete raw closure. Cold replay, explicit control/Terminal and snapshot
-materialization, member state, the 16 MiB budget and D1 limits remain. Both existing
-profiles, capacity grants and managed RPC v5 are unchanged. S2 acceptance is pending;
-prior A2.1 or S1 results are not acceptance evidence for the changed source. No
-performance or lifetime increase is claimed.
+materialization, the 16 MiB budget and D1 limits remain. S3 subsequently replaced
+bound member resident Journals, and [S4](RETAINED_GATEWAY_CONTROL.md) replaced
+ordinary gateway control/Prepare exchanges with retained evidence and RPC v6.
+Both profiles and capacity grants remain unchanged. Historical A2.1/S1 results
+are not acceptance evidence for later source; no performance or lifetime increase
+is claimed by this point-reader change.
 
 Historical A2.1 status: an experimental derived coordinator index and bounded
 point-recovery operation. **Its legacy 256 external requests, 1,024 transactions
@@ -103,7 +105,9 @@ procedure is supplied.
 ## Point-recovery RPC
 
 The request-index slice introduced trusted internal managed RPC **version 3**.
-[Incremental consumption](INCREMENTAL_DECISION_CONSUMPTION.md) now requires v4. Version-1/2
+[Incremental consumption](INCREMENTAL_DECISION_CONSUMPTION.md) subsequently used v4;
+the current [retained control contract](RETAINED_GATEWAY_CONTROL.md) requires v6.
+The rest of this section records the original A2.1 indexed implementation. Version-1/2
 messages are rejected, not retried through an older or weaker operation. The
 external managed graph envelope version, request schema and canonical application
 command codec are unchanged. Two new typed D1 errors, RequestIndexHistory and

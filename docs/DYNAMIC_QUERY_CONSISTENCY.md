@@ -1,8 +1,12 @@
 # Dynamic graph consistency: current boundary and implementation plan
 
-Status: design proposal plus executable characterization, **not implemented
-cluster snapshot isolation**. This document does not change existing API or
-storage semantics. It applies to arbitrary graph data, not a CoreHR shortcut.
+Status: design proposal plus executable characterization for the **observed
+distributed-query path**, which does not provide cluster snapshot isolation.
+Later [managed fixed-cohort sessions](MANAGED_FIXED_TRAVERSALS.md) implement a
+restricted certified-V path; they do not upgrade these observed APIs or certify
+arbitrary imported baselines/writers. This document preserves the original broad
+plan and observed counterexamples, not a claim that no managed path exists.
+It applies to arbitrary graph data, not a CoreHR shortcut.
 
 ## Current behavior
 

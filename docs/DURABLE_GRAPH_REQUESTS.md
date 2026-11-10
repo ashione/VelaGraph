@@ -67,7 +67,9 @@ execution identities are rejected. Plan codec v1 and journal v3 have exact golde
 fixtures. The surrounding D1 envelope is unchanged because the journal is separately
 versioned. Older binaries reject v3, and no downgrade is provided.
 
-There are at most 256 admitted external requests. Canonical request bytes are capped
+The default LegacyCountV1 profile permits at most 256 admitted external requests;
+the later [byte profile](COHORT_CAPACITY_PROFILE.md) replaces this count cap only
+for new empty cohorts. Canonical request bytes are capped
 at 64 KiB, encoded Plan bytes at 256 KiB, and a fully JSON-encoded admission event at
 2 MiB. All events plus reserved resolution bytes must fit the existing 16 MiB
 journal budget. The real encoded size, including numeric byte-array expansion,
@@ -100,11 +102,12 @@ until a successful batch writes v16; v15 already requires the index to be absent
 Residual request rows/manifests fail closed in both v15 and v16. Explicit validated
 snapshot repair remains supported. See the [storage/read contract](AUTHORITATIVE_EVENT_LEDGER.md).
 The S4 [managed RPC v6](RETAINED_GATEWAY_CONTROL.md), original Plan bytes, first-plan-wins behavior and existing deadlines
-are unchanged. The [S2 draft](COORDINATOR_ACTIVE_CHECKPOINT.md) consumes an active
-checkpoint for the durable bound coordinator resident/ordinary apply candidate
-and uses compact remote Command preflight. Cold replay, explicit control/Terminal,
-end-to-end decide/status/Prepare, member state and complete snapshot materialization
-still use full Journals. S2 acceptance is pending. The opt-in [byte profile](COHORT_CAPACITY_PROFILE.md)
+are unchanged. Merged [S2](COORDINATOR_ACTIVE_CHECKPOINT.md) and
+[S3](MEMBER_ACTIVE_CHECKPOINT.md) consume active checkpoints for bound durable
+coordinator/member resident and ordinary apply-candidate state. S4 removes ordinary
+managed execute/status/retry/abort and Prepare full-Journal exchanges. Cold replay,
+explicit full-history/terminal-proof paths and complete snapshot materialization
+remain. The opt-in [byte profile](COHORT_CAPACITY_PROFILE.md)
 replaces the legacy count quotas above, not the 16 MiB budget or local D1 limits.
 Every archive lookup remains O(total history); no speed or lifetime extension is
 claimed by this reader change.
