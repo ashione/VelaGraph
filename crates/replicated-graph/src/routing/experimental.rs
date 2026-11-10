@@ -661,6 +661,10 @@ pub(crate) fn execute_frozen_query(
                     .collect(),
             ),
             ObservedRowV3::Count(n) => QueryRow::Count(n),
+            ObservedRowV3::PropertyMap { source, properties } => QueryRow::PropertyMap {
+                source: element(ObservedElementRef::Vertex(source)),
+                properties,
+            },
             ObservedRowV3::Value { source, value } => QueryRow::Value {
                 source: Some(element(source)),
                 value,

@@ -749,3 +749,505 @@ fn repeat_reply_validation_preserves_each_emitted_shape_and_canonical_owner() {
     };
     assert_eq!(synthetic(operation, reply.clone()).unwrap(), reply);
 }
+
+fn selected_map(partition: u32, id: u64, entries: &[(&str, Value)]) -> QueryRow {
+    QueryRow::PropertyMap {
+        source: Q::Vertex { partition, id },
+        properties: entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), vec![value.clone()]))
+            .collect(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_value_maps_preflight_rejects_invalid_shapes_even_when_empty() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    let session = open(&g, Some(0)).await;
+    let long_key = "x".repeat(65);
+    let unicode_key = "界".repeat(22);
+    let mut invalid = vec![
+        "g.V().valueMap()".to_owned(),
+        "g.V().valueMap('')".to_owned(),
+        "g.V().valueMap('x','x')".to_owned(),
+        "g.V().valueMap('a','b','c','d','e','f','g','h','i')".to_owned(),
+        "g.E().valueMap('x')".to_owned(),
+        "g.V().outE().valueMap('x')".to_owned(),
+        "g.V().values('x').valueMap('x')".to_owned(),
+        "g.V().id().valueMap('x')".to_owned(),
+        "g.V().count().valueMap('x')".to_owned(),
+        "g.V().path().valueMap('x')".to_owned(),
+        format!("g.V().valueMap('{long_key}')"),
+        format!("g.V().valueMap('{unicode_key}')"),
+    ];
+    for suffix in [
+        "limit(1)",
+        "dedup()",
+        "count()",
+        "id()",
+        "path()",
+        "out()",
+        "values('x')",
+        "valueMap('x')",
+        "repeat(__.out()).times(1)",
+    ] {
+        invalid.push(format!("g.V().valueMap('x').{suffix}"));
+    }
+    for text in invalid {
+        assert_eq!(
+            traverse(&g, &session, &text).await,
+            Err(Error::Query(QueryFailure::Unsupported)),
+            "{text}"
+        );
+        assert_eq!(
+            call(&g, paged(&session, &text, None, 1)).await,
+            Err(Error::Query(QueryFailure::Unsupported)),
+            "{text}"
+        );
+    }
+    for text in [
+        "g.V().valueMap('x')".to_owned(),
+        "g.V().valueMap('a','b','c','d','e','f','g','h')".to_owned(),
+        "g.E().inV().valueMap('x')".to_owned(),
+        format!("g.V().valueMap('{}')", "x".repeat(64)),
+    ] {
+        assert!(
+            traverse(&g, &session, &text).await.unwrap().is_empty(),
+            "{text}"
+        );
+    }
+    assert!(g
+        .state
+        .get(&session)
+        .unwrap()
+        .result
+        .try_lock()
+        .unwrap()
+        .is_none());
+    close(&g, session).await;
+    g.shutdown().await;
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_value_maps_preserve_types_bags_provenance_and_frozen_pages() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    let fields = [
+        ("name", Value::Text("old".into())),
+        ("null", Value::Null),
+        ("integer", Value::Integer(-7)),
+        ("real", Value::Real(1.25)),
+        ("boolean", Value::Boolean(true)),
+    ];
+    for (external, partition, id, entries) in [
+        (1, 7, 1, fields.as_slice()),
+        (2, 8, 1, &[("name", Value::Text("remote".into()))][..]),
+        (3, 7, 2, &[][..]),
+    ] {
+        let mut data = vertex(id);
+        data.properties = entries
+            .iter()
+            .map(|(k, v)| ((*k).into(), v.clone()))
+            .collect();
+        committed(
+            &call(
+                &g,
+                Operation::Submit(Write {
+                    external_id: [external; 16],
+                    mutation: Mutation::CreateVertex {
+                        partition,
+                        vertex: data,
+                    },
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    committed(
+        &call(
+            &g,
+            Operation::Submit(Write {
+                external_id: [4; 16],
+                mutation: Mutation::CreateEdge { edge: edge() },
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    let old = open(&g, None).await;
+    let typed = selected_map(7, 1, &fields);
+    assert_eq!(
+        traverse(
+            &g,
+            &old,
+            "g.V(1).valueMap('real','name','null','integer','missing','boolean')"
+        )
+        .await
+        .unwrap(),
+        vec![typed]
+    );
+    let one = selected_map(7, 1, &[("name", Value::Text("old".into()))]);
+    let empty = selected_map(7, 2, &[]);
+    let remote = selected_map(8, 1, &[("name", Value::Text("remote".into()))]);
+    for (text, expected) in [
+        (
+            "g.V().valueMap('name')",
+            vec![one.clone(), remote.clone(), empty.clone()],
+        ),
+        (
+            "g.V(2,1,1).valueMap('name')",
+            vec![empty.clone(), one.clone(), one.clone()],
+        ),
+        (
+            "g.V(2,1,1).limit(2).valueMap('name')",
+            vec![empty.clone(), one.clone()],
+        ),
+        (
+            "g.V(1,1,2).dedup().valueMap('name')",
+            vec![one.clone(), empty.clone()],
+        ),
+        (
+            "g.V(1,1,2).limit(2).dedup().valueMap('name')",
+            vec![one.clone()],
+        ),
+        (
+            "g.V(1,1,2).dedup().limit(2).valueMap('name')",
+            vec![one.clone(), empty.clone()],
+        ),
+        ("g.V(1).outE().inV().valueMap('name')", vec![remote.clone()]),
+        (
+            "g.E(10).bothV().valueMap('name')",
+            vec![one.clone(), remote.clone()],
+        ),
+        (
+            "g.V(1,1).repeat(__.out()).times(1).valueMap('name')",
+            vec![remote.clone(), remote.clone()],
+        ),
+        (
+            "g.V(1).repeat(__.out()).emit().times(2).valueMap('name')",
+            vec![remote],
+        ),
+    ] {
+        assert_eq!(traverse(&g, &old, text).await.unwrap(), expected, "{text}");
+    }
+    let text = "g.V(2,1,1).valueMap('name')";
+    let first = call(&g, paged(&old, text, None, 1)).await.unwrap();
+    assert_eq!(page(first.clone()).data.rows, vec![empty]);
+    committed(
+        &call(
+            &g,
+            Operation::Submit(Write {
+                external_id: [5; 16],
+                mutation: Mutation::PatchVertex {
+                    vertex: entity(7, 1),
+                    patch: Patch {
+                        set: BTreeMap::from([("name".into(), Value::Text("new".into()))]),
+                        remove: BTreeSet::new(),
+                    },
+                },
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(call(&g, paged(&old, text, None, 1)).await.unwrap(), first);
+    let continuation = paged(&old, text, page(first).next, 1);
+    let second = call(&g, continuation.clone()).await.unwrap();
+    assert_eq!(page(second.clone()).data.rows, vec![one.clone()]);
+    assert_eq!(call(&g, continuation).await.unwrap(), second);
+    let last = page(
+        call(&g, paged(&old, text, page(second).next, 1))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(last.data.rows, vec![one.clone()]);
+    assert!(last.next.is_none());
+    assert_eq!(
+        traverse(&g, &old, "g.V(1).valueMap('name')").await.unwrap(),
+        vec![one]
+    );
+    let fresh = open(&g, None).await;
+    assert_eq!(
+        traverse(&g, &fresh, "g.V(1).valueMap('name')")
+            .await
+            .unwrap(),
+        vec![selected_map(7, 1, &[("name", Value::Text("new".into()))])]
+    );
+    close(&g, old).await;
+    close(&g, fresh).await;
+    g.shutdown().await;
+    f.stop().await;
+}
+
+#[test]
+fn selected_value_maps_reject_forged_shape_keys_lists_and_provenance() {
+    let session = synthetic_session();
+    let text = "g.V(1,1).valueMap('name','null')";
+    let operation = Operation::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+    };
+    let reply = |rows| Reply::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+        data: QueryData {
+            rows,
+            completeness: QueryCompleteness::Unverified,
+        },
+    };
+    let good = selected_map(
+        7,
+        1,
+        &[("name", Value::Text("one".into())), ("null", Value::Null)],
+    );
+    for rows in [
+        vec![good.clone(), good.clone()],
+        vec![selected_map(7, 1, &[])],
+    ] {
+        let valid = reply(rows);
+        assert_eq!(
+            serde_json::from_slice::<Reply>(&serde_json::to_vec(&valid).unwrap()).unwrap(),
+            valid
+        );
+        assert_eq!(synthetic(operation.clone(), valid.clone()).unwrap(), valid);
+    }
+    // Strict gateway decoding rejects unknown row and source fields rather
+    // than silently discarding data from an untrusted peer.
+    for source_field in [false, true] {
+        let mut wire = serde_json::to_value(reply(vec![good.clone()])).unwrap();
+        let row = &mut wire["Traverse"]["data"]["rows"][0]["PropertyMap"];
+        let object = if source_field {
+            row["source"]["Vertex"].as_object_mut().unwrap()
+        } else {
+            row.as_object_mut().unwrap()
+        };
+        object.insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<Reply>(wire).is_err());
+    }
+    let map = |source, properties| QueryRow::PropertyMap { source, properties };
+    for bad in [
+        v(7, 1),
+        QueryRow::Count(1),
+        QueryRow::Path(vec![Q::Vertex {
+            partition: 7,
+            id: 1,
+        }]),
+        QueryRow::Value {
+            source: Some(Q::Vertex {
+                partition: 7,
+                id: 1,
+            }),
+            value: Value::Null,
+        },
+        selected_map(8, 1, &[]),
+        selected_map(7, 99, &[]),
+        selected_map(99, 1, &[]),
+        selected_map(7, 1, &[("unselected", Value::Null)]),
+        selected_map(7, 1, &[("name", Value::Real(f64::INFINITY))]),
+        selected_map(7, 1, &[("name", Value::Real(f64::NAN))]),
+        selected_map(7, 1, &[("name", Value::Text("x".repeat(2048)))]),
+        map(
+            Q::Edge {
+                partition: 7,
+                id: 1,
+            },
+            BTreeMap::new(),
+        ),
+        map(
+            Q::Vertex {
+                partition: 7,
+                id: 1,
+            },
+            BTreeMap::from([("name".into(), vec![])]),
+        ),
+        map(
+            Q::Vertex {
+                partition: 7,
+                id: 1,
+            },
+            BTreeMap::from([("name".into(), vec![Value::Null, Value::Null])]),
+        ),
+    ] {
+        assert_eq!(
+            synthetic(operation.clone(), reply(vec![bad.clone()])),
+            Err(Error::Identity),
+            "{bad:?}"
+        );
+        let page_reply = Reply::TraversePage {
+            session: session.clone(),
+            query: query(7, text),
+            cursor: None,
+            page_size: 1,
+            page: QueryPage {
+                data: QueryData {
+                    rows: vec![bad],
+                    completeness: QueryCompleteness::Unverified,
+                },
+                next: None,
+                offset: 0,
+                total: 1,
+            },
+        };
+        assert_eq!(
+            synthetic(paged(&session, text, None, 1), page_reply),
+            Err(Error::Identity)
+        );
+    }
+    // Maps are never accepted for an element traversal, even with valid origins.
+    let plain = "g.V(1)";
+    assert_eq!(
+        synthetic(
+            Operation::Traverse {
+                session: session.clone(),
+                query: query(7, plain)
+            },
+            Reply::Traverse {
+                session,
+                query: query(7, plain),
+                data: QueryData {
+                    rows: vec![good],
+                    completeness: QueryCompleteness::Unverified,
+                }
+            }
+        ),
+        Err(Error::Identity)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_value_maps_enforce_whole_row_cap_without_retaining_partial_pages() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    let config = OwnedConfig::from(f.config());
+    let graph = config.graph();
+    // Each property individually fits, but their combined tagged map exceeds
+    // the existing 2 KiB selected-property cap. Seed through the trusted API.
+    for id in [1, 2] {
+        let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+        let mut vertex = Vertex::new(id);
+        for key in ["a", "b"] {
+            vertex.properties.insert(
+                key.into(),
+                Value::Text(if id == 1 {
+                    "small".into()
+                } else {
+                    "x".repeat(1100)
+                }),
+            );
+        }
+        let plan = snapshot.prepare_vertex(7, &vertex).unwrap();
+        graph.execute(&plan).await.unwrap();
+    }
+    // Two parallel self-loops per vertex turn 51 explicit roots into 102
+    // rows without needing a large fixture or relaxing parser/work budgets.
+    for (edge_id, vertex_id) in [(101, 1), (102, 1), (201, 2), (202, 2)] {
+        let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+        let edge = EdgeData {
+            id: edge_id,
+            from: entity(7, vertex_id),
+            to: entity(7, vertex_id),
+            label: "parallel".into(),
+            properties: BTreeMap::new(),
+        };
+        let plan = snapshot.prepare_edge(&edge.graph()).unwrap();
+        graph.execute(&plan).await.unwrap();
+    }
+    let session = open(&g, None).await;
+    assert_eq!(
+        traverse(&g, &session, "g.V(2).valueMap('a')")
+            .await
+            .unwrap(),
+        vec![selected_map(7, 2, &[("a", Value::Text("x".repeat(1100)))])]
+    );
+    let text = "g.V(1,2).valueMap('a','b')";
+    assert_eq!(
+        traverse(&g, &session, text).await,
+        Err(Error::Query(QueryFailure::ResourceExhausted))
+    );
+    assert_eq!(
+        call(&g, paged(&session, text, None, 1)).await,
+        Err(Error::Query(QueryFailure::ResourceExhausted))
+    );
+    assert!(g
+        .state
+        .get(&session)
+        .unwrap()
+        .result
+        .try_lock()
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        traverse(&g, &session, "g.V(1,2).limit(1).valueMap('a','b')")
+            .await
+            .unwrap(),
+        vec![selected_map(
+            7,
+            1,
+            &[
+                ("a", Value::Text("small".into())),
+                ("b", Value::Text("small".into()))
+            ]
+        )]
+    );
+    let roots = std::iter::repeat_n("1", 50)
+        .chain(std::iter::once("2"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let default_text = format!("g.V({roots}).out().valueMap('a','b')");
+    let explicit_text = format!("g.V({roots}).out().limit(101).valueMap('a','b')");
+    let expected = vec![
+        selected_map(
+            7,
+            1,
+            &[
+                ("a", Value::Text("small".into())),
+                ("b", Value::Text("small".into())),
+            ]
+        );
+        100
+    ];
+    // The default first 100 are selected before property-map materialization:
+    // row 101's oversized map must not invalidate those 100 valid results.
+    assert_eq!(
+        traverse(&g, &session, &default_text).await.unwrap(),
+        expected
+    );
+    // Explicitly admitting row 101 exposes its cap violation; neither the
+    // unpaged nor the paged API may return or retain the first 100 as success.
+    assert_eq!(
+        traverse(&g, &session, &explicit_text).await,
+        Err(Error::Query(QueryFailure::ResourceExhausted))
+    );
+    assert_eq!(
+        call(&g, paged(&session, &explicit_text, None, 1)).await,
+        Err(Error::Query(QueryFailure::ResourceExhausted))
+    );
+    assert!(g
+        .state
+        .get(&session)
+        .unwrap()
+        .result
+        .try_lock()
+        .unwrap()
+        .is_none());
+    close(&g, session.clone()).await;
+    let page_session = open(&g, Some(session.version)).await;
+    let default_page = page(
+        call(&g, paged(&page_session, &default_text, None, 100))
+            .await
+            .unwrap(),
+    );
+    assert_eq!((default_page.offset, default_page.total), (0, 100));
+    assert_eq!(default_page.data.rows, expected);
+    assert!(default_page.next.is_none());
+    close(&g, page_session).await;
+    g.shutdown().await;
+    drop(config);
+    f.stop().await;
+}

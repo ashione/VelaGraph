@@ -2,25 +2,15 @@
 use super::*;
 use std::io::{self, Write};
 
-pub(super) const MAX_MAP_BYTES: usize = 2048;
+#[cfg(test)]
+pub(super) use crate::selected_properties::MAX_MAP_BYTES;
+pub(super) use crate::selected_properties::{properties_bytes, validate_keys};
 pub(super) const MAX_PAGE_ROWS: usize = 128;
 pub(super) const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const STAGE_CEILING: Cost = Cost {
     bytes: 768 * 1024 * 1024,
     work: 2_000_000,
 };
-
-pub(super) fn validate_keys(keys: &[String]) -> Result<(), QueryFailure> {
-    if !(1..=8).contains(&keys.len())
-        || keys
-            .iter()
-            .enumerate()
-            .any(|(i, key)| key.is_empty() || key.len() > 64 || keys[..i].contains(key))
-    {
-        return Err(QueryFailure::InvalidArgument);
-    }
-    Ok(())
-}
 
 /// Maximum leaf count that fits the existing encoded hierarchy-batch cap.
 /// Measure the actual tagged enum representation with maximal identity widths;
@@ -76,38 +66,6 @@ pub(super) fn batch_rows(keys: &[String]) -> Result<usize, QueryFailure> {
         return Err(QueryFailure::ResourceExhausted);
     }
     Ok(count)
-}
-
-/// Measure tagged JSON without allocating an encoded copy. Missing properties
-/// are absent entries; an explicit Null remains a tagged Value::Null.
-pub(super) fn properties_bytes(
-    properties: &BTreeMap<String, Value>,
-) -> Result<usize, QueryFailure> {
-    if properties.len() > 8
-        || properties.iter().any(|(key, value)| {
-            key.is_empty()
-                || key.len() > 64
-                || matches!(value, Value::Real(number) if !number.is_finite())
-        })
-    {
-        return Err(QueryFailure::IncompleteOrCorrupt);
-    }
-    struct Counter(usize);
-    impl Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > MAX_MAP_BYTES.saturating_sub(self.0) {
-                return Err(io::Error::other("projection map byte limit"));
-            }
-            self.0 += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, properties).map_err(|_| QueryFailure::ResourceExhausted)?;
-    Ok(counter.0)
 }
 
 #[cfg(test)]

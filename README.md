@@ -34,7 +34,8 @@ executor, including qualified vertex/edge `id()`, element `dedup()` and scalar
 `values`/`label`/`id` deduplication and one bounded native out/in `repeat`, over
 one materialized cohort snapshot. Repeat supports exact-depth and post-body
 emission with combined depth at most 32 and unchanged cumulative resource limits.
-They do not yet support `valueMap` or data-local hierarchy jobs. The original gateway `Read` has its own smaller subset.
+Terminal selected vertex `valueMap` returns bounded multi-property rows at the same V.
+They do not yet support data-local hierarchy jobs. The original gateway `Read` has its own smaller subset.
 
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
 rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions

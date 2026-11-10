@@ -2,21 +2,7 @@
 //! No new allowance, snapshot, retry or hierarchy-job admission is introduced.
 use super::*;
 
-pub(super) fn valid_map(properties: &BTreeMap<String, Vec<Value>>, keys: &[String]) -> bool {
-    if properties.len() > keys.len()
-        || properties
-            .iter()
-            .any(|(key, values)| !keys.contains(key) || values.len() != 1
-            || matches!(values.first(), Some(Value::Text(text)) if text.len() > projection::MAX_MAP_BYTES))
-    {
-        return false;
-    }
-    let flat = properties
-        .iter()
-        .map(|(key, values)| (key.clone(), values[0].clone()))
-        .collect();
-    projection::properties_bytes(&flat).is_ok()
-}
+pub(super) use crate::selected_properties::valid_map;
 
 impl Execution<'_> {
     pub(super) async fn project_rows(

@@ -589,3 +589,14 @@ Shared routing-v3、单分区 V2Observed server 和 managed Traverse/TraversePag
 累计 work/bytes/rows、TTL 与完整结果分页界限不变。此项 #155 只补齐通用查询语义，
 不完成 #110 的 data-local fixed-V 容量目标，也不依赖 #124 或扩大生命周期配额。
 见 [完整契约](MANAGED_FIXED_TRAVERSALS.md#bounded-native-repeat)。
+
+
+### Selected vertex maps at fixed versions
+
+Shared routing-v3、单分区 V2Observed server 和 managed Traverse/TraversePage
+支持终端指定 1–8 字段的 vertex valueMap，复用官方 AST、同一快照与既有
+PropertyMap 结果。qualified 来源、有序 bag、missing/Null、默认结果上限与完整
+分页语义保持；共享 bounded property codec/validator 消除重复逻辑。
+2 KiB 单 map、累计 work/bytes、TTL 和生命周期限制不变。#157 只补齐通用
+多属性查询组合，不完成 data-local fixed-V 容量或 #110/#111 全量验收。
+见[契约](MANAGED_FIXED_TRAVERSALS.md#selected-vertex-property-maps)。

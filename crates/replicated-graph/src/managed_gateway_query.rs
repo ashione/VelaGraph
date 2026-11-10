@@ -345,6 +345,10 @@ impl From<WireElement> for QualifiedElement {
 #[serde(deny_unknown_fields)]
 enum WireRow {
     Element(WireElement),
+    PropertyMap {
+        source: WireElement,
+        properties: BTreeMap<String, Vec<Value>>,
+    },
     Path(Vec<WireElement>),
     Value {
         source: Option<WireElement>,
@@ -359,6 +363,10 @@ pub(super) fn strict_rows<'de, D: serde::Deserializer<'de>>(
         rows.into_iter()
             .map(|row| match row {
                 WireRow::Element(element) => QueryRow::Element(element.into()),
+                WireRow::PropertyMap { source, properties } => QueryRow::PropertyMap {
+                    source: source.into(),
+                    properties,
+                },
                 WireRow::Path(elements) => {
                     QueryRow::Path(elements.into_iter().map(Into::into).collect())
                 }
@@ -489,6 +497,10 @@ pub(super) fn execute_traversal(
                 }
                 ObservedRowV3::Edge(e) => QueryRow::Element(qualified(ObservedElementRef::Edge(e))),
                 ObservedRowV3::Count(n) => QueryRow::Count(n),
+                ObservedRowV3::PropertyMap { source, properties } => QueryRow::PropertyMap {
+                    source: qualified(ObservedElementRef::Vertex(source)),
+                    properties,
+                },
                 ObservedRowV3::Value { source, value } => QueryRow::Value {
                     source: Some(qualified(source)),
                     value,
@@ -621,6 +633,7 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
         owners: Vec::new(),
     }];
     let mut scalar = false;
+    let mut map_keys = None;
     let mut label = false;
     let mut id_projection = false;
     let mut count = false;
@@ -679,6 +692,7 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
                 }
                 shapes = expanded;
             }
+            Step::ValueMap(keys) => map_keys = Some(keys),
             Step::Existing(GremlinStep::Values(_)) => scalar = true,
             Step::Existing(GremlinStep::Id) => {
                 scalar = true;
@@ -716,7 +730,12 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
         }
     };
     data.rows.iter().all(|row| match row {
-        QueryRow::Element(e) if !scalar && !path => {
+        QueryRow::PropertyMap { source, properties } if map_keys.is_some() => {
+            valid_element(source, false)
+                && (shapes[0].elements.len() != 1 || valid_start(source))
+                && crate::selected_properties::valid_map(properties, map_keys.unwrap())
+        }
+        QueryRow::Element(e) if !scalar && !path && map_keys.is_none() => {
             valid_element(e, edge) && (shapes[0].elements.len() != 1 || valid_start(e))
         }
         QueryRow::Value {

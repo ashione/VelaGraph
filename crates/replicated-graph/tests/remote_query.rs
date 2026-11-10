@@ -455,7 +455,42 @@ async fn scenario() -> anyhow::Result<()> {
     };
     let vertex = |id| QualifiedElement::Vertex { partition: 0, id };
     let edge = |id| QualifiedElement::Edge { partition: 0, id };
+    let property_map = |id, properties| QueryRow::PropertyMap {
+        source: vertex(id),
+        properties,
+    };
     for (text, expected) in [
+        (
+            "g.V(2,1,2).valueMap('name','missing')",
+            vec![
+                property_map(
+                    2,
+                    BTreeMap::from([("name".into(), vec![Value::Text("bob".into())])]),
+                ),
+                property_map(
+                    1,
+                    BTreeMap::from([("name".into(), vec![Value::Text("alice".into())])]),
+                ),
+                property_map(
+                    2,
+                    BTreeMap::from([("name".into(), vec![Value::Text("bob".into())])]),
+                ),
+            ],
+        ),
+        (
+            "g.V(1,2,1).dedup().limit(1).valueMap('typed','flag','missing')",
+            vec![property_map(
+                1,
+                BTreeMap::from([
+                    ("typed".into(), vec![Value::Integer(1)]),
+                    ("flag".into(), vec![Value::Boolean(true)]),
+                ]),
+            )],
+        ),
+        (
+            "g.V(1).valueMap('missing')",
+            vec![property_map(1, BTreeMap::new())],
+        ),
         (
             "g.V(1,2,1).values('typed').dedup()",
             vec![
@@ -629,6 +664,8 @@ async fn scenario() -> anyhow::Result<()> {
     }
     for text in [
         "g.V(2).out('cross')",
+        "g.V(2).out('cross').valueMap('name')",
+        "g.E(10).inV().valueMap('name')",
         "g.E(10)",
         "g.E().count()",
         "g.V(2).out('cross').dedup().limit(1)",
@@ -651,7 +688,7 @@ async fn scenario() -> anyhow::Result<()> {
     for mode in [QueryMode::V1, QueryMode::V2Observed] {
         for (text, failure) in [
             ("g.V(", QueryFailure::Parse),
-            ("g.V().valueMap('name')", QueryFailure::Unsupported),
+            ("g.E().valueMap('name')", QueryFailure::Unsupported),
         ] {
             assert_eq!(
                 query(endpoint, Some(identity), request(mode, text), BUDGET).await?,
@@ -659,6 +696,16 @@ async fn scenario() -> anyhow::Result<()> {
             );
         }
     }
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V1, "g.V().valueMap('name')"),
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::Unsupported)
+    );
     assert_eq!(
         query(
             endpoint,

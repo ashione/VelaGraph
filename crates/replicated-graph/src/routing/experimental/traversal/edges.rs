@@ -14,6 +14,11 @@ pub enum ObservedRowV3 {
     Edge(EdgeRef),
     Path(Vec<ObservedPathElement>),
     Count(u64),
+    /// Terminal selected vertex properties, with singleton-list Gremlin values.
+    PropertyMap {
+        source: VertexRef,
+        properties: BTreeMap<String, Vec<Value>>,
+    },
     Value {
         source: ObservedElementRef,
         value: Value,
@@ -152,7 +157,7 @@ pub(crate) fn validate_steps(
     let mut edge_stream = matches!(query.start(), GremlinStart::Edges(_));
     let mut scalar = false;
     let mut depth = 0usize;
-    for step in query.steps() {
+    for (index, step) in query.steps().iter().enumerate() {
         if scalar
             && !matches!(
                 step,
@@ -172,6 +177,20 @@ pub(crate) fn validate_steps(
             ));
         }
         match step {
+            Step::ValueMap(keys) => {
+                if edge_stream || index + 1 != query.steps().len() {
+                    return Err(ExperimentalRouteError::Unsupported(
+                        "v3 valueMap requires a terminal vertex stream",
+                    ));
+                }
+                crate::selected_properties::validate_keys(keys).map_err(|_| {
+                    ExperimentalRouteError::Query(
+                        rocksdb_sql_table::Error::UnsupportedGremlinArgument(
+                            "valueMap requires one to eight distinct bounded keys".into(),
+                        ),
+                    )
+                })?;
+            }
             Step::Dedup => {}
             Step::Repeat { times, .. } => {
                 if edge_stream {
@@ -216,11 +235,6 @@ pub(crate) fn validate_steps(
                 | GremlinStep::Path
                 | GremlinStep::Count,
             ) => {}
-            _ => {
-                return Err(ExperimentalRouteError::Unsupported(
-                    "v3 step outside observed traversal subset",
-                ))
-            }
         }
     }
     if depth > rocksdb_sql_table::MAX_OBSERVED_GREMLIN_REPEAT_TIMES {
@@ -337,6 +351,53 @@ fn repeat_rows<R: TraversalRead + ?Sized>(
         }
     }
     Ok(if emit { emitted } else { rows })
+}
+
+fn project_maps<R: TraversalRead + ?Sized>(
+    read: &R,
+    rows: Vec<ElementRow>,
+    keys: &[String],
+    work: &mut Work,
+) -> ExperimentalResult<Vec<ObservedRowV3>> {
+    read.check()?;
+    // The terminal projection runs after the ordinary default result cap,
+    // but every upstream traversal/integrity check has already completed.
+    // Admit backing storage and every map before retaining singleton lists.
+    work.charge(rows.len() * std::mem::size_of::<ObservedRowV3>())?;
+    let mut output = Vec::with_capacity(rows.len());
+    for row in rows {
+        read.check()?;
+        work.visit()?;
+        let ObservedElementRef::Vertex(source) = row.element else {
+            unreachable!("validated vertex map stream")
+        };
+        let mut vertex = read
+            .get_vertex(source)?
+            .ok_or(ExperimentalError::MissingEndpoint(source))?;
+        work.vertex(&vertex)?;
+        vertex.properties.retain(|key, _| keys.contains(key));
+        let bytes =
+            crate::selected_properties::properties_bytes(&vertex.properties).map_err(|error| {
+                match error {
+                    crate::remote::query::QueryFailure::ResourceExhausted => {
+                        limit("v3 selected property map exceeds 2 KiB")
+                    }
+                    _ => ExperimentalRouteError::Query(rocksdb_sql_table::Error::CorruptData(
+                        "invalid selected property map".into(),
+                    )),
+                }
+            })?;
+        work.charge(bytes + 128 * vertex.properties.len() + 256)?;
+        output.push(ObservedRowV3::PropertyMap {
+            source,
+            properties: vertex
+                .properties
+                .into_iter()
+                .map(|(key, value)| (key, vec![value]))
+                .collect(),
+        });
+    }
+    Ok(output)
 }
 
 /// Private execution-only read boundary. Providers own their consistency proof;
@@ -505,7 +566,7 @@ pub(crate) trait TraversalRead {
                     )?;
                 }
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
-                Step::Existing(GremlinStep::Path | GremlinStep::Count) => {}
+                Step::Existing(GremlinStep::Path | GremlinStep::Count) | Step::ValueMap(_) => {}
                 Step::OutE(label)
                 | Step::InE(label)
                 | Step::BothE(label)
@@ -623,7 +684,6 @@ pub(crate) trait TraversalRead {
                     }
                     rows = next;
                 }
-                _ => unreachable!("validated observed subset"),
             }
         }
         let count = matches!(
@@ -643,7 +703,9 @@ pub(crate) trait TraversalRead {
             rows.truncate(100);
         }
         work.charge(rows.len() * 128 + self.metadata_bytes())?;
-        let rows = if count {
+        let rows = if let Some(Step::ValueMap(keys)) = query.steps().last() {
+            project_maps(self, rows, keys, &mut work)?
+        } else if count {
             vec![ObservedRowV3::Count(rows.len() as u64)]
         } else {
             rows.into_iter()
@@ -964,8 +1026,12 @@ mod tests {
         fn store(&self, _: u32) -> ExperimentalResult<AppendOnlyStore<Self::Node>> {
             unreachable!()
         }
-        fn get_vertex(&self, _: VertexRef) -> ExperimentalResult<Option<Vertex>> {
-            unreachable!()
+        fn get_vertex(&self, vertex: VertexRef) -> ExperimentalResult<Option<Vertex>> {
+            Ok(Some(Vertex {
+                id: vertex.id,
+                labels: Vec::new(),
+                properties: BTreeMap::from([("x".into(), Value::Text("value".into()))]),
+            }))
         }
         fn get_edge(&self, _: EdgeRef) -> ExperimentalResult<Option<CrossEdge>> {
             unreachable!()
@@ -986,6 +1052,65 @@ mod tests {
                 properties: BTreeMap::new(),
             }])
         }
+    }
+
+    #[test]
+    fn selected_maps_charge_backing_rows_properties_and_deadlines_before_retention() {
+        let read = LoopRead {
+            checks: std::cell::Cell::new(0),
+            fail_after: usize::MAX,
+        };
+        let row = || {
+            start_row(ObservedElementRef::Vertex(VertexRef {
+                partition: 7,
+                id: 1,
+            }))
+        };
+        let keys = vec!["x".to_string()];
+        let backing = std::mem::size_of::<ObservedRowV3>();
+        let vertex_bytes = 128 + 128 + 1 + 5;
+        let flat_bytes = serde_json::to_vec(&BTreeMap::from([("x", Value::Text("value".into()))]))
+            .unwrap()
+            .len();
+        let retained = flat_bytes + 128 + 256;
+        let mut work = Work {
+            bytes: 0,
+            visits: 0,
+        };
+        assert_eq!(
+            project_maps(&read, vec![row()], &keys, &mut work)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            (work.bytes, work.visits),
+            (backing + vertex_bytes + retained, 1)
+        );
+        for remaining in [backing - 1, backing + vertex_bytes + retained - 1] {
+            let mut work = Work {
+                bytes: 64 * 1024 * 1024 - remaining,
+                visits: 0,
+            };
+            assert!(project_maps(&read, vec![row()], &keys, &mut work).is_err());
+            assert!(work.bytes > 64 * 1024 * 1024);
+        }
+        let mut work = Work {
+            bytes: 0,
+            visits: 10_000,
+        };
+        assert!(project_maps(&read, vec![row()], &keys, &mut work).is_err());
+        assert_eq!(work.bytes, backing);
+        let expired = LoopRead {
+            checks: std::cell::Cell::new(0),
+            fail_after: 0,
+        };
+        let mut work = Work {
+            bytes: 0,
+            visits: 0,
+        };
+        assert!(project_maps(&expired, vec![row()], &keys, &mut work).is_err());
+        assert_eq!((work.bytes, work.visits), (0, 0));
     }
 
     #[test]

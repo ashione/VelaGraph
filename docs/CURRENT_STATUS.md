@@ -55,7 +55,8 @@ fail explicitly. Public graph mutations here are typed APIs, not Gremlin scripts
 Managed Traverse/TraversePage first materialize a cohort snapshot, then execute
 locally over it. They support one bounded native out/in repeat with optional post-body emit and
 combined depth at most 32, within unchanged cumulative limits. They do **not**
-support valueMap, data-local distributed fragments or hierarchy jobs. Capture is bounded to 10,000 rows, 2 MiB copied
+support data-local distributed fragments or hierarchy jobs. Terminal selected
+vertex valueMap is available under the same fixed-V/session limits. Capture is bounded to 10,000 rows, 2 MiB copied
 payload and 100,000 replay operations. A retained complete result has at most
 10,000 rows/1 MiB serialized bytes; paging does not increase those bounds. Consult
 [the full contract](MANAGED_FIXED_TRAVERSALS.md) for defaults, deadlines and
