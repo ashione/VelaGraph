@@ -1871,6 +1871,39 @@ async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::
 mod lifecycle_metrics;
 use lifecycle_metrics::Metrics;
 
+#[path = "support/lifecycle_attribution.rs"]
+mod lifecycle_attribution;
+use lifecycle_attribution::Attribution;
+
+async fn lifecycle_gateway(
+    config: RemoteConfig,
+    enabled: bool,
+    source: &str,
+    elf: &str,
+) -> anyhow::Result<(Gateway, Attribution)> {
+    let address = "127.0.0.1:0".parse()?;
+    let (gateway, reports) = if enabled {
+        let (gateway, reports) = Gateway::bind_remote_with_timing(config, address, BUDGET).await?;
+        (gateway, Some(reports))
+    } else {
+        (Gateway::bind_remote(config, address, BUDGET).await?, None)
+    };
+    Ok((gateway, Attribution::new(reports, source, elf)))
+}
+
+fn lifecycle_processes(
+    coordinator: &Process,
+    writer: &Process,
+    nonparticipant: &Process,
+) -> [(&'static str, u32); 4] {
+    [
+        ("gateway", std::process::id()),
+        ("coordinator", coordinator.child.id()),
+        ("writer", writer.child.id()),
+        ("nonparticipant", nonparticipant.child.id()),
+    ]
+}
+
 const EXTENDED_WRITES: u64 = 1025;
 const RETAINED_ENV: &str = "BYTE_BOUND_PROCESS_DIRECTORY";
 
@@ -2373,6 +2406,16 @@ async fn verify_small_lifecycle(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::Result<()> {
+    // Keep one ordinary test and the original total scenario budget. A second
+    // concurrent fixture would add pressure to process-wide RPC admission.
+    tokio::time::timeout(Duration::from_secs(240), async {
+        small_lifecycle_recovery(false).await?;
+        small_lifecycle_recovery(true).await
+    })
+    .await?
+}
+
+async fn small_lifecycle_recovery(enabled: bool) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(240), async {
         let config = ProcessConfig {
             cohort: byte_binding().cohort,
@@ -2418,19 +2461,26 @@ async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::
                 .validate()
                 .map_err(|e| anyhow!("invalid initial grant: {e:?}"))?;
         }
-        let g = Gateway::bind_remote(
+        let (g, mut attribution) = lifecycle_gateway(
             RemoteConfig {
                 coordinator: c_client.clone(),
                 binding: byte_binding(),
                 members: vec![a_client.clone(), b_client.clone()],
             },
-            "127.0.0.1:0".parse()?,
-            BUDGET,
+            enabled,
+            "unrecorded-small-functional-test",
+            "unrecorded-small-functional-test",
         )
         .await?;
         assert_eq!(
             BTreeSet::from([g.local_addr(), coordinator.address, a.address, b.address]).len(),
             4
+        );
+        attribution.emit(
+            "small_setup",
+            0,
+            false,
+            &lifecycle_processes(&coordinator, &a, &b),
         );
         let mut originals = BTreeMap::new();
         let mut evidence = BTreeMap::from([(0, small_version_evidence(&g, &c_client, 0).await?)]);
@@ -2450,6 +2500,7 @@ async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::
                     id
                 );
             }
+            attribution.drain();
             if [1, SMALL_LIFECYCLE_WRITES].contains(&ordinal) {
                 originals.insert(
                     ordinal,
@@ -2461,6 +2512,12 @@ async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::
                 );
             }
         }
+        attribution.emit(
+            "small_before_ack_reopen",
+            SMALL_LIFECYCLE_WRITES,
+            false,
+            &lifecycle_processes(&coordinator, &a, &b),
+        );
         b.stop()?;
         coordinator.stop()?;
         coordinator.reopen().await?;
@@ -2517,6 +2574,21 @@ async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::
         )
         .await?;
         g.shutdown().await;
+        // Both fixtures run exactly the same recovery/data assertions. The
+        // additional fixture proves that timing reports traverse the real path.
+        if enabled {
+            // Four original writes, one unknown-ACK retry, then three
+            // verification passes of two originals plus two changed requests.
+            assert_eq!(attribution.received(), 17);
+        } else {
+            assert_eq!(attribution.received(), 0);
+        }
+        attribution.emit(
+            "small_complete",
+            SMALL_LIFECYCLE_WRITES,
+            true,
+            &lifecycle_processes(&coordinator, &a, &b),
+        );
         Ok::<_, anyhow::Error>(())
     })
     .await?
@@ -2601,14 +2673,17 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
         );
     }
     assert_eq!(checkpoint.grants.len(), 2);
-    let g = Gateway::bind_remote(
+    let attribution_enabled =
+        std::env::var("BYTE_BOUND_PROCESS_ATTRIBUTION").is_ok_and(|v| v == "1");
+    let (g, mut attribution) = lifecycle_gateway(
         RemoteConfig {
             coordinator: c_client.clone(),
             binding: byte_binding(),
             members: vec![a_client.clone(), b_client.clone()],
         },
-        "127.0.0.1:0".parse()?,
-        BUDGET,
+        attribution_enabled,
+        &checkpoint.source_sha256,
+        &checkpoint.elf_sha256,
     )
     .await?;
     retain_proof(&c_client, 0, &mut checkpoint).await?;
@@ -2620,6 +2695,12 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
         .ok()
         .map(|v| v.parse::<u64>())
         .transpose()?;
+    attribution.emit(
+        "setup",
+        checkpoint.verified_ordinal,
+        false,
+        &lifecycle_processes(&coordinator, &a, &b),
+    );
     let started = std::time::Instant::now();
     for ordinal in checkpoint.verified_ordinal + 1..=EXTENDED_WRITES {
         let write = extended_write(ordinal);
@@ -2633,6 +2714,12 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
             }
             retain_original(&c_client, ordinal, &mut checkpoint).await?;
             checkpoint.save(root.path(), "ack_loss")?;
+            attribution.emit(
+                "before_ack_reopen",
+                checkpoint.verified_ordinal,
+                false,
+                &lifecycle_processes(&coordinator, &a, &b),
+            );
             b.stop()?;
             coordinator.stop()?;
             {
@@ -2643,12 +2730,19 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
                 let _span = checkpoint.metrics.span("recovery.reopen_nonparticipant");
                 b.reopen().await?;
             }
+            attribution.emit(
+                "after_ack_reopen",
+                checkpoint.verified_ordinal,
+                false,
+                &lifecycle_processes(&coordinator, &a, &b),
+            );
             retain_original(&c_client, ordinal, &mut checkpoint).await?;
         }
         let reply = {
             let _span = checkpoint.metrics.span("gateway.submit");
             call_bound(&g, byte_binding(), Operation::Submit(write)).await?
         };
+        attribution.drain();
         let (transaction_id, committed_ordinal) = committed(reply);
         assert_eq!(committed_ordinal, ordinal);
         if [1, 256, 1024, 1025].contains(&ordinal) {
@@ -2668,6 +2762,12 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
         checkpoint.pending_external_id = None;
         checkpoint.save(root.path(), "verified")?;
         if ordinal == 1 || ordinal % 16 == 0 || ordinal == EXTENDED_WRITES {
+            attribution.emit(
+                "writes",
+                ordinal,
+                false,
+                &lifecycle_processes(&coordinator, &a, &b),
+            );
             checkpoint.metrics.emit(
                 &checkpoint.source_sha256,
                 &checkpoint.elf_sha256,
@@ -2683,20 +2783,44 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
     }
     verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
     // Reopen the actual single writer too, then prove the old IDs and versions.
+    attribution.emit(
+        "before_writer_reopen",
+        checkpoint.verified_ordinal,
+        false,
+        &lifecycle_processes(&coordinator, &a, &b),
+    );
     a.stop()?;
     {
         let _span = checkpoint.metrics.span("recovery.reopen_writer");
         a.reopen().await?;
     }
     verify_retained_lifecycle(&g, &c_client, [&a_client, &b_client], &mut checkpoint).await?;
+    attribution.emit(
+        "after_writer_reopen",
+        checkpoint.verified_ordinal,
+        false,
+        &lifecycle_processes(&coordinator, &a, &b),
+    );
     if !checkpoint.snapshots_restored {
         // There are no concurrent gateway writes during these full snapshot cuts.
         // Each child closes RPC, shuts down Raft after a barrier, exports complete
         // meta/data, and installs it into a fresh state.db on the next launch.
+        attribution.emit(
+            "before_snapshot_restores",
+            checkpoint.verified_ordinal,
+            false,
+            &lifecycle_processes(&coordinator, &a, &b),
+        );
         for process in [&mut a, &mut b, &mut coordinator] {
             let _span = checkpoint.metrics.span("recovery.snapshot_export_install");
             process.snapshot_restore().await?;
         }
+        attribution.emit(
+            "after_snapshot_restores",
+            checkpoint.verified_ordinal,
+            false,
+            &lifecycle_processes(&coordinator, &a, &b),
+        );
         checkpoint.snapshots_restored = true;
         checkpoint.save(root.path(), "snapshot_flag")?;
     }
@@ -2705,6 +2829,12 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
     g.shutdown().await;
     checkpoint.completed = true;
     checkpoint.save(root.path(), "complete")?;
+    attribution.emit(
+        "complete",
+        checkpoint.verified_ordinal,
+        true,
+        &lifecycle_processes(&coordinator, &a, &b),
+    );
     eprintln!("byte-bound lifecycle COMPLETE: 1025 gateway writes; exact original IDs/Plans; complete old-V proofs; crash/reopen; three full snapshot restores; source_sha256={} elf_sha256={} checkpoint={}",
         checkpoint.source_sha256, checkpoint.elf_sha256, root.path().join("progress.json").display());
     Ok(())

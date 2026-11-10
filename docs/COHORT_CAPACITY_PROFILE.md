@@ -233,3 +233,9 @@ fresh-state snapshot restore for all three roles. Immutable member grants and
 the nonparticipant's zero local sequence are checked after recovery. This small
 ordinary-test case does not replace the unchanged release 1,025-write lifecycle
 or CoreHR gates, cross the 256/1,024 history boundaries, or establish throughput.
+
+The same small lifecycle case also runs the full contract with the existing
+opt-in gateway phase receiver, sequentially within its original total budget. The mandatory release runner captures
+[bounded phase and owned-process resource observations](MANAGED_SUBMISSION_TIMING.md#lifecycle-attribution)
+under its existing source/ELF evidence. Missing diagnostics stay unknown; they do
+not replace or relax any lifecycle, validator, fsync or timeout requirement.

@@ -1,4 +1,4 @@
-# Managed submission phase timing (Issue #127, first slice)
+# Managed submission phase timing (Issue #127)
 
 `Gateway::bind` and `bind_remote` keep diagnostics disabled. Explicitly choose
 `bind_with_timing` or `bind_remote_with_timing` to receive a process-local
@@ -80,8 +80,56 @@ Interrupted and closes the reached phases, while the original request/Plan remai
 recoverable and its retry commits without a new snapshot or admission. Existing
 wire golden vectors remain unchanged.
 
-This is the instrumentation/model review slice of #127. Owned-process resource
-counters, fresh-run source/profile/ELF manifests and lifecycle evidence integration,
-remote authoritative subphases, controlled overhead measurement, and any proposed
-removal of duplicate work remain follow-up work. No optimization or large
-functional/benchmark acceptance run is implied; #127 remains open.
+## Lifecycle attribution
+
+The existing release lifecycle runner explicitly sets
+`BYTE_BOUND_PROCESS_ATTRIBUTION=1`. The test harness then selects the timing
+binding. Other harness invocations and production bindings remain disabled unless
+explicitly selected. Correctness gates still independently require the exact
+release test, all 1,025 writes, immutable proofs/original Plans, every durable
+pending/verified checkpoint, ACK-loss recovery and all snapshot restores.
+No diagnostic output can turn an incomplete lifecycle into a pass.
+
+The harness drains at most the 64-report queue capacity per observation and
+retains only 13 cumulative phase slots plus Returned/Error/Interrupted totals.
+It emits JSON lines prefixed `byte-bound lifecycle attribution:` to the already
+retained `test.stderr`, at the existing write milestones and before/after recovery
+boundaries. Reports retain the original source/ELF hashes, fixture-owner PID,
+attempt-local sequence, elapsed time, verified ordinal and stage. Aggregate
+reports do not retain per-request IDs, Plans, graph values or error strings.
+Counters restart with each fixture attempt; never add snapshots of cumulative
+counters together or sum nested phases as wall time. Dropped, disconnected or
+unobserved reports remain **unknown**, not zero and not successful operations.
+On error/cancellation, a final best-effort record is marked incomplete and omits
+process samples rather than reading potentially stale PIDs. Hard process death
+can prevent that record entirely.
+
+At each explicit observation, the fixture reads only its owner and three owned
+child PIDs, each through at most two 16 KiB Linux `/proc` files. `stat` supplies
+process start ticks, user/system CPU ticks and current resident pages; `io`
+supplies character and storage-byte counters. Parse, permission, platform and
+missing-file failures are JSON null, independently for CPU/memory and I/O. The
+runner records OS/architecture, logical CPU count, clock ticks/second and page
+bytes in its existing `execution.json`. Compare deltas only within the same run,
+PID and start-ticks identity. Restarts create new identities; pre/post samples
+do not account for the unsampled shutdown/startup intervals. These are sampled
+counters, not peaks, fsync counts, disk latency, per-operation causal attribution,
+CPU-model identification or cgroup throttling measurements. The shared parent
+also runs the test runtime; its counters include fixture and diagnostic work.
+Ordinary tests can run concurrently, so their parent counters include other tests.
+
+The existing unignored `byte_bound_independent_processes_small_lifecycle_recovery`
+case executes the same complete small recovery contract with diagnostics disabled
+then enabled, inside one original 240-second total budget. It does not add a
+concurrent fixture or change default test parallelism. Both modes preserve
+original-ID retries and rejected changed requests; the enabled mode checks all
+17 actual Submit reports without timing thresholds. Its explicitly unrecorded source/ELF
+labels are not a release acceptance identity. Parser and aggregation tests cover
+missing/malformed/oversized input, command names containing parentheses, wrong
+PIDs, duplicate I/O fields, completion types and repeated drains.
+
+Instrumentation and resource sampling have nonzero cost and consume the existing
+budgets. No causal overhead estimate or speedup is claimed. Remote authoritative
+verification/reducer/persistence subphases, controlled overhead measurements and
+an evidence-backed duplicate-work optimization remain follow-up work. #127 stays
+open; this is attribution support, not a performance or HA milestone.

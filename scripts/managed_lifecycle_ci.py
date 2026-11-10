@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import platform
 import re
 import shutil
 import stat
@@ -665,6 +666,21 @@ def validate_results(builder, lifecycle, scenario):
             'build, lifecycle runtime and CoreHR scenario must all succeed')
 
 
+def runner_metadata():
+    def system_unit(name):
+        try:
+            value = os.sysconf(name)
+            return value if value > 0 else None
+        except (AttributeError, OSError, ValueError):
+            return None
+    return {
+        'system': platform.system(), 'release': platform.release(),
+        'machine': platform.machine(), 'logical_cpus': os.cpu_count(),
+        'clock_ticks_per_second': system_unit('SC_CLK_TCK'),
+        'page_bytes': system_unit('SC_PAGE_SIZE'),
+    }
+
+
 def run_gate(root, out, mode, handoff=None):
     require(mode in ('build', 'runtime'), 'explicit build or runtime mode required')
     out.mkdir()  # A CI invocation never resumes, overwrites or accepts old evidence.
@@ -733,7 +749,12 @@ def run_gate(root, out, mode, handoff=None):
             return
         retained = out / 'lifecycle'
         retained.mkdir()
-        env.update(BYTE_BOUND_PROCESS_DIRECTORY=str(retained),
+        # Runtime diagnostics never replace the exact output/checkpoint gates.
+        # Linux /proc CPU and RSS samples use these units; unknown stays null.
+        metadata['runner'] = runner_metadata()
+        save()
+        env.update(BYTE_BOUND_PROCESS_ATTRIBUTION='1',
+                   BYTE_BOUND_PROCESS_DIRECTORY=str(retained),
                    BYTE_BOUND_PROCESS_SOURCE_SHA256=source['sha256'],
                    BYTE_BOUND_PROCESS_ELF_SHA256=elf_hash)
         command = [str(executable), TEST, '--exact', '--nocapture', '--test-threads=1',
