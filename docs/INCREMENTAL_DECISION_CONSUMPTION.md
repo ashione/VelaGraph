@@ -68,7 +68,9 @@ checksums. No new toolchain or build-time code generator is required.
 ## Bounded transfer and exact retries
 
 A leader-barrier member HistoryStatus samples the cursor and applied watermark
-under one state lock. Coordinator HistoryPage verifies that base cursor against its
+under one state lock. Active durable members now reuse one
+[complete verification for visibility and history](HISTORY_STATUS_VALIDATION.md)
+within that operation. Coordinator HistoryPage verifies that base cursor against its
 actual Journal. The first page pins the coordinator's current full event count/root
 as `cut`; all continuation requests use that exact cut, even if new events append.
 

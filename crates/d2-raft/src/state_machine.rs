@@ -324,6 +324,10 @@ pub struct StateMachinePause<'a> {
 pub struct StateMachine {
     state: RwLock<StateMachineData>,
     snapshot_idx: AtomicU64,
+    #[cfg(test)]
+    member_verifications: AtomicU64,
+    #[cfg(test)]
+    history_status_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     storage: Option<Arc<StateMachineStorage>>,
     #[cfg(test)]
@@ -526,6 +530,10 @@ impl StateMachine {
                 archive_cut,
             }),
             snapshot_idx: AtomicU64::new(snapshot_idx),
+            #[cfg(test)]
+            member_verifications: AtomicU64::new(0),
+            #[cfg(test)]
+            history_status_gate: Default::default(),
             current_snapshot: RwLock::new(current_snapshot),
             storage: Some(storage),
             #[cfg(test)]
@@ -858,28 +866,80 @@ impl StateMachine {
         let state = self.state.read().await;
         self.coordinator_operation(|| {
             let verified = blocking_section(|| self.verified_member(&state))?;
-            let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
-            d1.check_shard(shard)?;
-            d1.check_epoch(epoch)?;
-            if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
-                return Err(D1Error::ManagedModeConflict);
+            self.participant_visibility_info_at(&state, verified.as_ref(), shard, epoch, mode_id)
+        })
+    }
+
+    // Shared validation for the public visibility getter and the active
+    // operation-local history observation. The caller retains the state guard.
+    fn participant_visibility_info_at(
+        &self,
+        state: &StateMachineData,
+        verified: Option<&event_ledger::VerifiedArchive<'_, '_>>,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<crate::cohort_reads::VisibilityInfo, D1Error> {
+        let d1 = state.d1.as_ref().ok_or(D1Error::NotActivated)?;
+        d1.check_shard(shard)?;
+        d1.check_epoch(epoch)?;
+        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+            return Err(D1Error::ManagedModeConflict);
+        }
+        let visibility = d1
+            .visibility
+            .as_ref()
+            .ok_or(D1Error::VisibilityNotEnabled)?;
+        Ok(crate::cohort_reads::VisibilityInfo {
+            authority: d1.participant.as_ref().unwrap().authority.clone(),
+            baseline_sequence: visibility.baseline_sequence,
+            cohort: visibility.journal.cohort().cloned(),
+            // Active verification already binds A and every terminal row
+            // to this snapshot; do not read a second live manifest.
+            applied_prefix: if verified.is_some() || visibility.journal.cohort().is_none() {
+                visibility.applied
+            } else {
+                self.decision_frontier(d1)?
+            },
+        })
+    }
+
+    /// Internal active-archive fast path: identity, cursor and A share one read
+    /// guard and one fully verified RocksDB snapshot/publication witness. The
+    /// witness never escapes this operation or survives into another request.
+    /// None deliberately leaves legacy/in-memory callers on their old path.
+    pub(crate) async fn participant_active_history_status(
+        &self,
+        shard: u64,
+        epoch: u64,
+        mode_id: [u8; 16],
+    ) -> Result<
+        Option<(
+            crate::cohort_reads::VisibilityInfo,
+            crate::transaction_decisions::HistoryCursor,
+        )>,
+        D1Error,
+    > {
+        let state = self.state.read().await;
+        self.coordinator_operation(|| {
+            let Some(verified) = blocking_section(|| self.verified_member(&state))? else {
+                return Ok(None);
+            };
+            #[cfg(test)]
+            if let Some(gate) = self.history_status_gate.lock().unwrap().take() {
+                blocking_section(|| {
+                    let _ = gate.entered.send(());
+                    let _ = gate.release.recv();
+                });
             }
-            let visibility = d1
-                .visibility
-                .as_ref()
-                .ok_or(D1Error::VisibilityNotEnabled)?;
-            Ok(crate::cohort_reads::VisibilityInfo {
-                authority: d1.participant.as_ref().unwrap().authority.clone(),
-                baseline_sequence: visibility.baseline_sequence,
-                cohort: visibility.journal.cohort().cloned(),
-                // Active verification already binds A and every terminal row
-                // to this snapshot; do not read a second live manifest.
-                applied_prefix: if verified.is_some() || visibility.journal.cohort().is_none() {
-                    visibility.applied
-                } else {
-                    self.decision_frontier(d1)?
-                },
-            })
+            let info = self.participant_visibility_info_at(
+                &state,
+                Some(&verified),
+                shard,
+                epoch,
+                mode_id,
+            )?;
+            Ok(Some((info, verified.head())))
         })
     }
 
