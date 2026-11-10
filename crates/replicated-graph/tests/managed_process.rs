@@ -1038,6 +1038,16 @@ async fn scenario() -> anyhow::Result<()> {
             &reopened,
             &recovered_session,
             7,
+            "g.V(101,101).bothE('reports').dedup().count()"
+        )
+        .await?,
+        vec![QueryRow::Count(2)]
+    );
+    assert_eq!(
+        traverse(
+            &reopened,
+            &recovered_session,
+            7,
             "g.V(101).out('reports').values('name')"
         )
         .await?,
@@ -1231,6 +1241,55 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         value: Value::Integer(id),
     };
     let expectations = vec![
+        (
+            7,
+            "g.V(101,101).dedup().out('reports').count()",
+            vec![QueryRow::Count(2)],
+        ),
+        (
+            7,
+            "g.V(101).out('reports').dedup().values('name')",
+            vec![value(8, 101, "Bob")],
+        ),
+        (
+            7,
+            "g.V(101).out('member').dedup()",
+            vec![row(7, 102), row(8, 102)],
+        ),
+        (
+            7,
+            "g.E(101,101).bothV().dedup()",
+            vec![row(7, 101), row(8, 101)],
+        ),
+        (
+            7,
+            "g.V(101).bothE('reports').dedup().count()",
+            vec![QueryRow::Count(3)],
+        ),
+        (
+            7,
+            "g.V(101).out('reports').out('reports').dedup().path()",
+            vec![QueryRow::Path(vec![
+                element(7, 101),
+                QualifiedElement::Edge {
+                    partition: 7,
+                    id: 101,
+                },
+                element(8, 101),
+                QualifiedElement::Edge {
+                    partition: 8,
+                    id: 101,
+                },
+                element(7, 101),
+            ])],
+        ),
+        (7, "g.V(101,101,102).limit(2).dedup()", vec![row(7, 101)]),
+        (
+            7,
+            "g.V(101,101,102).dedup().limit(2)",
+            vec![row(7, 101), row(7, 102)],
+        ),
+        (7, "g.V(999).dedup().count()", vec![QueryRow::Count(0)]),
         (7, "g.V(101).id()", vec![id_value(element(7, 101), 101)]),
         (
             7,
@@ -1378,7 +1437,10 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     call(g, Operation::Close { session: another }).await?;
     for unsupported in [
         "g.V(101).id().out()",
-        "g.V(101).dedup()",
+        "g.V(999).values('missing').dedup()",
+        "g.E(999).id().dedup()",
+        "g.V(999).dedup('a')",
+        "g.V(999).dedup().by('name')",
         "g.V(101).valueMap('name')",
         "g.V(101).repeat(out()).times(2)",
         "g.V(101).out().out().out().out()",
@@ -1388,6 +1450,15 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
             "accepted {unsupported}"
         );
     }
+    let distinct_session = open(g, Some(old.version)).await?;
+    let distinct_query = "g.V(101,101).bothE('reports').dedup()";
+    let distinct_rows: Vec<_> = [(7, 101), (8, 101), (7, 102)]
+        .into_iter()
+        .map(|(partition, id)| QueryRow::Element(QualifiedElement::Edge { partition, id }))
+        .collect();
+    let distinct_first = page(g, &distinct_session, 7, distinct_query, None, 1).await?;
+    assert_eq!(distinct_first.total, 3);
+    assert_eq!(distinct_first.data.rows, distinct_rows[..1]);
     let writes = vec![
         person_write(30, 8, 103, "person", "Cara"),
         Write {
@@ -1510,6 +1581,32 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
             collected.extend(next_page.data.rows);
             cursor = next_page.next;
         }
+        // Full deduplicated results and cursor replay stay at old V, including
+        // after one of the source edges is deleted from the latest graph.
+        assert_eq!(
+            page(g, &distinct_session, 7, distinct_query, None, 1).await?,
+            distinct_first
+        );
+        let mut distinct_cursor = distinct_first.next.clone();
+        let mut distinct_collected = distinct_first.data.rows.clone();
+        while let Some(token) = distinct_cursor {
+            let next = page(
+                g,
+                &distinct_session,
+                7,
+                distinct_query,
+                Some(token.clone()),
+                1,
+            )
+            .await?;
+            assert_eq!(
+                next,
+                page(g, &distinct_session, 7, distinct_query, Some(token), 1).await?
+            );
+            distinct_collected.extend(next.data.rows);
+            distinct_cursor = next.next;
+        }
+        assert_eq!(distinct_collected, distinct_rows);
         let fresh = open(g, Some(version)).await?;
         assert_eq!(
             traverse(g, &fresh, 8, "g.V(103).values('name')").await?,
@@ -1529,6 +1626,20 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
             traverse(g, &fresh, 7, "g.V(102).in('member').count()").await?,
             vec![QueryRow::Count(if phase == 3 { 2 } else { 1 })]
         );
+        assert_eq!(
+            traverse(
+                g,
+                &fresh,
+                7,
+                "g.V(101).out('reports').dedup().values('name')"
+            )
+            .await?,
+            vec![value(8, 101, name)]
+        );
+        assert_eq!(
+            traverse(g, &fresh, 7, distinct_query).await?.len(),
+            if phase < 2 { 3 } else { 2 }
+        );
         call(g, Operation::Close { session: fresh }).await?;
     }
     writer.await??;
@@ -1538,6 +1649,13 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
     let replay = page(g, &old, 7, path_query, None, 1).await?;
     assert_eq!(replay.data.rows, collected[..1]);
     assert_eq!(replay.total, 4);
+    call(
+        g,
+        Operation::Close {
+            session: distinct_session,
+        },
+    )
+    .await?;
     Ok((old, next))
 }
 

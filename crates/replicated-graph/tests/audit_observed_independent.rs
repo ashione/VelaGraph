@@ -181,6 +181,87 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             frozen.observed_gremlin_v3(99, "g.E().count()")?.rows,
             vec![R3::Count(0)]
         );
+        // Independent identity oracle: same-number partitions stay distinct,
+        // while paths and output order belong to the first occurrence.
+        for (query, expected) in [
+            ("g.V().dedup()", vec![1, 2, 3]),
+            ("g.V(7,7).dedup()", vec![1]),
+            ("g.V(7).out().dedup()", vec![2, 3, 1]),
+            ("g.V(7).out().limit(2).dedup()", vec![2]),
+            ("g.V(7).out().dedup().limit(2)", vec![2, 3]),
+            ("g.V(7).out().dedup().hasLabel('P3')", vec![3]),
+            ("g.V(7).out().hasLabel('P3').dedup()", vec![3]),
+            ("g.E(12,12).bothV().dedup()", vec![1]),
+            ("g.E(9,9).bothV().dedup()", vec![1, 2]),
+            ("g.V(999).dedup()", vec![]),
+        ] {
+            let result = s.observed_gremlin_v3(1, query)?;
+            assert_eq!(
+                result.rows,
+                expected
+                    .into_iter()
+                    .map(|p| R3::Vertex(vr(p)))
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+            assert_eq!(result.snapshots, s.snapshots);
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+        }
+        for (query, expected) in [
+            ("g.E(12,9,999,9).dedup()", vec![(1, 12), (1, 9)]),
+            (
+                "g.V(7,7).bothE().dedup()",
+                vec![(1, 9), (2, 9), (1, 10), (1, 11), (1, 12)],
+            ),
+            (
+                "g.V(7).outE().dedup().has('x',1)",
+                vec![(1, 10), (1, 11), (1, 12)],
+            ),
+        ] {
+            assert_eq!(
+                s.observed_gremlin_v3(1, query)?.rows,
+                expected
+                    .into_iter()
+                    .map(|(p, id)| R3::Edge(er(p, id)))
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+        }
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7,7).dedup().out().count()")?
+                .rows,
+            vec![R3::Count(4)]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).out().dedup().out().dedup().count()")?
+                .rows,
+            vec![R3::Count(3)]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7).out().dedup().limit(1).path()")?
+                .rows,
+            vec![R3::Path(vec![
+                ObservedPathElement::Vertex(vr(1)),
+                ObservedPathElement::Edge(er(1, 9)),
+                ObservedPathElement::Vertex(vr(2))
+            ])]
+        );
+        assert_eq!(
+            s.observed_gremlin_v3(1, "g.V(7,7).outE().dedup().limit(1).path()")?
+                .rows,
+            vec![R3::Path(vec![
+                ObservedPathElement::Vertex(vr(1)),
+                ObservedPathElement::Edge(er(1, 9))
+            ])]
+        );
+        for query in [
+            "g.V(999).values('missing').dedup()",
+            "g.E(999).id().dedup()",
+            "g.V(999).dedup('x')",
+            "g.V(999).dedup().by('name')",
+        ] {
+            assert!(s.observed_gremlin_v3(1, query).is_err(), "{query}");
+        }
         let value = |source, id| R3::Value {
             source,
             value: rocksdb_sql_table::Value::Integer(id),
@@ -618,6 +699,8 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             "g.V(7).outE()",
             "g.V(7).bothE().count()",
             "g.V(7).outE('Missing').count()",
+            "g.V(7).bothE().dedup().limit(1)",
+            "g.E().dedup().count()",
             "g.E(99).inV()",
             "g.E(99).outV()",
             "g.E(99).bothV().count()",
@@ -884,6 +967,12 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
         let more_ids = std::iter::repeat_n("90", 48).collect::<Vec<_>>().join(",");
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).has('missing').limit(1)")),
+            Err(ExperimentalRouteError::Query(
+                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+            ))
+        ));
+        assert!(matches!(
+            edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).bothV().dedup()")),
             Err(ExperimentalRouteError::Query(
                 rocksdb_sql_table::Error::TraversalLimitExceeded(_)
             ))

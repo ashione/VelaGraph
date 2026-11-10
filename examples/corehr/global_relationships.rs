@@ -53,7 +53,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         "global_scan_dedup_count",
         "g.V().dedup().count()".into(),
         json!({"count":m.people + m.departments}),
-        None,
+        Some(json!({"count":m.people + m.departments})),
     );
     let named = m.hop(&[20], "member_of", true);
     add(
@@ -75,7 +75,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
     let client = m.hop(&selected(false), "reports_to", true);
     add("global_prefix_dedup_manager_bag_count",
         "g.V().hasLabel('person').has('active',true).has('country','CN').dedup().limit(12).out('reports_to').count()".into(),
-        json!({"count":server.len()}), None);
+        json!({"count":server.len()}), Some(json!({"count":client.len()})));
     let prefix = "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).out('reports_to')";
     add(
         "global_join_filtered_manager_rows",
@@ -93,7 +93,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         "global_join_filtered_manager_unique_count",
         format!("{prefix}.dedup().count()"),
         json!({"count":unique(server).len()}),
-        None,
+        Some(json!({"count":unique(client).len()})),
     );
     let memberships = unique(m.hop(&selected(true), "member_of", true));
     add("global_join_department_maps", "g.V().hasLabel('person').has('active',true).has('country','CN').limit(12).out('member_of').dedup().valueMap('name','active','missing')".into(), maps(m,&memberships), None);
@@ -106,7 +106,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         .collect();
     add("global_join_named_department_members", format!("g.V().has('name','Department-{dept:06}').limit(1).in('member_of').has('active',true).limit(25).valueMap('name','active','missing')"), maps(m,&members), None);
     let colleagues = unique(m.hop(&named, "member_of", false));
-    add("global_join_two_hop_unique_colleagues", "g.V().has('name','Employee-000020').limit(1).out('member_of').in('member_of').dedup().count()".into(), json!({"count":colleagues.len()}), None);
+    add("global_join_two_hop_unique_colleagues", "g.V().has('name','Employee-000020').limit(1).out('member_of').in('member_of').dedup().count()".into(), json!({"count":colleagues.len()}), Some(json!({"count":colleagues.len()})));
     add(
         "global_join_empty_seed",
         "g.V().has('name','NoSuchEmployee').out('reports_to').count()".into(),
@@ -216,19 +216,37 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         json!({"count":0}),
         None,
     );
-    for (name, query) in [
-        (
-            "global_scan_reject_scalar_dedup",
-            "g.V().hasLabel('person').limit(1).values('name').dedup().count()",
-        ),
-        (
-            "global_join_reject_path",
-            "g.V().hasLabel('person').limit(1).out('member_of').dedup().path()",
-        ),
-    ] {
-        cases.push(json!({"name":name,"partition":1,"query":query,"expect_error":true,
-            "client_expect_unsupported":name != "global_scan_reject_scalar_dedup","server_supported":false,"server_expected_error":"Unsupported"}));
-    }
+    cases.push(
+        json!({"name":"global_scan_reject_scalar_dedup","partition":1,
+        "query":"g.V().hasLabel('person').limit(1).values('name').dedup().count()",
+        "expect_error":true,"client_expect_unsupported":false,
+        "server_supported":false,"server_expected_error":"Unsupported"}),
+    );
+    // Global paths remain outside the coordinator subset, but are supported by
+    // fixed-version v3. Derive the client path from source order and input edges.
+    let first = source(m, false)
+        .into_iter()
+        .find(|id| *id <= m.people)
+        .unwrap();
+    let mut seen = BTreeSet::new();
+    let paths = m
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| edge.from == first && edge.label == "member_of")
+        .filter(|(_, edge)| seen.insert((partition(edge.to), edge.to)))
+        .map(|(index, edge)| {
+            json!([
+                ["v", partition(first), first],
+                ["e", partition(first), index + 1],
+                ["v", partition(edge.to), edge.to]
+            ])
+        })
+        .collect::<Vec<_>>();
+    cases.push(json!({"name":"global_join_reject_path","partition":1,
+        "query":"g.V().hasLabel('person').limit(1).out('member_of').dedup().path()",
+        "client_expected":{"paths":paths},
+        "server_supported":false,"server_expected_error":"Unsupported"}));
     cases
 }
 
