@@ -195,9 +195,20 @@ executor and client together; older clients reject these map replies.
 ### Strict scalar is filtering
 
 V2Observed queries additionally share `is(literal)` after values/id/label, with
-strict typed equality, original bag order/provenance and positional is/dedup/limit
+strict typed equality, original bag order/provenance and positional is/dedup/limit/range
 composition followed optionally by count. Element inputs, predicates and invalid
 post-scalar transitions reject before reads, even on empty input. Existing
 single-partition fencing and all work/deadline/response bounds remain unchanged;
 V1 and server-coordinator queries still reject this extension. See the
 [shared contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering).
+
+
+### Shared bounded positional range
+
+Single-partition V2Observed queries share `range(low, high)` on vertex, edge and
+scalar streams, with integer bounds `0 <= low <= high <= 1000`. Half-open
+selection preserves ordered bags, qualified sources and paths in written step
+order. Explicit range suppresses the default cap but never hides upstream
+integrity or scope failures; all current inputs consume work. There is no source
+pushdown or budget increase. V1 and separate server-coordinator/job entrypoints
+remain unchanged. See the [shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-positional-ranges).

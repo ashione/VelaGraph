@@ -177,6 +177,7 @@ fn admitted_extensions(request: &QueryRequest) -> (bool, Option<MapShape>) {
                         matches!(
                             step,
                             Step::ValueMap(_)
+                                | Step::Range { .. }
                                 | Step::Dedup
                                 | Step::Existing(
                                     rocksdb_sql_table::GremlinStep::HasLabel(_)
@@ -739,6 +740,25 @@ mod tests {
         }];
         assert!(validate(&out, shape.as_ref()).is_ok());
         assert!(validate(&out, None).is_err());
+        // Range selects positions but cannot admit an unrelated source ID.
+        let (_, ranged_shape) = admitted_extensions(&request(
+            "g.V(1,1).range(1,2).valueMap('name','absent')",
+            QueryMode::V2Observed,
+        ));
+        assert_eq!(ranged_shape.as_ref().unwrap().start_ids, Some(vec![1, 1]));
+        assert!(validate(&out, ranged_shape.as_ref()).is_ok());
+        let mut wrong_source = out.clone();
+        let QueryRow::PropertyMap {
+            source: bad_source, ..
+        } = &mut wrong_source.rows[0]
+        else {
+            unreachable!()
+        };
+        *bad_source = QualifiedElement::Vertex {
+            partition: 10,
+            id: 2,
+        };
+        assert!(validate(&wrong_source, ranged_shape.as_ref()).is_err());
         for (text, mode) in [
             ("g.V(1)", QueryMode::V2Observed),
             ("g.E(1).valueMap('name')", QueryMode::V2Observed),

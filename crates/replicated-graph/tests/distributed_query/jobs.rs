@@ -105,6 +105,7 @@ pub(super) async fn check(endpoint: SocketAddr) -> anyhow::Result<()> {
         ensure!(run(endpoint, text).await? == expected, "{text}");
     }
     for text in [
+        "g.V(999).repeat(__.out()).times(2).range(0,0).count()",
         "g.V().count()",
         "g.V(11).repeat(__.out()).times(2)",
         "g.V(11).repeat(__.out()).times(2).limit(1).count()",

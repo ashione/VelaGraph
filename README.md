@@ -37,6 +37,8 @@ emission with combined depth at most 32 and unchanged cumulative resource limits
 Terminal selected vertex `valueMap` returns bounded multi-property rows at the same V.
 Standard `is(literal)` filters projected values, labels and IDs with strict typed
 equality, composing with dedup, positional limits and terminal count.
+Bounded `range(low, high)` slices vertex, edge and scalar streams in their
+current order, with zero-based half-open bounds up to 1000.
 They do not yet support data-local hierarchy jobs. The original gateway `Read` has its own smaller subset.
 
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still

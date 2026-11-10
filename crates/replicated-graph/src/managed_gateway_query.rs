@@ -557,6 +557,10 @@ fn traversal_maximum(query: &ObservedGremlinQuery) -> usize {
                 maximum = maximum.min(*n);
                 1
             }
+            Step::Range { low, high } => {
+                maximum = maximum.min(*high).saturating_sub(*low);
+                1
+            }
             _ => 1,
         };
         maximum = maximum.saturating_mul(factor).min(10_000);
@@ -576,10 +580,13 @@ pub(super) fn valid_traversal_total(query: &Query, total: u32) -> bool {
     ) {
         return total == 1;
     }
-    let explicit = parsed
-        .steps()
-        .iter()
-        .any(|s| matches!(s, ObservedGremlinStep::Existing(GremlinStep::Limit(_))));
+    let explicit = parsed.steps().iter().any(|s| {
+        matches!(
+            s,
+            ObservedGremlinStep::Existing(GremlinStep::Limit(_))
+                | ObservedGremlinStep::Range { .. }
+        )
+    });
     let maximum = traversal_maximum(&parsed);
     total as usize
         <= if explicit {

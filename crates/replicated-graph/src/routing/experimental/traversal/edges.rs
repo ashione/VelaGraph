@@ -151,21 +151,35 @@ fn dedup_rows(
 // Filtering moves existing rows without cloning values or provenance. The
 // cumulative work and retained-row charges apply even when later steps discard
 // these rows; an empty result never suppresses an upstream failure.
-fn filter_scalars(
+fn select_rows(
     rows: Vec<ElementRow>,
-    wanted: &Value,
+    mut keep: impl FnMut(usize, &ElementRow) -> bool,
     work: &mut Work,
     mut check: impl FnMut() -> ExperimentalResult<()>,
 ) -> ExperimentalResult<Vec<ElementRow>> {
     let mut next = Vec::new();
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
         check()?;
         work.visit()?;
-        if row.value.as_ref() == Some(wanted) {
+        if keep(index, &row) {
             push_element(&mut next, row, work)?;
         }
     }
     Ok(next)
+}
+
+fn filter_scalars(
+    rows: Vec<ElementRow>,
+    wanted: &Value,
+    work: &mut Work,
+    check: impl FnMut() -> ExperimentalResult<()>,
+) -> ExperimentalResult<Vec<ElementRow>> {
+    select_rows(
+        rows,
+        |_, row| row.value.as_ref() == Some(wanted),
+        work,
+        check,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,6 +205,7 @@ pub(crate) fn validate_steps(
             && !matches!(
                 step,
                 Step::Is(_)
+                    | Step::Range { .. }
                     | Step::Dedup
                     | Step::Existing(GremlinStep::Limit(_) | GremlinStep::Count)
             )
@@ -199,12 +214,12 @@ pub(crate) fn validate_steps(
             if matches!(query.start(), GremlinStart::Vertices(_)) {
                 return Err(ExperimentalRouteError::Query(
                     rocksdb_sql_table::Error::UnsupportedGremlinArgument(
-                        "only is/dedup/limit/count may follow a v2 scalar projection".into(),
+                        "only is/dedup/limit/range/count may follow a v2 scalar projection".into(),
                     ),
                 ));
             }
             return Err(ExperimentalRouteError::Unsupported(
-                "only is/dedup/limit/count may follow a v3 scalar projection",
+                "only is/dedup/limit/range/count may follow a v3 scalar projection",
             ));
         }
         match step {
@@ -229,7 +244,7 @@ pub(crate) fn validate_steps(
                     ));
                 }
             }
-            Step::Dedup => {}
+            Step::Dedup | Step::Range { .. } => {}
             Step::Repeat { times, .. } => {
                 if stream != StreamKind::Vertex {
                     return Err(ExperimentalRouteError::Unsupported(
@@ -589,6 +604,14 @@ pub(crate) trait TraversalRead {
                 Step::Is(value) => {
                     rows = filter_scalars(rows, value, &mut work, || self.check())?;
                 }
+                Step::Range { low, high } => {
+                    rows = select_rows(
+                        rows,
+                        |index, _| (*low..*high).contains(&index),
+                        &mut work,
+                        || self.check(),
+                    )?;
+                }
                 Step::Dedup => rows = dedup_rows(rows, &mut work, || self.check())?,
                 Step::Repeat {
                     incoming,
@@ -736,10 +759,12 @@ pub(crate) trait TraversalRead {
             Some(Step::Existing(GremlinStep::Path))
         );
         if !count
-            && !query
-                .steps()
-                .iter()
-                .any(|s| matches!(s, Step::Existing(GremlinStep::Limit(_))))
+            && !query.steps().iter().any(|s| {
+                matches!(
+                    s,
+                    Step::Existing(GremlinStep::Limit(_)) | Step::Range { .. }
+                )
+            })
         {
             rows.truncate(100);
         }
@@ -901,6 +926,147 @@ mod tests {
             path: Vec::new(),
             value: Some(value),
         }
+    }
+
+    #[test]
+    fn range_preflights_entire_stream_even_when_empty() {
+        for text in [
+            "g.V(999).range(0,0).outE().range(0,2).bothV().path()",
+            "g.E(999).range(1,2).label().range(0,1).is('x').dedup().count()",
+            "g.V().repeat(out()).times(2).range(1,3).valueMap('x')",
+        ] {
+            validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
+        }
+        for text in [
+            "g.V(999).range(0,0).inV()",
+            "g.E(999).range(0,0).out()",
+            "g.V(999).id().range(0,0).path()",
+            "g.V(999).values('missing').range(0,0).has('x')",
+            "g.V(999).range(0,0).repeat(out()).times(32).out()",
+        ] {
+            assert!(
+                validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap())
+                    .is_err(),
+                "accepted {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_selection_preserves_order_bags_qualified_identity_and_owned_values() {
+        let sources = [
+            ObservedElementRef::Vertex(VertexRef {
+                partition: 7,
+                id: 9,
+            }),
+            ObservedElementRef::Edge(EdgeRef {
+                partition: 3,
+                id: 1,
+            }),
+            ObservedElementRef::Vertex(VertexRef {
+                partition: 2,
+                id: 9,
+            }),
+            ObservedElementRef::Vertex(VertexRef {
+                partition: 7,
+                id: 9,
+            }),
+        ];
+        // Exercise the shared selection primitive over all endpoint pairs,
+        // including empty ranges and ranges beyond the complete input bag.
+        for low in 0..=6 {
+            for high in low..=6 {
+                let mut work = Work {
+                    visits: 0,
+                    bytes: 0,
+                };
+                let rows = sources
+                    .iter()
+                    .map(|source| ElementRow {
+                        element: *source,
+                        path: vec![source.path_element()],
+                        value: Some(Value::Text("保留".into())),
+                    })
+                    .collect();
+                let selected = select_rows(
+                    rows,
+                    |index, _| (low..high).contains(&index),
+                    &mut work,
+                    || Ok(()),
+                )
+                .unwrap();
+                let expected = &sources[low.min(sources.len())..high.min(sources.len())];
+                assert_eq!(
+                    selected.iter().map(|row| row.element).collect::<Vec<_>>(),
+                    expected
+                );
+                for row in &selected {
+                    assert_eq!(row.path, [row.element.path_element()]);
+                    assert_eq!(row.value, Some(Value::Text("保留".into())));
+                }
+                assert_eq!(work.visits, sources.len());
+                assert_eq!(
+                    work.bytes,
+                    expected.len() * (128 + std::mem::size_of::<ObservedPathElement>())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn range_selection_checks_discarded_suffix_work_deadline_and_retention() {
+        let rows = || (0..4).map(|id| scalar_row(id, Value::Null)).collect();
+        for bounds in [0..0, 0..1, 8..9] {
+            let mut work = Work {
+                visits: 9_997,
+                bytes: 0,
+            };
+            assert!(select_rows(
+                rows(),
+                |index, _| bounds.contains(&index),
+                &mut work,
+                || Ok(())
+            )
+            .is_err());
+            assert_eq!(work.visits, 10_001);
+        }
+        // Cancellation after the selected prefix still rejects, rather than
+        // returning a prefix before inspecting the rest of this bounded step.
+        let mut checks = 0;
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        assert!(select_rows(
+            rows(),
+            |index, _| index == 0,
+            &mut work,
+            || {
+                checks += 1;
+                if checks == 3 {
+                    Err(limit("expired"))
+                } else {
+                    Ok(())
+                }
+            }
+        )
+        .is_err());
+        assert_eq!(work.visits, 2);
+        let mut work = Work {
+            visits: 0,
+            bytes: 64 * 1024 * 1024 - 127,
+        };
+        assert!(select_rows(rows(), |index, _| index == 1, &mut work, || Ok(())).is_err());
+        assert_eq!(work.visits, 2);
+        assert!(work.bytes > 64 * 1024 * 1024);
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        assert!(select_rows(Vec::new(), |_, _| true, &mut work, || Ok(()))
+            .unwrap()
+            .is_empty());
+        assert_eq!((work.visits, work.bytes), (0, 0));
     }
 
     #[test]

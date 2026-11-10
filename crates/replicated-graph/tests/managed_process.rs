@@ -1109,6 +1109,7 @@ async fn scenario() -> anyhow::Result<()> {
     )
     .await?;
     fixed_version_value_map_scenario(&recovered).await?;
+    range_queries::historical(&recovered, stale_session.version).await?;
     recovered.shutdown().await;
     Ok(())
 }
@@ -3190,3 +3191,6 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
         checkpoint.source_sha256, checkpoint.elf_sha256, root.path().join("progress.json").display());
     Ok(())
 }
+
+#[path = "support/range_queries.rs"]
+mod range_queries;
