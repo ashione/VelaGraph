@@ -88,6 +88,8 @@ impl StateMachine {
         {
             return Err(D1Error::EventLedgerHistory);
         }
+        #[cfg(test)]
+        self.member_verifications.fetch_add(1, Ordering::Relaxed);
         event_ledger::verify_active(&storage.db, cut).map(Some)
     }
 

@@ -112,7 +112,12 @@ async fn actual_tcp_byte_member_uses_compact_history_and_original_plan() {
     )
     .await
     .unwrap();
-    let client = Client::new(server.local_addr(), identity, Duration::from_secs(2)).unwrap();
+    let client = Client::new(
+        server.local_addr(),
+        identity.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let remote = NodeRef::Remote(&client);
     assert_eq!(
         remote
@@ -122,12 +127,67 @@ async fn actual_tcp_byte_member_uses_compact_history_and_original_plan() {
         original_grant
     );
     assert_eq!(remote.visibility(&target).await.unwrap().applied_prefix, 0);
+    let before = node
+        .state_machine
+        .member_verifications
+        .load(Ordering::Relaxed);
     let initial = remote
         .history_status(&authority, &target, &cohort)
         .await
         .unwrap();
     assert_eq!(initial.applied_prefix, 0);
     assert_eq!(initial.cursor.event_count, 1);
+    assert_eq!(
+        remote
+            .history_status(&authority, &target, &cohort)
+            .await
+            .unwrap(),
+        initial
+    );
+    assert_eq!(
+        node.state_machine
+            .member_verifications
+            .load(Ordering::Relaxed)
+            - before,
+        2
+    );
+
+    // Send malformed requests directly, bypassing client preflight. A correct
+    // reply envelope cannot authorize another target/role/authority/cohort.
+    for fault in 0..4 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = serde_json::json!({
+                "version": 6, "identity": identity, "nonce": 100 + fault,
+                "operation": {"HistoryStatus": {"authority": authority, "target": target, "cohort": cohort}}
+            });
+            match fault {
+                0 => request["identity"]["role"] = serde_json::json!("Coordinator"),
+                1 => request["operation"]["HistoryStatus"]["target"]["shard"] = serde_json::json!(8),
+                2 => {
+                    request["operation"]["HistoryStatus"]["authority"]["shard"] = serde_json::json!(10)
+                }
+                _ => {
+                    request["operation"]["HistoryStatus"]["cohort"]["coordinator_epoch"] =
+                        serde_json::json!(2)
+                }
+            }
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let mut socket = tokio::net::TcpStream::connect(server.local_addr())
+                .await
+                .unwrap();
+            socket.write_u32(bytes.len() as u32).await.unwrap();
+            socket.write_all(&bytes).await.unwrap();
+            let length = socket.read_u32().await.unwrap() as usize;
+            assert!(length <= 1024 * 1024);
+            let mut reply = vec![0; length];
+            socket.read_exact(&mut reply).await.unwrap();
+            let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+            assert_eq!(reply["result"], serde_json::json!({"Err": "Identity"}));
+        })
+        .await
+        .expect("malformed-request exchange must terminate");
+    }
 
     let participant = Participant {
         shard: target.shard,
@@ -293,6 +353,67 @@ async fn actual_tcp_byte_member_uses_compact_history_and_original_plan() {
             .unwrap()
             .active_transactions()
             .is_empty());
+    }
+    // Successful prior requests cannot hide later corruption. Each new RPC
+    // must validate raw history, derived decisions and the publication binding.
+    let db = &node.state_machine.storage.as_ref().unwrap().db;
+    let raw_key = db
+        .iterator(IteratorMode::From(event_ledger::PREFIX, Direction::Forward))
+        .next()
+        .unwrap()
+        .unwrap()
+        .0
+        .to_vec();
+    assert!(raw_key.starts_with(event_ledger::PREFIX));
+    let decision_key = db
+        .iterator(IteratorMode::From(
+            crate::decision_segments::PREFIX,
+            Direction::Forward,
+        ))
+        .next()
+        .unwrap()
+        .unwrap()
+        .0
+        .to_vec();
+    assert!(decision_key.starts_with(crate::decision_segments::PREFIX));
+    for (key, error) in [
+        (raw_key, D1Error::VisibilityHistory),
+        (decision_key, D1Error::DecisionIndexHistory),
+        (D1_KEY.to_vec(), D1Error::VisibilityHistory),
+        (APPLIED_KEY.to_vec(), D1Error::VisibilityHistory),
+        (
+            crate::decision_segments::MANIFEST_KEY.to_vec(),
+            D1Error::DecisionIndexHistory,
+        ),
+        (b"sm/request/retired".to_vec(), D1Error::RequestIndexHistory),
+    ] {
+        let original = db.get(&key).unwrap();
+        db.put(&key, b"{}").unwrap();
+        let before = db
+            .iterator(IteratorMode::Start)
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remote.history_status(&authority, &target, &cohort).await,
+            Err(Error::Application(error))
+        );
+        assert_eq!(
+            db.iterator(IteratorMode::Start)
+                .map(|row| row.unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+        match original {
+            Some(bytes) => db.put(&key, bytes).unwrap(),
+            None => db.delete(&key).unwrap(),
+        }
+        assert_eq!(
+            remote
+                .history_status(&authority, &target, &cohort)
+                .await
+                .unwrap(),
+            status
+        );
     }
     node.state_machine.forbid_coordinator_journal(false);
     server.shutdown().await;

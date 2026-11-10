@@ -1826,14 +1826,22 @@ async fn visibility(
     target: &Target,
     pinned: Option<&Identity>,
 ) -> Result<VisibilityInfo, Error> {
-    if pinned.is_some_and(|p| p.role != Role::Participant || p.target != *target) {
-        return Err(Error::Identity);
-    }
+    check_participant_target(target, pinned)?;
     let info = node
         .state_machine
         .participant_visibility_info(target.shard, target.epoch, target.mode)
         .await
         .map_err(application_error)?;
+    check_visibility(&info, pinned)?;
+    Ok(info)
+}
+fn check_participant_target(target: &Target, pinned: Option<&Identity>) -> Result<(), Error> {
+    if pinned.is_some_and(|p| p.role != Role::Participant || p.target != *target) {
+        return Err(Error::Identity);
+    }
+    Ok(())
+}
+fn check_visibility(info: &VisibilityInfo, pinned: Option<&Identity>) -> Result<(), Error> {
     if info.baseline_sequence != 0
         || info.cohort.is_none()
         || pinned.is_some_and(|p| {
@@ -1842,7 +1850,7 @@ async fn visibility(
     {
         return Err(Error::Identity);
     }
-    Ok(info)
+    Ok(())
 }
 async fn checked_journal(
     node: &WorkNode,
@@ -1968,18 +1976,37 @@ async fn execute(
             target,
             cohort,
         } => {
-            let info = visibility(node, &target, pinned).await?;
-            if info.authority != authority || info.cohort.as_ref() != Some(&cohort) {
-                return Err(Error::Identity);
-            }
-            let (cursor, applied_prefix) = node
+            check_participant_target(&target, pinned)?;
+            let active = node
                 .state_machine
-                .participant_history_status(target.shard, target.epoch, target.mode)
+                .participant_active_history_status(target.shard, target.epoch, target.mode)
                 .await
                 .map_err(application_error)?;
-            let status = HistoryStatus {
-                cursor,
-                applied_prefix,
+            let status = if let Some((info, cursor)) = active {
+                check_visibility(&info, pinned)?;
+                if info.authority != authority || info.cohort.as_ref() != Some(&cohort) {
+                    return Err(Error::Identity);
+                }
+                HistoryStatus {
+                    cursor,
+                    applied_prefix: info.applied_prefix,
+                }
+            } else {
+                // Preserve compatibility checks and their error order for
+                // legacy/in-memory members without an active archive witness.
+                let info = visibility(node, &target, pinned).await?;
+                if info.authority != authority || info.cohort.as_ref() != Some(&cohort) {
+                    return Err(Error::Identity);
+                }
+                let (cursor, applied_prefix) = node
+                    .state_machine
+                    .participant_history_status(target.shard, target.epoch, target.mode)
+                    .await
+                    .map_err(application_error)?;
+                HistoryStatus {
+                    cursor,
+                    applied_prefix,
+                }
             };
             check_history_status(&status, &authority, &target, &cohort)?;
             Ok(Value::HistoryStatus(status))
@@ -3122,6 +3149,22 @@ mod tests {
             mode: [7; 16],
         };
         id
+    }
+    #[test]
+    fn history_visibility_rejects_nonzero_baseline_and_missing_cohort() {
+        let id = participant_identity();
+        let mut info = VisibilityInfo {
+            authority: id.authority.clone(),
+            baseline_sequence: 0,
+            cohort: Some(id.cohort.clone()),
+            applied_prefix: 0,
+        };
+        assert_eq!(check_visibility(&info, Some(&id)), Ok(()));
+        info.baseline_sequence = 1;
+        assert_eq!(check_visibility(&info, None), Err(Error::Identity));
+        info.baseline_sequence = 0;
+        info.cohort = None;
+        assert_eq!(check_visibility(&info, None), Err(Error::Identity));
     }
     #[test]
     fn history_wire_v6_preserves_existing_operation_tags() {

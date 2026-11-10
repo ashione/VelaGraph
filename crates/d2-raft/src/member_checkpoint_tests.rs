@@ -1602,3 +1602,284 @@ async fn durable_member_raw_command_matrix_preserves_inductive_state() {
         );
     }
 }
+
+fn status_journal(count: u64) -> Journal {
+    let mut journal = empty(CapacityProfile::LegacyCountV1);
+    for ordinal in 1..=count {
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&ordinal.to_be_bytes());
+        journal
+            .apply(Command::Begin {
+                id,
+                participants: vec![descriptor(7)],
+            })
+            .unwrap();
+        journal
+            .apply(Command::Decide {
+                id,
+                decision: Decision::Abort,
+            })
+            .unwrap();
+    }
+    journal
+}
+
+// Fixture construction is outside the measured region. Transactions are aborted
+// so the observed cursor can be ahead of A without graph data or intent changes.
+async fn status_fixture(count: u64) -> (tempfile::TempDir, Arc<StateMachine>, HistoryCursor) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    setup(&mut sm, CapacityProfile::LegacyCountV1).await;
+    let journal = status_journal(count);
+    let cut = sync_all(&mut sm, &journal).await;
+    let first = sm.applied().await.unwrap().index + 1;
+    if count > 1 {
+        let results = sm
+            .apply(
+                (1..=count / 2).map(|ordinal| entry(first + ordinal - 1, advance(ordinal, &cut))),
+            )
+            .await
+            .unwrap();
+        for result in results {
+            result.d1.unwrap().unwrap();
+        }
+    }
+    (dir, sm, cut)
+}
+
+#[tokio::test]
+#[ignore = "focused local microbenchmark; run explicitly with --release --ignored --nocapture"]
+async fn history_status_validation_benchmark() {
+    use std::time::Instant;
+    for count in [0, 32, 256, 1024] {
+        let (_dir, sm, cut) = status_fixture(count).await;
+        // Alternate the order to reduce warm-cache/order bias. No timing
+        // threshold is an acceptance gate; verification counts are exact.
+        for sample in 0..7 {
+            for mode in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let iterations = 10;
+                let before = sm.member_verifications.load(Ordering::Relaxed);
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let (info, cursor, applied) = if mode == 0 {
+                        let info = sm.participant_visibility_info(7, 1, [7; 16]).await.unwrap();
+                        let (cursor, applied) =
+                            sm.participant_history_status(7, 1, [7; 16]).await.unwrap();
+                        (info, cursor, applied)
+                    } else {
+                        let (info, cursor) = sm
+                            .participant_active_history_status(7, 1, [7; 16])
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let applied = info.applied_prefix;
+                        (info, cursor, applied)
+                    };
+                    assert_eq!(cursor, cut);
+                    assert_eq!(applied, count / 2);
+                    assert_eq!(info.applied_prefix, applied);
+                }
+                let elapsed = started.elapsed();
+                let scans = sm.member_verifications.load(Ordering::Relaxed) - before;
+                assert_eq!(scans, iterations * if mode == 0 { 2 } else { 1 });
+                println!("history_status transactions={count} events={} mode={mode} sample={sample} iterations={iterations} verifications={scans} elapsed_ns={}", cut.event_count, elapsed.as_nanos());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_status_observation_reopens_and_rechecks_sealed_rows() {
+    let (dir, sm, cut) = status_fixture(80).await;
+    let before = sm.member_verifications.load(Ordering::Relaxed);
+    for _ in 0..2 {
+        let (info, cursor) = sm
+            .participant_active_history_status(7, 1, [7; 16])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor, cut);
+        assert_eq!(info.applied_prefix, 40);
+        assert_eq!(info.authority, authority());
+        assert_eq!(info.cohort, Some(cohort(CapacityProfile::LegacyCountV1)));
+    }
+    assert_eq!(sm.member_verifications.load(Ordering::Relaxed) - before, 2);
+    drop(sm);
+    let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    sm.forbid_coordinator_journal(true);
+    let (info, cursor) = sm
+        .participant_active_history_status(7, 1, [7; 16])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((cursor, info.applied_prefix), (cut.clone(), 40));
+    for (shard, epoch, mode) in [(8, 1, [7; 16]), (7, 2, [7; 16]), (7, 1, [8; 16])] {
+        assert_eq!(
+            sm.participant_active_history_status(shard, epoch, mode)
+                .await
+                .err(),
+            sm.participant_visibility_info(shard, epoch, mode)
+                .await
+                .err()
+        );
+    }
+    let db = &sm.storage.as_ref().unwrap().db;
+    for prefix in [event_ledger::PREFIX, crate::decision_segments::PREFIX] {
+        let all = rows(&sm, prefix);
+        assert!(
+            all.len() >= 2,
+            "must corrupt an old sealed row, not only the active tail"
+        );
+        let (key, value) = &all[0];
+        db.put(key, b"{}").unwrap();
+        let corrupted = disk(&sm);
+        assert!(sm
+            .participant_active_history_status(7, 1, [7; 16])
+            .await
+            .is_err());
+        assert_eq!(disk(&sm), corrupted);
+        db.put(key, value).unwrap();
+        assert_eq!(
+            sm.participant_active_history_status(7, 1, [7; 16])
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            cut
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_status_observation_excludes_concurrent_publication() {
+    let (_dir, sm, old_cut) = status_fixture(4).await;
+    let journal = status_journal(5);
+    let new_cut = journal.history_cursor().unwrap();
+    let page = journal.history_page(&old_cut, Some(&new_cut)).unwrap();
+    let first = sm.applied().await.unwrap().index + 1;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    *sm.history_status_gate.lock().unwrap() = Some(ApplyPublishGate {
+        entered,
+        release: gate,
+    });
+    let reader = sm.clone();
+    let read = tokio::spawn(async move {
+        reader
+            .participant_active_history_status(7, 1, [7; 16])
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        sm.state.try_write().is_err(),
+        "verified observation must retain its read guard"
+    );
+    let mut writer = sm.clone();
+    let commands = [
+        entry(first, sync(page)),
+        entry(first + 1, advance(3, &new_cut)),
+        entry(first + 2, advance(4, &new_cut)),
+        entry(first + 3, advance(5, &new_cut)),
+    ];
+    let (waiting, queued) = tokio::sync::oneshot::channel();
+    let write = tokio::spawn(async move {
+        use std::future::Future;
+        let mut apply = Box::pin(writer.apply(commands));
+        std::future::poll_fn(|cx| {
+            assert!(
+                apply.as_mut().poll(cx).is_pending(),
+                "apply must wait for the reader"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        waiting.send(()).unwrap();
+        apply.await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    release.send(()).unwrap();
+    let (info, cursor) = read.await.unwrap().unwrap().unwrap();
+    assert_eq!((cursor, info.applied_prefix), (old_cut, 2));
+    for result in write.await.unwrap().unwrap() {
+        result.d1.unwrap().unwrap();
+    }
+    let (info, cursor) = sm
+        .participant_active_history_status(7, 1, [7; 16])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((cursor, info.applied_prefix), (new_cut, 5));
+}
+
+#[tokio::test]
+async fn history_status_observation_keeps_in_memory_fallback() {
+    for (durable, bound, baseline) in [
+        (false, false, 0),
+        (false, true, 0),
+        (false, false, 1),
+        (true, false, 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(if durable {
+            StateMachine::open(dir.path()).unwrap()
+        } else {
+            StateMachine::default()
+        });
+        let journal = if bound {
+            empty(CapacityProfile::LegacyCountV1)
+        } else {
+            Journal::new([9; 16]).unwrap()
+        };
+        apply(&mut sm, D1Command::Activate { shard: 7, epoch: 1 })
+            .await
+            .unwrap();
+        if baseline == 1 {
+            apply(&mut sm, D1Command::Write(request(1))).await.unwrap();
+        }
+        for command in [
+            D1Command::EnableManagedWrites {
+                shard: 7,
+                epoch: 1,
+                expected_sequence: baseline,
+                mode_id: [7; 16],
+            },
+            D1Command::EnableParticipant {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                authority: authority(),
+            },
+            D1Command::EnableVersionedReads {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                journal: journal.clone(),
+            },
+        ] {
+            apply(&mut sm, command).await.unwrap();
+        }
+        assert!(sm
+            .participant_active_history_status(7, 1, [7; 16])
+            .await
+            .unwrap()
+            .is_none());
+        let info = sm.participant_visibility_info(7, 1, [7; 16]).await.unwrap();
+        assert_eq!(info.cohort.is_some(), bound);
+        assert_eq!(info.baseline_sequence, baseline);
+        if bound {
+            assert_eq!(status(&sm).await, (journal.history_cursor().unwrap(), 0));
+        } else {
+            assert_eq!(
+                sm.participant_history_status(7, 1, [7; 16]).await,
+                Err(D1Error::VisibilityHistory)
+            );
+        }
+        assert_eq!(sm.member_verifications.load(Ordering::Relaxed), 0);
+    }
+}
