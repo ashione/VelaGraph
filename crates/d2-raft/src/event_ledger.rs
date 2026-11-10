@@ -301,6 +301,16 @@ impl<'a> Staged<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RAW_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn raw_walks() -> u64 {
+    RAW_WALKS.get()
+}
+
 /// One structural walker owns all raw namespace, canonical partition, and hash
 /// closure checks. Observers may collect semantic replay or one bounded result;
 /// neither can return a successful result before the entire scan closes.
@@ -309,6 +319,8 @@ fn walk(
     descriptor: &Descriptor,
     mut observe: impl FnMut(Command, &HistoryCursor, usize) -> anyhow::Result<()>,
 ) -> anyhow::Result<Tail> {
+    #[cfg(test)]
+    RAW_WALKS.set(RAW_WALKS.get() + 1);
     descriptor.validate()?;
     let applied: Option<LogId<NodeId>> = match snapshot.get(super::APPLIED_KEY)? {
         Some(bytes) => serde_json::from_slice(&bytes)?,
@@ -573,7 +585,26 @@ pub(super) fn verify_active<'db, 'cut>(
     db: &'db DB,
     cut: &'cut PublishedArchiveCut,
 ) -> Result<VerifiedArchive<'db, 'cut>, D1Error> {
+    verify_active_inner(db, cut, false).map(|(archive, _)| archive)
+}
+
+/// The member apply path also needs the prior partial terminal segment. Retain
+/// only those original transactions while performing the same complete checks.
+/// This result belongs to this snapshot and is never retained across operations.
+pub(super) fn verify_member_apply<'db, 'cut>(
+    db: &'db DB,
+    cut: &'cut PublishedArchiveCut,
+) -> Result<(VerifiedArchive<'db, 'cut>, Vec<Transaction>), D1Error> {
+    verify_active_inner(db, cut, true)
+}
+
+fn verify_active_inner<'db, 'cut>(
+    db: &'db DB,
+    cut: &'cut PublishedArchiveCut,
+    retain_member_tail: bool,
+) -> Result<(VerifiedArchive<'db, 'cut>, Vec<Transaction>), D1Error> {
     let snapshot = cut.snapshot(db)?;
+    let mut terminal_tail = Vec::new();
     cut.checkpoint
         .validate()
         .map_err(|_| D1Error::EventLedgerHistory)?;
@@ -605,6 +636,16 @@ pub(super) fn verify_active<'db, 'cut>(
             )),
         )
         .map_err(decision_error)?;
+        // The manifest above validates the cut before interval arithmetic. A
+        // sealed boundary has no partial tail, even if R is greater than A.
+        let tail_count = if retain_member_tail {
+            cut.terminal_through % crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64
+        } else {
+            0
+        };
+        let tail_after = cut.terminal_through - tail_count;
+        terminal_tail.reserve_exact(tail_count as usize);
+        let mut overflowed_tail = false;
         let mut projection = OrderedTerminals::new(domain.cohort.profile);
         let mut failed_decision = None;
         let result = walk(&snapshot, &cut.descriptor, |event, _, _| {
@@ -612,7 +653,17 @@ pub(super) fn verify_active<'db, 'cut>(
                 rows.observe(&tx).map_err(|error| {
                     failed_decision = Some(error);
                     anyhow::anyhow!("derived decision verification failed")
-                })
+                })?;
+                if tail_after < tx.ordinal && tx.ordinal <= cut.terminal_through {
+                    // Never change existing error precedence or retain more
+                    // than one partial segment on a malformed projection.
+                    if terminal_tail.len() < tail_count as usize {
+                        terminal_tail.push(tx);
+                    } else {
+                        overflowed_tail = true;
+                    }
+                }
+                Ok(())
             })
         });
         if let Some(error) = failed_decision {
@@ -623,15 +674,27 @@ pub(super) fn verify_active<'db, 'cut>(
             .matches(&cut.checkpoint)
             .map_err(super::ledger_read_error)?;
         rows.finish().map_err(decision_error)?;
+        if overflowed_tail
+            || terminal_tail.len() != tail_count as usize
+            || terminal_tail
+                .iter()
+                .enumerate()
+                .any(|(offset, tx)| tx.ordinal != tail_after + offset as u64 + 1)
+        {
+            return Err(D1Error::EventLedgerHistory);
+        }
         tail
     } else {
         walk(&snapshot, &cut.descriptor, |_, _, _| Ok(())).map_err(super::ledger_read_error)?
     };
-    Ok(VerifiedArchive {
-        snapshot,
-        cut,
-        tail,
-    })
+    Ok((
+        VerifiedArchive {
+            snapshot,
+            cut,
+            tail,
+        },
+        terminal_tail,
+    ))
 }
 
 /// Immutable operation-local semantic witness. Only strict original-event
@@ -922,6 +985,10 @@ impl<'db, 'cut> VerifiedArchive<'db, 'cut> {
 
     pub(super) fn decision_manifest(&self) -> &[u8] {
         &self.cut.decision_manifest
+    }
+
+    pub(super) fn terminal_through(&self) -> u64 {
+        self.cut.terminal_through
     }
 
     /// Bounded ordinal projection for the prior terminal tail. Every raw row
@@ -2361,6 +2428,282 @@ mod tests {
         cut
     }
 
+    fn tail_member_state(profile: CapacityProfile, count: u64, applied: u64) -> D1State {
+        let mut coordinator = if profile.is_legacy() {
+            state(bound())
+        } else {
+            byte_history(0)
+        };
+        let journal = coordinator
+            .coordinator
+            .as_mut()
+            .unwrap()
+            .full_mut()
+            .unwrap();
+        // Out-of-order completions drain in admission order. Some aborted
+        // transactions have prepared bits, and unresolved suffix records remain.
+        for n in 1..=count {
+            journal.replay_event(begin(n)).unwrap();
+            if n % 3 == 0 {
+                journal
+                    .replay_event(Command::Prepared {
+                        id: id(n),
+                        participant: participant(),
+                    })
+                    .unwrap();
+            }
+        }
+        let resolved = count.saturating_sub(2).max(applied);
+        for n in (1..=resolved).rev() {
+            journal.replay_event(decide(n, Decision::Abort)).unwrap();
+        }
+        if count > resolved + 1 {
+            journal
+                .replay_event(decide(count, Decision::Abort))
+                .unwrap();
+        }
+        let journal = coordinator
+            .coordinator
+            .take()
+            .unwrap()
+            .full()
+            .unwrap()
+            .clone();
+        let mut member = D1State::new(7, 1);
+        member.version = if profile.is_legacy() { 6 } else { 7 };
+        member.managed = Some(crate::D1ManagedMode {
+            mode_id: [7; 16],
+            activated_sequence: 0,
+        });
+        member.participant = Some(crate::participant_writes::State {
+            authority: Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
+            activated_sequence: 0,
+            records: Vec::new(),
+        });
+        member.visibility = Some(crate::versioned_reads::State {
+            baseline_sequence: 0,
+            epoch: 1,
+            applied,
+            journal: journal.into(),
+            commits: Vec::new(),
+            activation: (!profile.is_legacy()).then(|| CapacityActivation {
+                nonce: [3; 32],
+                log_id: marker(1).unwrap(),
+            }),
+        });
+        member
+            .visibility
+            .as_ref()
+            .unwrap()
+            .validate(&member)
+            .unwrap();
+        member
+    }
+
+    #[test]
+    fn member_tail_fusion_matches_original_projection_at_boundaries() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            for applied in [0, 1, 31, 32, 33, 63, 64, 65, 1024, 1025] {
+                let count = (applied + 7).min(profile.max_transactions() as u64);
+                if applied > profile.max_transactions() as u64 {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let db = DB::open_default(dir.path()).unwrap();
+                let state = tail_member_state(profile, count, applied);
+                let journal = state.visibility.as_ref().unwrap().journal.full().unwrap();
+                let cut = persist_archive(&db, &state, marker(10));
+                let expected: Vec<_> = if applied % 32 == 0 {
+                    Vec::new()
+                } else {
+                    (applied / 32 * 32 + 1..=applied)
+                        .map(|ordinal| journal.transaction_at(ordinal).unwrap().clone())
+                        .collect()
+                };
+                crate::transaction_decisions::without_full_journal(|| {
+                    let before = raw_walks();
+                    let ordinary = verify_active(&db, &cut).unwrap();
+                    let projected = if expected.is_empty() {
+                        Vec::new()
+                    } else {
+                        ordinary
+                            .transactions(applied / 32 * 32 + 1, applied, &[])
+                            .unwrap()
+                    };
+                    assert_eq!(raw_walks() - before, 1 + u64::from(!expected.is_empty()));
+                    let before = raw_walks();
+                    let (fused, tail) = verify_member_apply(&db, &cut).unwrap();
+                    assert_eq!(raw_walks() - before, 1);
+                    assert_eq!(tail, expected, "profile={profile:?}, A={applied}");
+                    assert_eq!(tail, projected);
+                    assert!(tail.len() < 32);
+                    assert_eq!(fused.checkpoint(), ordinary.checkpoint());
+                    let (_, absent) = verify_active_inner(&db, &cut, false).unwrap();
+                    assert!(absent.is_empty());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn member_tail_fusion_keeps_maximum_participant_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let mut state = tail_member_state(CapacityProfile::LegacyCountV1, 0, 0);
+        let mut wide = cohort();
+        wide.members = (7..)
+            .filter(|shard| *shard != 9)
+            .take(crate::transaction_decisions::MAX_PARTICIPANTS)
+            .map(|shard| Member {
+                shard,
+                epoch: 1,
+                mode: [shard as u8; 16],
+            })
+            .collect();
+        let participants: Vec<_> = wide
+            .members
+            .iter()
+            .map(|member| Participant {
+                shard: member.shard,
+                epoch: member.epoch,
+                mode: member.mode,
+                intent: [8; 32],
+            })
+            .collect();
+        let mut journal = Journal::new([9; 16]).unwrap();
+        journal
+            .replay_event(Command::BindCohort { cohort: wide })
+            .unwrap();
+        for n in 1..=34 {
+            journal
+                .replay_event(Command::Begin {
+                    id: id(n),
+                    participants: participants.clone(),
+                })
+                .unwrap();
+            for participant in participants.iter().take((n as usize) % participants.len()) {
+                journal
+                    .replay_event(Command::Prepared {
+                        id: id(n),
+                        participant: participant.clone(),
+                    })
+                    .unwrap();
+            }
+            journal.replay_event(decide(n, Decision::Abort)).unwrap();
+        }
+        let expected: Vec<_> = (1..=31)
+            .map(|n| journal.transaction_at(n).unwrap().clone())
+            .collect();
+        state.visibility.as_mut().unwrap().journal = journal.into();
+        state.visibility.as_mut().unwrap().applied = 31;
+        state.visibility.as_ref().unwrap().validate(&state).unwrap();
+        let cut = persist_archive(&db, &state, marker(10));
+        let (verified, tail) = verify_member_apply(&db, &cut).unwrap();
+        assert_eq!(tail, expected);
+        assert_eq!(tail, verified.transactions(1, 31, &[]).unwrap());
+        assert_eq!(tail.len(), 31);
+        assert!(tail
+            .iter()
+            .all(|tx| tx.participants.len() == crate::transaction_decisions::MAX_PARTICIPANTS));
+    }
+
+    #[test]
+    fn member_tail_fusion_preserves_full_validation_and_error_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let mut state = tail_member_state(CapacityProfile::LegacyCountV1, 80, 33);
+        // Resolve an early prefix before later raw rows, so simultaneous faults
+        // below really exercise the decision-error side channel before decode.
+        let mut journal = bound();
+        for n in 1..=80 {
+            journal.replay_event(begin(n)).unwrap();
+            journal.replay_event(decide(n, Decision::Abort)).unwrap();
+        }
+        journal.replay_event(begin(81)).unwrap();
+        journal.replay_event(begin(82)).unwrap();
+        journal.replay_event(decide(82, Decision::Abort)).unwrap();
+        state.visibility.as_mut().unwrap().journal = journal.into();
+        let cut = persist_archive(&db, &state, marker(10));
+        let raw = rows(&db);
+        let derived: Vec<_> = db
+            .iterator(IteratorMode::From(
+                crate::decision_segments::PREFIX,
+                Direction::Forward,
+            ))
+            .map(Result::unwrap)
+            .take_while(|(key, _)| key.starts_with(crate::decision_segments::PREFIX))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        assert!(raw.len() > 2 && derived.len() == 2);
+        let assert_error = |expected: D1Error| {
+            assert_eq!(verify_active(&db, &cut).err(), Some(expected.clone()));
+            assert_eq!(verify_member_apply(&db, &cut).err(), Some(expected));
+        };
+        // Both early and late raw rows, both terminal segments, and a missing
+        // row must fail even when the requested tail is only ordinal 33.
+        for (key, value, expected) in raw
+            .iter()
+            .map(|(k, v)| (k, v, D1Error::EventLedgerHistory))
+            .chain(
+                derived
+                    .iter()
+                    .map(|(k, v)| (k, v, D1Error::DecisionIndexHistory)),
+            )
+        {
+            db.put(key, b"{}").unwrap();
+            assert_error(expected.clone());
+            db.delete(key).unwrap();
+            assert_error(expected);
+            db.put(key, value).unwrap();
+        }
+        for (key, expected) in [
+            (super::super::D1_KEY, D1Error::EventLedgerHistory),
+            (super::super::APPLIED_KEY, D1Error::EventLedgerHistory),
+            (
+                crate::decision_segments::MANIFEST_KEY,
+                D1Error::DecisionIndexHistory,
+            ),
+        ] {
+            let original = db.get(key).unwrap().unwrap();
+            db.put(key, b"{}").unwrap();
+            assert_error(expected);
+            db.put(key, original).unwrap();
+        }
+        for (prefix, expected) in [
+            (PREFIX, D1Error::EventLedgerHistory),
+            (
+                crate::decision_segments::PREFIX,
+                D1Error::DecisionIndexHistory,
+            ),
+            (crate::request_index::PREFIX, D1Error::RequestIndexHistory),
+        ] {
+            let key = [prefix, b"foreign"].concat();
+            db.put(&key, b"{}").unwrap();
+            assert_error(expected.clone());
+            db.delete(key).unwrap();
+        }
+        // Early derived failure still wins over later raw failure.
+        db.put(&derived[0].0, b"{}").unwrap();
+        db.put(&raw.last().unwrap().0, b"{}").unwrap();
+        assert_error(D1Error::DecisionIndexHistory);
+        db.put(&derived[0].0, &derived[0].1).unwrap();
+        // Extra derived row is checked at finish, after raw closure.
+        let extra = [crate::decision_segments::PREFIX, b"foreign"].concat();
+        db.put(&extra, b"{}").unwrap();
+        assert_error(D1Error::EventLedgerHistory);
+        db.put(&raw.last().unwrap().0, &raw.last().unwrap().1)
+            .unwrap();
+        assert_error(D1Error::DecisionIndexHistory);
+        db.delete(extra).unwrap();
+        assert_eq!(verify_member_apply(&db, &cut).unwrap().1.len(), 1);
+    }
+
     #[test]
     fn target_projection_covers_direct_admitted_holes_and_complete_absence() {
         for profile in [
@@ -2966,7 +3309,7 @@ mod tests {
                 } else {
                     D1Error::EventLedgerHistory
                 };
-                assert_eq!(verify_active(&db, &cut).err(), Some(expected));
+                assert_eq!(verify_active(&db, &cut).err(), Some(expected.clone()));
             });
         }
     }

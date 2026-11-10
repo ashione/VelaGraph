@@ -1883,3 +1883,303 @@ async fn history_status_observation_keeps_in_memory_fallback() {
         assert_eq!(sm.member_verifications.load(Ordering::Relaxed), 0);
     }
 }
+
+// The original apply verification/projection/checker sequence is retained here
+// as a differential oracle, including errors for a tampered live A.
+fn checked_member_tail(
+    sm: &StateMachine,
+    state: &StateMachineData,
+    fused: bool,
+) -> Result<Vec<crate::transaction_decisions::Transaction>, StorageError<NodeId>> {
+    let fail = |error: anyhow::Error| write_error(std::io::Error::other(error.to_string()));
+    let (verified, collected) = (if fused {
+        sm.verified_member_apply(state)
+    } else {
+        sm.verified_member(state)
+            .map(|value| value.map(|archive| (archive, Vec::new())))
+    })
+    .map_err(|e| fail(anyhow::anyhow!("member archive: {e:?}")))?
+    .ok_or_else(|| fail(anyhow::anyhow!("active member lacks publication cut")))?;
+    let applied = state
+        .d1
+        .as_ref()
+        .unwrap()
+        .visibility
+        .as_ref()
+        .unwrap()
+        .applied;
+    let domain = &verified.descriptor().domain;
+    let identity = crate::decision_segments::CheckpointIdentity {
+        role: crate::decision_segments::Role::Member,
+        authority: domain.authority.clone(),
+        shard: domain.shard,
+        epoch: domain.epoch,
+        mode: domain.mode,
+        cohort: domain.cohort.clone(),
+    };
+    let key = crate::decision_segments::checkpoint_tail_key(&identity, applied).map_err(fail)?;
+    let bytes = key
+        .as_deref()
+        .map(|key| verified.get(key))
+        .transpose()
+        .map_err(fail)?
+        .flatten();
+    let tail = if applied.is_multiple_of(32) {
+        Vec::new()
+    } else if fused && applied == verified.terminal_through() {
+        collected
+    } else {
+        verified
+            .transactions(applied / 32 * 32 + 1, applied, &[])
+            .map_err(fail)?
+    };
+    crate::decision_segments::check_checkpoint_tail(
+        &identity,
+        applied,
+        state.last_applied_log,
+        verified.decision_manifest(),
+        verified.decision_manifest(),
+        bytes.as_deref(),
+        &tail,
+    )
+    .map_err(fail)?;
+    Ok(tail)
+}
+
+#[tokio::test]
+async fn member_apply_tail_fusion_removes_only_the_duplicate_walk() {
+    for count in [0, 2, 62, 64, 66, 126, 128, 130] {
+        let (_dir, mut sm, _) = status_fixture(count).await;
+        let before = event_ledger::raw_walks();
+        let expected = checked_member_tail(&sm, &*sm.state.read().await, false).unwrap();
+        assert_eq!(
+            event_ledger::raw_walks() - before,
+            1 + u64::from(!expected.is_empty())
+        );
+        let first = sm.applied().await.unwrap().index + 1;
+        let before = event_ledger::raw_walks();
+        // One apply with several entries must remove one walk, not one per entry.
+        sm.apply([blank(first), blank(first + 1), blank(first + 2)])
+            .await
+            .unwrap();
+        assert_eq!(event_ledger::raw_walks() - before, 1, "A={}", count / 2);
+        let before = event_ledger::raw_walks();
+        let _ = sm.participant_history_status(7, 1, [7; 16]).await.unwrap();
+        assert_eq!(event_ledger::raw_walks() - before, 1);
+    }
+}
+
+#[tokio::test]
+async fn member_apply_tail_fusion_keeps_malformed_live_a_errors() {
+    let (_dir, sm, _) = status_fixture(80).await;
+    let before_disk = disk(&sm);
+    let mut state = sm.state.write().await;
+    for applied in [0, 1, 32, 33, 64, 81, 1025, u64::MAX] {
+        state
+            .d1
+            .as_mut()
+            .unwrap()
+            .visibility
+            .as_mut()
+            .unwrap()
+            .applied = applied;
+        let expected = checked_member_tail(&sm, &state, false).unwrap_err();
+        let actual = sm
+            .apply_member_entries(&mut state, [blank(500)])
+            .unwrap_err();
+        assert_eq!(actual.to_string(), expected.to_string(), "A={applied}");
+        assert_eq!(disk(&sm), before_disk);
+    }
+}
+
+#[tokio::test]
+async fn member_apply_tail_fusion_nonempty_tail_failure_and_reopen() {
+    for applied in [31, 32, 33] {
+        let (dir, mut sm, cut) = status_fixture(applied * 2).await;
+        let old_disk = disk(&sm);
+        let old_d1 = sm.state.read().await.d1.clone();
+        let old_marker = sm.applied().await;
+        let next = old_marker.unwrap().index + 1;
+        let commands = [
+            entry(next, advance(applied + 1, &cut)),
+            entry(next + 1, advance(applied + 2, &cut)),
+        ];
+        sm.storage
+            .as_ref()
+            .unwrap()
+            .fail_next_write
+            .store(true, Ordering::Relaxed);
+        assert!(sm.apply(commands.clone()).await.is_err());
+        assert_eq!(disk(&sm), old_disk);
+        assert_eq!(sm.state.read().await.d1, old_d1);
+        assert_eq!(sm.applied().await, old_marker);
+        drop(sm);
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        sm.forbid_coordinator_journal(true);
+        assert_eq!(disk(&sm), old_disk);
+        assert_eq!(status(&sm).await, (cut.clone(), applied));
+        let results = sm.apply(commands).await.unwrap();
+        assert!(results.iter().all(|r| r.d1.as_ref().unwrap().is_ok()));
+        assert_eq!(status(&sm).await, (cut.clone(), applied + 2));
+        // A rejected final entry cannot leak its candidate. Earlier successful
+        // entries and exact terminal retry remain accepted in the same batch.
+        let next = sm.applied().await.unwrap().index + 1;
+        let mut bad = advance(applied + 3, &cut);
+        if let D1Command::AdvanceRetained { epoch, .. } = &mut bad {
+            *epoch = 9;
+        }
+        let results = sm
+            .apply([
+                entry(next, advance(applied + 2, &cut)),
+                entry(next + 1, bad),
+            ])
+            .await
+            .unwrap();
+        assert!(results[0].d1.as_ref().unwrap().is_ok());
+        assert!(results[1].d1.as_ref().unwrap().is_err());
+        drop(sm);
+        let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        assert_eq!(status(&sm).await, (cut, applied + 2));
+    }
+}
+
+#[tokio::test]
+#[ignore = "local paired verification benchmark; run explicitly with --release --ignored --nocapture"]
+async fn member_apply_tail_fusion_benchmark() {
+    use std::time::Instant;
+    for count in [0, 32, 64, 256, 512, 1024] {
+        let (_dir, sm, _) = status_fixture(count).await;
+        // Avoid only measuring sealed A while preserving the exact same cut
+        // for both alternatives. Fixture construction is never timed.
+        let mut sm = sm;
+        if count > 1 {
+            let cut = status(&sm).await.0;
+            apply(&mut sm, advance(count / 2 + 1, &cut)).await.unwrap();
+        }
+        let state = sm.state.read().await;
+        let expected = checked_member_tail(&sm, &state, false).unwrap();
+        for sample in 0..9 {
+            for mode in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let iterations = 20;
+                let before = event_ledger::raw_walks();
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let tail = checked_member_tail(&sm, &state, mode == 1).unwrap();
+                    assert_eq!(tail, expected);
+                }
+                let elapsed = started.elapsed();
+                let walks = event_ledger::raw_walks() - before;
+                assert_eq!(
+                    walks,
+                    iterations * (1 + u64::from(mode == 0 && !expected.is_empty()))
+                );
+                println!("member_tail transactions={count} mode={mode} sample={sample} iterations={iterations} walks={walks} elapsed_ns={}", elapsed.as_nanos());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn member_apply_tail_fusion_keeps_original_admit_commit_and_abort() {
+    for profile in [
+        CapacityProfile::LegacyCountV1,
+        CapacityProfile::ByteBound16MiBV1,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        setup(&mut sm, profile).await;
+        let mut journal = observed_commit(&mut sm, profile).await;
+        for command in [begin(2), abort(2), begin(3), begin(4), abort(4)] {
+            journal.apply(command).unwrap();
+        }
+        let cut = sync_all(&mut sm, &journal).await;
+        for ordinal in [1, 2] {
+            apply(&mut sm, advance(ordinal, &cut)).await.unwrap();
+        }
+        let expected: Vec<_> = (1..=2)
+            .map(|n| journal.transaction_at(n).unwrap().clone())
+            .collect();
+        assert_eq!(expected[0].decision, Some(Decision::Commit));
+        assert_eq!(expected[0].prepared, vec![true]);
+        assert_eq!(expected[1].decision, Some(Decision::Abort));
+        assert_eq!(expected[1].prepared, vec![false]);
+        for reopen in [false, true] {
+            if reopen {
+                drop(sm);
+                sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+                sm.forbid_coordinator_journal(true);
+            }
+            let state = sm.state.read().await;
+            assert_eq!(checked_member_tail(&sm, &state, false).unwrap(), expected);
+            assert_eq!(checked_member_tail(&sm, &state, true).unwrap(), expected);
+            assert_eq!(
+                state
+                    .d1
+                    .as_ref()
+                    .unwrap()
+                    .visibility
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .resolved_prefix(),
+                2
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn member_apply_tail_fusion_discards_partially_invalid_page() {
+    let (dir, mut sm, base) = status_fixture(62).await;
+    let (_control_dir, mut control, _) = status_fixture(62).await;
+    assert_eq!(status(&sm).await.1, 31);
+    let events = vec![begin(200), begin(0)];
+    let end = base.extend(&events).unwrap();
+    let bad = HistoryPage {
+        version: base.version,
+        base: base.clone(),
+        end: end.clone(),
+        cut: end,
+        events,
+    };
+    bad.validate().unwrap();
+    let mut journal = status_journal(62);
+    journal.apply(begin(201)).unwrap();
+    journal.apply(abort(201)).unwrap();
+    let good = journal.history_page(&base, None).unwrap();
+    let cut = good.cut.clone();
+    let next = sm.applied().await.unwrap().index + 1;
+    let results = sm
+        .apply([
+            entry(next, sync(bad)),
+            entry(next + 1, sync(good.clone())),
+            entry(next + 2, advance(32, &cut)),
+        ])
+        .await
+        .unwrap();
+    assert!(results[0].d1.as_ref().unwrap().is_err());
+    assert!(results[1..].iter().all(|r| r.d1.as_ref().unwrap().is_ok()));
+    control
+        .apply([
+            blank(next),
+            entry(next + 1, sync(good)),
+            entry(next + 2, advance(32, &cut)),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(disk(&sm), disk(&control));
+    assert_eq!(sm.state.read().await.d1, control.state.read().await.d1);
+    assert_eq!(
+        sm.participant_status(7, 1, [7; 16], id(200)).await.unwrap(),
+        Status::Unknown
+    );
+    let expected = disk(&sm);
+    drop(sm);
+    let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    assert_eq!(disk(&sm), expected);
+    assert_eq!(status(&sm).await, (cut, 32));
+    assert_eq!(
+        sm.participant_status(7, 1, [7; 16], id(200)).await.unwrap(),
+        Status::Unknown
+    );
+}
