@@ -31,8 +31,10 @@ Vertex deletion/cascades, arbitrary transaction programs, nonempty imported
 baseline certification and dynamic routing are not supported by this path.
 [Managed Traverse/TraversePage](docs/MANAGED_FIXED_TRAVERSALS.md) reuse the routing-v3
 executor, including qualified vertex/edge `id()`, element `dedup()` and scalar
-`values`/`label`/`id` deduplication, over one materialized cohort snapshot. They do not yet support `repeat`, `valueMap` or data-local
-hierarchy jobs. The original gateway `Read` has its own smaller subset.
+`values`/`label`/`id` deduplication and one bounded native out/in `repeat`, over
+one materialized cohort snapshot. Repeat supports exact-depth and post-body
+emission with combined depth at most 32 and unchanged cumulative resource limits.
+They do not yet support `valueMap` or data-local hierarchy jobs. The original gateway `Read` has its own smaller subset.
 
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
 rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions

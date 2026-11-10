@@ -395,41 +395,81 @@ async fn main() -> anyhow::Result<()> {
         for p in placements {
             catalog.commit_registration(&catalog.prepare_registration([p.group as u8; 16], p.group as u32, p)?)?;
         }
-        let t = Instant::now();
-        let session = resolver.experimental_read_session(BUDGET);
-        println!("{}", json!({"event":"client_session","seconds":t.elapsed().as_secs_f64(),"error":session.as_ref().err().map(|e|format!("{e:?}"))}));
-        match session {
-            Ok(s) => for c in client_cases {
-                let query = c["query"].as_str().unwrap();
-                let t = Instant::now();
-                let result = s.observed_gremlin_v3(c["partition"].as_u64().unwrap() as u32, query);
-                let client_unsupported = c["client_expect_unsupported"].as_bool() == Some(true);
-                let expect_error = c["expect_error"].as_bool() == Some(true) || client_unsupported;
-                let report = match result {
-                    Ok(output) => {
-                        ensure!(!expect_error, "unexpected success {query}");
-                        ensure!(output.completeness == AdjacencyCompleteness::Unverified);
-                        let actual = observed(&output.rows);
-                        let expected = c.get("client_expected").unwrap_or(&c["expected"]);
-                        ensure!(actual == *expected, "client oracle mismatch {query}: {actual} != {expected}");
-                        json!({"correct":true,"rows":output.rows.len()})
-                    },
-                    Err(e) => {
-                        ensure!(expect_error, "unexpected client error {query}: {e:?}");
-                        if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "server-only client case must explicitly reject Unsupported: {e:?}"); }
-                        ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
-                            ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
-                            | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
-                            | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)
-                            | rocksdb_sql_table::Error::TraversalLimitExceeded(_))), "unexpected error category: {e:?}");
-                        json!({"expected_rejection":format!("{e:?}")})
-                    }
-                };
-                println!("{}", json!({"event":"client_query","name":c["name"],"query":query,"ms":t.elapsed().as_secs_f64()*1000.,"result":report}));
-            },
-            Err(e) => {
-                ensure!(matches!(&e, ExperimentalRouteError::Route(RouteError::Storage(rocksdb_sql_table::StorageNodeError::ResourceExhausted(_)))), "unexpected session failure: {e:?}");
-                ensure!(manifest["shards"].as_array().unwrap().iter().map(|s|s["kv_rows"].as_u64().unwrap()).sum::<u64>() > replicated_graph::routing::MAX_SCAN_VIEW_ROWS as u64 || manifest["shards"].as_array().unwrap().iter().map(|s|s["raw_bytes"].as_u64().unwrap()).sum::<u64>() > replicated_graph::routing::MAX_SCAN_VIEW_BYTES as u64, "small session unexpectedly rejected");
+        // Predetermined fixture phases, never adaptive renewal or retries.
+        // Filtering is stable, retaining each phase's original manifest order.
+        for case in &client_cases {
+            ensure!(["legacy", "repeat_explicit", "repeat_global"].contains(
+                &case["client_phase"].as_str().unwrap_or("legacy")), "unknown client phase");
+        }
+        for phase in ["legacy", "repeat_explicit", "repeat_global"] {
+            let phase_cases: Vec<_> = client_cases.iter().filter(|case|
+                case["client_phase"].as_str().unwrap_or("legacy") == phase
+            ).collect();
+            if phase != "legacy" && phase_cases.is_empty() {
+                continue;
+            }
+            let skip_reason: Option<&str> = None;
+            let t = Instant::now();
+            let session = resolver.experimental_read_session(BUDGET);
+            let session_error_category = session.as_ref().err().map(|error| match error {
+                ExperimentalRouteError::Route(RouteError::Storage(
+                    rocksdb_sql_table::StorageNodeError::ResourceExhausted(_),
+                )) => "ResourceExhausted",
+                _ => "Unexpected",
+            });
+            println!("{}", json!({"event":"client_session","phase":phase,"planned_cases":phase_cases.len(),"skip_reason":skip_reason,"error_category":session_error_category,"seconds":t.elapsed().as_secs_f64(),"error":session.as_ref().err().map(|e|format!("{e:?}"))}));
+            match session {
+                Ok(s) => for c in phase_cases {
+                    let query = c["query"].as_str().unwrap();
+                    let t = Instant::now();
+                    let result = s.observed_gremlin_v3(c["partition"].as_u64().unwrap() as u32, query);
+                    let client_unsupported = c["client_expect_unsupported"].as_bool() == Some(true);
+                    // Explicit client results can differ from a server budget
+                    // rejection; never infer the client's budget from the server.
+                    let expect_error = c.get("client_expected").is_none()
+                        && (c["expect_error"].as_bool() == Some(true) || client_unsupported
+                            || c.get("client_expected_error").is_some());
+                    let report = match result {
+                        Ok(output) => {
+                            ensure!(!expect_error, "unexpected success {query}");
+                            ensure!(output.completeness == AdjacencyCompleteness::Unverified);
+                            let actual = observed(&output.rows);
+                            let expected = c.get("client_expected").unwrap_or(&c["expected"]);
+                            ensure!(actual == *expected, "client oracle mismatch {query}: {actual} != {expected}");
+                            json!({"correct":true,"rows":output.rows.len()})
+                        },
+                        Err(e) => {
+                            ensure!(expect_error, "unexpected client error {query}: {e:?}");
+                            let category = match &e {
+                                    ExperimentalRouteError::Unsupported(_)
+                                    | ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
+                                        | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
+                                        | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)) => "Unsupported",
+                                    ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(_)) => "ResourceExhausted",
+                                    ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)) => "InvalidArgument",
+                                    _ => "Unexpected",
+                                };
+                            if let Some(expected) = c["client_expected_error"].as_str() {
+                                ensure!(category == expected, "client error category {category} != {expected}: {query}: {e:?}");
+                            }
+                            if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "server-only client case must explicitly reject Unsupported: {e:?}"); }
+                            ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
+                                ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
+                                | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
+                                | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)
+                                | rocksdb_sql_table::Error::TraversalLimitExceeded(_))), "unexpected error category: {e:?}");
+                            json!({"expected_rejection":format!("{e:?}"),"error_category":category})
+                        }
+                    };
+                    println!("{}", json!({"event":"client_query","phase":phase,"name":c["name"],"query":query,"ms":t.elapsed().as_secs_f64()*1000.,"result":report}));
+                },
+                Err(e) => {
+                    ensure!(phase == "legacy", "later client phase acquisition failed: {phase}: {e:?}");
+                    ensure!(matches!(&e, ExperimentalRouteError::Route(RouteError::Storage(rocksdb_sql_table::StorageNodeError::ResourceExhausted(_)))), "unexpected session failure: {e:?}");
+                    ensure!(manifest["shards"].as_array().unwrap().iter().map(|s|s["kv_rows"].as_u64().unwrap()).sum::<u64>() > replicated_graph::routing::MAX_SCAN_VIEW_ROWS as u64 || manifest["shards"].as_array().unwrap().iter().map(|s|s["raw_bytes"].as_u64().unwrap()).sum::<u64>() > replicated_graph::routing::MAX_SCAN_VIEW_BYTES as u64, "small session unexpectedly rejected");
+                    // One full-fixture admission failure, not three retries.
+                    break;
+                }
             }
         }
         Ok(())

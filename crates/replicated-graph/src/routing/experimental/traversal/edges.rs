@@ -66,12 +66,15 @@ fn push_element(
     row: ElementRow,
     work: &mut Work,
 ) -> ExperimentalResult<()> {
-    if rows.len() >= 10_000 {
-        return Err(limit("v3 element row cap exceeded"));
-    }
-    work.charge(128 + row.path.len() * std::mem::size_of::<ObservedPathElement>())?;
+    admit_element(rows.len(), row.path.len(), work)?;
     rows.push(row);
     Ok(())
+}
+fn admit_element(rows: usize, path_len: usize, work: &mut Work) -> ExperimentalResult<()> {
+    if rows >= 10_000 {
+        return Err(limit("v3 element row cap exceeded"));
+    }
+    work.charge(128 + path_len * std::mem::size_of::<ObservedPathElement>())
 }
 fn start_row(element: ObservedElementRef) -> ElementRow {
     ElementRow {
@@ -148,6 +151,7 @@ pub(crate) fn validate_steps(
     use rocksdb_sql_table::ObservedGremlinStep as Step;
     let mut edge_stream = matches!(query.start(), GremlinStart::Edges(_));
     let mut scalar = false;
+    let mut depth = 0usize;
     for step in query.steps() {
         if scalar
             && !matches!(
@@ -169,10 +173,13 @@ pub(crate) fn validate_steps(
         }
         match step {
             Step::Dedup => {}
-            Step::Repeat { .. } => {
-                return Err(ExperimentalRouteError::Unsupported(
-                    "repeat is only supported by the server coordinator",
-                ));
+            Step::Repeat { times, .. } => {
+                if edge_stream {
+                    return Err(ExperimentalRouteError::Unsupported(
+                        "v3 repeat requires vertices",
+                    ));
+                }
+                depth += times;
             }
             Step::OutE(_) | Step::InE(_) | Step::BothE(_) => {
                 if edge_stream {
@@ -181,6 +188,7 @@ pub(crate) fn validate_steps(
                     ));
                 }
                 edge_stream = true;
+                depth += 1;
             }
             Step::InV | Step::OutV | Step::BothV => {
                 if !edge_stream {
@@ -196,6 +204,7 @@ pub(crate) fn validate_steps(
                         "v3 adjacency requires vertices",
                     ));
                 }
+                depth += 1;
             }
             Step::Existing(GremlinStep::Values(_) | GremlinStep::Label | GremlinStep::Id) => {
                 scalar = true
@@ -214,8 +223,122 @@ pub(crate) fn validate_steps(
             }
         }
     }
+    if depth > rocksdb_sql_table::MAX_OBSERVED_GREMLIN_REPEAT_TIMES {
+        return Err(limit("v3 combined traversal depth exceeds 32"));
+    }
     Ok(())
 }
+
+// Ordinary and repeated adjacency use one implementation and the same provider,
+// deadline and cumulative work counter. No query-text or AST rewriting occurs.
+fn expand_rows<R: TraversalRead + ?Sized>(
+    read: &R,
+    rows: Vec<ElementRow>,
+    dirs: &[Direction],
+    label: Option<&str>,
+    edge_output: bool,
+    work: &mut Work,
+) -> ExperimentalResult<Vec<ElementRow>> {
+    let mut next = Vec::new();
+    for row in rows {
+        read.check()?;
+        let ObservedElementRef::Vertex(vertex) = row.element else {
+            unreachable!("validated vertex stream")
+        };
+        let mut ordered = BTreeMap::new();
+        for direction in dirs {
+            work.visit()?;
+            let observed = read.observed_adjacency(vertex, *direction)?;
+            for edge in observed {
+                read.check()?;
+                work.visit()?;
+                work.edge(&edge)?;
+                if label.is_some_and(|label| label != edge.label) {
+                    continue;
+                }
+                let target = if *direction == Direction::Out {
+                    edge.to
+                } else {
+                    edge.from
+                };
+                // Qualified edge identity only. Parallel edges and input bag
+                // multiplicity survive; a loop in both directions collapses.
+                ordered.insert((edge.id, edge.from.partition), target);
+            }
+        }
+        for ((id, partition), target) in ordered {
+            read.check()?;
+            let edge = EdgeRef { partition, id };
+            // Admit the complete row before cloning the growing path.
+            admit_element(
+                next.len(),
+                row.path.len() + if edge_output { 1 } else { 2 },
+                work,
+            )?;
+            let mut path = row.path.clone();
+            path.push(ObservedPathElement::Edge(edge));
+            let element = if edge_output {
+                ObservedElementRef::Edge(edge)
+            } else {
+                path.push(ObservedPathElement::Vertex(target));
+                ObservedElementRef::Vertex(target)
+            };
+            next.push(ElementRow {
+                element,
+                path,
+                value: None,
+            });
+        }
+    }
+    Ok(next)
+}
+
+fn repeat_rows<R: TraversalRead + ?Sized>(
+    read: &R,
+    mut rows: Vec<ElementRow>,
+    incoming: bool,
+    label: Option<&str>,
+    times: usize,
+    emit: bool,
+    work: &mut Work,
+) -> ExperimentalResult<Vec<ElementRow>> {
+    let dirs = [if incoming {
+        Direction::In
+    } else {
+        Direction::Out
+    }];
+    let mut emitted = Vec::new();
+    for depth in 1..=times {
+        read.check()?;
+        work.visit()?;
+        rows = expand_rows(read, rows, &dirs, label, false, work)?;
+        if rows.is_empty() {
+            break;
+        }
+        if emit {
+            if depth == times {
+                // The last frontier has no next iteration. Move it once, while
+                // preserving the same cumulative emitted-retention charge.
+                for row in rows {
+                    read.check()?;
+                    push_element(&mut emitted, row, work)?;
+                }
+                return Ok(emitted);
+            }
+            for row in &rows {
+                read.check()?;
+                admit_element(emitted.len(), row.path.len(), work)?;
+                emitted.push(ElementRow {
+                    element: row.element,
+                    path: row.path.clone(),
+                    value: None,
+                });
+            }
+        }
+    }
+    Ok(if emit { emitted } else { rows })
+}
+
 /// Private execution-only read boundary. Providers own their consistency proof;
 /// the shared executor returns rows, never a snapshot/certification envelope.
 pub(crate) trait TraversalRead {
@@ -365,6 +488,22 @@ pub(crate) trait TraversalRead {
             self.check()?;
             match step {
                 Step::Dedup => rows = dedup_rows(rows, &mut work, || self.check())?,
+                Step::Repeat {
+                    incoming,
+                    label,
+                    times,
+                    emit,
+                } => {
+                    rows = repeat_rows(
+                        self,
+                        rows,
+                        *incoming,
+                        label.as_deref(),
+                        *times,
+                        *emit,
+                        &mut work,
+                    )?;
+                }
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
                 Step::Existing(GremlinStep::Path | GremlinStep::Count) => {}
                 Step::OutE(label)
@@ -379,56 +518,7 @@ pub(crate) trait TraversalRead {
                         Step::InE(_) | Step::Existing(GremlinStep::In(_)) => &[Direction::In],
                         _ => &[Direction::Out, Direction::In],
                     };
-                    let mut next = Vec::new();
-                    for row in rows {
-                        self.check()?;
-                        let ObservedElementRef::Vertex(vertex) = row.element else {
-                            unreachable!("validated vertex stream")
-                        };
-                        let mut ordered = BTreeMap::new();
-                        for direction in dirs {
-                            work.visit()?;
-                            let observed = self.observed_adjacency(vertex, *direction)?;
-                            for edge in observed {
-                                self.check()?;
-                                work.visit()?;
-                                work.edge(&edge)?;
-                                if label.as_ref().is_some_and(|label| label != &edge.label) {
-                                    continue;
-                                }
-                                let target = if *direction == Direction::Out {
-                                    edge.to
-                                } else {
-                                    edge.from
-                                };
-                                // Qualified edge identity only. Parallel edges and input bag
-                                // multiplicity survive; a loop in both directions collapses.
-                                ordered.insert((edge.id, edge.from.partition), target);
-                            }
-                        }
-                        for ((id, partition), target) in ordered {
-                            self.check()?;
-                            let edge = EdgeRef { partition, id };
-                            let mut path = row.path.clone();
-                            path.push(ObservedPathElement::Edge(edge));
-                            let element = if edge_output {
-                                ObservedElementRef::Edge(edge)
-                            } else {
-                                path.push(ObservedPathElement::Vertex(target));
-                                ObservedElementRef::Vertex(target)
-                            };
-                            push_element(
-                                &mut next,
-                                ElementRow {
-                                    element,
-                                    path,
-                                    value: None,
-                                },
-                                &mut work,
-                            )?;
-                        }
-                    }
-                    rows = next;
+                    rows = expand_rows(self, rows, dirs, label.as_deref(), edge_output, &mut work)?;
                 }
                 Step::InV | Step::OutV | Step::BothV => {
                     let mut next = Vec::new();
@@ -815,22 +905,214 @@ mod tests {
     }
 
     #[test]
-    fn client_observed_executor_rejects_server_only_repeat_before_reads() {
+    fn repeat_preflights_full_stream_and_combined_depth() {
         for text in [
             "g.V(1).repeat(__.out()).times(2)",
             "g.V().repeat(__.in()).emit().times(32)",
-            "g.E(1).repeat(__.out()).times(1)",
+            "g.E(1).bothV().repeat(__.out()).times(32).path()",
+            "g.V(1).outE().inV().repeat(__.in()).times(31).dedup().id()",
         ] {
             let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
-            assert!(matches!(
-                validate_steps(&query),
-                Err(ExperimentalRouteError::Unsupported(_))
-            ));
+            validate_steps(&query).unwrap();
         }
-        let scalar = rocksdb_sql_table::ObservedGremlinQuery::parse(
-            "g.V(1).values('x').repeat(__.out()).times(2)",
+        for text in [
+            "g.E(999).repeat(__.out()).times(1)",
+            "g.V(999).outE().repeat(__.out()).times(1)",
+            "g.V(999).values('x').repeat(__.out()).times(2)",
+            "g.V(999).repeat(__.in()).times(32).out()",
+            "g.V(999).outE().inV().repeat(__.out()).times(32)",
+        ] {
+            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            assert!(validate_steps(&query).is_err(), "{text}");
+        }
+        for text in [
+            "g.V(999).repeat(__.out()).times(0)",
+            "g.V(999).repeat(__.out()).times(33)",
+            "g.V(999).repeat(__.both()).times(2)",
+            "g.V(999).repeat(__.out().dedup()).times(2)",
+            "g.V(999).emit().repeat(__.out()).times(2)",
+            "g.V(999).repeat(__.out()).until(has('x'))",
+            "g.V(999).repeat(__.out()).times(1).repeat(__.in()).times(1)",
+        ] {
+            assert!(
+                rocksdb_sql_table::ObservedGremlinQuery::parse(text).is_err(),
+                "{text}"
+            );
+        }
+    }
+    struct LoopRead {
+        checks: std::cell::Cell<usize>,
+        fail_after: usize,
+    }
+    impl TraversalRead for LoopRead {
+        type Node = PinnedNode;
+        fn check(&self) -> ExperimentalResult<()> {
+            let checked = self.checks.get();
+            self.checks.set(checked + 1);
+            if checked >= self.fail_after {
+                Err(limit("expired"))
+            } else {
+                Ok(())
+            }
+        }
+        fn partitions(&self) -> Vec<u32> {
+            unreachable!()
+        }
+        fn metadata_bytes(&self) -> usize {
+            unreachable!()
+        }
+        fn store(&self, _: u32) -> ExperimentalResult<AppendOnlyStore<Self::Node>> {
+            unreachable!()
+        }
+        fn get_vertex(&self, _: VertexRef) -> ExperimentalResult<Option<Vertex>> {
+            unreachable!()
+        }
+        fn get_edge(&self, _: EdgeRef) -> ExperimentalResult<Option<CrossEdge>> {
+            unreachable!()
+        }
+        fn verified_edge_record(&self, _: EdgeRef) -> ExperimentalResult<Option<EdgeRecord>> {
+            unreachable!()
+        }
+        fn observed_adjacency(
+            &self,
+            vertex: VertexRef,
+            _: Direction,
+        ) -> ExperimentalResult<Vec<CrossEdge>> {
+            Ok(vec![CrossEdge {
+                id: 11,
+                from: vertex,
+                to: vertex,
+                label: "K".into(),
+                properties: BTreeMap::new(),
+            }])
+        }
+    }
+
+    #[test]
+    fn repeat_keeps_paths_and_cumulative_round_emission_and_deadline_budgets() {
+        let vertex = VertexRef {
+            partition: 7,
+            id: 3,
+        };
+        let read = LoopRead {
+            checks: std::cell::Cell::new(0),
+            fail_after: usize::MAX,
+        };
+        for emit in [false, true] {
+            let mut work = Work {
+                visits: 0,
+                bytes: 0,
+            };
+            let rows = repeat_rows(
+                &read,
+                vec![start_row(ObservedElementRef::Vertex(vertex))],
+                false,
+                None,
+                32,
+                emit,
+                &mut work,
+            )
+            .unwrap();
+            assert_eq!(work.visits, 96); // one round, one adjacency and one edge per depth
+            assert_eq!(rows.len(), if emit { 32 } else { 1 });
+            let mut expected_bytes = 0;
+            for depth in 1..=32 {
+                let row_bytes = 128 + (2 * depth + 1) * std::mem::size_of::<ObservedPathElement>();
+                expected_bytes += 257 + row_bytes + if emit { row_bytes } else { 0 };
+            }
+            assert_eq!(work.bytes, expected_bytes);
+            for (index, row) in rows.iter().enumerate() {
+                let depth = if emit { index + 1 } else { 32 };
+                let mut expected = vec![ObservedPathElement::Vertex(vertex)];
+                for _ in 0..depth {
+                    expected.extend([
+                        ObservedPathElement::Edge(EdgeRef {
+                            partition: 7,
+                            id: 11,
+                        }),
+                        ObservedPathElement::Vertex(vertex),
+                    ]);
+                }
+                assert_eq!(row.path, expected);
+            }
+        }
+        let mut work = Work {
+            visits: 9_998,
+            bytes: 0,
+        };
+        assert!(repeat_rows(
+            &read,
+            vec![start_row(ObservedElementRef::Vertex(vertex))],
+            false,
+            None,
+            2,
+            true,
+            &mut work
         )
-        .unwrap();
-        assert!(validate_steps(&scalar).is_err());
+        .is_err());
+        let mut work = Work {
+            visits: 0,
+            bytes: 64 * 1024 * 1024 - 257,
+        };
+        assert!(repeat_rows(
+            &read,
+            vec![start_row(ObservedElementRef::Vertex(vertex))],
+            false,
+            None,
+            2,
+            true,
+            &mut work
+        )
+        .is_err());
+        // A full first frontier fits exactly, but retaining the first emitted
+        // copy must fail before its clone and cannot return an early prefix.
+        let row_bytes = 128 + 3 * std::mem::size_of::<ObservedPathElement>();
+        let mut work = Work {
+            visits: 0,
+            bytes: 64 * 1024 * 1024 - 257 - row_bytes,
+        };
+        assert!(repeat_rows(
+            &read,
+            vec![start_row(ObservedElementRef::Vertex(vertex))],
+            false,
+            None,
+            2,
+            true,
+            &mut work
+        )
+        .is_err());
+        assert_eq!(work.visits, 3);
+        assert_eq!(work.bytes, 64 * 1024 * 1024 + row_bytes);
+        for fail_after in [0, 4, 10, 50] {
+            let read = LoopRead {
+                checks: std::cell::Cell::new(0),
+                fail_after,
+            };
+            let mut work = Work {
+                visits: 0,
+                bytes: 0,
+            };
+            assert!(repeat_rows(
+                &read,
+                vec![start_row(ObservedElementRef::Vertex(vertex))],
+                false,
+                None,
+                32,
+                true,
+                &mut work
+            )
+            .is_err());
+        }
+        let mut work = Work {
+            visits: 0,
+            bytes: 0,
+        };
+        assert!(
+            repeat_rows(&read, Vec::new(), false, None, 32, true, &mut work)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!((work.visits, work.bytes), (1, 0));
+        assert!(admit_element(10_000, 1, &mut work).is_err());
     }
 }

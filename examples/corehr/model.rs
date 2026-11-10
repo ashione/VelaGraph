@@ -459,7 +459,7 @@ impl Model {
                 "path" => json!({"paths":paths.iter().map(|(_,p)|p).collect::<Vec<_>>()}),
                 _ => verts(&paths.iter().map(|(id, _)| *id).collect::<Vec<_>>()),
             };
-            q.push(json!({"name":name,"partition":partition(start),"query":query,"expected":expected,"server_supported":true,"client_expect_unsupported":true}));
+            q.push(json!({"name":name,"partition":partition(start),"query":query,"expected":expected,"server_supported":true,"client_phase":"repeat_explicit"}));
         };
         for (kind, start, label) in [
             ("person", self.people, "reports_to"),
@@ -572,39 +572,75 @@ impl Model {
         );
         let mut seen = std::collections::BTreeSet::new();
         native("native_duplicate_ancestor_dedup_paths",p,format!("g.V({p},{p}).repeat(__.out('reports_to')).emit().times(32).dedup().limit(1000).path()"),duplicates.into_iter().filter(|(id,_)|seen.insert((partition(*id),*id))).collect(),"path");
-        for (name, query, error, client_direct) in [
+        // E starts require an endpoint transition before native repeat. The
+        // first fixture edge is 2 -> 1, and retains its canonical source shard.
+        q.push(
+            json!({"name":"client_edge_endpoint_repeat_path","partition":partition(2),"client_phase":"repeat_explicit",
+            "query":"g.E(1).outV().repeat(__.out('reports_to')).times(1).path()",
+            "client_expected":{"paths":[[
+                ["e",partition(2),1], ["v",partition(2),2],
+                ["e",partition(2),1], ["v",partition(1),1]
+            ]]},"server_supported":false,"server_expected_error":"Unsupported"}),
+        );
+        q.push(
+            json!({"name":"client_edge_repeat_without_endpoint","partition":partition(2),
+            "query":"g.E(1).repeat(__.out('reports_to')).times(1)",
+            "expect_error":true,"client_expect_unsupported":true,
+            "server_supported":false,"server_expected_error":"Unsupported"}),
+        );
+        for (name, query, error) in [
             (
                 "native_broad_descendants_budget",
                 "g.V(1).repeat(__.in('reports_to')).emit().times(32).count()",
                 "ResourceExhausted",
-                true,
             ),
             (
                 "native_broad_limit_cannot_rescue",
                 "g.V(1).repeat(__.in('reports_to')).emit().times(32).limit(1)",
                 "ResourceExhausted",
-                true,
             ),
             (
                 "native_zero_depth",
                 "g.V(1).repeat(__.out('reports_to')).times(0)",
                 "Unsupported",
-                false,
             ),
             (
                 "native_depth33",
                 "g.V(1).repeat(__.out('reports_to')).times(33)",
                 "ResourceExhausted",
-                false,
             ),
             (
                 "native_combined_depth33",
                 "g.V(1).out('reports_to').repeat(__.out('reports_to')).times(32)",
                 "ResourceExhausted",
-                true,
             ),
         ] {
-            q.push(json!({"name":name,"partition":partition(1),"query":query,"expect_error":true,"client_expect_unsupported":client_direct,"server_supported":false,"server_expected_error":error}));
+            let mut case = json!({"name":name,"partition":partition(1),"query":query,"expect_error":true,"server_supported":false,"server_expected_error":error,"client_expected_error":error});
+            if name.starts_with("native_broad_") {
+                case["client_phase"] = json!("repeat_explicit");
+                // The server's smaller work bound is independent of routing-v3.
+                // This 8-ary input tree has people-1 edges and people expanded
+                // vertices; include the start and one tick per nonempty level
+                // plus the terminal empty level in the documented work bound.
+                let mut root = self.people;
+                let mut height = 0;
+                while root > 1 {
+                    root = 1 + (root - 2) / 8;
+                    height += 1;
+                }
+                let work = 2 * self.people + height + 1;
+                if work <= 10_000 {
+                    case["client_expected"] = if name == "native_broad_descendants_budget" {
+                        json!({"count":self.people - 1})
+                    } else {
+                        verts(&[2])
+                    };
+                    case.as_object_mut()
+                        .unwrap()
+                        .remove("client_expected_error");
+                }
+            }
+            q.push(case);
         }
         for case in &mut q {
             if case["name"] == "global_zero_limit_count" {
@@ -662,7 +698,7 @@ fn fixture_invariants() {
 fn dedup_oracle_is_nonvacuous() {
     let m = Model::new(2000, 50);
     let q = m.queries();
-    assert_eq!(q.len(), 122);
+    assert_eq!(q.len(), 124);
     let get = |name: &str| q.iter().find(|v| v["name"] == name).unwrap();
     // Fixed-version v3 now supports element dedup. Keep these independent
     // relationship-list oracles enabled instead of masking them as rejections.
@@ -688,13 +724,9 @@ fn dedup_oracle_is_nonvacuous() {
         assert_ne!(get(name)["expect_error"], true, "{name}");
         assert!(get(name).get("expected").is_some(), "{name}");
     }
-    // Dedup does not expand the fixed-version client's repeat or valueMap
-    // grammar. Scalar dedup is supported by the client but not the coordinator.
-    for name in [
-        "native_duplicate_ancestor_dedup_paths",
-        "project_unique_departments",
-        "global_join_department_maps",
-    ] {
+    // valueMap stays unsupported. Native repeat and scalar dedup are now
+    // supported by the client without expanding the coordinator subset.
+    for name in ["project_unique_departments", "global_join_department_maps"] {
         assert_eq!(get(name)["client_expect_unsupported"], true, "{name}");
     }
     for name in [
@@ -819,4 +851,155 @@ fn native_hierarchy_oracle_preserves_levels_and_paths() {
     for (i, p) in paths.iter().enumerate() {
         assert_eq!(p.as_array().unwrap().len(), 1 + 2 * (i + 1));
     }
+}
+
+#[test]
+fn native_repeat_client_oracles_match_the_new_support_boundary() {
+    let m = Model::new(2000, 50);
+    let q = m.queries();
+    let get = |name: &str| q.iter().find(|case| case["name"] == name).unwrap();
+    let native = q
+        .iter()
+        .filter(|case| {
+            case["name"].as_str().unwrap().starts_with("native_")
+                && case["server_supported"] == true
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(native.len(), 18);
+    for case in native {
+        assert_ne!(case["client_expect_unsupported"], true, "{}", case["name"]);
+        assert_ne!(case["expect_error"], true);
+        assert!(case.get("expected").is_some());
+    }
+    for (name, expected) in [
+        ("native_broad_descendants_budget", json!({"count":1999})),
+        (
+            "native_broad_limit_cannot_rescue",
+            json!({"vertices":[[partition(2),2]]}),
+        ),
+    ] {
+        let case = get(name);
+        assert_eq!(case["client_expected"], expected);
+        assert!(case.get("client_expected_error").is_none());
+        // Never weaken the separate server budget rejection.
+        assert_eq!(case["expect_error"], true);
+        assert_eq!(case["server_expected_error"], "ResourceExhausted");
+        assert_eq!(case["server_supported"], false);
+    }
+    for name in ["native_depth33", "native_combined_depth33"] {
+        assert_eq!(get(name)["client_expected_error"], "ResourceExhausted");
+        assert!(get(name).get("client_expected").is_none());
+        assert_ne!(get(name)["client_expect_unsupported"], true);
+    }
+    assert_eq!(
+        get("native_zero_depth")["client_expected_error"],
+        "Unsupported"
+    );
+    assert_eq!(get("recursive_repeat")["expect_error"], true);
+    assert_eq!(
+        get("client_edge_repeat_without_endpoint")["client_expect_unsupported"],
+        true
+    );
+    assert_eq!(
+        get("client_edge_endpoint_repeat_path")["client_expected"]["paths"][0],
+        json!([["e", 3, 1], ["v", 3, 2], ["e", 3, 1], ["v", 2, 1]])
+    );
+    assert_eq!(
+        get("client_edge_endpoint_repeat_path")["server_expected_error"],
+        "Unsupported"
+    );
+    for name in [
+        "project_unique_departments",
+        "global_repeat_filtered_ancestor_maps",
+    ] {
+        assert_eq!(get(name)["client_expect_unsupported"], true);
+    }
+}
+
+#[test]
+fn over_budget_native_repeat_keeps_a_typed_client_failure() {
+    let m = Model::new(5000, 25);
+    let q = m.queries();
+    for name in [
+        "native_broad_descendants_budget",
+        "native_broad_limit_cannot_rescue",
+    ] {
+        let case = q.iter().find(|case| case["name"] == name).unwrap();
+        assert_eq!(case["client_expected_error"], "ResourceExhausted");
+        assert!(case.get("client_expected").is_none());
+        assert_ne!(case["client_expect_unsupported"], true);
+        assert_eq!(case["server_expected_error"], "ResourceExhausted");
+    }
+}
+
+#[test]
+fn client_repeat_phases_are_fixed_complete_and_ordered() {
+    let queries = Model::new(2000, 50).queries();
+    let phase_names = |phase: &str| {
+        queries
+            .iter()
+            .filter(|case| case["client_phase"].as_str().unwrap_or("legacy") == phase)
+            .map(|case| case["name"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        phase_names("repeat_explicit"),
+        vec![
+            "native_person_ancestors_emit32",
+            "native_person_ancestors_first_paths",
+            "native_person_exact_root",
+            "native_person_past_root",
+            "native_person_exact32_empty",
+            "native_department_ancestors_emit32",
+            "native_department_ancestors_first_paths",
+            "native_department_exact_root",
+            "native_department_past_root",
+            "native_department_exact32_empty",
+            "native_person_descendants_two",
+            "native_person_descendants_emit_two",
+            "native_person_active_descendants_count",
+            "native_person_descendants_emit_three_count",
+            "native_department_descendants_two",
+            "native_department_descendants_emit_two_count",
+            "native_duplicate_ancestor_bag_count",
+            "native_duplicate_ancestor_dedup_paths",
+            "client_edge_endpoint_repeat_path",
+            "native_broad_descendants_budget",
+            "native_broad_limit_cannot_rescue",
+        ]
+    );
+    assert_eq!(
+        phase_names("repeat_global"),
+        vec![
+            "global_repeat_named_ancestors",
+            "global_repeat_exact_depth",
+            "global_repeat_named_descendant_count",
+            "global_repeat_multi_root_bag",
+            "global_repeat_multi_root_unique",
+            "global_repeat_membership_then_department_hierarchy",
+            "global_repeat_missing_root",
+        ]
+    );
+    let legacy = phase_names("legacy");
+    assert_eq!(legacy.len(), 96);
+    for name in [
+        "recursive_repeat",
+        "native_zero_depth",
+        "native_depth33",
+        "native_combined_depth33",
+        "client_edge_repeat_without_endpoint",
+        "global_repeat_filtered_ancestor_maps",
+        "project_batch_people",
+    ] {
+        assert!(legacy.contains(&name), "moved legacy rejection {name}");
+    }
+    let all: Vec<_> = ["legacy", "repeat_explicit", "repeat_global"]
+        .into_iter()
+        .flat_map(phase_names)
+        .collect();
+    assert_eq!(all.len(), queries.len());
+    assert_eq!(
+        all.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        queries.len()
+    );
 }

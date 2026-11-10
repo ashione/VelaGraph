@@ -59,6 +59,76 @@ def validate_snapshots(snapshots, shards):
     require(seen == set(shards), 'incomplete snapshot shard set')
 
 
+def validate_client_phases(records, manifest, jobs):
+    """Check independent fixed fixture phases, never renewal or query retries."""
+    phases = ('legacy', 'repeat_explicit', 'repeat_global')
+    cases = manifest.get('queries')
+    require(isinstance(cases, list) and bool(cases)
+            and all(isinstance(c, dict) and isinstance(c.get('name'), str)
+                    and isinstance(c.get('query'), str)
+                    and c.get('client_phase', 'legacy') in phases for c in cases),
+            'invalid client phase manifest')
+    require(len({c['name'] for c in cases}) == len(cases), 'duplicate client case')
+    events = [r for r in records if r['event'] in ('client_session', 'client_query')]
+    require(bool(events), 'missing client phase evidence')
+    planned = {p: [c for c in cases if c.get('client_phase', 'legacy') == p] for p in phases}
+    if jobs:
+        planned = {'legacy': []}
+    active_phases = [p for p in phases if p == 'legacy' or planned.get(p)]
+    cursor = 0
+    for phase in active_phases:
+        require(cursor < len(events), 'missing client session')
+        session = events[cursor]
+        cursor += 1
+        require(session['event'] == 'client_session' and session.get('phase') == phase
+                and type(session.get('planned_cases')) is int
+                and session['planned_cases'] == len(planned[phase])
+                and session.get('skip_reason') == ('jobs_matrix' if jobs else None)
+                and 'error' in session and 'error_category' in session,
+                'invalid client session or phase order')
+        if session['error'] is not None:
+            # Mirror the existing immutable-scan admission bounds. A large
+            # fixture may fail once before any query; it cannot restart phases.
+            shards = manifest['shards']
+            require(all(type(s.get('raw_bytes')) is int and s['raw_bytes'] >= 0
+                        and type(s.get('kv_rows')) is int and s['kv_rows'] >= 0 for s in shards),
+                    'invalid client admission capacity evidence')
+            require(phase == 'legacy' and cursor == 1 and len(events) == 1
+                    and isinstance(session['error'], str) and bool(session['error'])
+                    and session['error_category'] == 'ResourceExhausted'
+                    and (sum(s['kv_rows'] for s in shards) > 200_000
+                         or sum(s['raw_bytes'] for s in shards) > 16 * 1024 * 1024),
+                    'unexpected client admission failure or retry')
+            return
+        require(session['error_category'] is None, 'successful client session has error category')
+        for case in planned[phase]:
+            require(cursor < len(events), 'missing client query')
+            row = events[cursor]
+            cursor += 1
+            require(row['event'] == 'client_query' and row.get('phase') == phase
+                    and row.get('name') == case['name'] and row.get('query') == case['query'],
+                    'missing, reordered, repeated or wrong client query')
+            result = row.get('result')
+            require(isinstance(result, dict), 'invalid client query result')
+            expected_error = 'client_expected' not in case and (
+                case.get('expect_error') is True or case.get('client_expect_unsupported') is True
+                or 'client_expected_error' in case)
+            if expected_error:
+                require(isinstance(result.get('expected_rejection'), str)
+                        and bool(result['expected_rejection']) and 'correct' not in result,
+                        'missing client rejection')
+                expected = case.get('client_expected_error')
+                if case.get('client_expect_unsupported') is True:
+                    expected = 'Unsupported'
+                require(result.get('error_category') in ('Unsupported', 'ResourceExhausted', 'InvalidArgument')
+                        and (expected is None or result['error_category'] == expected),
+                        'wrong client rejection category')
+            else:
+                require(result.get('correct') is True and 'expected_rejection' not in result,
+                        'missing client oracle success')
+    require(cursor == len(events), 'unexpected client session refresh or extra query')
+
+
 def validate(records, manifest, jobs=False):
     require(isinstance(records, list) and bool(records), 'empty output')
     require(all(isinstance(r, dict) and isinstance(r.get('event'), str) for r in records),
@@ -90,9 +160,10 @@ def validate(records, manifest, jobs=False):
     for row in records:
         if row['event'] == 'all_kv_verified':
             verified_so_far.add(row['shard'])
-        elif row['event'] in {'server_query', 'application_chain', 'job_begin',
+        elif row['event'] in {'client_session', 'client_query', 'server_query', 'application_chain', 'job_begin',
                                'job_progress', 'job_cleanup', 'job_outcome'}:
             require(verified_so_far == set(expected_shards), 'query precedes fixture verification')
+    validate_client_phases(records, manifest, jobs)
     if not jobs:
         queries = manifest.get('queries')
         require(isinstance(queries, list) and bool(queries)

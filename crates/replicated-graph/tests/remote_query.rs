@@ -231,7 +231,9 @@ fn fixture() -> anyhow::Result<(Export, Vec<Vec<QueryRow>>)> {
                 partition: 0,
                 id: 70,
             },
-            label: "loop".into(),
+            // Preserve all 22 unlabeled loops while isolating a one-row
+            // frontier for the full native-repeat path transport boundary.
+            label: if id == 200 { "single" } else { "loop" }.into(),
             properties: BTreeMap::new(),
         };
         v2.prepare_source(&edge)?
@@ -632,6 +634,7 @@ async fn scenario() -> anyhow::Result<()> {
         "g.V(2).out('cross').dedup().limit(1)",
         "g.E(10,10).dedup()",
         "g.V(2).out('cross').id().dedup().limit(1)",
+        "g.V(2).repeat(out('cross')).times(1).dedup().limit(1)",
     ] {
         assert_eq!(
             query(
@@ -666,6 +669,74 @@ async fn scenario() -> anyhow::Result<()> {
         .await?,
         Err(QueryFailure::Unsupported),
         "the shared v3 extension does not expand v1"
+    );
+    let loop_vertex = QualifiedElement::Vertex {
+        partition: 0,
+        id: 70,
+    };
+    let loop_edge = QualifiedElement::Edge {
+        partition: 0,
+        id: 200,
+    };
+    let mut longest = vec![loop_edge, loop_vertex];
+    for _ in 0..32 {
+        longest.extend([loop_edge, loop_vertex]);
+    }
+    assert_eq!(longest.len(), 66);
+    for text in [
+        "g.E(200).inV().repeat(out('single')).times(32).path()",
+        "g.E(200).outV().in('single').repeat(out('single')).times(31).path()",
+    ] {
+        let output = query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V2Observed, text),
+            BUDGET,
+        )
+        .await??;
+        assert_eq!(output.rows, vec![QueryRow::Path(longest.clone())], "{text}");
+        assert_eq!(output.completeness, QueryCompleteness::Unverified);
+    }
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(
+                QueryMode::V2Observed,
+                "g.V(70).repeat(out('single')).times(32).emit().count()"
+            ),
+            BUDGET
+        )
+        .await??
+        .rows,
+        vec![QueryRow::Count(32)]
+    );
+    for text in [
+        "g.V(999999).repeat(out()).times(32).out()",
+        "g.E(999999).repeat(out()).times(1)",
+        "g.V(999999).id().repeat(out()).times(1)",
+    ] {
+        assert!(
+            query(
+                endpoint,
+                Some(identity),
+                request(QueryMode::V2Observed, text),
+                BUDGET
+            )
+            .await?
+            .is_err(),
+            "accepted {text}"
+        );
+    }
+    assert_eq!(
+        query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V1, "g.V(70).repeat(out()).times(1)"),
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::Unsupported)
     );
     for text in [
         "g.V(999999).id().dedup().out()",

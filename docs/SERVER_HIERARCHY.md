@@ -23,8 +23,9 @@ multiple repeats, predicates, arbitrary repeat bodies, mutation, labelled loops,
 `by` and edge starts remain explicitly unsupported. Global vertex-filter starts
 are now accepted by the separately bounded [global composition](GLOBAL_VERTEX_TRAVERSAL.md);
 its suffix still excludes path/values. The examples here describe explicit-ID
-starts. The old v0
-parser/executor and client-side observed executor do not gain repeat execution.
+starts. The old v0 parser/executor and legacy observed v1/v2 remain unchanged.
+Shared routing-v3 and managed execution have their own
+[bounded repeat contract](MANAGED_FIXED_TRAVERSALS.md#bounded-native-repeat).
 
 ## Depth, paths, cycles and ordering
 

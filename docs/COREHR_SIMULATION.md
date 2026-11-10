@@ -63,7 +63,9 @@ snapshot or cross-shard transaction is claimed.
 The small workload exercises the broader client-side observed Gremlin surface:
 manager/direct reports, three-hop ancestry, two-hop descendants, memberships,
 filtered members, colleagues through departments (bag semantics), count,
-projection and explicit limits. Unsupported recursive `repeat`, sorting,
+projection and explicit limits. Bounded native `repeat(out/in).times(1..32)`
+with optional post-body `emit()` now runs on client v3 against independently
+derived path and result oracles. Unbounded or unsupported repeat forms, sorting,
 predicates and `range` pagination must reject explicitly. Fixed-version v3
 element `dedup()` now runs against the same independent relationship-list
 oracles, including first-path and limit-placement checks. The client v3 path
@@ -74,6 +76,17 @@ its smaller subset is not expanded by the shared routing-v3 implementation.
 Department member queries use an explicit 1,000-row limit; no claim is made that
 this is an unbounded membership listing. Paged storage verification does not
 mean Gremlin supports continuation tokens or offset pagination.
+
+Client fixture checks have three predetermined independent phases: the existing
+96 cases, 21 explicit-repeat cases, and 7 global-repeat cases. Each phase captures
+one ordinary 60-second read session, executes its cases once in manifest order,
+and drops it before the next phase. The harness never renews a session, retries
+an expired query, adapts phase boundaries to timing, or increases a resource
+limit. A full-fixture snapshot-capacity rejection is asserted once before any
+client query and stops all later client phases. Evidence validation checks every
+phase acquisition and query in order, so a skipped case or extra acquisition
+fails. These independent static-fixture phases do not claim a shared snapshot
+across phases or change the managed fixed-version lifetime guarantees.
 
 This integrated harness additionally includes the incoming-query implementation
 from the separately reviewed incoming-query candidate; its exact production-file hashes are recorded with the

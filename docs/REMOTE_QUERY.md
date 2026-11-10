@@ -163,3 +163,17 @@ remain. The shared implementation charges each input and unique key/text before
 retention; upstream integrity and resource errors still fail the whole query.
 This does not expand V1, the separate distributed coordinator or hierarchy jobs.
 See the [scalar contract](MANAGED_FIXED_TRAVERSALS.md#scalar-deduplication).
+
+
+### Shared bounded repeat
+
+The routing-v3 executor and single-partition V2Observed server entrypoint support
+one native out/in repeat with times(1..32) and optional unconditional post-body
+emit. Combined ordinary/repeated depth is at most 32. Ordered qualified bags,
+paths, filters/limits/dedup and fixed-read semantics retain their existing scope;
+single-partition server queries still reject cross-partition observations.
+All cumulative work/bytes/rows, adjacency and request limits stay unchanged.
+V2Observed long paths have at most 66 elements, including an edge start and its
+endpoint; clients and executor should be upgraded together. Local/v1 and legacy
+observed v1/v2 remain unchanged. See the
+[complete shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-native-repeat).

@@ -41,6 +41,8 @@ async fn empty_fixed_snapshot_validates_every_step_before_execution() {
         "g.E()",
         "g.V(1).outE().inV().path()",
         "g.V(1).id()",
+        "g.V(1).repeat(__.in()).emit().times(32).path()",
+        "g.E(1).bothV().repeat(__.out()).times(32).dedup().id()",
     ] {
         assert!(traverse(&g, &session, text).await.unwrap().is_empty());
     }
@@ -53,6 +55,15 @@ async fn empty_fixed_snapshot_validates_every_step_before_execution() {
         ("g.E(1).outE()", QueryFailure::Unsupported),
         ("g.V(1).values('x').out()", QueryFailure::Unsupported),
         ("g.V(1).id().out()", QueryFailure::Unsupported),
+        ("g.E(1).repeat(__.in()).times(1)", QueryFailure::Unsupported),
+        (
+            "g.V(1).values('x').repeat(__.in()).times(1)",
+            QueryFailure::Unsupported,
+        ),
+        (
+            "g.V(1).repeat(__.out()).times(32).out()",
+            QueryFailure::ResourceExhausted,
+        ),
     ] {
         assert_eq!(
             traverse(&g, &session, text).await,
@@ -638,4 +649,103 @@ fn forged_id_values_must_match_qualified_source() {
         };
         assert_eq!(synthetic(operation.clone(), reply), Err(Error::Identity));
     }
+}
+
+#[test]
+fn repeat_reply_validation_preserves_each_emitted_shape_and_canonical_owner() {
+    let session = synthetic_session();
+    let text = "g.V(1).out().repeat(__.in()).emit().times(2).out().path()";
+    let operation = Operation::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+    };
+    let reply = |rows| Reply::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+        data: QueryData {
+            rows,
+            completeness: QueryCompleteness::Unverified,
+        },
+    };
+    let vertex = |partition, id| Q::Vertex { partition, id };
+    let edge = |partition, id| Q::Edge { partition, id };
+    let short = vec![
+        vertex(7, 1),
+        edge(7, 10),
+        vertex(8, 2),
+        edge(7, 11),
+        vertex(7, 3),
+        edge(7, 12),
+        vertex(8, 4),
+    ];
+    let long = vec![
+        vertex(7, 1),
+        edge(7, 10),
+        vertex(8, 2),
+        edge(7, 11),
+        vertex(7, 3),
+        edge(8, 12),
+        vertex(8, 4),
+        edge(8, 13),
+        vertex(7, 5),
+    ];
+    let good = reply(vec![
+        QueryRow::Path(short.clone()),
+        QueryRow::Path(long.clone()),
+        QueryRow::Path(short.clone()),
+    ]);
+    assert_eq!(synthetic(operation.clone(), good.clone()).unwrap(), good);
+    for base in [short, long] {
+        for position in (1..base.len()).step_by(2) {
+            let mut bad = base.clone();
+            let Q::Edge { partition, .. } = &mut bad[position] else {
+                unreachable!()
+            };
+            *partition = if *partition == 7 { 8 } else { 7 };
+            assert_eq!(
+                synthetic(operation.clone(), reply(vec![QueryRow::Path(bad)])),
+                Err(Error::Identity)
+            );
+        }
+        for length in [0, base.len() - 1] {
+            assert_eq!(
+                synthetic(
+                    operation.clone(),
+                    reply(vec![QueryRow::Path(base[..length].to_vec())])
+                ),
+                Err(Error::Identity)
+            );
+        }
+    }
+    // Repeat expands after a prefix limit; only a suffix limit bounds its output.
+    for (text, total, expected) in [
+        ("g.V(1).limit(1).repeat(__.out()).times(2)", 10_000, true),
+        ("g.V(1).repeat(__.out()).times(2).limit(1)", 2, false),
+        ("g.V(1).repeat(__.out()).times(2)", 101, false),
+        ("g.V(1).repeat(__.out()).times(2).count()", 1, true),
+    ] {
+        assert_eq!(
+            super::query::valid_traversal_total(&query(7, text), total),
+            expected
+        );
+    }
+    let text = "g.E(10).inV().repeat(__.out()).times(32).path()";
+    let mut elements = vec![edge(7, 10), vertex(8, 1)];
+    for id in 0..32 {
+        elements.extend([edge(8, id), vertex(8, id + 2)]);
+    }
+    assert_eq!(elements.len(), 66);
+    let operation = Operation::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+    };
+    let reply = Reply::Traverse {
+        session: session.clone(),
+        query: query(7, text),
+        data: QueryData {
+            rows: vec![QueryRow::Path(elements)],
+            completeness: QueryCompleteness::Unverified,
+        },
+    };
+    assert_eq!(synthetic(operation, reply.clone()).unwrap(), reply);
 }

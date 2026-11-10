@@ -395,17 +395,19 @@ The official anonymous-traversal forms `__.out('reports')` and `out('reports')`
   (`as`) and `by` modulators remain unsupported. A missing or non-adjacent
   `times` is rejected rather than executed as an unbounded traversal.
 - Ordinary adjacency outside the repeat retains the independent three-step
-  parser bound. The server coordinator additionally validates the combined
-  repeated and ordinary depth against 32 before acquiring sessions.
+  parser bound. Supporting executors additionally validate the combined
+  repeated and ordinary depth against 32 before reading graph data.
 - The same 64-mark/16-KiB admission and terminal `path`/`count` rules apply.
   Stream-type validation remains an executor responsibility, including empty
   scalar/edge streams. The server accepts repeat for explicit V starts and global V scan prefixes
   under the bounded composition contract; hierarchy jobs still require explicit roots.
 
-This is a server-coordinated experimental capability, not an extension of v0
-or the client-side observed executor. The legacy `GremlinStep` enum and
-`GremlinQuery::parse` remain unchanged and reject repeat. The client-side
-`observed_gremlin_v3` validator explicitly rejects this additive AST step.
+This is an experimental capability, not an extension of v0. The legacy
+`GremlinStep` enum and `GremlinQuery::parse` remain unchanged and reject repeat.
+Shared routing-v3, single-partition V2Observed server and managed Traverse/Page
+also execute this bounded AST under their original read-provider envelopes; see
+[the fixed-version contract](MANAGED_FIXED_TRAVERSALS.md#bounded-native-repeat).
+Legacy observed v1/v2 and the original managed Read still reject repeat.
 All executions retain their existing cumulative resource bounds and
 Unverified completeness; this does not implement general Gremlin loops.
 
@@ -527,7 +529,15 @@ v3 semantics. `id()` emits Integer(i64) with qualified vertex/edge provenance;
 only dedup/limit/count may follow. IDs above i64::MAX fail with UnsupportedGremlinValue
 (mapped to Unsupported by the managed gateway), without wrapping or partial rows.
 A later limit/count cannot hide overflow; an earlier limit restricts the input
-at its original position. Repeat/valueMap and other unsupported steps reject.
+at its original position. ValueMap and other unsupported steps reject.
+One native single-out/in repeat with times(1..32) and optional post-body emit is
+supported on vertex streams. Combined ordinary and repeated depth is at most 32;
+exact-depth frontiers or increasing-depth emitted bags retain qualified paths,
+cycles and duplicate inputs under unchanged cumulative work/row/byte limits.
+Admission rejects repeat on scalar/edge streams before even empty input.
+Every round and retained emitted path is charged before allocation; a later
+limit/dedup/count cannot hide prior errors. Client path validation handles each
+emitted depth and the full direction-specific canonical-edge ownership suffix.
 Standard no-argument dedup is supported on vertex and edge streams, preserving
 the first qualified identity, path and order. After values/label/id, scalar dedup
 compares strict typed Values, preserving the first value and source. Null equals
