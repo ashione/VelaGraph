@@ -105,6 +105,8 @@ pub(super) fn steps(query: &GremlinQuery) -> Result<Vec<ScanStep>, QueryFailure>
             Step::ValueMap(keys) if index + 1 == query.steps().len() => {
                 projection::validate_keys(keys)?;
             }
+            Step::Existing(GremlinStep::Values(_))
+                if index + 1 == query.steps().len() && has_limit => {}
             Step::Existing(GremlinStep::Count) if index + 1 == query.steps().len() => count = true,
             _ => {
                 if let Some(converted) = scan_step(step)? {
@@ -246,7 +248,9 @@ impl Execution<'_> {
     }
     pub(super) async fn run_scan(&mut self, query: &GremlinQuery) -> DistributedResponse {
         let mut rows = self.scan_rows(query, None).await?;
-        if let Some(Step::ValueMap(keys)) = query.steps().last() {
+        if let Some(terminal @ (Step::ValueMap(_) | Step::Existing(GremlinStep::Values(_)))) =
+            query.steps().last()
+        {
             // Preserve the scan's fixed sessions and qualified ordering. The
             // retained IDs and projection buffers have separate logical charges.
             let mut traversers = Vec::new();
@@ -267,7 +271,21 @@ impl Execution<'_> {
                     &mut self.cost,
                 )?;
             }
-            rows = self.project_rows(&traversers, keys).await?;
+            rows = match terminal {
+                Step::ValueMap(keys) => self.project_rows(&traversers, keys).await?,
+                Step::Existing(GremlinStep::Values(key)) => self
+                    .values(traversers, key)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(QueryRow::Value {
+                            source: Some(row.vertex.element()),
+                            value: row.value.ok_or(QueryFailure::IncompleteOrCorrupt)?,
+                        })
+                    })
+                    .collect::<Result<_, QueryFailure>>()?,
+                _ => unreachable!(),
+            };
         }
         let output = DistributedOutput {
             completeness: QueryCompleteness::Unverified,
@@ -430,6 +448,7 @@ mod tests {
             "g.V().dedup().count()",
             "g.V().dedup().has('x').limit(2).valueMap('x')",
             "g.V().valueMap('x')",
+            "g.V().limit(129).has('x').dedup().limit(3).values('x')",
             "g.V().limit(9).has('x').limit(3).count()",
         ] {
             let q = GremlinQuery::parse(text).unwrap();
@@ -440,6 +459,11 @@ mod tests {
             "g.V().out()",
             "g.V().in()",
             "g.V().values('x')",
+            "g.V().hasLabel('missing').values('x')",
+            "g.V().values('x').limit(1)",
+            "g.V().limit(1).values('x').count()",
+            "g.V().limit(1).values('x').dedup()",
+            "g.V().limit(1).values('x','y')",
             "g.V().path()",
             "g.V().valueMap()",
             "g.V().valueMap('x','x')",
@@ -547,5 +571,81 @@ mod tests {
             properties: BTreeMap::from([("unrequested".into(), vec![Value::Null])]),
         }];
         assert!(validate_output(&result, &request).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scalar_scan_tests {
+    use super::*;
+    #[test]
+    fn scalar_scan_output_requires_ordered_qualified_sources_and_vertex_limit() {
+        let request = DistributedRequest {
+            start_partition: 1,
+            text: "g.V().limit(2).values('x')".into(),
+            timeout_millis: 5000,
+        };
+        let row = |partition| QueryRow::Value {
+            source: Some(VertexId { partition, id: 1 }.element()),
+            value: Value::Null,
+        };
+        let mut output = DistributedOutput {
+            completeness: QueryCompleteness::Unverified,
+            snapshots: vec![QueryStamp {
+                identity: RemoteIdentity { group: 1, node: 1 },
+                shard: 1,
+                epoch: 1,
+                sequence: 1,
+            }],
+            rows: vec![row(1), row(2)],
+        };
+        assert!(validate_output(&output, &request).is_ok());
+        for rows in [
+            vec![row(2), row(1)],
+            vec![row(1), row(1)],
+            vec![row(1), row(2), row(3)],
+            vec![QueryRow::Value {
+                source: None,
+                value: Value::Null,
+            }],
+            vec![QueryRow::Element(
+                VertexId {
+                    partition: 1,
+                    id: 1,
+                }
+                .element(),
+            )],
+            vec![QueryRow::Value {
+                source: Some(
+                    VertexId {
+                        partition: 1,
+                        id: 1,
+                    }
+                    .element(),
+                ),
+                value: Value::Real(f64::NAN),
+            }],
+        ] {
+            output.rows = rows;
+            assert!(validate_output(&output, &request).is_err());
+        }
+        output.rows.clear();
+        assert!(validate_output(&output, &request).is_ok());
+        assert_eq!(
+            plan(&DistributedRequest {
+                text: "g.V().limit(1001).values('x')".into(),
+                ..request
+            })
+            .unwrap_err(),
+            QueryFailure::InvalidArgument
+        );
+        assert_eq!(
+            plan(&DistributedRequest {
+                start_partition: 1,
+                timeout_millis: 5000,
+                text: "g.V().limit(0).values('x')".into()
+            })
+            .unwrap_err(),
+            QueryFailure::InvalidArgument
+        );
     }
 }

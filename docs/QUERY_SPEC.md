@@ -367,8 +367,9 @@ and traversal budgets on the same sessions. Joined results have no implicit
 100-row truncation. Global E/path remain Unsupported. Terminal single-key values after at least one
 out/in/repeat is supported: absent properties emit no row, present Null emits Null,
 and ordered bag multiplicity plus qualified source identity are preserved. Limits
-remain at their original vertex-stream position. No-hop values and all scalar
-post-processing on this global composition remain Unsupported. No-hop map/dedup follow the server global scan contract below. One bounded
+remain at their original vertex-stream position. Scan-only terminal values now
+requires a preceding explicit vertex limit (see SERVER_GLOBAL_SCAN.md); no-limit
+scan values and all scalar post-processing remain Unsupported. No-hop map/dedup follow the server global scan contract below. One bounded
 repeat is now admitted after the global scan prefix with the same combined
 32-depth check and cumulative traversal budget.
 
@@ -555,3 +556,10 @@ its ordered roots exactly and limits keep their positions. This does not dedup
 subsequent traversers: parallel edges, convergence and repeat emission preserve
 bag multiplicity unless a separate downstream dedup is explicitly present.
 No extra scan, budget, refresh or default truncation is introduced.
+
+Scan-only terminal `values(key)` requires an explicit preceding vertex `limit`
+(1..1000); filter/dedup/limit positions remain unchanged. Missing properties emit
+no row without refilling the vertex limit, present Null emits Null, and equal
+values retain separate qualified source rows in scan order. No-limit values,
+multi-key values and scalar post-processing are rejected before execution.
+The existing fixed-session scan and traversal budgets apply independently.
