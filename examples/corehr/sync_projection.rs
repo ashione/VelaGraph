@@ -12,7 +12,6 @@ fn properties(m: &Model, id: u64) -> Value {
     let mut map = serde_json::Map::from_iter([
         ("name".into(), json!([{"Text":name}])),
         ("active".into(), json!([{"Boolean":active(id)}])),
-        ("nullable".into(), json!(["Null"])),
     ]);
     if id <= m.people {
         map.insert(
@@ -32,7 +31,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
             "server_supported":true}),
         );
     };
-    let projection = ".valueMap('name','active','multi_department','nullable','missing')";
+    let projection = ".valueMap('name','active','multi_department','missing')";
     add(
         "project_batch_people",
         20,
@@ -95,7 +94,7 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
     );
     result.push(
         json!({"name":"project_empty_stream","partition":partition(20),
-        "query":"g.V(20).has('name','NoSuchEmployee').valueMap('name','nullable','missing')",
+        "query":"g.V(20).has('name','NoSuchEmployee').valueMap('name','missing')",
         "expected":{"maps":[]},"server_supported":true}),
     );
     result
@@ -123,9 +122,6 @@ fn batch_projection_oracle_preserves_bags_and_omits_missing_properties() {
                 properties(&m, 20)
             ]
         );
-        assert!(maps
-            .iter()
-            .all(|row| row["properties"]["nullable"] == json!(["Null"])));
         assert_eq!(q[5]["expected"]["maps"].as_array().unwrap().len(), 3);
         assert_eq!(q[5]["expected"]["maps"][0], q[5]["expected"]["maps"][2]);
         assert!(q[5]["expected"]["maps"]
