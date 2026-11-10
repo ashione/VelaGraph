@@ -587,7 +587,7 @@ async fn independent_managed_processes_partial_commit_and_durable_recovery() -> 
 }
 async fn scenario() -> anyhow::Result<()> {
     let mut coordinator = Process::start(9).await?;
-    let a = Process::start(7).await?;
+    let mut a = Process::start(7).await?;
     let mut b = Process::start(8).await?;
     assert_eq!(
         BTreeSet::from([
@@ -1011,9 +1011,9 @@ async fn scenario() -> anyhow::Result<()> {
     // although all durable graph writes and their caller-supplied IDs survive.
     let reopened = Gateway::bind_remote(
         RemoteConfig {
-            coordinator: c_client,
+            coordinator: c_client.clone(),
             binding: binding(),
-            members: vec![a_client, b_client],
+            members: vec![a_client.clone(), b_client.clone()],
         },
         "127.0.0.1:0".parse()?,
         BUDGET,
@@ -1064,8 +1064,192 @@ async fn scenario() -> anyhow::Result<()> {
         },
     )
     .await?;
+    // Separate short phase: never lengthen the earlier TTL-tight retained
+    // fixture, and never replace its unrolled traversal assertions.
+    let (repeat_version, repeat_rows) = fixed_version_repeat_scenario(&reopened).await?;
     reopened.shutdown().await;
+    a.stop()?;
+    b.stop()?;
+    coordinator.stop()?;
+    a.reopen().await?;
+    b.reopen().await?;
+    coordinator.reopen().await?;
+    let recovered = Gateway::bind_remote(
+        RemoteConfig {
+            coordinator: c_client,
+            binding: binding(),
+            members: vec![a_client, b_client],
+        },
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
+    let historical = open(&recovered, Some(repeat_version)).await?;
+    assert_eq!(
+        traverse(&recovered, &historical, 7, REPEAT_PATH_QUERY).await?,
+        repeat_rows
+    );
+    let historical_page = page(&recovered, &historical, 7, REPEAT_PATH_QUERY, None, 3).await?;
+    assert_eq!(historical_page.total, 8);
+    assert_eq!(historical_page.data.rows, repeat_rows[..3]);
+    assert_eq!(
+        page(&recovered, &historical, 7, REPEAT_PATH_QUERY, None, 3).await?,
+        historical_page
+    );
+    call(
+        &recovered,
+        Operation::Close {
+            session: historical,
+        },
+    )
+    .await?;
+    recovered.shutdown().await;
     Ok(())
+}
+
+const REPEAT_PATH_QUERY: &str = "g.V(501).repeat(out()).times(2).emit().path()";
+
+/// Small independent fixture with an explicit ordered oracle. Its session
+/// lifetime and original query/result budgets are unchanged.
+async fn fixed_version_repeat_scenario(g: &Gateway) -> anyhow::Result<(u64, Vec<QueryRow>)> {
+    for write in [
+        person_write(60, 7, 501, "repeat_person", "A"),
+        person_write(61, 8, 501, "repeat_person", "B"),
+        relation_write(62, 501, (7, 501), (8, 501), "repeat"),
+        relation_write(63, 502, (7, 501), (8, 501), "repeat"),
+        relation_write(64, 501, (8, 501), (7, 501), "repeat"),
+        relation_write(65, 503, (7, 501), (7, 501), "single"),
+    ] {
+        committed(call(g, Operation::Submit(write)).await?);
+    }
+    let a = element(7, 501);
+    let b = element(8, 501);
+    let ab = QualifiedElement::Edge {
+        partition: 7,
+        id: 501,
+    };
+    let parallel = QualifiedElement::Edge {
+        partition: 7,
+        id: 502,
+    };
+    let ba = QualifiedElement::Edge {
+        partition: 8,
+        id: 501,
+    };
+    let aa = QualifiedElement::Edge {
+        partition: 7,
+        id: 503,
+    };
+    // Three first-level rows followed by five second-level rows. Equal vertex
+    // IDs do not collapse partitions, parallel paths, or cyclic/self paths.
+    let paths = vec![
+        vec![a, ab, b],
+        vec![a, parallel, b],
+        vec![a, aa, a],
+        vec![a, ab, b, ba, a],
+        vec![a, parallel, b, ba, a],
+        vec![a, aa, a, ab, b],
+        vec![a, aa, a, parallel, b],
+        vec![a, aa, a, aa, a],
+    ]
+    .into_iter()
+    .map(QueryRow::Path)
+    .collect::<Vec<_>>();
+    let old = open(g, None).await?;
+    let version = old.version;
+    assert_eq!(
+        traverse(g, &old, 7, "g.V(501).repeat(out()).times(2).path()").await?,
+        paths[3..]
+    );
+    assert_eq!(
+        traverse(
+            g,
+            &old,
+            7,
+            "g.V(501).repeat(in('repeat')).times(1).out('repeat').count()"
+        )
+        .await?,
+        vec![QueryRow::Count(1)]
+    );
+    assert_eq!(
+        traverse(
+            g,
+            &old,
+            7,
+            "g.E(501).inV().repeat(out('repeat')).times(2).id().dedup()"
+        )
+        .await?,
+        vec![QueryRow::Value {
+            source: Some(b),
+            value: Value::Integer(501)
+        }]
+    );
+    let mut longest = vec![aa, a];
+    for _ in 0..32 {
+        longest.extend([aa, a]);
+    }
+    assert_eq!(
+        traverse(
+            g,
+            &old,
+            7,
+            "g.E(503).inV().repeat(out('single')).times(32).path()"
+        )
+        .await?,
+        vec![QueryRow::Path(longest)]
+    );
+    assert!(
+        read(g, &old, 7, "g.V(501).repeat(out()).times(1)")
+            .await
+            .is_err(),
+        "original managed Read must stay unchanged"
+    );
+    let first = page(g, &old, 7, REPEAT_PATH_QUERY, None, 3).await?;
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.total, paths.len() as u32);
+    assert_eq!(first.data.rows, paths[..3]);
+    let delete = Write {
+        external_id: [66; 16],
+        mutation: Mutation::DeleteEdge {
+            edge: Entity {
+                partition: 7,
+                id: 502,
+            },
+        },
+    };
+    let (written, observed) = tokio::join!(
+        call(g, Operation::Submit(delete)),
+        traverse(g, &old, 7, REPEAT_PATH_QUERY),
+    );
+    let (_, latest_version) = committed(written?);
+    assert!(latest_version > version);
+    assert_eq!(observed?, paths);
+    assert_eq!(page(g, &old, 7, REPEAT_PATH_QUERY, None, 3).await?, first);
+    let mut cursor = first.next;
+    let mut collected = first.data.rows;
+    // Exactly two remaining pages. No open-ended pagination loop.
+    for offset in [3, 6] {
+        let token = cursor.take().context("repeat continuation")?;
+        let next = page(g, &old, 7, REPEAT_PATH_QUERY, Some(token.clone()), 3).await?;
+        assert_eq!(next.offset, offset);
+        assert_eq!(next.total, 8);
+        assert_eq!(
+            next,
+            page(g, &old, 7, REPEAT_PATH_QUERY, Some(token), 3).await?
+        );
+        collected.extend(next.data.rows);
+        cursor = next.next;
+    }
+    assert!(cursor.is_none());
+    assert_eq!(collected, paths);
+    call(g, Operation::Close { session: old }).await?;
+    let fresh = open(g, None).await?;
+    assert_eq!(
+        traverse(g, &fresh, 7, "g.V(501).repeat(out()).times(2).count()").await?,
+        vec![QueryRow::Count(3)]
+    );
+    call(g, Operation::Close { session: fresh }).await?;
+    Ok((version, paths))
 }
 
 async fn traverse(
@@ -1516,7 +1700,7 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
         "g.V(999).dedup('a')",
         "g.V(999).dedup().by('name')",
         "g.V(101).valueMap('name')",
-        "g.V(101).repeat(out()).times(2)",
+        "g.V(101).repeat(both()).times(2)",
         "g.V(101).out().out().out().out()",
     ] {
         assert!(

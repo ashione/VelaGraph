@@ -53,7 +53,7 @@ pub const MAX_GREMLIN_ACCOUNTED_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum adjacency steps in one query: `out`/`in`/`both` and, for
 /// observed queries, `outE`/`inE`/`bothE` combined.
 pub const MAX_GREMLIN_EDGE_STEPS: usize = 3;
-/// Maximum iterations of one bounded server-coordinated observed `repeat`.
+/// Maximum iterations of one bounded experimental `repeat`.
 /// Ordinary adjacency steps outside the repeat retain their separate three-step cap.
 pub const MAX_OBSERVED_GREMLIN_REPEAT_TIMES: usize = 32;
 /// Maximum rows materialized before an explicit `limit` is reached.
@@ -149,7 +149,7 @@ pub enum ObservedGremlinStep {
     /// Selected vertex properties; executed only by prepared hierarchy result jobs.
     ValueMap(Vec<String>),
     /// One incoming/outgoing vertex adjacency repeated a bounded number of times.
-    /// `emit` is post-body only. Executed only by the server coordinator.
+    /// `emit` is post-body only. Each executor admits its own subset.
     Repeat {
         incoming: bool,
         label: Option<String>,
@@ -176,7 +176,7 @@ pub struct ObservedGremlinQuery {
 impl ObservedGremlinQuery {
     /// Parse the v0 subset plus observed edge/endpoint, dedup and bounded repeat steps.
     /// Ordinary adjacency steps share a maximum of three. One repeat has a separate
-    /// 32-iteration bound; server execution also bounds the combined depth. All
+    /// 32-iteration bound; supporting executors also bound the combined depth. All
     /// steps share structural admission. `path`, `count` and `valueMap` must be terminal.
     pub fn parse(input: &str) -> Result<Self> {
         parse_validated_query(input, true)

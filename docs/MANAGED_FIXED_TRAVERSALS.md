@@ -43,7 +43,7 @@ The external query is ordinary Gremlin text plus partition routing context:
   place. Count runs before the implicit default result cap.
 - With no explicit limit, non-count results have the existing default cap of
   100. Explicit limits are 1..=1000. Internal caps never produce partial success.
-- Repeat, valueMap, mutations, and unsupported compositions reject
+- ValueMap, mutations, and unsupported compositions reject
   before data reads, including empty streams. The original smaller `Read` API,
   including its id projection, is unchanged. This is not a second query dialect.
 
@@ -91,7 +91,8 @@ were received, even though the query had already completed.
 ## Bounds and reservations
 
 Existing parser limits remain 16 KiB and 64 structural marks. Shared traversal
-allows at most three edge steps, 10,000 intermediate rows, 10,000 work units and
+allows at most three ordinary edge steps plus one bounded repeat, with combined
+depth at most 32, 10,000 intermediate rows, 10,000 work units and
 64 MiB cumulative logical work. Adjacency is all-or-error at the existing
 1,000-entry/1 MiB per-direction primitive bounds. Snapshot acquisition retains
 its existing 10,000 rows, 2 MiB copied payload and 100,000 replay-operation caps.
@@ -252,3 +253,49 @@ reopen, not snapshot installation, purge safety, partial-apply fault injection
 or full-scale capacity. Existing separate tests retain their fault/recovery
 coverage. This small same-host semantic test does not complete #110/#111 or
 change any production resource limit, deadline or supported query shape.
+
+
+## Bounded native repeat
+
+Shared routing-v3, single-partition V2Observed server queries and managed
+Traverse/TraversePage accept the existing official bounded repeat AST:
+`repeat(__.out(label)).times(n)` or incoming `in`, with an optional label and
+`n` in 1..32. Unqualified anonymous `out`/`in` forms also work. Optional
+unconditional post-body `emit()` may precede or follow `times(n)`.
+No query text is rewritten and no client-side per-hop request loop is used.
+
+The repeat requires a vertex stream, including a stream produced by edge
+endpoint steps. Whole-AST admission rejects scalar/edge input even when empty.
+Ordinary out/in/both and outE/inE/bothE retain their combined three-step parser
+cap. Ordinary adjacency plus repeat iterations must total at most 32. Endpoint
+steps do not traverse a second edge. Thus an edge start followed by an endpoint
+and 32 repeated hops may produce a 66-element qualified path.
+
+Without emit, only the exact final frontier survives; dead ends contribute
+nothing. With emit, frontiers at depths 1 through n are concatenated in increasing
+depth order, each in input order and then `(edge ID, source partition)` order.
+The original starts are not emitted, and the terminal frontier is emitted once.
+Parallel edges, repeated starts, convergence, self-loops and cycles remain bags
+of paths. There is no implicit visited set or simple-path filtering. Subsequent
+filters, limits, element/scalar dedup, projections, path and count keep their
+existing positional semantics. Dedup retains the first emitted path/source.
+
+Every expansion reuses the original read provider and fixed snapshot. Each round
+consumes work, adjacency and edge visits use the existing charges, and each
+retained expansion/emission row is charged before its growing path is cloned.
+Emission and frontier retention share the cumulative 64 MiB logical-byte budget;
+work is never reset between rounds. The 10,000-work/row caps, default result cap,
+adjacency primitive bounds, request deadline, session TTL and complete-result
+frame/page limits are unchanged. A later limit, dedup or count cannot suppress
+an earlier integrity, expiry or budget failure, including after earlier depths
+have emitted rows. Paging still materializes and admits the complete result
+before the first page; no continuation acquires another version.
+
+Nested/multiple repeats, unbounded or conditional termination, times(0),
+pre-body emit, repeat-body both/edge steps, multi-step bodies, scoped/named loops,
+modulators and valueMap remain unsupported. Older executors reject the new
+composition; upgrade the executor and its client together for long paths.
+No wire/disk variant or persistent format changes. The original managed Read,
+local/v1 and legacy observed v1/v2 APIs retain their previous rejection boundary.
+This is a generic semantic addition under #155/#110, not a data-local fixed-V
+query engine, capacity expansion, full managed CoreHR or multi-host HA result.

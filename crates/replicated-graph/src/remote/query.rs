@@ -118,6 +118,7 @@ pub async fn query(
     let end = checked_deadline(deadline, None)?;
     request.validate()?;
     let expected = (request.shard, request.partition, request.mode);
+    let repeated_path = admits_repeated_path(&request);
     match rpc(
         endpoint,
         identity,
@@ -129,7 +130,7 @@ pub async fn query(
     {
         Reply::Query(response) => {
             if let Ok(output) = &response {
-                validate_output(output, expected, identity, end)?;
+                validate_output(output, expected, identity, repeated_path, end)?;
             }
             if Instant::now() >= end {
                 return Err(RemoteError::Timeout { request_id: None });
@@ -140,10 +141,25 @@ pub async fn query(
     }
 }
 
+fn admits_repeated_path(request: &QueryRequest) -> bool {
+    if request.mode != QueryMode::V2Observed {
+        return false;
+    }
+    let Ok(parsed) = rocksdb_sql_table::ObservedGremlinQuery::parse(&request.text) else {
+        return false;
+    };
+    crate::routing::experimental::validate_traversal(&parsed).is_ok()
+        && parsed
+            .steps()
+            .iter()
+            .any(|step| matches!(step, rocksdb_sql_table::ObservedGremlinStep::Repeat { .. }))
+}
+
 fn validate_output(
     output: &QueryOutput,
     expected: (u64, u32, QueryMode),
     identity: Option<RemoteIdentity>,
+    repeated_path: bool,
     end: Instant,
 ) -> Result<(), RemoteError> {
     if (output.snapshot.shard, output.partition, output.mode) != expected
@@ -170,7 +186,13 @@ fn validate_output(
         let valid = match row {
             QueryRow::Element(e) => valid_element(e),
             QueryRow::Path(path) => {
-                !path.is_empty() && path.len() <= 33 && path.iter().all(valid_element)
+                let maximum = if output.mode == QueryMode::V2Observed && repeated_path {
+                    // 32 expanded edges plus an optional edge-start endpoint.
+                    2 * rocksdb_sql_table::MAX_OBSERVED_GREMLIN_REPEAT_TIMES + 2
+                } else {
+                    33
+                };
+                !path.is_empty() && path.len() <= maximum && path.iter().all(valid_element)
             }
             QueryRow::Count(_) => true,
             QueryRow::PropertyMap { .. } => false,
@@ -529,6 +551,7 @@ mod tests {
                 out,
                 (7, 10, QueryMode::V2Observed),
                 Some(good.snapshot.identity),
+                false,
                 end,
             )
         };
@@ -563,6 +586,75 @@ mod tests {
         }
     }
     #[test]
+    fn long_path_admission_is_specific_to_supported_repeat_requests() {
+        for mode in [QueryMode::V1, QueryMode::V2Observed] {
+            for (text, supported) in [
+                ("g.V(1).out().path()", false),
+                ("g.V(1).repeat(out()).times(32).path()", true),
+                ("g.E(1).inV().repeat(in()).emit().times(32).path()", true),
+                ("g.E(1).repeat(out()).times(32).path()", false),
+                ("g.V(1).repeat(out()).times(32).out().path()", false),
+                ("g.V(1).repeat(both()).times(1).path()", false),
+            ] {
+                let request = QueryRequest {
+                    shard: 7,
+                    partition: 10,
+                    mode,
+                    text: text.into(),
+                    timeout_millis: 1000,
+                };
+                assert_eq!(
+                    admits_repeated_path(&request),
+                    mode == QueryMode::V2Observed && supported,
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observed_long_paths_keep_scope_and_mode_specific_envelope() {
+        let mut out = output();
+        let end = Instant::now() + MAX_QUERY_DEADLINE;
+        for (mode, repeated_path, maximum) in [
+            (QueryMode::V1, false, 33),
+            (QueryMode::V2Observed, false, 33),
+            (QueryMode::V2Observed, true, 66),
+        ] {
+            out.mode = mode;
+            out.completeness = if mode == QueryMode::V1 {
+                QueryCompleteness::SinglePartition
+            } else {
+                QueryCompleteness::Unverified
+            };
+            for length in [maximum, maximum + 1] {
+                out.rows = vec![QueryRow::Path(vec![
+                    QualifiedElement::Vertex {
+                        partition: 10,
+                        id: 1
+                    };
+                    length
+                ])];
+                assert_eq!(
+                    validate_output(&out, (7, 10, mode), None, repeated_path, end).is_ok(),
+                    length == maximum
+                );
+            }
+            out.rows = vec![QueryRow::Path(vec![
+                QualifiedElement::Vertex {
+                    partition: 11,
+                    id: 1
+                };
+                maximum
+            ])];
+            assert!(matches!(
+                validate_output(&out, (7, 10, mode), None, repeated_path, end),
+                Err(RemoteError::Protocol)
+            ));
+        }
+    }
+
+    #[test]
     fn response_encoding_and_deadline_are_bounded() {
         use std::io::Write;
         let mut writer = QueryWriter(Vec::new(), Instant::now() + MAX_QUERY_DEADLINE);
@@ -586,6 +678,7 @@ mod tests {
                 &out,
                 (7, 10, QueryMode::V2Observed),
                 None,
+                false,
                 Instant::now() + MAX_QUERY_DEADLINE
             ),
             Err(RemoteError::ResourceExhausted)

@@ -6,7 +6,7 @@ use replicated_graph::{
         experimental::{
             AdjacencyCompleteness, EdgeMutationKind, ExperimentalReadSession,
             ExperimentalRouteError, MutationAcknowledgement, ObservedPathElement, ObservedRow,
-            ObservedRowV2, Stage, StageOutcome,
+            ObservedRowV2, ObservedRowV3, Stage, StageOutcome,
         },
         RemoteReplica, RouteError, RouteResolver,
     },
@@ -272,6 +272,118 @@ async fn scenario() -> anyhow::Result<()> {
         let vr = |partition| VertexRef { partition, id: 7 };
         let v = |p| ObservedPathElement::Vertex(vr(p));
         let e = |partition, id| ObservedPathElement::Edge(EdgeRef { partition, id });
+        // Independent explicit oracle: parallel edges 9/10, a cross-shard
+        // cycle, and self-loop 12. Emission is level-major, never DFS order.
+        let first_level = vec![
+            vec![v(1), e(1, 9), v(2)],
+            vec![v(1), e(1, 10), v(2)],
+            vec![v(1), e(1, 11), v(3)],
+            vec![v(1), e(1, 12), v(1)],
+        ];
+        let second_level = vec![
+            vec![v(1), e(1, 9), v(2), e(2, 9), v(1)],
+            vec![v(1), e(1, 10), v(2), e(2, 9), v(1)],
+            vec![v(1), e(1, 12), v(1), e(1, 9), v(2)],
+            vec![v(1), e(1, 12), v(1), e(1, 10), v(2)],
+            vec![v(1), e(1, 12), v(1), e(1, 11), v(3)],
+            vec![v(1), e(1, 12), v(1), e(1, 12), v(1)],
+        ];
+        for (text, expected) in [
+            (
+                "g.V(7).repeat(out('K')).times(2).path()",
+                second_level.clone(),
+            ),
+            (
+                "g.V(7).repeat(out('K')).times(2).emit().path()",
+                [first_level.clone(), second_level.clone()].concat(),
+            ),
+            (
+                "g.V(7,7).repeat(out('K')).emit().times(2).path()",
+                [
+                    first_level.clone(),
+                    first_level,
+                    second_level.clone(),
+                    second_level,
+                ]
+                .concat(),
+            ),
+        ] {
+            let result = session.observed_gremlin_v3(1, text)?;
+            assert_eq!(
+                result.rows,
+                expected
+                    .into_iter()
+                    .map(ObservedRowV3::Path)
+                    .collect::<Vec<_>>(),
+                "{text}"
+            );
+            assert_eq!(result.snapshots, session.snapshots);
+            assert_eq!(result.metadata_sequence, session.metadata_sequence);
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+        }
+        for (text, partitions) in [
+            ("g.V(7).repeat(in('K')).times(2)", vec![1, 1, 2, 1]),
+            (
+                "g.V(7).out('K').repeat(in('K')).times(1)",
+                vec![1, 1, 1, 1, 1, 2, 1],
+            ),
+            (
+                "g.V(7).repeat(in('K')).times(1).out('K')",
+                vec![1, 2, 2, 3, 1],
+            ),
+            (
+                "g.V(7).repeat(out('K')).times(2).emit().dedup()",
+                vec![2, 3, 1],
+            ),
+            (
+                "g.V(7).repeat(out('K')).times(2).emit().hasLabel('P2').limit(3)",
+                vec![2, 2, 2],
+            ),
+            ("g.E(9).inV().repeat(out('K')).times(2)", vec![2, 2, 3, 1]),
+            ("g.V(999).repeat(out()).times(32)", vec![]),
+        ] {
+            assert_eq!(
+                session.observed_gremlin_v3(1, text)?.rows,
+                partitions
+                    .into_iter()
+                    .map(|p| ObservedRowV3::Vertex(vr(p)))
+                    .collect::<Vec<_>>(),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            session
+                .observed_gremlin_v3(
+                    1,
+                    "g.V(7).repeat(out('K')).times(2).emit().id().dedup().count()"
+                )?
+                .rows,
+            vec![ObservedRowV3::Count(1)]
+        );
+        assert_eq!(
+            session
+                .observed_gremlin_v3(1, "g.V(7).repeat(out('absent')).times(32).emit().count()")?
+                .rows,
+            vec![ObservedRowV3::Count(0)]
+        );
+        for text in [
+            "g.E(999).repeat(out()).times(1)",
+            "g.V(999).values('missing').repeat(out()).times(1)",
+            "g.V(999).repeat(both()).times(1)",
+            "g.V(999).repeat(out().out()).times(1)",
+            "g.V(999).repeat(out()).times(32).out()",
+            "g.V(999).out().repeat(in()).times(32)",
+            "g.V(999).repeat(out()).times(33)",
+        ] {
+            assert!(
+                session.observed_gremlin_v3(1, text).is_err(),
+                "accepted {text}"
+            );
+        }
+        // New admission is confined to v3, not the legacy observed APIs.
+        let repeat = "g.V(7).repeat(out('K')).times(2)";
+        assert!(session.observed_gremlin(1, repeat).is_err());
+        assert!(session.observed_gremlin_v2(1, repeat).is_err());
         // Global starts ignore even an unregistered start partition, include
         // partitions sharing a shard, and sort by (local ID, partition).
         let global = session.observed_gremlin(999, "g.V()")?;
@@ -613,6 +725,21 @@ async fn scenario() -> anyhow::Result<()> {
                 Direction::Out
             )
             .is_err());
+        for suffix in [".count()", ".dedup().limit(1)", ".has('missing').count()"] {
+            let text = format!("g.V(7).repeat(out('K')).times(2){suffix}");
+            assert!(matches!(
+                current.observed_gremlin_v3(1, &text),
+                Err(ExperimentalRouteError::Graph(
+                    ExperimentalError::Incomplete(_)
+                ))
+            ));
+        }
+        assert_eq!(
+            session
+                .observed_gremlin_v3(1, "g.V(7).repeat(out('K')).times(2).count()")?
+                .rows,
+            vec![ObservedRowV3::Count(6)]
+        );
         // Unknown completeness propagates even into scalar counts; visible
         // incompleteness is an error, not a partial vector or zero count.
         let observed = current.observed_gremlin(2, "g.V(7).in().count()")?;
@@ -638,6 +765,36 @@ async fn scenario() -> anyhow::Result<()> {
         ));
         let unknown_source = current.prepare_edge(&edge(30, 2, 1))?;
         let unknown_reverse = current.prepare_edge(&edge(31, 1, 2))?;
+        // Run new expensive resource probes only after every pre-existing
+        // retained-view assertion. Their work must not consume those leases.
+        // One full-width resource case is sufficient at this transport layer;
+        // deterministic unit tests separately cover all round/emission charges.
+        {
+            let text = "g.V(7).repeat(out('K')).times(32).dedup().limit(1)";
+            assert!(
+                matches!(
+                    session.observed_gremlin_v3(1, text),
+                    Err(ExperimentalRouteError::Query(
+                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                    ))
+                ),
+                "{text}"
+            );
+        }
+        let byte_heavy = format!(
+            "g.V({}).has('blob').repeat(out('absent')).times(1).count()",
+            vec!["99"; 48].join(",")
+        );
+        let result = session.observed_gremlin_v3(1, &byte_heavy);
+        assert!(
+            matches!(
+                &result,
+                Err(ExperimentalRouteError::Query(
+                    rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                ))
+            ),
+            "{result:?}"
+        );
         Ok((resolver, unknown_source, unknown_reverse))
     })
     .await??;

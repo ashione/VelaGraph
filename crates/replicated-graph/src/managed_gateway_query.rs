@@ -526,6 +526,16 @@ fn traversal_maximum(query: &ObservedGremlinQuery) -> usize {
     let mut maximum = if ids.is_empty() { 10_000 } else { ids.len() };
     for step in query.steps() {
         let factor = match step {
+            Step::Repeat { times, emit, .. } => {
+                let mut frontier = maximum;
+                let mut emitted = 0usize;
+                for _ in 0..*times {
+                    frontier = frontier.saturating_mul(1000).min(10_000);
+                    emitted = emitted.saturating_add(frontier).min(10_000);
+                }
+                maximum = if *emit { emitted } else { frontier };
+                1
+            }
             Step::BothE(_) | Step::Existing(GremlinStep::Both(_)) => 2000,
             Step::OutE(_)
             | Step::InE(_)
@@ -566,6 +576,22 @@ pub(super) fn valid_traversal_total(query: &Query, total: u32) -> bool {
             maximum.min(DEFAULT_GREMLIN_LIMIT)
         }
 }
+// At most 32 variants, one per post-emit depth. Each variant retains exact
+// element kinds and source-ownership constraints through the complete suffix.
+#[derive(Clone)]
+struct TraversalPathShape {
+    elements: Vec<bool>,
+    owners: Vec<(usize, Vec<usize>)>,
+}
+impl TraversalPathShape {
+    fn adjacency(&mut self, incoming: bool) {
+        let n = self.elements.len();
+        self.owners
+            .push((n, vec![if incoming { n + 1 } else { n - 1 }]));
+        self.elements.extend([true, false]);
+    }
+}
+
 /// Checks shapes/provenance in whole results or page slices. Bag duplicates are
 /// legal; this cannot authenticate a trusted peer or prove graph completeness.
 pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &Binding) -> bool {
@@ -590,8 +616,10 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
         GremlinStart::Vertices(ids) => (false, ids),
         GremlinStart::Edges(ids) => (true, ids),
     };
-    let mut shape = vec![edge];
-    let mut owners: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut shapes = vec![TraversalPathShape {
+        elements: vec![edge],
+        owners: Vec::new(),
+    }];
     let mut scalar = false;
     let mut label = false;
     let mut id_projection = false;
@@ -600,27 +628,56 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
     for step in parsed.steps() {
         match step {
             Step::OutE(_) | Step::InE(_) | Step::BothE(_) => {
-                if matches!(step, Step::OutE(_)) {
-                    owners.push((shape.len(), vec![shape.len() - 1]));
+                for shape in &mut shapes {
+                    if matches!(step, Step::OutE(_)) {
+                        shape
+                            .owners
+                            .push((shape.elements.len(), vec![shape.elements.len() - 1]));
+                    }
+                    shape.elements.push(true);
                 }
                 edge = true;
-                shape.push(true);
             }
             Step::InV | Step::OutV | Step::BothV => {
-                if matches!(step, Step::OutV) {
-                    owners.push((shape.len() - 1, vec![shape.len()]));
+                for shape in &mut shapes {
+                    if matches!(step, Step::OutV) {
+                        shape
+                            .owners
+                            .push((shape.elements.len() - 1, vec![shape.elements.len()]));
+                    }
+                    shape.elements.push(false);
                 }
                 edge = false;
-                shape.push(false);
             }
             Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Both(_)) => {
-                let endpoints = match step {
-                    Step::Existing(GremlinStep::Out(_)) => vec![shape.len() - 1],
-                    Step::Existing(GremlinStep::In(_)) => vec![shape.len() + 1],
-                    _ => vec![shape.len() - 1, shape.len() + 1],
-                };
-                owners.push((shape.len(), endpoints));
-                shape.extend([true, false]);
+                for shape in &mut shapes {
+                    let n = shape.elements.len();
+                    let endpoints = match step {
+                        Step::Existing(GremlinStep::Out(_)) => vec![n - 1],
+                        Step::Existing(GremlinStep::In(_)) => vec![n + 1],
+                        _ => vec![n - 1, n + 1],
+                    };
+                    shape.owners.push((n, endpoints));
+                    shape.elements.extend([true, false]);
+                }
+            }
+            Step::Repeat {
+                incoming,
+                times,
+                emit,
+                ..
+            } => {
+                let mut expanded = Vec::new();
+                for mut shape in shapes {
+                    for depth in 1..=*times {
+                        shape.adjacency(*incoming);
+                        if *emit && depth != *times {
+                            expanded.push(shape.clone());
+                        }
+                    }
+                    expanded.push(shape);
+                }
+                shapes = expanded;
             }
             Step::Existing(GremlinStep::Values(_)) => scalar = true,
             Step::Existing(GremlinStep::Id) => {
@@ -660,14 +717,14 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
     };
     data.rows.iter().all(|row| match row {
         QueryRow::Element(e) if !scalar && !path => {
-            valid_element(e, edge) && (shape.len() != 1 || valid_start(e))
+            valid_element(e, edge) && (shapes[0].elements.len() != 1 || valid_start(e))
         }
         QueryRow::Value {
             source: Some(e),
             value,
         } if scalar => {
             valid_element(e, edge)
-                && (shape.len() != 1 || valid_start(e))
+                && (shapes[0].elements.len() != 1 || valid_start(e))
                 && !matches!(value, Value::Real(v) if !v.is_finite())
                 && (!label || matches!(value, Value::Text(_)))
                 && (!id_projection || {
@@ -680,16 +737,18 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
                 })
         }
         QueryRow::Path(elements) if path => {
-            elements.len() == shape.len()
-                && elements
-                    .iter()
-                    .zip(&shape)
-                    .all(|(e, edge)| valid_element(e, *edge))
-                && elements.first().is_some_and(valid_start)
-                && owners.iter().all(|(edge, vertices)| {
-                    vertices
-                        .iter()
-                        .any(|v| partition(&elements[*edge]) == partition(&elements[*v]))
+            elements.first().is_some_and(valid_start)
+                && shapes.iter().any(|shape| {
+                    elements.len() == shape.elements.len()
+                        && elements
+                            .iter()
+                            .zip(&shape.elements)
+                            .all(|(e, edge)| valid_element(e, *edge))
+                        && shape.owners.iter().all(|(edge, vertices)| {
+                            vertices
+                                .iter()
+                                .any(|v| partition(&elements[*edge]) == partition(&elements[*v]))
+                        })
                 })
         }
         _ => false,
