@@ -47,7 +47,9 @@ nonempty baselines or dynamic routing. Optional
 [submission phase timing](docs/MANAGED_SUBMISSION_TIMING.md) provides bounded,
 process-local diagnostics; it is disabled by default. The new managed-path
 validation uses small cross-process personnel graphs, not the full-scale CoreHR
-fixture.
+fixture. Managed writes also support [conditional vertex/edge property patches](docs/MANAGED_GRAPH_GATEWAY.md#conditional-property-patches): exact property expectations
+are protected by the original participant CAS and retained request identity.
+This does not increase managed capacity or enable arbitrary graph transactions.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.

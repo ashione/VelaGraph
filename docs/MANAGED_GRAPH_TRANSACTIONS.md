@@ -12,7 +12,10 @@ replicated_graph::managed_graph connects the existing graph/v2 codecs and
 validation to coordinator decisions, durable participant intents and certified
 cohort snapshots. It supports creating vertices and creating directed edges,
 including cross-shard edges, same-shard edges and self-loops. It also supports
-vertex property patches, edge property patches and edge deletion. Reads expose vertices,
+vertex property patches, edge property patches and edge deletion. The additive
+`prepare_vertex_properties_if` / `prepare_edge_properties_if` check bounded exact
+property expectations on that same snapshot and retain its original CAS/edge
+guards. See the [conditional write contract](MANAGED_GRAPH_GATEWAY.md#conditional-property-patches). Reads expose vertices,
 verified canonical edges and index-observed adjacency from one common version.
 Vertex deletion, cascade operations and endpoint/label changes remain unsupported.
 

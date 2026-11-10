@@ -19,6 +19,11 @@ use rocksdb_sql_table::{ReadView, StorageNodeError, Vertex, WriteOp};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+#[path = "managed_property_conditions.rs"]
+mod conditions;
+pub(crate) use conditions::validate as validate_property_conditions;
+pub use conditions::{PropertyCondition, PropertyConditions};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("cohort snapshot: {0:?}")]
@@ -35,6 +40,12 @@ pub enum Error {
     Application(D1Error),
     #[error("transaction plan exceeds limits")]
     Capacity,
+    #[error("invalid managed property conditions")]
+    InvalidConditions,
+    #[error(
+        "managed property precondition did not match; no candidate was admitted by this attempt"
+    )]
+    PreconditionFailed,
 }
 impl From<cohort_reads::Error> for Error {
     fn from(e: cohort_reads::Error) -> Self {
@@ -269,12 +280,49 @@ impl GraphSnapshot {
             .store(vertex.partition)?
             .prepare_vertex_properties(vertex, &current, patch)?])
     }
+    /// Check all conditions at this fixed V and retain its original shard CAS.
+    /// An intervening write rejects preparation/execution; never refresh this
+    /// candidate after admission, even if the properties become equal again.
+    pub fn prepare_vertex_properties_if(
+        &self,
+        vertex: VertexRef,
+        conditions: &PropertyConditions,
+        patch: &rocksdb_sql_table::experimental_graph::VertexPropertyPatch,
+    ) -> Result<Plan> {
+        conditions::validate(conditions)?;
+        let current = self
+            .vertex(vertex)?
+            .ok_or(ExperimentalError::MissingEndpoint(vertex))?;
+        conditions::check(conditions, &current.properties)?;
+        self.plan(vec![self
+            .store(vertex.partition)?
+            .prepare_vertex_properties(vertex, &current, patch)?])
+    }
     pub fn prepare_edge_properties(
         &self,
         edge: EdgeRef,
         patch: &rocksdb_sql_table::experimental_graph::EdgePropertyPatch,
     ) -> Result<Plan> {
         let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
+        let source = self
+            .store(edge.partition)?
+            .prepare_source_properties(&current, patch)?;
+        let guard = self
+            .store(current.to.partition)?
+            .prepare_reverse_guard(&current)?;
+        self.paired_plan(source, guard)
+    }
+    /// Conditional source-property update with the same source CAS and target
+    /// reverse guard as an unconditional managed edge property patch.
+    pub fn prepare_edge_properties_if(
+        &self,
+        edge: EdgeRef,
+        conditions: &PropertyConditions,
+        patch: &rocksdb_sql_table::experimental_graph::EdgePropertyPatch,
+    ) -> Result<Plan> {
+        conditions::validate(conditions)?;
+        let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
+        conditions::check(conditions, &current.properties)?;
         let source = self
             .store(edge.partition)?
             .prepare_source_properties(&current, patch)?;
