@@ -6,6 +6,11 @@ through `Gateway::bind_remote(RemoteConfig, ...)`. Its existing local `Config`
 constructor remains supported. This is not production deployment, multi-machine
 validation, authenticated transport, replica failover, or D4/D5 completion.
 
+Current peers require internal managed RPC **v6**
+([S4 retained control](RETAINED_GATEWAY_CONTROL.md)); external gateway framing
+remains v1. The historical A1/A2.1/v4 sections at the end record earlier protocol
+slices, not the version or ordinary control path to deploy now.
+
 ## Boundaries
 
 The external managed gateway protocol, `PartitionEqualsShardV1` mapping,
@@ -124,14 +129,14 @@ network partitions, automatic failover, TLS/authentication, indexed MVCC,
 history reclamation, online placement changes or production scalability. The
 existing consensus transports and storage formats are not changed by this slice.
 
-## A1 evidence separation
+## Historical A1 evidence separation
 
 [Exact segmented terminal-prefix evidence](TERMINAL_PREFIX_EVIDENCE.md) defines the
 versioned proof, protocol-v2 fail-closed upgrade boundary, complete-prefix validation
 and unchanged durable recovery rules. Prepare and advance retain full Journals;
 read evidence remains O(V), with old-V bytes independent of later Plan archives.
 
-## A2.1 request point recovery
+## Historical A2.1 request point recovery
 
 [The durable derived request index](DURABLE_REQUEST_INDEX.md) adds LookupRequest
 and advances internal RPC to version 3. Recovery and admission winner readback
@@ -142,9 +147,25 @@ legacy v5 atomically and snapshots rebuild its derived index. Full Journals rema
 in command validation, execute/status, prepare/advance and authoritative storage.
 The 256-request, 1,024-transaction and 16 MiB Journal caps are unchanged.
 
-### Incremental catch-up (RPC v4)
+### Historical incremental catch-up (RPC v4)
 
 [Bounded history suffixes](INCREMENTAL_DECISION_CONSUMPTION.md) now replace
 archive-bearing Advance in managed graph catch-up. The full replayed Journal
 remains durable authority, existing caps remain, and all cohort members must use
 v4 before enabling the flow. v3 has no automatic fallback.
+
+## Current retained control and storage
+
+The merged [S4 contract](RETAINED_GATEWAY_CONTROL.md) replaces ordinary
+execute/status/retry/abort and Prepare archive exchanges with exact target
+evidence, fixed raw-history cuts, bounded HistoryPage/SyncHistory and
+PrepareRetained. Complete raw validation remains mandatory; smaller retained
+responses are not constant-time or bounded-total-history work.
+
+Bound coordinator/member durable state now uses disk v16/v17 active checkpoints,
+and bound request indexes have been retired after strict legacy validation.
+Cold replay, explicit full-history/terminal-proof paths and SnapshotV1 retain
+history-sized work. [Both capacity profiles](COHORT_CAPACITY_PROFILE.md) keep the
+16 MiB reserved history bound and local D1 limits; only fresh ByteBound16MiBV1
+cohorts replace legacy count caps. There is no v5 fallback, automatic downgrade,
+streamed SnapshotV1 delivery or unlimited lifecycle.

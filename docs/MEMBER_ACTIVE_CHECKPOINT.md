@@ -1,8 +1,10 @@
 # Consumed member checkpoint (S3)
 
-Status: draft implementation, acceptance not claimed. This is the existing
-finite-profile member dependency slice for Issues 108/109, not a capacity
-increase. [S2](COORDINATOR_ACTIVE_CHECKPOINT.md) supplies the consumed coordinator
+Status: merged experimental slice ([PR #113](https://github.com/ashione/VelaGraph/pull/113)).
+This is the finite-profile member dependency slice for Issues 108/109, not a
+capacity increase. Subsequent [S4 retained control](RETAINED_GATEWAY_CONTROL.md)
+uses internal RPC v6; the v5 references below describe S3's original wire boundary.
+[S2](COORDINATOR_ACTIVE_CHECKPOINT.md) supplies the consumed coordinator
 checkpoint; the same private `History::{Full,Active}` representation now serves
 bound durable members. `Coordinator` is a private compatibility alias, not a
 second state machine. Active implicit Journal serialization fails.

@@ -14,43 +14,47 @@ queries, hierarchy counts, and ordered vertex-identity result pages against
 generated reference data. This is functional validation on same-host independent
 processes, not a multi-machine performance or availability claim.
 
-Cross-shard graph operations remain an **opt-in experiment**: staged writes are
-not atomic across shards, and query results carry per-shard snapshots and
-Unverified completeness, not a globally atomic snapshot. Cross-shard transactions,
-automatic failover, online migration, and production transport security remain
-unfinished. The goal is a distributed graph database; this is not yet a
-production-ready one.
+## Choose the graph API
 
-The additive [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md)
-lets applications require a global committed snapshot without silently falling
-back: that requirement currently fails with Unsupported, including for jobs.
-It does not yet implement global MVCC or cross-shard transactions.
-An opt-in [managed shard write fence](docs/MANAGED_SHARD_WRITES.md) persists
-write-mode identity and rejects old raw writers after explicit activation. It
-adds shard-local atomic batch identities only; default graph APIs are unchanged
-and global transactions remain unimplemented. A separate opt-in
-[coordinator decision ledger](docs/TRANSACTION_DECISION_JOURNAL.md) persists
-transaction decisions on a dedicated empty shard. Opt-in
-[participant intents](docs/PARTICIPANT_WRITES.md) now retain prepares and apply
-trusted coordinator decisions atomically per shard through an in-process relay.
-They do not yet provide global read visibility or wire existing graph writers
-through distributed transactions. Explicit [versioned participant reads](docs/VERSIONED_PARTICIPANT_READS.md)
-now consume contiguous applied decision prefixes and replay retained history for
-one requested version; a lagging shard refuses that version. Global query admission
-and certification of a common initial baseline remain unfinished.
+The repository has three distinct graph paths. Support and consistency do not
+transfer automatically between them:
 
-The restricted managed gateway additionally offers [fixed-version traversals and
-complete-result pages](docs/MANAGED_FIXED_TRAVERSALS.md), reusing the bounded
-routing-v3 Gremlin executor over one certified cohort snapshot, including
-partition-qualified vertex/edge `dedup()` with first-path preservation. This does not
-enable the unrestricted GlobalCommittedSnapshot API or certify arbitrary writers,
-nonempty baselines or dynamic routing. Optional
-[submission phase timing](docs/MANAGED_SUBMISSION_TIMING.md) provides bounded,
-process-local diagnostics; it is disabled by default. The new managed-path
-validation uses small cross-process personnel graphs, not the full-scale CoreHR
-fixture. Managed writes also support [conditional vertex/edge property patches](docs/MANAGED_GRAPH_GATEWAY.md#conditional-property-patches): exact property expectations
-are protected by the original participant CAS and retained request identity.
-This does not increase managed capacity or enable arbitrary graph transactions.
+| Path | Current contract |
+| --- | --- |
+| Local v1 / K3 | `GraphEngine` owns one partition. Snapshot reads and explicit single-partition transactions are available; SQL remains a separate autocommit engine. The D1 `GraphRecordStore` adapter additionally supports replicated v1 CRUD and Gremlin. |
+| Observed experimental v2 | Static routed and server-coordinated cross-shard queries, bounded hierarchy jobs and selected result/property pages. Cross-shard writes are staged, not atomic. Results carry per-shard snapshots and **Unverified** completeness, not one certified graph version. |
+| Managed fixed cohort | Explicitly activated empty-baseline cohort, durable external-ID/original-Plan recovery, coordinated typed vertex/edge writes and certified same-version sessions. The gateway can use local Raft handles or fixed remote endpoints. Partial application cannot open a newer certified V. This is a restricted experiment, not general D4/D5 completion. |
+
+Managed writes support vertex/edge creation, property patches, edge deletion and
+[conditional property patches](docs/MANAGED_GRAPH_GATEWAY.md#conditional-property-patches).
+Vertex deletion/cascades, arbitrary transaction programs, nonempty imported
+baseline certification and dynamic routing are not supported by this path.
+[Managed Traverse/TraversePage](docs/MANAGED_FIXED_TRAVERSALS.md) reuse the routing-v3
+executor, including qualified vertex/edge `id()` and `dedup()`, over one materialized
+cohort snapshot. They do not yet support `repeat`, `valueMap` or data-local
+hierarchy jobs. The original gateway `Read` has its own smaller subset.
+
+The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
+rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions
+are a separate API; they do not silently upgrade observed reads. Even managed
+query rows retain Unverified **adjacency completeness** against arbitrary trusted
+low-level writes, distinct from their certified version.
+
+Both managed capacity profiles retain a **16 MiB reserved history budget** and
+separate intent, D1 retained-write and query budgets. Only new empty cohorts can
+select [ByteBound16MiBV1](docs/COHORT_CAPACITY_PROFILE.md), which replaces the legacy
+256-request/1,024-transaction count caps, not the lifetime byte bound. Active
+checkpoints and retained gateway control are merged, but cold recovery and complete
+SnapshotV1 still materialize history. No history GC or unlimited write lifetime is
+available. Managed query validation uses small cross-process graphs; the full-scale
+CoreHR scenario above remains on the observed path.
+
+Automatic routing/failover, online migration, authenticated/encrypted production
+transport and remote disaster recovery remain unfinished. Optional
+[submission phase timing](docs/MANAGED_SUBMISSION_TIMING.md) is disabled by default.
+See the [current capability and work index](docs/CURRENT_STATUS.md) for merged
+slices, remaining work and source/test references. VelaGraph is not yet a
+production-ready distributed database.
 
 The existing Rust package name `rocksdb-sql-table`, library imports, and SQL CLI
 remain unchanged.
@@ -111,7 +115,8 @@ the consensus decision is in [`docs/D2_CONSENSUS.md`](docs/D2_CONSENSUS.md).
 
 Deliberately **not** supported: joins, subqueries, window functions, `ALTER TABLE`, `DEFAULT`/`UNIQUE`/foreign-key column
 constraints, multi-statement SQL transactions, `SELECT` without `FROM`, and
-cross-partition graph transactions. See [Limitations](#limitations).
+general cross-partition graph transactions outside the restricted managed cohort.
+See [Limitations](#limitations).
 
 ## Remote graph command-line client
 
@@ -212,8 +217,9 @@ index catalog, which is also what `.schema` prints.
 `GraphEngine` is the first storage layer for the graph direction. It is additive
 and independent of the SQL engine; it includes a standard Gremlin v0 query
 subset, snapshot read views, and explicit single-partition write transactions.
-SQL statements still do not share a graph transaction, and distribution is not
-implemented.
+SQL statements still do not share a graph transaction. This `GraphEngine` API
+is local; the separate `GraphRecordStore`/replicated and managed APIs above provide
+the distributed experiments.
 
 ```rust
 use std::collections::BTreeMap;
@@ -310,19 +316,20 @@ are in [`docs/GRAPH_FORMAT.md`](docs/GRAPH_FORMAT.md). Edge creation and deletio
 update both adjacency indexes in one `WriteBatch`; deleting a vertex cascades to
 all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
 fsync), so a process crash may lose the most recent writes. This is a
-single-process, single-partition storage kernel: ids are globally unique `u64`
-values supplied by the caller, one `GraphEngine` owns one partition, and there
-is no cost-based planner, distributed transaction layer, or Raft layer yet. Both
-endpoints of an edge must currently live in the same partition; cross-partition
-boundary edges are a D1 design item. Scalar property values are a deliberate
-first-milestone limit, not the final data model. The K3 single-partition
+single-process, single-partition `GraphEngine` API: vertex IDs and edge IDs are
+caller-supplied `u64` values, unique within their respective partition namespaces.
+Distributed APIs qualify identities with the partition. One `GraphEngine` owns
+one partition and has no Raft or cross-partition transaction integration. Both
+endpoints of a v1 edge must live in that partition; separate v2/managed APIs
+provide the cross-partition experiments without changing this v1 contract.
+Scalar property values are a deliberate first-milestone limit, not the final data model. The K3 single-partition
 transaction and recovery boundary is specified in
 [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md). Snapshot-backed read views and
 single-partition write transactions with conservative conflict detection are
 implemented. A transaction commit uses one synced `WriteBatch`; a process-crash
 harness covers the before-commit and after-commit boundaries. Autocommit graph
-writes still use the old no-fsync behavior, and cross-partition transactions are
-not implemented.
+writes still use the old no-fsync behavior. This K3 API does not provide
+cross-partition transactions.
 
 ## SQL behavior details
 
@@ -439,6 +446,11 @@ insert or update; deleting or updating a row removes its old index entries.
 
 ## Architecture
 
+The SQL layout below is separate from [graph/v1 keys](docs/GRAPH_FORMAT.md) and
+the [experimental v2 records](docs/EXPERIMENTAL_CROSS_EDGES.md). Raft/D1 stores
+opaque records; managed coordination and query consistency live in the explicit
+layers described in the [source map](docs/CURRENT_STATUS.md#verification-and-source-map).
+
 ```text
 row/<table>/<encoded-pk>                         -> JSON array of typed row values
 meta/table/<table>                               -> JSON table schema
@@ -485,12 +497,23 @@ src/schema.rs   Types, columns, table and index definitions
 src/value.rs    Typed values, comparison, NULL semantics helpers
 src/main.rs     `rocksql` CLI (REPL, .tables/.schema, CSV)
 tests/sql.rs    End-to-end SQL behavior tests
+
+src/graph.rs                 Local GraphEngine / K3 transactions
+src/graph_records.rs         D1-backed v1 graph records
+src/gremlin.rs               Official-parser Gremlin v0 execution
+crates/d2-raft/              Consensus, durable D1 and managed state machines
+crates/replicated-graph/     Adapters, routing, observed and managed graph APIs
+scripts/                    Demo, CoreHR and retained-lifecycle validation
+docs/                       Entry-specific contracts and historical evidence
 ```
 
 ## Testing
 
 ```bash
-cargo test
+cargo fmt --all --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+git diff --check
 ```
 
 The suite covers CRUD, point lookups, three-valued NULL logic, ordering and
@@ -501,15 +524,22 @@ across reopen,
 table drop/recreate, index DDL, unique and composite indexes, index maintenance
 on insert/update/delete, range plans, and NULL handling in unique indexes. Unit
 tests in `src/key.rs` verify encoding round-trips and order preservation, and
-planner tests in `src/engine.rs` verify index selection.
+planner tests in `src/engine.rs` verify index selection. Graph and distributed
+suites additionally cover query semantics/budgets, conditional retry identities,
+fixed-V sessions, persistence, corruption and independent-process recovery. See
+the [source/test map](docs/CURRENT_STATUS.md#verification-and-source-map).
 
 CI runs formatting, tests, and Clippy on Ubuntu for pushes to `main` and pull
-requests; see `.github/workflows/ci.yml`. Locally run `cargo fmt --check` and
-`cargo clippy --all-targets -- -D warnings` for the same checks.
+requests; see [.github/workflows/ci.yml](.github/workflows/ci.yml). The separate
+[CoreHR workflow](docs/COREHR_CI.md) requires both the full observed scenario and
+a fresh release 1,025-write managed lifecycle with recovery evidence. The long
+lifecycle test is ignored by ordinary debug tests, so `cargo test --locked` alone
+is not full acceptance. Historical result documents are evidence for their named
+source/binary, not a substitute for current-head CI.
 
 ## Limitations
 
-This is a single-node storage kernel, not yet a distributed production database:
+The repository includes distributed experiments, but is not a production database:
 
 - No joins, subqueries, CTEs, window functions, or DISTINCT aggregate
   arguments. `GROUP BY` requires at least one aggregate projection or a HAVING
@@ -525,16 +555,18 @@ This is a single-node storage kernel, not yet a distributed production database:
   `DROP INDEX` only.
 - `UPDATE`/`INSERT` accept literal values only (`SET age = age + 1` is rejected).
 - `ORDER BY` must reference table columns, not output aliases.
-- SQL has no multi-statement transactions; graph transactions are single-partition
-  and single-process. Cross-partition/cross-process transactions, Raft replication,
-  placement, and failover are not implemented (D2–D4); one writer process per
-  database is assumed.
+- SQL has no multi-statement transactions. `GraphEngine` K3 transactions stay
+  single-partition/single-process. Separate Raft/static-routing and managed-cohort
+  APIs exist, but general distributed transactions, automatic placement/failover
+  and online migration remain incomplete. A RocksDB directory has one owning
+  process; independent node processes use separate directories.
 - Non-aggregate queries materialize all matching rows and sort results in
   memory; grouped/aggregate full scans stream rows but materialize the groups.
 - `DECIMAL` is approximate (`REAL`), `DATE` is stored as text rather than a
   native date, and `INTERVAL` supports only `DAY`.
-- No authentication, authorization, or SQL injection surface beyond the caller's
-  own database (there is no network protocol).
+- No SQL network service is provided. Graph TCP services do exist and require
+  trusted isolated networks; they lack production authentication, authorization
+  and TLS. Do not expose their low-level control or write APIs to untrusted peers.
 
 ### Single-shard replicated Gremlin prototype
 
@@ -563,8 +595,8 @@ prepared writes retain their original identity across explicit retries. All
 clones share admission limits across groups. See
 [the static routing contract](docs/D3_STATIC_CATALOG.md#bounded-in-process-route-resolver).
 The Linux-only same-host read gateway below is separate from this in-process
-resolver. Cross-host graph protocols, membership changes, migration and
-cross-group fencing remain unimplemented.
+resolver. Static remote graph protocols are available separately below; automatic
+membership changes, migration and cross-group ownership fencing remain unfinished.
 
 ### Same-host read-only graph gateway
 
@@ -668,7 +700,7 @@ does not add global joins or general Gremlin support.
 
 Experimental [fixed-cohort snapshot sessions](docs/CERTIFIED_COHORT_READS.md) certify empty-baseline KV participants at one retained decision version. They do not enable the remote graph GlobalCommittedSnapshot API.
 
-Experimental [managed graph/v2 transactions](docs/MANAGED_GRAPH_TRANSACTIONS.md) now connect vertex/edge creates, property updates and edge deletion to fixed-cohort commits and same-version reads. This trusted in-process slice does not enable remote Global Gremlin.
+Experimental [managed graph/v2 transactions](docs/MANAGED_GRAPH_TRANSACTIONS.md) connect vertex/edge creates, property updates and edge deletion to fixed-cohort commits and same-version reads. The gateway supports both in-process and fixed remote managed nodes; neither enables the older remote Global Gremlin API.
 
 The optional [durable request admission foundation](docs/DURABLE_GRAPH_REQUESTS.md) binds external IDs to exact transaction plans before prepare. The separate restricted TCP gateway below uses this foundation.
 
@@ -698,8 +730,8 @@ boundary. Internal managed peers now require protocol v6; evidence remains O(V).
 
 [Durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) returns one exact
 original external-ID/Plan binding without transferring the full Journal. Bound
-coordinator disk v15 now projects LookupRequest and HistoryPage directly from raw
-history, with bounded retained results and full namespace verification against a
+coordinators (current disk v16, with v15 migration support) project LookupRequest
+and HistoryPage directly from raw history, with bounded retained results and full namespace verification against a
 private, previously validated published cut. The duplicate request index is
 retired atomically after strict legacy validation. Every read still scans the
 whole history; this is not a speed or unlimited-lifetime claim.
@@ -712,18 +744,20 @@ this is a recovery/read foundation, not unlimited writes or a performance claim.
 Managed decision catch-up now uses [bounded event suffixes and retained ordinal
 consumption](docs/INCREMENTAL_DECISION_CONSUMPTION.md) for every cohort member.
 Original event history remains durable authority, SHA-256 anchors have an explicit
-integrity assumption, and the 256 / 1,024 / 16 MiB lifetime limits remain unchanged.
+integrity assumption. Legacy cohorts retain 256-request/1,024-transaction count
+caps; both profiles retain the 16 MiB reserved history budget and independent
+local D1 limits.
 
 The [authoritative event ledger](docs/AUTHORITATIVE_EVENT_LEDGER.md) stores
-fixed-cohort Commands as the sole live decision authority. Bound coordinators
-in the [S2 draft](docs/COORDINATOR_ACTIVE_CHECKPOINT.md) write disk v16 and consume
-an active checkpoint instead of a resident/ordinary apply-candidate full Journal;
-members keep v12/v14. Raw closure is still checked on each ordinary writer call.
-Cold replay, member/control/Terminal paths and complete snapshots still materialize
-history; metadata and current snapshot bytes remain resident. Resolving holes
-releases no historical capacity. The 16 MiB lifetime budget, profile-specific and
-local D1 limits, grants and managed RPC v5 are unchanged. S1 disk v15 remains an
-actual migration input. Draft implementation acceptance is not claimed.
+fixed-cohort Commands as the sole live decision authority. Merged
+[S2 coordinator](docs/COORDINATOR_ACTIVE_CHECKPOINT.md) and
+[S3 member checkpoints](docs/MEMBER_ACTIVE_CHECKPOINT.md) use disk v16/v17 and
+active state instead of resident/ordinary apply-candidate full Journals on bound
+durable paths. Actual earlier formats remain strict migration inputs. Full raw
+closure is still checked; cold replay, explicit full-history/terminal-proof paths
+and complete snapshots retain history-sized work. Metadata and current snapshot
+bytes remain resident, and resolving holes releases no historical capacity.
+Current internal managed RPC is v6; external gateway framing stays v1.
 
 New empty cohorts can explicitly select the [immutable byte-budget capacity
 profile](docs/COHORT_CAPACITY_PROFILE.md). Actual durable grants from every member
@@ -732,12 +766,6 @@ This profile replaces the legacy 256/1,024 count quotas with byte-derived guards
 while the 16 MiB reserved Journal, local D1 limits, complete replay/snapshots and
 whole-frame bounds remain. Existing/default cohorts stay legacy; there is no
 online conversion or unlimited-lifetime claim. New managed peers require RPC v6; see the [retained gateway control contract](docs/RETAINED_GATEWAY_CONTROL.md).
-
-The draft [consumed member checkpoint](docs/MEMBER_ACTIVE_CHECKPOINT.md) replaces
-bound durable member resident/ordinary-apply Journal with shared observed active
-state and exact original raw projections. It keeps every existing capacity limit
-and full SnapshotV1/legacy compatibility boundary; acceptance and higher-lifetime
-capacity are not claimed.
 
 The [retained gateway control slice](docs/RETAINED_GATEWAY_CONTROL.md) replaces
 actual managed graph full-Journal control and Prepare with anchored point evidence

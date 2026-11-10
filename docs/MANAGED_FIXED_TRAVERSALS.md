@@ -18,7 +18,8 @@ execution returns rows only; it cannot create or relabel a consistency proof.
 The managed provider contains only the retained GraphSnapshot and query deadline.
 All scans, vertex/edge lookups, adjacency and reverse/endpoint validation use the
 same snapshot. Session construction still requires exact coordinator authority,
-complete fixed cohort, empty baseline, common V and participant journal proofs.
+complete fixed cohort, empty baseline, common V and exact participant
+terminal-prefix evidence.
 Remote acquisition uses the existing pinned node identities and internal RPC.
 The gateway materializes cohort data before traversal and executes the shared
 synchronous traversal locally over those immutable maps. It does not yet adapt
@@ -111,9 +112,11 @@ conservatively reserve the same slot although they do not retain page results.
 
 This is not an RSS cap: allocator/map metadata, parser and traversal scratch,
 bounded journals and transient unpaged outputs under the eight-worker admission
-limit are additional. Source history remains retained without GC; the durable
-journal remains limited to 256 external requests/16 MiB. These small bounds do
-not support the 200,000-person CoreHR fixture on this managed path.
+limit are additional. Source history remains retained without GC. LegacyCountV1
+retains 256 external requests/1,024 transactions; ByteBound16MiBV1 replaces those
+count caps, while both keep the 16 MiB reserved history budget and independent
+D1/intent limits. See [capacity profiles](COHORT_CAPACITY_PROFILE.md). These small
+query bounds do not support the 200,000-person CoreHR fixture on this managed path.
 
 ## Compatibility and verification boundary
 

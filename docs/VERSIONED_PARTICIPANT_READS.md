@@ -19,9 +19,11 @@ records, and an empty coordinator journal with the matching authority. It captur
 the local baseline sequence and fixes the ownership epoch. The operation is
 irreversible and idempotent. Existing data may be a local baseline, but this does
 not certify that independently imported baselines form a consistent global cut.
-A future global admission layer must verify the complete participant set,
-coordinator/baseline identity and pinned catalog/routing epoch. Do not infer that
-certificate from matching local sequence numbers or equal values in a test.
+A layer admitting a cross-shard version must verify the complete participant set,
+coordinator/baseline identity and fixed routing. The later
+[fixed-cohort session layer](CERTIFIED_COHORT_READS.md) does this for explicitly
+bound empty baselines, not arbitrary imports or dynamic catalogs. Do not infer
+that certificate from matching local sequence numbers or equal values in a test.
 
 Once active, legacy ResolveParticipant is rejected even for an exact retry. Data
 can only be published through AdvanceVisibility. Other raw/managed writers remain
@@ -119,10 +121,11 @@ an actual in-process coordinator with independent participant Raft groups. A rea
 16 MiB intent-cap test proves an unknown Abort still advances and remains negative
 after recovery without allocating another intent record.
 
-Still required before global-query support: a certified initial baseline and fixed
-participant/catalog cohort, end-to-end remote protocol and managed graph writers,
-query admission/pins across a single chosen version, wider concurrent workloads,
-and full CoreHR transaction/read verification. Existing full CoreHR CI is a
-regression gate, not proof that its graph APIs use these new participant methods.
+Later merged slices add certified empty-baseline fixed cohorts, remote managed
+transport, typed graph writers and same-version Gremlin sessions. Their scope is
+listed in [CURRENT_STATUS.md](CURRENT_STATUS.md). General dynamic catalogs,
+nonempty-baseline certification, indexed MVCC/GC, larger managed query capacity
+and full-scale CoreHR transaction/read verification remain open. Existing full
+observed CoreHR CI does not prove that its graph APIs use participant versions.
 
 The optional [fixed-cohort session layer](CERTIFIED_COHORT_READS.md) adds persistent membership and empty-baseline certification. Existing unbound/nonempty modes cannot be automatically upgraded to that contract.

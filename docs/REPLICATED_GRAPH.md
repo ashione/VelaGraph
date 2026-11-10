@@ -9,9 +9,10 @@ to explicitly selected replicas; it does not make this a production service.
 Gremlin parser/operators can also execute through this replicated D1 adapter.
 A separate [D3a static catalog](D3_STATIC_CATALOG.md) provides persisted immutable
 placement in a dedicated metadata group. The optional bounded in-process resolver
-is described there. Shard migration,
-cross-shard transactions, network authentication and a production client protocol
-are not implemented.
+is described there. This v1 adapter has no cross-shard transactions. Separate
+[managed-cohort APIs](MANAGED_GRAPH_TRANSACTIONS.md) provide restricted coordinated
+writes; shard migration, network authentication and production deployment remain
+unfinished.
 
 ## Construction and execution
 
@@ -192,14 +193,18 @@ The query row cap is 10,000, not the CRUD adjacency convenience cap of 1,000.
 Pages are at most 256 rows / 16 MiB, and individual records share the 16 MiB bound.
 Oversized records, unsupported pagination, stale epochs, incompatible runtime
 contexts, read-barrier failures and query limits return errors, never truncated
-success. These caps do not bound total query heap or process RSS: repeated
-traversers can duplicate large property payloads. Aggregate byte accounting is
-not implemented. See [QUERY_SPEC.md](QUERY_SPEC.md) for the precise contract.
+success. A shared 64 MiB query-owned logical byte budget additionally accounts
+for decoded records, simultaneous intermediates, paths and results, including
+repeated large-property traversers. This is not a heap/RSS limit; retained views,
+adapter-private allocations and allocator overhead are excluded. See
+[QUERY_MEMORY.md](QUERY_MEMORY.md) and [QUERY_SPEC.md](QUERY_SPEC.md).
 
 This closes only the bounded, in-process, single-shard replicated query path.
-K3 write-overlay transactions still belong to `GraphEngine`; cross-shard queries,
-server-side remote query execution, automatic remote replica routing and
-production availability remain absent. A Linux-only same-host read gateway is
+K3 write-overlay transactions still belong to `GraphEngine`. Separate
+[server query](REMOTE_QUERY.md) and [distributed observed query](DISTRIBUTED_QUERY.md)
+APIs now exist, with their own scopes; they do not change this adapter contract.
+Automatic remote replica routing and production availability remain unfinished.
+A Linux-only same-host read gateway is
 separately documented in
 [GRAPH_UDS_GATEWAY.md](GRAPH_UDS_GATEWAY.md).
 The optional static in-process resolver is documented in D3_STATIC_CATALOG.md.

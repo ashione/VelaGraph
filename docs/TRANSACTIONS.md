@@ -62,8 +62,9 @@ Consequences the implementation and tests MUST state:
 ## 3. Read views
 
 `GraphEngine::read_view()` returns a borrowed read view that pins a RocksDB
-snapshot. The first K3 slice exposes point and adjacency reads, but no writes;
-bounded scan reads and Gremlin integration follow in later K3 slices:
+snapshot. Its public API exposes point and adjacency reads, but no writes.
+Current Gremlin execution also uses this snapshot internally, with bounded
+query-only scans and adjacency visitors described below:
 
 ```rust
 pub struct GraphReadView<'a> { /* snapshot + partition */ }

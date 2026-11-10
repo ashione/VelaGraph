@@ -1,12 +1,15 @@
 # Consumed coordinator active checkpoint (S2)
 
-Status: **draft implementation; acceptance is not claimed**. This describes the
-current source, not a published capacity increase or measured performance result.
+Status: **merged experimental slice** ([PR #112](https://github.com/ashione/VelaGraph/pull/112)).
+This is not a capacity increase or a measured performance result. The format and
+path descriptions below distinguish S2 itself from later merged extensions.
 The [S1 ledger contract](AUTHORITATIVE_EVENT_LEDGER.md) remains the historical
 contract for actual disk-v15 migration inputs. S2 writes coordinator disk **v16**;
 member disk v12/v14, raw formats 1/2, logical SnapshotV1 and managed RPC v5 stay
 unchanged in S2. The follow-on [S3 member checkpoint](MEMBER_ACTIVE_CHECKPOINT.md)
-now writes member v17 while preserving actual v12/v14 migration readers. Tracking: https://github.com/ashione/VelaGraph/issues/108 and
+writes member v17 while preserving actual v12/v14 migration readers.
+[S4 retained control](RETAINED_GATEWAY_CONTROL.md) subsequently introduced managed
+RPC v6 and removed ordinary gateway full-Journal control/Prepare dependencies. Tracking: https://github.com/ashione/VelaGraph/issues/108 and
 https://github.com/ashione/VelaGraph/issues/109.
 
 ## Replacement and authority
@@ -176,12 +179,14 @@ migration/snapshot and pre-sync/post-sync crash checks, full debug library/
 TCP/process regression, formatter/clippy/diff/Python validation, fresh release
 1,025 genuine gateway writes with original-ID/old-V/ACK-loss/snapshot recovery,
 and required remote CI remain delivery gates. Existing 15s/60s budgets stay fixed.
-Earlier source or executable results do not establish acceptance of this draft.
+Earlier source or executable results do not establish acceptance of a later tree.
+The merged slice does not waive these gates for subsequent changes.
 
-Removing 16 MiB still requires equivalent member active state and durable
-historical negative evidence; a separately reviewed finite profile with active
-and retained-archive budgets; all-member closed checkpoint certificates before
+S3 has since supplied member active state and retained historical negative evidence,
+and S4 removed the ordinary gateway control/Prepare Journal exchanges. Removing
+16 MiB still requires a separately reviewed finite profile with active and
+retained-archive budgets; all-member closed checkpoint certificates before
 credit reuse; self-contained streamed snapshot closure; and bounded remaining
-full-Journal control exchanges and O(V) terminal proofs. Offline or lagging members
+full-history operations and O(V) terminal proofs. Offline or lagging members
 cannot be replaced silently or release credit. S2 adds no GC, renewable grants,
 new profile, larger archive quota or unlimited-lifetime claim.

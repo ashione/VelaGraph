@@ -331,7 +331,9 @@ these write semantics after explicit activation; legacy `TxnBatch` does not.
 See [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md) for the different persistence,
 snapshot and retained-request budget boundaries. The separate
 [`replicated-graph` adapter](REPLICATED_GRAPH.md) implements this trait in-process;
-a remote graph service remains unimplemented.
+the [development TCP adapter](REMOTE_GRAPH.md) also supplies remote graph access.
+Neither adds the proposed general feature-bit handshake or production transport
+security; conditional semantics are explicit in the versioned D1 commands.
 
 Local dedup metadata gains an optional `expected_sequence` field. Missing means
 `None`, so existing records remain readable. Unconditional writes omit the field

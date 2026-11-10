@@ -1,12 +1,14 @@
 # VelaGraph Roadmap（实验阶段）
 
-> 当前阶段：已有单机图内核、Raft 存储节点、静态路由与有界跨分片查询，正在补齐通用查询功能并以 CoreHR 场景持续验收。先让功能闭环，再推进故障恢复、容错、在线迁移与生产安全；实验功能可用不代表 D3、D4、D5 已全部完成。
+> 当前阶段：已有单机图内核、Raft 存储节点、静态路由、有界 observed 跨分片查询及 restricted managed 事务/同版本读取。继续以真实写入、查询和恢复路径补齐功能与容量证据，以 CoreHR 持续验收；容错、在线迁移与生产安全分别推进，实验切片可用不代表 D3、D4、D5 已全部完成。
 
 **产品终局**：VelaGraph 的目标是成为以 KV（RocksDB）为单机存储的分布式属性图数据库，支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
 ## 1. 当前基线
 
-截至 2026-11-07，当前代码已超出最初 PR #1–#3 的单机 SQL 原型：
+截至 2026-11-10，本次核对基于 main `a0b7147`（已合并 #142/#144/#146）。
+[当前能力索引](CURRENT_STATUS.md)列出入口、源码/测试和开放工作；下列状态不是对未合并 PR 的验收。
+当前代码已超出最初 PR #1–#3 的单机 SQL 原型：
 
 - **内核**：属性图存储与标准 Gremlin 有界子集，单分片快照读、写事务与进程崩溃恢复测试；SQL 表引擎保留独立语义。
 - **分布式基础**：持久化 Raft 节点、版本化 D1 条件/幂等写、静态 catalog 与固定远程路由。自动路由收敛、成员变更和在线迁移尚未完成。
@@ -15,15 +17,24 @@
 
 **当前已接通**通用全局属性筛选 → 有界跨片 out/in → 过滤、limit、去重及终结 count/values/valueMap，具体范围见[组合契约](GLOBAL_VERTEX_TRAVERSAL.md)。扫描与遍历使用独立累计预算、同一固定会话和原截止时间，组合结果不默认截取 100 条。全局筛选后的单个有界 repeat（总深度≤32）现已接通；更广的组合（如全局起点 path、无显式 limit 的无跳转 values）仍未开放；大结果分页仍只适用于文档列出的层级 job 形状，不是任意查询分页。
 
-实验 graph/v2 的跨片边写入仍分阶段执行、不是原子事务；查询始终返回 **Unverified** 和实际各分片快照向量，**不是全局原子快照**。无完整邻接证明、无跨片事务、无自动故障切换承诺。参见 [README](../README.md)、[查询规范](QUERY_SPEC.md)及各 API 的单独契约。
+**Observed graph/v2 路径**的跨片边写入仍分阶段执行、不是原子事务；查询返回 **Unverified** 和实际各分片快照向量，**不是全局原子快照**。它与下面的 managed 固定 cohort 入口不同，不自动获得 managed 事务/版本保证。两者均无生产故障切换或任意低层写入下的完整邻接认证。参见 [README](../README.md)、[查询规范](QUERY_SPEC.md)及各 API 的单独契约。
 
-动态一致性的首个接口切片：[显式读取一致性协商](QUERY_CONSISTENCY_NEGOTIATION.md)已支持请求全局已提交快照并在能力不足时拒绝，覆盖同步查询及长期 job，不静默降级。**全局快照本身仍未实现**，下一步是覆盖全部写入口的事务版本与 MVCC，而不是仅靠查询协调层打时间戳。
+[显式一致性协商](QUERY_CONSISTENCY_NEGOTIATION.md)的旧 `GlobalCommittedSnapshot` 要求仍对同步查询和 job 返回 Unsupported，不静默降级。**另一个已实现的 restricted managed 入口**以固定、空 baseline cohort 认证同一 V，不等于为任意 catalog/旧 observed API 开放全局快照。
 
-协调决策账本的独立基础切片已实现：空受管分片可显式转为专用协调角色，持久化 Begin/Prepared/Commit/Abort 与未决空洞检查。它只记录决定，尚未连接数据分片 prepare、原子跨片数据发布或 MVCC；resolved prefix **不是可读全局版本**，严格全局查询仍 Unsupported。见[契约](TRANSACTION_DECISION_JOURNAL.md)。
+协调决策账本、参与者 prepare/commit/abort、连续 applied watermark、完整 cohort/empty-baseline 认证、外部请求 ID/原 Plan 恢复和远程 managed gateway 已接通。支持点/边创建、属性更新、边删除及条件属性补丁，partial apply 不得开放较新的 certified V。普通弱读仍可能看到逐片发布；`resolved_prefix` 本身不是可读版本。节点固定在同机独立进程的现有验证不等于多机 HA。见[受管事务](MANAGED_GRAPH_TRANSACTIONS.md)、[gateway](MANAGED_GRAPH_GATEWAY.md)及[固定版本查询](MANAGED_FIXED_TRAVERSALS.md)。
 
-参与者状态机已增加显式启用的 prepare/commit/abort 持久状态和可信进程内协调者转发：未决时保留条件写预约，读继续；已验证单片原子发布和旧快照稳定。它尚未接通远程 graph 写客户端、统一 MVCC 可见版本或 CoreHR 并发事务验收，跨片逐个发布仍可能被新查询看到混合状态；GlobalCommittedSnapshot 继续 Unsupported。见[参与者契约](PARTICIPANT_WRITES.md)。
+Managed Traverse/TraversePage 已支持 routing-v3 的 qualified `id()`、元素 `dedup()` 和完整结果分页，仍不支持 `repeat`/`valueMap` 或 data-local hierarchy jobs。当前会先 materialize 小型 cohort snapshot，不能把 observed 全量 CoreHR 通过等同于 managed 全规模动态一致性验收。
 
-版本读取基础切片：显式versioned participant模式逐ordinal消费全部终态决定（含Abort/非参与），本片数据和水位同批持久化；read_at(v)仅在本片已应用到v时有界重放历史，落后分片拒绝新版，旧版本不随后续写改变。未做GC或丢弃历史；这不是已完成全局查询、统一baseline认证或高性能索引MVCC，Global仍Unsupported。见[版本水位契约](VERSIONED_PARTICIPANT_READS.md)。
+S1 archive reads、S2 coordinator checkpoint、S3 member checkpoint、S4 retained gateway control 已合并。当前 bound durable metadata 为 coordinator v16/member v17，内部 RPC v6；冷启动 replay、完整 SnapshotV1 和部分证明仍依赖完整历史。两个 profile 都保留 16 MiB reserved history 及独立 intent/D1/query 限制；checkpoint 不回收配额，也不是远程备份。见[容量契约](COHORT_CAPACITY_PROFILE.md)。
+
+### 仍在推进的依赖与验收
+
+- [#108](https://github.com/ashione/VelaGraph/issues/108) / [#109](https://github.com/ashione/VelaGraph/issues/109)：已交付上述读取/active/control 切片，未完成有界冷恢复、完整流式快照、闭合 checkpoint/credit reuse 或生命周期扩展。不能把已合并 #113 再列为待实现，也不能因此关闭父任务。
+- [#124](https://github.com/ashione/VelaGraph/issues/124) / [#118](https://github.com/ashione/VelaGraph/issues/118)：durable purge/install 安全前置与文件流式 snapshot 仍未交付；本次文档刷新不发布其实现或声称恢复安全问题已解决。
+- [#110](https://github.com/ashione/VelaGraph/issues/110) → [#111](https://github.com/ashione/VelaGraph/issues/111)：先给 certified V 接通可验证的 data-local 查询/资源契约，再验收全规模 managed CoreHR。已合并的 id/dedup 是语义补齐，不是容量扩大。
+- [#127](https://github.com/ashione/VelaGraph/issues/127)：gateway phase timing 已由 #133 合并；[#143](https://github.com/ashione/VelaGraph/pull/143) 的生命周期归因在本次核对时仍未合并。#146 已合并 active durable HistoryStatus 的单次 verified cut，关闭 #145；仍逐请求校验完整 raw/terminal，不缓存、不放宽容量，也不证明整体 Submit/lifecycle 倍速。见[限定与验证](HISTORY_STATUS_VALIDATION.md)。
+- [#128](https://github.com/ashione/VelaGraph/issues/128)：failure-only paged-snapshot diagnostics 已由 #131 合并；原偶发失败根因仍未确认，单次绿灯不等于根因修复。
+- [#122](https://github.com/ashione/VelaGraph/issues/122)：产品观测性、调优和运维视图仍为低优先级计划，不把诊断计时当成完整产品监控。
 
 ### 已确认与待定
 
@@ -33,7 +44,7 @@
 | 两条线 | 内核线 + 分布式线，以窄存储接口解耦 | 已确认 |
 | 图模型 | 属性图（点/边/标签/属性），RDF 不作为当前目标 | 已实现基础模型 |
 | 查询语言 | 标准 Gremlin（Apache TinkerPop 官方语法）子集优先；不自造方言；SQL 作为后续分析接口 | 已确认 |
-| 一致性 | v1/K3 单分片事务边界；v2 跨片写非原子、查询 Unverified/分片独立快照；全局事务另立验收 | 边界已明确，D4 未完成 |
+| 一致性 | v1/K3 单分片事务；observed v2 分阶段写/独立快照；restricted managed 固定 cohort 事务与 certified V 已实现，general Global 仍拒绝 | 入口边界明确，完整 D4 未完成 |
 | 首批场景 | CoreHR：20 万人、5000 部门，上下级与多部门关系，支持逐步完善的通用查询 | 已选定并进入全量 CI |
 
 ## 2. 两条线的交付边界
@@ -105,6 +116,7 @@
 
 - **交付物**：跨分片 2PC 或快照事务；事务协调者；超时/恢复/悬挂事务处理。
 - **完成定义**：跨分片写入要么全提交要么全回滚；协调者崩溃可恢复；隔离级别文档化。
+- **当前状态**：固定 empty-baseline cohort 的受管事务、原 ID/Plan 恢复和同版本会话已实现；任意 baseline/writer、动态路由、无限保留和全规模动态一致性尚未验收。弱 observed API 不继承此保证。
 - **依赖**：D1、D2、D3；内核 K3 的单分片事务接口。
 
 ### D5 分布式查询与遍历
@@ -142,7 +154,7 @@
 | P1 内核 | K1/K2、K3 单分片能力已有实现；不等于全部规模/ABI目标完成 | 保持现有正确性回归，并按实际硬件验证规模目标 |
 | P2 分布式基础 | Raft 节点、静态 catalog/路由与远程图路径已有实现；自动切换、迁移仍有缺口 | 按 D2/D3 单独验证失效、收敛和恢复，不以 CoreHR 单副本场景代替 |
 | P3 通用查询功能（当前主线） | 已有显式 ID 跨片关系、层级作业及有界全局筛选后的 out/in 组合；继续扩展受验收约束的通用组合 | 通用算子组合、行/属性/计数结果与独立 oracle 一致；边界拒绝、快照与全量 CI 通过 |
-| P3 一致性与恢复（后续） | D4 跨片事务未完成，功能阶段不承诺全局原子性 | 跨片写入原子性、协调者恢复、失败与重试语义通过专项故障验证 |
+| P3 一致性与恢复（进行中） | Restricted managed 固定 cohort 事务、certified V、原 ID/Plan 重试和恢复切片已实现；observed 路径仍非原子，完整 D4 未完成 | 保留已有故障门禁，完成有界生命周期/恢复与 fixed-V 查询容量，再以全规模 managed CoreHR 独立验收 |
 | P4 生产硬化（后续） | 性能、容错、在线迁移、备份、多机部署和安全尚不能视为完成 | 明确硬件/负载的指标、恢复演练、权限/传输保护及试点验收 |
 
 **推进原则**：优先完成通用图功能，以 CoreHR 检查实现而不是在产品代码中写死人员/部门逻辑。性能改进必须有同配置可复现对比；不以扩大预算或移除拒绝测试代替优化。当前没有经实测确认的整阶段完工日期，原估算周数不作为交付承诺。
@@ -167,11 +179,11 @@
 |---|---|---|---|
 | 图分区导致跨分片遍历放大 | 2 跳查询命中多数分片；p99 随集群规模上升 | 保留明确的跳数、工作与内存上限；优化批量访问/分区亲和；超限显式失败，不静默降级 | 分布式负责人（待指定） |
 | Raft/共识实现复杂 | 端到端图路径缺少失效/恢复证据 | 继续采用已选 openraft，单独验收复制层与图路径的故障语义 | 分布式负责人（待指定） |
-| 事务范围失控 | 跨分片事务阻塞主路径；隔离级别反复变更 | 当前只按已实现的单分片与 v2 非原子边界承诺；2PC/跨片事务需单独设计验收 | 内核负责人（待指定） |
+| 事务范围失控 | 跨分片事务阻塞主路径；隔离级别反复变更 | 分别遵守 K3、observed v2 和 restricted managed fixed-cohort 契约；扩大事务/路由/恢复范围需单独设计验收 | 内核负责人（待指定） |
 | 两条线接口漂移 | 分布式层开始直接依赖图内部结构 | 保持版本化字节接口；语义变更先更新契约并独立评审 | 产品/架构负责人 |
 | 范围过大 | 同时做 SQL 兼容、图、分布式、云托管 | 首版只做属性图 + 标准 Gremlin 子集 + 单区域；其余进 backlog | 产品负责人 |
 
-**决策门**：图模型、查询语言、CoreHR 场景及当前一致性边界已有实现依据。新增跨片事务、迁移或全局快照仍须先冻结协议和失败语义；现有实验查询的成功不替代这些审批与验证。
+**决策门**：图模型、查询语言、CoreHR 场景及当前一致性边界已有实现依据。超出既有 fixed-cohort 契约的事务、迁移或全局快照仍须先冻结协议和失败语义；现有实验查询的成功不替代这些审批与验证。
 
 ## 8. Backlog（不排期）
 
@@ -190,7 +202,8 @@
 
 1. 在已接通的有界全局筛选 → out/in 组合上，按实际需求逐步扩展仍 Unsupported 的算子与大结果消费方式；先明确语义、预算和分页契约，不把任意组合默认为已支持。
 2. 持续以独立随机小图和 20 万人/5000 部门 CoreHR 验证新增组合，覆盖 bag/去重、过滤/limit 位置、空结果、属性输出和失败边界；CoreHR 仅是输入，不能成为执行特化或从结果反推预期。
-3. 按已测瓶颈推进可复现性能改进，再进入容错/恢复、在线路由/迁移及生产安全。大规模基准与多机验证分别建证据，不把同机结果外推。
+3. 并行推进 #108/#109 的剩余历史/恢复边界与 #110 的 fixed-V 查询容量，先冻结资源、失败和兼容契约，再以 #111 联合验收。#124/#118 的 purge/install 前置未交付前，不宣称流式恢复或放开生命周期。
+4. 以 #127 的已测瓶颈选择独立、可复现的优化，不靠放宽预算取得通过。在线路由/迁移、生产安全、远程备份与多机验证分别建证据，不把同机结果外推。
 
 ## 11. 分项实现记录与契约
 
@@ -500,9 +513,9 @@ full-cohort capacity, and close retained-archive checkpoint/snapshot recovery.
 Fresh frozen-source correctness, process-crash, 1,025-write release and remote CI
 gates remain required; this entry does not claim they have passed for S1.
 
-### Consumed coordinator active checkpoint (S2 draft)
+### Consumed coordinator active checkpoint (S2, merged)
 
-[The current draft](COORDINATOR_ACTIVE_CHECKPOINT.md) writes disk v16 and replaces
+[The merged S2 slice](COORDINATOR_ACTIVE_CHECKPOINT.md) writes disk v16 and replaces
 the durable bound coordinator's resident and ordinary apply-candidate Journal
 with active `(R,N]` state, retaining terminals behind holes. The actual writer
 checks full raw closure, uses batch-overlay identity lookups and stages raw/terminal
@@ -515,17 +528,21 @@ SnapshotV1 materialization remain. Actual v15 and older inputs migrate only on a
 successful batch; explicit snapshot repair checks the independently anchored old
 prefix and exact checkpoint. Both profiles, 16 MiB, member/D1 limits, grants,
 RPC v5 and deadlines remain unchanged. No GC, larger archive or performance claim.
-Acceptance is pending, including frozen-source correctness/crash/regression, fresh
-release 1,025-write recovery and remote CI gates. All-member closed checkpoints,
-member active state, bounded retained archives/control proofs and streamed
-snapshot closure remain subsequent work before removing the lifetime bound.
+S2 merged in #112; S3 member active state merged in #113 and S4 retained gateway
+control in #117. The preceding paragraph records S2's original boundary, not a
+claim that current members still use resident Journals. Frozen-source correctness,
+fresh release 1,025-write recovery and remote CI remain required for later changes.
+All-member closed checkpoints/credit reuse, bounded retained archives and remaining
+full-history operations, and streamed snapshot closure remain open before removing
+the lifetime bound.
 
 ### S4 retained gateway control
 
 Actual managed execute/status/retry/abort and Prepare use bounded exact target
 evidence and retained original-event cuts. See [the contract](RETAINED_GATEWAY_CONTROL.md)
 for wire6/new Raft command upgrade restrictions, unchanged finite quotas and
-explicit full-proof/snapshot boundaries. Test presence does not claim acceptance.
+explicit full-proof/snapshot boundaries. This slice merged in #117; test presence
+or historical runs do not waive fresh-head gates for later changes.
 
 ### Global traversal terminal scalar properties
 
