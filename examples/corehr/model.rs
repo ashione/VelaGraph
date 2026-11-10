@@ -459,7 +459,7 @@ impl Model {
                 "path" => json!({"paths":paths.iter().map(|(_,p)|p).collect::<Vec<_>>()}),
                 _ => verts(&paths.iter().map(|(id, _)| *id).collect::<Vec<_>>()),
             };
-            q.push(json!({"name":name,"partition":partition(start),"query":query,"expected":expected,"server_supported":true}));
+            q.push(json!({"name":name,"partition":partition(start),"query":query,"expected":expected,"server_supported":true,"client_phase":"repeat_explicit"}));
         };
         for (kind, start, label) in [
             ("person", self.people, "reports_to"),
@@ -575,7 +575,7 @@ impl Model {
         // E starts require an endpoint transition before native repeat. The
         // first fixture edge is 2 -> 1, and retains its canonical source shard.
         q.push(
-            json!({"name":"client_edge_endpoint_repeat_path","partition":partition(2),
+            json!({"name":"client_edge_endpoint_repeat_path","partition":partition(2),"client_phase":"repeat_explicit",
             "query":"g.E(1).outV().repeat(__.out('reports_to')).times(1).path()",
             "client_expected":{"paths":[[
                 ["e",partition(2),1], ["v",partition(2),2],
@@ -617,6 +617,7 @@ impl Model {
         ] {
             let mut case = json!({"name":name,"partition":partition(1),"query":query,"expect_error":true,"server_supported":false,"server_expected_error":error,"client_expected_error":error});
             if name.starts_with("native_broad_") {
+                case["client_phase"] = json!("repeat_explicit");
                 // The server's smaller work bound is independent of routing-v3.
                 // This 8-ary input tree has people-1 edges and people expanded
                 // vertices; include the start and one tick per nonempty level
@@ -929,4 +930,76 @@ fn over_budget_native_repeat_keeps_a_typed_client_failure() {
         assert_ne!(case["client_expect_unsupported"], true);
         assert_eq!(case["server_expected_error"], "ResourceExhausted");
     }
+}
+
+#[test]
+fn client_repeat_phases_are_fixed_complete_and_ordered() {
+    let queries = Model::new(2000, 50).queries();
+    let phase_names = |phase: &str| {
+        queries
+            .iter()
+            .filter(|case| case["client_phase"].as_str().unwrap_or("legacy") == phase)
+            .map(|case| case["name"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        phase_names("repeat_explicit"),
+        vec![
+            "native_person_ancestors_emit32",
+            "native_person_ancestors_first_paths",
+            "native_person_exact_root",
+            "native_person_past_root",
+            "native_person_exact32_empty",
+            "native_department_ancestors_emit32",
+            "native_department_ancestors_first_paths",
+            "native_department_exact_root",
+            "native_department_past_root",
+            "native_department_exact32_empty",
+            "native_person_descendants_two",
+            "native_person_descendants_emit_two",
+            "native_person_active_descendants_count",
+            "native_person_descendants_emit_three_count",
+            "native_department_descendants_two",
+            "native_department_descendants_emit_two_count",
+            "native_duplicate_ancestor_bag_count",
+            "native_duplicate_ancestor_dedup_paths",
+            "client_edge_endpoint_repeat_path",
+            "native_broad_descendants_budget",
+            "native_broad_limit_cannot_rescue",
+        ]
+    );
+    assert_eq!(
+        phase_names("repeat_global"),
+        vec![
+            "global_repeat_named_ancestors",
+            "global_repeat_exact_depth",
+            "global_repeat_named_descendant_count",
+            "global_repeat_multi_root_bag",
+            "global_repeat_multi_root_unique",
+            "global_repeat_membership_then_department_hierarchy",
+            "global_repeat_missing_root",
+        ]
+    );
+    let legacy = phase_names("legacy");
+    assert_eq!(legacy.len(), 96);
+    for name in [
+        "recursive_repeat",
+        "native_zero_depth",
+        "native_depth33",
+        "native_combined_depth33",
+        "client_edge_repeat_without_endpoint",
+        "global_repeat_filtered_ancestor_maps",
+        "project_batch_people",
+    ] {
+        assert!(legacy.contains(&name), "moved legacy rejection {name}");
+    }
+    let all: Vec<_> = ["legacy", "repeat_explicit", "repeat_global"]
+        .into_iter()
+        .flat_map(phase_names)
+        .collect();
+    assert_eq!(all.len(), queries.len());
+    assert_eq!(
+        all.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        queries.len()
+    );
 }

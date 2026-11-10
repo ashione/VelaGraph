@@ -36,6 +36,9 @@ pub(super) fn queries(m: &Model) -> Vec<Value> {
         let mut row = json!({"name":name,"partition":1,"query":query,"expected":expected,"server_supported":true});
         if let Some(value) = client {
             row["client_expected"] = value;
+            if name.starts_with("global_repeat_") {
+                row["client_phase"] = json!("repeat_global");
+            }
         } else {
             row["client_expect_unsupported"] = json!(true);
         }

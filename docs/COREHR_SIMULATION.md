@@ -77,6 +77,17 @@ Department member queries use an explicit 1,000-row limit; no claim is made that
 this is an unbounded membership listing. Paged storage verification does not
 mean Gremlin supports continuation tokens or offset pagination.
 
+Client fixture checks have three predetermined independent phases: the existing
+96 cases, 21 explicit-repeat cases, and 7 global-repeat cases. Each phase captures
+one ordinary 60-second read session, executes its cases once in manifest order,
+and drops it before the next phase. The harness never renews a session, retries
+an expired query, adapts phase boundaries to timing, or increases a resource
+limit. A full-fixture snapshot-capacity rejection is asserted once before any
+client query and stops all later client phases. Evidence validation checks every
+phase acquisition and query in order, so a skipped case or extra acquisition
+fails. These independent static-fixture phases do not claim a shared snapshot
+across phases or change the managed fixed-version lifetime guarantees.
+
 This integrated harness additionally includes the incoming-query implementation
 from the separately reviewed incoming-query candidate; its exact production-file hashes are recorded with the
 experiment. See `COREHR_HIERARCHY_RESULTS.md` for native bounded-repeat validation,

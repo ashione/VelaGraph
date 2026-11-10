@@ -1,13 +1,33 @@
 import copy
 import unittest
-from corehr_ci import validate
+from corehr_ci import validate, validate_client_phases
+
+
+def client_evidence(cases):
+    rows = []
+    for phase in ('legacy', 'repeat_explicit', 'repeat_global'):
+        group = [c for c in cases if c.get('client_phase', 'legacy') == phase]
+        if not group and phase != 'legacy':
+            continue
+        rows.append({'event': 'client_session', 'phase': phase, 'planned_cases': len(group),
+                     'error': None, 'error_category': None, 'skip_reason': None})
+        for case in group:
+            error = 'client_expected' not in case and (
+                case.get('expect_error') is True or case.get('client_expect_unsupported') is True
+                or 'client_expected_error' in case)
+            result = {'expected_rejection': 'typed rejection', 'error_category': case.get(
+                'client_expected_error', 'Unsupported')} if error else {'correct': True}
+            rows.append({'event': 'client_query', 'phase': phase, 'name': case['name'],
+                         'query': case['query'], 'result': result})
+    return rows
 
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
         self.manifest = {'shards': [{'partition': i, 'kv_rows': i} for i in range(1, 4)], 'queries': [
-            {'name': 'membership', 'server_supported': True},
-            {'name': 'unsupported', 'server_expected_error': 'Unsupported'}]}
+            {'name': 'membership', 'query': 'g.V(1)', 'server_supported': True},
+            {'name': 'unsupported', 'query': 'g.V(1).unsupported()',
+             'client_expect_unsupported': True, 'server_expected_error': 'Unsupported'}]}
         self.records = [{'event': 'all_kv_verified', 'shard': i, 'rows': i} for i in range(1, 4)]
         self.records += [
             {'event': 'server_query', 'name': 'membership', 'latency': {},
@@ -17,6 +37,7 @@ class EvidenceTests(unittest.TestCase):
             {'event': 'application_chain', 'correct': True},
             {'event': 'application_chain', 'correct': True},
             {'event': 'resources', 'complete': True, 'query_failures': 0}]
+        self.records[-1:-1] = client_evidence(self.manifest['queries'])
 
     def test_complete(self):
         self.assertEqual(validate(self.records, self.manifest)['queries'], 2)
@@ -56,7 +77,8 @@ class EvidenceTests(unittest.TestCase):
                   'department_exact6': 1094, 'ceo_emit32_dedup': 199999,
                   'duplicate_ceo_emit32_dedup': 199999, 'department_emit32_dedup': 4999}
         stamps = [{'shard': i, 'epoch': 1, 'sequence': 2, 'identity': {'group': i, 'node': 1}} for i in range(1, 4)]
-        rows = self.records[:3]
+        rows = self.records[:3] + [{'event': 'client_session', 'phase': 'legacy',
+                                   'planned_cases': 0, 'error': None, 'error_category': None, 'skip_reason': 'jobs_matrix'}]
         for name, phase, sample in ([(name, 'matrix', sample) for name in counts for sample in range(3)]
                                     + [(name, 'probe', 0) for name in ['department_emit32', 'ceo_emit32_dedup']]):
             key = {'name': name, 'phase': phase, 'sample': sample}
@@ -184,11 +206,12 @@ class EvidenceTests(unittest.TestCase):
 
     def test_reject_overlapping_or_interrupted_jobs(self):
         records = self.job_records()
+        start = next(i for i, row in enumerate(records) if row['event'] == 'job_begin')
         rows = copy.deepcopy(records)
-        rows[4], rows[8] = rows[8], rows[4]
+        rows[start + 1], rows[start + 5] = rows[start + 5], rows[start + 1]
         with self.assertRaises(ValueError):
             validate(rows, self.manifest, jobs=True)
-        rows = records[:4] + [{'event': 'load'}] + records[4:]
+        rows = records[:start + 1] + [{'event': 'load'}] + records[start + 1:]
         with self.assertRaises(ValueError):
             validate(rows, self.manifest, jobs=True)
 
@@ -244,6 +267,121 @@ class EvidenceTests(unittest.TestCase):
             rows = remaining[:index] + [completion] + remaining[index:]
             with self.subTest(index=index), self.assertRaises(ValueError):
                 validate(rows, self.manifest, jobs=True)
+
+
+class ClientPhaseTests(unittest.TestCase):
+    def setUp(self):
+        self.manifest = {'shards': [{'partition': i, 'kv_rows': i, 'raw_bytes': 100}
+                                    for i in range(1, 4)], 'queries': [
+            {'name': 'old', 'query': 'g.V(1)'},
+            {'name': 'broad', 'query': 'g.V(1).repeat(__.in()).emit().times(32)',
+             'client_phase': 'repeat_explicit', 'expect_error': True,
+             'client_expected': {'count': 1999}},
+            {'name': 'too_deep', 'query': 'g.V(1).out().repeat(__.out()).times(32)',
+             'expect_error': True, 'client_expected_error': 'ResourceExhausted'},
+            {'name': 'global', 'query': "g.V().has('id',1).repeat(__.out()).times(2)",
+             'client_phase': 'repeat_global'}]}
+        self.rows = client_evidence(self.manifest['queries'])
+
+    def test_fixed_phases_and_client_override(self):
+        validate_client_phases(self.rows, self.manifest, False)
+        self.assertEqual([r['name'] for r in self.rows if r['event'] == 'client_query'],
+                         ['old', 'too_deep', 'broad', 'global'])
+
+    def test_every_missing_duplicate_or_reordered_client_event_rejects(self):
+        for i in range(len(self.rows)):
+            for rows in (self.rows[:i] + self.rows[i + 1:],
+                         self.rows[:i] + [self.rows[i]] + self.rows[i:]):
+                with self.subTest(index=i), self.assertRaises(ValueError):
+                    validate_client_phases(rows, self.manifest, False)
+        for i in range(len(self.rows) - 1):
+            rows = copy.deepcopy(self.rows)
+            rows[i], rows[i + 1] = rows[i + 1], rows[i]
+            with self.subTest(swap=i), self.assertRaises(ValueError):
+                validate_client_phases(rows, self.manifest, False)
+
+    def test_wrong_phase_count_query_or_oracle_rejects(self):
+        mutations = [
+            (0, 'phase', 'repeat_explicit'), (0, 'planned_cases', True),
+            (0, 'planned_cases', 3), (0, 'skip_reason', 'jobs_matrix'),
+            (1, 'phase', 'repeat_global'), (1, 'query', 'g.V(2)'),
+            (1, 'result', {'correct': False}),
+            (2, 'result', {'expected_rejection': 'typed', 'error_category': 'Unsupported'}),
+            (2, 'result', {'correct': True}),
+        ]
+        for index, key, value in mutations:
+            rows = copy.deepcopy(self.rows)
+            rows[index][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                validate_client_phases(rows, self.manifest, False)
+
+    def test_no_timeout_refresh_or_later_capacity_rejection(self):
+        for i, row in enumerate(self.rows):
+            if row['event'] != 'client_session':
+                continue
+            for error in ('Timeout', 'ResourceExhausted'):
+                rows = copy.deepcopy(self.rows)
+                rows[i]['error'] = error
+                with self.subTest(index=i, error=error), self.assertRaises(ValueError):
+                    validate_client_phases(rows, self.manifest, False)
+
+    def test_large_fixture_capacity_failure_occurs_once_before_queries(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest['shards'][0]['kv_rows'] = 200_001
+        first = {**self.rows[0], 'error': 'Route(Storage(ResourceExhausted))',
+                 'error_category': 'ResourceExhausted'}
+        validate_client_phases([first], manifest, False)
+        with self.assertRaises(ValueError):
+            validate_client_phases([first], self.manifest, False)
+        for suffix in ([first], self.rows[1:]):
+            with self.assertRaises(ValueError):
+                validate_client_phases([first] + suffix, manifest, False)
+
+    def test_capacity_evidence_requires_typed_category_and_integer_bytes(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest['shards'][0]['raw_bytes'] = 16 * 1024 * 1024 + 1
+        first = {**self.rows[0], 'error': 'Route(Storage(ResourceExhausted))',
+                 'error_category': 'ResourceExhausted'}
+        validate_client_phases([first], manifest, False)
+        for category in (None, 'Timeout', 'Unexpected'):
+            with self.assertRaises(ValueError):
+                validate_client_phases([{**first, 'error': 'Timeout("ResourceExhausted")',
+                                         'error_category': category}], manifest, False)
+        for value in (True, -1, 1.5, '16777217', None):
+            bad = copy.deepcopy(manifest)
+            bad['shards'][1]['raw_bytes'] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_client_phases([first], bad, False)
+        for field in ('error', 'error_category'):
+            missing = dict(first)
+            del missing[field]
+            with self.assertRaises(ValueError):
+                validate_client_phases([missing], manifest, False)
+        rows = copy.deepcopy(self.rows)
+        rows[0]['error_category'] = 'ResourceExhausted'
+        with self.assertRaises(ValueError):
+            validate_client_phases(rows, self.manifest, False)
+
+    def test_matrix_admission_has_explicit_zero_query_scope(self):
+        rows = [{'event': 'client_session', 'phase': 'legacy', 'planned_cases': 0,
+                 'error': None, 'error_category': None, 'skip_reason': 'jobs_matrix'}]
+        validate_client_phases(rows, self.manifest, True)
+        for changes in ({'skip_reason': None}, {'planned_cases': 1}, {'phase': 'repeat_explicit'}):
+            with self.assertRaises(ValueError):
+                validate_client_phases([{**rows[0], **changes}], self.manifest, True)
+        with self.assertRaises(ValueError):
+            validate_client_phases(rows + [self.rows[1]], self.manifest, True)
+
+    def test_manifest_phase_or_duplicate_case_rejects(self):
+        for phase in (None, 'dynamic_retry', 1):
+            manifest = copy.deepcopy(self.manifest)
+            manifest['queries'][0]['client_phase'] = phase
+            with self.assertRaises(ValueError):
+                validate_client_phases(self.rows, manifest, False)
+        manifest = copy.deepcopy(self.manifest)
+        manifest['queries'].append(manifest['queries'][0])
+        with self.assertRaises(ValueError):
+            validate_client_phases(self.rows, manifest, False)
 
 
 if __name__ == '__main__':
