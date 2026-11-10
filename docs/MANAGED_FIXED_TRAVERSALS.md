@@ -215,3 +215,40 @@ The original managed Read, local/v1 queries, legacy observed v1/v2 APIs and
 server-coordinator global/hierarchy query shapes are not expanded by this slice.
 Older shared executors reject the new scalar compositions; upgrade the executor
 to use them.
+
+## Dynamic reference-model acceptance
+
+The ordinary independent-process test
+`exact_old_prefix_captures_while_other_transactions_commit` additionally runs a
+generic input-only graph model from
+[`dynamic_query_model.rs`](../crates/replicated-graph/tests/support/dynamic_query_model.rs).
+It reuses the same three durable child processes sequentially, keeping the
+parent's graph access TCP-only and the original exact-prefix assertions intact.
+
+A fixed script performs 21 managed writes: qualified vertex and edge creation,
+vertex/edge property updates and removal, and permanent edge deletion. The
+reference state is built only from these inputs, with exhaustive vector scans
+and linear equality checks rather than the engine's parser, adjacency indexes,
+snapshot reducer or traversal helpers. The fixture includes cross-partition ID
+ties, local and cross-shard edges, parallel edges, a cycle, a self-loop, strict
+typed values, and missing properties distinct from stored Null.
+
+Thirteen query shapes compare complete ordered rows and provenance at every new
+version. They cover global identities, properties, both-direction bags,
+dedup/limit ordering, two-hop paths, edge endpoints, property filters and counts.
+Two retained versions also replay complete path/scalar pages while later
+submissions run. Each page's offset, total, row, end marker and replayed token
+are checked against the model, with a loop bounded by the expected row count.
+No assertion assumes a particular internal write/read scheduling order.
+
+All 22 model versions, including the empty model before construction, are
+reacquired and compared before and after restarting the gateway and all three
+children. Old sessions and transplanted old-incarnation cursors must reject;
+fresh historical sessions still reproduce the model. To distinguish incarnation
+fencing from an old session's possible TTL expiry, a live new session/token and
+cursor with only the old incarnation substituted must reject, while the
+unchanged new session succeeds. This exercises durable
+reopen, not snapshot installation, purge safety, partial-apply fault injection
+or full-scale capacity. Existing separate tests retain their fault/recovery
+coverage. This small same-host semantic test does not complete #110/#111 or
+change any production resource limit, deadline or supported query shape.

@@ -1787,9 +1787,9 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::Result<()> {
-    let coordinator = Process::start(9).await?;
-    let a = Process::start(7).await?;
-    let b = Process::start(8).await?;
+    let mut coordinator = Process::start(9).await?;
+    let mut a = Process::start(7).await?;
+    let mut b = Process::start(8).await?;
     let g = Gateway::bind_remote(
         RemoteConfig {
             coordinator: coordinator.client()?,
@@ -1863,9 +1863,14 @@ async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::
     call(&g, Operation::Close { session: latest }).await?;
     eprintln!("concurrent exact-prefix captures: 6 fixed V2 acquisitions, 4 new commits, final V6; child PIDs {:?}",
         [coordinator.child.id(), a.child.id(), b.child.id()]);
-    g.shutdown().await;
+    // Reuse this fixture sequentially: the model adds no parallel child cohort
+    // and leaves all original exact-prefix assertions above intact.
+    dynamic_query_model::scenario(g, &mut coordinator, &mut a, &mut b).await?;
     Ok(())
 }
+
+#[path = "support/dynamic_query_model.rs"]
+mod dynamic_query_model;
 
 #[path = "support/lifecycle_metrics.rs"]
 mod lifecycle_metrics;
