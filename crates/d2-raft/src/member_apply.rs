@@ -72,6 +72,24 @@ impl StateMachine {
         &'db self,
         state: &'cut StateMachineData,
     ) -> Result<Option<event_ledger::VerifiedArchive<'db, 'cut>>, D1Error> {
+        self.verify_member_archive(state, event_ledger::verify_active)
+    }
+
+    pub(super) fn verified_member_apply<'db, 'cut>(
+        &'db self,
+        state: &'cut StateMachineData,
+    ) -> Result<Option<(event_ledger::VerifiedArchive<'db, 'cut>, Vec<Transaction>)>, D1Error> {
+        self.verify_member_archive(state, event_ledger::verify_member_apply)
+    }
+
+    fn verify_member_archive<'db, 'cut, T>(
+        &'db self,
+        state: &'cut StateMachineData,
+        verify: impl FnOnce(
+            &'db rocksdb::DB,
+            &'cut event_ledger::PublishedArchiveCut,
+        ) -> Result<T, D1Error>,
+    ) -> Result<Option<T>, D1Error> {
         let Some(visibility) = state.d1.as_ref().and_then(|d1| d1.visibility.as_ref()) else {
             return Ok(None);
         };
@@ -90,7 +108,7 @@ impl StateMachine {
         }
         #[cfg(test)]
         self.member_verifications.fetch_add(1, Ordering::Relaxed);
-        event_ledger::verify_active(&storage.db, cut).map(Some)
+        verify(&storage.db, cut).map(Some)
     }
 
     pub(super) fn apply_member_entries<I>(
@@ -106,8 +124,8 @@ impl StateMachine {
             .storage
             .as_ref()
             .ok_or_else(|| fail(anyhow::anyhow!("active member lacks disk")))?;
-        let verified = self
-            .verified_member(sm)
+        let (verified, verified_tail) = self
+            .verified_member_apply(sm)
             .map_err(|e| fail(anyhow::anyhow!("member archive: {e:?}")))?
             .ok_or_else(|| fail(anyhow::anyhow!("active member lacks publication cut")))?;
         let old_a = sm.d1.as_ref().unwrap().visibility.as_ref().unwrap().applied;
@@ -131,7 +149,11 @@ impl StateMachine {
         let tail_records =
             if old_a.is_multiple_of(crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64) {
                 Vec::new()
+            } else if old_a == verified.terminal_through() {
+                verified_tail
             } else {
+                // Invalid in-memory A must follow the original projection and
+                // tail-check error path, after the original key/get operations.
                 let first = old_a / crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64
                     * crate::terminal_prefix::SEGMENT_TRANSACTIONS as u64
                     + 1;
