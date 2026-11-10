@@ -24,6 +24,7 @@ enum Op {
     Has(&'static str, Option<Value>),
     Limit(usize),
     Hop(bool, Option<&'static str>),
+    Both(Option<&'static str>),
     Repeat(bool, Option<&'static str>, usize, bool),
     Dedup,
     Count,
@@ -46,6 +47,10 @@ fn text(ops: &[Op]) -> String {
                 if *incoming { "in" } else { "out" },
                 label.map(|s| format!("'{s}'")).unwrap_or_default()
             ),
+            Op::Both(label) => format!(
+                ".both({})",
+                label.map(|s| format!("'{s}'")).unwrap_or_default()
+            ),
             Op::Repeat(incoming, label, times, emit) => format!(
                 ".repeat(__.{}({})).times({times}){}",
                 if *incoming { "in" } else { "out" },
@@ -63,10 +68,12 @@ fn text(ops: &[Op]) -> String {
 fn oracle(model: &Model, ops: &[Op]) -> Vec<QueryRow> {
     let ids: Vec<Id> = model.vertices.keys().copied().collect();
     let mut result = evaluate(model, ids, ops);
-    if !ops
-        .iter()
-        .any(|op| matches!(op, Op::Hop(..) | Op::Repeat(..) | Op::Limit(_) | Op::Count))
-    {
+    if !ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::Hop(..) | Op::Both(..) | Op::Repeat(..) | Op::Limit(_) | Op::Count
+        )
+    }) {
         result.truncate(100);
     }
     result
@@ -101,6 +108,31 @@ fn evaluate(model: &Model, mut ids: Vec<Id>, ops: &[Op]) -> Vec<QueryRow> {
                         let endpoint = if *incoming { edge.from } else { edge.to };
                         expanded.push((endpoint.partition, endpoint.id));
                     }
+                }
+                ids = expanded;
+            }
+            Op::Both(label) => {
+                let mut expanded = Vec::new();
+                for current in ids {
+                    // Iterate fixture edges once: an exact self-loop has one
+                    // identity, whereas parallel edges retain separate rows.
+                    let mut edges: Vec<_> = model
+                        .edges
+                        .iter()
+                        .filter(|e| {
+                            ((e.from.partition, e.from.id) == current
+                                || (e.to.partition, e.to.id) == current)
+                                && label.is_none_or(|l| e.label == l)
+                        })
+                        .collect();
+                    edges.sort_by_key(|e| (e.id, e.from.partition));
+                    expanded.extend(edges.into_iter().map(|e| {
+                        if (e.from.partition, e.from.id) == current {
+                            (e.to.partition, e.to.id)
+                        } else {
+                            (e.from.partition, e.from.id)
+                        }
+                    }));
                 }
                 ids = expanded;
             }
@@ -282,6 +314,49 @@ fn export(model: &Model, missing: Option<bool>) -> anyhow::Result<Vec<Export>> {
 fn cases() -> Vec<Vec<Op>> {
     use Op::*;
     let mut cases = vec![
+        vec![Label("node"), Both(Some("a"))],
+        vec![Label("node"), Both(None), Map],
+        vec![Label("node"), Both(None), Dedup, Map],
+        vec![Label("node"), Limit(1), Both(Some("many")), Count],
+        vec![Label("node"), Limit(1), Both(Some("many")), Dedup, Count],
+        vec![
+            Label("node"),
+            Both(Some("a")),
+            Limit(3),
+            Has("active", Some(Value::Boolean(true))),
+            Map,
+        ],
+        vec![
+            Label("node"),
+            Both(Some("a")),
+            Has("active", Some(Value::Boolean(true))),
+            Limit(3),
+            Map,
+        ],
+        vec![
+            Label("node"),
+            Limit(2),
+            Both(Some("a")),
+            Hop(true, Some("b")),
+            Both(Some("a")),
+            Count,
+        ],
+        vec![
+            Label("node"),
+            Limit(1),
+            Both(Some("a")),
+            Repeat(false, Some("b"), 2, true),
+            Count,
+        ],
+        vec![
+            Label("node"),
+            Limit(1),
+            Repeat(true, Some("b"), 2, false),
+            Both(Some("a")),
+            Map,
+        ],
+        vec![Label("none"), Both(None), Map],
+        vec![Label("none"), Both(None), Count],
         vec![Dedup, Hop(false, Some("many")), Count],
         vec![Dedup, Hop(false, Some("many")), Dedup, Count],
         vec![Label("node"), Dedup, Limit(7), Hop(true, Some("a")), Map],
@@ -405,6 +480,14 @@ fn cases() -> Vec<Vec<Op>> {
         vec![Label("none"), Hop(false, None), Count],
     ];
     for n in [1, 127, 128, 129, 255, 256] {
+        cases.push(vec![Label("page"), Limit(n), Both(Some("page")), Count]);
+        cases.push(vec![
+            Label("page"),
+            Has("active", Some(Value::Boolean(true))),
+            Limit(n),
+            Both(Some("page")),
+            Count,
+        ]);
         cases.push(vec![
             Label("page"),
             Limit(n),
@@ -482,6 +565,9 @@ fn cases() -> Vec<Vec<Op>> {
                 Has("active", Some(Value::Boolean(true))),
                 Limit(3),
             ],
+            vec![Both(Some("many"))],
+            vec![Label("node"), Both(None), Dedup],
+            vec![Label("none"), Both(None)],
             vec![Hop(false, Some("many"))],
             vec![Label("node"), Hop(false, None)],
             vec![Label("node"), Hop(true, None), Dedup],
@@ -576,6 +662,21 @@ async fn global_join_matches_independent_seeded_ordered_oracle() -> anyhow::Resu
                 actual.rows
             );
         }
+        for suffix in ["limit(1).count()", "dedup().limit(1).count()"] {
+            let result = distributed::query(
+                service.local_addr(),
+                DistributedRequest {
+                    start_partition: 11,
+                    text: format!("g.V().hasLabel('node').limit(1).both('a').repeat(__.out('a')).times(31).{suffix}"),
+                    timeout_millis: 5000,
+                },
+                BUDGET,
+            ).await?;
+            ensure!(
+                matches!(result, Err(QueryFailure::ResourceExhausted)),
+                "both repeat cumulative work: {result:?}"
+            );
+        }
         // A tiny downstream answer cannot forgive cumulative repeated work.
         for depth in [1, 32] {
             let result = distributed::query(
@@ -660,6 +761,8 @@ async fn global_join_late_corruption_is_not_hidden_by_filter_or_limit() -> anyho
         .await?;
         let direction = if missing_source { "in" } else { "out" };
         for query in [
+            "g.V().hasLabel('node').both('absent').dedup().limit(1).count()".into(),
+            "g.V().hasLabel('node').both().values('absent')".into(),
             format!("g.V().hasLabel('node').{direction}().count()"),
             format!("g.V().hasLabel('node').{direction}().values('absent')"),
             format!(

@@ -1,5 +1,7 @@
 //! Deterministic synthetic CoreHR ground truth. No database reads in this oracle.
 use serde_json::{json, Value};
+#[path = "bidirectional.rs"]
+mod bidirectional;
 #[path = "batch_relationships.rs"]
 mod batch_relationships;
 #[path = "global_relationships.rs"]
@@ -630,6 +632,7 @@ impl Model {
                 case["server_supported"] = json!(true);
             }
         }
+        q.extend(bidirectional::queries(self));
         q.extend(batch_relationships::queries(self));
         q.extend(sync_projection::queries(self));
         q.extend(global_relationships::queries(self));

@@ -8,7 +8,9 @@ pub(super) fn validate_depth(query: &GremlinQuery) -> Result<(), QueryFailure> {
     let mut repeats = 0;
     for step in query.steps() {
         match step {
-            Step::Existing(GremlinStep::In(_) | GremlinStep::Out(_)) => depth += 1,
+            Step::Existing(GremlinStep::In(_) | GremlinStep::Out(_) | GremlinStep::Both(_)) => {
+                depth += 1
+            }
             Step::Repeat { times, .. } => {
                 repeats += 1;
                 if *times == 0 {
@@ -30,14 +32,14 @@ pub(super) fn validate_depth(query: &GremlinQuery) -> Result<(), QueryFailure> {
     Ok(())
 }
 
-pub(super) fn path_directions(query: &GremlinQuery) -> Vec<Vec<bool>> {
+pub(super) fn path_directions(query: &GremlinQuery) -> Vec<Vec<Direction>> {
     let mut paths = vec![Vec::new()];
     for step in query.steps() {
         match step {
-            Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_)) => {
-                let incoming = matches!(step, Step::Existing(GremlinStep::In(_)));
+            Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Both(_)) => {
+                let direction = Direction::from_step(step).expect("matched adjacency");
                 for path in &mut paths {
-                    path.push(incoming);
+                    path.push(direction);
                 }
             }
             Step::Repeat {
@@ -50,7 +52,10 @@ pub(super) fn path_directions(query: &GremlinQuery) -> Vec<Vec<bool>> {
                 for path in paths {
                     for depth in if *emit { 1..=*times } else { *times..=*times } {
                         let mut next = path.clone();
-                        next.extend(std::iter::repeat_n(*incoming, depth));
+                        next.extend(std::iter::repeat_n(
+                            Direction::from_incoming(*incoming),
+                            depth,
+                        ));
                         expanded.push(next);
                     }
                 }
@@ -75,7 +80,9 @@ impl Execution<'_> {
         for depth in 1..=times {
             check(self.end)?;
             self.cost.charge(0, 1, CEILING)?;
-            rows = self.expand(rows, incoming, label).await?;
+            rows = self
+                .expand(rows, Direction::from_incoming(incoming), label)
+                .await?;
             if rows.is_empty() {
                 break;
             }
@@ -182,9 +189,15 @@ mod tests {
         assert_eq!(
             path_directions(&query),
             vec![
-                vec![false, true, false],
-                vec![false, true, true, false],
-                vec![false, true, true, true, false]
+                vec![Direction::Out, Direction::In, Direction::Out],
+                vec![Direction::Out, Direction::In, Direction::In, Direction::Out],
+                vec![
+                    Direction::Out,
+                    Direction::In,
+                    Direction::In,
+                    Direction::In,
+                    Direction::Out
+                ]
             ]
         );
         let vertex = |p| QualifiedElement::Vertex {
