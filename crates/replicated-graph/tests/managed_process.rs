@@ -40,6 +40,9 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUDGET: Duration = Duration::from_secs(15);
+// Independent retained-view fixture phases share this test runner's resources.
+// Serialize only those phases, never their internal concurrent graph operations.
+static RETAINED_FIXTURE_PHASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const CHILD_ENV: &str = "MANAGED_PROCESS_DIRECTORY";
 fn authority() -> Authority {
     Authority {
@@ -1066,6 +1069,8 @@ async fn scenario() -> anyhow::Result<()> {
     .await?;
     // Separate short phase: never lengthen the earlier TTL-tight retained
     // fixture, and never replace its unrolled traversal assertions.
+    // Wait only after the original sessions close and before opening ours.
+    let _fixture_phase = RETAINED_FIXTURE_PHASE.lock().await;
     let (repeat_version, repeat_rows) = fixed_version_repeat_scenario(&reopened).await?;
     reopened.shutdown().await;
     a.stop()?;
@@ -2049,6 +2054,8 @@ async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::
         [coordinator.child.id(), a.child.id(), b.child.id()]);
     // Reuse this fixture sequentially: the model adds no parallel child cohort
     // and leaves all original exact-prefix assertions above intact.
+    // All prefix sessions are closed; do not overlap the new independent phase.
+    let _fixture_phase = RETAINED_FIXTURE_PHASE.lock().await;
     dynamic_query_model::scenario(g, &mut coordinator, &mut a, &mut b).await?;
     Ok(())
 }
