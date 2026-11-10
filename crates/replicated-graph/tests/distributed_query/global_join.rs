@@ -470,6 +470,18 @@ fn cases() -> Vec<Vec<Op>> {
     // Include >100 equal scalars, missing versus Null, and both limit positions.
     for key in ["name", "nullable", "absent", "typed", "active"] {
         for prefix in [
+            vec![Limit(1)],
+            vec![Limit(129)],
+            vec![Limit(1000)],
+            vec![Dedup, Limit(1000), Dedup],
+            vec![Label("none"), Limit(1000)],
+            vec![Limit(7), Has("active", Some(Value::Boolean(true)))],
+            vec![Has("active", Some(Value::Boolean(true))), Limit(7)],
+            vec![
+                Limit(129),
+                Has("active", Some(Value::Boolean(true))),
+                Limit(3),
+            ],
             vec![Hop(false, Some("many"))],
             vec![Label("node"), Hop(false, None)],
             vec![Label("node"), Hop(true, None), Dedup],

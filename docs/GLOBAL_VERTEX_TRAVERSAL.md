@@ -30,7 +30,9 @@ Terminal `values(key)` emits one scalar per traverser with that property, preser
 ordered bag multiplicity and qualified vertex provenance. Missing properties emit
 no row; present Null emits Null. Equal scalars are not deduplicated. Filters and
 limits preceding values retain their original vertex-stream positions.
-No-hop values, multiple keys and any step following values remain Unsupported.
+No-hop values requires an explicit preceding vertex limit under the separate
+[scan-only contract](SERVER_GLOBAL_SCAN.md). Multiple keys and any step following
+values remain Unsupported.
 Values uses the existing fixed-session property fragment and traversal charges;
 there is no new budget, implicit 100-row truncation, session refresh or wire format.
 No-hop `dedup`/`valueMap` follow the separate [scan-only contract](SERVER_GLOBAL_SCAN.md).
