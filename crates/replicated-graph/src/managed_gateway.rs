@@ -19,8 +19,13 @@ use rocksdb_sql_table::{
     Value, Vertex,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[path = "managed_gateway_jobs.rs"]
+mod jobs;
 #[path = "managed_gateway_local.rs"]
 mod local;
+pub use jobs::{JobGrant, JobHandle, JobPhase, JobPolicy, JobStatus};
+#[path = "managed_query_lifecycle.rs"]
+mod lifecycle;
 #[path = "managed_gateway_pages.rs"]
 mod pages;
 #[path = "managed_gateway_query.rs"]
@@ -64,6 +69,8 @@ static CLIENT_ADMISSION: Semaphore = Semaphore::const_new(MAX_CONNECTIONS);
 pub enum Error {
     #[error("invalid managed gateway protocol")]
     Protocol,
+    #[error("query job is not ready or has a pending lease round")]
+    JobBusy,
     #[error("Gremlin query rejected: {0}")]
     Query(QueryFailure),
     #[error("binding, version, or request identity mismatch")]
@@ -389,6 +396,30 @@ pub enum Operation {
     CloseLocalQuery {
         session: LocalSession,
     },
+    /// Process-local, operation-ID replayable admission. Accepted contains no rows.
+    StartLocalQueryJob {
+        operation_id: [u8; 16],
+        version: Option<u64>,
+        query: Query,
+        page_size: u16,
+        policy: JobPolicy,
+    },
+    GetLocalQueryJob {
+        job: JobHandle,
+    },
+    RenewLocalQueryJob {
+        job: JobHandle,
+        expected_generation: u64,
+    },
+    FetchLocalQueryJob {
+        job: JobHandle,
+        query: Query,
+        cursor: Option<PageCursor>,
+        page_size: u16,
+    },
+    CancelLocalQueryJob {
+        job: JobHandle,
+    },
 }
 /// Durable decision and whole-cohort visibility are distinct observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,6 +497,30 @@ pub enum Reply {
         page: QueryPage,
     },
     CloseLocalQuery(LocalSession),
+    StartLocalQueryJob {
+        operation_id: [u8; 16],
+        job: JobHandle,
+    },
+    GetLocalQueryJob {
+        job: JobHandle,
+        status: JobStatus,
+    },
+    RenewLocalQueryJob {
+        job: JobHandle,
+        grant: JobGrant,
+    },
+    FetchLocalQueryJob {
+        job: JobHandle,
+        query: Query,
+        cursor: Option<PageCursor>,
+        page_size: u16,
+        version: u64,
+        page: QueryPage,
+    },
+    CancelLocalQueryJob {
+        job: JobHandle,
+        status: JobStatus,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -594,6 +649,10 @@ struct State {
     incarnation: [u8; 16],
     sessions: Mutex<BTreeMap<[u8; 32], Arc<Retained>>>,
     local_sessions: Mutex<BTreeMap<[u8; 32], Arc<local::Retained>>>,
+    jobs: Mutex<BTreeMap<[u8; 16], Arc<jobs::Job>>>,
+    job_tasks: Mutex<JoinSet<()>>,
+    job_rpc_budget: Duration,
+    jobs_stopping: std::sync::atomic::AtomicBool,
     memory: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     submit: tokio::sync::Mutex<()>,
@@ -601,6 +660,7 @@ struct State {
 }
 impl State {
     fn expire(&self) {
+        self.expire_jobs();
         self.local_sessions
             .lock()
             .unwrap()
@@ -679,7 +739,7 @@ impl State {
         .map_err(|_| Error::Unknown)?
     }
     async fn execute(
-        &self,
+        self: &Arc<Self>,
         operation: Operation,
         work: Arc<OwnedSemaphorePermit>,
         end: Instant,
@@ -874,6 +934,30 @@ impl State {
                 self.local_sessions.lock().unwrap().remove(&session.token);
                 Ok(Reply::CloseLocalQuery(session))
             }
+            Operation::StartLocalQueryJob {
+                operation_id,
+                version,
+                query,
+                page_size,
+                policy,
+            } => self.start_job(operation_id, version, query, page_size, policy),
+            Operation::GetLocalQueryJob { job } => self.job_status(job, false),
+            Operation::CancelLocalQueryJob { job } => self.job_status(job, true),
+            Operation::RenewLocalQueryJob {
+                job,
+                expected_generation,
+            } => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(end),
+                self.renew_job(job, expected_generation, end),
+            )
+            .await
+            .map_err(|_| Error::Unknown)?,
+            Operation::FetchLocalQueryJob {
+                job,
+                query,
+                cursor,
+                page_size,
+            } => self.fetch_job(job, query, cursor, page_size),
             Operation::Close { session } => {
                 self.get(&session)?
                     .closed
@@ -951,6 +1035,10 @@ impl Gateway {
             incarnation: random()?,
             sessions: Mutex::new(BTreeMap::new()),
             local_sessions: Mutex::new(BTreeMap::new()),
+            jobs: Mutex::new(BTreeMap::new()),
+            job_tasks: Mutex::new(JoinSet::new()),
+            job_rpc_budget: deadline.min(Duration::from_secs(5)),
+            jobs_stopping: std::sync::atomic::AtomicBool::new(false),
             memory: Arc::new(Semaphore::new(MAX_SESSIONS)),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             submit: tokio::sync::Mutex::new(()),
@@ -1003,8 +1091,12 @@ impl Gateway {
                     }
                 });
             }
+            worker.cancel_jobs();
             handlers.abort_all();
             while handlers.join_next().await.is_some() {}
+            let mut jobs = std::mem::take(&mut *worker.job_tasks.lock().unwrap());
+            while jobs.join_next().await.is_some() {}
+            worker.jobs.lock().unwrap().clear();
             worker.sessions.lock().unwrap().clear();
             worker.local_sessions.lock().unwrap().clear();
         });
@@ -1062,6 +1154,15 @@ async fn serve(
     let request: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await?;
     let end = if matches!(
         request.operation,
+        Operation::StartLocalQueryJob { .. }
+            | Operation::GetLocalQueryJob { .. }
+            | Operation::RenewLocalQueryJob { .. }
+            | Operation::FetchLocalQueryJob { .. }
+            | Operation::CancelLocalQueryJob { .. }
+    ) {
+        end.min(Instant::now() + Duration::from_secs(5))
+    } else if matches!(
+        request.operation,
         Operation::Read { .. }
             | Operation::Traverse { .. }
             | Operation::TraversePage { .. }
@@ -1107,6 +1208,10 @@ async fn serve(
         }
         _ => None,
     };
+    let job_retained = match &response.result {
+        Ok(Reply::FetchLocalQueryJob { job, .. }) => Some(state.get_job(job)?),
+        _ => None,
+    };
     let expiry = match &response.result {
         Ok(
             Reply::OpenSession(s)
@@ -1117,9 +1222,10 @@ async fn serve(
         Ok(Reply::OpenLocalQuery { session, .. } | Reply::FetchLocalQuery { session, .. }) => {
             Some(state.get_local(session)?.expires)
         }
+        Ok(Reply::RenewLocalQueryJob { job, .. }) => Some(state.get_job(job)?.deadline()?),
         _ => None,
     };
-    let (bytes, success, local_retained) = tokio::task::spawn_blocking(move || {
+    let (bytes, success, local_retained, job_retained) = tokio::task::spawn_blocking(move || {
         let _work = work;
         let encoded = match encode(&response, MAX_RESPONSE_BYTES) {
             Ok(bytes) => bytes,
@@ -1138,7 +1244,15 @@ async fn serve(
         if Instant::now() >= end {
             return Err(Error::Unknown);
         }
-        Ok((encoded, response.result.is_ok(), local_retained))
+        if let Some(job) = &job_retained {
+            job.live_ready()?;
+        }
+        Ok((
+            encoded,
+            response.result.is_ok(),
+            local_retained,
+            job_retained,
+        ))
     })
     .await
     .map_err(|_| Error::Unknown)??;
@@ -1150,7 +1264,15 @@ async fn serve(
         // after it. timeout_at alone can poll an immediately-ready write first.
         local::live(retained, end)?;
     }
+    if let Some(job) = &job_retained {
+        job.live_ready()?;
+    }
     let write_end = expiry.map_or(end, |expiry| expiry.min(end));
+    let write_end = if let Some(job) = &job_retained {
+        write_end.min(job.deadline()?)
+    } else {
+        write_end
+    };
     let sent = tokio::time::timeout_at(
         tokio::time::Instant::from_std(write_end),
         write_bytes(&mut socket, &bytes),
@@ -1330,6 +1452,57 @@ fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
                 && local::valid_page(query, cursor.as_ref(), *page_size, page, &request.binding)
         }
         (Operation::CloseLocalQuery { session }, Reply::CloseLocalQuery(s)) => session == s,
+        (
+            Operation::StartLocalQueryJob { operation_id, .. },
+            Reply::StartLocalQueryJob {
+                operation_id: id,
+                job,
+            },
+        ) => operation_id == id && job.incarnation != [0; 16] && job.token != [0; 32],
+        (Operation::GetLocalQueryJob { job }, Reply::GetLocalQueryJob { job: j, status }) => {
+            job == j && jobs::valid_status(status)
+        }
+        (Operation::CancelLocalQueryJob { job }, Reply::CancelLocalQueryJob { job: j, status }) => {
+            job == j
+                && jobs::valid_status(status)
+                && matches!(
+                    status.phase,
+                    JobPhase::Cancelled | JobPhase::Expired | JobPhase::Failed
+                )
+        }
+        (
+            Operation::RenewLocalQueryJob {
+                job,
+                expected_generation,
+            },
+            Reply::RenewLocalQueryJob { job: j, grant },
+        ) => {
+            job == j
+                && expected_generation.checked_add(1) == Some(grant.generation)
+                && (1..=60_000).contains(&grant.remaining_millis)
+        }
+        (
+            Operation::FetchLocalQueryJob {
+                job,
+                query,
+                cursor,
+                page_size,
+            },
+            Reply::FetchLocalQueryJob {
+                job: j,
+                query: q,
+                cursor: c,
+                page_size: size,
+                page,
+                ..
+            },
+        ) => {
+            job == j
+                && query == q
+                && cursor == c
+                && page_size == size
+                && local::valid_page(query, cursor.as_ref(), *page_size, page, &request.binding)
+        }
         _ => false,
     };
     if valid {

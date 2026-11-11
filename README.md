@@ -51,6 +51,12 @@ the whole immutable result before publishing replayable pages. This M1 path keep
 the existing 10,000-row / 2 MiB / 100,000-operation capture budget; it is not a
 large-scale managed capacity increase or a replacement for old entrypoints.
 
+An opt-in [bounded query-job lifecycle](docs/MANAGED_QUERY_JOBS.md) separates
+control RPCs from finite execution, with explicit same-V renewal, cancellation
+and complete-result publication. It preserves original short-lived APIs and
+does not enlarge capture/history budgets. This experimental candidate remains
+under validation.
+
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
 rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions
 are a separate API; they do not silently upgrade observed reads. Even managed

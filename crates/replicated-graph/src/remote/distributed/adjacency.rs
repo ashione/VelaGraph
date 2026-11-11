@@ -106,7 +106,7 @@ impl Execution<'_> {
             // Each iteration consumes at least one of two <=1,000-entry lists.
             // Merge in place: no cloned/concatenated adjacency or identity set.
             while let Some((edge, reverse)) = next_hop(&mut outgoing, &mut incoming)? {
-                check(self.end)?;
+                self.check()?;
                 if direction == Direction::Both {
                     self.cost.charge(0, 1, self.ceiling)?;
                 }

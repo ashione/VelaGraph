@@ -21,7 +21,7 @@ impl Execution<'_> {
         )?;
         let mut output = Vec::with_capacity(rows.len());
         for row in rows {
-            check(self.end)?;
+            self.check()?;
             let FragmentValue::Projected { vertex, properties } = self
                 .fragment(Fragment::Project {
                     vertex: row.vertex,
@@ -130,6 +130,7 @@ mod tests {
         };
         let mut execution = Execution {
             fixed_sessions: None,
+            control: None,
             scan_cost: Cost::default(),
             catalog: &catalog,
             sessions: BTreeMap::new(),

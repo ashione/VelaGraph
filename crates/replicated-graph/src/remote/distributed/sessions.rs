@@ -9,6 +9,7 @@ use rocksdb_sql_table::{
 };
 use std::sync::Mutex;
 mod fixed_sessions;
+mod node_lease;
 
 static SESSION_SLOTS: Semaphore = Semaphore::const_new(8);
 static SESSION_BYTES: Semaphore = Semaphore::const_new(128 * 1024 * 1024);
@@ -54,7 +55,7 @@ impl Sessions {
         self.fixed_values
             .lock()
             .unwrap()
-            .retain(|_, s| now < s.node.end);
+            .retain(|_, s| s.live_at(Instant::from_std(now)));
     }
     pub(in crate::remote) async fn open(
         &self,

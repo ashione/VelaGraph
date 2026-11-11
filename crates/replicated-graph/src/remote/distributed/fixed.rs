@@ -21,6 +21,45 @@ pub(crate) struct FixedOpenRequest {
     pub(crate) ttl_millis: u64,
     pub(crate) acquire_timeout_millis: u64,
 }
+/// Opt-in lease policy. The node's hard lifetime starts before capture.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RenewableFixedOpenRequest {
+    pub(crate) open: FixedOpenRequest,
+    pub(crate) hard_lifetime_millis: u64,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RenewableFixedOpened {
+    pub(crate) opened: FixedOpened,
+    pub(crate) grant: FixedLeaseGrant,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FixedRenewRequest {
+    pub(crate) descriptor: FixedDescriptor,
+    pub(crate) generation: u64,
+    pub(crate) lease_millis: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FixedLeaseGrant {
+    pub(crate) descriptor: FixedDescriptor,
+    pub(crate) generation: u64,
+    /// Relative to the original request, including on an exact replay.
+    pub(crate) granted_millis: u64,
+}
+impl RenewableFixedOpenRequest {
+    pub(crate) fn validate(&self, shard: u64) -> Result<(), RemoteError> {
+        self.open.validate(shard)?;
+        if !(1..=120_000).contains(&self.hard_lifetime_millis)
+            || self.open.ttl_millis > self.hard_lifetime_millis
+        {
+            return Err(RemoteError::InvalidArgument);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FixedDescriptor {
@@ -222,6 +261,94 @@ pub(crate) async fn open(
         _ => Err(RemoteError::Protocol),
     }
 }
+pub(crate) fn renewable_preflight(
+    identity: RemoteIdentity,
+    request: &RenewableFixedOpenRequest,
+    end: Instant,
+) -> Result<(), RemoteError> {
+    request.validate(request.open.target.shard)?;
+    frame_size(
+        &Request {
+            version: VERSION,
+            identity: Some(identity),
+            operation: Operation::OpenRenewableFixedQuery(request.clone()),
+        },
+        end,
+    )?;
+    frame_size(
+        &Response {
+            version: VERSION,
+            result: Ok(Reply::OpenRenewableFixedQuery(RenewableFixedOpened {
+                opened: FixedOpened {
+                    descriptor: request.open.worst_descriptor(identity),
+                    retained_proof: request.open.proof.clone(),
+                    capture_cost: CaptureCost {
+                        rows: usize::MAX,
+                        bytes: usize::MAX,
+                        replay_operations: usize::MAX,
+                    },
+                },
+                grant: FixedLeaseGrant {
+                    descriptor: request.open.worst_descriptor(identity),
+                    generation: u64::MAX,
+                    granted_millis: u64::MAX,
+                },
+            })),
+        },
+        end,
+    )?;
+    Ok(())
+}
+pub(crate) async fn renewable_open(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    mut request: RenewableFixedOpenRequest,
+    duration: Duration,
+) -> Result<RenewableFixedOpened, RemoteError> {
+    let started = Instant::now();
+    let end = checked_deadline(duration, None)?;
+    renewable_preflight(identity, &request, end)?;
+    let now = Instant::now();
+    narrow_open_deadlines(
+        &mut request.open,
+        now - started,
+        end.saturating_duration_since(now),
+    )?;
+    request.hard_lifetime_millis = Duration::from_millis(request.hard_lifetime_millis)
+        .saturating_sub(now - started)
+        .as_millis() as u64;
+    match rpc(
+        endpoint,
+        Some(identity),
+        Operation::OpenRenewableFixedQuery(request),
+        end.saturating_duration_since(Instant::now()),
+        None,
+    )
+    .await?
+    {
+        Reply::OpenRenewableFixedQuery(opened) => Ok(opened),
+        _ => Err(RemoteError::Protocol),
+    }
+}
+pub(crate) async fn renew(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    request: FixedRenewRequest,
+    duration: Duration,
+) -> Result<FixedLeaseGrant, RemoteError> {
+    match rpc(
+        endpoint,
+        Some(identity),
+        Operation::RenewFixedQuery(request),
+        duration,
+        None,
+    )
+    .await?
+    {
+        Reply::RenewFixedQuery(grant) => Ok(grant),
+        _ => Err(RemoteError::Protocol),
+    }
+}
 pub(super) async fn fragment(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
@@ -297,6 +424,25 @@ mod tests {
             acquire_timeout_millis: 5000,
         }
     }
+    #[test]
+    fn renewable_policy_is_additive_and_finitely_bounded() {
+        let mut legacy = request();
+        legacy.ttl_millis = 60_001;
+        assert!(legacy.validate(7).is_err());
+        let mut renewable = RenewableFixedOpenRequest {
+            open: request(),
+            hard_lifetime_millis: 120_000,
+        };
+        renewable.validate(7).unwrap();
+        for hard in [0, 4_999, 120_001, u64::MAX] {
+            renewable.hard_lifetime_millis = hard;
+            assert!(renewable.validate(7).is_err());
+        }
+        renewable.hard_lifetime_millis = 120_000;
+        renewable.open.ttl_millis = 60_001;
+        assert!(renewable.validate(7).is_err());
+    }
+
     #[test]
     fn local_preflight_spends_original_open_lease_without_rounding_up() {
         let mut request = request();
@@ -480,6 +626,156 @@ mod tests {
         )
         .await
         .unwrap();
+        service.shutdown().await;
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_renewable_fixed_rpc_replays_grant_and_keeps_fragment_sequence() {
+        let _fixture = sessions::TEST_SESSION_FIXTURES.lock().await;
+        use d2_raft::{
+            transaction_decisions::{Command, Journal},
+            Cluster,
+        };
+        let cluster = Cluster::new();
+        let node = cluster.in_group(7).start(1).await.unwrap();
+        node.raft
+            .initialize(BTreeMap::from([(
+                1,
+                openraft::BasicNode {
+                    addr: "inproc://7/1".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+        node.raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |m| m.current_leader == Some(1) && m.last_applied.is_some(),
+                "leader",
+            )
+            .await
+            .unwrap();
+        let request = request();
+        let mut journal = Journal::new([9; 16]).unwrap();
+        journal
+            .apply(Command::BindCohort {
+                cohort: request.proof.cohort().clone(),
+            })
+            .unwrap();
+        for command in [
+            D1Command::Activate { shard: 7, epoch: 1 },
+            D1Command::EnableManagedWrites {
+                shard: 7,
+                epoch: 1,
+                expected_sequence: 0,
+                mode_id: [7; 16],
+            },
+            D1Command::EnableParticipant {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                authority: Authority {
+                    shard: 9,
+                    mode: [9; 16],
+                },
+            },
+            D1Command::EnableVersionedReads {
+                shard: 7,
+                epoch: 1,
+                mode_id: [7; 16],
+                journal,
+            },
+        ] {
+            node.raft
+                .client_write(LogCommand::D1V1(command))
+                .await
+                .unwrap()
+                .data
+                .d1
+                .unwrap()
+                .unwrap();
+        }
+        let service = GraphService::start_managed(
+            &node,
+            "127.0.0.1:0".parse().unwrap(),
+            7,
+            7,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let identity = RemoteIdentity { group: 7, node: 1 };
+        let endpoint = service.local_addr();
+        let request = RenewableFixedOpenRequest {
+            open: request,
+            hard_lifetime_millis: 120_000,
+        };
+        let opened = renewable_open(endpoint, identity, request.clone(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(opened.opened.retained_proof, request.open.proof);
+        assert_eq!(opened.grant.descriptor, opened.opened.descriptor);
+        assert_eq!(opened.grant.generation, 0);
+        let renew_request = FixedRenewRequest {
+            descriptor: opened.opened.descriptor.clone(),
+            generation: 1,
+            lease_millis: 60_000,
+        };
+        let grant = renew(
+            endpoint,
+            identity,
+            renew_request.clone(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(grant.generation, 1);
+        assert_eq!(grant.granted_millis, 60_000);
+        for sequence in 0..2 {
+            let output = fragment(
+                endpoint,
+                identity,
+                FixedFragmentRequest {
+                    descriptor: opened.opened.descriptor.clone(),
+                    request_sequence: sequence,
+                    fragment: Fragment::Exists(VertexId {
+                        partition: 7,
+                        id: 1,
+                    }),
+                    remaining: CEILING,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output.request_sequence, sequence);
+            assert!(matches!(output.value, FragmentValue::Bool(false)));
+            assert_eq!(
+                renew(
+                    endpoint,
+                    identity,
+                    renew_request.clone(),
+                    Duration::from_secs(5)
+                )
+                .await
+                .unwrap(),
+                grant
+            );
+        }
+        close(
+            endpoint,
+            identity,
+            opened.opened.descriptor,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            renew(endpoint, identity, renew_request, Duration::from_secs(5)).await,
+            Err(RemoteError::SessionUnavailable)
+        ));
         service.shutdown().await;
         node.raft.shutdown().await.unwrap();
     }

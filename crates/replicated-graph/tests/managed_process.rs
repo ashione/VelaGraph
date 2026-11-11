@@ -3495,3 +3495,6 @@ async fn data_local_fixed_query_across_managed_processes(
     g.shutdown().await;
     Ok(())
 }
+
+#[path = "support/query_job_lifecycle.rs"]
+mod query_job_lifecycle;
