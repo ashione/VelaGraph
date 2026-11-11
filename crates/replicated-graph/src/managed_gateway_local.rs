@@ -331,6 +331,7 @@ impl State {
             fixed_execution::execute(
                 &mut sessions,
                 &req,
+                self.config.local_query_parallelism,
                 tokio::time::Instant::from_std(end.min(expires)),
             )
             .await

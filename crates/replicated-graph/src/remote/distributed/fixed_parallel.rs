@@ -4,9 +4,15 @@ use super::*;
 use fixed_execution::NodeSession;
 use std::{future::Future, task::Poll};
 
-// Matches the existing bounded job executor. This is a scheduling width, not a
-// new query/node budget. Skew or insufficient headroom uses the serial allowance.
-pub(super) const WIDTH: usize = 3;
+// Width is startup configuration, independent of query shape and graph data.
+// The existing eight-member protocol bounds staged lists/checks and RPCs.
+pub(super) fn validate_width(width: usize) -> Result<(), QueryFailure> {
+    if (1..=8).contains(&width) {
+        Ok(())
+    } else {
+        Err(QueryFailure::InvalidArgument)
+    }
+}
 
 fn fits(used: Cost, extra: Cost, remaining: Cost) -> bool {
     used.bytes
@@ -113,12 +119,14 @@ fn validate(fragment: &Fragment, value: &FragmentValue) -> Result<(), QueryFailu
     }
 }
 
-pub(super) async fn run(
+pub(super) async fn run_with_width(
     sessions: &mut BTreeMap<u64, NodeSession>,
     fragments: Vec<Fragment>,
     cost: &mut Cost,
     end: Instant,
+    width: usize,
 ) -> Result<Vec<FragmentValue>, QueryFailure> {
+    validate_width(width)?;
     check(end)?;
     if fragments.len() > MAX_ROWS {
         return Err(QueryFailure::ResourceExhausted);
@@ -152,7 +160,7 @@ pub(super) async fn run(
             reserved.work += bound.work;
             selected.push((i, bound));
             shards.insert(shard);
-            if selected.len() == WIDTH {
+            if selected.len() == width {
                 break;
             }
         }
@@ -232,6 +240,16 @@ pub(super) fn reservation_for_test(fragment: &Fragment, node: &NodeSession) -> O
 }
 
 #[cfg(test)]
+async fn run(
+    sessions: &mut BTreeMap<u64, NodeSession>,
+    fragments: Vec<Fragment>,
+    cost: &mut Cost,
+    end: Instant,
+) -> Result<Vec<FragmentValue>, QueryFailure> {
+    run_with_width(sessions, fragments, cost, end, 3).await
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use d2_raft::{
@@ -244,11 +262,14 @@ mod tests {
     };
 
     async fn fixture() -> (BTreeMap<u64, NodeSession>, Vec<TcpListener>) {
+        fixture_with_members(4).await
+    }
+    async fn fixture_with_members(count: u64) -> (BTreeMap<u64, NodeSession>, Vec<TcpListener>) {
         let cohort = Cohort {
             coordinator_shard: 9,
             coordinator_epoch: 1,
             profile: Default::default(),
-            members: (1..=4)
+            members: (1..=count)
                 .map(|shard| Member {
                     shard,
                     epoch: 1,
@@ -258,7 +279,7 @@ mod tests {
         };
         let mut nodes = BTreeMap::new();
         let mut listeners = Vec::new();
-        for shard in 1..=4 {
+        for shard in 1..=count {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let route = PartitionRoute {
                 partition: shard as u32,
@@ -357,7 +378,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_widths_bound_eight_lanes_and_preserve_duplicate_order() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        // Barriers prove overlap without a timing/performance assertion.
+        for width in [1, 2, 4, 8] {
+            let (mut nodes, listeners) = fixture_with_members(8).await;
+            let barrier = Arc::new(tokio::sync::Barrier::new(width));
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let mut servers = Vec::new();
+            for listener in listeners {
+                let barrier = barrier.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                servers.push(tokio::spawn(async move {
+                    for sequence in 0..2 {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let request = request(&mut socket).await;
+                        assert_eq!(request.request_sequence, sequence);
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        assert!(now <= width);
+                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                            .await
+                            .unwrap();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        reply(&mut socket, request, 0).await;
+                    }
+                }));
+            }
+            let fragments = (1..=8)
+                .flat_map(|shard| [fragment(shard, 2), fragment(shard, 3)])
+                .collect();
+            let mut cost = Cost::default();
+            let values = run_with_width(
+                &mut nodes,
+                fragments,
+                &mut cost,
+                Instant::now() + Duration::from_secs(5),
+                width,
+            )
+            .await
+            .unwrap();
+            assert_eq!(values.len(), 16);
+            for (index, value) in values.iter().enumerate() {
+                assert!(matches!(value, FragmentValue::Bool(b) if *b == (index % 2 == 0)));
+            }
+            assert_eq!(peak.load(Ordering::SeqCst), width);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert_eq!(cost.work, 48);
+            assert!(cost.bytes <= CEILING.bytes);
+            assert!(nodes.values().all(|node| node.sequence == 2));
+            for server in servers {
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_width_never_consumes_sequence_or_budget() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        let (mut nodes, _listeners) = fixture().await;
+        for width in [0, 9, usize::MAX] {
+            let mut cost = Cost::default();
+            assert!(matches!(
+                run_with_width(
+                    &mut nodes,
+                    vec![fragment(1, 2)],
+                    &mut cost,
+                    Instant::now() + Duration::from_secs(5),
+                    width
+                )
+                .await,
+                Err(QueryFailure::InvalidArgument)
+            ));
+            assert_eq!((cost.bytes, cost.work), (0, 0));
+            assert!(nodes.values().all(|node| node.sequence == 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_eighth_width_wave_cancels_all_siblings_without_refunding_sequences() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        let (mut nodes, listeners) = fixture_with_members(8).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut servers = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let barrier = barrier.clone();
+            servers.push(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = request(&mut socket).await;
+                tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                    .await
+                    .unwrap();
+                if index == 7 {
+                    reply(&mut socket, request, 2).await;
+                } else {
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+                }
+            }));
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_with_width(
+                &mut nodes,
+                (1..=8).map(|shard| fragment(shard, 2)).collect(),
+                &mut Cost::default(),
+                Instant::now() + Duration::from_secs(5),
+                8,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(QueryFailure::IncompleteOrCorrupt)));
+        assert!(nodes.values().all(|node| node.sequence == 1));
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn independent_lanes_overlap_with_disjoint_budgets_and_keep_input_order() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;
         drop(listeners.pop());
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
@@ -420,6 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn outgoing_lanes_overlap_without_dividing_a_valid_leaf_allowance() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;
         listeners.truncate(3);
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
@@ -469,6 +618,8 @@ mod tests {
 
     #[tokio::test]
     async fn capture_dimensions_bound_work_and_keep_large_captures_serial() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, _) = fixture().await;
         let node = nodes.get_mut(&1).unwrap();
         let leaf = Fragment::Out(VertexId {
@@ -502,6 +653,8 @@ mod tests {
 
     #[tokio::test]
     async fn same_session_is_serial_and_width_is_bounded() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;
         let fourth = listeners.pop().unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
@@ -572,6 +725,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_or_over_budget_wave_fails_without_retry() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         for fault in 1..=4 {
             let (mut nodes, mut listeners) = fixture().await;
             listeners.truncate(2);
@@ -618,6 +773,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_drops_every_socket_and_preserves_consumed_sequences() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;
         listeners.truncate(3);
         let started = Arc::new(AtomicUsize::new(0));
@@ -660,43 +817,50 @@ mod tests {
 
     #[tokio::test]
     async fn low_remaining_budget_keeps_the_original_serial_allowance() {
-        let (mut nodes, mut listeners) = fixture().await;
-        listeners.truncate(2);
-        let grants = Arc::new(Mutex::new(Vec::new()));
-        let mut servers = Vec::new();
-        for listener in listeners {
-            let grants = grants.clone();
-            servers.push(tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let request = request(&mut socket).await;
-                grants.lock().unwrap().push(request.remaining);
-                reply(&mut socket, request, 0).await;
-            }));
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        for width in [1, 3, 8] {
+            let (mut nodes, mut listeners) = fixture().await;
+            listeners.truncate(2);
+            let grants = Arc::new(Mutex::new(Vec::new()));
+            let mut servers = Vec::new();
+            for listener in listeners {
+                let grants = grants.clone();
+                servers.push(tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = request(&mut socket).await;
+                    grants.lock().unwrap().push(request.remaining);
+                    reply(&mut socket, request, 0).await;
+                }));
+            }
+            let mut cost = Cost {
+                bytes: CEILING.bytes - 65536,
+                work: CEILING.work - 100,
+            };
+            run_with_width(
+                &mut nodes,
+                vec![fragment(1, 2), fragment(2, 3)],
+                &mut cost,
+                Instant::now() + Duration::from_secs(5),
+                width,
+            )
+            .await
+            .unwrap();
+            for server in servers {
+                server.await.unwrap();
+            }
+            let grants = grants.lock().unwrap();
+            assert!(grants[0].bytes > 60000);
+            assert_eq!(grants[0].work, 99);
+            assert_eq!(grants[1].work, 96);
+            assert!(grants[1].bytes < grants[0].bytes);
         }
-        let mut cost = Cost {
-            bytes: CEILING.bytes - 65536,
-            work: CEILING.work - 100,
-        };
-        run(
-            &mut nodes,
-            vec![fragment(1, 2), fragment(2, 3)],
-            &mut cost,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        for server in servers {
-            server.await.unwrap();
-        }
-        let grants = grants.lock().unwrap();
-        assert!(grants[0].bytes > 60000);
-        assert_eq!(grants[0].work, 99);
-        assert_eq!(grants[1].work, 96);
-        assert!(grants[1].bytes < grants[0].bytes);
     }
 
     #[tokio::test]
     async fn overflow_is_not_a_smaller_parallel_grant() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, _listeners) = fixture().await;
         nodes.get_mut(&1).unwrap().capture_bytes = usize::MAX;
         assert!(reservation(&fragment(1, 1), &nodes[&1]).is_none());
@@ -711,6 +875,8 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_lane_cancels_stalled_sibling_without_waiting_for_deadline() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;
         listeners.truncate(2);
         let healthy = listeners.pop().unwrap();
@@ -748,6 +914,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_empty_stage_cannot_return_success() {
+        // These fake peers still use the process-wide bounded RPC client.
+        let _sessions = fixed_execution::lock_session_fixtures().await;
         let result = run(
             &mut BTreeMap::new(),
             Vec::new(),

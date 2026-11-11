@@ -420,6 +420,7 @@ struct Execution<'a> {
     catalog: &'a StaticCatalog,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     fixed_sessions: Option<&'a mut BTreeMap<u64, fixed_execution::NodeSession>>,
+    fixed_parallelism: usize,
     end: Instant,
     cost: Cost,
     scan_cost: Cost,
@@ -793,6 +794,7 @@ async fn execute(
     let query = plan(&request)?;
     let mut execution = Execution {
         fixed_sessions: None,
+        fixed_parallelism: 3,
         catalog,
         ceiling: CEILING,
         scan_cost: Cost {
