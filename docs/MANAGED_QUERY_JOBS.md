@@ -135,18 +135,24 @@ write-history exhaustion or make unlimited historical versions available.
 The companion deterministic state and node tests cover exact idle/hard boundaries,
 replay, conflicting generations, fencing, cancellation/last-read race orderings,
 cumulative ledgers and last-owner permit retention. The independent-process test
-uses an explicitly labelled test-only transport proxy: 24 repeated roots produce
-72 required fragments, each delayed one second while genuine TCP managed writes
-update properties and delete the original edge. Each RPC remains separately
+uses an explicitly labelled test-only transport proxy: 12 repeated roots branch
+across two shards over two hops, producing 24 ordered paths and 96 required
+fragments. Each fragment is delayed one second while genuine TCP managed writes
+update properties and delete original edges. Shared proxy observations require
+actual overlapping traffic on distinct shards. Each RPC remains separately
 bounded and the query remains Running beyond the old 60-second lifetime.
 The oracle is a fixture-owned ordered qualified path vector, not production
-execution output. An undelayed control is also exercised.
+execution output. An undelayed control is also exercised. The long test runs in
+its own automatically discovered integration-test target, using the same shared
+child-process fixture. This keeps its client admission slots and long fixture
+lock hold separate from legacy tests without changing their deadlines or
+assertions.
 
 This is functional lifecycle evidence under injected network latency, not a
 compute benchmark, throughput improvement, full-scale managed CoreHR result or
-multi-host availability proof. Current base main executes the data-local subset
-serially; integration with pending parallel work #178/#181 requires its own
-exact-candidate test run, not evidence borrowed from either branch.
+multi-host availability proof. The implementation reuses main
+`8d906126`'s generic parallel scheduler from #178/#181. It requires a combined
+exact-candidate test run, not evidence borrowed from either original branch.
 
 See [design and official-system research](BOUNDED_QUERY_LIFECYCLE_DESIGN.md).
 All exact-head regression and CI outcomes, including failures, must be recorded

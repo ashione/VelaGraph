@@ -3,8 +3,8 @@
 Status: research and design rationale for the experimental candidate.
 The implemented API is documented in [query jobs](MANAGED_QUERY_JOBS.md);
 validation is ongoing and this design is not an acceptance report.
-Base: main `31c52eaa438fafa9ba3f1d067a4b0c677a379932`.
-Related: #110, #111, #174, #176. Independent of #178/#181.
+Integrated base: main `8d906126d04b419eb7f53466f067a78d97f5e435`.
+Related: #110, #111, #174, #176, #182. Reuses the merged #178/#181 scheduler.
 
 ## Problem and the compatibility boundary
 
@@ -65,10 +65,10 @@ measured capacity claims.
 ## Recommended delivery target
 
 Implement a new opt-in data-local fixed-V job, reusing the existing official AST,
-fixed fragment engine. Main at this base executes serially; the bounded parallel
-scheduler is separate pending work in #178/#181 and must be integrated only
-through its verified candidate, with joint exact-head validation. Lifecycle must
-not implement a competing scheduler or import unpublished changes. Do not first build a
+fixed fragment engine and the bounded parallel scheduler merged in #178/#181.
+The lifecycle samples the current lease at each leaf dispatch and completion;
+it does not implement a competing scheduler or change the startup concurrency
+limit. Combined exact-head validation is required. Do not first build a
 new long-lived gateway-materialized query engine. An old materialized-session
 renewal API can be considered separately if explicitly needed; it is not a
 prerequisite and is not included here.

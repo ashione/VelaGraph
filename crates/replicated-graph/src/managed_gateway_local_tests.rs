@@ -1170,3 +1170,231 @@ async fn fixed_local_replacement_keeps_captured_paths_and_matches_lazy_traverse(
     }
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_local_parallel_validation_uses_real_views_and_never_hides_filtered_corruption() {
+    let _gate = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    for corrupt in [false, true] {
+        let f = Fixture::new().await;
+        let (g, servers, graphs) = local_gateway(&f).await;
+        for (external, shard) in [(1, 7), (2, 8)] {
+            committed(
+                &call(&g, Operation::Submit(create(external, shard, 1)))
+                    .await
+                    .unwrap(),
+            );
+        }
+        for (external, target) in [(3, 7), (4, 8)] {
+            committed(
+                &call(
+                    &g,
+                    Operation::Submit(Write {
+                        external_id: [external; 16],
+                        mutation: Mutation::CreateEdge {
+                            edge: EdgeData {
+                                id: u64::from(external),
+                                from: entity(7, 1),
+                                to: entity(target, 1),
+                                label: if target == 7 { "selected" } else { "filtered" }.into(),
+                                properties: BTreeMap::new(),
+                            },
+                        },
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut routes = g.state.config.local_routes.clone().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut proxies = Vec::new();
+        for route in &mut routes {
+            let real = route.endpoint;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            route.endpoint = listener.local_addr().unwrap();
+            let barrier = barrier.clone();
+            let shard = route.identity.group;
+            proxies.push(tokio::spawn(async move {
+                let mut sequence = 0;
+                let mut outgoing = 0;
+                let mut descriptor = None;
+                loop {
+                    let (mut client, _) = listener.accept().await.unwrap();
+                    let body = wire_read(&mut client).await;
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let leaf = &request["operation"]["FixedQueryFragment"];
+                    let verify = leaf["fragment"]["VerifyReverse"].is_object();
+                    if leaf.is_object() {
+                        assert_eq!(leaf["request_sequence"], sequence);
+                        sequence += 1;
+                        assert_eq!(leaf["descriptor"]["version"], 4);
+                        if let Some(original) = &descriptor {
+                            assert_eq!(&leaf["descriptor"], original);
+                        } else {
+                            descriptor = Some(leaf["descriptor"].clone());
+                        }
+                    }
+                    let out = leaf["fragment"]["Out"].is_object();
+                    if out {
+                        outgoing += 1;
+                    }
+                    // The initial root exists only on shard 7. Its first Out
+                    // creates the cross-shard frontier. The second hop must
+                    // dispatch Out to both actual retained participant views.
+                    let parallel_out = !corrupt && out && (shard == 8 || outgoing > 1);
+                    if verify || parallel_out {
+                        // Both actual participant lanes must be in flight. The
+                        // barrier is synchronization, not a performance claim.
+                        tokio::time::timeout(Duration::from_secs(4), barrier.wait())
+                            .await
+                            .unwrap();
+                    }
+                    let mut upstream = TcpStream::connect(real).await.unwrap();
+                    wire_write(&mut upstream, &body).await;
+                    let mut reply = wire_read(&mut upstream).await;
+                    if corrupt && verify && shard == 8 {
+                        let mut value: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+                        value["result"]["Ok"]["FixedQueryFragment"]["Ok"]["value"]["Bool"] =
+                            false.into();
+                        reply = serde_json::to_vec(&value).unwrap();
+                    }
+                    if corrupt && verify && shard == 7 {
+                        // The failing peer may cancel this healthy lane before
+                        // its response finishes. That is expected cancellation.
+                        if client.write_u32(reply.len() as u32).await.is_ok() {
+                            let _ = client.write_all(&reply).await;
+                        }
+                    } else {
+                        wire_write(&mut client, &reply).await;
+                    }
+                    if request["operation"]["CloseFixedQuery"].is_object() {
+                        break;
+                    }
+                }
+            }));
+        }
+        let tested = Gateway::bind_remote_local_queries(
+            remote_config(&g),
+            routes,
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        let result = call(
+            &tested,
+            local_open(
+                Some(4),
+                if corrupt {
+                    "g.V(1).out('selected').count()"
+                } else {
+                    "g.V(1).out().out('selected').count()"
+                },
+                1,
+            ),
+        )
+        .await;
+        if corrupt {
+            assert_eq!(result, Err(Error::Query(QueryFailure::IncompleteOrCorrupt)));
+            assert!(tested.state.local_sessions.lock().unwrap().is_empty());
+        } else {
+            let (session, _, page) = ready(result.unwrap());
+            assert_eq!(page.data.rows, vec![QueryRow::Count(1)]);
+            call(&tested, Operation::CloseLocalQuery { session })
+                .await
+                .unwrap();
+        }
+        for proxy in proxies {
+            tokio::time::timeout(Duration::from_secs(5), proxy)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tested.shutdown().await;
+        g.shutdown().await;
+        for graph in graphs {
+            graph.shutdown().await;
+        }
+        for server in servers {
+            server.shutdown().await;
+        }
+        f.stop().await;
+    }
+}
+
+// Same harness can be applied unchanged to serial main. No artificial delays,
+// bypassed writes, revised budgets, or special query implementation are used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual serial/candidate end-to-end measurement, not a timing assertion"]
+async fn fixed_local_parallel_query_measurement() {
+    let _gate = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    for (external, shard) in [(1, 7), (2, 8)] {
+        committed(
+            &call(&g, Operation::Submit(create(external, shard, 1)))
+                .await
+                .unwrap(),
+        );
+    }
+    for (external, from, to) in [(3, 7, 7), (4, 7, 8), (5, 8, 7)] {
+        committed(
+            &call(
+                &g,
+                Operation::Submit(Write {
+                    external_id: [external; 16],
+                    mutation: Mutation::CreateEdge {
+                        edge: EdgeData {
+                            id: u64::from(external),
+                            from: entity(from, 1),
+                            to: entity(to, 1),
+                            label: "link".into(),
+                            properties: BTreeMap::new(),
+                        },
+                    },
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    for text in [
+        "g.V(1,1,1,1,1,1,1,1).out().out().out().count()",
+        "g.V(1,1,1,1,1,1,1,1).in().in().in().count()",
+    ] {
+        let mut samples = Vec::new();
+        for round in 0..11 {
+            let start = std::time::Instant::now();
+            let (session, _, page) = ready(call(&g, local_open(Some(5), text, 1)).await.unwrap());
+            let micros = start.elapsed().as_micros();
+            assert_eq!(session.version, 5);
+            assert_eq!(page.data.rows, vec![QueryRow::Count(40)]);
+            call(&g, Operation::CloseLocalQuery { session })
+                .await
+                .unwrap();
+            if round >= 2 {
+                samples.push(micros);
+            }
+        }
+        eprintln!(
+            "PARALLEL_QUERY_MEASUREMENT {}",
+            serde_json::json!({
+                "query":text,"version":5,"rows":40,"open_micros":samples,
+                "scope":"same-host TCP, in-process real Raft participants, debug build, no injected delay"
+            })
+        );
+    }
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    f.stop().await;
+}
+
+#[path = "managed_gateway_scaling_tests.rs"]
+mod scaling;

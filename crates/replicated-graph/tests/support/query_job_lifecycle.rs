@@ -10,7 +10,44 @@ use tokio::{
 
 const ROOT: u64 = 2_000_001;
 const EDGE: u64 = 2_000_010;
-const COPIES: usize = 24;
+const MIDDLE: u64 = ROOT + 1;
+const COPIES: usize = 12;
+const REQUIRED_FRAGMENTS: u64 = (COPIES * 8) as u64;
+
+#[derive(Default)]
+struct FragmentTraffic {
+    active: std::sync::Mutex<BTreeMap<u64, usize>>,
+    peak_shards: AtomicU64,
+}
+impl FragmentTraffic {
+    fn enter(self: &Arc<Self>, shard: u64) -> ActiveFragment {
+        let mut active = self.active.lock().unwrap();
+        *active.entry(shard).or_default() += 1;
+        self.peak_shards
+            .fetch_max(active.len() as u64, Ordering::SeqCst);
+        ActiveFragment {
+            traffic: self.clone(),
+            shard,
+        }
+    }
+    fn peak(&self) -> u64 {
+        self.peak_shards.load(Ordering::SeqCst)
+    }
+}
+struct ActiveFragment {
+    traffic: Arc<FragmentTraffic>,
+    shard: u64,
+}
+impl Drop for ActiveFragment {
+    fn drop(&mut self) {
+        let mut active = self.traffic.active.lock().unwrap();
+        let count = active.get_mut(&self.shard).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            active.remove(&self.shard);
+        }
+    }
+}
 
 /// Bounded, transparent one-request TCP proxy. Control traffic never sleeps.
 /// Each accepted task has a deadline; JoinSet owns and aborts all child tasks.
@@ -21,7 +58,11 @@ struct FragmentDelay {
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 impl FragmentDelay {
-    async fn start(upstream: SocketAddr) -> anyhow::Result<Self> {
+    async fn start(
+        upstream: SocketAddr,
+        shard: u64,
+        traffic: Arc<FragmentTraffic>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = listener.local_addr()?;
         let fragments = Arc::new(AtomicU64::new(0));
@@ -37,6 +78,7 @@ impl FragmentDelay {
                         anyhow::ensure!(children.len() < 32, "proxy task bound");
                         let count = count.clone();
                         let delay = delay.clone();
+                        let traffic = traffic.clone();
                         children.spawn(async move {
                             tokio::time::timeout(Duration::from_secs(10), async move {
                                 let length = incoming.read_u32().await?;
@@ -44,7 +86,10 @@ impl FragmentDelay {
                                 let mut frame = vec![0; length as usize];
                                 incoming.read_exact(&mut frame).await?;
                                 let request: serde_json::Value = serde_json::from_slice(&frame)?;
-                                if request["operation"].get("FixedQueryFragment").is_some() {
+                                let _active = request["operation"]
+                                    .get("FixedQueryFragment")
+                                    .map(|_| traffic.enter(shard));
+                                if _active.is_some() {
                                     count.fetch_add(1, Ordering::SeqCst);
                                     tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst))).await;
                                 }
@@ -120,31 +165,45 @@ fn query() -> Query {
     Query {
         partition: 7,
         text: format!(
-            "g.V({}).out().path()",
+            "g.V({}).out().out().path()",
             vec![ROOT.to_string(); COPIES].join(",")
         ),
     }
 }
 fn expected() -> Vec<QueryRow> {
-    // Independent semantic oracle, not copied from any engine output.
-    vec![
-        QueryRow::Path(vec![
-            QualifiedElement::Vertex {
-                partition: 7,
-                id: ROOT
-            },
-            QualifiedElement::Edge {
-                partition: 7,
-                id: EDGE
-            },
-            QualifiedElement::Vertex {
-                partition: 8,
-                id: ROOT
-            },
-        ]);
-        COPIES
-    ]
+    // Fixture-owned ordered bag with qualified identities, independent of engine output.
+    let mut rows = Vec::new();
+    for _ in 0..COPIES {
+        for (middle_partition, first_edge, last_partition, last_edge) in
+            [(7, EDGE, 8, EDGE + 2), (8, EDGE + 1, 7, EDGE + 3)]
+        {
+            rows.push(QueryRow::Path(vec![
+                QualifiedElement::Vertex {
+                    partition: 7,
+                    id: ROOT,
+                },
+                QualifiedElement::Edge {
+                    partition: 7,
+                    id: first_edge,
+                },
+                QualifiedElement::Vertex {
+                    partition: middle_partition,
+                    id: MIDDLE,
+                },
+                QualifiedElement::Edge {
+                    partition: middle_partition,
+                    id: last_edge,
+                },
+                QualifiedElement::Vertex {
+                    partition: last_partition,
+                    id: ROOT,
+                },
+            ]));
+        }
+    }
+    rows
 }
+
 async fn write(g: &Gateway, sequence: u8, mutation: Mutation) -> anyhow::Result<u64> {
     let mut external_id = [b'J'; 16];
     external_id[15] = sequence;
@@ -263,8 +322,9 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
     let mut b = Process::start(8).await?;
     let mut ar = route(&a).await?;
     let mut br = route(&b).await?;
-    let ap = FragmentDelay::start(ar.endpoint).await?;
-    let bp = FragmentDelay::start(br.endpoint).await?;
+    let traffic = Arc::new(FragmentTraffic::default());
+    let ap = FragmentDelay::start(ar.endpoint, 7, traffic.clone()).await?;
+    let bp = FragmentDelay::start(br.endpoint, 8, traffic.clone()).await?;
     ar.endpoint = ap.endpoint;
     br.endpoint = bp.endpoint;
     let g = Gateway::bind_remote_local_queries(
@@ -278,14 +338,17 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
         BUDGET,
     )
     .await?;
-    for (sequence, partition) in [(1, 7), (2, 8)] {
+    for (index, (partition, id)) in [(7, ROOT), (8, ROOT), (7, MIDDLE), (8, MIDDLE)]
+        .into_iter()
+        .enumerate()
+    {
         write(
             &g,
-            sequence,
+            (index + 1) as u8,
             Mutation::CreateVertex {
                 partition,
                 vertex: VertexData {
-                    id: ROOT,
+                    id,
                     labels: vec!["person".into()],
                     properties: BTreeMap::new(),
                 },
@@ -293,26 +356,37 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
         )
         .await?;
     }
-    let fixed_version = write(
-        &g,
-        3,
-        Mutation::CreateEdge {
-            edge: EdgeData {
-                id: EDGE,
-                from: Entity {
-                    partition: 7,
-                    id: ROOT,
+    let mut fixed_version = 0;
+    for (index, (source_partition, source, target_partition, target)) in [
+        (7, ROOT, 7, MIDDLE),
+        (7, ROOT, 8, MIDDLE),
+        (7, MIDDLE, 8, ROOT),
+        (8, MIDDLE, 7, ROOT),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixed_version = write(
+            &g,
+            (index + 5) as u8,
+            Mutation::CreateEdge {
+                edge: EdgeData {
+                    id: EDGE + index as u64,
+                    from: Entity {
+                        partition: source_partition,
+                        id: source,
+                    },
+                    to: Entity {
+                        partition: target_partition,
+                        id: target,
+                    },
+                    label: "knows".into(),
+                    properties: BTreeMap::new(),
                 },
-                to: Entity {
-                    partition: 8,
-                    id: ROOT,
-                },
-                label: "knows".into(),
-                properties: BTreeMap::new(),
             },
-        },
-    )
-    .await?;
+        )
+        .await?;
+    }
     // Un-delayed control: same API, query, real child nodes, and independent oracle.
     let control_started = tokio::time::Instant::now();
     let control = start(&g, 11, fixed_version, 60_000).await?;
@@ -337,6 +411,10 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
     );
     cancel(&g, &control).await?;
 
+    // The ordinary default width=3 scheduler must overlap eligible work on
+    // distinct shards. Twelve repeated roots generate 96 required leaves;
+    // dependencies and same-shard lanes retain 68 one-second transport waves.
+    traffic.peak_shards.store(0, Ordering::SeqCst);
     ap.delay(1_000);
     bp.delay(1_000);
     let base = ap.count() + bp.count();
@@ -353,11 +431,11 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
     assert!(
         write(
             &g,
-            4,
+            20,
             Mutation::PatchVertex {
                 vertex: Entity {
                     partition: 8,
-                    id: ROOT
+                    id: MIDDLE
                 },
                 patch: Patch {
                     set: BTreeMap::from([(
@@ -372,20 +450,22 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
             > fixed_version
     );
     assert_eq!(status(&g, &job).await?.phase, JobPhase::Running);
-    assert!(
-        write(
-            &g,
-            5,
-            Mutation::DeleteEdge {
-                edge: Entity {
-                    partition: 7,
-                    id: EDGE
-                }
-            }
-        )
-        .await?
-            > fixed_version
-    );
+    for (sequence, edge) in [(21, EDGE), (22, EDGE + 1)] {
+        assert!(
+            write(
+                &g,
+                sequence,
+                Mutation::DeleteEdge {
+                    edge: Entity {
+                        partition: 7,
+                        id: edge
+                    }
+                },
+            )
+            .await?
+                > fixed_version
+        );
+    }
     let latest = open(&g, None).await?;
     assert!(latest.version > fixed_version);
     assert_eq!(
@@ -393,11 +473,11 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
         vec![QueryRow::Count(0)]
     );
     assert_eq!(
-        traverse(&g, &latest, 8, &format!("g.V({ROOT}).values('name')")).await?,
+        traverse(&g, &latest, 8, &format!("g.V({MIDDLE}).values('name')")).await?,
         vec![QueryRow::Value {
             source: Some(QualifiedElement::Vertex {
                 partition: 8,
-                id: ROOT
+                id: MIDDLE
             }),
             value: Value::Text("changed while running".into()),
         }]
@@ -434,18 +514,24 @@ async fn renewable_query_runs_past_sixty_seconds_with_real_writes() -> anyhow::R
     }
     assert!(running_since.elapsed() > Duration::from_secs(60));
     assert!(
-        ap.count() + bp.count() - base < 72,
+        ap.count() + bp.count() - base < REQUIRED_FRAGMENTS,
         "required reads still outstanding after 60s"
     );
     let ready = phase(&g, &job, JobPhase::Ready).await?;
-    assert_eq!(ap.count() + bp.count() - base, 72);
+    assert_eq!(ap.count() + bp.count() - base, REQUIRED_FRAGMENTS);
+    assert_eq!(
+        traffic.peak(),
+        2,
+        "required leaves must overlap on both real shards"
+    );
     eprintln!(
-        "query job Ready elapsed={:?}, all 72 required TCP fragments finished at original V={}",
+        "query job Ready elapsed={:?}, all 96 required TCP fragments finished at original V={}, peak active shards={}",
         running_since.elapsed(),
-        fixed_version
+        fixed_version,
+        traffic.peak(),
     );
     assert_eq!(ready.version, Some(fixed_version));
-    assert_eq!(ready.total, Some(COPIES as u32));
+    assert_eq!(ready.total, Some((2 * COPIES) as u32));
     let mut rows = Vec::new();
     let mut pages = Vec::new();
     let mut cursor = None;

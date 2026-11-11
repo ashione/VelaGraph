@@ -131,6 +131,7 @@ mod tests {
         let mut execution = Execution {
             fixed_sessions: None,
             control: None,
+            fixed_parallelism: 3,
             scan_cost: Cost::default(),
             catalog: &catalog,
             sessions: BTreeMap::new(),

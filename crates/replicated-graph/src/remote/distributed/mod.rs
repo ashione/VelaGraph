@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod adjacency;
 pub(crate) mod fixed;
 pub(crate) mod fixed_execution;
+mod fixed_parallel;
 use adjacency::Direction;
 pub(in crate::remote) mod channel;
 pub mod consistency;
@@ -420,6 +421,7 @@ struct Execution<'a> {
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     fixed_sessions: Option<&'a mut BTreeMap<u64, fixed_execution::NodeSession>>,
     control: Option<fixed_execution::ExecutionControl>,
+    fixed_parallelism: usize,
     end: Instant,
     cost: Cost,
     scan_cost: Cost,
@@ -808,6 +810,7 @@ async fn execute(
     let mut execution = Execution {
         fixed_sessions: None,
         control: None,
+        fixed_parallelism: 3,
         catalog,
         ceiling: CEILING,
         scan_cost: Cost {

@@ -671,7 +671,12 @@ impl State {
             };
             sessions.insert(
                 target.shard,
-                fixed_execution::NodeSession::new(route.clone(), descriptor.clone()),
+                fixed_execution::NodeSession::new(
+                    route.clone(),
+                    descriptor.clone(),
+                    opened.opened.capture_cost.bytes,
+                    opened.opened.capture_cost.rows,
+                ),
             );
             if opened.opened.retained_proof != *cut.proof()
                 || opened.grant.descriptor != *descriptor
@@ -729,6 +734,7 @@ impl State {
         let rows = fixed_execution::execute_controlled(
             sessions,
             &local::request(&job.key.query),
+            self.config.local_query_parallelism,
             tokio::time::Instant::from_std(job.execution_end),
             control,
         )

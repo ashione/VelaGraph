@@ -50,6 +50,9 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 8;
 pub const MAX_SESSIONS: usize = 4;
+/// Maximum configurable fixed-version shard lanes per query. This is bounded by
+/// the current eight-member local-query protocol, not a new resource allowance.
+pub const MAX_LOCAL_QUERY_PARALLELISM: usize = 8;
 /// Every materialization reserves both retained payload copies, including write
 /// preparation snapshots and expired sessions still held by an active worker.
 pub const SNAPSHOT_CHARGE: usize = 4 * 1024 * 1024;
@@ -570,11 +573,13 @@ struct OwnedConfig {
     binding: Binding,
     members: Vec<OwnedNode>,
     local_routes: Option<Vec<LocalGraphRoute>>,
+    local_query_parallelism: usize,
 }
 impl From<Config> for OwnedConfig {
     fn from(config: Config) -> Self {
         Self {
             local_routes: None,
+            local_query_parallelism: 3,
             coordinator: OwnedNode::Local(config.coordinator),
             binding: config.binding,
             members: config.members.into_iter().map(OwnedNode::Local).collect(),
@@ -585,6 +590,7 @@ impl From<RemoteConfig> for OwnedConfig {
     fn from(config: RemoteConfig) -> Self {
         Self {
             local_routes: None,
+            local_query_parallelism: 3,
             coordinator: OwnedNode::Remote(config.coordinator),
             binding: config.binding,
             members: config.members.into_iter().map(OwnedNode::Remote).collect(),
@@ -996,9 +1002,26 @@ impl Gateway {
         bind: SocketAddr,
         deadline: Duration,
     ) -> Result<Self> {
+        Self::bind_remote_local_queries_with_parallelism(config, routes, bind, deadline, 3).await
+    }
+    /// Configure one through eight fixed-version shard lanes per query.
+    /// The legacy constructor retains three lanes. One selects serial execution.
+    /// This does not enlarge cumulative budgets, shared admission, or deadlines.
+    /// Invalid widths fail before binding or contacting nodes.
+    pub async fn bind_remote_local_queries_with_parallelism(
+        config: RemoteConfig,
+        routes: Vec<LocalGraphRoute>,
+        bind: SocketAddr,
+        deadline: Duration,
+        parallelism: usize,
+    ) -> Result<Self> {
+        if !(1..=MAX_LOCAL_QUERY_PARALLELISM).contains(&parallelism) {
+            return Err(Error::Protocol);
+        }
         local::validate_routes(&config, &routes)?;
         let mut config: OwnedConfig = config.into();
         config.local_routes = Some(routes);
+        config.local_query_parallelism = parallelism;
         Self::bind_config(config, bind, deadline, None).await
     }
     /// Opt in to bounded local phase reports; draining/dropping them never gates writes.

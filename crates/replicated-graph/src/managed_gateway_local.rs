@@ -303,6 +303,8 @@ impl State {
                             endpoint: route.endpoint,
                         },
                         opened.descriptor.clone(),
+                        opened.capture_cost.bytes,
+                        opened.capture_cost.rows,
                     ),
                 );
                 // Compare the complete retained certificate, not a boolean or V.
@@ -329,6 +331,7 @@ impl State {
             fixed_execution::execute(
                 &mut sessions,
                 &req,
+                self.config.local_query_parallelism,
                 tokio::time::Instant::from_std(end.min(expires)),
             )
             .await

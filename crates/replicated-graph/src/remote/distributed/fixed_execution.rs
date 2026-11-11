@@ -47,14 +47,23 @@ impl ExecutionControl {
 pub(crate) struct NodeSession {
     pub route: PartitionRoute,
     pub descriptor: FixedDescriptor,
-    sequence: u64,
+    pub(super) sequence: u64,
+    pub(super) capture_bytes: usize,
+    pub(super) capture_rows: usize,
 }
 impl NodeSession {
-    pub(crate) fn new(route: PartitionRoute, descriptor: FixedDescriptor) -> Self {
+    pub(crate) fn new(
+        route: PartitionRoute,
+        descriptor: FixedDescriptor,
+        capture_bytes: usize,
+        capture_rows: usize,
+    ) -> Self {
         Self {
             route,
             descriptor,
             sequence: 0,
+            capture_bytes,
+            capture_rows,
         }
     }
 }
@@ -93,6 +102,81 @@ fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     // Match the original explicit-ID grammar/defaults; the parser bounds hops.
     Ok(query)
 }
+pub(super) struct Prepared {
+    route: PartitionRoute,
+    request: FixedFragmentRequest,
+    pub(super) cost: Cost,
+}
+pub(super) fn prepare(
+    node: &mut NodeSession,
+    fragment: Fragment,
+    ceiling: Cost,
+) -> Result<Prepared, QueryFailure> {
+    let mut cost = Cost::default();
+    cost.charge(512, 1, ceiling)?;
+    let mut request = FixedFragmentRequest {
+        descriptor: node.descriptor.clone(),
+        request_sequence: node.sequence,
+        fragment,
+        remaining: Cost {
+            bytes: ceiling.bytes.saturating_sub(cost.bytes),
+            work: ceiling.work.saturating_sub(cost.work),
+        },
+    };
+    let encoded = serde_json::to_vec(&request).map_err(|_| QueryFailure::InvalidArgument)?;
+    cost.charge(encoded.len().saturating_mul(2), 0, ceiling)?;
+    request.remaining = Cost {
+        bytes: ceiling.bytes.saturating_sub(cost.bytes),
+        work: ceiling.work.saturating_sub(cost.work),
+    };
+    // Unknown/failure ends the query. Never refund work or reopen/retry.
+    node.sequence = node
+        .sequence
+        .checked_add(1)
+        .ok_or(QueryFailure::ResourceExhausted)?;
+    Ok(Prepared {
+        route: node.route.clone(),
+        request,
+        cost,
+    })
+}
+pub(super) async fn invoke(
+    prepared: Prepared,
+    end: Instant,
+    control: Option<&ExecutionControl>,
+) -> Result<fixed::FixedFragmentOutput, QueryFailure> {
+    check(end)?;
+    // Every leaf samples the current lease and bounded RPC budget at dispatch.
+    // A later renewal cannot extend an already in-flight request.
+    let rpc_end = match control {
+        Some(control) => end
+            .min(control.check()?)
+            .min(Instant::now() + control.rpc_budget),
+        None => end,
+    };
+    let expected = prepared.request.descriptor.clone();
+    let sequence = prepared.request.request_sequence;
+    let remaining = prepared.request.remaining;
+    let output = fixed::fragment(
+        prepared.route.endpoint,
+        prepared.route.identity,
+        prepared.request,
+        rpc_end.saturating_duration_since(Instant::now()),
+    )
+    .await
+    .map_err(remote_failure)??;
+    check(rpc_end)?;
+    if let Some(control) = control {
+        control.check()?;
+    }
+    if output.descriptor != expected || output.request_sequence != sequence {
+        return Err(QueryFailure::IncompleteOrCorrupt);
+    }
+    if output.cost.bytes > remaining.bytes || output.cost.work > remaining.work {
+        return Err(QueryFailure::ResourceExhausted);
+    }
+    Ok(output)
+}
 pub(super) async fn fragment(
     sessions: &mut BTreeMap<u64, NodeSession>,
     fragment: Fragment,
@@ -101,51 +185,19 @@ pub(super) async fn fragment(
     control: Option<&ExecutionControl>,
 ) -> Result<FragmentValue, QueryFailure> {
     check(end)?;
-    let rpc_end = match control {
-        Some(control) => end
-            .min(control.check()?)
-            .min(Instant::now() + control.rpc_budget),
-        None => end,
-    };
     let node = sessions
         .get_mut(&u64::from(fragment.partition()))
         .ok_or(QueryFailure::UnsupportedScope)?;
-    cost.charge(512, 1, CEILING)?;
-    let mut request = FixedFragmentRequest {
-        descriptor: node.descriptor.clone(),
-        request_sequence: node.sequence,
+    let prepared = prepare(
+        node,
         fragment,
-        remaining: Cost {
-            bytes: MAX_BYTES.saturating_sub(cost.bytes),
-            work: MAX_WORK.saturating_sub(cost.work),
+        Cost {
+            bytes: CEILING.bytes.saturating_sub(cost.bytes),
+            work: CEILING.work.saturating_sub(cost.work),
         },
-    };
-    let encoded = serde_json::to_vec(&request).map_err(|_| QueryFailure::InvalidArgument)?;
-    cost.charge(encoded.len().saturating_mul(2), 0, CEILING)?;
-    request.remaining = Cost {
-        bytes: MAX_BYTES.saturating_sub(cost.bytes),
-        work: MAX_WORK.saturating_sub(cost.work),
-    };
-    let sequence = node.sequence;
-    // Unknown/failure ends the query. Never refund work or reopen/retry.
-    node.sequence = sequence
-        .checked_add(1)
-        .ok_or(QueryFailure::ResourceExhausted)?;
-    let output = fixed::fragment(
-        node.route.endpoint,
-        node.route.identity,
-        request,
-        rpc_end.saturating_duration_since(Instant::now()),
-    )
-    .await
-    .map_err(remote_failure)??;
-    check(end)?;
-    if let Some(control) = control {
-        control.check()?;
-    }
-    if output.descriptor != node.descriptor || output.request_sequence != sequence {
-        return Err(QueryFailure::IncompleteOrCorrupt);
-    }
+    )?;
+    cost.charge(prepared.cost.bytes, prepared.cost.work, CEILING)?;
+    let output = invoke(prepared, end, control).await?;
     cost.charge(output.cost.bytes, output.cost.work, CEILING)?;
     Ok(output.value)
 }
@@ -153,14 +205,16 @@ pub(super) async fn fragment(
 pub(crate) async fn execute(
     sessions: &mut BTreeMap<u64, NodeSession>,
     request: &DistributedRequest,
+    parallelism: usize,
     end: Instant,
 ) -> Result<Vec<QueryRow>, QueryFailure> {
-    execute_inner(sessions, request, end, None).await
+    execute_inner(sessions, request, parallelism, end, None).await
 }
 
 pub(crate) async fn execute_controlled(
     sessions: &mut BTreeMap<u64, NodeSession>,
     request: &DistributedRequest,
+    parallelism: usize,
     end: Instant,
     control: ExecutionControl,
 ) -> Result<Vec<QueryRow>, QueryFailure> {
@@ -168,16 +222,18 @@ pub(crate) async fn execute_controlled(
     tokio::select! {
         biased;
         _ = control.cancelled() => Err(QueryFailure::Unavailable),
-        result = execute_inner(sessions, request, end, Some(control.clone())) => result,
+        result = execute_inner(sessions, request, parallelism, end, Some(control.clone())) => result,
     }
 }
 
 async fn execute_inner(
     sessions: &mut BTreeMap<u64, NodeSession>,
     request: &DistributedRequest,
+    parallelism: usize,
     end: Instant,
     control: Option<ExecutionControl>,
 ) -> Result<Vec<QueryRow>, QueryFailure> {
+    fixed_parallel::validate_width(parallelism)?;
     let query = parse(request)?;
     let catalog = StaticCatalog {
         partitions: sessions.values().map(|s| s.route.clone()).collect(),
@@ -188,6 +244,7 @@ async fn execute_inner(
         sessions: BTreeMap::new(),
         fixed_sessions: Some(sessions),
         control,
+        fixed_parallelism: parallelism,
         end,
         cost: Cost {
             bytes: 4096,
