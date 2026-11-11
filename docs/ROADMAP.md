@@ -21,7 +21,7 @@
 
 [显式一致性协商](QUERY_CONSISTENCY_NEGOTIATION.md)的旧 `GlobalCommittedSnapshot` 要求仍对同步查询和 job 返回 Unsupported，不静默降级。**另一个已实现的 restricted managed 入口**以固定、空 baseline cohort 认证同一 V，不等于为任意 catalog/旧 observed API 开放全局快照。
 
-协调决策账本、参与者 prepare/commit/abort、连续 applied watermark、完整 cohort/empty-baseline 认证、外部请求 ID/原 Plan 恢复和远程 managed gateway 已接通。支持点/边创建、属性更新、边删除及条件属性补丁，partial apply 不得开放较新的 certified V。普通弱读仍可能看到逐片发布；`resolved_prefix` 本身不是可读版本。节点固定在同机独立进程的现有验证不等于多机 HA。见[受管事务](MANAGED_GRAPH_TRANSACTIONS.md)、[gateway](MANAGED_GRAPH_GATEWAY.md)及[固定版本查询](MANAGED_FIXED_TRAVERSALS.md)。
+协调决策账本、参与者 prepare/commit/abort、连续 applied watermark、完整 cohort/empty-baseline 认证、外部请求 ID/原 Plan 恢复和远程 managed gateway 已接通。支持点/边创建、属性更新、边删除、条件属性补丁及[原子边替换](MANAGED_EDGE_REPLACEMENT.md)：一次事务删除旧关系并创建新 qualified ID，保留旧 V 与旧 ID tombstone。partial apply 不得开放较新的 certified V。普通弱读仍可能看到逐片发布；`resolved_prefix` 本身不是可读版本。节点固定在同机独立进程的现有验证不等于多机 HA。见[受管事务](MANAGED_GRAPH_TRANSACTIONS.md)、[gateway](MANAGED_GRAPH_GATEWAY.md)及[固定版本查询](MANAGED_FIXED_TRAVERSALS.md)。
 
 Managed Traverse/TraversePage 已支持 routing-v3 的 qualified `id()`、元素/标量 `dedup()` 和完整结果分页，支持单个有界 out/in `repeat` 与 post-body emit（总深度≤32），支持终结 selected `valueMap`、严格标量 `is`、有界 `range` 及 `simplePath`/`cyclicPath` 实际遍历对象路径过滤，仍不支持 data-local hierarchy jobs。当前会先 materialize 小型 cohort snapshot，不能把 observed 全量 CoreHR 通过等同于 managed 全规模动态一致性验收。
 

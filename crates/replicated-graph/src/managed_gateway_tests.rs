@@ -1804,3 +1804,6 @@ mod submission_timing_tests;
 
 #[path = "managed_gateway_condition_tests.rs"]
 mod condition_tests;
+
+#[path = "managed_gateway_replace_tests.rs"]
+mod replace_tests;
