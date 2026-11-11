@@ -2183,3 +2183,6 @@ async fn member_apply_tail_fusion_discards_partially_invalid_page() {
         Status::Unknown
     );
 }
+
+#[path = "member_projection_tests.rs"]
+mod projection_tests;
