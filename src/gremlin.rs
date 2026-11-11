@@ -90,6 +90,7 @@ const RULE_METHOD_OUTE: usize = 118;
 const RULE_METHOD_OUTV: usize = 119;
 const RULE_METHOD_BOTH: usize = 44;
 const RULE_METHOD_COUNT: usize = 59;
+const RULE_METHOD_CYCLIC_PATH: usize = 60;
 const RULE_METHOD_DEDUP: usize = 63;
 const RULE_METHOD_EMIT: usize = 70;
 const RULE_METHOD_HAS: usize = 79;
@@ -103,6 +104,7 @@ const RULE_METHOD_OUT: usize = 117;
 const RULE_METHOD_PATH: usize = 121;
 const RULE_METHOD_RANGE: usize = 129;
 const RULE_METHOD_REPEAT: usize = 131;
+const RULE_METHOD_SIMPLE_PATH: usize = 140;
 const RULE_METHOD_TIMES: usize = 148;
 const RULE_INTEGER_LITERAL: usize = 292;
 const RULE_METHOD_VALUE_MAP: usize = 160;
@@ -148,6 +150,10 @@ pub enum ObservedGremlinStep {
     Existing(GremlinStep),
     /// Element/scalar deduplication; each executor admits its own subset.
     Dedup,
+    /// Keep element traversers whose actual object path has no repeated identity.
+    SimplePath,
+    /// Keep element traversers whose actual object path repeats an identity.
+    CyclicPath,
     /// Strict literal equality on scalar streams; each executor admits its own subset.
     Is(Value),
     /// Bounded half-open positional range; each executor admits its own subset.
@@ -1159,6 +1165,14 @@ fn parse_observed_step(node: &ParseTree) -> Result<ObservedGremlinStep> {
             }
             Ok(ObservedGremlinStep::ValueMap(keys))
         }
+        RULE_METHOD_SIMPLE_PATH => {
+            require_no_args(&name, &args)?;
+            Ok(ObservedGremlinStep::SimplePath)
+        }
+        RULE_METHOD_CYCLIC_PATH => {
+            require_no_args(&name, &args)?;
+            Ok(ObservedGremlinStep::CyclicPath)
+        }
         RULE_METHOD_DEDUP => {
             require_no_args(&name, &args)?;
             Ok(ObservedGremlinStep::Dedup)
@@ -2069,6 +2083,49 @@ mod range_parser_tests {
                 ObservedGremlinQuery::parse(&text).is_err(),
                 "accepted {text}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod path_filter_parser_tests {
+    use super::*;
+
+    #[test]
+    fn path_filters_use_official_no_argument_ast_without_legacy_expansion() {
+        for (name, step) in [
+            ("simplePath", ObservedGremlinStep::SimplePath),
+            ("cyclicPath", ObservedGremlinStep::CyclicPath),
+        ] {
+            let text = format!("g.V().{name}()");
+            let query = ObservedGremlinQuery::parse(&text).unwrap();
+            assert_eq!(query.steps(), &[step]);
+            assert!(!query.explicit_limit);
+            assert!(matches!(
+                GremlinQuery::parse(&text),
+                Err(Error::UnsupportedGremlinStep(_))
+            ));
+            for suffix in [
+                format!("{name}(1)"),
+                format!("{name}(local)"),
+                format!("{name}().by('name')"),
+                format!("{name}().from('a')"),
+                format!("{name}().to('b')"),
+                format!("repeat(out().{name}()).times(2)"),
+                format!("path().{name}()"),
+                format!("count().{name}()"),
+                format!("valueMap('x').{name}()"),
+            ] {
+                let text = format!("g.V(999).{suffix}");
+                assert!(ObservedGremlinQuery::parse(&text).is_err(), "{text}");
+            }
+        }
+        for text in [
+            "g.V().simplePath().outE().cyclicPath().inV().path()",
+            "g.E().simplePath().bothV().cyclicPath().count()",
+            "g.V().repeat(out()).times(2).emit().simplePath().id().dedup()",
+        ] {
+            assert!(ObservedGremlinQuery::parse(text).is_ok(), "{text}");
         }
     }
 }

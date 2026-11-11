@@ -742,8 +742,84 @@ async fn scenario() -> anyhow::Result<()> {
         assert_stamp(&output, identity, sequence);
         assert!(bytes < 4096);
     }
+    for (text, expected) in [
+        (
+            "g.V(1,1).out('knows').simplePath().path()",
+            vec![QueryRow::Path(vec![vertex(1), edge(9), vertex(2)]); 2],
+        ),
+        (
+            "g.V(1).out('knows').inE('knows').simplePath().path()",
+            vec![QueryRow::Path(vec![vertex(1), edge(9), vertex(2), edge(9)])],
+        ),
+        (
+            "g.V(1).outE('knows').inV().inE('knows').cyclicPath().path()",
+            vec![QueryRow::Path(vec![vertex(1), edge(9), vertex(2), edge(9)])],
+        ),
+        (
+            "g.V(1).outE('knows').inV().inE('knows').simplePath().count()",
+            vec![QueryRow::Count(0)],
+        ),
+        (
+            "g.V(1).out('knows').in('knows').cyclicPath().path()",
+            vec![QueryRow::Path(vec![
+                vertex(1),
+                edge(9),
+                vertex(2),
+                edge(9),
+                vertex(1),
+            ])],
+        ),
+        (
+            "g.V(70).out().simplePath().count()",
+            vec![QueryRow::Count(0)],
+        ),
+        (
+            "g.V(70).out().cyclicPath().count()",
+            vec![QueryRow::Count(22)],
+        ),
+        (
+            "g.V(70).both('single').cyclicPath().count()",
+            vec![QueryRow::Count(1)],
+        ),
+        (
+            "g.V(70).repeat(out('single')).times(2).emit().cyclicPath().count()",
+            vec![QueryRow::Count(2)],
+        ),
+        (
+            "g.V(70).repeat(out('single')).times(2).emit().simplePath().count()",
+            vec![QueryRow::Count(0)],
+        ),
+        ("g.E(9,9).simplePath().count()", vec![QueryRow::Count(2)]),
+        ("g.V(999999).cyclicPath().count()", vec![QueryRow::Count(0)]),
+    ] {
+        let output = query(
+            endpoint,
+            Some(identity),
+            request(QueryMode::V2Observed, text),
+            BUDGET,
+        )
+        .await??;
+        assert_eq!(output.rows, expected, "{text}");
+        assert_eq!(output.completeness, QueryCompleteness::Unverified);
+        assert_stamp(&output, identity, sequence);
+    }
+    for text in ["g.V(999999).simplePath()", "g.V(70).cyclicPath()"] {
+        assert_eq!(
+            query(
+                endpoint,
+                Some(identity),
+                request(QueryMode::V1, text),
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::Unsupported),
+            "{text}"
+        );
+    }
     for text in [
         "g.V(2).out('cross').range(0,0)",
+        "g.V(2).out('cross').cyclicPath().count()",
+        "g.V(2).out('cross').simplePath().range(0,0)",
         "g.E(10).range(0,0)",
         "g.V(2).out('cross')",
         "g.V(2).out('cross').valueMap('name')",
@@ -905,6 +981,7 @@ async fn scenario() -> anyhow::Result<()> {
     assert_eq!(longest.len(), 66);
     for text in [
         "g.E(200).inV().repeat(out('single')).times(32).path()",
+        "g.E(200).inV().repeat(out('single')).times(32).cyclicPath().path()",
         "g.E(200).outV().in('single').repeat(out('single')).times(31).path()",
     ] {
         let output = query(
@@ -931,6 +1008,18 @@ async fn scenario() -> anyhow::Result<()> {
         .rows,
         vec![QueryRow::Count(32)]
     );
+    assert!(query(
+        endpoint,
+        Some(identity),
+        request(
+            QueryMode::V2Observed,
+            "g.E(200).inV().repeat(out('single')).times(32).simplePath().path()",
+        ),
+        BUDGET,
+    )
+    .await??
+    .rows
+    .is_empty());
     for text in [
         "g.V(999999).repeat(out()).times(32).out()",
         "g.E(999999).repeat(out()).times(1)",
@@ -959,6 +1048,14 @@ async fn scenario() -> anyhow::Result<()> {
         Err(QueryFailure::Unsupported)
     );
     for text in [
+        "g.V(999999).id().simplePath()",
+        "g.E(999999).label().cyclicPath()",
+        "g.V(999999).values('missing').simplePath()",
+        "g.V(999999).simplePath().by('name')",
+        "g.V(999999).cyclicPath().from('x')",
+        "g.V(999999).simplePath().to('x')",
+        "g.V(999999).repeat(out().simplePath()).times(2)",
+        "g.V(999999).repeat(out().cyclicPath()).times(2)",
         "g.V(999999).is(1)",
         "g.E(999999).is(1)",
         "g.V(999999).id().is(1).out()",

@@ -23,7 +23,7 @@
 
 协调决策账本、参与者 prepare/commit/abort、连续 applied watermark、完整 cohort/empty-baseline 认证、外部请求 ID/原 Plan 恢复和远程 managed gateway 已接通。支持点/边创建、属性更新、边删除及条件属性补丁，partial apply 不得开放较新的 certified V。普通弱读仍可能看到逐片发布；`resolved_prefix` 本身不是可读版本。节点固定在同机独立进程的现有验证不等于多机 HA。见[受管事务](MANAGED_GRAPH_TRANSACTIONS.md)、[gateway](MANAGED_GRAPH_GATEWAY.md)及[固定版本查询](MANAGED_FIXED_TRAVERSALS.md)。
 
-Managed Traverse/TraversePage 已支持 routing-v3 的 qualified `id()`、元素/标量 `dedup()` 和完整结果分页，支持单个有界 out/in `repeat` 与 post-body emit（总深度≤32），仍不支持 `valueMap` 或 data-local hierarchy jobs。当前会先 materialize 小型 cohort snapshot，不能把 observed 全量 CoreHR 通过等同于 managed 全规模动态一致性验收。
+Managed Traverse/TraversePage 已支持 routing-v3 的 qualified `id()`、元素/标量 `dedup()` 和完整结果分页，支持单个有界 out/in `repeat` 与 post-body emit（总深度≤32），支持终结 selected `valueMap`、严格标量 `is`、有界 `range` 及 `simplePath`/`cyclicPath` 实际遍历对象路径过滤，仍不支持 data-local hierarchy jobs。当前会先 materialize 小型 cohort snapshot，不能把 observed 全量 CoreHR 通过等同于 managed 全规模动态一致性验收。
 
 S1 archive reads、S2 coordinator checkpoint、S3 member checkpoint、S4 retained gateway control 已合并。当前 bound durable metadata 为 coordinator v16/member v17，内部 RPC v6；冷启动 replay、完整 SnapshotV1 和部分证明仍依赖完整历史。两个 profile 都保留 16 MiB reserved history 及独立 intent/D1/query 限制；checkpoint 不回收配额，也不是远程备份。见[容量契约](COHORT_CAPACITY_PROFILE.md)。
 

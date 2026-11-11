@@ -234,11 +234,13 @@ snapshot reducer or traversal helpers. The fixture includes cross-partition ID
 ties, local and cross-shard edges, parallel edges, a cycle, a self-loop, strict
 typed values, and missing properties distinct from stored Null.
 
-Fifteen query shapes compare complete ordered rows and provenance at every new
+Twenty-nine query shapes compare complete ordered rows and provenance at every new
 version. They cover global identities, properties, both-direction bags,
-dedup/limit ordering, two-hop paths, edge endpoints, property/scalar filters and counts.
-Two retained versions also replay complete path/scalar pages while later
-submissions run. Each page's offset, total, row, end marker and replayed token
+dedup/limit ordering, two-hop paths, edge endpoints, property/scalar filters,
+actual-object simple/cyclic path filters and counts.
+Two retained versions replay complete path/scalar pages while later submissions
+run. Two sequentially pinned versions also replay simple/cyclic path pages in
+the concurrent submission/read phase. Each page's offset, total, row, end marker and replayed token
 are checked against the model, with a loop bounded by the expected row count.
 No assertion assumes a particular internal write/read scheduling order.
 
@@ -435,3 +437,62 @@ an additive Range variant, requiring exhaustive Rust matches to handle it; wire
 and disk formats are unchanged. Older executors reject the new text shape.
 This generic query slice does not expand managed acquisition capacity or complete
 #110/#111, and makes no performance or multi-host availability claim.
+
+
+## Bounded simple and cyclic path filters
+
+Shared routing-v3, single-partition V2Observed server queries and managed
+Traverse/TraversePage accept standard no-argument `simplePath()` and
+`cyclicPath()` on vertex or edge streams. The official AST supplies both steps.
+Whole-stream validation precedes reads, including empty starts: scalar input,
+arguments, scopes, by/from/to modulators, filters inside a repeat body and steps
+after terminal path/count/valueMap remain unsupported.
+
+`simplePath` retains a traverser only if all actual objects it has visited are
+distinct. `cyclicPath` retains it if any such identity repeats. Identity includes
+element kind, partition and ID: a vertex and an edge with the same number are
+not equal, nor are same-number elements in different partitions. Each input is
+independent, so repeated starts and parallel edges remain ordered bags. The
+filters neither deduplicate separate traversers nor prevent future revisits.
+
+The existing returned path includes canonical edges even for vertex-only
+out/in/both steps. Those implicit edges are provenance, not visited Gremlin
+objects, and do not participate in these filters. Explicit outE/inE/bothE and
+edge starts do participate. For example, on a non-loop edge from vertex 1 to 2,
+`g.V(1).out().inE().simplePath()` retains the path: its actual objects are the
+two vertices and the edge, despite the repeated edge in the returned provenance
+path. `g.V(1).outE().inV().inE().cyclicPath()` retains the corresponding explicit
+edge revisit. The public path format is unchanged.
+
+Filters execute where written alongside has/hasLabel, dedup, limit/range,
+ordinary adjacency and bounded repeat. They can precede projections or terminal
+path/count/valueMap. A filter after repeat inspects each completed/emitted path;
+it is not pushed into the repeat body or used to prune earlier frontiers.
+Emission retains actual-object history at every depth. Subsequent expansion can
+make a previously simple path cyclic. Filtering does not suppress the default
+first-100 result cap; existing explicit limit/range and count rules remain.
+
+Each row has a private fixed-width object-position mask over its existing path,
+not a second allocated path or a global visited set. Current admission permits
+at most 66 provenance entries. Appends check mask representability before path
+allocation. The shared fallible row selector moves retained rows without cloning:
+one work unit per input, one per marked object inspected and one per identity
+comparison, each with a deadline check. Pairwise comparison requires at most
+2,145 comparisons for 66 entries, further limited by the unchanged cumulative
+10,000-work budget. Retention uses the existing `128 + path_length *
+size_of(ObservedPathElement)` byte charge before allocation; the fixed row fee
+covers the mask. Charges are cumulative, including rejected rows and previous
+steps. An upstream corruption, scope, overflow or resource error remains an
+error even if the filter would discard every row. There is no predicate pushdown.
+
+All reads use the same provider and managed V. Complete-result pages still
+validate/materialize the entire bounded result and every page envelope before
+the first page; later writes, deletion and replay do not change retained rows.
+No TTL renewal, retry, budget increase or new wire/disk variant is introduced.
+Client validators retain their shape/provenance checks; they do not authenticate
+a peer or prove predicate truth. Observed results remain Unverified. Legacy
+local/v1, observed v1/v2, original managed Read and separate server-coordinator,
+global-scan and hierarchy-job subsets are unchanged. Older executors reject the
+new text; exhaustive Rust matches must handle the additive SimplePath/CyclicPath
+AST variants. This #167 semantic slice does not complete #110/#111 or enlarge
+managed snapshot capacity.

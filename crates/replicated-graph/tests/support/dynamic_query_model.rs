@@ -6,6 +6,8 @@ use super::*;
 type Key = (u32, u64);
 const LABEL: &str = "model";
 const PATH_QUERY: &str = "g.V(10).out('model').in('model').path()";
+const SIMPLE_QUERY: &str = "g.V(10).out('model').inE('model').simplePath().path()";
+const CYCLIC_QUERY: &str = "g.V(10).out('model').in('model').cyclicPath().path()";
 const SCALAR_QUERY: &str = "g.V().hasLabel('model').values('marker').dedup()";
 
 #[derive(Clone, Debug)]
@@ -19,6 +21,68 @@ struct ModelEdge {
 struct Model {
     vertices: Vec<(Key, Option<Value>)>,
     edges: Vec<ModelEdge>,
+}
+// The oracle keeps real traverser objects separately from the compatibility
+// path rows, which also contain implicit edges from vertex-to-vertex steps.
+#[derive(Clone, Debug)]
+struct Walk {
+    objects: Vec<QualifiedElement>,
+    path: Vec<QualifiedElement>,
+}
+impl Walk {
+    fn start(object: QualifiedElement) -> Self {
+        Self {
+            objects: vec![object],
+            path: vec![object],
+        }
+    }
+    fn current(&self) -> &QualifiedElement {
+        self.objects.last().unwrap()
+    }
+    fn simple(&self) -> bool {
+        self.objects
+            .iter()
+            .enumerate()
+            .all(|(i, object)| !self.objects[..i].contains(object))
+    }
+    fn advance(&self, object: QualifiedElement, implicit: Option<QualifiedElement>) -> Self {
+        let mut next = self.clone();
+        if let Some(edge) = implicit {
+            next.path.push(edge);
+        }
+        next.path.push(object);
+        next.objects.push(object);
+        next
+    }
+}
+#[derive(Clone, Copy)]
+enum Hop {
+    Out,
+    In,
+    InE,
+    OutE,
+    InV,
+}
+fn path_rows(walks: Vec<Walk>) -> Vec<QueryRow> {
+    walks
+        .into_iter()
+        .map(|walk| QueryRow::Path(walk.path))
+        .collect()
+}
+fn path_filter(walks: Vec<Walk>, simple: bool) -> Vec<Walk> {
+    walks
+        .into_iter()
+        .filter(|walk| walk.simple() == simple)
+        .collect()
+}
+fn unique_current(walks: Vec<Walk>) -> Vec<Walk> {
+    let mut result: Vec<Walk> = Vec::new();
+    for walk in walks {
+        if !result.iter().any(|prior| prior.current() == walk.current()) {
+            result.push(walk);
+        }
+    }
+    result
 }
 #[derive(Clone, Debug)]
 enum Change {
@@ -193,6 +257,124 @@ impl Model {
         }
         rows
     }
+    fn hop(&self, walks: &[Walk], hop: Hop) -> Vec<Walk> {
+        let mut result = Vec::new();
+        for walk in walks {
+            for edge in self.edges() {
+                let from = vertex_element(edge.from);
+                let to = vertex_element(edge.to);
+                let id = edge_element(edge.id);
+                let next = match hop {
+                    Hop::Out if walk.current() == &from => Some((to, Some(id))),
+                    Hop::In if walk.current() == &to => Some((from, Some(id))),
+                    Hop::InE if walk.current() == &to => Some((id, None)),
+                    Hop::OutE if walk.current() == &from => Some((id, None)),
+                    Hop::InV if walk.current() == &id => Some((to, None)),
+                    _ => None,
+                };
+                if let Some((object, implicit)) = next {
+                    result.push(walk.advance(object, implicit));
+                }
+            }
+        }
+        result
+    }
+    fn path_cases(&self) -> Vec<(&'static str, Vec<QueryRow>)> {
+        let roots: Vec<_> = self
+            .vertices()
+            .into_iter()
+            .filter(|key| *key == (7, 10))
+            .map(|key| Walk::start(vertex_element(key)))
+            .collect();
+        let outgoing = self.hop(&roots, Hop::Out);
+        let returning = self.hop(&outgoing, Hop::In);
+        let mixed = self.hop(&outgoing, Hop::InE);
+        let edges: Vec<_> = self
+            .edges()
+            .into_iter()
+            .filter(|edge| edge.id == (7, 10))
+            .map(|edge| Walk::start(edge_element(edge.id)))
+            .collect();
+        let edge_round = self.hop(&self.hop(&edges, Hop::InV), Hop::OutE);
+        let repeated_roots: Vec<_> = [(7, 10), (7, 10), (7, 11)]
+            .into_iter()
+            .filter(|key| self.vertices.iter().any(|(candidate, _)| candidate == key))
+            .map(|key| Walk::start(vertex_element(key)))
+            .collect();
+        let repeated = self.hop(&self.hop(&repeated_roots, Hop::Out), Hop::In);
+        vec![
+            (
+                "g.V(10).out('model').in('model').simplePath().path()",
+                path_rows(path_filter(returning.clone(), true)),
+            ),
+            (
+                CYCLIC_QUERY,
+                path_rows(path_filter(returning.clone(), false)),
+            ),
+            (SIMPLE_QUERY, path_rows(path_filter(mixed.clone(), true))),
+            (
+                "g.V(10).out('model').inE('model').cyclicPath().path()",
+                path_rows(path_filter(mixed, false)),
+            ),
+            (
+                "g.E(10).inV().outE('model').simplePath().path()",
+                path_rows(path_filter(edge_round.clone(), true)),
+            ),
+            (
+                "g.E(10).inV().outE('model').cyclicPath().path()",
+                path_rows(path_filter(edge_round, false)),
+            ),
+            (
+                "g.V(10).out('model').simplePath().in('model').path()",
+                path_rows(self.hop(&path_filter(outgoing, true), Hop::In)),
+            ),
+            (
+                "g.V(10).out('model').in('model').range(1,4).cyclicPath().path()",
+                path_rows(path_filter(
+                    returning.iter().skip(1).take(3).cloned().collect(),
+                    false,
+                )),
+            ),
+            (
+                "g.V(10).out('model').in('model').cyclicPath().range(1,4).path()",
+                path_rows(
+                    path_filter(returning.clone(), false)
+                        .into_iter()
+                        .skip(1)
+                        .take(3)
+                        .collect(),
+                ),
+            ),
+            (
+                "g.V(10).out('model').in('model').limit(1).simplePath().path()",
+                path_rows(path_filter(
+                    returning.iter().take(1).cloned().collect(),
+                    true,
+                )),
+            ),
+            (
+                "g.V(10).out('model').in('model').simplePath().limit(1).path()",
+                path_rows(
+                    path_filter(returning.clone(), true)
+                        .into_iter()
+                        .take(1)
+                        .collect(),
+                ),
+            ),
+            (
+                "g.V(10,10,11).out('model').in('model').dedup().simplePath().path()",
+                path_rows(path_filter(unique_current(repeated.clone()), true)),
+            ),
+            (
+                "g.V(10,10,11).out('model').in('model').simplePath().dedup().path()",
+                path_rows(unique_current(path_filter(repeated.clone(), true))),
+            ),
+            (
+                "g.V(10,10,11).out('model').in('model').simplePath().path()",
+                path_rows(path_filter(repeated, true)),
+            ),
+        ]
+    }
     fn cases(&self) -> Vec<(&'static str, Vec<QueryRow>)> {
         let rows = |keys: Vec<Key>| {
             keys.into_iter()
@@ -354,9 +536,23 @@ fn script() -> Vec<Change> {
 }
 
 async fn verify(g: &Gateway, session: &Session, model: &Model) -> anyhow::Result<()> {
-    for (query, expected) in model.cases() {
+    verify_cases(
+        g,
+        session,
+        model.cases().into_iter().chain(model.path_cases()),
+    )
+    .await
+}
+async fn verify_cases(
+    g: &Gateway,
+    session: &Session,
+    cases: impl IntoIterator<Item = (&'static str, Vec<QueryRow>)>,
+) -> anyhow::Result<()> {
+    for (query, expected) in cases {
         assert_eq!(
-            traverse(g, session, 7, query).await?,
+            traverse(g, session, 7, query)
+                .await
+                .with_context(|| format!("dynamic model Traverse V{}: {query}", session.version))?,
             expected,
             "V{}: {query}",
             session.version
@@ -385,11 +581,14 @@ impl Pinned {
         let expected = model
             .cases()
             .into_iter()
+            .chain(model.path_cases())
             .find(|(text, _)| *text == query)
             .unwrap()
             .1;
         assert!(expected.len() > 1, "fixture must exercise a continuation");
-        let first = page(g, &session, 7, query, None, 1).await?;
+        let first = page(g, &session, 7, query, None, 1)
+            .await
+            .with_context(|| format!("dynamic initial page V{version}: {query}"))?;
         Ok(Self {
             session,
             started,
@@ -400,7 +599,15 @@ impl Pinned {
         })
     }
     async fn verify(&self, g: &Gateway) -> anyhow::Result<()> {
-        verify(g, &self.session, &self.model).await?;
+        // Keep the original retained PATH/SCALAR model coverage intact without
+        // multiplying the new path matrix on every retained-session read. Each
+        // dedicated path pin checks its own complete result and every page.
+        let cases = if self.query == PATH_QUERY || self.query == SCALAR_QUERY {
+            self.model.cases()
+        } else {
+            vec![(self.query, self.expected.clone())]
+        };
+        verify_cases(g, &self.session, cases).await?;
         assert_eq!(
             page(g, &self.session, 7, self.query, None, 1).await?,
             self.first
@@ -409,7 +616,14 @@ impl Pinned {
         // an erroneous server returns a cycle of otherwise replayable tokens.
         let mut cursor = None;
         for (offset, expected) in self.expected.iter().enumerate() {
-            let got = page(g, &self.session, 7, self.query, cursor.clone(), 1).await?;
+            let got = page(g, &self.session, 7, self.query, cursor.clone(), 1)
+                .await
+                .with_context(|| {
+                    format!(
+                        "dynamic page V{} offset {offset}: {}",
+                        self.session.version, self.query
+                    )
+                })?;
             assert_eq!(got, page(g, &self.session, 7, self.query, cursor, 1).await?);
             assert_eq!(got.offset as usize, offset);
             assert_eq!(got.total as usize, self.expected.len());
@@ -431,6 +645,8 @@ pub(super) async fn scenario(
     let mut model = Model::default();
     let mut history = vec![(6, model.clone())];
     let mut pinned = Vec::<Pinned>::new();
+    let mut active_path: Option<Pinned> = None;
+    let mut path_history = Vec::<Pinned>::new();
     let changes = script();
     assert_eq!(changes.len(), 21);
     for (index, change) in changes.iter().enumerate() {
@@ -439,7 +655,20 @@ pub(super) async fn scenario(
         // assertion assumes which internal commit stage wins the race.
         let reads = async {
             for retained in &pinned {
-                retained.verify(&g).await?;
+                retained.verify(&g).await.with_context(|| {
+                    format!(
+                        "dynamic concurrent original pin V{} during write {index}: {}",
+                        retained.session.version, retained.query
+                    )
+                })?;
+            }
+            if let Some(retained) = &active_path {
+                retained.verify(&g).await.with_context(|| {
+                    format!(
+                        "dynamic concurrent path pin V{} during write {index}: {}",
+                        retained.session.version, retained.query
+                    )
+                })?;
             }
             Ok::<_, anyhow::Error>(())
         };
@@ -452,12 +681,39 @@ pub(super) async fn scenario(
         history.push((version, model.clone()));
         let fresh = open(&g, Some(version)).await?;
         assert_eq!(fresh.version, version);
-        verify(&g, &fresh, &model).await?;
+        verify(&g, &fresh, &model)
+            .await
+            .with_context(|| format!("dynamic fresh V{version} after write {index}"))?;
         call(&g, Operation::Close { session: fresh }).await?;
         for retained in &pinned {
-            retained.verify(&g).await?;
+            retained.verify(&g).await.with_context(|| {
+                format!(
+                    "dynamic post-write original pin V{} after write {index}: {}",
+                    retained.session.version, retained.query
+                )
+            })?;
+        }
+        if index == 13 || index == 20 {
+            let retained = active_path.take().unwrap();
+            call(
+                &g,
+                Operation::Close {
+                    session: retained.session.clone(),
+                },
+            )
+            .await?;
+            path_history.push(retained);
         }
         if index == 9 || index == 13 {
+            // Keep only one additional retained path snapshot. At most three
+            // read snapshots plus the racing writer capture use the existing
+            // four-slot materialization bound; each session pages one query.
+            let path_query = if index == 9 {
+                SIMPLE_QUERY
+            } else {
+                CYCLIC_QUERY
+            };
+            active_path = Some(Pinned::new(&g, version, model.clone(), path_query).await?);
             let query = if index == 9 { PATH_QUERY } else { SCALAR_QUERY };
             pinned.push(Pinned::new(&g, version, model.clone(), query).await?);
         }
@@ -474,7 +730,9 @@ pub(super) async fn scenario(
     for (version, expected) in &history {
         let session = open(&g, Some(*version)).await?;
         assert_eq!(session.version, *version);
-        verify(&g, &session, expected).await?;
+        verify(&g, &session, expected)
+            .await
+            .with_context(|| format!("dynamic pre-restart history V{version}"))?;
         call(&g, Operation::Close { session }).await?;
     }
     g.shutdown().await;
@@ -494,7 +752,7 @@ pub(super) async fn scenario(
         BUDGET,
     )
     .await?;
-    for retained in &pinned {
+    for retained in pinned.iter().chain(&path_history) {
         assert_eq!(
             call(
                 &restarted,
@@ -515,11 +773,13 @@ pub(super) async fn scenario(
     for (version, expected) in &history {
         let session = open(&restarted, Some(*version)).await?;
         assert_eq!(session.version, *version);
-        verify(&restarted, &session, expected).await?;
+        verify(&restarted, &session, expected)
+            .await
+            .with_context(|| format!("dynamic post-restart history V{version}"))?;
         call(&restarted, Operation::Close { session }).await?;
     }
     // A new historical session cannot adopt a token from the old incarnation.
-    for retained in &pinned {
+    for retained in pinned.iter().chain(&path_history) {
         let new = Pinned::new(
             &restarted,
             retained.session.version,
@@ -566,7 +826,12 @@ pub(super) async fn scenario(
             .await,
             Err(gateway::Error::Identity)
         );
-        new.verify(&restarted).await?;
+        new.verify(&restarted).await.with_context(|| {
+            format!(
+                "dynamic restarted pin V{}: {}",
+                new.session.version, new.query
+            )
+        })?;
         call(
             &restarted,
             Operation::Close {
@@ -576,7 +841,7 @@ pub(super) async fn scenario(
         .await?;
     }
     restarted.shutdown().await;
-    eprintln!("dynamic model: 21 typed writes; 22 historical versions x 13 complete-result queries before/after three-child and gateway restart; two retained paged versions interleaved with writes");
+    eprintln!("dynamic model: 21 typed writes; 22 historical versions x 29 complete-result queries before/after three-child and gateway restart; two path/scalar paged versions interleaved with writes plus two sequential simple/cyclic paged versions retained across later writes");
     Ok(())
 }
 
@@ -606,4 +871,49 @@ fn independent_model_has_qualified_bags_and_strict_values() {
     model.apply(&Change::DeleteEdge((7, 11)));
     assert_eq!(model.paths().len(), 5);
     assert!(model.edges.iter().any(|edge| edge.id == (8, 11)));
+}
+
+#[test]
+fn independent_path_model_ignores_implicit_edges_but_not_real_revisits() {
+    let mut model = Model::default();
+    for change in script().iter().take(10) {
+        model.apply(change);
+    }
+    let cases = model.path_cases();
+    let rows = |query| &cases.iter().find(|(text, _)| *text == query).unwrap().1;
+    assert_eq!(rows(SIMPLE_QUERY).len(), 4);
+    // Both equal-number vertices and the repeated rendered edge are harmless:
+    // the actual history is vertex(7,10), vertex(8,10), edge(7,10).
+    assert_eq!(
+        rows(SIMPLE_QUERY)[0],
+        QueryRow::Path(vec![
+            vertex_element((7, 10)),
+            edge_element((7, 10)),
+            vertex_element((8, 10)),
+            edge_element((7, 10)),
+        ])
+    );
+    assert_eq!(rows(CYCLIC_QUERY), &model.paths());
+    assert_eq!(
+        rows("g.E(10).inV().outE('model').simplePath().path()"),
+        &vec![QueryRow::Path(vec![
+            edge_element((7, 10)),
+            vertex_element((8, 10)),
+            edge_element((8, 10)),
+        ])]
+    );
+    assert!(rows("g.E(10).inV().outE('model').cyclicPath().path()").is_empty());
+    assert_ne!(
+        rows("g.V(10,10,11).out('model').in('model').dedup().simplePath().path()"),
+        rows("g.V(10,10,11).out('model').in('model').simplePath().dedup().path()"),
+    );
+    for change in script().iter().skip(10) {
+        model.apply(change);
+    }
+    let cases = model.path_cases();
+    let rows = |query| &cases.iter().find(|(text, _)| *text == query).unwrap().1;
+    assert_ne!(
+        rows("g.V(10).out('model').in('model').limit(1).simplePath().path()"),
+        rows("g.V(10).out('model').in('model').simplePath().limit(1).path()"),
+    );
 }

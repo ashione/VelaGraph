@@ -46,6 +46,9 @@ fail explicitly. Public graph mutations here are typed APIs, not Gremlin scripts
   Bounded `range(low, high)` selects positions on vertex/edge/scalar streams at
   the same V, preserving ordered bags and qualified provenance. This is not
   source-scan pushdown or a capacity expansion.
+  Standard `simplePath()`/`cyclicPath()` filter actual visited element identities,
+  preserving qualified bags and legacy provenance paths at the same V
+  ([contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters)).
   Standard `is(literal)` also filters scalar streams in place with strict typed
   equality, preserving ordered bags and source provenance; predicates remain
   rejected ([contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering)).
