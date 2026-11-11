@@ -1808,3 +1808,5 @@ mod condition_tests;
 
 #[path = "managed_gateway_local_tests.rs"]
 mod local_tests;
+#[path = "managed_gateway_replace_tests.rs"]
+mod replace_tests;

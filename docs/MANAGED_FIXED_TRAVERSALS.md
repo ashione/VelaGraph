@@ -25,6 +25,11 @@ The gateway materializes cohort data before traversal and executes the shared
 synchronous traversal locally over those immutable maps. It does not yet adapt
 the data-local distributed fragment engine or incremental hierarchy jobs to V.
 
+The shared executor [materializes paths only when consumed](QUERY_PATH_MATERIALIZATION.md)
+by path/simplePath/cyclicPath. Other queries retain their logical path lengths,
+with identical cumulative byte/work admission and all original graph checks.
+This query-local allocation optimization does not increase snapshot capacity.
+
 The external query is ordinary Gremlin text plus partition routing context:
 
 - V/E starts accept explicit IDs (argument order and duplicate IDs preserved), or

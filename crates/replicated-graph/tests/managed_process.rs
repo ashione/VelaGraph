@@ -607,7 +607,13 @@ async fn rejects_wrong_identity(process: &Process) -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_managed_processes_partial_commit_and_durable_recovery() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(240), scenario()).await?
+    tokio::time::timeout(Duration::from_secs(240), async {
+        scenario().await?;
+        // Preserve every original check and deadline. The additive replacement
+        // fixture starts only after the original cohort and sessions close.
+        managed_process_edge_replace::scenario().await
+    })
+    .await?
 }
 async fn scenario() -> anyhow::Result<()> {
     let mut coordinator = Process::start(9).await?;
@@ -1132,9 +1138,6 @@ async fn scenario() -> anyhow::Result<()> {
     fixed_version_value_map_scenario(&recovered).await?;
     range_queries::historical(&recovered, stale_session.version).await?;
     recovered.shutdown().await;
-    // Reuse this existing cohort after all old sessions close. Do not add a
-    // fourth concurrent fixture or lengthen any earlier retained-session TTL.
-    data_local_fixed_query_across_managed_processes(&coordinator, &mut a, &mut b).await?;
     Ok(())
 }
 
@@ -3219,6 +3222,8 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
 #[path = "support/range_queries.rs"]
 mod range_queries;
 
+#[path = "support/managed_process_edge_replace.rs"]
+mod managed_process_edge_replace;
 async fn data_local_fixed_query_across_managed_processes(
     coordinator: &Process,
     a: &mut Process,
@@ -3349,6 +3354,96 @@ async fn data_local_fixed_query_across_managed_processes(
     };
     assert_eq!(data.rows, vec![expected.clone(), expected.clone()]);
     call(&g, Operation::Close { session: old }).await?;
+    // Replace the source owner while retaining the numerical edge ID. The old
+    // Ready result must keep the original qualified edge and target at V.
+    let (_, replaced_version) = committed(
+        call(
+            &g,
+            write(
+                4,
+                Mutation::ReplaceEdge {
+                    edge: Entity {
+                        partition: 7,
+                        id: EDGE,
+                    },
+                    replacement: EdgeData {
+                        id: EDGE,
+                        from: Entity {
+                            partition: 8,
+                            id: ROOT,
+                        },
+                        to: Entity {
+                            partition: 7,
+                            id: ROOT,
+                        },
+                        label: "updated".into(),
+                        properties: BTreeMap::new(),
+                    },
+                },
+            ),
+        )
+        .await?,
+    );
+    let replaced_query = Query {
+        partition: 8,
+        text: format!("g.V({ROOT},{ROOT}).out('updated').path()"),
+    };
+    let Reply::OpenLocalQuery {
+        session: replaced,
+        page: replaced_page,
+        ..
+    } = call(
+        &g,
+        Operation::OpenLocalQuery {
+            version: Some(replaced_version),
+            ttl_millis: 60_000,
+            query: replaced_query.clone(),
+            page_size: 1000,
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected replaced Ready");
+    };
+    let replaced_path = QueryRow::Path(vec![
+        QualifiedElement::Vertex {
+            partition: 8,
+            id: ROOT,
+        },
+        QualifiedElement::Edge {
+            partition: 8,
+            id: EDGE,
+        },
+        QualifiedElement::Vertex {
+            partition: 7,
+            id: ROOT,
+        },
+    ]);
+    assert_eq!(
+        replaced_page.data.rows,
+        vec![replaced_path.clone(), replaced_path]
+    );
+    let materialized = open(&g, Some(replaced_version)).await?;
+    let Reply::Traverse { data, .. } = call(
+        &g,
+        Operation::Traverse {
+            session: materialized.clone(),
+            query: replaced_query,
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected replaced Traverse");
+    };
+    assert_eq!(data, replaced_page.data);
+    call(
+        &g,
+        Operation::Close {
+            session: materialized,
+        },
+    )
+    .await?;
+    call(&g, Operation::CloseLocalQuery { session: replaced }).await?;
     let fetch = Operation::FetchLocalQuery {
         session: session.clone(),
         query: query.clone(),

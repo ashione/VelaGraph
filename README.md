@@ -25,7 +25,8 @@ transfer automatically between them:
 | Observed experimental v2 | Static routed and server-coordinated cross-shard queries, bounded hierarchy jobs and selected result/property pages. Cross-shard writes are staged, not atomic. Results carry per-shard snapshots and **Unverified** completeness, not one certified graph version. |
 | Managed fixed cohort | Explicitly activated empty-baseline cohort, durable external-ID/original-Plan recovery, coordinated typed vertex/edge writes and certified same-version sessions. The gateway can use local Raft handles or fixed remote endpoints. Partial application cannot open a newer certified V. This is a restricted experiment, not general D4/D5 completion. |
 
-Managed writes support vertex/edge creation, property patches, edge deletion and
+Managed writes support vertex/edge creation, property patches, edge deletion,
+[atomic edge replacement](docs/MANAGED_EDGE_REPLACEMENT.md) and
 [conditional property patches](docs/MANAGED_GRAPH_GATEWAY.md#conditional-property-patches).
 Vertex deletion/cascades, arbitrary transaction programs, nonempty imported
 baseline certification and dynamic routing are not supported by this path.

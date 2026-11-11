@@ -57,6 +57,12 @@ failure fails the entire query. After the last required access, a node failure
 may be unobservable while the gateway seals results. Ready and subsequent Fetch
 rely on the gateway's retained result, not live nodes.
 
+An atomic edge replacement is a later certified write. Existing descriptors and
+pages retain the original qualified edge records at V; queries opened at the
+new version see the replacement, including a change of source owner with the
+same numerical edge ID. The legacy managed Traverse executor has its own lazy
+path representation. This entrypoint continues to use the distributed executor.
+
 The entire result is at most 10,000 rows and 1 MiB; page size is 1..=1000. Every
 complete page envelope, including Binding, original query, V/session, cursor and
 maximal request-id encoding, must fit 1 MiB before Ready. Cursors are independent

@@ -1810,3 +1810,6 @@ async fn status_never_combines_target_with_a_different_same_ordinal_proof() {
     );
     peer.await.unwrap();
 }
+
+#[path = "managed_edge_replace_tests.rs"]
+mod edge_replace_tests;

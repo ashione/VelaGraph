@@ -861,3 +861,312 @@ async fn fixed_local_concurrent_write_never_refreshes_descriptor_or_recaptures()
     }
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_local_replacement_keeps_captured_paths_and_matches_lazy_traverse() {
+    let _gate = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    for (external, partition, id) in [(1, 7, 1), (2, 7, 2), (3, 8, 1)] {
+        committed(
+            &call(&g, Operation::Submit(create(external, partition, id)))
+                .await
+                .unwrap(),
+        );
+    }
+    let edge_data = |id, from, to, label: &str| EdgeData {
+        id,
+        from,
+        to,
+        label: label.into(),
+        properties: BTreeMap::new(),
+    };
+    let mut old_v = 0;
+    for (external, edge) in [
+        (4, edge_data(10, entity(7, 1), entity(8, 1), "reports")),
+        (5, edge_data(11, entity(7, 1), entity(8, 1), "parallel")),
+        (6, edge_data(12, entity(8, 1), entity(8, 1), "self")),
+    ] {
+        old_v = committed(
+            &call(
+                &g,
+                Operation::Submit(Write {
+                    external_id: [external; 16],
+                    mutation: Mutation::CreateEdge { edge },
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+        .1;
+    }
+    let replacement = Write {
+        external_id: [7; 16],
+        mutation: Mutation::ReplaceEdge {
+            edge: entity(7, 10),
+            replacement: edge_data(10, entity(8, 1), entity(7, 2), "manages"),
+        },
+    };
+    let mut routes = g.state.config.local_routes.clone().unwrap();
+    let real = routes[0].endpoint;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    routes[0].endpoint = listener.local_addr().unwrap();
+    let write_address = g.local_addr();
+    let proxy = tokio::spawn(async move {
+        let mut descriptor = None;
+        let (mut opens, mut sequence, mut new_v) = (0, 0u64, None);
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let body = wire_read(&mut client).await;
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let operation = &request["operation"];
+            let fragment = operation["FixedQueryFragment"].is_object();
+            let close = operation["CloseFixedQuery"].is_object();
+            if operation["OpenFixedQuery"].is_object() {
+                opens += 1;
+                assert_eq!(opens, 1);
+            } else if fragment {
+                let fragment = &operation["FixedQueryFragment"];
+                assert_eq!(fragment["request_sequence"], sequence);
+                sequence += 1;
+                if let Some(original) = &descriptor {
+                    assert_eq!(&fragment["descriptor"], original);
+                } else {
+                    descriptor = Some(fragment["descriptor"].clone());
+                }
+            } else {
+                assert!(close);
+            }
+            let mut upstream = TcpStream::connect(real).await.unwrap();
+            wire_write(&mut upstream, &body).await;
+            let reply = wire_read(&mut upstream).await;
+            if fragment && new_v.is_none() {
+                // Both members were captured before the first required read.
+                // Change source owner, target and label while retaining the edge ID before traversal resumes.
+                let reply = super::request(
+                    write_address,
+                    bound(),
+                    Operation::Submit(replacement.clone()),
+                    Duration::from_secs(15),
+                )
+                .await
+                .unwrap();
+                new_v = Some(committed(&reply).1);
+            }
+            wire_write(&mut client, &reply).await;
+            if close {
+                assert_eq!(opens, 1);
+                assert!(sequence > 1);
+                return new_v.unwrap();
+            }
+        }
+    });
+    let tested = Gateway::bind_remote_local_queries(
+        remote_config(&g),
+        routes,
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(15),
+    )
+    .await
+    .unwrap();
+    let old_query = query(7, "g.V(1,1).out('reports').out('self').path()");
+    let (session, _, page) = ready(
+        call(
+            &tested,
+            Operation::OpenLocalQuery {
+                version: Some(old_v),
+                ttl_millis: 60_000,
+                query: old_query.clone(),
+                page_size: 1,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let new_v = tokio::time::timeout(Duration::from_secs(15), proxy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(new_v > old_v);
+    use crate::remote::query::QualifiedElement as E;
+    let vertex = |partition, id| E::Vertex { partition, id };
+    let edge = |partition, id| E::Edge { partition, id };
+    let old_path = QueryRow::Path(vec![
+        vertex(7, 1),
+        edge(7, 10),
+        vertex(8, 1),
+        edge(8, 12),
+        vertex(8, 1),
+    ]);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.data.rows, vec![old_path.clone()]);
+    let Reply::FetchLocalQuery { page: replay, .. } = call(
+        &tested,
+        Operation::FetchLocalQuery {
+            session: session.clone(),
+            query: old_query.clone(),
+            cursor: page.next,
+            page_size: 1,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(replay.data.rows, vec![old_path.clone()]);
+
+    async fn parity(g: &Gateway, version: u64, query: Query, expected: Vec<QueryRow>) {
+        let (local, _, page) = ready(
+            call(
+                g,
+                Operation::OpenLocalQuery {
+                    version: Some(version),
+                    ttl_millis: 60_000,
+                    query: query.clone(),
+                    page_size: 1000,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(page.data.rows, expected, "V={version} {}", query.text);
+        let old = open(g, Some(version)).await;
+        let Reply::Traverse { data, .. } = call(
+            g,
+            Operation::Traverse {
+                session: old.clone(),
+                query,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(data, page.data);
+        close(g, old).await;
+        call(g, Operation::CloseLocalQuery { session: local })
+            .await
+            .unwrap();
+    }
+    // The old path is independently captured again after replacement, then
+    // compared with the separately optimized materialized traversal engine.
+    parity(
+        &g,
+        old_v,
+        old_query.clone(),
+        vec![old_path.clone(), old_path],
+    )
+    .await;
+    parity(&g, new_v, old_query, vec![]).await;
+    parity(
+        &g,
+        new_v,
+        query(7, "g.V(1).out('reports').count()"),
+        vec![QueryRow::Count(0)],
+    )
+    .await;
+    parity(
+        &g,
+        new_v,
+        query(7, "g.V(1).out('parallel')"),
+        vec![QueryRow::Element(vertex(8, 1))],
+    )
+    .await;
+    let new_path = QueryRow::Path(vec![vertex(8, 1), edge(8, 10), vertex(7, 2)]);
+    parity(
+        &g,
+        new_v,
+        query(8, "g.V(1,1).out('manages').path()"),
+        vec![new_path.clone(), new_path.clone()],
+    )
+    .await;
+    parity(
+        &g,
+        new_v,
+        query(8, "g.V(1,1).out('manages').count()"),
+        vec![QueryRow::Count(2)],
+    )
+    .await;
+    parity(
+        &g,
+        new_v,
+        query(7, "g.V(2).in('manages')"),
+        vec![QueryRow::Element(vertex(8, 1))],
+    )
+    .await;
+    parity(
+        &g,
+        new_v,
+        query(7, "g.V(2,2).in('manages').count()"),
+        vec![QueryRow::Count(2)],
+    )
+    .await;
+    parity(
+        &g,
+        new_v,
+        query(7, "g.V(2).in('manages').in('parallel').path()"),
+        vec![QueryRow::Path(vec![
+            vertex(7, 2),
+            edge(8, 10),
+            vertex(8, 1),
+            edge(7, 11),
+            vertex(7, 1),
+        ])],
+    )
+    .await;
+    let self_v = committed(
+        &call(
+            &g,
+            Operation::Submit(Write {
+                external_id: [8; 16],
+                mutation: Mutation::ReplaceEdge {
+                    edge: entity(8, 10),
+                    replacement: edge_data(21, entity(7, 2), entity(7, 2), "manages"),
+                },
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .1;
+    parity(
+        &g,
+        new_v,
+        query(8, "g.V(1,1).out('manages').path()"),
+        vec![new_path.clone(), new_path],
+    )
+    .await;
+    parity(
+        &g,
+        self_v,
+        query(8, "g.V(1).out('manages').count()"),
+        vec![QueryRow::Count(0)],
+    )
+    .await;
+    parity(
+        &g,
+        self_v,
+        query(7, "g.V(2).out('manages').in('manages').path()"),
+        vec![QueryRow::Path(vec![
+            vertex(7, 2),
+            edge(7, 21),
+            vertex(7, 2),
+            edge(7, 21),
+            vertex(7, 2),
+        ])],
+    )
+    .await;
+    call(&tested, Operation::CloseLocalQuery { session })
+        .await
+        .unwrap();
+    tested.shutdown().await;
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    f.stop().await;
+}

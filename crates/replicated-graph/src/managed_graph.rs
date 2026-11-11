@@ -261,12 +261,7 @@ impl GraphSnapshot {
     pub fn prepare_edge(&self, edge: &CrossEdge) -> Result<Plan> {
         let source = self.store(edge.from.partition)?.prepare_source(edge)?;
         let reverse = self.store(edge.to.partition)?.prepare_reverse(edge)?;
-        let batches = if source.shard() == reverse.shard() {
-            vec![source.combine(reverse)?]
-        } else {
-            vec![source, reverse]
-        };
-        self.plan(batches)
+        self.plan(vec![source, reverse])
     }
     pub fn prepare_vertex_properties(
         &self,
@@ -310,7 +305,7 @@ impl GraphSnapshot {
         let guard = self
             .store(current.to.partition)?
             .prepare_reverse_guard(&current)?;
-        self.paired_plan(source, guard)
+        self.plan(vec![source, guard])
     }
     /// Conditional source-property update with the same source CAS and target
     /// reverse guard as an unconditional managed edge property patch.
@@ -329,7 +324,7 @@ impl GraphSnapshot {
         let guard = self
             .store(current.to.partition)?
             .prepare_reverse_guard(&current)?;
-        self.paired_plan(source, guard)
+        self.plan(vec![source, guard])
     }
     pub fn prepare_edge_delete(&self, edge: EdgeRef) -> Result<Plan> {
         let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
@@ -339,15 +334,34 @@ impl GraphSnapshot {
         let reverse = self
             .store(current.to.partition)?
             .prepare_reverse_delete(&current)?;
-        self.paired_plan(source, reverse)
+        self.plan(vec![source, reverse])
     }
-    fn paired_plan(&self, source: PreparedBatch, reverse: PreparedBatch) -> Result<Plan> {
-        let batches = if source.shard() == reverse.shard() {
-            vec![source.combine(reverse)?]
-        } else {
-            vec![source, reverse]
-        };
-        self.plan(batches)
+    /// Atomically replace one live relationship with a distinct new edge.
+    /// Both old halves and both new endpoints are validated at this same V.
+    /// The old qualified ID stays permanently reserved; this is delete/create,
+    /// not an in-place endpoint or label change. Retain the returned exact Plan.
+    pub fn prepare_edge_replace(&self, edge: EdgeRef, replacement: &CrossEdge) -> Result<Plan> {
+        if edge == replacement.identity() {
+            return Err(
+                ExperimentalError::Invalid("replacement must have a new edge identity").into(),
+            );
+        }
+        let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
+        // The first batch owns the permanent tombstone's operation ID. Preserve
+        // it as the global transaction ID even when another shard sorts first.
+        let source = self
+            .store(edge.partition)?
+            .prepare_source_delete(&current)?;
+        let reverse = self
+            .store(current.to.partition)?
+            .prepare_reverse_delete(&current)?;
+        let new_source = self
+            .store(replacement.from.partition)?
+            .prepare_source(replacement)?;
+        let new_reverse = self
+            .store(replacement.to.partition)?
+            .prepare_reverse(replacement)?;
+        self.plan(vec![source, reverse, new_source, new_reverse])
     }
     fn plan(&self, batches: Vec<PreparedBatch>) -> Result<Plan> {
         let cohort = self.session.cohort()?.clone();
@@ -358,10 +372,26 @@ impl GraphSnapshot {
         if id == [0; 16] {
             return Err(Error::Identity);
         }
+        // Every batch was validated against this immutable snapshot. Coalesce
+        // all contributions for a shard before allocating one intent, enforcing
+        // exact epoch/sequence equality and rejecting duplicate operation keys.
+        // At most four batches reach this private helper; no user-supplied list.
+        let mut by_shard: BTreeMap<u64, PreparedBatch> = BTreeMap::new();
+        for batch in batches {
+            match by_shard.entry(batch.shard()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(batch);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    let (shard, previous) = entry.remove_entry();
+                    by_shard.insert(shard, previous.combine(batch)?);
+                }
+            }
+        }
         let mut parts = Vec::new();
         let mut bytes = 0usize;
         let mut operations = 0usize;
-        for batch in batches {
+        for batch in by_shard.into_values() {
             let (request, sequence) = batch.into_conditional_request();
             let member = cohort
                 .members
