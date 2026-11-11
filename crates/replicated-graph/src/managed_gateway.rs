@@ -19,10 +19,13 @@ use rocksdb_sql_table::{
     Value, Vertex,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[path = "managed_gateway_local.rs"]
+mod local;
 #[path = "managed_gateway_pages.rs"]
 mod pages;
 #[path = "managed_gateway_query.rs"]
 mod query;
+pub use local::{LocalGraphRoute, LocalSession};
 pub use pages::{PageCursor, QueryPage, MAX_PAGE_SIZE};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -369,6 +372,23 @@ pub enum Operation {
     Close {
         session: Session,
     },
+    /// Execute one bounded data-local query completely before returning Ready.
+    OpenLocalQuery {
+        version: Option<u64>,
+        ttl_millis: u64,
+        query: Query,
+        page_size: u16,
+    },
+    /// Replay a page of a known immutable result, without accessing graph nodes.
+    FetchLocalQuery {
+        session: LocalSession,
+        query: Query,
+        cursor: Option<PageCursor>,
+        page_size: u16,
+    },
+    CloseLocalQuery {
+        session: LocalSession,
+    },
 }
 /// Durable decision and whole-cohort visibility are distinct observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +452,20 @@ pub enum Reply {
         page: QueryPage,
     },
     Close(Session),
+    OpenLocalQuery {
+        session: LocalSession,
+        query: Query,
+        page_size: u16,
+        page: QueryPage,
+    },
+    FetchLocalQuery {
+        session: LocalSession,
+        query: Query,
+        cursor: Option<PageCursor>,
+        page_size: u16,
+        page: QueryPage,
+    },
+    CloseLocalQuery(LocalSession),
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -480,10 +514,12 @@ struct OwnedConfig {
     coordinator: OwnedNode,
     binding: Binding,
     members: Vec<OwnedNode>,
+    local_routes: Option<Vec<LocalGraphRoute>>,
 }
 impl From<Config> for OwnedConfig {
     fn from(config: Config) -> Self {
         Self {
+            local_routes: None,
             coordinator: OwnedNode::Local(config.coordinator),
             binding: config.binding,
             members: config.members.into_iter().map(OwnedNode::Local).collect(),
@@ -493,6 +529,7 @@ impl From<Config> for OwnedConfig {
 impl From<RemoteConfig> for OwnedConfig {
     fn from(config: RemoteConfig) -> Self {
         Self {
+            local_routes: None,
             coordinator: OwnedNode::Remote(config.coordinator),
             binding: config.binding,
             members: config.members.into_iter().map(OwnedNode::Remote).collect(),
@@ -556,6 +593,7 @@ struct State {
     config: OwnedConfig,
     incarnation: [u8; 16],
     sessions: Mutex<BTreeMap<[u8; 32], Arc<Retained>>>,
+    local_sessions: Mutex<BTreeMap<[u8; 32], Arc<local::Retained>>>,
     memory: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     submit: tokio::sync::Mutex<()>,
@@ -563,6 +601,10 @@ struct State {
 }
 impl State {
     fn expire(&self) {
+        self.local_sessions
+            .lock()
+            .unwrap()
+            .retain(|_, s| Instant::now() < s.expires);
         self.sessions
             .lock()
             .unwrap()
@@ -810,6 +852,28 @@ impl State {
                 .await
                 .map_err(|_| Error::Unknown)?
             }
+            Operation::OpenLocalQuery {
+                version,
+                ttl_millis,
+                query,
+                page_size,
+            } => {
+                self.open_local(version, ttl_millis, query, page_size, work, end)
+                    .await
+            }
+            Operation::FetchLocalQuery {
+                session,
+                query,
+                cursor,
+                page_size,
+            } => self.fetch_local(session, query, cursor, page_size, end),
+            Operation::CloseLocalQuery { session } => {
+                self.get_local(&session)?
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.local_sessions.lock().unwrap().remove(&session.token);
+                Ok(Reply::CloseLocalQuery(session))
+            }
             Operation::Close { session } => {
                 self.get(&session)?
                     .closed
@@ -839,6 +903,19 @@ impl Gateway {
         deadline: Duration,
     ) -> Result<Self> {
         Self::bind_config(config.into(), bind, deadline, None).await
+    }
+    /// Opt in to query-bound data-local reads on explicitly pinned graph ports.
+    /// Each graph identity must match the corresponding managed Client and Binding.
+    pub async fn bind_remote_local_queries(
+        config: RemoteConfig,
+        routes: Vec<LocalGraphRoute>,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<Self> {
+        local::validate_routes(&config, &routes)?;
+        let mut config: OwnedConfig = config.into();
+        config.local_routes = Some(routes);
+        Self::bind_config(config, bind, deadline, None).await
     }
     /// Opt in to bounded local phase reports; draining/dropping them never gates writes.
     pub async fn bind_with_timing(
@@ -873,6 +950,7 @@ impl Gateway {
             timing,
             incarnation: random()?,
             sessions: Mutex::new(BTreeMap::new()),
+            local_sessions: Mutex::new(BTreeMap::new()),
             memory: Arc::new(Semaphore::new(MAX_SESSIONS)),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             submit: tokio::sync::Mutex::new(()),
@@ -928,6 +1006,7 @@ impl Gateway {
             handlers.abort_all();
             while handlers.join_next().await.is_some() {}
             worker.sessions.lock().unwrap().clear();
+            worker.local_sessions.lock().unwrap().clear();
         });
         Ok(Self {
             address,
@@ -962,9 +1041,13 @@ impl Drop for Gateway {
 struct OpenDelivery {
     state: Arc<State>,
     token: Option<[u8; 32]>,
+    local_token: Option<[u8; 32]>,
 }
 impl Drop for OpenDelivery {
     fn drop(&mut self) {
+        if let Some(token) = self.local_token {
+            self.state.local_sessions.lock().unwrap().remove(&token);
+        }
         if let Some(token) = self.token {
             self.state.sessions.lock().unwrap().remove(&token);
         }
@@ -979,7 +1062,11 @@ async fn serve(
     let request: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await?;
     let end = if matches!(
         request.operation,
-        Operation::Read { .. } | Operation::Traverse { .. } | Operation::TraversePage { .. }
+        Operation::Read { .. }
+            | Operation::Traverse { .. }
+            | Operation::TraversePage { .. }
+            | Operation::OpenLocalQuery { .. }
+            | Operation::FetchLocalQuery { .. }
     ) {
         end.min(Instant::now() + rocksdb_sql_table::GREMLIN_DEADLINE)
     } else {
@@ -997,6 +1084,10 @@ async fn serve(
     };
     let mut delivery = OpenDelivery {
         state: state.clone(),
+        local_token: match &result {
+            Ok(Reply::OpenLocalQuery { session, .. }) => Some(session.token),
+            _ => None,
+        },
         token: match &result {
             Ok(Reply::OpenSession(s)) => Some(s.token),
             _ => None,
@@ -1008,6 +1099,14 @@ async fn serve(
         binding: state.config.binding.clone(),
         result,
     };
+    // Retain the result reservation through encoding and the complete send,
+    // even when another request closes/expires the registry entry meanwhile.
+    let local_retained = match &response.result {
+        Ok(Reply::OpenLocalQuery { session, .. } | Reply::FetchLocalQuery { session, .. }) => {
+            Some(state.get_local(session)?)
+        }
+        _ => None,
+    };
     let expiry = match &response.result {
         Ok(
             Reply::OpenSession(s)
@@ -1015,9 +1114,12 @@ async fn serve(
             | Reply::Traverse { session: s, .. }
             | Reply::TraversePage { session: s, .. },
         ) => Some(state.get(s)?.expires),
+        Ok(Reply::OpenLocalQuery { session, .. } | Reply::FetchLocalQuery { session, .. }) => {
+            Some(state.get_local(session)?.expires)
+        }
         _ => None,
     };
-    let (bytes, success) = tokio::task::spawn_blocking(move || {
+    let (bytes, success, local_retained) = tokio::task::spawn_blocking(move || {
         let _work = work;
         let encoded = match encode(&response, MAX_RESPONSE_BYTES) {
             Ok(bytes) => bytes,
@@ -1026,18 +1128,27 @@ async fn serve(
                 encode(&response, MAX_RESPONSE_BYTES)?
             }
         };
-        if expiry.is_some_and(|end| Instant::now() >= end) {
+        if expiry.is_some_and(|end| Instant::now() >= end)
+            || local_retained
+                .as_ref()
+                .is_some_and(|retained| retained.closed.load(std::sync::atomic::Ordering::Acquire))
+        {
             return Err(Error::SessionUnavailable);
         }
         if Instant::now() >= end {
             return Err(Error::Unknown);
         }
-        Ok((encoded, response.result.is_ok()))
+        Ok((encoded, response.result.is_ok(), local_retained))
     })
     .await
     .map_err(|_| Error::Unknown)??;
     if Instant::now() >= end {
         return Err(Error::Unknown);
+    }
+    if let Some(retained) = &local_retained {
+        // The blocking encoder may finish before TTL while this task resumes
+        // after it. timeout_at alone can poll an immediately-ready write first.
+        local::live(retained, end)?;
     }
     let write_end = expiry.map_or(end, |expiry| expiry.min(end));
     let sent = tokio::time::timeout_at(
@@ -1054,6 +1165,7 @@ async fn serve(
     })?;
     if sent.is_ok() && success {
         delivery.token = None;
+        delivery.local_token = None;
     }
     sent
 }
@@ -1175,6 +1287,49 @@ fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
                 && pages::valid_page(query, cursor.as_ref(), *page_size, page, &request.binding)
         }
         (Operation::Close { session }, Reply::Close(s)) => session == s,
+        (
+            Operation::OpenLocalQuery {
+                version,
+                query,
+                page_size,
+                ..
+            },
+            Reply::OpenLocalQuery {
+                session,
+                query: q,
+                page_size: size,
+                page,
+            },
+        ) => {
+            session.incarnation != [0; 16]
+                && session.token != [0; 32]
+                && version.is_none_or(|v| v == session.version)
+                && query == q
+                && page_size == size
+                && local::valid_page(query, None, *page_size, page, &request.binding)
+        }
+        (
+            Operation::FetchLocalQuery {
+                session,
+                query,
+                cursor,
+                page_size,
+            },
+            Reply::FetchLocalQuery {
+                session: s,
+                query: q,
+                cursor: c,
+                page_size: size,
+                page,
+            },
+        ) => {
+            session == s
+                && query == q
+                && cursor == c
+                && page_size == size
+                && local::valid_page(query, cursor.as_ref(), *page_size, page, &request.binding)
+        }
+        (Operation::CloseLocalQuery { session }, Reply::CloseLocalQuery(s)) => session == s,
         _ => false,
     };
     if valid {

@@ -8,6 +8,8 @@ use rocksdb_sql_table::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 mod adjacency;
+pub(crate) mod fixed;
+pub(crate) mod fixed_execution;
 use adjacency::Direction;
 pub(in crate::remote) mod channel;
 pub mod consistency;
@@ -416,6 +418,7 @@ fn dedup_vertices(
 struct Execution<'a> {
     catalog: &'a StaticCatalog,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
+    fixed_sessions: Option<&'a mut BTreeMap<u64, fixed_execution::NodeSession>>,
     end: Instant,
     cost: Cost,
     scan_cost: Cost,
@@ -438,6 +441,11 @@ impl Execution<'_> {
         connection: Option<&mut Option<channel::Connection>>,
     ) -> Result<FragmentValue, QueryFailure> {
         check(self.end)?;
+        if let Some(sessions) = &mut self.fixed_sessions {
+            // The separate admitted fixed path shares all traversal/adjacency
+            // semantics, but never calls an observed OpenQuery/QueryFragment.
+            return fixed_execution::fragment(sessions, fragment, &mut self.cost, self.end).await;
+        }
         let route = self.route(fragment.partition())?.clone();
         let descriptor = self
             .sessions
@@ -713,11 +721,17 @@ impl Execution<'_> {
         };
         let output = DistributedOutput {
             completeness: QueryCompleteness::Unverified,
-            snapshots: self
-                .sessions
-                .values()
-                .map(|(_, d)| d.stamp.clone())
-                .collect(),
+            snapshots: if let Some(sessions) = &self.fixed_sessions {
+                sessions
+                    .values()
+                    .map(|s| s.descriptor.stamp.clone())
+                    .collect()
+            } else {
+                self.sessions
+                    .values()
+                    .map(|(_, d)| d.stamp.clone())
+                    .collect()
+            },
             rows: if let Some(projected) = projected {
                 projected
             } else if count {
@@ -777,6 +791,7 @@ async fn execute(
     check(end)?;
     let query = plan(&request)?;
     let mut execution = Execution {
+        fixed_sessions: None,
         catalog,
         ceiling: CEILING,
         scan_cost: Cost {

@@ -156,18 +156,77 @@ pub async fn acquire_endpoints(
     result.map_err(|_| window.timeout_error())?
 }
 
-// Admission is deliberately not a read certificate or a restart token. It
-// selects one coordinator prefix after observing every member's readiness, but
-// each member must still return matching same-lock evidence with its read.
-// Keep the original endpoints and acquisition window in the cut: a consumer
-// must not silently refresh V, replace a replica, or restart its deadline.
-struct AdmittedCut<'a> {
+/// Admission is deliberately not a read certificate or a restart token. It
+/// selects one coordinator prefix after observing every member's readiness, but
+/// each member must still return matching same-lock evidence with its read.
+/// Private fields preserve the original endpoints and acquisition window.
+/// Consumers must not refresh V, replace a replica, or restart its deadline.
+pub struct AdmittedCut<'a> {
     authority: Authority,
     cohort: Cohort,
     version: u64,
     proof: TerminalPrefix,
     members: Vec<(NodeRef<'a>, Target)>,
     window: AcquisitionWindow,
+}
+
+impl<'a> AdmittedCut<'a> {
+    /// Admission is not certification. Each selected member must still return
+    /// the exact proof with its same-lock captured read before any result is used.
+    pub fn check(&self) -> Result<(), Error> {
+        self.window.check()
+    }
+    pub fn authority(&self) -> &Authority {
+        &self.authority
+    }
+    pub fn cohort(&self) -> &Cohort {
+        &self.cohort
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn proof(&self) -> &TerminalPrefix {
+        &self.proof
+    }
+    pub fn members(&self) -> &[(NodeRef<'a>, Target)] {
+        &self.members
+    }
+    pub fn expires_at(&self) -> Instant {
+        self.window.expires
+    }
+    pub fn deadline(&self) -> Instant {
+        self.window.deadline
+    }
+}
+
+/// Admit one immutable complete cohort cut without downloading graph KV.
+/// The returned private-field value preserves exact endpoints, proof, V and
+/// original deadlines. It is neither a read certificate nor a restart token.
+/// Callers must compare every member's same-lock proof before publishing data.
+pub async fn admit_endpoints<'a>(
+    coordinator: NodeRef<'a>,
+    authority: Authority,
+    coordinator_epoch: u64,
+    members: Vec<(NodeRef<'a>, Target)>,
+    version: Option<u64>,
+    lifetime: Duration,
+) -> Result<AdmittedCut<'a>, Error> {
+    let window = AcquisitionWindow::new(lifetime)?;
+    let cut = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(window.deadline),
+        admit_cut(
+            coordinator,
+            authority,
+            coordinator_epoch,
+            members,
+            version,
+            window,
+        ),
+    )
+    .await
+    .map_err(|_| window.timeout_error())??;
+    cut.check()?;
+    Ok(cut)
 }
 
 #[derive(Clone, Copy)]

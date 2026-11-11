@@ -369,5 +369,9 @@ pub(super) async fn scenario() -> anyhow::Result<()> {
         assert_eq!(read(&g, &newest, partition, text).await?, expected);
     }
     g.shutdown().await;
+    // Reuse this smaller certified history and the same three processes for
+    // fixed-query/replacement interaction, after all earlier assertions finish.
+    // Keep the existing phase lock and overall 240-second test deadline.
+    data_local_fixed_query_across_managed_processes(&coordinator, &mut a, &mut b).await?;
     Ok(())
 }

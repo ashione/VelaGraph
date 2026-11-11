@@ -203,6 +203,7 @@ pub(super) async fn run(
             let sessions = job.sessions.clone();
             futures.push(Box::pin(async move {
                 let mut execution = Execution {
+                    fixed_sessions: None,
                     scan_cost: Cost::default(),
                     catalog,
                     sessions,

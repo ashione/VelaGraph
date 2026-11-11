@@ -106,6 +106,11 @@ enum Operation {
         descriptor: SnapshotDescriptor,
     },
     Query(query::QueryRequest),
+    OpenFixedQuery(distributed::fixed::FixedOpenRequest),
+    FixedQueryFragment(distributed::fixed::FixedFragmentRequest),
+    CloseFixedQuery {
+        descriptor: distributed::fixed::FixedDescriptor,
+    },
     OpenQuery {
         shard: u64,
         timeout_millis: u64,
@@ -139,6 +144,9 @@ enum Reply {
     SnapshotPage(SnapshotPage),
     CloseSnapshot,
     Query(query::QueryResponse),
+    OpenFixedQuery(distributed::fixed::FixedOpened),
+    FixedQueryFragment(Result<distributed::fixed::FixedFragmentOutput, query::QueryFailure>),
+    CloseFixedQuery,
     OpenQuery(distributed::Descriptor),
     OpenHierarchyQuery {
         descriptor: distributed::Descriptor,
@@ -178,10 +186,54 @@ impl GraphService {
         shard: u64,
         deadline: Duration,
     ) -> Result<Self, RemoteError> {
-        let identity = RemoteIdentity {
+        Self::start_parts(
+            node.id,
+            node.raft.clone(),
+            node.state_machine.clone(),
+            bind,
             group,
-            node: node.id,
-        };
+            shard,
+            deadline,
+        )
+        .await
+    }
+
+    /// Serve the exact same Raft/state handle as a managed-RPC endpoint. The
+    /// caller fixes both ports and identities in trusted server configuration.
+    /// This adds neither authentication nor automatic endpoint discovery.
+    pub async fn start_managed(
+        node: &d2_raft::NodeHandle,
+        bind: SocketAddr,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        if group != node.group_id() {
+            return Err(RemoteError::InvalidArgument);
+        }
+        Self::start_parts(
+            node.id,
+            node.raft.clone(),
+            node.state_machine.clone(),
+            bind,
+            group,
+            shard,
+            deadline,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_parts(
+        node: u64,
+        raft: openraft::Raft<TypeConfig>,
+        state: Arc<StateMachine>,
+        bind: SocketAddr,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        let identity = RemoteIdentity { group, node };
         checked_deadline(deadline, None)?;
         let listener = TcpListener::bind(bind)
             .await
@@ -189,8 +241,6 @@ impl GraphService {
         let address = listener
             .local_addr()
             .map_err(|_| RemoteError::Unavailable)?;
-        let raft = node.raft.clone();
-        let state = node.state_machine.clone();
         let sessions = Arc::new(paged::Sessions::new()?);
         let worker_sessions = sessions.clone();
         let query_sessions = Arc::new(distributed::Sessions::new()?);
@@ -276,6 +326,14 @@ impl GraphService {
                             if (1..=5000).contains(timeout_millis) =>
                         {
                             end.min(Instant::now() + Duration::from_millis(*timeout_millis))
+                        }
+                        Operation::OpenFixedQuery(request)
+                            if (1..=5000).contains(&request.acquire_timeout_millis) =>
+                        {
+                            end.min(
+                                Instant::now()
+                                    + Duration::from_millis(request.acquire_timeout_millis),
+                            )
                         }
                         Operation::OpenHierarchyQuery { .. } => {
                             end.min(Instant::now() + Duration::from_secs(5))
@@ -388,11 +446,50 @@ async fn execute(
     {
         return Err(RemoteError::InvalidArgument);
     }
+    if matches!(
+        request.operation,
+        Operation::OpenFixedQuery(_)
+            | Operation::FixedQueryFragment(_)
+            | Operation::CloseFixedQuery { .. }
+    ) && request.identity != Some(identity)
+    {
+        return Err(RemoteError::InvalidArgument);
+    }
     match request.operation {
         Operation::Managed(request) => managed::handle(raft, state, shard, request)
             .await
             .map(Reply::Managed),
         Operation::OpenHierarchyChannel { .. } => Err(RemoteError::InvalidArgument),
+        Operation::OpenFixedQuery(request) => {
+            request.validate(shard)?;
+            // Start the node lease before preflight/barrier/capture, never afterwards.
+            let lease_end = Instant::now() + Duration::from_millis(request.ttl_millis);
+            distributed::fixed::preflight(identity, &request, end.min(lease_end))?;
+            raft.ensure_linearizable()
+                .await
+                .map_err(|_| RemoteError::Unavailable)?;
+            query_sessions
+                .open_fixed(
+                    &state,
+                    identity,
+                    shard,
+                    request,
+                    end.min(lease_end),
+                    lease_end,
+                )
+                .await
+                .map(Reply::OpenFixedQuery)
+        }
+        Operation::FixedQueryFragment(request) => {
+            query_sessions
+                .fragment_fixed(&state, identity, shard, request, end)
+                .await
+        }
+        Operation::CloseFixedQuery { descriptor } => {
+            query_sessions.close_fixed(identity, shard, &descriptor)?;
+            Ok(Reply::CloseFixedQuery)
+        }
+
         Operation::OpenQuery {
             shard: requested,
             timeout_millis,
@@ -787,6 +884,8 @@ async fn rpc(
             | Operation::OpenQuery { .. }
             | Operation::OpenHierarchyQuery { .. }
             | Operation::OpenHierarchyChannel { .. }
+            | Operation::FixedQueryFragment(_)
+            | Operation::CloseFixedQuery { .. }
             | Operation::QueryFragment(_)
             | Operation::CloseQuery { .. }
     ) {
