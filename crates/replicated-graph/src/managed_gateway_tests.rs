@@ -1152,6 +1152,7 @@ async fn undelivered_open_guard_reclaims_on_cancellation() {
     let g = f.gateway().await;
     let session = open(&g, None).await;
     let delivery = OpenDelivery {
+        local_token: None,
         state: g.state.clone(),
         token: Some(session.token),
     };
@@ -1804,3 +1805,6 @@ mod submission_timing_tests;
 
 #[path = "managed_gateway_condition_tests.rs"]
 mod condition_tests;
+
+#[path = "managed_gateway_local_tests.rs"]
+mod local_tests;

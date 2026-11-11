@@ -129,6 +129,7 @@ mod tests {
             partitions: Vec::new(),
         };
         let mut execution = Execution {
+            fixed_sessions: None,
             scan_cost: Cost::default(),
             catalog: &catalog,
             sessions: BTreeMap::new(),

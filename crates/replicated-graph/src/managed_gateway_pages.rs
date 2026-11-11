@@ -28,14 +28,14 @@ pub struct QueryPage {
 }
 
 pub(super) struct Materialized {
-    query: Query,
-    size: u16,
-    data: QueryData,
-    offsets: BTreeMap<PageCursor, usize>,
-    cursors: BTreeMap<usize, PageCursor>,
+    pub(super) query: Query,
+    pub(super) size: u16,
+    pub(super) data: QueryData,
+    pub(super) offsets: BTreeMap<PageCursor, usize>,
+    pub(super) cursors: BTreeMap<usize, PageCursor>,
 }
 impl Materialized {
-    fn page(&self, offset: usize) -> QueryPage {
+    pub(super) fn page(&self, offset: usize) -> QueryPage {
         let stop = offset
             .saturating_add(usize::from(self.size))
             .min(self.data.rows.len());

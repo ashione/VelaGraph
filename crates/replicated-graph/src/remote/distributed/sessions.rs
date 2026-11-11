@@ -8,6 +8,7 @@ use rocksdb_sql_table::{
     StorageNode, StorageNodeError, Vertex, WriteRequest, WriteResult,
 };
 use std::sync::Mutex;
+mod fixed_sessions;
 
 static SESSION_SLOTS: Semaphore = Semaphore::const_new(8);
 static SESSION_BYTES: Semaphore = Semaphore::const_new(128 * 1024 * 1024);
@@ -18,7 +19,7 @@ static FRAGMENT_SLOTS: Semaphore = Semaphore::const_new(8);
 // acquisition behavior is still exercised explicitly inside the guarded tests.
 // A snapshot temporarily reserves 64 MiB before shrinking to its retained size.
 #[cfg(test)]
-static TEST_SESSION_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static TEST_SESSION_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Session {
     descriptor: Descriptor,
@@ -32,6 +33,7 @@ struct Session {
 pub(in crate::remote) struct Sessions {
     incarnation: [u8; 16],
     values: Mutex<BTreeMap<[u8; 16], Arc<Session>>>,
+    fixed_values: Mutex<BTreeMap<[u8; 16], Arc<fixed_sessions::FixedSession>>>,
 }
 fn token() -> Result<[u8; 16], RemoteError> {
     let mut token = [0; 16];
@@ -43,11 +45,16 @@ impl Sessions {
         Ok(Self {
             incarnation: token()?,
             values: Mutex::new(BTreeMap::new()),
+            fixed_values: Mutex::new(BTreeMap::new()),
         })
     }
     pub(in crate::remote) fn expire(&self) {
         let now = std::time::Instant::now();
         self.values.lock().unwrap().retain(|_, s| now < s.node.end);
+        self.fixed_values
+            .lock()
+            .unwrap()
+            .retain(|_, s| now < s.node.end);
     }
     pub(in crate::remote) async fn open(
         &self,

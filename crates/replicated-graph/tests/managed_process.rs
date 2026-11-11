@@ -224,6 +224,9 @@ async fn managed_node_child() -> anyhow::Result<()> {
     } else {
         Server::bind(node.clone(), own_identity, address, BUDGET).await?
     };
+    // Test-only lazy graph-port control: ordinary managed fixtures do not
+    // start an extra service or allocate query sessions.
+    let mut graph = None;
     fs::write(
         directory.join("ready.tmp"),
         serde_json::to_vec(&(std::process::id(), server.local_addr()))?,
@@ -232,9 +235,27 @@ async fn managed_node_child() -> anyhow::Result<()> {
     // Test-only filesystem control. No production RPC or public bypass is added.
     loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
+        if graph.is_none() && shard != 9 && directory.join("graph.request").exists() {
+            let service = replicated_graph::remote::GraphService::start_managed(
+                &node,
+                "127.0.0.1:0".parse()?,
+                shard,
+                shard,
+                BUDGET,
+            )
+            .await?;
+            atomic_json(
+                &directory.join("graph-ready.json"),
+                &(std::process::id(), service.local_addr()),
+            )?;
+            graph = Some(service);
+        }
         if directory.join("snapshot.request").exists() {
             node.raft.ensure_linearizable().await?;
             server.shutdown().await;
+            if let Some(graph) = graph {
+                graph.shutdown().await;
+            }
             node.raft.shutdown().await?;
             let mut state = node.state_machine.clone();
             let snapshot = state.build_snapshot().await?;
@@ -1111,6 +1132,9 @@ async fn scenario() -> anyhow::Result<()> {
     fixed_version_value_map_scenario(&recovered).await?;
     range_queries::historical(&recovered, stale_session.version).await?;
     recovered.shutdown().await;
+    // Reuse this existing cohort after all old sessions close. Do not add a
+    // fourth concurrent fixture or lengthen any earlier retained-session TTL.
+    data_local_fixed_query_across_managed_processes(&coordinator, &mut a, &mut b).await?;
     Ok(())
 }
 
@@ -3194,3 +3218,185 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
 
 #[path = "support/range_queries.rs"]
 mod range_queries;
+
+async fn data_local_fixed_query_across_managed_processes(
+    coordinator: &Process,
+    a: &mut Process,
+    b: &mut Process,
+) -> anyhow::Result<()> {
+    async fn route(p: &Process) -> anyhow::Result<gateway::LocalGraphRoute> {
+        fs::write(p.directory.path().join("graph.request"), b"start")?;
+        let endpoint = tokio::time::timeout(BUDGET, async {
+            loop {
+                if let Ok(bytes) = fs::read(p.directory.path().join("graph-ready.json")) {
+                    let (pid, endpoint): (u32, SocketAddr) = serde_json::from_slice(&bytes)?;
+                    if pid == p.child.id() {
+                        return Ok::<_, anyhow::Error>(endpoint);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(gateway::LocalGraphRoute {
+            endpoint,
+            identity: replicated_graph::remote::RemoteIdentity {
+                group: p.shard,
+                node: 1,
+            },
+            managed_identity: identity(p.shard),
+        })
+    }
+    let g = Gateway::bind_remote_local_queries(
+        RemoteConfig {
+            coordinator: coordinator.client()?,
+            binding: binding(),
+            members: vec![a.client()?, b.client()?],
+        },
+        vec![route(a).await?, route(b).await?],
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
+    const ROOT: u64 = 1_000_001;
+    const EDGE: u64 = 1_000_010;
+    let write = |sequence: u8, mutation| {
+        let mut external_id = [0; 16];
+        external_id[..3].copy_from_slice(&[b'L', b'F', sequence]);
+        Operation::Submit(Write {
+            external_id,
+            mutation,
+        })
+    };
+    for (sequence, partition) in [(1, 7), (2, 8)] {
+        committed(
+            call(
+                &g,
+                write(
+                    sequence,
+                    Mutation::CreateVertex {
+                        partition,
+                        vertex: VertexData {
+                            id: ROOT,
+                            labels: vec!["person".into()],
+                            properties: BTreeMap::new(),
+                        },
+                    },
+                ),
+            )
+            .await?,
+        );
+    }
+    let edge = EdgeData {
+        id: EDGE,
+        from: Entity {
+            partition: 7,
+            id: ROOT,
+        },
+        to: Entity {
+            partition: 8,
+            id: ROOT,
+        },
+        label: "knows".into(),
+        properties: BTreeMap::new(),
+    };
+    let (_, fixed_version) = committed(call(&g, write(3, Mutation::CreateEdge { edge })).await?);
+    let query = Query {
+        partition: 7,
+        text: format!("g.V({ROOT},{ROOT}).out().path()"),
+    };
+    let Reply::OpenLocalQuery { session, page, .. } = call(
+        &g,
+        Operation::OpenLocalQuery {
+            version: Some(fixed_version),
+            ttl_millis: 60_000,
+            query: query.clone(),
+            page_size: 1,
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected Ready");
+    };
+    let expected = QueryRow::Path(vec![
+        QualifiedElement::Vertex {
+            partition: 7,
+            id: ROOT,
+        },
+        QualifiedElement::Edge {
+            partition: 7,
+            id: EDGE,
+        },
+        QualifiedElement::Vertex {
+            partition: 8,
+            id: ROOT,
+        },
+    ]);
+    assert_eq!(session.version, fixed_version);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.data.rows, vec![expected.clone()]);
+    let old = open(&g, Some(fixed_version)).await?;
+    let Reply::Traverse { data, .. } = call(
+        &g,
+        Operation::Traverse {
+            session: old.clone(),
+            query: query.clone(),
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected Traverse");
+    };
+    assert_eq!(data.rows, vec![expected.clone(), expected.clone()]);
+    call(&g, Operation::Close { session: old }).await?;
+    let fetch = Operation::FetchLocalQuery {
+        session: session.clone(),
+        query: query.clone(),
+        cursor: page.next.clone(),
+        page_size: 1,
+    };
+    let before = call(&g, fetch.clone()).await?;
+    a.stop()?;
+    b.stop()?;
+    assert_eq!(call(&g, fetch.clone()).await?, before);
+    assert_eq!(call(&g, fetch).await?, before);
+    assert!(call(
+        &g,
+        Operation::OpenLocalQuery {
+            version: Some(fixed_version),
+            ttl_millis: 60_000,
+            query: Query {
+                partition: 7,
+                text: "g.V(999).count()".into()
+            },
+            page_size: 1
+        }
+    )
+    .await
+    .is_err());
+    // Known result replay does not acquire descriptors after process restart.
+    a.reopen().await?;
+    b.reopen().await?;
+    assert_eq!(
+        call(
+            &g,
+            Operation::FetchLocalQuery {
+                session: session.clone(),
+                query: query.clone(),
+                cursor: None,
+                page_size: 1
+            }
+        )
+        .await?,
+        Reply::FetchLocalQuery {
+            session: session.clone(),
+            query: query.clone(),
+            cursor: None,
+            page_size: 1,
+            page
+        }
+    );
+    call(&g, Operation::CloseLocalQuery { session }).await?;
+    g.shutdown().await;
+    Ok(())
+}

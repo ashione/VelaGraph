@@ -62,12 +62,15 @@ an unresolved decision. An explicitly requested version is never downgraded.
 
 Internally the shared admission stage retains the original member handles,
 exact targets, authority/cohort, chosen V, complete terminal proof and original
-acquisition/expiry deadlines in one private value. This is only an admitted cut,
+acquisition/expiry deadlines in one private-field value. This is only an admitted cut,
 not a certified snapshot: it contains no graph rows and cannot be serialized or
 used as a restart token. The materialized stage consumes that value without
 reselecting V, replacing endpoints or renewing its deadline. Both stages remain
-inside the same total acquisition timeout. This refactoring adds no public query
+inside the same total acquisition timeout. This admission alone adds no public query
 entrypoint, data-local execution, proof-size allowance or capacity increase.
+The separately opt-in [data-local gateway](MANAGED_LOCAL_GATEWAY.md) now uses
+`admit_endpoints` to obtain this non-serializable admitted cut and compares every
+member's actual same-lock retained proof before executing fixed descriptors.
 
 Every member then passes its own leader barrier and captures read_at(V). Under the
 same local state lock, the retained terminal transaction prefix must equal the
