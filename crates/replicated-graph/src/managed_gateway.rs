@@ -51,7 +51,7 @@ pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 8;
 pub const MAX_SESSIONS: usize = 4;
 /// Maximum configurable fixed-version shard lanes per query. This is bounded by
-/// the current eight-member local-query protocol, not a new resource allowance.
+/// admission and staged-fragment budgets, independently of cohort membership.
 pub const MAX_LOCAL_QUERY_PARALLELISM: usize = 8;
 /// Every materialization reserves both retained payload copies, including write
 /// preparation snapshots and expired sessions still held by an active worker.

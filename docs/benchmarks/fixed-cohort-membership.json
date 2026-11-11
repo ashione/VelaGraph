@@ -1,0 +1,68 @@
+{
+  "base_commit": "0e6532024efa53fd6e74672266e82889744b9898",
+  "scope": "9 independent durable data processes + 1 coordinator; loopback, one replica per shard. Not multi-host/HA/throughput/64-process evidence.",
+  "source_sha256": {
+    "crates/replicated-graph/src/managed_gateway.rs": "af001fcd867e434c3c38c6d9683a9ba15a2a9cc5569c1e705481400f13bbbd87",
+    "crates/replicated-graph/src/managed_gateway_local.rs": "15b3f811d417bbee3fcbbd1ff5f4c4686f22a9acd9008d67d891542a71ed0491",
+    "crates/replicated-graph/src/managed_gateway_local_tests.rs": "b1d7e011efcdb02865b0b07fe7ebb77323069504ae853a42dd07bb86b467a872",
+    "crates/replicated-graph/src/remote/distributed/fixed.rs": "a02b67d595e1809b7c07455c4877adf0bb4e649680a4e716670a09184c7405f6",
+    "crates/replicated-graph/src/remote/distributed/fixed_execution.rs": "40a312c344b39810ddf20a45558bfe8f8ae501de3f64b38408cacdfe019302bc",
+    "crates/replicated-graph/src/remote/distributed/fixed_parallel.rs": "aab001acdd684966f526610eb10c5bdd370a37f8e87be9ee8180982e54786393",
+    "crates/replicated-graph/src/remote/distributed/mod.rs": "ef551e564f7c09fd01cb56812960ad393810316f603e72a0e3f25dc88f2f342a",
+    "crates/replicated-graph/tests/cohort_membership.rs": "3d73a555dba1305f235fd9fa004d2d6889c23cffe063d7bd1754d724497d102e"
+  },
+  "process_acceptance": {
+    "test": "nine_data_processes_preserve_fixed_v_order_and_dynamic_writes",
+    "passed": 1,
+    "failed": 0,
+    "ignored_private_child": 1,
+    "elapsed_seconds": 192.74,
+    "gateway_request_seconds": 60,
+    "per_node_fixture_rpc_seconds": 15,
+    "outer_scenario_seconds": 300,
+    "log_sha256": "a2b2dd8d7f6b7cf055d83742c3b0e03591e1aeb79e7433e8386b96ff44ecbdbe",
+    "binary_sha256": "7bf7d26c924bb9028e78142e4b96ab1360249f54fa8fae624555b9c38c0437d0",
+    "assertions": [
+      "19 ordinary managed mutations; fixed V18 and later V19",
+      "duplicate-root ordered paths across all 9 members, widths 1/8 equivalent",
+      "V18 unchanged after write, V19 count10",
+      "job admission and complete-result replay at V18",
+      "missing ninth member fails",
+      "restart ninth member and verify historical V18 with width 3"
+    ]
+  },
+  "focused_units": {
+    "passed": 4,
+    "log_sha256": "f4a33c945d1f825ec43e852743af71ac4ca73c2e11bf11c55171996c42d4cddd",
+    "bounds": [
+      1,
+      8,
+      9,
+      32,
+      64,
+      65
+    ]
+  },
+  "earlier_fixture": {
+    "gateway_request_seconds": 15,
+    "result": "Unknown at managed write 16 before queries",
+    "elapsed_seconds": 133.93,
+    "log_sha256": "de910fe22659b1d7f9c2ac6cbc076a7dbe1e2f1b1716983686609b9143cc04f0",
+    "interpretation": "Full-cohort write work remains serial. Passing fixture selects existing supported 60-second configuration; production deadlines unchanged."
+  },
+  "limits_unchanged": [
+    "1..8 lanes/default 3",
+    "capture 10,000 rows / 2 MiB / 100,000 operations",
+    "2 coordinator executions",
+    "8 sessions / 8 workers per node",
+    "16 MiB journal and graph frame",
+    "original result,lease and admission budgets"
+  ],
+  "limitations": [
+    "64 is structural admission, not real 64-process acceptance",
+    "immutable cohorts cannot resize",
+    "trusted plaintext transport only",
+    "repeated proof/identity and serial certification cost",
+    "no #124 work or dependencies"
+  ]
+}

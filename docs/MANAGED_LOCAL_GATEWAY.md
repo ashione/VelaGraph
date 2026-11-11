@@ -36,7 +36,8 @@ adjacency completeness, separately from their certified V.
 
 ## Admission, execution and results
 
-The cohort is at most eight members. Admission selects exactly one V from the
+The fixed cohort supports at most 64 members, independently of the one-to-eight
+execution lanes. See [membership bounds and validation](FIXED_COHORT_MEMBERSHIP.md). Admission selects exactly one V from the
 original complete cohort and retains original endpoints, authority, cohort,
 complete terminal proof and deadlines. This admitted cut is not itself a read
 certificate. Every graph member captures once with its same-lock certified
@@ -206,7 +207,7 @@ Deployments should tune downward when query concurrency is high.
 This follows the separation between configurable operator concurrency and
 resource limits in [Trino task properties](https://trino.io/docs/current/admin/properties-task.html#task-concurrency),
 and the overload-protection goals of [CockroachDB admission control](https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/admission_control.md).
-These are design references, not transferred performance claims. The eight-member
+These are design references, not transferred performance claims. The fixed-member
 fixed cohort, immutable full-partition captures, restricted Gremlin subset,
 whole-result sealing and retained-history costs remain. Removing those boundaries
 needs separately reviewed streaming operators, indexed versioned views and
