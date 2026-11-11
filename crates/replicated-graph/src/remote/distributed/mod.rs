@@ -420,6 +420,7 @@ struct Execution<'a> {
     catalog: &'a StaticCatalog,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     fixed_sessions: Option<&'a mut BTreeMap<u64, fixed_execution::NodeSession>>,
+    control: Option<fixed_execution::ExecutionControl>,
     fixed_parallelism: usize,
     end: Instant,
     cost: Cost,
@@ -427,6 +428,13 @@ struct Execution<'a> {
     ceiling: Cost,
 }
 impl Execution<'_> {
+    fn check(&self) -> Result<(), QueryFailure> {
+        check(self.end)?;
+        if let Some(control) = &self.control {
+            control.check()?;
+        }
+        Ok(())
+    }
     fn route(&self, partition: u32) -> Result<&PartitionRoute, QueryFailure> {
         self.catalog
             .partitions
@@ -442,11 +450,18 @@ impl Execution<'_> {
         fragment: Fragment,
         connection: Option<&mut Option<channel::Connection>>,
     ) -> Result<FragmentValue, QueryFailure> {
-        check(self.end)?;
+        self.check()?;
         if let Some(sessions) = &mut self.fixed_sessions {
             // The separate admitted fixed path shares all traversal/adjacency
             // semantics, but never calls an observed OpenQuery/QueryFragment.
-            return fixed_execution::fragment(sessions, fragment, &mut self.cost, self.end).await;
+            return fixed_execution::fragment(
+                sessions,
+                fragment,
+                &mut self.cost,
+                self.end,
+                self.control.as_ref(),
+            )
+            .await;
         }
         let route = self.route(fragment.partition())?.clone();
         let descriptor = self
@@ -643,7 +658,7 @@ impl Execution<'_> {
             }
         }
         for step in traversal_steps {
-            check(self.end)?;
+            self.check()?;
             match step {
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
                 Step::Dedup => {
@@ -757,7 +772,7 @@ impl Execution<'_> {
         };
         let bytes = bounded_encode(&output, self.end)?;
         self.cost.charge(bytes.len() * 2, 0, self.ceiling)?;
-        check(self.end)?;
+        self.check()?;
         Ok(output)
     }
     async fn close(&self) {
@@ -794,6 +809,7 @@ async fn execute(
     let query = plan(&request)?;
     let mut execution = Execution {
         fixed_sessions: None,
+        control: None,
         fixed_parallelism: 3,
         catalog,
         ceiling: CEILING,

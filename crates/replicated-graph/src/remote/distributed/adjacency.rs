@@ -109,7 +109,7 @@ impl Execution<'_> {
             // Each iteration consumes at least one of two <=1,000-entry lists.
             // Merge in place: no cloned/concatenated adjacency or identity set.
             while let Some((edge, reverse)) = next_hop(&mut outgoing, &mut incoming)? {
-                check(self.end)?;
+                self.check()?;
                 if direction == Direction::Both {
                     self.cost.charge(0, 1, self.ceiling)?;
                 }
@@ -173,12 +173,13 @@ impl Execution<'_> {
                 .fixed_sessions
                 .as_deref_mut()
                 .ok_or(QueryFailure::Unavailable)?;
-            let adjacency = fixed_parallel::run_with_width(
+            let adjacency = fixed_parallel::run_controlled(
                 sessions,
                 fragments,
                 &mut self.cost,
                 self.end,
                 self.fixed_parallelism,
+                self.control.as_ref(),
             )
             .await?;
             let mut checks = Vec::new();
@@ -203,12 +204,13 @@ impl Execution<'_> {
             }
             // Validate every canonical/reverse/endpoint dependency, including
             // label-filtered candidates, before materializing any window rows.
-            let checked = fixed_parallel::run_with_width(
+            let checked = fixed_parallel::run_controlled(
                 sessions,
                 checks,
                 &mut self.cost,
                 self.end,
                 self.fixed_parallelism,
+                self.control.as_ref(),
             )
             .await?;
             let mut edges = if incoming {

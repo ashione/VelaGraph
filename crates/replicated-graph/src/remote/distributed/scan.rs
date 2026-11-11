@@ -186,7 +186,7 @@ impl Execution<'_> {
             request.partition = partition;
             request.after = None;
             while !request.stopped() {
-                check(self.end)?;
+                self.check()?;
                 let FragmentValue::Scan(page) =
                     self.fragment(Fragment::Scan(request.clone())).await?
                 else {

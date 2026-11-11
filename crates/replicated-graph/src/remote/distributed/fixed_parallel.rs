@@ -119,12 +119,24 @@ fn validate(fragment: &Fragment, value: &FragmentValue) -> Result<(), QueryFailu
     }
 }
 
-pub(super) async fn run_with_width(
+#[cfg(test)]
+async fn run_with_width(
     sessions: &mut BTreeMap<u64, NodeSession>,
     fragments: Vec<Fragment>,
     cost: &mut Cost,
     end: Instant,
     width: usize,
+) -> Result<Vec<FragmentValue>, QueryFailure> {
+    run_controlled(sessions, fragments, cost, end, width, None).await
+}
+
+pub(super) async fn run_controlled(
+    sessions: &mut BTreeMap<u64, NodeSession>,
+    fragments: Vec<Fragment>,
+    cost: &mut Cost,
+    end: Instant,
+    width: usize,
+    control: Option<&fixed_execution::ExecutionControl>,
 ) -> Result<Vec<FragmentValue>, QueryFailure> {
     validate_width(width)?;
     check(end)?;
@@ -136,6 +148,9 @@ pub(super) async fn run_with_width(
     // Each wave removes at least one bounded input; no retries or new sessions.
     while !pending.is_empty() {
         check(end)?;
+        if let Some(control) = control {
+            control.check()?;
+        }
         let remaining = Cost {
             bytes: CEILING.bytes.saturating_sub(cost.bytes),
             work: CEILING.work.saturating_sub(cost.work),
@@ -184,7 +199,7 @@ pub(super) async fn run_with_width(
             let prepared = fixed_execution::prepare(node, fragment.clone(), bound)?;
             cost.charge(prepared.cost.bytes, prepared.cost.work, CEILING)?;
             futures.push(Box::pin(async move {
-                let output = fixed_execution::invoke(prepared, end)
+                let output = fixed_execution::invoke(prepared, end, control)
                     .await
                     .and_then(|output| {
                         validate(&fragment, &output.value)?;
@@ -218,6 +233,9 @@ pub(super) async fn run_with_width(
         .await;
         drop(futures);
         completed?;
+        if let Some(control) = control {
+            control.check()?;
+        }
         // No wave becomes visible to operators until every leaf, descriptor,
         // sequence and budget has passed. Completion order never sets row order.
         let mut accepted = Vec::new();
@@ -231,6 +249,9 @@ pub(super) async fn run_with_width(
         }
     }
     check(end)?;
+    if let Some(control) = control {
+        control.check()?;
+    }
     Ok(outputs.into_iter().map(Option::unwrap).collect())
 }
 
@@ -430,6 +451,168 @@ mod tests {
             assert_eq!(cost.work, 48);
             assert!(cost.bytes <= CEILING.bytes);
             assert!(nodes.values().all(|node| node.sequence == 2));
+            for server in servers {
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_parallel_waves_keep_original_lanes_after_renewal() {
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        let (mut nodes, listeners) = fixture_with_members(2).await;
+        let original: Vec<_> = nodes.values().map(|node| node.descriptor.clone()).collect();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let lease = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(10)));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let (_stop, receiver) = tokio::sync::watch::channel(false);
+        let observed_lease = lease.clone();
+        let observed_checks = checks.clone();
+        let control = fixed_execution::ExecutionControl::new(
+            Arc::new(move || {
+                observed_checks.fetch_add(1, Ordering::SeqCst);
+                Ok(*observed_lease.lock().unwrap())
+            }),
+            receiver,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut servers = Vec::new();
+        for listener in listeners {
+            let barrier = barrier.clone();
+            let lease = lease.clone();
+            servers.push(tokio::spawn(async move {
+                for sequence in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = request(&mut socket).await;
+                    assert_eq!(request.request_sequence, sequence);
+                    tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                        .await
+                        .unwrap();
+                    if sequence == 0 {
+                        // Model an acknowledged live grant. No descriptor, lane
+                        // sequence or work allowance is recreated by renewal.
+                        *lease.lock().unwrap() = Instant::now() + Duration::from_secs(30);
+                    }
+                    reply(&mut socket, request, 0).await;
+                }
+            }));
+        }
+        let mut cost = Cost::default();
+        let output = run_controlled(
+            &mut nodes,
+            vec![
+                fragment(1, 2),
+                fragment(1, 3),
+                fragment(2, 4),
+                fragment(2, 5),
+            ],
+            &mut cost,
+            // The job execution lifetime may exceed the transport's 60s cap;
+            // every actual leaf must still use the separate bounded RPC budget.
+            Instant::now() + Duration::from_secs(120),
+            2,
+            Some(&control),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &output[..],
+            [
+                FragmentValue::Bool(true),
+                FragmentValue::Bool(false),
+                FragmentValue::Bool(true),
+                FragmentValue::Bool(false)
+            ]
+        ));
+        assert_eq!(cost.work, 12);
+        assert!(checks.load(Ordering::SeqCst) >= 8);
+        assert_eq!(
+            nodes
+                .values()
+                .map(|node| node.descriptor.clone())
+                .collect::<Vec<_>>(),
+            original
+        );
+        assert!(nodes.values().all(|node| node.sequence == 2));
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_parallel_wave_stops_on_expiry_or_cancel_without_partial_output() {
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        for cancel in [false, true] {
+            let (mut nodes, listeners) = fixture_with_members(2).await;
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let lease = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(10)));
+            let (stop, receiver) = tokio::sync::watch::channel(false);
+            let observed = lease.clone();
+            let control = fixed_execution::ExecutionControl::new(
+                Arc::new(move || Ok(*observed.lock().unwrap())),
+                receiver,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let mut servers = Vec::new();
+            for listener in listeners {
+                let barrier = barrier.clone();
+                servers.push(tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = request(&mut socket).await;
+                    for _ in 0..2 {
+                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                            .await
+                            .unwrap();
+                    }
+                    // A sibling error may already have cancelled this local socket.
+                    let _ = reply_result(&mut socket, request, 0).await;
+                }));
+            }
+            let signal = stop.clone();
+            let expire = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                    .await
+                    .unwrap();
+                // Both required lanes have dispatched. Expire before either reply,
+                // independent of scheduler order or wall-clock sleeps.
+                if cancel {
+                    signal.send(true).unwrap();
+                } else {
+                    *lease.lock().unwrap() = Instant::now() - Duration::from_secs(1);
+                }
+                tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                    .await
+                    .unwrap();
+            });
+            let mut cost = Cost::default();
+            let output = run_controlled(
+                &mut nodes,
+                vec![
+                    fragment(1, 2),
+                    fragment(2, 4),
+                    fragment(1, 6),
+                    fragment(2, 8),
+                ],
+                &mut cost,
+                Instant::now() + Duration::from_secs(120),
+                2,
+                Some(&control),
+            )
+            .await;
+            let expected = if cancel {
+                QueryFailure::Unavailable
+            } else {
+                QueryFailure::Timeout
+            };
+            assert!(matches!(output, Err(error) if error == expected));
+            assert!(
+                nodes.values().all(|node| node.sequence == 1),
+                "next wave must not consume a sequence or dispatch after lease loss"
+            );
+            assert_eq!(cost.work, 2, "consumed dispatches are not refunded");
+            expire.await.unwrap();
             for server in servers {
                 server.await.unwrap();
             }

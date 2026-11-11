@@ -78,7 +78,7 @@ impl Execution<'_> {
     ) -> Result<Vec<Traverser>, QueryFailure> {
         let mut emitted = Vec::new();
         for depth in 1..=times {
-            check(self.end)?;
+            self.check()?;
             self.cost.charge(0, 1, CEILING)?;
             rows = self
                 .expand(rows, Direction::from_incoming(incoming), label)

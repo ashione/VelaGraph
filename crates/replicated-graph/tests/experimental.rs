@@ -208,6 +208,7 @@ async fn scenario() -> anyhow::Result<()> {
                 id: 9
             })?
             .is_none());
+        let session_capture_started = std::time::Instant::now();
         let session = resolver.experimental_read_session(Duration::from_secs(60))?;
         assert_eq!(
             session
@@ -914,14 +915,17 @@ async fn scenario() -> anyhow::Result<()> {
         // deterministic unit tests separately cover all round/emission charges.
         {
             let text = "g.V(7).repeat(out('K')).times(32).dedup().limit(1)";
+            let age_before_probe = session_capture_started.elapsed();
+            let result = session.observed_gremlin_v3(1, text);
             assert!(
                 matches!(
-                    session.observed_gremlin_v3(1, text),
+                    &result,
                     Err(ExperimentalRouteError::Query(
                         rocksdb_sql_table::Error::TraversalLimitExceeded(_)
                     ))
                 ),
-                "{text}"
+                "query={text}, result={result:?}, age_before_probe={age_before_probe:?}, age_after_probe={:?} (ages include session capture)",
+                session_capture_started.elapsed()
             );
         }
         let byte_heavy = format!(

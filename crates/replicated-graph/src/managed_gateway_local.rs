@@ -30,10 +30,10 @@ pub(super) struct Retained {
     result: pages::Materialized,
     pub(super) closed: std::sync::atomic::AtomicBool,
 }
-fn snapshot_error(error: cohort_reads::Error) -> Error {
+pub(super) fn snapshot_error(error: cohort_reads::Error) -> Error {
     managed_graph::Error::from(error).into()
 }
-fn remote_error(error: RemoteError) -> Error {
+pub(super) fn remote_error(error: RemoteError) -> Error {
     match error {
         RemoteError::ResourceExhausted
         | RemoteError::Application(d2_raft::D1Error::VisibilityReadLimit) => Error::Capacity,
@@ -43,7 +43,7 @@ fn remote_error(error: RemoteError) -> Error {
         _ => Error::Unknown,
     }
 }
-fn request(query: &Query) -> DistributedRequest {
+pub(super) fn request(query: &Query) -> DistributedRequest {
     DistributedRequest {
         start_partition: query.partition,
         text: query.text.clone(),
@@ -100,7 +100,7 @@ pub(super) fn live(retained: &Retained, end: Instant) -> Result<()> {
     }
     before_deadline(end)
 }
-fn preflight(binding: &Binding, reply: Reply) -> Result<()> {
+pub(super) fn preflight(binding: &Binding, reply: Reply) -> Result<()> {
     encode(
         &Response {
             version: VERSION,
