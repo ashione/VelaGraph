@@ -57,8 +57,8 @@ shards at most three RPCs are in flight; one session always has at most one.
 Each wave receives disjoint conservative allowances from the same cumulative
 query budget. Large/skewed leaves or insufficient headroom use the original
 serial remaining allowance, never an equal split or a retry with more credits.
-Out's worst-case work bound currently prevents two Out leaves sharing a wave;
-reverse checks, incoming resolutions and eligible In leaves can overlap. This
+Out, In, reverse checks and incoming resolutions can overlap when their
+capture-dimension reservations fit the unchanged budget. This
 is a general leaf/stage execution mechanism, without graph-, label-, ID- or
 terminal-query special cases. The observed executor remains unchanged.
 
@@ -119,11 +119,25 @@ slice cannot demonstrate crossing the old 2 MiB capture boundary or completion o
 ## Parallel execution validation and scope
 
 The scheduler uses each participant's already-validated total capture bytes as
-an upper bound for an individual raw row, including uninterpreted records. The
+an upper bound for an individual raw row, including uninterpreted records.
+It also uses that same immutable capture's total row count to bound adjacency:
+after source validation, both Out and In can scan at most
+min(1000, capture_rows - 1) index candidates (saturating subtraction).
+Out reserves all canonical checks for those candidates even if a canonical
+record is missing, preserving corruption errors instead of exhausting a
+speculatively reduced allowance.
+No label, ID, graph-specific degree estimate, or query pattern selects a plan.
+This removes the unconditional 5004-work reservation that previously prevented
+any two Out leaves sharing a wave under the unchanged 10000-work budget. The
 bound covers successful MeteredNode gets/scans, server result encoding and client
 request/transport charges. It is conservative and checked for overflow. It is
-not a fresh memory pool or a statement about allocator RSS. No capture protocol,
-wire version, session ledger, grammar, deadline, TTL or resource cap changes.
+not a fresh memory pool or a statement about allocator RSS. A large capture,
+large individual property value, or little remaining budget can still force
+serial execution: there is no guarantee of parallelism for every graph. In
+particular two 1000-edge worst-case Out leaves cannot fit the existing budget.
+Allowances are never divided speculatively and a budget failure is never retried.
+No capture protocol, wire version, session ledger, grammar, deadline, TTL or
+resource cap changes.
 Request counter widths can differ with reserved allowances, so exact encoded-byte
 charges need not be bit-for-bit identical to serial execution.
 
@@ -132,8 +146,10 @@ width, forced reversed completion, duplicate ordinals, disjoint allowances,
 low-budget fallback, descriptor/sequence/leaf/cost corruption, failure-driven
 sibling cancellation, caller cancellation, expired empty stages, and actual
 MeteredNode charges versus the bound. A real Raft participant/TCP gateway test
-requires reverse validation on two shards to overlap and rejects corruption
-even in a label-filtered edge. Existing input-model bag/path, concurrent-write,
+requires both second-hop Out acquisition and reverse validation on two shards
+to overlap, and rejects corruption even in a label-filtered edge. Actual metering
+covers source-only empty adjacency and a dangling-index corruption error.
+Existing input-model bag/path, concurrent-write,
 old-V, node-loss, replacement and resource-owner tests remain applicable.
 
 The ignored `fixed_local_parallel_query_measurement` harness performs real
@@ -152,3 +168,10 @@ Those sources motivate mechanisms, not transferred performance claims. Future
 batched/paged operators and indexed versioned views can reuse the same execution
 context and ordering contract; this slice does not implement them or remove
 whole-partition capture/history limits.
+
+The capture-dimension refinement also follows the separation of concurrency
+slots and accounted resources in [Trino task properties](https://trino.io/docs/current/admin/properties-task.html)
+and [CockroachDB admission control](https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/admission_control.md).
+Their memory-accounting and non-preemptible-resource constraints motivate safe
+admission rather than optimistic fractional grants. No external system's
+performance results are transferred to this implementation.

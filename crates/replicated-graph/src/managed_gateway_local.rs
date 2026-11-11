@@ -304,6 +304,7 @@ impl State {
                         },
                         opened.descriptor.clone(),
                         opened.capture_cost.bytes,
+                        opened.capture_cost.rows,
                     ),
                 );
                 // Compare the complete retained certificate, not a boolean or V.

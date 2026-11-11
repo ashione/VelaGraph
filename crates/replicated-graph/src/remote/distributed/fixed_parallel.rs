@@ -38,9 +38,19 @@ fn reservation(fragment: &Fragment, node: &NodeSession) -> Option<Cost> {
             let each = 384usize.checked_add(row.checked_mul(5)?)?;
             let out = matches!(fragment, Fragment::Out(_));
             let each = each.checked_add(if out { get.checked_mul(3)? } else { 0 })?;
+            // After validating the source, all candidate index rows are
+            // distinct from that vertex. Do not assume a canonical row exists
+            // for each index: dangling indexes must reach their original
+            // corruption error, not exhaust a smaller speculative allowance.
+            // This uses immutable capture dimensions, never labels, IDs,
+            // estimated degrees, or a query-specific plan.
+            let entries = node.capture_rows.saturating_sub(1).min(1000);
             (
-                get.checked_add(128)?.checked_add(each.checked_mul(1000)?)?,
-                if out { 5002 } else { 2002 },
+                get.checked_add(128)?
+                    .checked_add(each.checked_mul(entries)?)?,
+                // MeteredNode::scan requires one unit of headroom even for
+                // an empty scan; it does not charge that unit when no row exists.
+                2usize.checked_add(entries.checked_mul(if out { 5 } else { 2 })?.max(1))?,
             )
         }
         _ => return None,
@@ -277,7 +287,7 @@ mod tests {
                 version: 8,
                 mode: [shard as u8; 16],
             };
-            nodes.insert(shard, NodeSession::new(route, descriptor, 256));
+            nodes.insert(shard, NodeSession::new(route, descriptor, 256, 10));
             listeners.push(listener);
         }
         (nodes, listeners)
@@ -307,6 +317,7 @@ mod tests {
         let value = match &request.fragment {
             Fragment::Exists(v) => FragmentValue::Bool(v.id % 2 == 0),
             Fragment::VerifyReverse(_) => FragmentValue::Bool(true),
+            Fragment::Out(_) => FragmentValue::Edges(Vec::new()),
             _ => panic!("fixture leaf"),
         };
         let mut output = fixed::FixedFragmentOutput {
@@ -405,6 +416,88 @@ mod tests {
         assert!(grants.work + 3 <= CEILING.work);
         assert_eq!(cost.work, 9);
         assert!(nodes.values().take(3).all(|node| node.sequence == 1));
+    }
+
+    #[tokio::test]
+    async fn outgoing_lanes_overlap_without_dividing_a_valid_leaf_allowance() {
+        let (mut nodes, mut listeners) = fixture().await;
+        listeners.truncate(3);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut servers = Vec::new();
+        let mut grants = Cost::default();
+        for shard in 1..=3 {
+            let leaf = Fragment::Out(VertexId {
+                partition: shard,
+                id: 99,
+            });
+            let bound = reservation(&leaf, &nodes[&u64::from(shard)]).unwrap();
+            assert!(fits(grants, bound, CEILING));
+            grants.bytes += bound.bytes;
+            grants.work += bound.work;
+        }
+        for listener in listeners {
+            let barrier = barrier.clone();
+            servers.push(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = request(&mut socket).await;
+                assert!(matches!(request.fragment, Fragment::Out(_)));
+                // Regression: the old unconditional 5004 work reservation
+                // cannot admit even two Out leaves and cannot pass this gate.
+                tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                    .await
+                    .unwrap();
+                reply(&mut socket, request, 0).await;
+            }));
+        }
+        let result = run(
+            &mut nodes,
+            (1..=3)
+                .map(|partition| Fragment::Out(VertexId { partition, id: 99 }))
+                .collect(),
+            &mut Cost::default(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(result
+            .iter()
+            .all(|v| matches!(v, FragmentValue::Edges(e) if e.is_empty())));
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_dimensions_bound_work_and_keep_large_captures_serial() {
+        let (mut nodes, _) = fixture().await;
+        let node = nodes.get_mut(&1).unwrap();
+        let leaf = Fragment::Out(VertexId {
+            partition: 1,
+            id: 99,
+        });
+        // Includes the source vertex and every possible index candidate,
+        // including dangling indexes with missing canonical records.
+        for (rows, expected_work) in [
+            (0, 5),
+            (1, 5),
+            (2, 9),
+            (3, 14),
+            (4, 19),
+            (1000, 4999),
+            (1001, 5004),
+            (usize::MAX, 5004),
+        ] {
+            node.capture_rows = rows;
+            assert_eq!(reservation(&leaf, node).unwrap().work, expected_work);
+        }
+        let bound = reservation(&leaf, node).unwrap();
+        assert!(!fits(bound, bound, CEILING));
+        // A huge vertex/property payload must not be treated as an average
+        // row; insufficient byte headroom retains the serial fallback too.
+        node.capture_rows = 10;
+        node.capture_bytes = fixed::CAPTURE_BYTES;
+        let bound = reservation(&leaf, node).unwrap();
+        assert!(bound.bytes > CEILING.bytes);
     }
 
     #[tokio::test]
@@ -543,7 +636,9 @@ mod tests {
         {
             let running = run(
                 &mut nodes,
-                vec![fragment(1, 2), fragment(2, 3), fragment(3, 4)],
+                (1..=3)
+                    .map(|partition| Fragment::Out(VertexId { partition, id: 2 }))
+                    .collect(),
                 &mut cost,
                 Instant::now() + Duration::from_secs(5),
             );

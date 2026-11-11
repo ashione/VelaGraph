@@ -869,6 +869,15 @@ mod lifetime_tests {
         entries: &BTreeMap<Vec<u8>, Vec<u8>>,
         fragment: Fragment,
     ) {
+        assert_fixed_reservation_outcome(frozen, entries, fragment, None);
+    }
+
+    pub(super) fn assert_fixed_reservation_outcome(
+        frozen: &query::FrozenNode,
+        entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        fragment: Fragment,
+        expected_error: Option<QueryFailure>,
+    ) {
         use super::super::{fixed, fixed_execution, fixed_parallel};
         use d2_raft::{
             participant_writes::Authority,
@@ -912,6 +921,7 @@ mod lifetime_tests {
             route,
             descriptor.clone(),
             entries.iter().map(|(k, v)| k.len() + v.len()).sum(),
+            entries.len(),
         );
         session.sequence = u64::MAX - 1;
         let bound = fixed_parallel::reservation_for_test(&fragment, &session).unwrap();
@@ -925,7 +935,15 @@ mod lifetime_tests {
             },
         };
         node.charge(512, 1).unwrap();
-        let value = run_fragment(&node, shard, fragment).unwrap();
+        let result = run_fragment(&node, shard, fragment);
+        if let Some(error) = expected_error {
+            assert_eq!(result.err(), Some(error));
+            let actual = *node.cost.lock().unwrap();
+            assert!(actual.bytes + prepared.cost.bytes <= bound.bytes);
+            assert!(actual.work + prepared.cost.work <= bound.work);
+            return;
+        }
+        let value = result.unwrap();
         let output = fixed::FixedFragmentOutput {
             descriptor,
             request_sequence: u64::MAX - 1,
@@ -1458,6 +1476,89 @@ mod epoch_tests {
         })
         .await
         .unwrap();
+
+        // Keeping only the actual encoded source vertex leaves no adjacency.
+        // The source-only bound reaches zero, but the meter
+        // must still have the headroom needed to execute an empty scan.
+        let empty_adjacency: BTreeMap<_, _> = entries
+            .iter()
+            .filter(|(key, _)| key.windows(8).any(|part| part == b"/vertex/"))
+            .take(1)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(empty_adjacency.len(), 1);
+        let empty_frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, empty_adjacency.clone()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        super::lifetime_tests::assert_fixed_reservation(
+            &empty_frozen,
+            &empty_adjacency,
+            Fragment::Out(VertexId {
+                partition: 0,
+                id: 1,
+            }),
+        );
+
+        super::lifetime_tests::assert_fixed_reservation(
+            &empty_frozen,
+            &empty_adjacency,
+            Fragment::In(VertexId {
+                partition: 0,
+                id: 1,
+            }),
+        );
+        // In with exactly two retained rows: target vertex and one incoming
+        // index. Unlike Out it does not require a local canonical edge row.
+        let mut one_incoming = BTreeMap::new();
+        let (key, value) = entries
+            .iter()
+            .rev()
+            .find(|(key, _)| key.windows(8).any(|part| part == b"/vertex/"))
+            .unwrap();
+        one_incoming.insert(key.clone(), value.clone());
+        let (key, value) = entries
+            .iter()
+            .find(|(key, _)| key.windows(4).any(|part| part == b"/in/"))
+            .unwrap();
+        one_incoming.insert(key.clone(), value.clone());
+        let incoming_frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, one_incoming.clone()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        super::lifetime_tests::assert_fixed_reservation(
+            &incoming_frozen,
+            &one_incoming,
+            Fragment::In(VertexId {
+                partition: 0,
+                id: 2,
+            }),
+        );
+
+        // One real source vertex plus one dangling outgoing index is the
+        // minimal corruption case. Reserving (rows - 1) / 2 edges would mask
+        // IncompleteOrCorrupt with a premature ResourceExhausted error.
+        let mut dangling = BTreeMap::new();
+        for marker in [b"/vertex/".as_slice(), b"/out/".as_slice()] {
+            let (key, value) = entries
+                .iter()
+                .find(|(key, _)| key.windows(marker.len()).any(|part| part == marker))
+                .unwrap();
+            dangling.insert(key.clone(), value.clone());
+        }
+        let dangling_frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, dangling.clone()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        super::lifetime_tests::assert_fixed_reservation_outcome(
+            &dangling_frozen,
+            &dangling,
+            Fragment::Out(VertexId {
+                partition: 0,
+                id: 1,
+            }),
+            Some(QueryFailure::IncompleteOrCorrupt),
+        );
 
         // The maximum is deliberately an uninterpreted/malformed raw row outside
         // graph prefixes. OpenHierarchy must include it, not decode/filter it away.

@@ -8,18 +8,21 @@ pub(crate) struct NodeSession {
     pub descriptor: FixedDescriptor,
     pub(super) sequence: u64,
     pub(super) capture_bytes: usize,
+    pub(super) capture_rows: usize,
 }
 impl NodeSession {
     pub(crate) fn new(
         route: PartitionRoute,
         descriptor: FixedDescriptor,
         capture_bytes: usize,
+        capture_rows: usize,
     ) -> Self {
         Self {
             route,
             descriptor,
             sequence: 0,
             capture_bytes,
+            capture_rows,
         }
     }
 }

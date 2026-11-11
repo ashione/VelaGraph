@@ -1217,6 +1217,7 @@ async fn fixed_local_parallel_validation_uses_real_views_and_never_hides_filtere
             let shard = route.identity.group;
             proxies.push(tokio::spawn(async move {
                 let mut sequence = 0;
+                let mut outgoing = 0;
                 let mut descriptor = None;
                 loop {
                     let (mut client, _) = listener.accept().await.unwrap();
@@ -1234,7 +1235,15 @@ async fn fixed_local_parallel_validation_uses_real_views_and_never_hides_filtere
                             descriptor = Some(leaf["descriptor"].clone());
                         }
                     }
-                    if verify {
+                    let out = leaf["fragment"]["Out"].is_object();
+                    if out {
+                        outgoing += 1;
+                    }
+                    // The initial root exists only on shard 7. Its first Out
+                    // creates the cross-shard frontier. The second hop must
+                    // dispatch Out to both actual retained participant views.
+                    let parallel_out = !corrupt && out && (shard == 8 || outgoing > 1);
+                    if verify || parallel_out {
                         // Both actual participant lanes must be in flight. The
                         // barrier is synchronization, not a performance claim.
                         tokio::time::timeout(Duration::from_secs(4), barrier.wait())
@@ -1275,7 +1284,15 @@ async fn fixed_local_parallel_validation_uses_real_views_and_never_hides_filtere
         .unwrap();
         let result = call(
             &tested,
-            local_open(Some(4), "g.V(1).out('selected').count()", 1),
+            local_open(
+                Some(4),
+                if corrupt {
+                    "g.V(1).out('selected').count()"
+                } else {
+                    "g.V(1).out().out('selected').count()"
+                },
+                1,
+            ),
         )
         .await;
         if corrupt {
