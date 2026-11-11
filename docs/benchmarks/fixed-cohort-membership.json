@@ -64,5 +64,14 @@
     "trusted plaintext transport only",
     "repeated proof/identity and serial certification cost",
     "no #124 work or dependencies"
-  ]
+  ],
+  "acceptance_source_tree": "fc9924bf997fcb64a99b86f7ce7086cb856d6198",
+  "source_snapshot_note": "The source_sha256 map and process binary identify the initial acceptance tree. The follow-up correction below only updates a pre-existing test for the widened admission contract; production code is identical.",
+  "followup_test_only_correction": {
+    "file": "crates/replicated-graph/src/managed_gateway_local_tests.rs",
+    "sha256": "75d57fc2009810d19aee7da7d9e167e8fef23322c73aec3d1596c604b1b37f3c",
+    "tests_passed": 3,
+    "log_sha256": "2dc64fa206b687618eab5e68fe83c51c0c783dc27b2b756330595fdd0e17e988",
+    "description": "Preserve boundary coverage: accept 64 routes, reject 65-member client identity and an extra route; replace obsolete nine-member rejection assertion."
+  }
 }
