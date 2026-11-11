@@ -60,6 +60,15 @@ leader-observed member applied prefixes. This selects one common safe watermark,
 not the newest coordinator decision that might still be unapplied. V cannot cross
 an unresolved decision. An explicitly requested version is never downgraded.
 
+Internally the shared admission stage retains the original member handles,
+exact targets, authority/cohort, chosen V, complete terminal proof and original
+acquisition/expiry deadlines in one private value. This is only an admitted cut,
+not a certified snapshot: it contains no graph rows and cannot be serialized or
+used as a restart token. The materialized stage consumes that value without
+reselecting V, replacing endpoints or renewing its deadline. Both stages remain
+inside the same total acquisition timeout. This refactoring adds no public query
+entrypoint, data-local execution, proof-size allowance or capacity increase.
+
 Every member then passes its own leader barrier and captures read_at(V). Under the
 same local state lock, the retained terminal transaction prefix must equal the
 coordinator observation: authority, cohort, IDs, ordinals, participant sets,
@@ -94,6 +103,17 @@ budget before materialization. Intermediate replay state counts. Exhaustion fail
 closed even if a not-yet-read shard might turn out to be empty. Metadata, bounded
 terminal-prefix evidence and map allocation overhead are additional to the payload
 budget. Failure drops all partial captures.
+
+The replay-operation counter measures D1 WriteOps, not all certification work.
+For current durable active coordinator/member states, deriving terminal evidence
+can reconstruct and validate the complete retained raw event history, including
+temporary Journals with original Plans, before projecting the requested V. Thus
+an old small V does not imply a small certification cost. This remains bounded
+by the existing profile's history byte/event limits, not by
+`ReadLimit.operations`. The original acquisition deadline is checked, but it
+cannot preempt synchronous certification work. Temporary certification
+allocations, codec scratch, CPU time and state-lock duration are additional costs; this
+refactoring neither measures nor reduces them and makes no process-RSS claim.
 
 This is a process-local materialized pin, not a restartable token, renewable lease,
 or server-side reservation. A node failure after successful capture does not change
