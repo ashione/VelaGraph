@@ -862,6 +862,117 @@ mod tests {
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+    // Exercise the same MeteredNode/run_fragment and exact fixed envelope as
+    // the production worker, including raw rows ignored by the graph decoder.
+    pub(super) fn assert_fixed_reservation(
+        frozen: &query::FrozenNode,
+        entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        fragment: Fragment,
+    ) {
+        assert_fixed_reservation_outcome(frozen, entries, fragment, None);
+    }
+
+    pub(super) fn assert_fixed_reservation_outcome(
+        frozen: &query::FrozenNode,
+        entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        fragment: Fragment,
+        expected_error: Option<QueryFailure>,
+    ) {
+        use super::super::{fixed, fixed_execution, fixed_parallel};
+        use d2_raft::{
+            participant_writes::Authority,
+            transaction_decisions::{Cohort, Member},
+        };
+        let shard = 7;
+        let route = PartitionRoute {
+            partition: 0,
+            shard,
+            epoch: 1,
+            identity: RemoteIdentity { group: 2, node: 1 },
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+        };
+        let descriptor = fixed::FixedDescriptor {
+            stamp: QueryStamp {
+                identity: route.identity,
+                shard,
+                epoch: 1,
+                sequence: u64::MAX,
+            },
+            incarnation: [255; 16],
+            token: [255; 16],
+            authority: Authority {
+                shard: 9,
+                mode: [255; 16],
+            },
+            cohort: Cohort {
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                profile: Default::default(),
+                members: vec![Member {
+                    shard,
+                    epoch: 1,
+                    mode: [255; 16],
+                }],
+            },
+            version: u64::MAX,
+            mode: [255; 16],
+        };
+        let mut session = fixed_execution::NodeSession::new(
+            route,
+            descriptor.clone(),
+            entries.iter().map(|(k, v)| k.len() + v.len()).sum(),
+            entries.len(),
+        );
+        session.sequence = u64::MAX - 1;
+        let bound = fixed_parallel::reservation_for_test(&fragment, &session).unwrap();
+        let prepared = fixed_execution::prepare(&mut session, fragment.clone(), bound).unwrap();
+        let node = MeteredNode {
+            frozen: frozen.clone(),
+            cost: Arc::new(Mutex::new(Cost::default())),
+            ceiling: Cost {
+                bytes: bound.bytes - prepared.cost.bytes,
+                work: bound.work - prepared.cost.work,
+            },
+        };
+        node.charge(512, 1).unwrap();
+        let result = run_fragment(&node, shard, fragment);
+        if let Some(error) = expected_error {
+            assert_eq!(result.err(), Some(error));
+            let actual = *node.cost.lock().unwrap();
+            assert!(actual.bytes + prepared.cost.bytes <= bound.bytes);
+            assert!(actual.work + prepared.cost.work <= bound.work);
+            return;
+        }
+        let value = result.unwrap();
+        let output = fixed::FixedFragmentOutput {
+            descriptor,
+            request_sequence: u64::MAX - 1,
+            cost: CEILING,
+            value,
+        };
+        let encoded = bounded_encode(&output, Instant::from_std(frozen.end)).unwrap();
+        node.charge(encoded.len() * 2, 0).unwrap();
+        let actual = *node.cost.lock().unwrap();
+        assert!(actual.bytes + prepared.cost.bytes <= bound.bytes);
+        assert!(actual.work + prepared.cost.work <= bound.work);
+    }
+
+    #[test]
+    fn fixed_reservation_covers_absent_keys_in_empty_capture() {
+        let frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, BTreeMap::new()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        assert_fixed_reservation(
+            &frozen,
+            &BTreeMap::new(),
+            Fragment::Exists(VertexId {
+                partition: 0,
+                id: u64::MAX,
+            }),
+        );
+    }
+
     #[tokio::test]
     async fn token_bound_view_expires_closes_and_retains_admission_while_in_use() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
@@ -1366,6 +1477,89 @@ mod epoch_tests {
         .await
         .unwrap();
 
+        // Keeping only the actual encoded source vertex leaves no adjacency.
+        // The source-only bound reaches zero, but the meter
+        // must still have the headroom needed to execute an empty scan.
+        let empty_adjacency: BTreeMap<_, _> = entries
+            .iter()
+            .filter(|(key, _)| key.windows(8).any(|part| part == b"/vertex/"))
+            .take(1)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(empty_adjacency.len(), 1);
+        let empty_frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, empty_adjacency.clone()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        super::lifetime_tests::assert_fixed_reservation(
+            &empty_frozen,
+            &empty_adjacency,
+            Fragment::Out(VertexId {
+                partition: 0,
+                id: 1,
+            }),
+        );
+
+        super::lifetime_tests::assert_fixed_reservation(
+            &empty_frozen,
+            &empty_adjacency,
+            Fragment::In(VertexId {
+                partition: 0,
+                id: 1,
+            }),
+        );
+        // In with exactly two retained rows: target vertex and one incoming
+        // index. Unlike Out it does not require a local canonical edge row.
+        let mut one_incoming = BTreeMap::new();
+        let (key, value) = entries
+            .iter()
+            .rev()
+            .find(|(key, _)| key.windows(8).any(|part| part == b"/vertex/"))
+            .unwrap();
+        one_incoming.insert(key.clone(), value.clone());
+        let (key, value) = entries
+            .iter()
+            .find(|(key, _)| key.windows(4).any(|part| part == b"/in/"))
+            .unwrap();
+        one_incoming.insert(key.clone(), value.clone());
+        let incoming_frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, one_incoming.clone()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        super::lifetime_tests::assert_fixed_reservation(
+            &incoming_frozen,
+            &one_incoming,
+            Fragment::In(VertexId {
+                partition: 0,
+                id: 2,
+            }),
+        );
+
+        // One real source vertex plus one dangling outgoing index is the
+        // minimal corruption case. Reserving (rows - 1) / 2 edges would mask
+        // IncompleteOrCorrupt with a premature ResourceExhausted error.
+        let mut dangling = BTreeMap::new();
+        for marker in [b"/vertex/".as_slice(), b"/out/".as_slice()] {
+            let (key, value) = entries
+                .iter()
+                .find(|(key, _)| key.windows(marker.len()).any(|part| part == marker))
+                .unwrap();
+            dangling.insert(key.clone(), value.clone());
+        }
+        let dangling_frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, dangling.clone()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        super::lifetime_tests::assert_fixed_reservation_outcome(
+            &dangling_frozen,
+            &dangling,
+            Fragment::Out(VertexId {
+                partition: 0,
+                id: 1,
+            }),
+            Some(QueryFailure::IncompleteOrCorrupt),
+        );
+
         // The maximum is deliberately an uninterpreted/malformed raw row outside
         // graph prefixes. OpenHierarchy must include it, not decode/filter it away.
         let raw_key = b"uninterpreted/invalid-record".to_vec();
@@ -1452,6 +1646,13 @@ mod epoch_tests {
             keys: vec!["姓名".into(), "null".into(), "missing".into()],
         }]);
         for (kind, leaf) in leaves.enumerate() {
+            if kind < 5 {
+                super::lifetime_tests::assert_fixed_reservation(
+                    &pinned.node,
+                    &entries,
+                    leaf.clone(),
+                );
+            }
             let fragment = Fragment::HierarchyBatch {
                 partition: 0,
                 fragments: vec![leaf],
