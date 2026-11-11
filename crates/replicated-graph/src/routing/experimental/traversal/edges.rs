@@ -34,12 +34,90 @@ pub struct ObservedTraversalV3 {
 }
 struct ElementRow {
     element: ObservedElementRef,
-    path: Vec<ObservedPathElement>,
+    path: ElementPath,
     // The public path includes implicit adjacency edges. Only marked entries
     // were actual traverser objects for standard simplePath/cyclicPath.
     objects: u128,
     value: Option<Value>,
 }
+// A query which never consumes paths needs their logical length for the exact
+// existing cumulative admission charges, but not the provenance allocations.
+// This is execution-local; it cannot escape in a result or a read session.
+#[derive(Clone, Debug, PartialEq)]
+enum ElementPath {
+    Length(usize),
+    Retained(Vec<ObservedPathElement>),
+}
+impl ElementPath {
+    fn start(element: ObservedPathElement, retain: bool) -> Self {
+        if retain {
+            Self::Retained(vec![element])
+        } else {
+            Self::Length(1)
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Length(len) => *len,
+            Self::Retained(path) => path.len(),
+        }
+    }
+    fn push(&mut self, element: ObservedPathElement) {
+        match self {
+            Self::Length(len) => *len += 1,
+            Self::Retained(path) => path.push(element),
+        }
+    }
+    fn clear(&mut self) {
+        match self {
+            Self::Length(len) => *len = 0,
+            Self::Retained(path) => path.clear(),
+        }
+    }
+    fn retained(&self) -> ExperimentalResult<&[ObservedPathElement]> {
+        match self {
+            Self::Retained(path) => Ok(path),
+            Self::Length(_) => Err(limit("v3 required path was not retained")),
+        }
+    }
+    fn into_retained(self) -> ExperimentalResult<Vec<ObservedPathElement>> {
+        match self {
+            Self::Retained(path) => Ok(path),
+            Self::Length(_) => Err(limit("v3 required path was not retained")),
+        }
+    }
+}
+fn retains_paths(query: &rocksdb_sql_table::ObservedGremlinQuery) -> bool {
+    use rocksdb_sql_table::ObservedGremlinStep as Step;
+    // Exhaustive so a future path-dependent step cannot silently lose its data.
+    query.steps().iter().any(|step| match step {
+        Step::SimplePath | Step::CyclicPath | Step::Existing(GremlinStep::Path) => true,
+        Step::Existing(
+            GremlinStep::Out(_)
+            | GremlinStep::In(_)
+            | GremlinStep::Both(_)
+            | GremlinStep::HasLabel(_)
+            | GremlinStep::Has { .. }
+            | GremlinStep::Values(_)
+            | GremlinStep::Id
+            | GremlinStep::Label
+            | GremlinStep::Limit(_)
+            | GremlinStep::Count,
+        )
+        | Step::Dedup
+        | Step::Is(_)
+        | Step::Range { .. }
+        | Step::ValueMap(_)
+        | Step::Repeat { .. }
+        | Step::OutE(_)
+        | Step::InE(_)
+        | Step::BothE(_)
+        | Step::InV
+        | Step::OutV
+        | Step::BothV => false,
+    })
+}
+
 impl ObservedElementRef {
     fn path_element(self) -> ObservedPathElement {
         match self {
@@ -84,10 +162,10 @@ fn admit_element(rows: usize, path_len: usize, work: &mut Work) -> ExperimentalR
     }
     work.charge(128 + path_len * std::mem::size_of::<ObservedPathElement>())
 }
-fn start_row(element: ObservedElementRef) -> ElementRow {
+fn start_row(element: ObservedElementRef, retain_path: bool) -> ElementRow {
     ElementRow {
         element,
-        path: vec![element.path_element()],
+        path: ElementPath::start(element.path_element(), retain_path),
         objects: 1,
         value: None,
     }
@@ -205,13 +283,14 @@ fn path_is_simple(
     if row.path.len() > u128::BITS as usize {
         return Err(limit("v3 object path representation exceeded"));
     }
-    for (index, element) in row.path.iter().enumerate() {
+    let path = row.path.retained()?;
+    for (index, element) in path.iter().enumerate() {
         if row.objects & (1u128 << index) == 0 {
             continue;
         }
         check()?;
         work.visit()?;
-        for (prior, previous) in row.path[..index].iter().enumerate() {
+        for (prior, previous) in path[..index].iter().enumerate() {
             if row.objects & (1u128 << prior) == 0 {
                 continue;
             }
@@ -540,6 +619,7 @@ pub(crate) trait TraversalRead {
         let query = ObservedGremlinQuery::parse(text).map_err(ExperimentalRouteError::Query)?;
         self.check()?;
         validate_steps(&query)?;
+        let retain_path = retains_paths(&query);
         let (edge_start, ids) = match query.start() {
             GremlinStart::Edges(ids) => (true, ids),
             GremlinStart::Vertices(ids) => (false, ids),
@@ -583,7 +663,7 @@ pub(crate) trait TraversalRead {
                 work.vertex(&vertex)?;
                 ObservedElementRef::Vertex(r)
             };
-            push_element(&mut rows, start_row(element), &mut work)?;
+            push_element(&mut rows, start_row(element, retain_path), &mut work)?;
         }
         if ids.is_empty() {
             for partition in self.partitions() {
@@ -621,7 +701,7 @@ pub(crate) trait TraversalRead {
                             }
                             push_element(
                                 &mut rows,
-                                start_row(ObservedElementRef::Edge(r)),
+                                start_row(ObservedElementRef::Edge(r), retain_path),
                                 &mut work,
                             )?;
                             acquired += 1;
@@ -640,7 +720,7 @@ pub(crate) trait TraversalRead {
                             };
                             push_element(
                                 &mut rows,
-                                start_row(ObservedElementRef::Vertex(r)),
+                                start_row(ObservedElementRef::Vertex(r), retain_path),
                                 &mut work,
                             )?;
                             acquired += 1;
@@ -841,21 +921,21 @@ pub(crate) trait TraversalRead {
         } else {
             rows.into_iter()
                 .map(|r| {
-                    if let Some(value) = r.value {
+                    Ok(if let Some(value) = r.value {
                         ObservedRowV3::Value {
                             source: r.element,
                             value,
                         }
                     } else if path {
-                        ObservedRowV3::Path(r.path)
+                        ObservedRowV3::Path(r.path.into_retained()?)
                     } else {
                         match r.element {
                             ObservedElementRef::Vertex(v) => ObservedRowV3::Vertex(v),
                             ObservedElementRef::Edge(e) => ObservedRowV3::Edge(e),
                         }
-                    }
+                    })
                 })
-                .collect()
+                .collect::<ExperimentalResult<Vec<_>>>()?
         };
         self.check()?;
         Ok(rows)
@@ -953,10 +1033,13 @@ mod tests {
     #[test]
     fn dedup_charges_duplicates_retention_and_cancellation() {
         let row = || {
-            start_row(ObservedElementRef::Vertex(VertexRef {
-                partition: 1,
-                id: 7,
-            }))
+            start_row(
+                ObservedElementRef::Vertex(VertexRef {
+                    partition: 1,
+                    id: 7,
+                }),
+                true,
+            )
         };
         let mut work = Work {
             visits: 9_998,
@@ -988,7 +1071,7 @@ mod tests {
     fn scalar_row(id: u64, value: Value) -> ElementRow {
         ElementRow {
             element: ObservedElementRef::Vertex(VertexRef { partition: 1, id }),
-            path: Vec::new(),
+            path: ElementPath::Length(0),
             objects: 0,
             value: Some(value),
         }
@@ -1050,7 +1133,7 @@ mod tests {
                     .iter()
                     .map(|source| ElementRow {
                         element: *source,
-                        path: vec![source.path_element()],
+                        path: ElementPath::Retained(vec![source.path_element()]),
                         objects: 1,
                         value: Some(Value::Text("保留".into())),
                     })
@@ -1068,7 +1151,7 @@ mod tests {
                     expected
                 );
                 for row in &selected {
-                    assert_eq!(row.path, [row.element.path_element()]);
+                    assert_eq!(row.path.retained().unwrap(), [row.element.path_element()]);
                     assert_eq!(row.value, Some(Value::Text("保留".into())));
                 }
                 assert_eq!(work.visits, sources.len());
@@ -1457,10 +1540,13 @@ mod tests {
             fail_after: usize::MAX,
         };
         let row = || {
-            start_row(ObservedElementRef::Vertex(VertexRef {
-                partition: 7,
-                id: 1,
-            }))
+            start_row(
+                ObservedElementRef::Vertex(VertexRef {
+                    partition: 7,
+                    id: 1,
+                }),
+                true,
+            )
         };
         let keys = vec!["x".to_string()];
         let backing = std::mem::size_of::<ObservedRowV3>();
@@ -1526,7 +1612,7 @@ mod tests {
             };
             let rows = repeat_rows(
                 &read,
-                vec![start_row(ObservedElementRef::Vertex(vertex))],
+                vec![start_row(ObservedElementRef::Vertex(vertex), true)],
                 false,
                 None,
                 32,
@@ -1554,7 +1640,7 @@ mod tests {
                         ObservedPathElement::Vertex(vertex),
                     ]);
                 }
-                assert_eq!(row.path, expected);
+                assert_eq!(row.path.retained().unwrap(), expected);
                 let object_mask = (0..=depth).fold(0u128, |mask, i| mask | (1u128 << (2 * i)));
                 assert_eq!(row.objects, object_mask);
                 assert!(!path_is_simple(
@@ -1574,7 +1660,7 @@ mod tests {
         };
         assert!(repeat_rows(
             &read,
-            vec![start_row(ObservedElementRef::Vertex(vertex))],
+            vec![start_row(ObservedElementRef::Vertex(vertex), true)],
             false,
             None,
             2,
@@ -1588,7 +1674,7 @@ mod tests {
         };
         assert!(repeat_rows(
             &read,
-            vec![start_row(ObservedElementRef::Vertex(vertex))],
+            vec![start_row(ObservedElementRef::Vertex(vertex), true)],
             false,
             None,
             2,
@@ -1605,7 +1691,7 @@ mod tests {
         };
         assert!(repeat_rows(
             &read,
-            vec![start_row(ObservedElementRef::Vertex(vertex))],
+            vec![start_row(ObservedElementRef::Vertex(vertex), true)],
             false,
             None,
             2,
@@ -1626,7 +1712,7 @@ mod tests {
             };
             assert!(repeat_rows(
                 &read,
-                vec![start_row(ObservedElementRef::Vertex(vertex))],
+                vec![start_row(ObservedElementRef::Vertex(vertex), true)],
                 false,
                 None,
                 32,
@@ -1652,3 +1738,7 @@ mod tests {
 #[cfg(test)]
 #[path = "path_filter_tests.rs"]
 mod path_filter_tests;
+
+#[cfg(test)]
+#[path = "lazy_path_tests.rs"]
+mod lazy_path_tests;

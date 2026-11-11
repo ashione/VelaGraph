@@ -13,7 +13,7 @@ fn row(path: Vec<ObservedPathElement>, objects: u128) -> ElementRow {
     };
     ElementRow {
         element,
-        path,
+        path: ElementPath::Retained(path),
         objects,
         value: None,
     }
@@ -78,7 +78,7 @@ fn path_filters_compare_typed_qualified_actual_objects_not_implicit_edges() {
             let kept = filter_paths(rows, simple, &mut work, || Ok(())).unwrap();
             assert_eq!(kept.len(), if simple == expected_simple { 2 } else { 0 });
             for kept in kept {
-                assert_eq!(kept.path, path);
+                assert_eq!(kept.path.retained().unwrap(), path);
                 assert_eq!(kept.objects, objects);
                 assert!(kept.value.is_none());
             }
