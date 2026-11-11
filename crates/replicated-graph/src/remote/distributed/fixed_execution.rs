@@ -6,14 +6,20 @@ use fixed::{FixedDescriptor, FixedFragmentRequest};
 pub(crate) struct NodeSession {
     pub route: PartitionRoute,
     pub descriptor: FixedDescriptor,
-    sequence: u64,
+    pub(super) sequence: u64,
+    pub(super) capture_bytes: usize,
 }
 impl NodeSession {
-    pub(crate) fn new(route: PartitionRoute, descriptor: FixedDescriptor) -> Self {
+    pub(crate) fn new(
+        route: PartitionRoute,
+        descriptor: FixedDescriptor,
+        capture_bytes: usize,
+    ) -> Self {
         Self {
             route,
             descriptor,
             sequence: 0,
+            capture_bytes,
         }
     }
 }
@@ -52,6 +58,69 @@ fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     // Match the original explicit-ID grammar/defaults; the parser bounds hops.
     Ok(query)
 }
+pub(super) struct Prepared {
+    route: PartitionRoute,
+    request: FixedFragmentRequest,
+    pub(super) cost: Cost,
+}
+pub(super) fn prepare(
+    node: &mut NodeSession,
+    fragment: Fragment,
+    ceiling: Cost,
+) -> Result<Prepared, QueryFailure> {
+    let mut cost = Cost::default();
+    cost.charge(512, 1, ceiling)?;
+    let mut request = FixedFragmentRequest {
+        descriptor: node.descriptor.clone(),
+        request_sequence: node.sequence,
+        fragment,
+        remaining: Cost {
+            bytes: ceiling.bytes.saturating_sub(cost.bytes),
+            work: ceiling.work.saturating_sub(cost.work),
+        },
+    };
+    let encoded = serde_json::to_vec(&request).map_err(|_| QueryFailure::InvalidArgument)?;
+    cost.charge(encoded.len().saturating_mul(2), 0, ceiling)?;
+    request.remaining = Cost {
+        bytes: ceiling.bytes.saturating_sub(cost.bytes),
+        work: ceiling.work.saturating_sub(cost.work),
+    };
+    // Unknown/failure ends the query. Never refund work or reopen/retry.
+    node.sequence = node
+        .sequence
+        .checked_add(1)
+        .ok_or(QueryFailure::ResourceExhausted)?;
+    Ok(Prepared {
+        route: node.route.clone(),
+        request,
+        cost,
+    })
+}
+pub(super) async fn invoke(
+    prepared: Prepared,
+    end: Instant,
+) -> Result<fixed::FixedFragmentOutput, QueryFailure> {
+    check(end)?;
+    let expected = prepared.request.descriptor.clone();
+    let sequence = prepared.request.request_sequence;
+    let remaining = prepared.request.remaining;
+    let output = fixed::fragment(
+        prepared.route.endpoint,
+        prepared.route.identity,
+        prepared.request,
+        end.saturating_duration_since(Instant::now()),
+    )
+    .await
+    .map_err(remote_failure)??;
+    check(end)?;
+    if output.descriptor != expected || output.request_sequence != sequence {
+        return Err(QueryFailure::IncompleteOrCorrupt);
+    }
+    if output.cost.bytes > remaining.bytes || output.cost.work > remaining.work {
+        return Err(QueryFailure::ResourceExhausted);
+    }
+    Ok(output)
+}
 pub(super) async fn fragment(
     sessions: &mut BTreeMap<u64, NodeSession>,
     fragment: Fragment,
@@ -62,39 +131,16 @@ pub(super) async fn fragment(
     let node = sessions
         .get_mut(&u64::from(fragment.partition()))
         .ok_or(QueryFailure::UnsupportedScope)?;
-    cost.charge(512, 1, CEILING)?;
-    let mut request = FixedFragmentRequest {
-        descriptor: node.descriptor.clone(),
-        request_sequence: node.sequence,
+    let prepared = prepare(
+        node,
         fragment,
-        remaining: Cost {
-            bytes: MAX_BYTES.saturating_sub(cost.bytes),
-            work: MAX_WORK.saturating_sub(cost.work),
+        Cost {
+            bytes: CEILING.bytes.saturating_sub(cost.bytes),
+            work: CEILING.work.saturating_sub(cost.work),
         },
-    };
-    let encoded = serde_json::to_vec(&request).map_err(|_| QueryFailure::InvalidArgument)?;
-    cost.charge(encoded.len().saturating_mul(2), 0, CEILING)?;
-    request.remaining = Cost {
-        bytes: MAX_BYTES.saturating_sub(cost.bytes),
-        work: MAX_WORK.saturating_sub(cost.work),
-    };
-    let sequence = node.sequence;
-    // Unknown/failure ends the query. Never refund work or reopen/retry.
-    node.sequence = sequence
-        .checked_add(1)
-        .ok_or(QueryFailure::ResourceExhausted)?;
-    let output = fixed::fragment(
-        node.route.endpoint,
-        node.route.identity,
-        request,
-        end.saturating_duration_since(Instant::now()),
-    )
-    .await
-    .map_err(remote_failure)??;
-    check(end)?;
-    if output.descriptor != node.descriptor || output.request_sequence != sequence {
-        return Err(QueryFailure::IncompleteOrCorrupt);
-    }
+    )?;
+    cost.charge(prepared.cost.bytes, prepared.cost.work, CEILING)?;
+    let output = invoke(prepared, end).await?;
     cost.charge(output.cost.bytes, output.cost.work, CEILING)?;
     Ok(output.value)
 }

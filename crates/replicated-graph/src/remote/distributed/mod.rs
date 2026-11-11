@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod adjacency;
 pub(crate) mod fixed;
 pub(crate) mod fixed_execution;
+mod fixed_parallel;
 use adjacency::Direction;
 pub(in crate::remote) mod channel;
 pub mod consistency;

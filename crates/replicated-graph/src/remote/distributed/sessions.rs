@@ -862,6 +862,99 @@ mod tests {
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+    // Exercise the same MeteredNode/run_fragment and exact fixed envelope as
+    // the production worker, including raw rows ignored by the graph decoder.
+    pub(super) fn assert_fixed_reservation(
+        frozen: &query::FrozenNode,
+        entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        fragment: Fragment,
+    ) {
+        use super::super::{fixed, fixed_execution, fixed_parallel};
+        use d2_raft::{
+            participant_writes::Authority,
+            transaction_decisions::{Cohort, Member},
+        };
+        let shard = 7;
+        let route = PartitionRoute {
+            partition: 0,
+            shard,
+            epoch: 1,
+            identity: RemoteIdentity { group: 2, node: 1 },
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+        };
+        let descriptor = fixed::FixedDescriptor {
+            stamp: QueryStamp {
+                identity: route.identity,
+                shard,
+                epoch: 1,
+                sequence: u64::MAX,
+            },
+            incarnation: [255; 16],
+            token: [255; 16],
+            authority: Authority {
+                shard: 9,
+                mode: [255; 16],
+            },
+            cohort: Cohort {
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                profile: Default::default(),
+                members: vec![Member {
+                    shard,
+                    epoch: 1,
+                    mode: [255; 16],
+                }],
+            },
+            version: u64::MAX,
+            mode: [255; 16],
+        };
+        let mut session = fixed_execution::NodeSession::new(
+            route,
+            descriptor.clone(),
+            entries.iter().map(|(k, v)| k.len() + v.len()).sum(),
+        );
+        session.sequence = u64::MAX - 1;
+        let bound = fixed_parallel::reservation_for_test(&fragment, &session).unwrap();
+        let prepared = fixed_execution::prepare(&mut session, fragment.clone(), bound).unwrap();
+        let node = MeteredNode {
+            frozen: frozen.clone(),
+            cost: Arc::new(Mutex::new(Cost::default())),
+            ceiling: Cost {
+                bytes: bound.bytes - prepared.cost.bytes,
+                work: bound.work - prepared.cost.work,
+            },
+        };
+        node.charge(512, 1).unwrap();
+        let value = run_fragment(&node, shard, fragment).unwrap();
+        let output = fixed::FixedFragmentOutput {
+            descriptor,
+            request_sequence: u64::MAX - 1,
+            cost: CEILING,
+            value,
+        };
+        let encoded = bounded_encode(&output, Instant::from_std(frozen.end)).unwrap();
+        node.charge(encoded.len() * 2, 0).unwrap();
+        let actual = *node.cost.lock().unwrap();
+        assert!(actual.bytes + prepared.cost.bytes <= bound.bytes);
+        assert!(actual.work + prepared.cost.work <= bound.work);
+    }
+
+    #[test]
+    fn fixed_reservation_covers_absent_keys_in_empty_capture() {
+        let frozen = query::FrozenNode {
+            view: ReadView::from_entries(7, 1, 1, BTreeMap::new()).unwrap(),
+            end: (Instant::now() + Duration::from_secs(5)).into_std(),
+        };
+        assert_fixed_reservation(
+            &frozen,
+            &BTreeMap::new(),
+            Fragment::Exists(VertexId {
+                partition: 0,
+                id: u64::MAX,
+            }),
+        );
+    }
+
     #[tokio::test]
     async fn token_bound_view_expires_closes_and_retains_admission_while_in_use() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
@@ -1452,6 +1545,13 @@ mod epoch_tests {
             keys: vec!["姓名".into(), "null".into(), "missing".into()],
         }]);
         for (kind, leaf) in leaves.enumerate() {
+            if kind < 5 {
+                super::lifetime_tests::assert_fixed_reservation(
+                    &pinned.node,
+                    &entries,
+                    leaf.clone(),
+                );
+            }
             let fragment = Fragment::HierarchyBatch {
                 partition: 0,
                 fragments: vec![leaf],

@@ -303,6 +303,7 @@ impl State {
                             endpoint: route.endpoint,
                         },
                         opened.descriptor.clone(),
+                        opened.capture_cost.bytes,
                     ),
                 );
                 // Compare the complete retained certificate, not a boolean or V.
