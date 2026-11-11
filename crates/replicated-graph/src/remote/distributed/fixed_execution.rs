@@ -151,8 +151,10 @@ pub(super) async fn fragment(
 pub(crate) async fn execute(
     sessions: &mut BTreeMap<u64, NodeSession>,
     request: &DistributedRequest,
+    parallelism: usize,
     end: Instant,
 ) -> Result<Vec<QueryRow>, QueryFailure> {
+    fixed_parallel::validate_width(parallelism)?;
     let query = parse(request)?;
     let catalog = StaticCatalog {
         partitions: sessions.values().map(|s| s.route.clone()).collect(),
@@ -162,6 +164,7 @@ pub(crate) async fn execute(
         catalog: &catalog,
         sessions: BTreeMap::new(),
         fixed_sessions: Some(sessions),
+        fixed_parallelism: parallelism,
         end,
         cost: Cost {
             bytes: 4096,

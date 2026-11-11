@@ -50,10 +50,11 @@ Fixed-open replies have their own receive branch; old frame limits are unchanged
 Some valid maximal ByteBound histories exceed this transport cap and fail Capacity.
 
 Required fragments use a bounded, ordered shard-lane scheduler over the original
-immutable descriptors. Directional expansion stages at most three traversers:
+immutable descriptors. Directional expansion stages at most the configured number
+of traversers (three by default):
 first acquire their adjacency lists, then validate every canonical/reverse/endpoint
 dependency, and finally merge by input ordinal and edge order. Across independent
-shards at most three RPCs are in flight; one session always has at most one.
+shards at most that many RPCs are in flight; one session always has at most one.
 Each wave receives disjoint conservative allowances from the same cumulative
 query budget. Large/skewed leaves or insufficient headroom use the original
 serial remaining allowance, never an equal split or a retry with more credits.
@@ -175,3 +176,38 @@ and [CockroachDB admission control](https://github.com/cockroachdb/cockroach/blo
 Their memory-accounting and non-preemptible-resource constraints motivate safe
 admission rather than optimistic fractional grants. No external system's
 performance results are transferred to this implementation.
+
+## Configurable bounded shard concurrency
+
+`Gateway::bind_remote_local_queries_with_parallelism(config, routes, bind,
+deadline, parallelism)` adds an immutable deployment setting in `1..=8`.
+The existing constructor still selects three; one selects serial fragment
+execution. Invalid values return `Protocol` before route validation, binding,
+or node contact. Query text and the wire protocol cannot change this setting.
+A width larger than the cohort is allowed; actual independent lanes are limited
+by the available original sessions and conservative byte/work reservations.
+
+The setting also bounds each expansion window: at most eight adjacency lists,
+each at most 1000 entries, and at most 8000 dependency checks. This increases the
+maximum staged scratch compared with the default three-list window, not the
+64 MiB cumulative logical query-byte budget or 10000-work budget. It is not an
+RSS cap. More speculative work may run before an error, and error order and
+encoded-byte accounting need not equal serial execution. All dependency checks
+still precede filtering/materialization, with ordered bags and qualified paths.
+
+The coordinator's two-query admission, graph client's sixteen-call admission,
+node's eight fragment workers, shared retained-session pools, capture budgets,
+original deadlines and per-session sequencing remain unchanged. Other queries
+or observed work may consume those shared slots and cause an explicit admission
+failure. A wider setting does not guarantee speedup or parallelism, does not
+queue/retry failed RPCs, and does not add fairness or cluster-wide admission.
+Deployments should tune downward when query concurrency is high.
+
+This follows the separation between configurable operator concurrency and
+resource limits in [Trino task properties](https://trino.io/docs/current/admin/properties-task.html#task-concurrency),
+and the overload-protection goals of [CockroachDB admission control](https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/admission_control.md).
+These are design references, not transferred performance claims. The eight-member
+fixed cohort, immutable full-partition captures, restricted Gremlin subset,
+whole-result sealing and retained-history costs remain. Removing those boundaries
+needs separately reviewed streaming operators, indexed versioned views and
+cohort/flow-control contracts; changing a concurrency setting is not that work.

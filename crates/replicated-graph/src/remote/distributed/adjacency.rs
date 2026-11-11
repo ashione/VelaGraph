@@ -153,8 +153,9 @@ impl Execution<'_> {
         let mut rows = rows.into_iter();
         let mut next = Vec::new();
         loop {
-            // At most three adjacency lists (each <=1000 edges) are staged.
-            let window: Vec<_> = rows.by_ref().take(fixed_parallel::WIDTH).collect();
+            // Startup width bounds staged adjacency lists (each <=1000 edges).
+            // At the maximum width, <=8000 checks fit the 10000-input cap.
+            let window: Vec<_> = rows.by_ref().take(self.fixed_parallelism).collect();
             if window.is_empty() {
                 break;
             }
@@ -172,8 +173,14 @@ impl Execution<'_> {
                 .fixed_sessions
                 .as_deref_mut()
                 .ok_or(QueryFailure::Unavailable)?;
-            let adjacency =
-                fixed_parallel::run(sessions, fragments, &mut self.cost, self.end).await?;
+            let adjacency = fixed_parallel::run_with_width(
+                sessions,
+                fragments,
+                &mut self.cost,
+                self.end,
+                self.fixed_parallelism,
+            )
+            .await?;
             let mut checks = Vec::new();
             let mut lengths = Vec::new();
             let mut outgoing = Vec::new();
@@ -196,7 +203,14 @@ impl Execution<'_> {
             }
             // Validate every canonical/reverse/endpoint dependency, including
             // label-filtered candidates, before materializing any window rows.
-            let checked = fixed_parallel::run(sessions, checks, &mut self.cost, self.end).await?;
+            let checked = fixed_parallel::run_with_width(
+                sessions,
+                checks,
+                &mut self.cost,
+                self.end,
+                self.fixed_parallelism,
+            )
+            .await?;
             let mut edges = if incoming {
                 checked
                     .into_iter()

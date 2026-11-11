@@ -49,7 +49,9 @@ retains certified views on participant nodes and reuses the distributed executor
 for explicit `g.V(ids)` with `out`/`in` and terminal `path`/`count`. It validates
 the whole immutable result before publishing replayable pages. Bounded shard-lane
 execution overlaps independent fixed-V fragments while preserving ordered bags,
-shared budgets and per-session sequencing. This M1 path keeps
+shared budgets and per-session sequencing. Deployment configuration can select
+one through eight lanes (three by default), without enlarging query budgets.
+This M1 path keeps
 the existing 10,000-row / 2 MiB / 100,000-operation capture budget; it is not a
 large-scale managed capacity increase or a replacement for old entrypoints.
 

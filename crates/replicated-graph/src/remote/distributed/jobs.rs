@@ -625,6 +625,7 @@ impl Job {
         }
         let execution = Execution {
             fixed_sessions: None,
+            fixed_parallelism: 3,
             scan_cost: Cost::default(),
             catalog: &self.catalog,
             sessions: self.sessions.clone(),

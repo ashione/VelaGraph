@@ -1395,3 +1395,6 @@ async fn fixed_local_parallel_query_measurement() {
     }
     f.stop().await;
 }
+
+#[path = "managed_gateway_scaling_tests.rs"]
+mod scaling;
