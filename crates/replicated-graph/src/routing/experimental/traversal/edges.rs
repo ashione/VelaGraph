@@ -35,6 +35,9 @@ pub struct ObservedTraversalV3 {
 struct ElementRow {
     element: ObservedElementRef,
     path: Vec<ObservedPathElement>,
+    // The public path includes implicit adjacency edges. Only marked entries
+    // were actual traverser objects for standard simplePath/cyclicPath.
+    objects: u128,
     value: Option<Value>,
 }
 impl ObservedElementRef {
@@ -85,6 +88,7 @@ fn start_row(element: ObservedElementRef) -> ElementRow {
     ElementRow {
         element,
         path: vec![element.path_element()],
+        objects: 1,
         value: None,
     }
 }
@@ -151,17 +155,17 @@ fn dedup_rows(
 // Filtering moves existing rows without cloning values or provenance. The
 // cumulative work and retained-row charges apply even when later steps discard
 // these rows; an empty result never suppresses an upstream failure.
-fn select_rows(
+fn select_rows<C: FnMut() -> ExperimentalResult<()>>(
     rows: Vec<ElementRow>,
-    mut keep: impl FnMut(usize, &ElementRow) -> bool,
+    mut keep: impl FnMut(usize, &ElementRow, &mut Work, &mut C) -> ExperimentalResult<bool>,
     work: &mut Work,
-    mut check: impl FnMut() -> ExperimentalResult<()>,
+    mut check: C,
 ) -> ExperimentalResult<Vec<ElementRow>> {
     let mut next = Vec::new();
     for (index, row) in rows.into_iter().enumerate() {
         check()?;
         work.visit()?;
-        if keep(index, &row) {
+        if keep(index, &row, work, &mut check)? {
             push_element(&mut next, row, work)?;
         }
     }
@@ -176,7 +180,60 @@ fn filter_scalars(
 ) -> ExperimentalResult<Vec<ElementRow>> {
     select_rows(
         rows,
-        |_, row| row.value.as_ref() == Some(wanted),
+        |_, row, _, _| Ok(row.value.as_ref() == Some(wanted)),
+        work,
+        check,
+    )
+}
+
+// Current admission permits at most 66 provenance entries (an edge start,
+// endpoint, and 32 two-entry hops). A checked mask avoids a second allocated
+// path and fails closed if a future shape exceeds its private representation.
+fn mark_object(objects: u128, index: usize) -> ExperimentalResult<u128> {
+    let bit = u32::try_from(index)
+        .ok()
+        .and_then(|index| 1u128.checked_shl(index))
+        .ok_or_else(|| limit("v3 object path representation exceeded"))?;
+    Ok(objects | bit)
+}
+
+fn path_is_simple(
+    row: &ElementRow,
+    work: &mut Work,
+    check: &mut impl FnMut() -> ExperimentalResult<()>,
+) -> ExperimentalResult<bool> {
+    if row.path.len() > u128::BITS as usize {
+        return Err(limit("v3 object path representation exceeded"));
+    }
+    for (index, element) in row.path.iter().enumerate() {
+        if row.objects & (1u128 << index) == 0 {
+            continue;
+        }
+        check()?;
+        work.visit()?;
+        for (prior, previous) in row.path[..index].iter().enumerate() {
+            if row.objects & (1u128 << prior) == 0 {
+                continue;
+            }
+            check()?;
+            work.visit()?;
+            if element == previous {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn filter_paths(
+    rows: Vec<ElementRow>,
+    simple: bool,
+    work: &mut Work,
+    check: impl FnMut() -> ExperimentalResult<()>,
+) -> ExperimentalResult<Vec<ElementRow>> {
+    select_rows(
+        rows,
+        |_, row, work, check| Ok(path_is_simple(row, work, check)? == simple),
         work,
         check,
     )
@@ -244,7 +301,7 @@ pub(crate) fn validate_steps(
                     ));
                 }
             }
-            Step::Dedup | Step::Range { .. } => {}
+            Step::Dedup | Step::Range { .. } | Step::SimplePath | Step::CyclicPath => {}
             Step::Repeat { times, .. } => {
                 if stream != StreamKind::Vertex {
                     return Err(ExperimentalRouteError::Unsupported(
@@ -342,6 +399,7 @@ fn expand_rows<R: TraversalRead + ?Sized>(
                 row.path.len() + if edge_output { 1 } else { 2 },
                 work,
             )?;
+            let objects = mark_object(row.objects, row.path.len() + usize::from(!edge_output))?;
             let mut path = row.path.clone();
             path.push(ObservedPathElement::Edge(edge));
             let element = if edge_output {
@@ -353,6 +411,7 @@ fn expand_rows<R: TraversalRead + ?Sized>(
             next.push(ElementRow {
                 element,
                 path,
+                objects,
                 value: None,
             });
         }
@@ -398,6 +457,7 @@ fn repeat_rows<R: TraversalRead + ?Sized>(
                 emitted.push(ElementRow {
                     element: row.element,
                     path: row.path.clone(),
+                    objects: row.objects,
                     value: None,
                 });
             }
@@ -601,13 +661,18 @@ pub(crate) trait TraversalRead {
         for step in query.steps() {
             self.check()?;
             match step {
+                Step::SimplePath | Step::CyclicPath => {
+                    rows = filter_paths(rows, matches!(step, Step::SimplePath), &mut work, || {
+                        self.check()
+                    })?;
+                }
                 Step::Is(value) => {
                     rows = filter_scalars(rows, value, &mut work, || self.check())?;
                 }
                 Step::Range { low, high } => {
                     rows = select_rows(
                         rows,
-                        |index, _| (*low..*high).contains(&index),
+                        |index, _, _, _| Ok((*low..*high).contains(&index)),
                         &mut work,
                         || self.check(),
                     )?;
@@ -662,17 +727,16 @@ pub(crate) trait TraversalRead {
                         };
                         for vertex in endpoints {
                             self.check()?;
+                            let objects = mark_object(row.objects, row.path.len())?;
+                            admit_element(next.len(), row.path.len() + 1, &mut work)?;
                             let mut path = row.path.clone();
                             path.push(ObservedPathElement::Vertex(*vertex));
-                            push_element(
-                                &mut next,
-                                ElementRow {
-                                    element: ObservedElementRef::Vertex(*vertex),
-                                    path,
-                                    value: None,
-                                },
-                                &mut work,
-                            )?;
+                            next.push(ElementRow {
+                                element: ObservedElementRef::Vertex(*vertex),
+                                path,
+                                objects,
+                                value: None,
+                            });
                         }
                     }
                     rows = next;
@@ -742,6 +806,7 @@ pub(crate) trait TraversalRead {
                                     _ => 8,
                                 })?;
                                 row.path.clear();
+                                row.objects = 0;
                             }
                             push_element(&mut next, row, &mut work)?;
                         }
@@ -924,6 +989,7 @@ mod tests {
         ElementRow {
             element: ObservedElementRef::Vertex(VertexRef { partition: 1, id }),
             path: Vec::new(),
+            objects: 0,
             value: Some(value),
         }
     }
@@ -985,12 +1051,13 @@ mod tests {
                     .map(|source| ElementRow {
                         element: *source,
                         path: vec![source.path_element()],
+                        objects: 1,
                         value: Some(Value::Text("保留".into())),
                     })
                     .collect();
                 let selected = select_rows(
                     rows,
-                    |index, _| (low..high).contains(&index),
+                    |index, _, _, _| Ok((low..high).contains(&index)),
                     &mut work,
                     || Ok(()),
                 )
@@ -1023,7 +1090,7 @@ mod tests {
             };
             assert!(select_rows(
                 rows(),
-                |index, _| bounds.contains(&index),
+                |index, _, _, _| Ok(bounds.contains(&index)),
                 &mut work,
                 || Ok(())
             )
@@ -1039,7 +1106,7 @@ mod tests {
         };
         assert!(select_rows(
             rows(),
-            |index, _| index == 0,
+            |index, _, _, _| Ok(index == 0),
             &mut work,
             || {
                 checks += 1;
@@ -1056,16 +1123,24 @@ mod tests {
             visits: 0,
             bytes: 64 * 1024 * 1024 - 127,
         };
-        assert!(select_rows(rows(), |index, _| index == 1, &mut work, || Ok(())).is_err());
+        assert!(select_rows(
+            rows(),
+            |index, _, _, _| Ok(index == 1),
+            &mut work,
+            || Ok(())
+        )
+        .is_err());
         assert_eq!(work.visits, 2);
         assert!(work.bytes > 64 * 1024 * 1024);
         let mut work = Work {
             visits: 0,
             bytes: 0,
         };
-        assert!(select_rows(Vec::new(), |_, _| true, &mut work, || Ok(()))
-            .unwrap()
-            .is_empty());
+        assert!(
+            select_rows(Vec::new(), |_, _, _, _| Ok(true), &mut work, || Ok(()))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!((work.visits, work.bytes), (0, 0));
     }
 
@@ -1480,6 +1555,17 @@ mod tests {
                     ]);
                 }
                 assert_eq!(row.path, expected);
+                let object_mask = (0..=depth).fold(0u128, |mask, i| mask | (1u128 << (2 * i)));
+                assert_eq!(row.objects, object_mask);
+                assert!(!path_is_simple(
+                    row,
+                    &mut Work {
+                        visits: 0,
+                        bytes: 0
+                    },
+                    &mut || Ok(())
+                )
+                .unwrap());
             }
         }
         let mut work = Work {
@@ -1562,3 +1648,7 @@ mod tests {
         assert!(admit_element(10_000, 1, &mut work).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "path_filter_tests.rs"]
+mod path_filter_tests;

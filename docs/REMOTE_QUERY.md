@@ -212,3 +212,16 @@ order. Explicit range suppresses the default cap but never hides upstream
 integrity or scope failures; all current inputs consume work. There is no source
 pushdown or budget increase. V1 and separate server-coordinator/job entrypoints
 remain unchanged. See the [shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-positional-ranges).
+
+
+### Shared simple and cyclic path filters
+
+Routing-v3 and single-partition V2Observed queries accept no-argument
+`simplePath()`/`cyclicPath()` on element streams. They compare actual visited
+objects with typed qualified identity, excluding implicit adjacency edges from
+the existing returned provenance path. Bags, positional composition, bounded
+repeat/emission, fixed snapshots and Unverified metadata are preserved. Invalid
+scalar/modulated/repeat-body forms reject before reads; filters do not hide
+upstream integrity/scope failures or enlarge budgets. V1, legacy observed v1/v2
+and separate server-coordinator/job entrypoints remain unchanged. See the
+[shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters).

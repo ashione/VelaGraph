@@ -648,3 +648,20 @@ pushdown: upstream integrity/resource errors remain errors, and every current
 row is visited and charged, including discarded rows. Existing limits, V,
 complete-page/cursor semantics and legacy/coordinator/job rejection boundaries
 are unchanged. See the [complete contract](MANAGED_FIXED_TRAVERSALS.md#bounded-positional-ranges).
+
+
+### Fixed-version simple and cyclic path filters
+
+Shared routing-v3, single-partition V2Observed server and managed Traverse/Page
+accept no-argument `simplePath()`/`cyclicPath()` on element streams. They retain
+paths with no repeated actual object / at least one repeated actual object,
+respectively, using element-kind and partition-qualified identity. Implicit
+adjacency edges in the existing returned path are excluded; explicit edge steps
+and edge starts are included. Ordered bags and provenance are unchanged.
+Filters run in place, including after bounded repeat/emission, and cannot hide
+upstream failures or prevent later revisits. Scalar input, arguments, modulators
+and repeat-body filters reject before reads even on empty streams. Work counts
+inputs, marked objects and comparisons; retention is charged before allocation,
+under unchanged cumulative budgets and deadlines. Default result caps, fixed V,
+complete pages and all legacy/coordinator/job rejection boundaries remain.
+See the [complete contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters).

@@ -178,6 +178,8 @@ fn admitted_extensions(request: &QueryRequest) -> (bool, Option<MapShape>) {
                             step,
                             Step::ValueMap(_)
                                 | Step::Range { .. }
+                                | Step::SimplePath
+                                | Step::CyclicPath
                                 | Step::Dedup
                                 | Step::Existing(
                                     rocksdb_sql_table::GremlinStep::HasLabel(_)
@@ -759,6 +761,14 @@ mod tests {
             id: 2,
         };
         assert!(validate(&wrong_source, ranged_shape.as_ref()).is_err());
+        for filter in ["simplePath", "cyclicPath"] {
+            let (_, shape) = admitted_extensions(&request(
+                &format!("g.V(1).{filter}().valueMap('name','absent')"),
+                QueryMode::V2Observed,
+            ));
+            assert_eq!(shape.as_ref().unwrap().start_ids, Some(vec![1]));
+            assert!(validate(&wrong_source, shape.as_ref()).is_err());
+        }
         for (text, mode) in [
             ("g.V(1)", QueryMode::V2Observed),
             ("g.E(1).valueMap('name')", QueryMode::V2Observed),

@@ -645,3 +645,16 @@ property cap and unchanged cumulative work/response bounds. Single-partition
 scope remains enforced, including edge endpoint and adjacency reads. V1/legacy
 observed query surfaces and Unverified consistency are unchanged. Upgrade the
 executor and client together; older clients reject these map replies.
+
+
+### Shared simple and cyclic path filters
+
+Routing-v3 and single-partition V2Observed queries accept no-argument
+`simplePath()`/`cyclicPath()` on element streams. They compare actual visited
+objects with typed qualified identity, excluding implicit adjacency edges from
+the existing returned provenance path. Bags, positional composition, bounded
+repeat/emission, fixed snapshots and Unverified metadata are preserved. Invalid
+scalar/modulated/repeat-body forms reject before reads; filters do not hide
+upstream integrity/scope failures or enlarge budgets. V1, legacy observed v1/v2
+and separate server-coordinator/job entrypoints remain unchanged. See the
+[shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters).

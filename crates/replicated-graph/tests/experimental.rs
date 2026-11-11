@@ -298,6 +298,75 @@ async fn scenario() -> anyhow::Result<()> {
         let filter = "g.V(7).id().is(7)";
         assert!(session.observed_gremlin(1, filter).is_err());
         assert!(session.observed_gremlin_v2(1, filter).is_err());
+        // Path filters compare traverser objects, not the synthetic edge
+        // entries retained in the existing path() output format.
+        for (text, expected) in [
+            ("g.V(7).out('K').simplePath().path()", vec![
+                vec![v(1), e(1, 9), v(2)],
+                vec![v(1), e(1, 10), v(2)],
+                vec![v(1), e(1, 11), v(3)],
+            ]),
+            ("g.V(7).out('K').cyclicPath().path()", vec![vec![v(1), e(1, 12), v(1)]]),
+            ("g.V(7).out('K').hasLabel('P2').inE('K').simplePath().path()", vec![
+                vec![v(1), e(1, 9), v(2), e(1, 9)],
+                vec![v(1), e(1, 9), v(2), e(1, 10)],
+                vec![v(1), e(1, 10), v(2), e(1, 9)],
+                vec![v(1), e(1, 10), v(2), e(1, 10)],
+            ]),
+            ("g.V(7).outE('K').inV().hasLabel('P2').inE('K').cyclicPath().path()", vec![
+                vec![v(1), e(1, 9), v(2), e(1, 9)],
+                vec![v(1), e(1, 10), v(2), e(1, 10)],
+            ]),
+            // Both edges have local ID 9, but distinct source partitions.
+            ("g.E(9).inV().outE('K').simplePath().path()", vec![vec![e(1, 9), v(2), e(2, 9)]]),
+            ("g.V(7).repeat(out('K')).times(2).emit().simplePath().path()", vec![
+                vec![v(1), e(1, 9), v(2)],
+                vec![v(1), e(1, 10), v(2)],
+                vec![v(1), e(1, 11), v(3)],
+            ]),
+        ] {
+            let result = session.observed_gremlin_v3(1, text)?;
+            assert_eq!(result.rows, expected.into_iter().map(ObservedRowV3::Path).collect::<Vec<_>>(), "{text}");
+            assert_eq!(result.snapshots, session.snapshots);
+            assert_eq!(result.metadata_sequence, session.metadata_sequence);
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+        }
+        for (text, count) in [
+            ("g.V(7,7).out('K').simplePath().count()", 6),
+            ("g.V(7).repeat(out('K')).times(2).simplePath().count()", 0),
+            ("g.V(7).repeat(out('K')).times(2).emit().cyclicPath().count()", 7),
+            ("g.V(7).both('K').cyclicPath().count()", 1),
+            ("g.V(7).out('K').limit(1).cyclicPath().count()", 0),
+            ("g.V(7).out('K').cyclicPath().limit(1).count()", 1),
+            ("g.V(999).simplePath().count()", 0),
+            ("g.E(9,9).simplePath().count()", 2),
+            ("g.E(9).cyclicPath().count()", 0),
+        ] {
+            assert_eq!(session.observed_gremlin_v3(1, text)?.rows, vec![ObservedRowV3::Count(count)], "{text}");
+        }
+        for text in [
+            "g.V(999).id().simplePath()",
+            "g.V(999).values('missing').cyclicPath()",
+            "g.E(999).label().simplePath()",
+            "g.V(999).simplePath().by('typed')",
+            "g.V(999).cyclicPath().from('x')",
+            "g.V(999).simplePath().to('x')",
+            "g.V(999).repeat(out().simplePath()).times(2)",
+            "g.V(999).repeat(out().cyclicPath()).times(2)",
+        ] {
+            assert!(session.observed_gremlin_v3(1, text).is_err(), "accepted {text}");
+        }
+        for text in ["g.V(999).simplePath()", "g.E(999).cyclicPath()"] {
+            assert!(session.observed_gremlin(1, text).is_err(), "accepted legacy {text}");
+            assert!(session.observed_gremlin_v2(1, text).is_err(), "accepted v2 {text}");
+        }
+        for text in ["g.V(7).out('K').simplePath().count()", "g.V(7).out('K').cyclicPath().count()"] {
+            let result = old.observed_gremlin_v3(1, text)?;
+            assert_eq!(result.rows, vec![ObservedRowV3::Count(0)]);
+            assert_eq!(result.snapshots, old.snapshots);
+            assert_eq!(result.metadata_sequence, old.metadata_sequence);
+            assert_eq!(result.completeness, AdjacencyCompleteness::Unverified);
+        }
         // Independent explicit oracle: parallel edges 9/10, a cross-shard
         // cycle, and self-loop 12. Emission is level-major, never DFS order.
         let first_level = vec![
@@ -771,7 +840,7 @@ async fn scenario() -> anyhow::Result<()> {
                 Direction::Out
             )
             .is_err());
-        for suffix in [".count()", ".dedup().limit(1)", ".has('missing').count()", ".id().is(-1).count()"] {
+        for suffix in [".count()", ".dedup().limit(1)", ".has('missing').count()", ".id().is(-1).count()", ".simplePath().count()", ".cyclicPath().range(0,0)"] {
             let text = format!("g.V(7).repeat(out('K')).times(2){suffix}");
             assert!(matches!(
                 current.observed_gremlin_v3(1, &text),
@@ -786,6 +855,13 @@ async fn scenario() -> anyhow::Result<()> {
                 .rows,
             vec![ObservedRowV3::Count(6)]
         );
+        // The previously pinned session must still see its complete old
+        // adjacency after the newer incomplete edge and catalog registration.
+        let filtered_old = session.observed_gremlin_v3(1, "g.V(7).out('K').simplePath().count()")?;
+        assert_eq!(filtered_old.rows, vec![ObservedRowV3::Count(3)]);
+        assert_eq!(filtered_old.snapshots, session.snapshots);
+        assert_eq!(filtered_old.metadata_sequence, session.metadata_sequence);
+        assert_eq!(filtered_old.completeness, AdjacencyCompleteness::Unverified);
         // Unknown completeness propagates even into scalar counts; visible
         // incompleteness is an error, not a partial vector or zero count.
         let observed = current.observed_gremlin(2, "g.V(7).in().count()")?;
