@@ -25,6 +25,7 @@ mod local;
 mod pages;
 #[path = "managed_gateway_query.rs"]
 mod query;
+pub use crate::remote::distributed::fixed::LocalReadProfile;
 pub use local::{LocalGraphRoute, LocalSession};
 pub use pages::{PageCursor, QueryPage, MAX_PAGE_SIZE};
 use std::{
@@ -379,6 +380,14 @@ pub enum Operation {
         query: Query,
         page_size: u16,
     },
+    /// Execute a complete local query under an explicitly selected capture policy.
+    OpenLocalQueryWithProfile {
+        profile: LocalReadProfile,
+        version: Option<u64>,
+        ttl_millis: u64,
+        query: Query,
+        page_size: u16,
+    },
     /// Replay a page of a known immutable result, without accessing graph nodes.
     FetchLocalQuery {
         session: LocalSession,
@@ -453,6 +462,13 @@ pub enum Reply {
     },
     Close(Session),
     OpenLocalQuery {
+        session: LocalSession,
+        query: Query,
+        page_size: u16,
+        page: QueryPage,
+    },
+    OpenLocalQueryWithProfile {
+        profile: LocalReadProfile,
         session: LocalSession,
         query: Query,
         page_size: u16,
@@ -858,8 +874,26 @@ impl State {
                 query,
                 page_size,
             } => {
-                self.open_local(version, ttl_millis, query, page_size, work, end)
+                self.open_local(None, version, ttl_millis, query, page_size, work, end)
                     .await
+            }
+            Operation::OpenLocalQueryWithProfile {
+                profile,
+                version,
+                ttl_millis,
+                query,
+                page_size,
+            } => {
+                self.open_local(
+                    Some(profile),
+                    version,
+                    ttl_millis,
+                    query,
+                    page_size,
+                    work,
+                    end,
+                )
+                .await
             }
             Operation::FetchLocalQuery {
                 session,
@@ -1066,6 +1100,7 @@ async fn serve(
             | Operation::Traverse { .. }
             | Operation::TraversePage { .. }
             | Operation::OpenLocalQuery { .. }
+            | Operation::OpenLocalQueryWithProfile { .. }
             | Operation::FetchLocalQuery { .. }
     ) {
         end.min(Instant::now() + rocksdb_sql_table::GREMLIN_DEADLINE)
@@ -1085,7 +1120,10 @@ async fn serve(
     let mut delivery = OpenDelivery {
         state: state.clone(),
         local_token: match &result {
-            Ok(Reply::OpenLocalQuery { session, .. }) => Some(session.token),
+            Ok(
+                Reply::OpenLocalQuery { session, .. }
+                | Reply::OpenLocalQueryWithProfile { session, .. },
+            ) => Some(session.token),
             _ => None,
         },
         token: match &result {
@@ -1102,9 +1140,11 @@ async fn serve(
     // Retain the result reservation through encoding and the complete send,
     // even when another request closes/expires the registry entry meanwhile.
     let local_retained = match &response.result {
-        Ok(Reply::OpenLocalQuery { session, .. } | Reply::FetchLocalQuery { session, .. }) => {
-            Some(state.get_local(session)?)
-        }
+        Ok(
+            Reply::OpenLocalQuery { session, .. }
+            | Reply::OpenLocalQueryWithProfile { session, .. }
+            | Reply::FetchLocalQuery { session, .. },
+        ) => Some(state.get_local(session)?),
         _ => None,
     };
     let expiry = match &response.result {
@@ -1114,9 +1154,11 @@ async fn serve(
             | Reply::Traverse { session: s, .. }
             | Reply::TraversePage { session: s, .. },
         ) => Some(state.get(s)?.expires),
-        Ok(Reply::OpenLocalQuery { session, .. } | Reply::FetchLocalQuery { session, .. }) => {
-            Some(state.get_local(session)?.expires)
-        }
+        Ok(
+            Reply::OpenLocalQuery { session, .. }
+            | Reply::OpenLocalQueryWithProfile { session, .. }
+            | Reply::FetchLocalQuery { session, .. },
+        ) => Some(state.get_local(session)?.expires),
         _ => None,
     };
     let (bytes, success, local_retained) = tokio::task::spawn_blocking(move || {
@@ -1302,6 +1344,30 @@ fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
             },
         ) => {
             session.incarnation != [0; 16]
+                && session.token != [0; 32]
+                && version.is_none_or(|v| v == session.version)
+                && query == q
+                && page_size == size
+                && local::valid_page(query, None, *page_size, page, &request.binding)
+        }
+        (
+            Operation::OpenLocalQueryWithProfile {
+                profile,
+                version,
+                query,
+                page_size,
+                ..
+            },
+            Reply::OpenLocalQueryWithProfile {
+                profile: returned_profile,
+                session,
+                query: q,
+                page_size: size,
+                page,
+            },
+        ) => {
+            profile == returned_profile
+                && session.incarnation != [0; 16]
                 && session.token != [0; 32]
                 && version.is_none_or(|v| v == session.version)
                 && query == q

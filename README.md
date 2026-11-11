@@ -47,9 +47,12 @@ They do not yet support data-local hierarchy jobs. The original gateway `Read` h
 A separate opt-in [data-local fixed-V gateway](docs/MANAGED_LOCAL_GATEWAY.md)
 retains certified views on participant nodes and reuses the distributed executor
 for explicit `g.V(ids)` with `out`/`in` and terminal `path`/`count`. It validates
-the whole immutable result before publishing replayable pages. This M1 path keeps
-the existing 10,000-row / 2 MiB / 100,000-operation capture budget; it is not a
-large-scale managed capacity increase or a replacement for old entrypoints.
+the whole immutable result before publishing replayable pages. The original
+operation retains its 10,000-row / 2 MiB / 100,000-operation capture budget. An
+explicit `LocalRead8MiBV1` query profile permits 8 MiB of captured payload with
+unchanged row/work/history/write/result limits and shared admission pools. This
+is not an 8 MiB write lifecycle or full managed CoreHR capacity claim, and does
+not replace old entrypoints.
 
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
 rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions

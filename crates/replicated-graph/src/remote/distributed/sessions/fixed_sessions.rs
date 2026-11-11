@@ -84,6 +84,7 @@ impl Sessions {
             return Err(RemoteError::Protocol);
         }
         let descriptor = FixedDescriptor {
+            profile: request.profile,
             stamp: QueryStamp {
                 identity,
                 shard,
@@ -302,6 +303,7 @@ async fn validate_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::distributed::fixed::LocalReadProfile;
     use d2_raft::{
         participant_writes::Authority,
         transaction_decisions::{Cohort, Command, Decision, Journal, Member, Participant},
@@ -390,6 +392,7 @@ mod tests {
         }
         fn request(&self, version: u64) -> FixedOpenRequest {
             FixedOpenRequest {
+                profile: Default::default(),
                 target: Target {
                     shard: 7,
                     epoch: 1,
@@ -499,7 +502,7 @@ mod tests {
                 .get(b"key"),
             None
         );
-        for mutate in 0..6 {
+        for mutate in 0..7 {
             let mut wrong = v1.descriptor.clone();
             match mutate {
                 0 => wrong.version = 0,
@@ -507,10 +510,11 @@ mod tests {
                 2 => wrong.cohort.coordinator_epoch += 1,
                 3 => wrong.mode = [1; 16],
                 4 => wrong.stamp.sequence += 1,
-                _ => {
+                5 => {
                     wrong.cohort.profile =
                         d2_raft::transaction_decisions::CapacityProfile::ByteBound16MiBV1
                 }
+                _ => wrong.profile = LocalReadProfile::LocalRead8MiBV1,
             }
             assert!(matches!(
                 sessions.lookup_fixed(identity(), 7, &wrong),
@@ -671,8 +675,21 @@ mod tests {
         let end = Instant::now() + Duration::from_secs(5);
         let observed = sessions.open(&f.state, identity(), 7, end).await.unwrap();
         let mut fixed = Vec::new();
-        for _ in 1..before {
-            fixed.push(f.open(&sessions, 0).await.descriptor);
+        for index in 1..before {
+            let mut request = f.request(0);
+            request.profile = if index % 2 == 0 {
+                LocalReadProfile::LocalRead8MiBV1
+            } else {
+                LocalReadProfile::Parity2MiBV1
+            };
+            request.capture_limit = request.profile.capture_limit();
+            fixed.push(
+                sessions
+                    .open_fixed(&f.state, identity(), 7, request, end, end)
+                    .await
+                    .unwrap()
+                    .descriptor,
+            );
         }
         assert_eq!(SESSION_SLOTS.available_permits(), 0);
         assert!(matches!(
@@ -708,50 +725,129 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_slots_and_bytes_stay_with_cancelled_worker_after_close() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
-        let mut f = Fixture::new().await;
-        f.commit(vec![WriteOp::put(b"key", b"value")]).await;
-        let sessions = Sessions::new().unwrap();
-        let before_slots = SESSION_SLOTS.available_permits();
-        let before_bytes = SESSION_BYTES.available_permits();
-        let opened = f.open(&sessions, 1).await;
-        let end = Instant::now() + Duration::from_secs(5);
-        let observed = sessions.open(&f.state, identity(), 7, end).await.unwrap();
-        assert_eq!(SESSION_SLOTS.available_permits(), before_slots - 2);
-        assert_eq!(
-            SESSION_BYTES.available_permits(),
-            before_bytes - opened.capture_cost.bytes * 2
-        );
-        let held = sessions
-            .lookup_fixed(identity(), 7, &opened.descriptor)
-            .unwrap();
-        let weak = Arc::downgrade(&held);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let worker = tokio::task::spawn_blocking(move || {
-            let _held = held;
-            let _ = started_tx.send(());
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            drop(_held);
-            let _ = done_tx.send(());
-        });
-        started_rx.await.unwrap();
-        worker.abort();
-        sessions
-            .close_fixed(identity(), 7, &opened.descriptor)
-            .unwrap();
-        sessions.close(identity(), 7, &observed).unwrap();
-        assert_eq!(SESSION_SLOTS.available_permits(), before_slots - 1);
-        assert_eq!(
-            SESSION_BYTES.available_permits(),
-            before_bytes - opened.capture_cost.bytes
-        );
-        assert!(weak.upgrade().is_some());
-        release_tx.send(()).unwrap();
-        done_rx.await.unwrap();
-        assert!(weak.upgrade().is_none());
-        assert_eq!(SESSION_SLOTS.available_permits(), before_slots);
-        assert_eq!(SESSION_BYTES.available_permits(), before_bytes);
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            let mut f = Fixture::new().await;
+            f.commit(vec![WriteOp::put(b"key", b"value")]).await;
+            let sessions = Sessions::new().unwrap();
+            let before_slots = SESSION_SLOTS.available_permits();
+            let before_bytes = SESSION_BYTES.available_permits();
+            let mut request = f.request(1);
+            request.profile = profile;
+            request.capture_limit = profile.capture_limit();
+            let end = Instant::now() + Duration::from_secs(5);
+            let opened = sessions
+                .open_fixed(&f.state, identity(), 7, request, end, end)
+                .await
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(5);
+            let observed = sessions.open(&f.state, identity(), 7, end).await.unwrap();
+            assert_eq!(SESSION_SLOTS.available_permits(), before_slots - 2);
+            assert_eq!(
+                SESSION_BYTES.available_permits(),
+                before_bytes - opened.capture_cost.bytes * 2
+            );
+            let held = sessions
+                .lookup_fixed(identity(), 7, &opened.descriptor)
+                .unwrap();
+            let weak = Arc::downgrade(&held);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                let _held = held;
+                let _ = started_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(_held);
+                let _ = done_tx.send(());
+            });
+            started_rx.await.unwrap();
+            worker.abort();
+            sessions
+                .close_fixed(identity(), 7, &opened.descriptor)
+                .unwrap();
+            sessions.close(identity(), 7, &observed).unwrap();
+            assert_eq!(SESSION_SLOTS.available_permits(), before_slots - 1);
+            assert_eq!(
+                SESSION_BYTES.available_permits(),
+                before_bytes - opened.capture_cost.bytes
+            );
+            assert!(weak.upgrade().is_some());
+            release_tx.send(()).unwrap();
+            done_rx.await.unwrap();
+            assert!(weak.upgrade().is_none());
+            assert_eq!(SESSION_SLOTS.available_permits(), before_slots);
+            assert_eq!(SESSION_BYTES.available_permits(), before_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_capture_byte_boundaries_and_failed_reservation_release() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        // Synthetic certified D1 records exercise capture boundaries, not a
+        // supported managed graph load or an 8 MiB write lifecycle.
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            let cap = profile.capture_limit().bytes;
+            for extra in [0, 1] {
+                let mut f = Fixture::new().await;
+                f.commit(vec![WriteOp::put(b"k", vec![0; cap - 1 + extra])])
+                    .await;
+                let sessions = Sessions::new().unwrap();
+                let slots = SESSION_SLOTS.available_permits();
+                let bytes = SESSION_BYTES.available_permits();
+                let mut request = f.request(1);
+                request.profile = profile;
+                request.capture_limit = profile.capture_limit();
+                let end = Instant::now() + Duration::from_secs(5);
+                let opened = sessions
+                    .open_fixed(&f.state, identity(), 7, request.clone(), end, end)
+                    .await;
+                if extra == 1 {
+                    assert!(matches!(
+                        opened,
+                        Err(RemoteError::Application(D1Error::VisibilityReadLimit))
+                    ));
+                } else {
+                    let opened = opened.unwrap();
+                    assert_eq!(opened.capture_cost.bytes, cap);
+                    assert_eq!(opened.capture_cost.rows, 1);
+                    assert_eq!(opened.capture_cost.replay_operations, 1);
+                    assert_eq!(opened.descriptor.profile, profile);
+                    let held = sessions
+                        .lookup_fixed(identity(), 7, &opened.descriptor)
+                        .unwrap();
+                    sessions
+                        .close_fixed(identity(), 7, &opened.descriptor)
+                        .unwrap();
+                    assert_eq!(SESSION_SLOTS.available_permits(), slots - 1);
+                    assert_eq!(SESSION_BYTES.available_permits(), bytes - cap);
+                    drop(held);
+                }
+                assert!(sessions.fixed_values.lock().unwrap().is_empty());
+                assert_eq!(SESSION_SLOTS.available_permits(), slots);
+                assert_eq!(SESSION_BYTES.available_permits(), bytes);
+                // Reserving the complete allowed peak must fail before capture,
+                // even when the final payload might be smaller than that peak.
+                let reserved = SESSION_BYTES
+                    .try_acquire_many((bytes - cap + 1) as u32)
+                    .unwrap();
+                let end = Instant::now() + Duration::from_secs(5);
+                assert!(matches!(
+                    sessions
+                        .open_fixed(&f.state, identity(), 7, request, end, end)
+                        .await,
+                    Err(RemoteError::ResourceExhausted)
+                ));
+                assert_eq!(SESSION_SLOTS.available_permits(), slots);
+                drop(reserved);
+                assert_eq!(SESSION_BYTES.available_permits(), bytes);
+            }
+        }
     }
 
     struct SmallGraph {
