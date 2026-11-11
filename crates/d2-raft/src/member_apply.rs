@@ -27,6 +27,41 @@ impl MemberHistory for event_ledger::MemberOverlay<'_, '_, '_> {
     }
 }
 
+/// One command-local point projection from the exact borrowed immutable overlay.
+/// Its private fields can only be populated by the original complete lookup.
+/// This never crosses an accepted suffix change or state publication.
+pub(super) struct ProjectedTransaction<'a> {
+    history: &'a dyn MemberHistory,
+    transaction: Transaction,
+}
+impl<'a> ProjectedTransaction<'a> {
+    pub(super) fn new(
+        history: &'a event_ledger::MemberOverlay<'_, '_, '_>,
+        ordinal: u64,
+    ) -> Result<Self, D1Error> {
+        let transaction = history.transaction_at(ordinal).map_err(ledger_read_error)?;
+        Ok(Self {
+            history,
+            transaction,
+        })
+    }
+}
+impl MemberHistory for ProjectedTransaction<'_> {
+    fn transaction(&self, id: [u8; 16]) -> Result<Option<Transaction>, D1Error> {
+        self.history.transaction(id)
+    }
+    fn request_for_transaction(&self, id: [u8; 16]) -> Result<Option<RequestRecord>, D1Error> {
+        self.history.request_for_transaction(id)
+    }
+    fn transaction_at(&self, ordinal: u64) -> Result<Option<Transaction>, D1Error> {
+        if ordinal == self.transaction.ordinal {
+            Ok(Some(self.transaction.clone()))
+        } else {
+            self.history.transaction_at(ordinal)
+        }
+    }
+}
+
 fn history_error(error: anyhow::Error) -> D1Error {
     if error.is::<rocksdb::Error>() || error.is::<std::io::Error>() {
         D1Error::EventLedgerUnavailable
@@ -354,10 +389,14 @@ impl StateMachine {
                 {
                     return Err(D1Error::VisibilityUnresolved);
                 }
-                let tx = accepted
-                    .transaction_at(ordinal)
-                    .map_err(ledger_read_error)?;
-                candidate.advance_member_transaction(tx, &accepted, base.d1.as_ref())?
+                // Keep the first projection before the common observation and
+                // ordinal checks, preserving their existing error precedence.
+                let projected = ProjectedTransaction::new(&accepted, ordinal)?;
+                candidate.advance_member_transaction(
+                    projected.transaction.clone(),
+                    &projected,
+                    base.d1.as_ref(),
+                )?
             }
             D1Command::PrepareRetained(prepare) => {
                 candidate.check_retained_prepare(&prepare)?;
