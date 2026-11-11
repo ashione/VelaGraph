@@ -12,12 +12,15 @@ replicated_graph::managed_graph connects the existing graph/v2 codecs and
 validation to coordinator decisions, durable participant intents and certified
 cohort snapshots. It supports creating vertices and creating directed edges,
 including cross-shard edges, same-shard edges and self-loops. It also supports
-vertex property patches, edge property patches and edge deletion. The additive
+vertex property patches, edge property patches, edge deletion and
+[atomic edge replacement](MANAGED_EDGE_REPLACEMENT.md). Replacement deletes one
+old edge and creates a distinct qualified identity in one Plan, across at most
+four existing endpoint shards. The additive
 `prepare_vertex_properties_if` / `prepare_edge_properties_if` check bounded exact
 property expectations on that same snapshot and retain its original CAS/edge
 guards. See the [conditional write contract](MANAGED_GRAPH_GATEWAY.md#conditional-property-patches). Reads expose vertices,
 verified canonical edges and index-observed adjacency from one common version.
-Vertex deletion, cascade operations and endpoint/label changes remain unsupported.
+Vertex deletion, cascade operations and in-place endpoint/label changes remain unsupported.
 
 The initial mapping is explicit and deterministic: partition as u64 equals shard.
 Every cohort shard must fit u32. No caller-supplied partition map can redirect an
@@ -42,9 +45,11 @@ cohort, validation version, ownership modes/epochs, original local CAS sequences
 exact ordered operations. Cloning preserves the entire plan; preparing again is a
 new operation, not a retry. Intent IDs identify the plan and are not signatures.
 
-An edge plan always includes both source canonical/outgoing operations and target
+A create/delete edge plan always includes both source canonical/outgoing operations and target
 incoming operations. When both endpoints share a shard, the existing batch combiner
-produces one request, one identity and one CAS, retaining both directions. Clients
+produces one request, one identity and one CAS, retaining both directions. The
+shared assembler also coalesces every overlapping shard in replacement plans,
+retaining encounter order and rejecting duplicate keys. Clients
 cannot supply an incomplete list of participant batches through this API. Aggregate
 plan operations and payload bytes are checked against D1 batch caps before sending.
 

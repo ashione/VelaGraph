@@ -153,3 +153,14 @@ Historical `*_RESULTS.md`, performance reports, `docs/benchmarks/` and
 rewrite their numbers as current measurements or transfer a passing old artifact
 to a different tree. Record passed, failed and not-run checks separately. Missing,
 partial, ignored or stale lifecycle evidence is not a successful acceptance run.
+
+## Atomic managed relationship replacement
+
+[ReplaceEdge](MANAGED_EDGE_REPLACEMENT.md) composes old-edge deletion and a new
+qualified edge creation into one durable managed Plan across at most four shards.
+The shared participant assembler preserves the old tombstone transaction ID,
+original per-shard CAS, six operations and unchanged bounds. Fixed-V queries
+remain before-or-after while observed reads retain their existing limitations.
+No in-place endpoint mutation, vertex cascade, general transaction program or
+capacity/recovery claim is added. Native overlap/conflict tests and independent
+process gateway/reopen tests are listed in the contract.

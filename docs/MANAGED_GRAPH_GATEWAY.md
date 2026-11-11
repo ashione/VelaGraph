@@ -41,10 +41,13 @@ Submit accepts a nonzero external 128-bit request ID and one of:
 
 - CreateVertex, CreateEdge, PatchVertex, PatchEdge, DeleteEdge, and the additive
   conditional PatchVertexIf / PatchEdgeIf described below.
+- [ReplaceEdge](MANAGED_EDGE_REPLACEMENT.md) atomically deletes one live edge and
+  creates a distinct qualified edge identity, validating all endpoints at one V.
 - Property values are tagged Null/Integer/Real/Text/Boolean. Integer 1 and real
   1.0 remain different commands. Non-finite real values are invalid.
-- Patch set/remove semantics reuse the existing graph/v2 validators; endpoint,
-  label and vertex-deletion changes are unsupported.
+- Patch set/remove semantics reuse the existing graph/v2 validators. In-place
+  endpoint/label changes and vertex deletion remain unsupported; ReplaceEdge
+  creates a new identity and permanently tombstones the old one.
 
 The canonical command is compact JSON of the ordered tuple
 `("managed-graph-command-v1", Binding, Mutation)`, using fixed-field structs,

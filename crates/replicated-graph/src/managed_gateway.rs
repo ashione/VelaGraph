@@ -222,6 +222,11 @@ pub enum Mutation {
     DeleteEdge {
         edge: Entity,
     },
+    /// Delete the old relationship and create a distinct new identity at one V.
+    ReplaceEdge {
+        edge: Entity,
+        replacement: EdgeData,
+    },
 }
 impl Mutation {
     fn prepare(&self, snapshot: &GraphSnapshot) -> managed_graph::Result<Plan> {
@@ -250,6 +255,9 @@ impl Mutation {
                 },
             ),
             Self::DeleteEdge { edge } => snapshot.prepare_edge_delete(edge.edge()),
+            Self::ReplaceEdge { edge, replacement } => {
+                snapshot.prepare_edge_replace(edge.edge(), &replacement.graph())
+            }
             Self::PatchVertexIf {
                 vertex,
                 conditions,
@@ -280,6 +288,7 @@ impl Mutation {
         let values = match self {
             Self::CreateVertex { vertex, .. } => Some(&vertex.properties),
             Self::CreateEdge { edge } => Some(&edge.properties),
+            Self::ReplaceEdge { replacement, .. } => Some(&replacement.properties),
             Self::PatchVertex { patch, .. }
             | Self::PatchEdge { patch, .. }
             | Self::PatchVertexIf { patch, .. }

@@ -586,7 +586,13 @@ async fn rejects_wrong_identity(process: &Process) -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_managed_processes_partial_commit_and_durable_recovery() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(240), scenario()).await?
+    tokio::time::timeout(Duration::from_secs(240), async {
+        scenario().await?;
+        // Preserve every original check and deadline. The additive replacement
+        // fixture starts only after the original cohort and sessions close.
+        managed_process_edge_replace::scenario().await
+    })
+    .await?
 }
 async fn scenario() -> anyhow::Result<()> {
     let mut coordinator = Process::start(9).await?;
@@ -3194,3 +3200,6 @@ async fn extended_lifecycle(timeout: u64) -> anyhow::Result<()> {
 
 #[path = "support/range_queries.rs"]
 mod range_queries;
+
+#[path = "support/managed_process_edge_replace.rs"]
+mod managed_process_edge_replace;
