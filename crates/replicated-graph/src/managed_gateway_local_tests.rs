@@ -404,9 +404,9 @@ fn fixed_graph_routes_bind_complete_managed_identity() {
 }
 
 #[test]
-fn fixed_graph_nine_matching_routes_are_rejected_before_admission() {
+fn fixed_graph_protocol_member_limit_is_checked_before_admission() {
     let mut binding = bound();
-    binding.cohort.members = (10..19)
+    binding.cohort.members = (10..74)
         .map(|shard| d2_raft::transaction_decisions::Member {
             shard,
             epoch: 1,
@@ -459,6 +459,24 @@ fn fixed_graph_nine_matching_routes_are_rejected_before_admission() {
         binding,
         members,
     };
+    local::validate_routes(&config, &routes).unwrap();
+    let mut oversized = config.coordinator.identity().clone();
+    oversized
+        .cohort
+        .members
+        .push(d2_raft::transaction_decisions::Member {
+            shard: 74,
+            epoch: 1,
+            mode: [74; 16],
+        });
+    assert!(Client::new(
+        "127.0.0.1:12345".parse().unwrap(),
+        oversized,
+        Duration::from_secs(1)
+    )
+    .is_err());
+    // A caller cannot bypass the gateway bound with an extra configured route.
+    routes.push(routes[0].clone());
     assert_eq!(
         local::validate_routes(&config, &routes),
         Err(Error::Identity)
