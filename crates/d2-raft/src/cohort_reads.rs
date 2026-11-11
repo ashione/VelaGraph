@@ -2,6 +2,7 @@
 //! local/remote primitive does not enable the remote graph Global query API.
 use crate::managed_rpc::{self, NodeRef};
 use crate::participant_writes::Authority;
+use crate::terminal_prefix::TerminalPrefix;
 use crate::transaction_decisions::Cohort;
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
 use crate::{D1Error, NodeHandle};
@@ -138,126 +139,196 @@ pub async fn acquire_endpoints(
     {
         return Err(Error::InvalidLimits);
     }
-    let expires = Instant::now()
-        .checked_add(lifetime)
-        .ok_or(Error::InvalidLimits)?;
-    let acquire_deadline = Instant::now() + lifetime.min(MAX_ACQUIRE_TIME);
-    let check_deadline = || {
-        if Instant::now() >= expires {
+    let window = AcquisitionWindow::new(lifetime)?;
+    let result = tokio::time::timeout(lifetime.min(MAX_ACQUIRE_TIME), async {
+        let cut = admit_cut(
+            coordinator,
+            authority,
+            coordinator_epoch,
+            members,
+            version,
+            window,
+        )
+        .await?;
+        capture_cut(cut, limit).await
+    })
+    .await;
+    result.map_err(|_| window.timeout_error())?
+}
+
+// Admission is deliberately not a read certificate or a restart token. It
+// selects one coordinator prefix after observing every member's readiness, but
+// each member must still return matching same-lock evidence with its read.
+// Keep the original endpoints and acquisition window in the cut: a consumer
+// must not silently refresh V, replace a replica, or restart its deadline.
+struct AdmittedCut<'a> {
+    authority: Authority,
+    cohort: Cohort,
+    version: u64,
+    proof: TerminalPrefix,
+    members: Vec<(NodeRef<'a>, Target)>,
+    window: AcquisitionWindow,
+}
+
+#[derive(Clone, Copy)]
+struct AcquisitionWindow {
+    expires: Instant,
+    deadline: Instant,
+}
+impl AcquisitionWindow {
+    fn new(lifetime: Duration) -> Result<Self, Error> {
+        if lifetime.is_zero() || lifetime > MAX_SESSION_LIFETIME {
+            return Err(Error::InvalidLimits);
+        }
+        Ok(Self {
+            expires: Instant::now()
+                .checked_add(lifetime)
+                .ok_or(Error::InvalidLimits)?,
+            deadline: Instant::now() + lifetime.min(MAX_ACQUIRE_TIME),
+        })
+    }
+    fn check(self) -> Result<(), Error> {
+        if Instant::now() >= self.expires {
             Err(Error::Expired)
-        } else if Instant::now() >= acquire_deadline {
+        } else if Instant::now() >= self.deadline {
             Err(Error::Unavailable)
         } else {
             Ok(())
         }
-    };
-    let result = tokio::time::timeout(lifetime.min(MAX_ACQUIRE_TIME), async {
-        let summary = coordinator
-            .summary(&authority, coordinator_epoch)
-            .await
-            .map_err(|e| {
-                if e == managed_rpc::Error::Application(D1Error::VisibilityHistory) {
-                    Error::UnboundCohort
-                } else {
-                    Error::from(e)
-                }
-            })?;
-        let cohort = summary.cohort;
-        if cohort.coordinator_shard != authority.shard
-            || cohort.coordinator_epoch != coordinator_epoch
-            || members.len() != cohort.members.len()
-        {
-            return Err(Error::Identity);
-        }
-        for ((_, target), expected) in members.iter().zip(&cohort.members) {
-            if target.shard != expected.shard
-                || target.epoch != expected.epoch
-                || target.mode != expected.mode
-            {
-                return Err(Error::Identity);
-            }
-        }
-        let mut common = summary.resolved_prefix;
-        for (node, target) in &members {
-            check_deadline()?;
-            let info = node.visibility(target).await?;
-            if info.baseline_sequence != 0
-                || info.authority != authority
-                || info.cohort.as_ref() != Some(&cohort)
-            {
-                return Err(Error::Identity);
-            }
-            common = common.min(info.applied_prefix);
-        }
-        let version = version.unwrap_or(common);
-        if version > summary.resolved_prefix {
-            return Err(Error::Unresolved);
-        }
-        check_deadline()?;
-        let proof = coordinator
-            .terminal(&authority, coordinator_epoch, version)
-            .await?;
-        if proof.cohort() != &cohort {
-            return Err(Error::Identity);
-        }
-        let mut snapshots = BTreeMap::new();
-        let mut rows = 0usize;
-        let mut bytes = 0usize;
-        let mut operations = 0usize;
-        for (node, target) in members {
-            check_deadline()?;
-            let remaining = ReadLimit {
-                rows: limit.rows.saturating_sub(rows),
-                bytes: limit.bytes.saturating_sub(bytes),
-                operations: limit.operations.saturating_sub(operations),
-            };
-            // Exhaustion is fail-closed even if a later shard might be empty.
-            if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
-                return Err(Error::Capacity);
-            }
-            let snapshot = node.read_terminal(&target, remaining, &proof).await?;
-            check_deadline()?;
-            if snapshot.shard != target.shard
-                || snapshot.epoch != target.epoch
-                || snapshot.version != version
-                || snapshot.applied_prefix < version
-                || snapshot.baseline_sequence != 0
-                || snapshot.authority != authority
-                || snapshot.cohort.as_ref() != Some(&cohort)
-            {
-                return Err(Error::Identity);
-            }
-            operations = operations.saturating_add(snapshot.replay_operations);
-            rows = rows.saturating_add(snapshot.entries.len());
-            bytes = bytes.saturating_add(
-                snapshot
-                    .entries
-                    .iter()
-                    .map(|(k, v)| k.len() + v.len())
-                    .sum::<usize>(),
-            );
-            if rows > limit.rows || bytes > limit.bytes || operations > limit.operations {
-                return Err(Error::Capacity);
-            }
-            snapshots.insert(target.shard, snapshot);
-        }
-        check_deadline()?;
-        Ok(SnapshotSession {
-            authority,
-            cohort,
-            version,
-            expires,
-            snapshots,
-        })
-    })
-    .await;
-    result.map_err(|_| {
-        if Instant::now() >= expires {
+    }
+    fn timeout_error(self) -> Error {
+        if Instant::now() >= self.expires {
             Error::Expired
         } else {
             Error::Unavailable
         }
-    })?
+    }
+}
+
+async fn admit_cut<'a>(
+    coordinator: NodeRef<'a>,
+    authority: Authority,
+    coordinator_epoch: u64,
+    members: Vec<(NodeRef<'a>, Target)>,
+    version: Option<u64>,
+    window: AcquisitionWindow,
+) -> Result<AdmittedCut<'a>, Error> {
+    let summary = coordinator
+        .summary(&authority, coordinator_epoch)
+        .await
+        .map_err(|e| {
+            if e == managed_rpc::Error::Application(D1Error::VisibilityHistory) {
+                Error::UnboundCohort
+            } else {
+                Error::from(e)
+            }
+        })?;
+    let cohort = summary.cohort;
+    if cohort.coordinator_shard != authority.shard
+        || cohort.coordinator_epoch != coordinator_epoch
+        || members.len() != cohort.members.len()
+    {
+        return Err(Error::Identity);
+    }
+    for ((_, target), expected) in members.iter().zip(&cohort.members) {
+        if target.shard != expected.shard
+            || target.epoch != expected.epoch
+            || target.mode != expected.mode
+        {
+            return Err(Error::Identity);
+        }
+    }
+    let mut common = summary.resolved_prefix;
+    for (node, target) in &members {
+        window.check()?;
+        let info = node.visibility(target).await?;
+        if info.baseline_sequence != 0
+            || info.authority != authority
+            || info.cohort.as_ref() != Some(&cohort)
+        {
+            return Err(Error::Identity);
+        }
+        common = common.min(info.applied_prefix);
+    }
+    let version = version.unwrap_or(common);
+    if version > summary.resolved_prefix {
+        return Err(Error::Unresolved);
+    }
+    window.check()?;
+    let proof = coordinator
+        .terminal(&authority, coordinator_epoch, version)
+        .await?;
+    if proof.cohort() != &cohort {
+        return Err(Error::Identity);
+    }
+    Ok(AdmittedCut {
+        authority,
+        cohort,
+        version,
+        proof,
+        members,
+        window,
+    })
+}
+
+async fn capture_cut(cut: AdmittedCut<'_>, limit: ReadLimit) -> Result<SnapshotSession, Error> {
+    let AdmittedCut {
+        authority,
+        cohort,
+        version,
+        proof,
+        members,
+        window,
+    } = cut;
+    let mut snapshots = BTreeMap::new();
+    let mut rows = 0usize;
+    let mut bytes = 0usize;
+    let mut operations = 0usize;
+    for (node, target) in members {
+        window.check()?;
+        let remaining = ReadLimit {
+            rows: limit.rows.saturating_sub(rows),
+            bytes: limit.bytes.saturating_sub(bytes),
+            operations: limit.operations.saturating_sub(operations),
+        };
+        // Exhaustion is fail-closed even if a later shard might be empty.
+        if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
+            return Err(Error::Capacity);
+        }
+        let snapshot = node.read_terminal(&target, remaining, &proof).await?;
+        window.check()?;
+        if snapshot.shard != target.shard
+            || snapshot.epoch != target.epoch
+            || snapshot.version != version
+            || snapshot.applied_prefix < version
+            || snapshot.baseline_sequence != 0
+            || snapshot.authority != authority
+            || snapshot.cohort.as_ref() != Some(&cohort)
+        {
+            return Err(Error::Identity);
+        }
+        operations = operations.saturating_add(snapshot.replay_operations);
+        rows = rows.saturating_add(snapshot.entries.len());
+        bytes = bytes.saturating_add(
+            snapshot
+                .entries
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>(),
+        );
+        if rows > limit.rows || bytes > limit.bytes || operations > limit.operations {
+            return Err(Error::Capacity);
+        }
+        snapshots.insert(target.shard, snapshot);
+    }
+    window.check()?;
+    Ok(SnapshotSession {
+        authority,
+        cohort,
+        version,
+        expires: window.expires,
+        snapshots,
+    })
 }
 
 #[cfg(test)]
@@ -462,6 +533,202 @@ mod tests {
         )
         .await
     }
+    async fn admitted<'a>(
+        coordinator: &'a NodeHandle,
+        a: &'a NodeHandle,
+        b: &'a NodeHandle,
+        version: Option<u64>,
+    ) -> Result<AdmittedCut<'a>, Error> {
+        admit_cut(
+            NodeRef::Local(coordinator),
+            authority(),
+            1,
+            vec![
+                (NodeRef::Local(a), target(7)),
+                (NodeRef::Local(b), target(8)),
+            ],
+            version,
+            AcquisitionWindow::new(Duration::from_secs(20)).unwrap(),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_cut_retains_original_endpoints_version_and_deadlines() {
+        let _resources = crate::managed_rpc::test_resource_guard().await;
+        let cluster = Cluster::new();
+        let mut j = Journal::new([9; 16]).unwrap();
+        j.apply(Command::BindCohort { cohort: cohort() }).unwrap();
+        let c = start(&cluster, 9, &j).await;
+        let a = start(&cluster, 7, &j).await;
+        let b = start(&cluster, 8, &j).await;
+        let cut = admitted(&c, &a, &b, None).await.unwrap();
+        assert_eq!(cut.authority, authority());
+        assert_eq!(cut.cohort, cohort());
+        assert_eq!(cut.version, 0);
+        assert_eq!(cut.proof, j.terminal_prefix(0).unwrap());
+        assert!(matches!(cut.members[0].0, NodeRef::Local(n) if std::ptr::eq(n, &a)));
+        assert!(matches!(cut.members[1].0, NodeRef::Local(n) if std::ptr::eq(n, &b)));
+        assert_eq!(cut.members[0].1, target(7));
+        assert_eq!(cut.members[1].1, target(8));
+        let expires = cut.window.expires;
+        commit(&c, &[(&a, 7), (&b, 8)], 1, 0).await;
+        advance(&c, &a, 7, 1).await;
+        advance(&c, &b, 8, 1).await;
+        let old = capture_cut(cut, limit()).await.unwrap();
+        assert_eq!(old.version().unwrap(), 0);
+        assert_eq!(old.expires_at().unwrap(), expires);
+        assert!(old.shard(7).unwrap().entries.is_empty());
+        assert!(old.shard(8).unwrap().entries.is_empty());
+        assert_eq!(
+            capture(&c, &a, &b, None).await.unwrap().version().unwrap(),
+            1
+        );
+
+        // Selecting a prefix is not certifying its data: even a nonparticipant
+        // must consume that prefix before capture can publish a session.
+        commit(&c, &[(&a, 7)], 2, 1).await;
+        advance(&c, &a, 7, 2).await;
+        let automatic = admitted(&c, &a, &b, None).await.unwrap();
+        assert_eq!(automatic.version, 1);
+        let explicit = admitted(&c, &a, &b, Some(2)).await.unwrap();
+        assert_eq!(explicit.version, 2);
+        assert_eq!(
+            capture_cut(explicit, limit()).await.unwrap_err(),
+            Error::Application(D1Error::VisibilityNotApplied)
+        );
+        advance(&c, &b, 8, 2).await;
+        assert_eq!(
+            capture_cut(automatic, limit())
+                .await
+                .unwrap()
+                .version()
+                .unwrap(),
+            1
+        );
+
+        // Admission must not create a renewable acquisition window.
+        let mut expired = admitted(&c, &a, &b, None).await.unwrap();
+        expired.window.expires = Instant::now();
+        assert_eq!(
+            capture_cut(expired, limit()).await.unwrap_err(),
+            Error::Expired
+        );
+        let mut timed_out = admitted(&c, &a, &b, None).await.unwrap();
+        timed_out.window.deadline = Instant::now();
+        assert_eq!(
+            capture_cut(timed_out, limit()).await.unwrap_err(),
+            Error::Unavailable
+        );
+        for node in [&a, &b, &c] {
+            node.raft.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_rejects_incomplete_or_changed_cohort_and_unresolved_holes() {
+        let _resources = crate::managed_rpc::test_resource_guard().await;
+        let cluster = Cluster::new();
+        let mut j = Journal::new([9; 16]).unwrap();
+        j.apply(Command::BindCohort { cohort: cohort() }).unwrap();
+        let c = start(&cluster, 9, &j).await;
+        let a = start(&cluster, 7, &j).await;
+        let b = start(&cluster, 8, &j).await;
+        let valid = vec![
+            (NodeRef::Local(&a), target(7)),
+            (NodeRef::Local(&b), target(8)),
+        ];
+        let mut wrong_epoch = valid.clone();
+        wrong_epoch[1].1.epoch += 1;
+        let mut wrong_mode = valid.clone();
+        wrong_mode[1].1.mode = [42; 16];
+        for members in [
+            vec![valid[0].clone()],
+            vec![valid[0].clone(), valid[0].clone()],
+            vec![valid[1].clone(), valid[0].clone()],
+            wrong_epoch,
+            wrong_mode,
+        ] {
+            assert!(matches!(
+                admit_cut(
+                    NodeRef::Local(&c),
+                    authority(),
+                    1,
+                    members,
+                    Some(0),
+                    AcquisitionWindow::new(Duration::from_secs(20)).unwrap()
+                )
+                .await,
+                Err(Error::Identity)
+            ));
+        }
+        // A correctly shaped target list must not redirect a member read to
+        // another member's handle, even at the identical empty version zero.
+        assert!(admit_cut(
+            NodeRef::Local(&c),
+            authority(),
+            1,
+            vec![
+                (NodeRef::Local(&b), target(7)),
+                (NodeRef::Local(&a), target(8))
+            ],
+            Some(0),
+            AcquisitionWindow::new(Duration::from_secs(20)).unwrap()
+        )
+        .await
+        .is_err());
+        let mut wrong_authority = authority();
+        wrong_authority.mode = [42; 16];
+        assert!(admit_cut(
+            NodeRef::Local(&c),
+            wrong_authority,
+            1,
+            valid,
+            Some(0),
+            AcquisitionWindow::new(Duration::from_secs(20)).unwrap()
+        )
+        .await
+        .is_err());
+
+        journal_command(
+            &c,
+            Command::Begin {
+                id: [1; 16],
+                participants: vec![descriptor(7)],
+            },
+        )
+        .await
+        .unwrap();
+        journal_command(
+            &c,
+            Command::Begin {
+                id: [2; 16],
+                participants: vec![descriptor(8)],
+            },
+        )
+        .await
+        .unwrap();
+        journal_command(
+            &c,
+            Command::Decide {
+                id: [2; 16],
+                decision: Decision::Abort,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(admitted(&c, &a, &b, None).await.unwrap().version, 0);
+        for version in [1, 2] {
+            assert!(matches!(
+                admitted(&c, &a, &b, Some(version)).await,
+                Err(Error::Unresolved)
+            ));
+        }
+        for node in [&a, &b, &c] {
+            node.raft.shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_cohort_same_version_survives_continuing_writes_and_refuses_partial_apply() {
         let _resources = crate::managed_rpc::test_resource_guard().await;
