@@ -52,6 +52,19 @@ fn synced_temporal_batch_survives_process_death() {
         assert_eq!(view.version(), if mode == "after" { 2 } else { 1 });
         assert_eq!(view.get_vertex(2).unwrap().is_some(), mode == "after");
         assert_eq!(view.get_edge(7).unwrap().is_some(), mode == "after");
+        for query in ["g.V(1).out('LINK')", "g.V(2).in('LINK')"] {
+            assert_eq!(
+                view.execute_gremlin(query).unwrap().rows.len(),
+                usize::from(mode == "after")
+            );
+        }
+        assert!(store
+            .view(Some(1), 10)
+            .unwrap()
+            .execute_gremlin("g.V(1).out()")
+            .unwrap()
+            .rows
+            .is_empty());
         assert!(store
             .view(Some(1), 10)
             .unwrap()

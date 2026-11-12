@@ -156,10 +156,10 @@ work includes:
   independent physical backups alone do not establish this.
 - [Bitemporal graph semantics](docs/BITEMPORAL_GRAPH_PLAN.md): valid time and
   system version. An [in-memory reference](docs/BITEMPORAL_REFERENCE.md) and
-  [durable local point-read slice](docs/TEMPORAL_STORE.md) are implemented.
+  [durable local temporal slice](docs/TEMPORAL_STORE.md) are implemented.
   The latter uses a separate RocksDB database and synced local versions; it is
-  connected to bounded official-Gremlin explicit-ID point queries, not temporal
-  adjacency/global scans, managed/cohort V or existing checkpoints.
+  connected to bounded official-Gremlin explicit-ID point queries and indexed
+  out/in/both traversal, not global scans, managed/cohort V or existing checkpoints.
 - Object-store-authoritative storage with disposable local caches, subject to
   durability and recovery design; native S3/OSS/TOS deployment validation remains
   separate from the current checkpoint transport.
