@@ -1,0 +1,20 @@
+[package]
+name = "checkpoint-object-store"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Bounded immutable physical checkpoint object transport"
+
+[dependencies]
+object_store = { version = "=0.14.2", features = ["aws"] }
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.10.9"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+async-trait = "=0.1.92"
