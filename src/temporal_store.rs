@@ -22,6 +22,8 @@ const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 pub enum TemporalStoreError {
     #[error("storage error: {0}")]
     Storage(#[from] rocksdb::Error),
+    #[error("storage node: {0}")]
+    Node(#[from] crate::StorageNodeError),
     #[error("graph record error: {0}")]
     Graph(#[from] crate::Error),
     #[error("invalid valid-time interval")]
@@ -117,43 +119,7 @@ impl TemporalStore {
     /// An empty batch advances the local prefix without changing any assertion.
     /// An uncertain RocksDB error has no idempotent retry guarantee in this slice.
     pub fn commit(&self, mutations: &[TemporalMutation]) -> Result<u64> {
-        if mutations.len() > MAX_BATCH {
-            return Err(TemporalStoreError::Limit);
-        }
-        let mut encoded = Vec::with_capacity(mutations.len());
-        let mut bytes = 0usize;
-        for (i, mutation) in mutations.iter().enumerate() {
-            let interval = mutation.interval();
-            if interval.to.is_some_and(|to| to <= interval.from) {
-                return Err(TemporalStoreError::InvalidInterval);
-            }
-            for prior in &mutations[..i] {
-                let p = prior.interval();
-                if prior.key() == mutation.key()
-                    && p.to.is_none_or(|to| interval.from < to)
-                    && interval.to.is_none_or(|to| p.from < to)
-                {
-                    return Err(TemporalStoreError::AmbiguousBatch);
-                }
-            }
-            let value = mutation.encode()?;
-            bytes = bytes
-                .checked_add(
-                    value.len()
-                        + RECORD_PREFIX.len()
-                        + 21
-                        + if matches!(mutation, TemporalMutation::Edge { .. }) {
-                            2 * (ADJACENCY_PREFIX.len() + 17 + 8)
-                        } else {
-                            0
-                        },
-                )
-                .ok_or(TemporalStoreError::Limit)?;
-            if bytes > MAX_BATCH_BYTES {
-                return Err(TemporalStoreError::Limit);
-            }
-            encoded.push(value);
-        }
+        let encoded = encode_batch(mutations)?;
         let _guard = self.write.lock().map_err(|_| TemporalStoreError::Corrupt)?;
         let head = decode_version(self.db.get(HEAD_KEY)?.as_deref())?;
         let version = head.checked_add(1).ok_or(TemporalStoreError::Limit)?;
@@ -193,6 +159,47 @@ impl TemporalStore {
             valid_time,
         })
     }
+}
+
+fn encode_batch(mutations: &[TemporalMutation]) -> Result<Vec<Vec<u8>>> {
+    if mutations.len() > MAX_BATCH {
+        return Err(TemporalStoreError::Limit);
+    }
+    let mut encoded = Vec::with_capacity(mutations.len());
+    let mut bytes = 0usize;
+    for (i, mutation) in mutations.iter().enumerate() {
+        let interval = mutation.interval();
+        if interval.to.is_some_and(|to| to <= interval.from) {
+            return Err(TemporalStoreError::InvalidInterval);
+        }
+        for prior in &mutations[..i] {
+            let p = prior.interval();
+            if prior.key() == mutation.key()
+                && p.to.is_none_or(|to| interval.from < to)
+                && interval.to.is_none_or(|to| p.from < to)
+            {
+                return Err(TemporalStoreError::AmbiguousBatch);
+            }
+        }
+        let value = mutation.encode()?;
+        bytes = bytes
+            .checked_add(
+                value.len()
+                    + RECORD_PREFIX.len()
+                    + 21
+                    + if matches!(mutation, TemporalMutation::Edge { .. }) {
+                        2 * (ADJACENCY_PREFIX.len() + 17 + 8)
+                    } else {
+                        0
+                    },
+            )
+            .ok_or(TemporalStoreError::Limit)?;
+        if bytes > MAX_BATCH_BYTES {
+            return Err(TemporalStoreError::Limit);
+        }
+        encoded.push(value);
+    }
+    Ok(encoded)
 }
 
 /// Borrowed snapshot; historical lookup reads an identity's revision index,
@@ -740,3 +747,6 @@ mod tests {
 }
 
 mod query;
+
+/// Temporal records inside the existing D1/managed state-machine database.
+pub mod managed;
