@@ -1,49 +1,18 @@
-//! A small SQL table engine built on top of RocksDB, with an experimental
-//! property-graph storage kernel.
+//! VelaGraph property-graph storage and Gremlin query kernel.
 //!
-//! The SQL engine stores table definitions in a catalog key space and rows in
-//! primary-key order under a per-table prefix. It supports a deliberately small
-//! SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`,
-//! `INSERT`, `UPDATE`, `DELETE`, and single-table `SELECT` with `WHERE`,
-//! `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING` and
-//! `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` aggregates.
-//!
-//! `GraphEngine` is a separate, additive storage kernel for property graphs:
-//! vertices, labelled directed edges, typed properties, outgoing/incoming
-//! adjacency indexes, a standard Gremlin v0 query surface, snapshot read views,
-//! and single-partition write transactions. Crash recovery is not yet verified.
-//!
-//! ```no_run
-//! use rocksdb_sql_table::{Outcome, TableEngine};
-//!
-//! # fn main() -> rocksdb_sql_table::Result<()> {
-//! let engine = TableEngine::open("./data")?;
-//! engine.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL)")?;
-//! engine.execute("INSERT INTO users (id, name) VALUES (1, 'Ada'), (2, 'Grace')")?;
-//!
-//! let outcomes = engine.execute("SELECT id, name FROM users ORDER BY id")?;
-//! if let Outcome::Rows(result) = &outcomes[0] {
-//!     assert_eq!(result.rows.len(), 2);
-//! }
-//! # Ok(())
-//! # }
-//! ```
+//! Provides typed vertices and edges, deterministic graph records, bounded
+//! traversals, snapshot reads, and single-partition write transactions.
 
-mod engine;
 mod error;
 mod global_scan;
 mod graph;
 mod graph_records;
 mod gremlin;
-mod key;
 mod query_memory;
-mod schema;
-mod storage;
 mod storage_node;
 mod traversal;
 mod value;
 
-pub use engine::{Outcome, QueryResult, TableEngine};
 pub use error::{Error, Result};
 pub use global_scan::{GlobalScanOutput, GlobalScanPlan, QualifiedGremlinRow};
 pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
@@ -58,7 +27,6 @@ pub use gremlin::{
     MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS, MAX_GREMLIN_STRUCTURAL_MARKS,
     MAX_OBSERVED_GREMLIN_REPEAT_TIMES,
 };
-pub use schema::{Column, DataType, IndexSchema, TableSchema};
 pub use storage_node::{
     Epoch, Export, KeyRange, KeyValue, LocalStorageNode, ReadView, RequestId, ScanCursor,
     ScanLimit, ScanPage, Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp,

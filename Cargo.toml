@@ -7,21 +7,16 @@ resolver = "2"
 name = "rocksdb-sql-table"
 version = "0.1.0"
 edition = "2021"
-description = "A small SQL table engine built on top of RocksDB"
+description = "VelaGraph property-graph storage and Gremlin query kernel"
 
 [lib]
 name = "rocksdb_sql_table"
 path = "src/lib.rs"
 
-[[bin]]
-name = "rocksql"
-path = "src/main.rs"
-
 [dependencies]
 rocksdb = { version = "0.25.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlparser = "0.63.0"
 gremlin-rs = "0.1.0"
 thiserror = "2"
 getrandom = "0.3"
