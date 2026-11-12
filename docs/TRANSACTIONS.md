@@ -17,12 +17,10 @@ K3 v0 applies to **one open `GraphEngine` owning one physical partition in one
 OS process**, and to graph keys only.
 
 - It MUST NOT span multiple `GraphEngine` handles, partitions, processes, or
-  the SQL table namespace.
+  unrelated key namespaces.
 - It MUST NOT provide cross-partition or cross-shard atomicity. D4 owns that.
 - Existing autocommit graph methods remain callable and keep their documented
   behavior; transactions are additive.
-- The SQL engine is not changed. A transaction cannot mix SQL rows and graph
-  records.
 - K3 v0 does not promise global serializability, distributed reads, or
   idempotent client retries. D1/D4 add those above this layer.
 
@@ -206,7 +204,6 @@ and no second source of truth.
   K3 must not claim that those autocommit writes are synced.
 - Writes that were not acknowledged as committed may be lost after a crash; that
   is allowed and documented. They must never appear half-written.
-- The SQL engine's durability behavior is out of scope.
 
 ### Recovery tests
 
@@ -276,7 +273,6 @@ harness.
 - Global serializability, distributed snapshots, and follower reads (D3/D4).
 - Per-key version indexes and non-conservative conflict detection.
 - Transaction retry, idempotency keys, and client request IDs (D1 node layer).
-- SQL/graph combined transactions.
 - Gremlin through replicated storage needs a bounded, paginated read interface;
   the local query backend does not alter the D1 scan contract or provide Raft reads.
 
