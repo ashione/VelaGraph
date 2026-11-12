@@ -1141,3 +1141,82 @@ async fn structurally_valid_checkpoint_substitutions_require_exact_raw_replay() 
         );
     }
 }
+
+async fn row_witness_mode<F: std::future::Future>(original: bool, future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        if original {
+            event_ledger::with_original_coordinator_verify(|| {
+                std::future::Future::poll(future.as_mut(), cx)
+            })
+        } else {
+            std::future::Future::poll(future.as_mut(), cx)
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "paired durable apply measurement including witness staging, not Submit/lifecycle"]
+async fn row_witness_real_apply_cost() {
+    let build = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    for resolved in [false, true] {
+        for count in [32, 128, 512] {
+            let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+            let mut stores = [
+                Arc::new(StateMachine::open(dirs[0].path()).unwrap()),
+                Arc::new(StateMachine::open(dirs[1].path()).unwrap()),
+            ];
+            for (slot, sm) in stores.iter_mut().enumerate() {
+                row_witness_mode(slot == 0, setup(sm, CapacityProfile::LegacyCountV1)).await;
+                let commands = (1..=count)
+                    .flat_map(|n| {
+                        let begin = coordinator(Command::Begin {
+                            id: id(n),
+                            participants: vec![participant()],
+                        });
+                        if resolved {
+                            vec![begin, abort(n)]
+                        } else {
+                            vec![begin]
+                        }
+                    })
+                    .collect();
+                row_witness_mode(slot == 0, apply(sm, commands)).await;
+            }
+            assert_eq!(disk(&stores[0]), disk(&stores[1]));
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..24 {
+                let n = count + round + 1;
+                for slot in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let commands = vec![
+                        coordinator(Command::Begin {
+                            id: id(n),
+                            participants: vec![participant()],
+                        }),
+                        abort(n),
+                    ];
+                    let now = std::time::Instant::now();
+                    row_witness_mode(slot == 0, apply(&mut stores[slot], commands)).await;
+                    if round >= 4 {
+                        times[slot].push(now.elapsed().as_micros());
+                    }
+                }
+                assert_eq!(disk(&stores[0]), disk(&stores[1]));
+                assert_eq!(checkpoint(&stores[0]).await, checkpoint(&stores[1]).await);
+            }
+            for samples in &mut times {
+                samples.sort_unstable();
+            }
+            eprintln!("ROW_WITNESS_APPLY initial_tx={count} resolved_prefix={resolved} original_median_us={} witness_median_us={} samples=20 build={build} command=Begin+Abort same_batch sync=true", times[0][10], times[1][10]);
+            eprintln!(
+                "ROW_WITNESS_APPLY_SAMPLES original_us={:?} witness_us={:?}",
+                times[0], times[1]
+            );
+        }
+    }
+}
