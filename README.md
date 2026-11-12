@@ -135,6 +135,11 @@ Standard Gremlin / typed graph mutations
 | `crates/checkpoint-object-store/` | Experimental immutable checkpoint transport |
 | `scripts/`, `docs/` | Reproducible scenarios, contracts and evidence |
 
+An optional [typed gRPC snapshot endpoint](docs/INTERNAL_GRPC_SNAPSHOTS.md)
+provides `Open` / `Page` / `Close` over a reusable HTTP/2 channel. It shares the
+legacy TCP snapshot/session budgets. Query fragments, managed RPC and Raft have
+**not** migrated yet; this is not the external HTTP/gRPC write/query API.
+
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
