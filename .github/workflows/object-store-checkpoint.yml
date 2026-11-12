@@ -1,0 +1,112 @@
+name: Object store checkpoint
+on:
+  pull_request:
+    paths:
+      - 'crates/checkpoint-object-store/**'
+      - 'crates/d2-raft/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/seaweedfs-ci.sh'
+      - '.github/workflows/object-store-checkpoint.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/checkpoint-object-store/**'
+      - 'crates/d2-raft/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/seaweedfs-ci.sh'
+      - '.github/workflows/object-store-checkpoint.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: object-store-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  seaweedfs-contract:
+    name: SeaweedFS S3 contract (not cloud certification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: target/object-store
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      SEAWEEDFS_LOG_DIR: ${{ github.workspace }}/seaweedfs-logs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache isolated Rust build (no checkpoint data)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target/object-store'
+          prefix-key: v1-object-store-no-debug
+          cache-on-failure: false
+      - name: Native contract tests and compile explicit S3 test
+        run: cargo test --locked -p checkpoint-object-store
+      - name: Lint isolated adapter
+        run: cargo clippy --locked -p checkpoint-object-store --all-targets -- -D warnings
+      - name: Real S3 create race and upload/download
+        run: scripts/seaweedfs-ci.sh cargo test --locked -p checkpoint-object-store --test s3 -- --ignored --nocapture
+      - name: Service diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaweedfs-contract-logs
+          path: seaweedfs-logs/
+          retention-days: 3
+          if-no-files-found: ignore
+  physical-checkpoint-roundtrip:
+    name: Physical checkpoint S3 offline restore
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      SEAWEEDFS_LOG_DIR: ${{ github.workspace }}/seaweedfs-physical-logs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install RocksDB build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          # Hosted images may retain stale LLVM directories. Select a library
+          # clang-sys actually recognizes and verify that the loader can open it.
+          python3 - <<'PYTHON'
+          import ctypes, glob, os, pathlib
+          candidates = sorted(glob.glob('/usr/lib/llvm-*/lib/libclang.so') + glob.glob('/usr/lib/llvm-*/lib/libclang-*.so'))
+          for candidate in candidates:
+              try:
+                  library = ctypes.CDLL(candidate)
+                  getattr(library, 'clang_getClangVersion')
+              except (OSError, AttributeError):
+                  continue
+              directory = str(pathlib.Path(candidate).parent)
+              with open(os.environ['GITHUB_ENV'], 'a') as output:
+                  output.write('LIBCLANG_PATH=' + directory + '\n')
+              print('Verified LIBCLANG_PATH=' + directory)
+              break
+          else:
+              raise SystemExit('No loadable libclang.so/libclang-*.so found')
+          PYTHON
+      - name: Cache physical test build (no checkpoint data)
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-object-physical-no-debug
+          cache-on-failure: false
+      - name: Real DB in-memory transport test and compile S3 variant
+        run: cargo test --locked -p d2-raft --test physical_checkpoint_s3
+      - name: Real DB checkpoint through S3 and guarded offline restore
+        run: scripts/seaweedfs-ci.sh cargo test --locked -p d2-raft --test physical_checkpoint_s3 -- --ignored --nocapture
+      - name: Service diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaweedfs-physical-logs
+          path: seaweedfs-physical-logs/
+          retention-days: 3
+          if-no-files-found: ignore

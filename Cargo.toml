@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/d2-raft", "crates/replicated-graph"]
+members = ["crates/d2-raft", "crates/replicated-graph", "crates/checkpoint-object-store"]
 default-members = [".", "crates/d2-raft", "crates/replicated-graph"]
 resolver = "2"
 
