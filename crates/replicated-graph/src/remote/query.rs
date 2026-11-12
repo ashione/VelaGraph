@@ -304,6 +304,8 @@ async fn execute_query_inner(
         .try_acquire()
         .map_err(|_| RemoteError::ResourceExhausted)?;
     raft.ensure_linearizable().await.map_err(|e| {
+        let reason = diagnostic::read_barrier_kind(&e);
+        diagnostic::failure(format_args!("phase=query_barrier reason={reason}"));
         if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
             RemoteError::NotLeader {
                 leader: hint.leader_id,
@@ -401,7 +403,11 @@ async fn run_query_worker(
         work()
     })
     .await
-    .map_err(|_| RemoteError::Unavailable)
+    .map_err(|e| {
+        let reason = if e.is_panic() { "panic" } else { "cancelled" };
+        diagnostic::failure(format_args!("phase=query_worker reason={reason}"));
+        RemoteError::Unavailable
+    })
 }
 fn check(end: Instant) -> Result<(), QueryFailure> {
     if Instant::now() >= end {
@@ -912,6 +918,15 @@ mod tests {
         assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
         server.await.unwrap();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_panic_keeps_unavailable_and_releases_its_permit() {
+        static ADMISSION: Semaphore = Semaphore::const_new(1);
+        let permit = ADMISSION.try_acquire().unwrap();
+        let result = run_query_worker(permit, || panic!("synthetic worker failure")).await;
+        assert!(matches!(result, Err(RemoteError::Unavailable)));
+        assert_eq!(ADMISSION.available_permits(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelling_waiters_keeps_worker_admission_until_work_stops() {
         let mut stops = Vec::new();
