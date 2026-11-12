@@ -600,6 +600,7 @@ impl State {
             let now = Instant::now();
             fixed::RenewableFixedOpenRequest {
                 open: fixed::FixedOpenRequest {
+                    profile: fixed::LocalReadProfile::Parity2MiBV1,
                     target,
                     proof: cut.proof().clone(),
                     capture_limit: limit,
@@ -638,6 +639,7 @@ impl State {
             }
             let request = make_open(target.clone(), limit);
             let requested_lease = request.open.ttl_millis;
+            let requested_profile = request.open.profile;
             let sent = Instant::now();
             let opened = fixed::renewable_open(
                 route.endpoint,
@@ -678,7 +680,8 @@ impl State {
                     opened.opened.capture_cost.rows,
                 ),
             );
-            if opened.opened.retained_proof != *cut.proof()
+            if descriptor.profile != requested_profile
+                || opened.opened.retained_proof != *cut.proof()
                 || opened.grant.descriptor != *descriptor
                 || opened.grant.generation != 0
                 || opened.grant.granted_millis == 0
@@ -902,6 +905,7 @@ mod tests {
                 endpoint: "127.0.0.1:1".parse().unwrap(),
             },
             descriptor: fixed::FixedDescriptor {
+                profile: fixed::LocalReadProfile::Parity2MiBV1,
                 stamp: QueryStamp {
                     identity,
                     shard: 7,
@@ -1052,6 +1056,7 @@ mod tests {
                     endpoint,
                 },
                 descriptor: fixed::FixedDescriptor {
+                    profile: fixed::LocalReadProfile::Parity2MiBV1,
                     stamp: QueryStamp {
                         identity,
                         shard,

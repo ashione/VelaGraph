@@ -137,7 +137,7 @@ No TTL, test assertion, persistent format, or corruption behavior was relaxed to
 turn either incomplete/failed gate into success.
 
 
-## Current-main revalidation
+## Prior-main revalidation (5f68639)
 
 The candidate is reapplied to main
 `5f68639a9b3fef6b6f5c0bebfe85a752c6e68b88`. The d2 implementation is
@@ -164,3 +164,31 @@ original full walker, the old cut rejects a fresh snapshot, and the new cut
 succeeds without mutating or sharing the old witness slice. Existing sync/crash,
 snapshot repair/reopen, and large-row tests remain unchanged. Static review is
 not execution acceptance; fresh tests and required CI still gate this revision.
+
+
+## Integration with the explicit 8 MiB capture profile
+
+This revision integrates main
+`0d19990b61a4e0f14cba3df840e502ffed17bb19`, including #177's explicit
+`LocalRead8MiBV1` profile. The row-witness production implementation is unchanged.
+Prior results for `bdb982836f3ee09131904fbe4a0313d58c91b24a` only cover the
+previous main and do not validate this combined tree.
+
+The existing real-process `expanded_local_read_crosses_original_capture_boundary`
+acceptance must run against this combination, retaining its 180-second harness
+timeout and original 60-second session TTL. It covers the actual default 2 MiB
+rejection, explicit 8 MiB capture with unchanged row/replay limits, old/new
+versions, sealed-result replay through member shutdown/reopen, resource charges,
+negative unavailable-member/legacy-profile cases, and terminal verification.
+The fixture captures 2,100,415 bytes, just above the default 2 MiB cap; it
+does not fill the entire 8 MiB allowance or prove long-duration operation at
+that upper boundary. The original concurrent exact-prefix pin scenario must also be rerun without
+relaxing its TTL or assertions. These are separate capacity and lifetime gates,
+not evidence that a larger capture budget fixes ledger CPU or pin expiration.
+
+The explicit capture budget accounts captured payload, not total process RSS.
+Private coordinator row inventories and each verifier's bounded Tail remain
+separate state-memory costs; they must not be represented as covered by the
+8 MiB capture limit. Full cold replay, independent staging, complete raw byte
+coverage, and immutable publication remain required. Fresh local results and
+complete CI on this exact integration are pending.

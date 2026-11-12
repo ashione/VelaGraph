@@ -15,9 +15,39 @@ pub(crate) const CAPTURE_ROWS: usize = 10_000;
 pub(crate) const CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const CAPTURE_OPERATIONS: usize = 100_000;
 
+/// Explicit query-only capture policy. It does not change durable history,
+/// write admission, execution, proof, result or shared reservation limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalReadProfile {
+    /// The original M1 policy and the implicit legacy default.
+    #[default]
+    Parity2MiBV1,
+    /// Opt-in 8 MiB capture with unchanged row and replay-operation limits.
+    LocalRead8MiBV1,
+}
+impl LocalReadProfile {
+    /// Aggregate live/replay-peak rows and bytes, and cumulative D1 replay work.
+    /// These are logical accounting bounds, not allocator/RSS or CPU-time caps.
+    pub fn capture_limit(self) -> ReadLimit {
+        ReadLimit {
+            rows: CAPTURE_ROWS,
+            bytes: match self {
+                Self::Parity2MiBV1 => CAPTURE_BYTES,
+                Self::LocalRead8MiBV1 => 8 * 1024 * 1024,
+            },
+            operations: CAPTURE_OPERATIONS,
+        }
+    }
+    fn is_default(&self) -> bool {
+        *self == Self::Parity2MiBV1
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FixedOpenRequest {
+    #[serde(default, skip_serializing_if = "LocalReadProfile::is_default")]
+    pub(crate) profile: LocalReadProfile,
     pub(crate) target: Target,
     pub(crate) proof: TerminalPrefix,
     pub(crate) capture_limit: ReadLimit,
@@ -55,7 +85,10 @@ pub(crate) struct FixedLeaseGrant {
 impl RenewableFixedOpenRequest {
     pub(crate) fn validate(&self, shard: u64) -> Result<(), RemoteError> {
         self.open.validate(shard)?;
-        if !(1..=120_000).contains(&self.hard_lifetime_millis)
+        // Renewable jobs retain the original query-capture policy. The expanded
+        // profile is only selected by the short-lived explicit-profile API.
+        if self.open.profile != LocalReadProfile::Parity2MiBV1
+            || !(1..=120_000).contains(&self.hard_lifetime_millis)
             || self.open.ttl_millis > self.hard_lifetime_millis
         {
             return Err(RemoteError::InvalidArgument);
@@ -66,6 +99,8 @@ impl RenewableFixedOpenRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FixedDescriptor {
+    #[serde(default, skip_serializing_if = "LocalReadProfile::is_default")]
+    pub(crate) profile: LocalReadProfile,
     pub(crate) stamp: QueryStamp,
     pub(crate) incarnation: [u8; 16],
     pub(crate) token: [u8; 16],
@@ -108,6 +143,7 @@ pub(crate) struct FixedFragmentOutput {
 impl FixedOpenRequest {
     pub(crate) fn validate(&self, shard: u64) -> Result<(), RemoteError> {
         let target = &self.target;
+        let limit = self.profile.capture_limit();
         if target.shard != shard
             || u32::try_from(shard).is_err()
             || target.epoch == 0
@@ -118,9 +154,9 @@ impl FixedOpenRequest {
             })
             || !(1..=60_000).contains(&self.ttl_millis)
             || !(1..=5000).contains(&self.acquire_timeout_millis)
-            || !(1..=CAPTURE_ROWS).contains(&self.capture_limit.rows)
-            || !(1..=CAPTURE_BYTES).contains(&self.capture_limit.bytes)
-            || !(1..=CAPTURE_OPERATIONS).contains(&self.capture_limit.operations)
+            || !(1..=limit.rows).contains(&self.capture_limit.rows)
+            || !(1..=limit.bytes).contains(&self.capture_limit.bytes)
+            || !(1..=limit.operations).contains(&self.capture_limit.operations)
         {
             return Err(RemoteError::InvalidArgument);
         }
@@ -128,6 +164,7 @@ impl FixedOpenRequest {
     }
     pub(super) fn worst_descriptor(&self, identity: RemoteIdentity) -> FixedDescriptor {
         FixedDescriptor {
+            profile: self.profile,
             stamp: QueryStamp {
                 identity,
                 shard: self.target.shard,
@@ -412,6 +449,7 @@ mod tests {
             })
             .unwrap();
         FixedOpenRequest {
+            profile: LocalReadProfile::Parity2MiBV1,
             target: Target {
                 shard: 7,
                 epoch: 1,
@@ -428,49 +466,129 @@ mod tests {
         }
     }
     #[test]
+    fn explicit_profiles_keep_legacy_wire_and_unchanged_work_limits() {
+        let mut req = request();
+        let legacy = serde_json::to_value(&req).unwrap();
+        assert!(legacy.get("profile").is_none());
+        let decoded: FixedOpenRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.profile, LocalReadProfile::Parity2MiBV1);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            req.profile = profile;
+            req.capture_limit = profile.capture_limit();
+            assert_eq!(req.capture_limit.rows, 10_000);
+            assert_eq!(req.capture_limit.operations, 100_000);
+            req.validate(7).unwrap();
+            let descriptor = req.worst_descriptor(RemoteIdentity { group: 7, node: 1 });
+            assert_eq!(descriptor.profile, profile);
+            for field in 0..3 {
+                let mut invalid = req.clone();
+                match field {
+                    0 => invalid.capture_limit.rows += 1,
+                    1 => invalid.capture_limit.bytes += 1,
+                    _ => invalid.capture_limit.operations += 1,
+                }
+                assert!(matches!(
+                    invalid.validate(7),
+                    Err(RemoteError::InvalidArgument)
+                ));
+            }
+        }
+        assert_eq!(
+            LocalReadProfile::Parity2MiBV1.capture_limit().bytes,
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            LocalReadProfile::LocalRead8MiBV1.capture_limit().bytes,
+            8 * 1024 * 1024
+        );
+        let mut stripped = serde_json::to_value(&req).unwrap();
+        stripped.as_object_mut().unwrap().remove("profile");
+        assert!(matches!(
+            serde_json::from_value::<FixedOpenRequest>(stripped)
+                .unwrap()
+                .validate(7),
+            Err(RemoteError::InvalidArgument)
+        ));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("FutureUnlimitedV2"),
+        ] {
+            let mut invalid = serde_json::to_value(&req).unwrap();
+            invalid["profile"] = value;
+            assert!(serde_json::from_value::<FixedOpenRequest>(invalid).is_err());
+        }
+        // A legacy strict reader must reject the additive field, not fall back.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyOpen {
+            target: Target,
+            proof: TerminalPrefix,
+            capture_limit: ReadLimit,
+            ttl_millis: u64,
+            acquire_timeout_millis: u64,
+        }
+        let old: LegacyOpen = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.target.shard, 7);
+        assert_eq!(old.proof.version(), 0);
+        assert_eq!(old.capture_limit.bytes, 4096);
+        assert_eq!((old.ttl_millis, old.acquire_timeout_millis), (5000, 5000));
+        assert!(serde_json::from_value::<LegacyOpen>(serde_json::to_value(req).unwrap()).is_err());
+    }
+    #[test]
     fn fixed_membership_roundtrips_at_protocol_bound_without_weaker_identity() {
         use d2_raft::transaction_decisions::{Command, Journal, Member};
-        for count in [9, MAX_MEMBERS] {
-            let cohort = Cohort {
-                coordinator_shard: 9,
-                coordinator_epoch: 1,
-                members: (20..20 + count as u64)
-                    .map(|shard| Member {
-                        shard,
-                        epoch: 1,
-                        mode: [shard as u8; 16],
-                    })
-                    .collect(),
-                profile: Default::default(),
-            };
-            let mut journal = Journal::new([9; 16]).unwrap();
-            journal.apply(Command::BindCohort { cohort }).unwrap();
-            let mut open = request();
-            open.proof = journal.terminal_prefix(0).unwrap();
-            open.target = Target {
-                shard: 20,
-                epoch: 1,
-                mode: [20; 16],
-            };
-            let bytes = serde_json::to_vec(&open).unwrap();
-            let mut decoded: FixedOpenRequest = serde_json::from_slice(&bytes).unwrap();
-            decoded.validate(20).unwrap();
-            preflight(
-                RemoteIdentity { group: 20, node: 1 },
-                &decoded,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-            )
-            .unwrap();
-            decoded.target.mode = [21; 16];
-            assert!(decoded.validate(20).is_err());
-            let mut malformed = serde_json::to_value(&open).unwrap();
-            let members = malformed["proof"]["cohort"]["members"]
-                .as_array_mut()
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            for count in [9, MAX_MEMBERS] {
+                let cohort = Cohort {
+                    coordinator_shard: 9,
+                    coordinator_epoch: 1,
+                    members: (20..20 + count as u64)
+                        .map(|shard| Member {
+                            shard,
+                            epoch: 1,
+                            mode: [shard as u8; 16],
+                        })
+                        .collect(),
+                    profile: Default::default(),
+                };
+                let mut journal = Journal::new([9; 16]).unwrap();
+                journal.apply(Command::BindCohort { cohort }).unwrap();
+                let mut open = request();
+                open.profile = profile;
+                open.capture_limit = profile.capture_limit();
+                open.proof = journal.terminal_prefix(0).unwrap();
+                open.target = Target {
+                    shard: 20,
+                    epoch: 1,
+                    mode: [20; 16],
+                };
+                let bytes = serde_json::to_vec(&open).unwrap();
+                let mut decoded: FixedOpenRequest = serde_json::from_slice(&bytes).unwrap();
+                decoded.validate(20).unwrap();
+                preflight(
+                    RemoteIdentity { group: 20, node: 1 },
+                    &decoded,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
                 .unwrap();
-            while members.len() <= MAX_MEMBERS {
-                members.push(members[0].clone());
+                decoded.target.mode = [21; 16];
+                assert!(decoded.validate(20).is_err());
+                let mut malformed = serde_json::to_value(&open).unwrap();
+                let members = malformed["proof"]["cohort"]["members"]
+                    .as_array_mut()
+                    .unwrap();
+                while members.len() <= MAX_MEMBERS {
+                    members.push(members[0].clone());
+                }
+                assert!(serde_json::from_value::<FixedOpenRequest>(malformed).is_err());
             }
-            assert!(serde_json::from_value::<FixedOpenRequest>(malformed).is_err());
         }
     }
     #[test]
@@ -483,6 +601,9 @@ mod tests {
             hard_lifetime_millis: 120_000,
         };
         renewable.validate(7).unwrap();
+        renewable.open.profile = LocalReadProfile::LocalRead8MiBV1;
+        assert!(renewable.validate(7).is_err());
+        renewable.open.profile = LocalReadProfile::Parity2MiBV1;
         for hard in [0, 4_999, 120_001, u64::MAX] {
             renewable.hard_lifetime_millis = hard;
             assert!(renewable.validate(7).is_err());
@@ -490,6 +611,50 @@ mod tests {
         renewable.hard_lifetime_millis = 120_000;
         renewable.open.ttl_millis = 60_001;
         assert!(renewable.validate(7).is_err());
+    }
+
+    #[test]
+    fn renewable_expanded_profile_rejected_by_validation_and_preflight() {
+        let identity = RemoteIdentity { group: 7, node: 1 };
+        let mut renewable = RenewableFixedOpenRequest {
+            open: request(),
+            hard_lifetime_millis: 120_000,
+        };
+        // The new field remains absent on the existing parity renewal wire.
+        let legacy = serde_json::to_value(&renewable).unwrap();
+        assert!(legacy["open"].get("profile").is_none());
+        let decoded: RenewableFixedOpenRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.open.profile, LocalReadProfile::Parity2MiBV1);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+        renewable_preflight(
+            identity,
+            &renewable,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+
+        renewable.open.profile = LocalReadProfile::LocalRead8MiBV1;
+        for bytes in [
+            4096,
+            LocalReadProfile::LocalRead8MiBV1.capture_limit().bytes,
+        ] {
+            renewable.open.capture_limit.bytes = bytes;
+            // Valid short-lived capture does not authorize a renewable capture,
+            // even when its requested bytes fit the old parity budget.
+            renewable.open.validate(7).unwrap();
+            assert!(matches!(
+                renewable.validate(7),
+                Err(RemoteError::InvalidArgument)
+            ));
+            assert!(matches!(
+                renewable_preflight(
+                    identity,
+                    &renewable,
+                    Instant::now() + Duration::from_secs(5)
+                ),
+                Err(RemoteError::InvalidArgument)
+            ));
+        }
     }
 
     #[test]
@@ -521,40 +686,47 @@ mod tests {
             group: u64::MAX,
             node: u64::MAX,
         };
-        let request = request();
-        let end = Instant::now() + Duration::from_secs(5);
-        preflight(identity, &request, end).unwrap();
-        let full = Request {
-            version: VERSION,
-            identity: Some(identity),
-            operation: Operation::OpenFixedQuery(request.clone()),
-        };
-        assert_eq!(
-            frame_size(&full, end).unwrap(),
-            serde_json::to_vec(&full).unwrap().len()
-        );
-        assert!(
-            frame_size(&full, end).unwrap() > serde_json::to_vec(&request.proof).unwrap().len()
-        );
-        let reply = Response {
-            version: VERSION,
-            result: Ok(Reply::OpenFixedQuery(FixedOpened {
-                descriptor: request.worst_descriptor(identity),
-                retained_proof: request.proof.clone(),
-                capture_cost: CaptureCost {
-                    rows: usize::MAX,
-                    bytes: usize::MAX,
-                    replay_operations: usize::MAX,
-                },
-            })),
-        };
-        assert_eq!(
-            frame_size(&reply, end).unwrap(),
-            serde_json::to_vec(&reply).unwrap().len()
-        );
-        let mut malformed = serde_json::to_value(request.proof).unwrap();
-        malformed["through"] = 1.into();
-        assert!(serde_json::from_value::<TerminalPrefix>(malformed).is_err());
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            let mut request = request();
+            request.profile = profile;
+            request.capture_limit = profile.capture_limit();
+            let end = Instant::now() + Duration::from_secs(5);
+            preflight(identity, &request, end).unwrap();
+            let full = Request {
+                version: VERSION,
+                identity: Some(identity),
+                operation: Operation::OpenFixedQuery(request.clone()),
+            };
+            assert_eq!(
+                frame_size(&full, end).unwrap(),
+                serde_json::to_vec(&full).unwrap().len()
+            );
+            assert!(
+                frame_size(&full, end).unwrap() > serde_json::to_vec(&request.proof).unwrap().len()
+            );
+            let reply = Response {
+                version: VERSION,
+                result: Ok(Reply::OpenFixedQuery(FixedOpened {
+                    descriptor: request.worst_descriptor(identity),
+                    retained_proof: request.proof.clone(),
+                    capture_cost: CaptureCost {
+                        rows: usize::MAX,
+                        bytes: usize::MAX,
+                        replay_operations: usize::MAX,
+                    },
+                })),
+            };
+            assert_eq!(
+                frame_size(&reply, end).unwrap(),
+                serde_json::to_vec(&reply).unwrap().len()
+            );
+            let mut malformed = serde_json::to_value(request.proof).unwrap();
+            malformed["through"] = 1.into();
+            assert!(serde_json::from_value::<TerminalPrefix>(malformed).is_err());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -781,6 +953,12 @@ mod tests {
         .unwrap();
         assert_eq!(grant.generation, 1);
         assert_eq!(grant.granted_millis, 60_000);
+        let mut foreign = renew_request.clone();
+        foreign.descriptor.profile = LocalReadProfile::LocalRead8MiBV1;
+        assert!(matches!(
+            renew(endpoint, identity, foreign, Duration::from_secs(5)).await,
+            Err(RemoteError::InvalidArgument)
+        ));
         for sequence in 0..2 {
             let output = fragment(
                 endpoint,
