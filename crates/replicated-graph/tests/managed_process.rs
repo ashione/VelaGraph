@@ -187,8 +187,14 @@ async fn rejects_wrong_identity(process: &Process) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Independent scenarios share the process-wide managed RPC admission pool.
+// Isolate complete fixtures before their timers/sessions start; retain all
+// intentional concurrent reads/writes and failure injection inside each one.
+static PROCESS_SCENARIO: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_managed_processes_partial_commit_and_durable_recovery() -> anyhow::Result<()> {
+    let _scenario = PROCESS_SCENARIO.lock().await;
     tokio::time::timeout(Duration::from_secs(240), async {
         scenario().await?;
         // Preserve every original check and deadline. The additive replacement
@@ -1709,6 +1715,7 @@ async fn fixed_version_traversal_scenario(g: &Gateway) -> anyhow::Result<(Sessio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_old_prefix_captures_while_other_transactions_commit() -> anyhow::Result<()> {
+    let _scenario = PROCESS_SCENARIO.lock().await;
     let mut coordinator = Process::start(9).await?;
     let mut a = Process::start(7).await?;
     let mut b = Process::start(8).await?;
@@ -2335,6 +2342,7 @@ async fn verify_small_lifecycle(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::Result<()> {
+    let _scenario = PROCESS_SCENARIO.lock().await;
     // Keep one ordinary test and the original total scenario budget. A second
     // concurrent fixture would add pressure to process-wide RPC admission.
     tokio::time::timeout(Duration::from_secs(240), async {
@@ -2530,6 +2538,7 @@ async fn small_lifecycle_recovery(enabled: bool) -> anyhow::Result<()> {
 )]
 async fn byte_bound_independent_processes_1025_writes_retain_original_lifecycle(
 ) -> anyhow::Result<()> {
+    let _scenario = PROCESS_SCENARIO.lock().await;
     let timeout = std::env::var("BYTE_BOUND_PROCESS_TIMEOUT_SECS")
         .unwrap_or_else(|_| "21600".into())
         .parse::<u64>()?;

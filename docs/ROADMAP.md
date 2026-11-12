@@ -616,3 +616,13 @@ The managed data-local fixed-V path now separates [fixed cohort membership](FIXE
 (up to the existing 64-member protocol bound) from its one-to-eight query lanes.
 Observed fanout, global capture/history budgets, and immutable cohort ownership
 are unchanged; online expansion and membership beyond 64 remain future work.
+
+### Full-cohort advancement fanout
+
+[Bounded catch-up](BOUNDED_COHORT_FANOUT.md) separates 1–4 member pipelines
+(default 3, matching existing RPC admission) from fixed membership and query
+lanes. It preserves exact per-member history cuts, ordered consumption, complete
+terminal certification and original deadlines. Snapshot capture remains serial
+under its aggregate budget. Process benchmarks cover 3/9/12 members with small
+graphs; larger histories/data, multi-host scaling and online resizing remain
+unproven, rather than inferred from these latency measurements.

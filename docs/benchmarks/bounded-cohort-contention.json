@@ -1,0 +1,811 @@
+{
+  "schema_version": 1,
+  "test": "cohort_multi_request_contention",
+  "evidence_date_utc": "2026-11-12",
+  "candidate": {
+    "base_commit": "4c0b2ada3eeb31742eb3173f302a005701bb7e36",
+    "description": "Base commit 4c0b2ad plus the total-admission accounting fix in managed_rpc.rs.",
+    "runtime_change": "Replace four independent waiting tickets with eight total admission tickets held for each complete admitted call, including legacy fail-fast calls and FIFO-reserved active permits. Retain four active RPC permits, original deadlines, queue eligibility, and legacy fail-fast behavior.",
+    "post_successful_run_changes": [
+      "Added a reserved-but-not-yet-polled cancellation regression assertion to the unit test.",
+      "Clarified comments describing total admission and FIFO reservations.",
+      "Renamed the acceptance log waiting_rpc_limit field to additional_admitted_rpc_limit and added total_admitted_rpc_limit."
+    ],
+    "post_successful_run_added_runtime_behavior": false,
+    "source_hash_scope": "SHA256 values below identify the worktree files captured when this evidence document was written, including post-run test/comment/output-only edits. They are not represented as hashes of a preserved exact pre-run source tree or test executable."
+  },
+  "production_source_sha256": {
+    "crates/d2-raft/src/managed_rpc.rs": "ad71d7cbc51b18769ae5a126aa732ed97b586fb3560f399cca43ad0ca62f5846",
+    "crates/replicated-graph/src/managed_graph.rs": "e079a8e1d4e43855115540b3d2ddc4e4461a7a39fe508adf6cdc6827c1379948",
+    "crates/replicated-graph/src/managed_gateway.rs": "94548903a7290728907c0d95e9cbb48ce76d298bd83618c4b1cd3760a7b95966"
+  },
+  "log_sha256": {
+    "cohort-queue-contention.log": "196f1868c1efff2c4f21a4907d9208f347984510968e7163c112e6a835a10148",
+    "cohort-queue-contention-diagnostic.log": "b64f3ce5349c4bcd885295b1fbc8584faeb618075a971642116362f1a88f6a00",
+    "cohort-queue-contention-fixed.log": "e48f900615d511b641504e200f826f076c980bf2c5835bae36e5c446d3e4278f"
+  },
+  "source_log": "cohort-queue-contention-fixed.log",
+  "result": "passed",
+  "test_elapsed_seconds": 107.24,
+  "configuration": {
+    "members": 9,
+    "member_widths": [
+      1,
+      3,
+      4
+    ],
+    "gateway_modes": [
+      "shared",
+      "separate"
+    ],
+    "placement": "One coordinator and nine distinct loopback data processes per fresh configuration; one or two gateways in the same test process share the process-global outbound admission budget.",
+    "active_rpc_limit": 4,
+    "additional_admitted_rpc_limit": 4,
+    "total_admitted_rpc_limit": 8,
+    "limits_are_configured_not_measured": true
+  },
+  "controlled_contention": {
+    "workload": "One sequential writer submits four writes while one sequential observer requests Status for the original committed ordinal 1.",
+    "completed_configurations": 6,
+    "visible_writes": 24,
+    "writes_completed_while_observer_active": 24,
+    "status_requests": 231,
+    "status_committed_ordinal_1_visible": 231,
+    "write_latency_us": {
+      "min": 1314872,
+      "median": 2396033.0,
+      "max": 4775394
+    },
+    "status_latency_us": {
+      "min": 76954,
+      "median": 252487,
+      "max": 652724
+    }
+  },
+  "cases": [
+    {
+      "source_log_line": 7,
+      "member_width": 1,
+      "shared_gateway": true,
+      "visible_writes": 4,
+      "writes_completed_while_observer_active": 4,
+      "status_requests": 37,
+      "write_latency_us": {
+        "min": 2147442,
+        "median": 3418780.0,
+        "max": 4775394
+      },
+      "status_latency_us": {
+        "min": 159093,
+        "median": 368680,
+        "max": 647718
+      },
+      "overload": {
+        "initial_write_visible": true,
+        "status_visible": 7,
+        "status_committed_not_visible": 0,
+        "status_capacity_or_unknown": 1,
+        "retry_committed_visible_ordinal": 6
+      }
+    },
+    {
+      "source_log_line": 8,
+      "member_width": 1,
+      "shared_gateway": false,
+      "visible_writes": 4,
+      "writes_completed_while_observer_active": 4,
+      "status_requests": 37,
+      "write_latency_us": {
+        "min": 2184762,
+        "median": 3313435.5,
+        "max": 4739964
+      },
+      "status_latency_us": {
+        "min": 160732,
+        "median": 358019,
+        "max": 652724
+      },
+      "overload": {
+        "initial_write_visible": true,
+        "status_visible": 7,
+        "status_committed_not_visible": 0,
+        "status_capacity_or_unknown": 1,
+        "retry_committed_visible_ordinal": 6
+      }
+    },
+    {
+      "source_log_line": 10,
+      "member_width": 3,
+      "shared_gateway": true,
+      "visible_writes": 4,
+      "writes_completed_while_observer_active": 4,
+      "status_requests": 41,
+      "write_latency_us": {
+        "min": 1314872,
+        "median": 2123396.5,
+        "max": 2924623
+      },
+      "status_latency_us": {
+        "min": 79463,
+        "median": 186680,
+        "max": 498737
+      },
+      "overload": {
+        "initial_write_visible": null,
+        "status_visible": 0,
+        "status_committed_not_visible": 8,
+        "status_capacity_or_unknown": 0,
+        "retry_committed_visible_ordinal": 6
+      }
+    },
+    {
+      "source_log_line": 11,
+      "member_width": 3,
+      "shared_gateway": false,
+      "visible_writes": 4,
+      "writes_completed_while_observer_active": 4,
+      "status_requests": 40,
+      "write_latency_us": {
+        "min": 1397317,
+        "median": 2062966.0,
+        "max": 3057009
+      },
+      "status_latency_us": {
+        "min": 76954,
+        "median": 194764.0,
+        "max": 425681
+      },
+      "overload": {
+        "initial_write_visible": true,
+        "status_visible": 0,
+        "status_committed_not_visible": 7,
+        "status_capacity_or_unknown": 1,
+        "retry_committed_visible_ordinal": 6
+      }
+    },
+    {
+      "source_log_line": 12,
+      "member_width": 4,
+      "shared_gateway": true,
+      "visible_writes": 4,
+      "writes_completed_while_observer_active": 4,
+      "status_requests": 38,
+      "write_latency_us": {
+        "min": 1432786,
+        "median": 2214272.5,
+        "max": 3059862
+      },
+      "status_latency_us": {
+        "min": 86809,
+        "median": 225783.5,
+        "max": 479369
+      },
+      "overload": {
+        "initial_write_visible": true,
+        "status_visible": 0,
+        "status_committed_not_visible": 7,
+        "status_capacity_or_unknown": 1,
+        "retry_committed_visible_ordinal": 6
+      }
+    },
+    {
+      "source_log_line": 13,
+      "member_width": 4,
+      "shared_gateway": false,
+      "visible_writes": 4,
+      "writes_completed_while_observer_active": 4,
+      "status_requests": 38,
+      "write_latency_us": {
+        "min": 1395361,
+        "median": 2156647.0,
+        "max": 3007293
+      },
+      "status_latency_us": {
+        "min": 89346,
+        "median": 216277.5,
+        "max": 520937
+      },
+      "overload": {
+        "initial_write_visible": true,
+        "status_visible": 0,
+        "status_committed_not_visible": 7,
+        "status_capacity_or_unknown": 1,
+        "retry_committed_visible_ordinal": 6
+      }
+    }
+  ],
+  "overload_totals": {
+    "workload": "After controlled contention completes, eight concurrent Status requests race one Submit.",
+    "status_requests": 48,
+    "status_visible": 14,
+    "status_committed_not_visible": 29,
+    "status_capacity_or_unknown": 5,
+    "initial_writes_committed_visible": 5,
+    "initial_writes_committed_not_visible": 0,
+    "initial_writes_capacity_or_unknown": 1,
+    "same_request_retries_committed_visible_ordinal_6": 6,
+    "final_snapshot_version_6": 6
+  },
+  "prior_failure": {
+    "source_log": "cohort-queue-contention.log",
+    "result": "failed",
+    "test_elapsed_seconds": 79.8,
+    "completed_configuration_summary": {
+      "completed_configurations": 4,
+      "visible_writes": 16,
+      "writes_completed_while_observer_active": 16,
+      "status_requests": 152,
+      "status_committed_ordinal_1_visible": 152,
+      "write_latency_us": {
+        "min": 1352506,
+        "median": 2687663.5,
+        "max": 5162162
+      },
+      "status_latency_us": {
+        "min": 83828,
+        "median": 267259.0,
+        "max": 721587
+      }
+    },
+    "completed_cases": [
+      {
+        "source_log_line": 7,
+        "member_width": 1,
+        "shared_gateway": true,
+        "visible_writes": 4,
+        "writes_completed_while_observer_active": 4,
+        "status_requests": 37,
+        "write_latency_us": {
+          "min": 2126992,
+          "median": 3357697.5,
+          "max": 5074128
+        },
+        "status_latency_us": {
+          "min": 183470,
+          "median": 356157,
+          "max": 661900
+        },
+        "overload": {
+          "initial_write_visible": null,
+          "status_visible": 7,
+          "status_committed_not_visible": 0,
+          "status_capacity_or_unknown": 1,
+          "retry_committed_visible_ordinal": 6
+        }
+      },
+      {
+        "source_log_line": 8,
+        "member_width": 1,
+        "shared_gateway": false,
+        "visible_writes": 4,
+        "writes_completed_while_observer_active": 4,
+        "status_requests": 36,
+        "write_latency_us": {
+          "min": 2436296,
+          "median": 3540538.5,
+          "max": 5162162
+        },
+        "status_latency_us": {
+          "min": 184400,
+          "median": 393575.0,
+          "max": 721587
+        },
+        "overload": {
+          "initial_write_visible": true,
+          "status_visible": 6,
+          "status_committed_not_visible": 0,
+          "status_capacity_or_unknown": 2,
+          "retry_committed_visible_ordinal": 6
+        }
+      },
+      {
+        "source_log_line": 10,
+        "member_width": 3,
+        "shared_gateway": true,
+        "visible_writes": 4,
+        "writes_completed_while_observer_active": 4,
+        "status_requests": 39,
+        "write_latency_us": {
+          "min": 1618180,
+          "median": 2135120.5,
+          "max": 2946320
+        },
+        "status_latency_us": {
+          "min": 83828,
+          "median": 212678,
+          "max": 405486
+        },
+        "overload": {
+          "initial_write_visible": true,
+          "status_visible": 0,
+          "status_committed_not_visible": 6,
+          "status_capacity_or_unknown": 2,
+          "retry_committed_visible_ordinal": 6
+        }
+      },
+      {
+        "source_log_line": 11,
+        "member_width": 3,
+        "shared_gateway": false,
+        "visible_writes": 4,
+        "writes_completed_while_observer_active": 4,
+        "status_requests": 40,
+        "write_latency_us": {
+          "min": 1352506,
+          "median": 2079431.0,
+          "max": 2950355
+        },
+        "status_latency_us": {
+          "min": 93148,
+          "median": 199476.5,
+          "max": 457370
+        },
+        "overload": {
+          "initial_write_visible": null,
+          "status_visible": 0,
+          "status_committed_not_visible": 7,
+          "status_capacity_or_unknown": 1,
+          "retry_committed_visible_ordinal": 6
+        }
+      }
+    ],
+    "failed_configuration": {
+      "member_width": 4,
+      "shared_gateway": true
+    },
+    "failure": "Status for the original committed ordinal 1 returned Committed { ordinal: 1, visible: false } during the two-request controlled contention phase.",
+    "not_reached_configuration": {
+      "member_width": 4,
+      "shared_gateway": false
+    },
+    "partial_failed_configuration_samples_logged": false,
+    "diagnostic": {
+      "source_log": "cohort-queue-contention-diagnostic.log",
+      "result": "failed",
+      "test_elapsed_seconds": 2.28,
+      "exact_output": "DIAGNOSTIC_STATUS width=4 result=Ok(Err(Capacity))",
+      "interpretation": "The diagnostic identifies Capacity during Status certification. These logs alone do not establish CPU saturation or independently prove the unique internal cause; the admission handoff explanation also relies on source review and its separate deterministic regression test."
+    }
+  },
+  "field_notes": {
+    "latency_unit": "microseconds",
+    "median": "For an even sample count, the arithmetic mean of the two central sorted values; pooled medians use all raw samples, not medians of case medians.",
+    "initial_write_visible_null": "Initial Submit returned Capacity or Unknown; the log does not distinguish them. Null does not mean Abort or visible=false.",
+    "status_capacity_or_unknown": "Combined error class; it does not establish that every response was an admission rejection.",
+    "limit_field_rename": "The preserved successful-run raw log uses waiting_rpc_limit=4. The corrected description is additional_admitted_rpc_limit=4 and total_admitted_rpc_limit=8. Raw records below are unchanged."
+  },
+  "conclusion_boundaries": [
+    "This is one fresh-cohort controlled contention run per configuration, not a throughput, stationary-latency, general starvation-freedom, high-availability, or large-data qualification.",
+    "The 24 reported visible writes are only the four measured contention writes per configuration. They exclude each configuration's initial write and overload write. Each completed configuration ends at ordinal 6.",
+    "The writer and observer overlap, and every measured write completes while observation remains active. The separate-gateway mode still shares one process-global outbound admission pool.",
+    "All 231 measured contention Status responses are required by the acceptance assertion to be committed ordinal 1 and visible. Status loop counts vary with relative progress; they are not independent fixed-size samples or workload throughput measurements.",
+    "The separate deliberate overload phase permits known Commit with visible=false or Capacity/Unknown. Same-request retry and final snapshot checks verify recovery at ordinal 6; they do not promise visible success under arbitrary overload.",
+    "Four active allocations and eight total admitted calls are configuration bounds, not measured peak concurrency, RSS, CPU queue size, or a bound on all application memory.",
+    "The 107.24-second test duration includes process setup, all six configurations, overload, and recovery; it is not a throughput denominator.",
+    "Four writes per configuration and growing transaction history are insufficient for statistically supported performance rankings, tail-latency claims, or a claim that width 4 is faster than width 3.",
+    "FIFO order, cancellation cleanup, and reserved-but-unpolled handoff correctness require the separate directed tests. This acceptance run shows progress in the tested workload, not universal fairness.",
+    "The reserved-cancellation assertion added after this successful run is not counted as validated by this log; its result must be recorded separately."
+  ],
+  "raw_cohort_load": [
+    {
+      "source_log_line": 7,
+      "line": "COHORT_LOAD {\"active_rpc_limit\":4,\"interpretation\":\"single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput\",\"member_width\":1,\"members\":9,\"overload_initial_visible\":true,\"overload_recovered_ordinal\":6,\"overload_status_incomplete\":0,\"overload_status_rejected\":1,\"overload_status_visible\":7,\"shared_gateway\":true,\"status_wall_us\":[159093,169688,199052,218872,200900,198143,368680,279276,244018,255037,252080,303845,329135,258665,387132,288212,340514,336101,328122,317310,438879,452711,457907,393971,396439,570016,487272,477518,449105,437997,613343,594534,497354,442309,556330,647718,500162],\"visible_writes\":4,\"waiting_rpc_limit\":4,\"write_wall_us\":[2147442,2911162,3926398,4775394],\"writes_while_observing\":4}"
+    },
+    {
+      "source_log_line": 8,
+      "line": "COHORT_LOAD {\"active_rpc_limit\":4,\"interpretation\":\"single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput\",\"member_width\":1,\"members\":9,\"overload_initial_visible\":true,\"overload_recovered_ordinal\":6,\"overload_status_incomplete\":0,\"overload_status_rejected\":1,\"overload_status_visible\":7,\"shared_gateway\":false,\"status_wall_us\":[169408,160732,180752,194486,178251,323351,223850,264847,246967,261741,266355,265105,267995,373894,354324,306029,307551,349104,354096,371830,412537,358019,422068,417975,455610,495401,501235,440709,431619,420213,550998,492309,488255,583386,526412,652724,555909],\"visible_writes\":4,\"waiting_rpc_limit\":4,\"write_wall_us\":[2184762,2942182,3684689,4739964],\"writes_while_observing\":4}"
+    },
+    {
+      "source_log_line": 10,
+      "line": "COHORT_LOAD {\"active_rpc_limit\":4,\"interpretation\":\"single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput\",\"member_width\":3,\"members\":9,\"overload_initial_visible\":null,\"overload_recovered_ordinal\":6,\"overload_status_incomplete\":8,\"overload_status_rejected\":0,\"overload_status_visible\":0,\"shared_gateway\":true,\"status_wall_us\":[96400,79463,86490,133147,93117,114146,167267,129907,181266,235478,131164,141354,128074,130323,173067,170573,253319,211976,303193,273772,157600,157993,153703,159351,186680,252626,292049,287418,363828,337975,199212,216549,194591,184542,206627,296639,313387,354553,401100,498737,303237],\"visible_writes\":4,\"waiting_rpc_limit\":4,\"write_wall_us\":[1314872,1885948,2360845,2924623],\"writes_while_observing\":4}"
+    },
+    {
+      "source_log_line": 11,
+      "line": "COHORT_LOAD {\"active_rpc_limit\":4,\"interpretation\":\"single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput\",\"member_width\":3,\"members\":9,\"overload_initial_visible\":true,\"overload_recovered_ordinal\":6,\"overload_status_incomplete\":7,\"overload_status_rejected\":1,\"overload_status_visible\":0,\"shared_gateway\":false,\"status_wall_us\":[76954,81900,86038,88816,124614,152449,260367,151850,194580,194948,125480,136451,135391,186355,137601,155425,229906,174530,270825,275801,157331,155828,182497,180039,160756,255209,302257,238215,337936,343593,197997,233919,224791,338767,314529,371046,384754,425681,412924,259782],\"visible_writes\":4,\"waiting_rpc_limit\":4,\"write_wall_us\":[1397317,1814538,2311394,3057009],\"writes_while_observing\":4}"
+    },
+    {
+      "source_log_line": 12,
+      "line": "COHORT_LOAD {\"active_rpc_limit\":4,\"interpretation\":\"single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput\",\"member_width\":4,\"members\":9,\"overload_initial_visible\":true,\"overload_recovered_ordinal\":6,\"overload_status_incomplete\":7,\"overload_status_rejected\":1,\"overload_status_visible\":0,\"shared_gateway\":true,\"status_wall_us\":[86809,96418,102898,98466,107333,163542,157519,235807,243899,159352,170785,138549,137617,207460,223044,180836,371857,333885,256023,185965,178549,199146,265055,267879,255600,420281,383352,259699,203557,220643,228523,238612,261881,290635,414925,398267,479369,303685],\"visible_writes\":4,\"waiting_rpc_limit\":4,\"write_wall_us\":[1432786,1997324,2431221,3059862],\"writes_while_observing\":4}"
+    },
+    {
+      "source_log_line": 13,
+      "line": "COHORT_LOAD {\"active_rpc_limit\":4,\"interpretation\":\"single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput\",\"member_width\":4,\"members\":9,\"overload_initial_visible\":true,\"overload_recovered_ordinal\":6,\"overload_status_incomplete\":7,\"overload_status_rejected\":1,\"overload_status_visible\":0,\"shared_gateway\":false,\"status_wall_us\":[89346,93444,95326,97703,122173,154973,199972,177454,236946,146727,121618,132363,133195,222986,211990,239500,252487,307575,194686,181251,175859,185678,187267,204056,259458,273956,383426,397579,255625,232194,277184,220565,343676,375277,283199,481381,520937,291167],\"visible_writes\":4,\"waiting_rpc_limit\":4,\"write_wall_us\":[1395361,1805464,2507830,3007293],\"writes_while_observing\":4}"
+    }
+  ],
+  "exact_candidate_repeat": {
+    "log": "cohort-queue-contention-final.log",
+    "sha256": "2a88177ef35577629d3f8060c500bd223a35b63b6770fe1a79d716ee9e68f1dc",
+    "results": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 104.62s"
+    ],
+    "raw": [
+      {
+        "active_rpc_limit": 4,
+        "additional_admitted_rpc_limit": 4,
+        "interpretation": "single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput",
+        "member_width": 1,
+        "members": 9,
+        "overload_initial_visible": null,
+        "overload_recovered_ordinal": 6,
+        "overload_status_incomplete": 0,
+        "overload_status_rejected": 0,
+        "overload_status_visible": 8,
+        "shared_gateway": true,
+        "status_wall_us": [
+          188672,
+          232672,
+          238205,
+          233603,
+          225950,
+          203353,
+          219844,
+          400978,
+          318334,
+          273767,
+          264533,
+          250068,
+          289169,
+          343359,
+          305269,
+          364059,
+          337332,
+          420511,
+          335745,
+          323435,
+          344111,
+          364130,
+          429000,
+          505152,
+          452456,
+          424190,
+          386739,
+          404713,
+          414382,
+          494241,
+          490430,
+          623186,
+          511202,
+          594567,
+          613717,
+          492730
+        ],
+        "total_admitted_rpc_limit": 8,
+        "visible_writes": 4,
+        "write_wall_us": [
+          2311320,
+          2870334,
+          3580515,
+          4462394
+        ],
+        "writes_while_observing": 4
+      },
+      {
+        "active_rpc_limit": 4,
+        "additional_admitted_rpc_limit": 4,
+        "interpretation": "single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput",
+        "member_width": 1,
+        "members": 9,
+        "overload_initial_visible": true,
+        "overload_recovered_ordinal": 6,
+        "overload_status_incomplete": 0,
+        "overload_status_rejected": 1,
+        "overload_status_visible": 7,
+        "shared_gateway": false,
+        "status_wall_us": [
+          175999,
+          166460,
+          189556,
+          214533,
+          210058,
+          210626,
+          248936,
+          267614,
+          281547,
+          245216,
+          268293,
+          284848,
+          260499,
+          284349,
+          275722,
+          292384,
+          377518,
+          434027,
+          343625,
+          357678,
+          420186,
+          415183,
+          373001,
+          387374,
+          426535,
+          461969,
+          482530,
+          447305,
+          409928,
+          461697,
+          475519,
+          495127,
+          602251,
+          591617,
+          622475,
+          512847
+        ],
+        "total_admitted_rpc_limit": 8,
+        "visible_writes": 4,
+        "write_wall_us": [
+          1977483,
+          2798485,
+          3580431,
+          4505981
+        ],
+        "writes_while_observing": 4
+      },
+      {
+        "active_rpc_limit": 4,
+        "additional_admitted_rpc_limit": 4,
+        "interpretation": "single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput",
+        "member_width": 3,
+        "members": 9,
+        "overload_initial_visible": true,
+        "overload_recovered_ordinal": 6,
+        "overload_status_incomplete": 7,
+        "overload_status_rejected": 1,
+        "overload_status_visible": 0,
+        "shared_gateway": true,
+        "status_wall_us": [
+          88575,
+          79243,
+          85912,
+          129870,
+          96991,
+          100066,
+          164179,
+          97763,
+          193747,
+          203480,
+          125779,
+          130565,
+          120022,
+          179984,
+          203339,
+          168450,
+          236057,
+          328218,
+          282113,
+          160505,
+          163247,
+          161678,
+          138179,
+          254744,
+          235462,
+          287570,
+          267007,
+          295917,
+          325340,
+          202504,
+          205424,
+          204070,
+          212274,
+          227765,
+          237030,
+          394839,
+          280286,
+          391588,
+          427085
+        ],
+        "total_admitted_rpc_limit": 8,
+        "visible_writes": 4,
+        "write_wall_us": [
+          1219691,
+          1847304,
+          2216111,
+          2760864
+        ],
+        "writes_while_observing": 4
+      },
+      {
+        "active_rpc_limit": 4,
+        "additional_admitted_rpc_limit": 4,
+        "interpretation": "single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput",
+        "member_width": 3,
+        "members": 9,
+        "overload_initial_visible": true,
+        "overload_recovered_ordinal": 6,
+        "overload_status_incomplete": 7,
+        "overload_status_rejected": 1,
+        "overload_status_visible": 0,
+        "shared_gateway": false,
+        "status_wall_us": [
+          89753,
+          90996,
+          87828,
+          96491,
+          99526,
+          132555,
+          118542,
+          200286,
+          201258,
+          217986,
+          146244,
+          184657,
+          134015,
+          225268,
+          213072,
+          230565,
+          190200,
+          273896,
+          320423,
+          176878,
+          173571,
+          180869,
+          159082,
+          233911,
+          214219,
+          277690,
+          260605,
+          403921,
+          391213,
+          189767,
+          223000,
+          187342,
+          207830,
+          310598,
+          317880,
+          282815,
+          366327,
+          458536,
+          417441,
+          278809
+        ],
+        "total_admitted_rpc_limit": 8,
+        "visible_writes": 4,
+        "write_wall_us": [
+          1379313,
+          1981129,
+          2401321,
+          3043930
+        ],
+        "writes_while_observing": 4
+      },
+      {
+        "active_rpc_limit": 4,
+        "additional_admitted_rpc_limit": 4,
+        "interpretation": "single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput",
+        "member_width": 4,
+        "members": 9,
+        "overload_initial_visible": true,
+        "overload_recovered_ordinal": 6,
+        "overload_status_incomplete": 7,
+        "overload_status_rejected": 1,
+        "overload_status_visible": 0,
+        "shared_gateway": true,
+        "status_wall_us": [
+          99911,
+          115601,
+          105585,
+          136961,
+          119880,
+          118576,
+          192416,
+          215781,
+          298707,
+          129091,
+          134469,
+          135868,
+          157009,
+          151361,
+          177005,
+          213570,
+          238060,
+          244511,
+          335319,
+          198036,
+          165151,
+          174555,
+          175415,
+          206956,
+          191427,
+          267741,
+          264737,
+          370937,
+          410313,
+          262093,
+          196176,
+          214800,
+          207584,
+          187106,
+          341537,
+          325666,
+          375195,
+          348179,
+          484271,
+          364522,
+          233244
+        ],
+        "total_admitted_rpc_limit": 8,
+        "visible_writes": 4,
+        "write_wall_us": [
+          1458924,
+          2024816,
+          2484105,
+          3085360
+        ],
+        "writes_while_observing": 4
+      },
+      {
+        "active_rpc_limit": 4,
+        "additional_admitted_rpc_limit": 4,
+        "interpretation": "single fresh-cohort controlled contention run; limits are configuration, not measured RSS or throughput",
+        "member_width": 4,
+        "members": 9,
+        "overload_initial_visible": null,
+        "overload_recovered_ordinal": 6,
+        "overload_status_incomplete": 8,
+        "overload_status_rejected": 0,
+        "overload_status_visible": 0,
+        "shared_gateway": false,
+        "status_wall_us": [
+          77938,
+          94959,
+          103491,
+          104828,
+          125427,
+          136470,
+          209419,
+          304444,
+          188915,
+          154510,
+          135668,
+          148871,
+          138489,
+          205565,
+          202391,
+          200449,
+          356972,
+          342971,
+          246204,
+          168955,
+          171074,
+          179633,
+          174469,
+          288897,
+          222266,
+          247456,
+          375621,
+          393669,
+          245536,
+          202540,
+          232926,
+          213782,
+          222032,
+          246958,
+          302446,
+          300235,
+          470562,
+          563421,
+          350688
+        ],
+        "total_admitted_rpc_limit": 8,
+        "visible_writes": 4,
+        "write_wall_us": [
+          1400376,
+          2084552,
+          2474294,
+          3090702
+        ],
+        "writes_while_observing": 4
+      }
+    ],
+    "code_commit": "35e60ac49151e2a188c96544a24b68f76057ce2d",
+    "code_tree": "78169bfae032e971f4c4c83702ee581033812aa4",
+    "binary_sha256": "36de4aa43cfdd599254e5b2036c59b2db243705feffc5d9211873d72a9799439",
+    "exact_candidate_repeat": true,
+    "totals": {
+      "visible_writes": 24,
+      "controlled_status": 231,
+      "overload_status_visible": 15,
+      "overload_status_incomplete": 29,
+      "overload_status_capacity_or_unknown": 4,
+      "same_id_recovery_ordinal_6": 6
+    }
+  }
+}

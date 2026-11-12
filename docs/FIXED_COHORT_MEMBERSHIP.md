@@ -70,7 +70,8 @@ old-V results after a subsequent write, latest-V visibility, query-job admission
 and result replay, failure of a missing ninth member, and historical results after
 that member reopens. This is functional acceptance, not multi-host HA or a
 throughput benchmark. The fixture explicitly uses the existing 60-second gateway
-request/deployment maximum because full-cohort dynamic write work is still serial.
+request/deployment maximum because dynamic writes retain serial capture/decision
+work. Member catch-up now uses [bounded fanout](BOUNDED_COHORT_FANOUT.md).
 An earlier 15-second fixture failed with Unknown during its 16th managed write,
 before query execution. No production deadline, lease or per-node budget is raised;
 more members do not imply a latency guarantee. Unit tests cover 9 and 64 structural admissions, 65-member

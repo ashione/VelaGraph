@@ -590,12 +590,14 @@ struct OwnedConfig {
     members: Vec<OwnedNode>,
     local_routes: Option<Vec<LocalGraphRoute>>,
     local_query_parallelism: usize,
+    member_parallelism: usize,
 }
 impl From<Config> for OwnedConfig {
     fn from(config: Config) -> Self {
         Self {
             local_routes: None,
             local_query_parallelism: 3,
+            member_parallelism: managed_graph::DEFAULT_MEMBER_PARALLELISM,
             coordinator: OwnedNode::Local(config.coordinator),
             binding: config.binding,
             members: config.members.into_iter().map(OwnedNode::Local).collect(),
@@ -607,9 +609,14 @@ impl From<RemoteConfig> for OwnedConfig {
         Self {
             local_routes: None,
             local_query_parallelism: 3,
-            coordinator: OwnedNode::Remote(config.coordinator),
+            member_parallelism: managed_graph::DEFAULT_MEMBER_PARALLELISM,
+            coordinator: OwnedNode::Remote(config.coordinator.with_bounded_admission()),
             binding: config.binding,
-            members: config.members.into_iter().map(OwnedNode::Remote).collect(),
+            members: config
+                .members
+                .into_iter()
+                .map(|client| OwnedNode::Remote(client.with_bounded_admission()))
+                .collect(),
         }
     }
 }
@@ -637,6 +644,8 @@ impl OwnedConfig {
             self.binding.cohort.coordinator_epoch,
             self.endpoints(),
         )
+        .with_member_parallelism(self.member_parallelism)
+        .expect("validated deployment width")
     }
     fn validate(&self) -> Result<()> {
         self.binding
@@ -1049,13 +1058,35 @@ impl Gateway {
         deadline: Duration,
         parallelism: usize,
     ) -> Result<Self> {
-        if !(1..=MAX_LOCAL_QUERY_PARALLELISM).contains(&parallelism) {
+        Self::bind_remote_local_queries_with_concurrency(
+            config,
+            routes,
+            bind,
+            deadline,
+            parallelism,
+            managed_graph::DEFAULT_MEMBER_PARALLELISM,
+        )
+        .await
+    }
+    /// Independent deployment limits for query execution and member catch-up.
+    pub async fn bind_remote_local_queries_with_concurrency(
+        config: RemoteConfig,
+        routes: Vec<LocalGraphRoute>,
+        bind: SocketAddr,
+        deadline: Duration,
+        parallelism: usize,
+        member_parallelism: usize,
+    ) -> Result<Self> {
+        if !(1..=MAX_LOCAL_QUERY_PARALLELISM).contains(&parallelism)
+            || !(1..=managed_graph::MAX_MEMBER_PARALLELISM).contains(&member_parallelism)
+        {
             return Err(Error::Protocol);
         }
         local::validate_routes(&config, &routes)?;
         let mut config: OwnedConfig = config.into();
         config.local_routes = Some(routes);
         config.local_query_parallelism = parallelism;
+        config.member_parallelism = member_parallelism;
         Self::bind_config(config, bind, deadline, None).await
     }
     /// Opt in to bounded local phase reports; draining/dropping them never gates writes.
@@ -1076,6 +1107,37 @@ impl Gateway {
     ) -> Result<(Self, timing::Reports)> {
         let (sender, reports) = timing::channel();
         let gateway = Self::bind_config(config.into(), bind, deadline, Some(sender)).await?;
+        Ok((gateway, reports))
+    }
+    /// Configure remote catch-up width without enabling diagnostic reports.
+    pub async fn bind_remote_with_member_parallelism(
+        config: RemoteConfig,
+        bind: SocketAddr,
+        deadline: Duration,
+        member_parallelism: usize,
+    ) -> Result<Self> {
+        if !(1..=managed_graph::MAX_MEMBER_PARALLELISM).contains(&member_parallelism) {
+            return Err(Error::Protocol);
+        }
+        let mut config: OwnedConfig = config.into();
+        config.member_parallelism = member_parallelism;
+        Self::bind_config(config, bind, deadline, None).await
+    }
+    /// Configure bounded full-cohort catch-up independently of query execution.
+    /// Width is deployment-owned, 1..=4; no wire setting or deadline extension.
+    pub async fn bind_remote_with_member_parallelism_and_timing(
+        config: RemoteConfig,
+        bind: SocketAddr,
+        deadline: Duration,
+        member_parallelism: usize,
+    ) -> Result<(Self, timing::Reports)> {
+        if !(1..=managed_graph::MAX_MEMBER_PARALLELISM).contains(&member_parallelism) {
+            return Err(Error::Protocol);
+        }
+        let mut config: OwnedConfig = config.into();
+        config.member_parallelism = member_parallelism;
+        let (sender, reports) = timing::channel();
+        let gateway = Self::bind_config(config, bind, deadline, Some(sender)).await?;
         Ok((gateway, reports))
     }
     async fn bind_config(

@@ -23,13 +23,17 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const PROTOCOL_VERSION: u32 = 6;
 const CONCURRENCY: usize = 4;
+/// Additional admitted calls beyond the four allocated active permits.
+/// All clients share eight total admission tickets; FIFO reservations count
+/// as active even before their acquisition futures are polled again.
+pub const MAX_OUTBOUND_WAITERS: usize = 4;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -208,7 +212,110 @@ enum Operation {
         proof: TerminalPrefix,
     },
 }
+// Shallow bounds before opting an owned payload into waiting. Do not serialize
+// here: checked proof encoders may clone, and CPU/frame work belongs after active
+// admission. These bounds complement (not replace) semantic/wire validation.
+fn bounded_queue_command(command: &Command) -> bool {
+    use crate::transaction_decisions::{
+        MAX_PARTICIPANTS, MAX_REQUEST_BYTES, MAX_REQUEST_PAYLOAD_BYTES,
+    };
+    match command {
+        Command::AdmitRequest {
+            request,
+            payload,
+            participants,
+            ..
+        } => {
+            request.len() <= MAX_REQUEST_BYTES
+                && request.capacity() <= 2 * MAX_REQUEST_BYTES
+                && payload.len() <= MAX_REQUEST_PAYLOAD_BYTES
+                && payload.capacity() <= 2 * MAX_REQUEST_PAYLOAD_BYTES
+                && participants.len() <= MAX_PARTICIPANTS
+                && participants.capacity() <= 2 * MAX_PARTICIPANTS
+        }
+        Command::Begin { participants, .. } => {
+            participants.len() <= MAX_PARTICIPANTS
+                && participants.capacity() <= 2 * MAX_PARTICIPANTS
+        }
+        Command::BindCohort { cohort } => {
+            cohort.members.len() <= MAX_PARTICIPANTS
+                && cohort.members.capacity() <= 2 * MAX_PARTICIPANTS
+        }
+        Command::ConfirmCohortCapacity { cohort, grants } => {
+            cohort.members.len() <= MAX_PARTICIPANTS
+                && cohort.members.capacity() <= 2 * MAX_PARTICIPANTS
+                && grants.len() <= MAX_PARTICIPANTS
+                && grants.capacity() <= 2 * MAX_PARTICIPANTS
+        }
+        Command::Prepared { .. } | Command::Decide { .. } => true,
+    }
+}
+fn bounded_queue_prepare(prepare: &RetainedPrepare) -> bool {
+    if prepare.request.validate().is_err()
+        || prepare.request.operations.capacity() > crate::MAX_BATCH_OPERATIONS.next_power_of_two()
+        || prepare.cut.cohort.members.capacity()
+            > 2 * crate::transaction_decisions::MAX_PARTICIPANTS
+    {
+        return false;
+    }
+    let mut retained = 0usize;
+    for operation in &prepare.request.operations {
+        let (key, value) = match operation {
+            crate::WriteOp::Put { key, value } => (key.capacity(), value.capacity()),
+            crate::WriteOp::Delete { key } => (key.capacity(), 0),
+        };
+        let Some(next) = retained.checked_add(key).and_then(|n| n.checked_add(value)) else {
+            return false;
+        };
+        if next > 2 * crate::MAX_BATCH_BYTES {
+            return false;
+        }
+        retained = next;
+    }
+    true
+}
 impl Operation {
+    fn queue_eligible(&self) -> Result<bool, Error> {
+        use crate::transaction_decisions::{MAX_HISTORY_PAGE_EVENTS, MAX_PARTICIPANTS};
+        let bounded = match self {
+            // Compatibility archives and nested forwarding retain fail-fast
+            // admission; this policy does not queue arbitrary full journals.
+            Self::Prepare { .. } | Self::Advance { .. } | Self::ConfirmCapacity { .. } => {
+                return Ok(false)
+            }
+            Self::Command { command, .. } => bounded_queue_command(command),
+            Self::PrepareRetained(prepare) => bounded_queue_prepare(prepare),
+            Self::SyncHistory { page, .. } => {
+                page.events.len() <= MAX_HISTORY_PAGE_EVENTS
+                    && page.events.capacity() <= 2 * MAX_HISTORY_PAGE_EVENTS
+                    && page.base.cohort.members.capacity() <= 2 * MAX_PARTICIPANTS
+                    && page.end.cohort.members.len() <= MAX_PARTICIPANTS
+                    && page.end.cohort.members.capacity() <= 2 * MAX_PARTICIPANTS
+                    && page.cut.cohort.members.len() <= MAX_PARTICIPANTS
+                    && page.cut.cohort.members.capacity() <= 2 * MAX_PARTICIPANTS
+                    && page.events.iter().all(bounded_queue_command)
+            }
+            // Identities/cursors already match the bounded Client identity.
+            // TerminalPrefix is a private checked, byte-bounded type.
+            Self::LookupTarget { .. }
+            | Self::GrantStatus { .. }
+            | Self::HistoryStatus { .. }
+            | Self::HistoryPage { .. }
+            | Self::AdvanceRetained { .. }
+            | Self::LookupRequest { .. }
+            | Self::Summary { .. }
+            | Self::Terminal { .. }
+            | Self::Journal { .. }
+            | Self::Visibility { .. }
+            | Self::Prefix { .. }
+            | Self::Read { .. } => true,
+        };
+        if bounded {
+            Ok(true)
+        } else {
+            Err(Error::Capacity)
+        }
+    }
     fn tag(&self) -> u8 {
         match self {
             Self::LookupTarget { .. } => 17,
@@ -353,6 +460,17 @@ fn outbound_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOTS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENCY)))
 }
+fn outbound_admissions() -> &'static Arc<Semaphore> {
+    static WAITERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    WAITERS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENCY + MAX_OUTBOUND_WAITERS)))
+}
+// One ticket lives for the complete admitted call, including a reserved but
+// not-yet-polled active permit. Independent waiting tickets would transiently
+// double-count a waiter during Tokio's FIFO handoff and reject valid successors.
+struct OutboundPermit<'a> {
+    _active: SemaphorePermit<'a>,
+    _admitted: SemaphorePermit<'static>,
+}
 // Test fixtures using these process-global budgets must not consume one
 // another's admission. Only top-level tests lock this guard, before deadlines;
 // all clients, spawned work and internal concurrency retain production pools.
@@ -478,6 +596,7 @@ pub struct Client {
     identity: Identity,
     timeout: Duration,
     slots: Arc<Semaphore>,
+    bounded_wait: bool,
     nonce: Arc<AtomicU64>,
 }
 impl Client {
@@ -489,7 +608,44 @@ impl Client {
             identity,
             timeout,
             slots: outbound_slots().clone(),
+            bounded_wait: false,
             nonce: Arc::new(AtomicU64::new(1)),
+        })
+    }
+    /// Opt into bounded FIFO waiting for the existing process-wide RPC slots.
+    /// Four active allocations plus four additional admitted calls are bounded
+    /// process-wide, before encoding or connecting;
+    /// full-journal compatibility and capacity-confirmation calls stay fail-fast.
+    /// Queue-full is
+    /// Capacity. Waiting consumes the original RPC deadline. Client::new stays
+    /// fail-fast, and clones preserve the selected local admission policy.
+    pub fn with_bounded_admission(mut self) -> Self {
+        self.bounded_wait = true;
+        self
+    }
+    async fn outbound_permit(
+        &self,
+        deadline: tokio::time::Instant,
+        eligible: impl FnOnce() -> Result<bool, Error>,
+    ) -> Result<OutboundPermit<'_>, Error> {
+        // Legacy fail-fast calls count too, so at most eight call payloads are
+        // admitted globally. Four active allocations include FIFO reservations.
+        let admitted = outbound_admissions()
+            .try_acquire()
+            .map_err(|_| Error::Capacity)?;
+        let active = match self.slots.try_acquire() {
+            Ok(active) => active,
+            Err(_) if self.bounded_wait && eligible()? => {
+                tokio::time::timeout_at(deadline, self.slots.acquire())
+                    .await
+                    .map_err(|_| Error::Unavailable)?
+                    .map_err(|_| Error::Unavailable)?
+            }
+            Err(_) => return Err(Error::Capacity),
+        };
+        Ok(OutboundPermit {
+            _active: active,
+            _admitted: admitted,
         })
     }
     pub fn identity(&self) -> &Identity {
@@ -633,7 +789,12 @@ impl Client {
         deadline: tokio::time::Instant,
     ) -> Result<Value, Error> {
         self.validate_operation(&operation)?;
-        let _permit = self.slots.try_acquire().map_err(|_| Error::Capacity)?;
+        let _permit = self
+            .outbound_permit(deadline, || operation.queue_eligible())
+            .await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable);
+        }
         tokio::time::timeout_at(deadline, async {
             // Retain the documented Rust 1.95 API while newer toolchains rename it.
             #[allow(deprecated)]
@@ -1532,8 +1693,12 @@ async fn confirm_cohort_capacity(
     }
     let mut grants = Vec::with_capacity(members.len());
     for member in members.iter() {
+        // A colocated caller may hold an outbound permit while this handler
+        // forwards. Never inherit queued admission into that dependency edge.
+        let mut forwarding = member.clone();
+        forwarding.bounded_wait = false;
         // Client timeouts remain capped by the one original server deadline.
-        let value = member
+        let value = forwarding
             .call_at(
                 Operation::GrantStatus {
                     authority: authority.clone(),
@@ -2789,6 +2954,256 @@ mod tests {
         );
         peer.await.unwrap();
         assert_eq!(a.slots.available_permits(), CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn bounded_outbound_queue_is_global_fifo_and_stays_within_original_active_cap() {
+        use std::future::Future;
+        use std::task::Poll;
+        let _resources = test_resource_guard().await;
+        let client = Client::new(
+            "127.0.0.1:1".parse().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_bounded_admission();
+        let clone = client.clone();
+        assert!(clone.bounded_wait);
+        let mut held = Vec::new();
+        for _ in 0..CONCURRENCY {
+            held.push(
+                client
+                    .outbound_permit(
+                        tokio::time::Instant::now() + Duration::from_secs(10),
+                        || Ok(true),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut queued: Vec<_> = (0..MAX_OUTBOUND_WAITERS)
+            .map(|_| Some(Box::pin(clone.outbound_permit(deadline, || Ok(true)))))
+            .collect();
+        std::future::poll_fn(|cx| {
+            for future in &mut queued {
+                assert!(future.as_mut().unwrap().as_mut().poll(cx).is_pending());
+            }
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(outbound_admissions().available_permits(), 0);
+        assert!(matches!(
+            client.outbound_permit(deadline, || Ok(true)).await,
+            Err(Error::Capacity)
+        ));
+        let independent = Client::new(
+            "127.0.0.1:1".parse().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_bounded_admission();
+        assert!(matches!(
+            independent
+                .call(Operation::Journal {
+                    authority: identity().authority,
+                    epoch: 1
+                })
+                .await,
+            Err(Error::Capacity)
+        ));
+        assert_eq!(independent.nonce.load(Ordering::Relaxed), 1);
+
+        assert_eq!(client.slots.available_permits(), 0);
+        drop(held.pop());
+        // The released slot is reserved for queued[0], which is deliberately
+        // not polled yet. A successor must use the freed total admission even
+        // during this handoff; independent waiter tickets wrongly reject it.
+        let mut successor = Box::pin(client.outbound_permit(deadline, || Ok(true)));
+        std::future::poll_fn(|cx| {
+            assert!(successor.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(outbound_admissions().available_permits(), 0);
+        drop(successor);
+        assert_eq!(outbound_admissions().available_permits(), 1);
+        for index in 0..queued.len() {
+            assert!(
+                client.slots.try_acquire().is_err(),
+                "new arrivals cannot steal a reserved FIFO slot"
+            );
+            let permit = std::future::poll_fn(|cx| {
+                // Poll later callers first: admission order must not follow polling order.
+                for later in queued.iter_mut().skip(index + 1) {
+                    assert!(later.as_mut().unwrap().as_mut().poll(cx).is_pending());
+                }
+                match queued[index].as_mut().unwrap().as_mut().poll(cx) {
+                    Poll::Ready(Ok(permit)) => Poll::Ready(permit),
+                    _ => panic!("oldest admitted caller did not receive the released slot"),
+                }
+            })
+            .await;
+            queued[index] = None;
+            assert_eq!(client.slots.available_permits(), 0);
+            assert_eq!(outbound_admissions().available_permits(), index + 1);
+            drop(permit);
+        }
+        drop(held);
+        assert_eq!(client.slots.available_permits(), CONCURRENCY);
+        assert_eq!(
+            outbound_admissions().available_permits(),
+            CONCURRENCY + MAX_OUTBOUND_WAITERS
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_outbound_wait_cancellation_and_deadline_release_without_connecting() {
+        use std::future::Future;
+        use std::task::Poll;
+        let _resources = test_resource_guard().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = Client::new(
+            listener.local_addr().unwrap(),
+            identity(),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_bounded_admission();
+        let mut held = Vec::new();
+        for _ in 0..CONCURRENCY {
+            held.push(
+                client
+                    .outbound_permit(
+                        tokio::time::Instant::now() + Duration::from_secs(10),
+                        || Ok(true),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut call = Box::pin(client.call_at(
+            Operation::Journal {
+                authority: identity().authority,
+                epoch: 1,
+            },
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            outbound_admissions().available_permits(),
+            MAX_OUTBOUND_WAITERS - 1
+        );
+        // Cancel after FIFO has reserved an active slot but before this call
+        // can be polled again. Neither connection nor nonce work may start.
+        drop(held.pop());
+        drop(call);
+        assert_eq!(client.slots.available_permits(), 1);
+        assert_eq!(
+            outbound_admissions().available_permits(),
+            MAX_OUTBOUND_WAITERS + 1
+        );
+        held.push(
+            client
+                .outbound_permit(
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                    || Ok(true),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            outbound_admissions().available_permits(),
+            MAX_OUTBOUND_WAITERS
+        );
+        assert!(matches!(
+            client
+                .call_at(
+                    Operation::Journal {
+                        authority: identity().authority,
+                        epoch: 1
+                    },
+                    tokio::time::Instant::now()
+                )
+                .await,
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            outbound_admissions().available_permits(),
+            MAX_OUTBOUND_WAITERS
+        );
+        assert_eq!(client.nonce.load(Ordering::Relaxed), 1);
+        assert!(listener
+            .accept()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock));
+        drop(held);
+        assert_eq!(client.slots.available_permits(), CONCURRENCY);
+    }
+
+    #[test]
+    fn queue_payload_shapes_reject_excess_length_and_spare_capacity() {
+        use crate::transaction_decisions::{MAX_REQUEST_BYTES, MAX_REQUEST_PAYLOAD_BYTES};
+        let make = |request: Vec<u8>, payload: Vec<u8>| Command::AdmitRequest {
+            id: [1; 16],
+            request,
+            payload,
+            transaction_id: [2; 16],
+            participants: vec![Participant {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+                intent: [1; 32],
+            }],
+        };
+        assert!(bounded_queue_command(&make(vec![1], vec![2])));
+        assert!(!bounded_queue_command(&make(
+            vec![0; MAX_REQUEST_BYTES + 1],
+            vec![2]
+        )));
+        assert!(!bounded_queue_command(&make(
+            vec![1],
+            vec![0; MAX_REQUEST_PAYLOAD_BYTES + 1]
+        )));
+        let mut oversized = Vec::with_capacity(2 * MAX_REQUEST_BYTES + 1);
+        oversized.push(1);
+        assert!(!bounded_queue_command(&make(oversized, vec![2])));
+        let mut prepare = RetainedPrepare {
+            version: 1,
+            authority: identity().authority,
+            participant: Participant {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+                intent: [1; 32],
+            },
+            request: D1WriteRequest {
+                shard: 7,
+                epoch: 1,
+                request_id: [1; 16],
+                expected_sequence: None,
+                operations: vec![crate::WriteOp::put("k", "v")],
+            },
+            cut: terminal_journal(1).history_cursor().unwrap(),
+        };
+        assert!(bounded_queue_prepare(&prepare));
+        prepare
+            .request
+            .operations
+            .reserve(crate::MAX_BATCH_OPERATIONS.next_power_of_two() + 1);
+        assert!(!bounded_queue_prepare(&prepare));
+        assert!(!Operation::ConfirmCapacity {
+            authority: identity().authority,
+            epoch: 1
+        }
+        .queue_eligible()
+        .unwrap());
     }
 
     #[test]
@@ -4198,13 +4613,33 @@ mod tests {
         let server = Server::bind_byte_bound_coordinator(
             coordinator.clone(),
             id.clone(),
-            vec![observer_client.clone(), writer_client.clone()],
+            vec![
+                observer_client.clone().with_bounded_admission(),
+                writer_client.clone().with_bounded_admission(),
+            ],
             "127.0.0.1:0".parse().unwrap(),
             Duration::from_secs(2),
         )
         .await
         .unwrap();
         let client = Client::new(server.local_addr(), id.clone(), Duration::from_secs(2)).unwrap();
+        // Parent request occupies slot four. Even explicitly queued endpoint
+        // clients must not wait on this same pool during nested forwarding.
+        let held: Vec<_> = (0..CONCURRENCY - 1)
+            .map(|_| client.slots.try_acquire().unwrap())
+            .collect();
+        assert_eq!(
+            NodeRef::Remote(&client)
+                .confirm_capacity(&id.authority, 1)
+                .await,
+            Err(Error::Capacity)
+        );
+        assert_eq!(
+            outbound_admissions().available_permits(),
+            CONCURRENCY + MAX_OUTBOUND_WAITERS
+        );
+        drop(held);
+
         assert_eq!(
             NodeRef::Local(&coordinator)
                 .confirm_capacity(&id.authority, 1)

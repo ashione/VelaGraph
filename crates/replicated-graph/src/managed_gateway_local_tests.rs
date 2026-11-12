@@ -1669,3 +1669,51 @@ fn fixed_graph_membership_accepts_protocol_bound_and_checks_late_routes() {
         );
     }
 }
+
+#[tokio::test]
+async fn member_width_rejects_before_endpoint_or_route_validation() {
+    let config = || RemoteConfig {
+        coordinator: Client::new(
+            "127.0.0.1:1".parse().unwrap(),
+            identity(9),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        binding: bound(),
+        members: Vec::new(),
+    };
+    for width in [0, 5, 8, usize::MAX] {
+        assert!(matches!(
+            Gateway::bind_remote_with_member_parallelism(
+                config(),
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_secs(1),
+                width
+            )
+            .await,
+            Err(Error::Protocol)
+        ));
+        assert!(matches!(
+            Gateway::bind_remote_with_member_parallelism_and_timing(
+                config(),
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_secs(1),
+                width
+            )
+            .await,
+            Err(Error::Protocol)
+        ));
+        assert!(matches!(
+            Gateway::bind_remote_local_queries_with_concurrency(
+                config(),
+                Vec::new(),
+                "127.0.0.1:0".parse().unwrap(),
+                Duration::from_secs(1),
+                8,
+                width
+            )
+            .await,
+            Err(Error::Protocol)
+        ));
+    }
+}
