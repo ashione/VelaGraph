@@ -390,6 +390,14 @@ pub enum Operation {
         query: Query,
         page_size: u16,
     },
+    /// Wait for this binding's complete safe prefix >= minimum_version, then
+    /// execute at that one immutable V. Does not repair or retry writes.
+    OpenLocalQueryAfter {
+        minimum_version: u64,
+        ttl_millis: u64,
+        query: Query,
+        page_size: u16,
+    },
     /// Execute a complete local query under an explicitly selected capture policy.
     OpenLocalQueryWithProfile {
         profile: LocalReadProfile,
@@ -949,8 +957,26 @@ impl State {
                 query,
                 page_size,
             } => {
-                self.open_local(None, version, ttl_millis, query, page_size, work, end)
+                self.open_local(None, version, None, ttl_millis, query, page_size, work, end)
                     .await
+            }
+            Operation::OpenLocalQueryAfter {
+                minimum_version,
+                ttl_millis,
+                query,
+                page_size,
+            } => {
+                self.open_local(
+                    None,
+                    None,
+                    Some(minimum_version),
+                    ttl_millis,
+                    query,
+                    page_size,
+                    work,
+                    end,
+                )
+                .await
             }
             Operation::OpenLocalQueryWithProfile {
                 profile,
@@ -962,6 +988,7 @@ impl State {
                 self.open_local(
                     Some(profile),
                     version,
+                    None,
                     ttl_millis,
                     query,
                     page_size,
@@ -1287,6 +1314,7 @@ async fn serve(
             | Operation::TraversePage { .. }
             | Operation::OpenLocalQuery { .. }
             | Operation::OpenLocalQueryWithProfile { .. }
+            | Operation::OpenLocalQueryAfter { .. }
             | Operation::FetchLocalQuery { .. }
     ) {
         end.min(Instant::now() + rocksdb_sql_table::GREMLIN_DEADLINE)
@@ -1553,6 +1581,27 @@ fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
             session.incarnation != [0; 16]
                 && session.token != [0; 32]
                 && version.is_none_or(|v| v == session.version)
+                && query == q
+                && page_size == size
+                && local::valid_page(query, None, *page_size, page, &request.binding)
+        }
+        (
+            Operation::OpenLocalQueryAfter {
+                minimum_version,
+                query,
+                page_size,
+                ..
+            },
+            Reply::OpenLocalQuery {
+                session,
+                query: q,
+                page_size: size,
+                page,
+            },
+        ) => {
+            session.incarnation != [0; 16]
+                && session.token != [0; 32]
+                && session.version >= *minimum_version
                 && query == q
                 && page_size == size
                 && local::valid_page(query, None, *page_size, page, &request.binding)

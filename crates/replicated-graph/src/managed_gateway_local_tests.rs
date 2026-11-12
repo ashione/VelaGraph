@@ -144,6 +144,38 @@ fn explicit_profile_reply_binding_and_legacy_wire_shapes() {
         binding: bound(),
         result: Ok(reply),
     };
+    let mut causal_request = Request {
+        version: VERSION,
+        request_id: [9; 16],
+        binding: bound(),
+        operation: Operation::OpenLocalQueryAfter {
+            minimum_version: 7,
+            ttl_millis: 60_000,
+            query: query.clone(),
+            page_size: 1,
+        },
+    };
+    assert_eq!(
+        validate_reply(&causal_request, response(legacy.clone())),
+        Ok(legacy.clone())
+    );
+    if let Operation::OpenLocalQueryAfter {
+        minimum_version, ..
+    } = &mut causal_request.operation
+    {
+        *minimum_version = 8;
+    }
+    assert_eq!(
+        validate_reply(&causal_request, response(legacy.clone())),
+        Err(Error::Identity)
+    );
+    assert_eq!(
+        serde_json::from_str::<Operation>(
+            &serde_json::to_string(&causal_request.operation).unwrap()
+        )
+        .unwrap(),
+        causal_request.operation
+    );
     for profile in [
         LocalReadProfile::Parity2MiBV1,
         LocalReadProfile::LocalRead8MiBV1,
@@ -1716,4 +1748,65 @@ async fn member_width_rejects_before_endpoint_or_route_validation() {
             Err(Error::Protocol)
         ));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn causal_lower_bound_local_query_round_trip_and_timeout() {
+    let _gate = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    let write = call(&g, Operation::Submit(create(71, 7, 1))).await.unwrap();
+    let (_, floor) = committed(&write);
+    let after = |minimum_version, ttl_millis| Operation::OpenLocalQueryAfter {
+        minimum_version,
+        ttl_millis,
+        query: Query {
+            partition: 7,
+            text: "g.V(1).count()".into(),
+        },
+        page_size: 1,
+    };
+    let (session, _, page) = ready(call(&g, after(floor, 60_000)).await.unwrap());
+    assert!(session.version >= floor);
+    assert_eq!(page.data.rows, vec![QueryRow::Count(1)]);
+    call(&g, Operation::CloseLocalQuery { session })
+        .await
+        .unwrap();
+    let charge_before_wait = g.retained_payload_charge();
+    assert_eq!(
+        call(&g, after(floor + 1, 100)).await,
+        Err(Error::SessionUnavailable)
+    );
+    assert_eq!(g.retained_payload_charge(), charge_before_wait);
+    let (caught_up, _, page) = {
+        let waiting = call(&g, after(floor + 1, 60_000));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err()
+        );
+        committed(&call(&g, Operation::Submit(create(72, 8, 2))).await.unwrap());
+        ready(waiting.await.unwrap())
+    };
+    assert!(caught_up.version > floor);
+    assert_eq!(page.data.rows, vec![QueryRow::Count(1)]);
+    call(&g, Operation::CloseLocalQuery { session: caught_up })
+        .await
+        .unwrap();
+    // A failed wait must not leave a local result/session reservation behind.
+    let (session, _, _) = ready(call(&g, after(floor, 60_000)).await.unwrap());
+    call(&g, Operation::CloseLocalQuery { session })
+        .await
+        .unwrap();
+    for server in servers {
+        server.shutdown().await;
+    }
+    assert!(call(&g, after(floor, 60_000)).await.is_err());
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    f.stop().await;
 }

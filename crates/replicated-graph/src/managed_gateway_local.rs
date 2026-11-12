@@ -191,6 +191,7 @@ impl State {
         &self,
         requested_profile: Option<LocalReadProfile>,
         version: Option<u64>,
+        minimum_version: Option<u64>,
         ttl_millis: u64,
         query: Query,
         page_size: u16,
@@ -227,15 +228,28 @@ impl State {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Capacity)?;
-        let cut = cohort_reads::admit_endpoints(
-            self.config.coordinator.reference(),
-            self.config.binding.authority.clone(),
-            self.config.binding.cohort.coordinator_epoch,
-            self.config.endpoints(),
-            version,
-            ttl,
-        )
-        .await
+        let cut = if let Some(minimum) = minimum_version {
+            cohort_reads::admit_endpoints_at_least(
+                self.config.coordinator.reference(),
+                self.config.binding.authority.clone(),
+                &self.config.binding.cohort,
+                self.config.endpoints(),
+                minimum,
+                ttl,
+                end,
+            )
+            .await
+        } else {
+            cohort_reads::admit_endpoints(
+                self.config.coordinator.reference(),
+                self.config.binding.authority.clone(),
+                self.config.binding.cohort.coordinator_epoch,
+                self.config.endpoints(),
+                version,
+                ttl,
+            )
+            .await
+        }
         .map_err(snapshot_error)?;
         before_deadline(end)?;
         if cut.cohort() != &self.config.binding.cohort
