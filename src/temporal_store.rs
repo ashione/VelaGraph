@@ -202,37 +202,16 @@ impl TemporalStoreView<'_> {
             if !key.starts_with(&prefix) {
                 break;
             }
-            if i >= MAX_READ_REVISIONS || key.len() != RECORD_PREFIX.len() + 21 {
-                return Err(if i >= MAX_READ_REVISIONS {
-                    TemporalStoreError::Limit
-                } else {
-                    TemporalStoreError::Corrupt
-                });
+            if i >= MAX_READ_REVISIONS {
+                return Err(TemporalStoreError::Limit);
             }
-            let stored_version = !u64::from_be_bytes(
-                key[RECORD_PREFIX.len() + 9..RECORD_PREFIX.len() + 17]
-                    .try_into()
-                    .map_err(|_| TemporalStoreError::Corrupt)?,
-            );
-            let ordinal = u32::from_be_bytes(
-                key[RECORD_PREFIX.len() + 17..]
-                    .try_into()
-                    .map_err(|_| TemporalStoreError::Corrupt)?,
-            );
-            if stored_version == 0
-                || stored_version > self.version
-                || ordinal as usize >= MAX_BATCH
-                || value.len() > MAX_BATCH_BYTES
-            {
-                return Err(TemporalStoreError::Corrupt);
-            }
+            let (valid, payload) = decode_revision(&key, &value, self.version)?;
             bytes = bytes
                 .checked_add(key.len() + value.len())
                 .ok_or(TemporalStoreError::Limit)?;
             if bytes > MAX_READ_BYTES {
                 return Err(TemporalStoreError::Limit);
             }
-            let (valid, payload) = decode_assertion(&value)?;
             if valid.from <= self.valid_time && valid.to.is_none_or(|to| self.valid_time < to) {
                 return Ok(payload.map(|p| p.to_vec()));
             }
@@ -266,6 +245,29 @@ impl TemporalStoreView<'_> {
         }
         Ok(Some(edge))
     }
+}
+fn decode_revision<'a>(
+    key: &[u8],
+    value: &'a [u8],
+    max_version: u64,
+) -> Result<(Interval, Option<&'a [u8]>)> {
+    if key.len() != RECORD_PREFIX.len() + 21 || value.len() > MAX_BATCH_BYTES {
+        return Err(TemporalStoreError::Corrupt);
+    }
+    let version = !u64::from_be_bytes(
+        key[RECORD_PREFIX.len() + 9..RECORD_PREFIX.len() + 17]
+            .try_into()
+            .map_err(|_| TemporalStoreError::Corrupt)?,
+    );
+    let ordinal = u32::from_be_bytes(
+        key[RECORD_PREFIX.len() + 17..]
+            .try_into()
+            .map_err(|_| TemporalStoreError::Corrupt)?,
+    );
+    if version == 0 || version > max_version || ordinal as usize >= MAX_BATCH {
+        return Err(TemporalStoreError::Corrupt);
+    }
+    decode_assertion(value)
 }
 fn decode_version(value: Option<&[u8]>) -> Result<u64> {
     Ok(u64::from_be_bytes(
@@ -705,3 +707,5 @@ mod tests {
         ));
     }
 }
+
+mod query;
