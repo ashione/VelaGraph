@@ -559,6 +559,7 @@ unchanged consistency/resource contracts, and critical-path benchmark scope.
 
 The opt-in [durable temporal point-read slice](docs/TEMPORAL_STORE.md) stores
 append-only valid-time assertions in a dedicated local RocksDB database, with
-atomic synced local versions and historical V/T point reads. It does not yet
-connect to Gremlin, Raft, managed distributed sessions or existing checkpoints;
+atomic synced local versions and historical V/T point reads. Explicit-ID official
+Gremlin point queries reuse the existing executor; global scans and adjacency
+remain unsupported. It does not connect to Raft, managed sessions or checkpoints;
 #196 remains open. Existing graph/v1/v2 semantics and formats are unchanged.

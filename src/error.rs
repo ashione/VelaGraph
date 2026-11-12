@@ -3,6 +3,9 @@ use thiserror::Error;
 /// Errors returned by the graph kernel.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("temporal store error: {0}")]
+    TemporalStore(Box<crate::temporal_store::TemporalStoreError>),
+
     #[error("RocksDB error: {0}")]
     RocksDb(#[from] rocksdb::Error),
 

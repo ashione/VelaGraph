@@ -1,7 +1,7 @@
 # Experimental durable local temporal assertions (format 1)
 
 Status: first **single-partition durable point-read slice** of #196. It is not a
-production temporal query engine, managed/cohort V, Gremlin backend, distributed
+production temporal query engine, managed/cohort V, complete Gremlin backend, distributed
 transaction, global checkpoint, or migration of existing graph data. The parent
 [bitemporal reference](BITEMPORAL_REFERENCE.md) is the semantic baseline.
 
@@ -88,8 +88,8 @@ application checksum or cryptographic authentication is claimed.
 
 These are new local experimental work bounds, not relaxations of existing graph,
 cohort or memory limits. Caller-provided input memory and RocksDB allocations are
-not a total RSS guarantee. Temporal indexed adjacency and Gremlin's existing
-cooperative deadline/memory accounting are the next slice, not implemented here.
+not a total RSS guarantee. Temporal indexed adjacency remains a later slice. The explicit-ID Gremlin
+backend described below already uses cooperative deadline and memory accounting.
 
 ## Recovery, retention and migration
 
@@ -110,7 +110,7 @@ Future physical placement must integrate authoritative temporal data explicitly.
 The format is opt-in and does not mutate existing v1/v2 records. Future incompatible
 changes need another namespace/format version and explicit reviewed migration;
 no old database can silently inherit an invented valid-time origin. The store is
-not currently connected to Raft, managed sessions, remote storage or Gremlin.
+not currently connected to Raft, managed sessions or remote storage.
 
 ## Validation and next step
 
@@ -121,7 +121,39 @@ corruption and history work limits. A separate dense time-cell oracle validates
 40 system versions x 16 valid instants **after close/reopen**. Process-death tests
 run in `tests/temporal_recovery.rs`. No throughput/scale claim follows from them.
 
-Next: a versioned temporal adjacency candidate index, stable lazy QueryReadBackend
-and existing official Gremlin executor, then certified distributed V/T with shared
+Next: a versioned temporal adjacency candidate index and global scans, then
+certified distributed V/T with shared
 session/page identity. #196 remains open. CoreHR is one eventual acceptance
 fixture, not a storage label or optimization rule.
+
+
+## Official Gremlin point-query integration
+
+`TemporalStoreView::execute_gremlin(text)` uses the existing official parser and
+shared `GremlinQuery` executor through a lazy `QueryReadBackend`. Explicit
+`g.V(ids...)` and `g.E(ids...)` support the existing local no-hop steps: has,
+hasLabel, values, id, label, limit, terminal count and path. Duplicate inputs,
+input order, missing-property behavior, strict values and existing default caps
+are inherited unchanged. `path()` here reports explicit start objects only;
+it does not imply temporal path traversal support.
+
+Global `V()`/`E()` starts and out/in/both reject **before any records are read**,
+including when input IDs are absent or the graph is empty. Existing unsupported
+language features still fail through the official parser. There is no custom
+syntax, scan-to-copy fallback or per-query materialized graph. Valid time and
+system version are selected by the view API, not embedded into Gremlin text.
+
+Each query shares the existing logical memory budget and cooperative deadline.
+Raw visited key/value bytes are charged while decoding, and canonical decoded
+records use the existing accounted codecs before owned allocations. Cumulative
+history work across all requested IDs and both edge endpoints is bounded to
+4,096 visited revisions / 64 MiB, rather than resetting for each lookup. Limits,
+corruption and deadline failures are errors, not partial results. RocksDB's
+iterator allocation and allocator overhead are outside the logical memory
+accounting, as in the existing kernel; no hard RSS bound is claimed.
+
+Ordinary tests exercise reopen-to-Gremlin corrections/future views, fixed old
+views after writes, edge endpoint absence, duplicate/order/path projection,
+empty-input rejection, malformed syntax, memory/deadline/cumulative-work limits
+and corruption before filters. The on-disk format is unchanged by this query
+adapter. Distributed session/page coordinates and temporal adjacency remain open.

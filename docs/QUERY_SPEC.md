@@ -665,3 +665,15 @@ inputs, marked objects and comparisons; retention is charged before allocation,
 under unchanged cumulative budgets and deadlines. Default result caps, fixed V,
 complete pages and all legacy/coordinator/job rejection boundaries remain.
 See the [complete contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters).
+
+### Experimental durable temporal point queries
+
+The opt-in `TemporalStoreView::execute_gremlin` binds a fixed local system version
+and valid instant before executing the official local no-hop subset. Explicit
+`g.V(ids)` / `g.E(ids)` support has/hasLabel, values/id/label, limit, count and
+start-only path projection. Global starts and out/in/both reject before reads,
+including for absent IDs or empty input; no temporal adjacency or distributed
+query is implied. Order, bags, scalar types and the shared executor's caps stay
+unchanged. One query shares cumulative temporal revision/byte work bounds,
+logical allocation accounting and a cooperative deadline. See the precise
+[temporal query contract](TEMPORAL_STORE.md#official-gremlin-point-query-integration).

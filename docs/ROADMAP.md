@@ -674,5 +674,5 @@ unproven, rather than inferred from these latency measurements.
 `temporal_store` 在独立、显式版本化数据库中保存 canonical 点/边修订，
 一次同步 WriteBatch 提交本地系统版本与有效区间，支持固定 V/T 的历史点读、
 端点可见性与 reopen/进程退出恢复验证。它不是 distributed cohort V，也没有
-接入 Gremlin、时态邻接索引或既有双 DB checkpoint。下一步接官方查询执行器
-和索引，再验证真实跨片同 V/T。详见 [范围与格式](TEMPORAL_STORE.md)，#196 不关闭。
+接入时态邻接索引或既有双 DB checkpoint。显式 ID 的官方 Gremlin 点查询已
+复用原执行器；下一步做索引/遍历，再验证真实跨片同 V/T。详见 [范围与格式](TEMPORAL_STORE.md)，#196 不关闭。
