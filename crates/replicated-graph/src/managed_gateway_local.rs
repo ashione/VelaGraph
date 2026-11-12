@@ -30,6 +30,9 @@ pub(super) struct Retained {
     _memory: OwnedSemaphorePermit,
     result: pages::Materialized,
     pub(super) closed: std::sync::atomic::AtomicBool,
+    // Immutable session/result/page sizing: one successful HTTP frame proof is
+    // valid for every subsequent fetch. Failed/expired proofs are never cached.
+    http_preflighted: std::sync::atomic::AtomicBool,
 }
 pub(super) fn snapshot_error(error: cohort_reads::Error) -> Error {
     managed_graph::Error::from(error).into()
@@ -156,9 +159,17 @@ fn preflight_http_pages(
     before_deadline(end)
 }
 impl Retained {
-    pub(super) fn preflight_http(&self, session: &LocalSession, end: Instant) -> Result<()> {
+    pub(super) fn preflight_http(&self, end: Instant) -> Result<()> {
         live(self, end)?;
-        preflight_http_pages(session, &self.result, end)?;
+        if !self
+            .http_preflighted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            preflight_http_pages(&self.descriptor, &self.result, end)?;
+            live(self, end)?;
+            self.http_preflighted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         live(self, end)
     }
 }
@@ -447,6 +458,7 @@ impl State {
                 _memory: memory,
                 result: materialized,
                 closed: std::sync::atomic::AtomicBool::new(false),
+                http_preflighted: std::sync::atomic::AtomicBool::new(false),
             });
             preflight_pages(
                 &binding,
@@ -532,18 +544,29 @@ mod boundary_tests {
                 cursors: BTreeMap::new(),
             },
             closed: std::sync::atomic::AtomicBool::new(false),
+            http_preflighted: std::sync::atomic::AtomicBool::new(false),
         };
         let end = now + Duration::from_secs(20);
         live(&retained, end).unwrap();
+        assert!(!retained
+            .http_preflighted
+            .load(std::sync::atomic::Ordering::Acquire));
+        retained.preflight_http(end).unwrap();
+        assert!(retained
+            .http_preflighted
+            .load(std::sync::atomic::Ordering::Acquire));
+        retained.preflight_http(end).unwrap();
         // The encoder can complete before TTL while the awaiting task resumes
         // afterwards. The same mandatory pre-send check must reject this state.
         retained.expires = now;
         assert_eq!(live(&retained, end), Err(Error::SessionUnavailable));
+        assert_eq!(retained.preflight_http(end), Err(Error::SessionUnavailable));
         retained.expires = now + Duration::from_secs(10);
         retained
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(live(&retained, end), Err(Error::SessionUnavailable));
+        assert_eq!(retained.preflight_http(end), Err(Error::SessionUnavailable));
     }
     #[test]
     fn seal_checks_late_full_envelope_before_ready() {

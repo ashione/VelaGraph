@@ -161,12 +161,10 @@ impl Invocation {
         })
     }
     pub(super) fn preflight_http(&self) -> Result<()> {
-        if let (
-            Some(retained),
-            Ok(Reply::OpenLocalQuery { session, .. } | Reply::FetchLocalQuery { session, .. }),
-        ) = (&self.local_retained, &self.response.result)
+        if let (Some(retained), Ok(Reply::OpenLocalQuery { .. } | Reply::FetchLocalQuery { .. })) =
+            (&self.local_retained, &self.response.result)
         {
-            retained.preflight_http(session, self.end)?;
+            retained.preflight_http(self.end)?;
         }
         self.live()
     }

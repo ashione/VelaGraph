@@ -14,7 +14,9 @@ After constructing an existing validated live `managed_gateway::Gateway`, call
 and keep both gateway and returned `HttpService` alive. Call `shutdown().await`
 for orderly cleanup. Dropping either server signals shutdown. Any non-loopback
 bind is rejected; there is no implicit public bind, TLS, authentication or
-production exposure. Restored/offline nodes cannot bypass their existing startup
+production exposure. Loopback alone is not an authentication or browser-attack
+boundary; do not expose this preview to untrusted local clients. Host/Origin
+policy and credentials belong to the later hardened service entry. Restored/offline nodes cannot bypass their existing startup
 guards through this adapter. No public restore or readiness override is added.
 
 `GET /preview1/service` describes a live managed gateway and explicitly reports
@@ -91,7 +93,10 @@ next cursor, offset and total. Use the returned session/query unchanged for
 fetch, with cursor null to replay the first page or the prior `next` cursor to
 advance. Every page is preflighted against the HTTP wire budget before the first
 HTTP page is delivered, including sessions originally opened via managed TCP.
-Pages cannot exceed the full result or execution budgets. `Unverified`
+The successful whole-result HTTP preflight is cached on that immutable retained
+session; later fetches still check liveness and their own response encoding,
+but do not re-encode the entire result. Pages cannot exceed the full result or
+execution budgets. `Unverified`
 completeness is preserved rather than relabelled as complete.
 
 ## Failure and retry contract
