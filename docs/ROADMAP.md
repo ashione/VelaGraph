@@ -59,6 +59,17 @@
 首版不做写编辑器、集群管理、可视化建模或独立监控平台；不发布独立网站，不扩大
 CORS/权限或上传遥测。此 UI 只读范围不取消 #218 对外服务必须支持写入的要求。
 
+## 发布里程碑
+
+按 [发布验收计划](RELEASE_PLAN.md) 从 **v0.0.1** 起发布实验版本：
+先固定拓扑 gRPC/HTTP 服务，再持续一致读写与恢复、弹性路由并发，最后观测与 Portal。
+验收通过后才打 tag/release，不把规划或单个 PR 合并当作发布完成。
+总跟踪 [#224](https://github.com/ashione/VelaGraph/issues/224)；新增缺口分别为
+[#221](https://github.com/ashione/VelaGraph/issues/221) 入口负载均衡/会话归属/连接复用、
+[#222](https://github.com/ashione/VelaGraph/issues/222) 动态发现/合格副本选择/分片迁移、
+[#223](https://github.com/ashione/VelaGraph/issues/223) 通用写并发。
+双时间、对象存储权威按独立切片验收，本体仍待基础 ready 后考虑；不承诺首版生产就绪。
+
 ## 1. 当前基线
 
 截至 2026-11-10，本次核对基于 main `a0b7147`（已合并 #142/#144/#146）。
