@@ -3324,6 +3324,7 @@ mod tests {
             let old = history(count);
             let cut = persist_archive(&db, &old, marker(10));
             let original = rows(&db);
+            let old_witnesses = cut.row_witnesses.as_ref().unwrap().to_vec();
             let suffix = vec![begin(count), decide(count, Decision::Abort)];
             let mut full = old.coordinator.as_ref().unwrap().full().unwrap().clone();
             for event in &suffix {
@@ -3423,6 +3424,23 @@ mod tests {
                     serde_json::to_vec(&marker(11)).unwrap(),
                 );
                 db.write(batch).unwrap();
+                // The immutable old cut is valid only with its original snapshot.
+                // Recheck all old bytes after a real successor commit rather than
+                // treating the previously successful VerifiedArchive as authority.
+                let pinned_tail = verify_coordinator_rows(&verified.snapshot, &cut).unwrap();
+                let replayed_tail =
+                    walk(&verified.snapshot, &cut.descriptor, |_, _, _| Ok(())).unwrap();
+                assert_eq!(pinned_tail.events, replayed_tail.events);
+                assert_eq!(pinned_tail.before, replayed_tail.before);
+                assert_eq!(
+                    verify_active(&db, &cut).err(),
+                    Some(D1Error::EventLedgerHistory)
+                );
+                assert_eq!(cut.row_witnesses.as_ref().unwrap().as_ref(), old_witnesses);
+                assert!(!Arc::ptr_eq(
+                    cut.row_witnesses.as_ref().unwrap(),
+                    next_cut.row_witnesses.as_ref().unwrap(),
+                ));
                 assert_eq!(
                     verify_active(&db, &next_cut).unwrap().checkpoint(),
                     candidate.as_ref()

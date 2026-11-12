@@ -156,3 +156,11 @@ at 2026-11-11T20:40:44.5746077Z. The later artifact upload failed with a
 This remote execution result does not erase the earlier local pin failure or
 constitute a green current-main gate. The unchanged artifact/aggregate checks
 will be rerun on the updated candidate, not waived or marked optional.
+
+The current-main independent review found no new production integrity blocker.
+One minimal regression now retains the old VerifiedArchive across a real
+successor commit: its pinned bytes still pass both witness verification and the
+original full walker, the old cut rejects a fresh snapshot, and the new cut
+succeeds without mutating or sharing the old witness slice. Existing sync/crash,
+snapshot repair/reopen, and large-row tests remain unchanged. Static review is
+not execution acceptance; fresh tests and required CI still gate this revision.
