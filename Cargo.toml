@@ -24,3 +24,7 @@ getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "quickstart"
+test = true
