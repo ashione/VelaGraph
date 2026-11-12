@@ -79,6 +79,9 @@ impl Execution<'_> {
         direction: Direction,
         label: Option<&str>,
     ) -> Result<Vec<Traverser>, QueryFailure> {
+        if self.fixed_sessions.is_some() {
+            return self.expand_fixed(rows, direction, label).await;
+        }
         let mut next = Vec::new();
         for row in rows {
             // Validate both complete directions before selecting rows. A later
@@ -106,7 +109,7 @@ impl Execution<'_> {
             // Each iteration consumes at least one of two <=1,000-entry lists.
             // Merge in place: no cloned/concatenated adjacency or identity set.
             while let Some((edge, reverse)) = next_hop(&mut outgoing, &mut incoming)? {
-                check(self.end)?;
+                self.check()?;
                 if direction == Direction::Both {
                     self.cost.charge(0, 1, self.ceiling)?;
                 }
@@ -130,6 +133,131 @@ impl Execution<'_> {
                     },
                     &mut self.cost,
                 )?;
+            }
+        }
+        Ok(next)
+    }
+    // Bounded exchange stages over the same leaf transport, independent of root
+    // IDs, labels, topology or terminal operator. Ordinals remain implicit in
+    // the input vector; only the scheduler may reorder physical completion.
+    async fn expand_fixed(
+        &mut self,
+        rows: Vec<Traverser>,
+        direction: Direction,
+        label: Option<&str>,
+    ) -> Result<Vec<Traverser>, QueryFailure> {
+        if direction == Direction::Both {
+            return Err(QueryFailure::Unsupported);
+        }
+        let incoming = direction == Direction::In;
+        let mut rows = rows.into_iter();
+        let mut next = Vec::new();
+        loop {
+            // Startup width bounds staged adjacency lists (each <=1000 edges).
+            // At the maximum width, <=8000 checks fit the 10000-input cap.
+            let window: Vec<_> = rows.by_ref().take(self.fixed_parallelism).collect();
+            if window.is_empty() {
+                break;
+            }
+            let fragments = window
+                .iter()
+                .map(|row| {
+                    if incoming {
+                        Fragment::In(row.vertex)
+                    } else {
+                        Fragment::Out(row.vertex)
+                    }
+                })
+                .collect();
+            let sessions = self
+                .fixed_sessions
+                .as_deref_mut()
+                .ok_or(QueryFailure::Unavailable)?;
+            let adjacency = fixed_parallel::run_controlled(
+                sessions,
+                fragments,
+                &mut self.cost,
+                self.end,
+                self.fixed_parallelism,
+                self.control.as_ref(),
+            )
+            .await?;
+            let mut checks = Vec::new();
+            let mut lengths = Vec::new();
+            let mut outgoing = Vec::new();
+            for (row, value) in window.iter().zip(adjacency) {
+                match value {
+                    FragmentValue::Incoming(entries) if incoming => {
+                        lengths.push(entries.len());
+                        checks.extend(entries.into_iter().map(|edge| Fragment::ResolveIncoming {
+                            target: row.vertex,
+                            edge,
+                        }));
+                    }
+                    FragmentValue::Edges(edges) if !incoming => {
+                        lengths.push(edges.len());
+                        checks.extend(edges.iter().cloned().map(Fragment::VerifyReverse));
+                        outgoing.extend(edges);
+                    }
+                    _ => return Err(QueryFailure::IncompleteOrCorrupt),
+                }
+            }
+            // Validate every canonical/reverse/endpoint dependency, including
+            // label-filtered candidates, before materializing any window rows.
+            let checked = fixed_parallel::run_controlled(
+                sessions,
+                checks,
+                &mut self.cost,
+                self.end,
+                self.fixed_parallelism,
+                self.control.as_ref(),
+            )
+            .await?;
+            let mut edges = if incoming {
+                checked
+                    .into_iter()
+                    .map(|value| match value {
+                        FragmentValue::Edge(edge) => Ok(edge),
+                        _ => Err(QueryFailure::IncompleteOrCorrupt),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                if checked
+                    .iter()
+                    .any(|v| !matches!(v, FragmentValue::Bool(true)))
+                {
+                    return Err(QueryFailure::IncompleteOrCorrupt);
+                }
+                outgoing
+            }
+            .into_iter();
+            for (row, len) in window.into_iter().zip(lengths) {
+                for edge in edges.by_ref().take(len) {
+                    check(self.end)?;
+                    if label.is_some_and(|label| label != edge.label) {
+                        continue;
+                    }
+                    if incoming {
+                        self.cost.charge(256 + edge.label.len(), 1, self.ceiling)?;
+                    }
+                    self.cost.charge(row.path.len() * 32, 0, self.ceiling)?;
+                    let mut path = row.path.clone();
+                    path.push(QualifiedElement::Edge {
+                        partition: edge.from.partition,
+                        id: edge.id,
+                    });
+                    let vertex = if incoming { edge.from } else { edge.to };
+                    path.push(vertex.element());
+                    push(
+                        &mut next,
+                        Traverser {
+                            vertex,
+                            path,
+                            value: None,
+                        },
+                        &mut self.cost,
+                    )?;
+                }
             }
         }
         Ok(next)

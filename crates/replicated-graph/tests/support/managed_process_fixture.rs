@@ -1,28 +1,10 @@
-// Common actual-process bootstrap and lifecycle helpers. Included at each crate
-// root so current_exe() --ignored --exact managed_node_child stays valid.
-use anyhow::{anyhow, Context};
-use d2_raft::{
-    managed_rpc::{activate_byte_bound_member, Client, Identity, Role, Server},
-    participant_writes::Authority,
-    transaction_decisions::{CapacityProfile, Cohort, Command as DecisionCommand, Journal, Member},
-    versioned_reads::Target,
-    Cluster, D1Command, LogCommand, NodeHandle, StateMachine,
-};
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-use replicated_graph::managed_gateway::{Binding, Mapping};
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::{Cursor, Write as _},
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::Arc,
-    time::Duration,
-};
-
+// Shared independent-process fixture for both integration-test binaries.
+// Include at the crate root to keep the private subprocess entrypoint named
+// exactly `managed_node_child` in each binary, as Process::launch requires.
 const BUDGET: Duration = Duration::from_secs(15);
+// Independent retained-view fixture phases share this test runner's resources.
+// Serialize only those phases, never their internal concurrent graph operations.
+static RETAINED_FIXTURE_PHASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const CHILD_ENV: &str = "MANAGED_PROCESS_DIRECTORY";
 fn authority() -> Authority {
     Authority {
@@ -50,6 +32,9 @@ fn target(shard: u64) -> Target {
         epoch: 1,
         mode: [shard as u8; 16],
     }
+}
+fn identity(shard: u64) -> Identity {
+    identity_in(shard, cohort())
 }
 fn identity_in(shard: u64, cohort: Cohort) -> Identity {
     Identity {
@@ -389,11 +374,6 @@ impl Process {
         self.child.wait()?;
         Ok(())
     }
-    async fn reopen(&mut self) -> anyhow::Result<()> {
-        fs::remove_file(self.directory.path().join("ready.json"))?;
-        self.child = Self::launch(self.directory.path(), self.shard, self.address, false)?;
-        self.ready().await
-    }
     fn client(&self) -> anyhow::Result<Client> {
         Ok(Client::new(
             self.address,
@@ -406,5 +386,79 @@ impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+async fn call(g: &Gateway, operation: Operation) -> gateway::Result<Reply> {
+    call_bound(g, binding(), operation).await
+}
+async fn call_bound(g: &Gateway, binding: Binding, operation: Operation) -> gateway::Result<Reply> {
+    gateway::request(g.local_addr(), binding, operation, BUDGET).await
+}
+async fn open(g: &Gateway, version: Option<u64>) -> anyhow::Result<Session> {
+    open_bound(g, binding(), version).await
+}
+async fn open_bound(
+    g: &Gateway,
+    binding: Binding,
+    version: Option<u64>,
+) -> anyhow::Result<Session> {
+    match call_bound(
+        g,
+        binding,
+        Operation::OpenSession {
+            version,
+            ttl_millis: 60000,
+        },
+    )
+    .await?
+    {
+        Reply::OpenSession(s) => Ok(s),
+        other => anyhow::bail!("expected session: {other:?}"),
+    }
+}
+fn committed(reply: Reply) -> ([u8; 16], u64) {
+    match reply {
+        Reply::Write {
+            transaction_id: Some(id),
+            status:
+                WriteStatus::Committed {
+                    ordinal,
+                    visible: true,
+                },
+            ..
+        } => (id, ordinal),
+        other => panic!("expected visible Commit: {other:?}"),
+    }
+}
+async fn traverse(
+    g: &Gateway,
+    session: &Session,
+    partition: u32,
+    text: &str,
+) -> anyhow::Result<Vec<QueryRow>> {
+    let query = Query {
+        partition,
+        text: text.into(),
+    };
+    match call(
+        g,
+        Operation::Traverse {
+            session: session.clone(),
+            query: query.clone(),
+        },
+    )
+    .await?
+    {
+        Reply::Traverse {
+            session: returned,
+            query: echoed,
+            data,
+        } => {
+            assert_eq!(returned, *session);
+            assert_eq!(echoed, query);
+            assert_eq!(data.completeness, QueryCompleteness::Unverified);
+            Ok(data.rows)
+        }
+        other => anyhow::bail!("expected traversal: {other:?}"),
     }
 }

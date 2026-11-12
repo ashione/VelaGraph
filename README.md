@@ -47,12 +47,23 @@ They do not yet support data-local hierarchy jobs. The original gateway `Read` h
 A separate opt-in [data-local fixed-V gateway](docs/MANAGED_LOCAL_GATEWAY.md)
 retains certified views on participant nodes and reuses the distributed executor
 for explicit `g.V(ids)` with `out`/`in` and terminal `path`/`count`. It validates
-the whole immutable result before publishing replayable pages. The original
-operation retains its 10,000-row / 2 MiB / 100,000-operation capture budget. An
-explicit `LocalRead8MiBV1` query profile permits 8 MiB of captured payload with
-unchanged row/work/history/write/result limits and shared admission pools. This
-is not an 8 MiB write lifecycle or full managed CoreHR capacity claim, and does
-not replace old entrypoints.
+the whole immutable result before publishing replayable pages. Bounded shard-lane
+execution overlaps independent fixed-V fragments while preserving ordered bags,
+shared budgets and per-session sequencing. Deployment configuration can select
+one through eight lanes (three by default), without enlarging query budgets.
+[Fixed data membership](docs/FIXED_COHORT_MEMBERSHIP.md) is independently bounded
+at 64 members; widening a cohort does not enlarge lane width or capture budgets.
+The original operation retains its 10,000-row / 2 MiB / 100,000-operation capture
+budget. An explicit `LocalRead8MiBV1` query profile permits 8 MiB of captured
+payload with unchanged row/work/history/write/result limits and shared admission
+pools. This is not an 8 MiB write lifecycle or full managed CoreHR capacity claim,
+and does not replace old entrypoints or expand the separate query-job budget.
+
+An opt-in [bounded query-job lifecycle](docs/MANAGED_QUERY_JOBS.md) separates
+control RPCs from finite execution, with explicit same-V renewal, cancellation
+and complete-result publication. It preserves original short-lived APIs and
+does not enlarge capture/history budgets. This experimental candidate remains
+under validation.
 
 The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
 rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions

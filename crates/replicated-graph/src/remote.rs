@@ -107,6 +107,8 @@ enum Operation {
     },
     Query(query::QueryRequest),
     OpenFixedQuery(distributed::fixed::FixedOpenRequest),
+    OpenRenewableFixedQuery(distributed::fixed::RenewableFixedOpenRequest),
+    RenewFixedQuery(distributed::fixed::FixedRenewRequest),
     FixedQueryFragment(distributed::fixed::FixedFragmentRequest),
     CloseFixedQuery {
         descriptor: distributed::fixed::FixedDescriptor,
@@ -145,6 +147,8 @@ enum Reply {
     CloseSnapshot,
     Query(query::QueryResponse),
     OpenFixedQuery(distributed::fixed::FixedOpened),
+    OpenRenewableFixedQuery(distributed::fixed::RenewableFixedOpened),
+    RenewFixedQuery(distributed::fixed::FixedLeaseGrant),
     FixedQueryFragment(Result<distributed::fixed::FixedFragmentOutput, query::QueryFailure>),
     CloseFixedQuery,
     OpenQuery(distributed::Descriptor),
@@ -335,6 +339,14 @@ impl GraphService {
                                     + Duration::from_millis(request.acquire_timeout_millis),
                             )
                         }
+                        Operation::OpenRenewableFixedQuery(request)
+                            if (1..=5000).contains(&request.open.acquire_timeout_millis) =>
+                        {
+                            end.min(
+                                Instant::now()
+                                    + Duration::from_millis(request.open.acquire_timeout_millis),
+                            )
+                        }
                         Operation::OpenHierarchyQuery { .. } => {
                             end.min(Instant::now() + Duration::from_secs(5))
                         }
@@ -449,6 +461,8 @@ async fn execute(
     if matches!(
         request.operation,
         Operation::OpenFixedQuery(_)
+            | Operation::OpenRenewableFixedQuery(_)
+            | Operation::RenewFixedQuery(_)
             | Operation::FixedQueryFragment(_)
             | Operation::CloseFixedQuery { .. }
     ) && request.identity != Some(identity)
@@ -480,6 +494,35 @@ async fn execute(
                 .await
                 .map(Reply::OpenFixedQuery)
         }
+        Operation::OpenRenewableFixedQuery(request) => {
+            request.validate(shard)?;
+            let admitted = Instant::now();
+            let lease_end = admitted + Duration::from_millis(request.open.ttl_millis);
+            let hard_end = admitted + Duration::from_millis(request.hard_lifetime_millis);
+            let end = end
+                .min(lease_end)
+                .min(admitted + Duration::from_millis(request.open.acquire_timeout_millis));
+            distributed::fixed::renewable_preflight(identity, &request, end)?;
+            raft.ensure_linearizable()
+                .await
+                .map_err(|_| RemoteError::Unavailable)?;
+            query_sessions
+                .open_renewable_fixed(
+                    &state,
+                    identity,
+                    shard,
+                    request.open,
+                    end,
+                    lease_end,
+                    hard_end,
+                )
+                .await
+                .map(Reply::OpenRenewableFixedQuery)
+        }
+        Operation::RenewFixedQuery(request) => query_sessions
+            .renew_fixed_checked(&state, identity, shard, request, end)
+            .await
+            .map(Reply::RenewFixedQuery),
         Operation::FixedQueryFragment(request) => {
             query_sessions
                 .fragment_fixed(&state, identity, shard, request, end)

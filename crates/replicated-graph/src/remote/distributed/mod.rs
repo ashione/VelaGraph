@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod adjacency;
 pub(crate) mod fixed;
 pub(crate) mod fixed_execution;
+mod fixed_parallel;
 use adjacency::Direction;
 pub(in crate::remote) mod channel;
 pub mod consistency;
@@ -46,7 +47,16 @@ pub struct StaticCatalog {
 }
 impl StaticCatalog {
     fn validate(&self) -> Result<(), RemoteError> {
-        if self.partitions.is_empty() || self.partitions.len() > 32 {
+        self.validate_bounded(32, 8)
+    }
+    // Fixed-V cohorts have their own protocol membership ceiling. Keep the
+    // observed entrypoint's independent admission contract unchanged.
+    fn validate_bounded(
+        &self,
+        max_partitions: usize,
+        max_shards: usize,
+    ) -> Result<(), RemoteError> {
+        if self.partitions.is_empty() || self.partitions.len() > max_partitions {
             return Err(RemoteError::InvalidArgument);
         }
         let mut partitions = BTreeMap::new();
@@ -78,7 +88,7 @@ impl StaticCatalog {
                 return Err(RemoteError::InvalidArgument);
             }
         }
-        if shards.len() > 8 {
+        if shards.len() > max_shards {
             return Err(RemoteError::ResourceExhausted);
         }
         Ok(())
@@ -419,12 +429,21 @@ struct Execution<'a> {
     catalog: &'a StaticCatalog,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     fixed_sessions: Option<&'a mut BTreeMap<u64, fixed_execution::NodeSession>>,
+    control: Option<fixed_execution::ExecutionControl>,
+    fixed_parallelism: usize,
     end: Instant,
     cost: Cost,
     scan_cost: Cost,
     ceiling: Cost,
 }
 impl Execution<'_> {
+    fn check(&self) -> Result<(), QueryFailure> {
+        check(self.end)?;
+        if let Some(control) = &self.control {
+            control.check()?;
+        }
+        Ok(())
+    }
     fn route(&self, partition: u32) -> Result<&PartitionRoute, QueryFailure> {
         self.catalog
             .partitions
@@ -440,11 +459,18 @@ impl Execution<'_> {
         fragment: Fragment,
         connection: Option<&mut Option<channel::Connection>>,
     ) -> Result<FragmentValue, QueryFailure> {
-        check(self.end)?;
+        self.check()?;
         if let Some(sessions) = &mut self.fixed_sessions {
             // The separate admitted fixed path shares all traversal/adjacency
             // semantics, but never calls an observed OpenQuery/QueryFragment.
-            return fixed_execution::fragment(sessions, fragment, &mut self.cost, self.end).await;
+            return fixed_execution::fragment(
+                sessions,
+                fragment,
+                &mut self.cost,
+                self.end,
+                self.control.as_ref(),
+            )
+            .await;
         }
         let route = self.route(fragment.partition())?.clone();
         let descriptor = self
@@ -641,7 +667,7 @@ impl Execution<'_> {
             }
         }
         for step in traversal_steps {
-            check(self.end)?;
+            self.check()?;
             match step {
                 Step::Existing(GremlinStep::Limit(n)) => rows.truncate(*n),
                 Step::Dedup => {
@@ -755,7 +781,7 @@ impl Execution<'_> {
         };
         let bytes = bounded_encode(&output, self.end)?;
         self.cost.charge(bytes.len() * 2, 0, self.ceiling)?;
-        check(self.end)?;
+        self.check()?;
         Ok(output)
     }
     async fn close(&self) {
@@ -792,6 +818,8 @@ async fn execute(
     let query = plan(&request)?;
     let mut execution = Execution {
         fixed_sessions: None,
+        control: None,
+        fixed_parallelism: 3,
         catalog,
         ceiling: CEILING,
         scan_cost: Cost {
@@ -1054,9 +1082,16 @@ fn validate_output(
     output: &DistributedOutput,
     request: &DistributedRequest,
 ) -> Result<(), RemoteError> {
+    validate_output_bounded(output, request, 8)
+}
+fn validate_output_bounded(
+    output: &DistributedOutput,
+    request: &DistributedRequest,
+    max_snapshots: usize,
+) -> Result<(), RemoteError> {
     if output.completeness != QueryCompleteness::Unverified
         || output.snapshots.is_empty()
-        || output.snapshots.len() > 8
+        || output.snapshots.len() > max_snapshots
         || output.rows.len() > MAX_ROWS
         || output
             .snapshots
@@ -1183,6 +1218,67 @@ mod tests {
             epoch: 2,
             identity: RemoteIdentity { group: 3, node: 1 },
             endpoint: "127.0.0.1:10000".parse().unwrap(),
+        }
+    }
+    #[test]
+    fn fixed_membership_is_independent_of_observed_fanout_and_lane_width() {
+        let routes: Vec<_> = (1..=65)
+            .map(|n| PartitionRoute {
+                partition: n,
+                shard: u64::from(n),
+                epoch: 1,
+                identity: RemoteIdentity {
+                    group: u64::from(n),
+                    node: 1,
+                },
+                endpoint: format!("127.0.0.1:{}", 10000 + n).parse().unwrap(),
+            })
+            .collect();
+        for count in [1, 8, 9, 32, 64] {
+            let catalog = StaticCatalog {
+                partitions: routes[..count].to_vec(),
+            };
+            assert!(catalog
+                .validate_bounded(fixed::MAX_MEMBERS, fixed::MAX_MEMBERS)
+                .is_ok());
+            assert_eq!(catalog.validate().is_ok(), count <= 8);
+        }
+        let mut catalog = StaticCatalog { partitions: routes };
+        assert!(catalog
+            .validate_bounded(fixed::MAX_MEMBERS, fixed::MAX_MEMBERS)
+            .is_err());
+        catalog.partitions.pop();
+        catalog.partitions[63].endpoint = catalog.partitions[0].endpoint;
+        assert!(catalog
+            .validate_bounded(fixed::MAX_MEMBERS, fixed::MAX_MEMBERS)
+            .is_err());
+        assert!(fixed_parallel::validate_width(8).is_ok());
+        assert!(fixed_parallel::validate_width(9).is_err());
+    }
+    #[test]
+    fn fixed_output_membership_preserves_observed_snapshot_bound() {
+        let request = request("g.V(1).count()");
+        for count in [1, 8, 9, 64, 65] {
+            let output = DistributedOutput {
+                completeness: QueryCompleteness::Unverified,
+                snapshots: (1..=count)
+                    .map(|shard| QueryStamp {
+                        identity: RemoteIdentity {
+                            group: shard,
+                            node: 1,
+                        },
+                        shard,
+                        epoch: 1,
+                        sequence: 0,
+                    })
+                    .collect(),
+                rows: vec![QueryRow::Count(0)],
+            };
+            assert_eq!(validate_output(&output, &request).is_ok(), count <= 8);
+            assert_eq!(
+                validate_output_bounded(&output, &request, fixed::MAX_MEMBERS).is_ok(),
+                count <= 64
+            );
         }
     }
     #[test]

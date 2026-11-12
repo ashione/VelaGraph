@@ -31,10 +31,10 @@ pub(super) struct Retained {
     result: pages::Materialized,
     pub(super) closed: std::sync::atomic::AtomicBool,
 }
-fn snapshot_error(error: cohort_reads::Error) -> Error {
+pub(super) fn snapshot_error(error: cohort_reads::Error) -> Error {
     managed_graph::Error::from(error).into()
 }
-fn remote_error(error: RemoteError) -> Error {
+pub(super) fn remote_error(error: RemoteError) -> Error {
     match error {
         RemoteError::ResourceExhausted
         | RemoteError::Application(d2_raft::D1Error::VisibilityReadLimit) => Error::Capacity,
@@ -44,7 +44,7 @@ fn remote_error(error: RemoteError) -> Error {
         _ => Error::Unknown,
     }
 }
-fn request(query: &Query) -> DistributedRequest {
+pub(super) fn request(query: &Query) -> DistributedRequest {
     DistributedRequest {
         start_partition: query.partition,
         text: query.text.clone(),
@@ -54,7 +54,7 @@ fn request(query: &Query) -> DistributedRequest {
 pub(super) fn validate_routes(config: &RemoteConfig, routes: &[LocalGraphRoute]) -> Result<()> {
     let cohort = &config.binding.cohort;
     if routes.is_empty()
-        || routes.len() > 8
+        || routes.len() > fixed::MAX_MEMBERS
         || routes.len() != cohort.members.len()
         || routes.len() != config.members.len()
     {
@@ -101,7 +101,7 @@ pub(super) fn live(retained: &Retained, end: Instant) -> Result<()> {
     }
     before_deadline(end)
 }
-fn preflight(binding: &Binding, reply: Reply) -> Result<()> {
+pub(super) fn preflight(binding: &Binding, reply: Reply) -> Result<()> {
     encode(
         &Response {
             version: VERSION,
@@ -323,6 +323,8 @@ impl State {
                             endpoint: route.endpoint,
                         },
                         opened.descriptor.clone(),
+                        opened.capture_cost.bytes,
+                        opened.capture_cost.rows,
                     ),
                 );
                 // Compare the complete retained certificate, not a boolean or V.
@@ -346,6 +348,7 @@ impl State {
             fixed_execution::execute(
                 &mut sessions,
                 &req,
+                self.config.local_query_parallelism,
                 tokio::time::Instant::from_std(end.min(expires)),
             )
             .await

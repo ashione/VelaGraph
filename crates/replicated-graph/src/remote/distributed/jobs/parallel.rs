@@ -204,6 +204,8 @@ pub(super) async fn run(
             futures.push(Box::pin(async move {
                 let mut execution = Execution {
                     fixed_sessions: None,
+                    control: None,
+                    fixed_parallelism: 3,
                     scan_cost: Cost::default(),
                     catalog,
                     sessions,

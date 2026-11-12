@@ -1,16 +1,22 @@
 //! Independent-process managed transport acceptance, not multi-host HA evidence.
 //! Every parent data path crosses TCP. Only each child owns its own Raft handle.
-include!("support/managed_process_fixture.rs");
-
+use anyhow::{anyhow, Context};
 use d2_raft::{
-    managed_rpc::NodeRef,
-    transaction_decisions::{Decision, MemberCapacityGrant, RequestRecord},
-    versioned_reads::ReadLimit,
+    managed_rpc::{activate_byte_bound_member, Client, Identity, NodeRef, Role, Server},
+    participant_writes::Authority,
+    transaction_decisions::{
+        CapacityProfile, Cohort, Command as DecisionCommand, Decision, Journal, Member,
+        MemberCapacityGrant, RequestRecord,
+    },
+    versioned_reads::{ReadLimit, Target},
+    Cluster, D1Command, LogCommand, NodeHandle, StateMachine,
 };
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use replicated_graph::{
     managed_gateway::{
-        self as gateway, EdgeData, Entity, Gateway, Mutation, Operation, PageCursor, Patch, Query,
-        QueryPage, RemoteConfig, Reply, Session, VertexData, Write, WriteStatus,
+        self as gateway, Binding, EdgeData, Entity, Gateway, Mapping, Mutation, Operation,
+        PageCursor, Patch, Query, QueryPage, RemoteConfig, Reply, Session, VertexData, Write,
+        WriteStatus,
     },
     managed_graph::GraphCohort,
     remote::query::{QualifiedElement, QueryCompleteness, QueryRow},
@@ -19,15 +25,23 @@ use rocksdb_sql_table::{
     experimental_graph::{CrossEdge, VertexRef},
     Value,
 };
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{Cursor, Write as _},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// Independent retained-view fixture phases share this test runner's resources.
-// Serialize only those phases, never their internal concurrent graph operations.
-static RETAINED_FIXTURE_PHASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-fn identity(shard: u64) -> Identity {
-    identity_in(shard, cohort())
-}
+// Share only fixture helpers, never another target's acceptance tests.
+include!("support/managed_process_fixture.rs");
+
 fn limit() -> ReadLimit {
     ReadLimit {
         rows: 1000,
@@ -35,6 +49,7 @@ fn limit() -> ReadLimit {
         operations: 10000,
     }
 }
+
 impl FixtureDirectory {
     fn retained(path: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(&path)?;
@@ -46,6 +61,11 @@ impl FixtureDirectory {
 }
 
 impl Process {
+    async fn reopen(&mut self) -> anyhow::Result<()> {
+        fs::remove_file(self.directory.path().join("ready.json"))?;
+        self.child = Self::launch(self.directory.path(), self.shard, self.address, false)?;
+        self.ready().await
+    }
     async fn snapshot_restore(&mut self) -> anyhow::Result<()> {
         if self.directory.path().join("snapshot.restored").exists() {
             return Ok(());
@@ -73,34 +93,6 @@ impl Process {
     }
 }
 
-async fn call(g: &Gateway, operation: Operation) -> gateway::Result<Reply> {
-    call_bound(g, binding(), operation).await
-}
-async fn call_bound(g: &Gateway, binding: Binding, operation: Operation) -> gateway::Result<Reply> {
-    gateway::request(g.local_addr(), binding, operation, BUDGET).await
-}
-async fn open(g: &Gateway, version: Option<u64>) -> anyhow::Result<Session> {
-    open_bound(g, binding(), version).await
-}
-async fn open_bound(
-    g: &Gateway,
-    binding: Binding,
-    version: Option<u64>,
-) -> anyhow::Result<Session> {
-    match call_bound(
-        g,
-        binding,
-        Operation::OpenSession {
-            version,
-            ttl_millis: 60000,
-        },
-    )
-    .await?
-    {
-        Reply::OpenSession(s) => Ok(s),
-        other => anyhow::bail!("expected session: {other:?}"),
-    }
-}
 async fn read(
     g: &Gateway,
     session: &Session,
@@ -141,20 +133,7 @@ async fn read_bound(
         other => anyhow::bail!("expected query: {other:?}"),
     }
 }
-fn committed(reply: Reply) -> ([u8; 16], u64) {
-    match reply {
-        Reply::Write {
-            transaction_id: Some(id),
-            status:
-                WriteStatus::Committed {
-                    ordinal,
-                    visible: true,
-                },
-            ..
-        } => (id, ordinal),
-        other => panic!("expected visible Commit: {other:?}"),
-    }
-}
+
 fn create(external: u8, partition: u32) -> Write {
     Write {
         external_id: [external; 16],
@@ -941,38 +920,6 @@ async fn fixed_version_repeat_scenario(g: &Gateway) -> anyhow::Result<(u64, Vec<
     Ok((version, paths))
 }
 
-async fn traverse(
-    g: &Gateway,
-    session: &Session,
-    partition: u32,
-    text: &str,
-) -> anyhow::Result<Vec<QueryRow>> {
-    let query = Query {
-        partition,
-        text: text.into(),
-    };
-    match call(
-        g,
-        Operation::Traverse {
-            session: session.clone(),
-            query: query.clone(),
-        },
-    )
-    .await?
-    {
-        Reply::Traverse {
-            session: returned,
-            query: echoed,
-            data,
-        } => {
-            assert_eq!(returned, *session);
-            assert_eq!(echoed, query);
-            assert_eq!(data.completeness, QueryCompleteness::Unverified);
-            Ok(data.rows)
-        }
-        other => anyhow::bail!("expected traversal: {other:?}"),
-    }
-}
 async fn page(
     g: &Gateway,
     session: &Session,

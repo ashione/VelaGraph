@@ -1,8 +1,8 @@
 //! Fixed sessions share the observed process-wide permits and fragment engine.
 use super::*;
 use crate::remote::distributed::fixed::{
-    CaptureCost, FixedDescriptor, FixedFragmentOutput, FixedFragmentRequest, FixedOpenRequest,
-    FixedOpened,
+    CaptureCost, FixedDescriptor, FixedFragmentOutput, FixedFragmentRequest, FixedLeaseGrant,
+    FixedOpenRequest, FixedOpened, FixedRenewRequest, LocalReadProfile, RenewableFixedOpened,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,9 +15,32 @@ pub(super) struct FixedSession {
     descriptor: FixedDescriptor,
     pub(super) node: query::FrozenNode,
     ledger: Mutex<Ledger>,
+    lease: Mutex<Option<super::node_lease::NodeLease>>,
     failed: AtomicBool,
     _slot: tokio::sync::SemaphorePermit<'static>,
     _bytes: tokio::sync::SemaphorePermit<'static>,
+}
+impl FixedSession {
+    pub(super) fn live_at(&self, now: Instant) -> bool {
+        let lease = self.lease.lock().unwrap();
+        // The old fixed-session cleanup/poison behavior is unchanged.
+        let Some(lease) = lease.as_ref() else {
+            return now < Instant::from_std(self.node.end);
+        };
+        let end = lease.end;
+        let live = now < end && !self.failed.load(Ordering::Acquire);
+        if !live {
+            self.failed.store(true, Ordering::Release);
+        }
+        live
+    }
+    fn deadline(&self) -> Instant {
+        self.lease
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(Instant::from_std(self.node.end), |lease| lease.end)
+    }
 }
 impl Sessions {
     #[allow(clippy::too_many_arguments)]
@@ -30,6 +53,54 @@ impl Sessions {
         end: Instant,
         lease_end: Instant,
     ) -> Result<FixedOpened, RemoteError> {
+        self.open_fixed_inner(state, identity, shard, request, (end, lease_end), None)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::remote) async fn open_renewable_fixed(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        request: FixedOpenRequest,
+        end: Instant,
+        lease_end: Instant,
+        hard_end: Instant,
+    ) -> Result<RenewableFixedOpened, RemoteError> {
+        if request.profile != LocalReadProfile::Parity2MiBV1 {
+            return Err(RemoteError::InvalidArgument);
+        }
+        let opened = self
+            .open_fixed_inner(
+                state,
+                identity,
+                shard,
+                request,
+                (end, lease_end),
+                Some(hard_end),
+            )
+            .await?;
+        let grant = FixedLeaseGrant {
+            descriptor: opened.descriptor.clone(),
+            generation: 0,
+            granted_millis: lease_end
+                .min(hard_end)
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        };
+        Ok(RenewableFixedOpened { opened, grant })
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn open_fixed_inner(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        request: FixedOpenRequest,
+        deadlines: (Instant, Instant),
+        hard: Option<Instant>,
+    ) -> Result<FixedOpened, RemoteError> {
+        let (end, lease_end) = deadlines;
         let end = end.min(lease_end);
         check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
         request.validate(shard)?;
@@ -116,6 +187,7 @@ impl Sessions {
                 end: lease_end.into_std(),
             },
             ledger: Mutex::new(Ledger::default()),
+            lease: Mutex::new(hard.map(|hard| super::node_lease::NodeLease::new(lease_end, hard))),
             failed: AtomicBool::new(false),
             _slot: slot,
             _bytes: bytes,
@@ -159,6 +231,83 @@ impl Sessions {
             return Err(RemoteError::SessionUnavailable);
         }
         Ok(session)
+    }
+    pub(in crate::remote) async fn renew_fixed_checked(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        request: FixedRenewRequest,
+        end: Instant,
+    ) -> Result<FixedLeaseGrant, RemoteError> {
+        let session = self.lookup_fixed(identity, shard, &request.descriptor)?;
+        if session.lease.lock().unwrap().is_none() {
+            return Err(RemoteError::InvalidArgument);
+        }
+        drop(session);
+        let result = async {
+            validate_mode(state, &request.descriptor).await?;
+            check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
+            let grant = self.renew_fixed(identity, shard, request.clone())?;
+            validate_mode(state, &request.descriptor).await?;
+            check(end).map_err(|_| RemoteError::Timeout { request_id: None })?;
+            Ok(grant)
+        }
+        .await;
+        if matches!(
+            result,
+            Err(RemoteError::SessionUnavailable | RemoteError::Timeout { .. })
+        ) {
+            // A late/fenced grant cannot authorize more dispatch. Close only the
+            // exact original renewable token; any existing worker retains ownership.
+            let _ = self.close_fixed(identity, shard, &request.descriptor);
+        }
+        result
+    }
+    pub(in crate::remote) fn renew_fixed(
+        &self,
+        identity: RemoteIdentity,
+        shard: u64,
+        request: FixedRenewRequest,
+    ) -> Result<FixedLeaseGrant, RemoteError> {
+        if request.descriptor.stamp.identity != identity || request.descriptor.stamp.shard != shard
+        {
+            return Err(RemoteError::InvalidArgument);
+        }
+        if request.descriptor.incarnation != self.incarnation {
+            return Err(RemoteError::SessionUnavailable);
+        }
+        // Registry lock is the renewal/expiry/close linearization point. Never
+        // renew a detached Arc or hold the fragment ledger across control work.
+        let mut values = self.fixed_values.lock().unwrap();
+        let session = values
+            .get(&request.descriptor.token)
+            .ok_or(RemoteError::SessionUnavailable)?;
+        if session.descriptor != request.descriptor {
+            return Err(RemoteError::InvalidArgument);
+        }
+        let now = Instant::now();
+        if !session.live_at(now) {
+            values.remove(&request.descriptor.token);
+            return Err(RemoteError::SessionUnavailable);
+        }
+        let result = {
+            let mut lease = session.lease.lock().unwrap();
+            lease.as_mut().ok_or(RemoteError::InvalidArgument)?.renew(
+                now,
+                request.generation,
+                request.lease_millis,
+            )
+        };
+        if !session.live_at(now) {
+            values.remove(&request.descriptor.token);
+        }
+        let granted_millis = result?;
+        Ok(FixedLeaseGrant {
+            descriptor: request.descriptor,
+            generation: request.generation,
+            granted_millis,
+        })
     }
     pub(in crate::remote) fn close_fixed(
         &self,
@@ -210,7 +359,7 @@ impl Sessions {
         }
         let session = self.lookup_fixed(identity, shard, &request.descriptor)?;
         validate_mode(state, &session.descriptor).await?;
-        let end = end.min(Instant::from_std(session.node.end));
+        let end = end.min(session.deadline());
         let permit = FRAGMENT_SLOTS
             .try_acquire()
             .map_err(|_| RemoteError::ResourceExhausted)?;
@@ -303,7 +452,6 @@ async fn validate_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::distributed::fixed::LocalReadProfile;
     use d2_raft::{
         participant_writes::Authority,
         transaction_decisions::{Cohort, Command, Decision, Journal, Member, Participant},
@@ -472,6 +620,251 @@ mod tests {
             }),
             remaining: CEILING,
         }
+    }
+
+    #[tokio::test]
+    async fn renewable_expanded_profile_rejected_before_shared_pool_admission() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        let f = Fixture::new().await;
+        let sessions = Sessions::new().unwrap();
+        let slots = SESSION_SLOTS.available_permits();
+        let bytes = SESSION_BYTES.available_permits();
+        // Exhaust both shared pools to prove profile rejection precedes slot or
+        // byte admission rather than merely dropping a temporary reservation.
+        let held_slots = SESSION_SLOTS.try_acquire_many(slots as u32).unwrap();
+        let held_bytes = SESSION_BYTES.try_acquire_many(bytes as u32).unwrap();
+        for capture_bytes in [
+            4096,
+            LocalReadProfile::LocalRead8MiBV1.capture_limit().bytes,
+        ] {
+            let mut request = f.request(0);
+            request.profile = LocalReadProfile::LocalRead8MiBV1;
+            request.capture_limit.bytes = capture_bytes;
+            request.validate(7).unwrap();
+            let now = Instant::now();
+            let end = now + Duration::from_secs(5);
+            assert!(matches!(
+                sessions
+                    .open_renewable_fixed(
+                        &f.state,
+                        identity(),
+                        7,
+                        request,
+                        end,
+                        end,
+                        now + Duration::from_secs(120),
+                    )
+                    .await,
+                Err(RemoteError::InvalidArgument)
+            ));
+            assert!(sessions.fixed_values.lock().unwrap().is_empty());
+            assert_eq!(SESSION_SLOTS.available_permits(), 0);
+            assert_eq!(SESSION_BYTES.available_permits(), 0);
+        }
+        drop(held_slots);
+        drop(held_bytes);
+        assert_eq!(SESSION_SLOTS.available_permits(), slots);
+        assert_eq!(SESSION_BYTES.available_permits(), bytes);
+    }
+
+    #[tokio::test]
+    async fn renewable_view_samples_current_lease_and_preserves_ledger_and_ownership() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        let mut f = Fixture::new().await;
+        let sessions = Sessions::new().unwrap();
+        let slots = SESSION_SLOTS.available_permits();
+        let now = Instant::now();
+        let end = now + Duration::from_secs(5);
+        let opened = sessions
+            .open_renewable_fixed(
+                &f.state,
+                identity(),
+                7,
+                f.request(0),
+                end,
+                end,
+                now + Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        let descriptor = &opened.opened.descriptor;
+        assert_eq!(opened.grant.generation, 0);
+        assert!(opened.grant.granted_millis <= 5_000);
+        // Deterministically expire only the old FrozenNode timestamp. Renewable
+        // dispatch MUST use the separately stored current lease, not this field.
+        {
+            let mut values = sessions.fixed_values.lock().unwrap();
+            Arc::get_mut(values.get_mut(&descriptor.token).unwrap())
+                .unwrap()
+                .node
+                .end = std::time::Instant::now() - Duration::from_secs(1);
+        }
+        let renew = FixedRenewRequest {
+            descriptor: descriptor.clone(),
+            generation: 1,
+            lease_millis: 60_000,
+        };
+        let grant = sessions.renew_fixed(identity(), 7, renew.clone()).unwrap();
+        let held = sessions.lookup_fixed(identity(), 7, descriptor).unwrap();
+        let lease_end = held.deadline();
+        let mut foreign = renew.clone();
+        foreign.descriptor.version += 1;
+        assert!(matches!(
+            sessions.renew_fixed(identity(), 7, foreign),
+            Err(RemoteError::InvalidArgument)
+        ));
+        let mut foreign = renew.clone();
+        foreign.descriptor.profile = LocalReadProfile::LocalRead8MiBV1;
+        assert!(matches!(
+            sessions.renew_fixed(identity(), 7, foreign),
+            Err(RemoteError::InvalidArgument)
+        ));
+        f.commit(vec![WriteOp::put(b"later", b"write")]).await;
+        assert_eq!(held.node.view.get(b"later"), None);
+        assert!(matches!(
+            sessions
+                .fragment_fixed(&f.state, identity(), 7, fragment(descriptor, 0), end)
+                .await
+                .unwrap(),
+            Reply::FixedQueryFragment(Ok(_))
+        ));
+        let used = held.ledger.lock().unwrap().used;
+        assert!(used.work > 0);
+        assert_eq!(
+            sessions.renew_fixed(identity(), 7, renew.clone()).unwrap(),
+            grant
+        );
+        assert_eq!(held.deadline(), lease_end);
+        assert_eq!(held.ledger.lock().unwrap().next_sequence, 1);
+        assert_eq!(held.ledger.lock().unwrap().used.work, used.work);
+        assert!(matches!(
+            sessions
+                .fragment_fixed(&f.state, identity(), 7, fragment(descriptor, 1), end)
+                .await
+                .unwrap(),
+            Reply::FixedQueryFragment(Ok(_))
+        ));
+        assert!(held.ledger.lock().unwrap().used.work > used.work);
+        let ledger = held.ledger.lock().unwrap();
+        sessions
+            .renew_fixed(
+                identity(),
+                7,
+                FixedRenewRequest {
+                    descriptor: descriptor.clone(),
+                    generation: 2,
+                    lease_millis: 60_000,
+                },
+            )
+            .unwrap();
+        sessions.close_fixed(identity(), 7, descriptor).unwrap();
+        assert!(sessions.renew_fixed(identity(), 7, renew).is_err());
+        assert!(sessions.lookup_fixed(identity(), 7, descriptor).is_err());
+        assert_eq!(SESSION_SLOTS.available_permits(), slots - 1);
+        drop(ledger);
+        drop(held);
+        assert_eq!(SESSION_SLOTS.available_permits(), slots);
+        let legacy = f.open(&sessions, 0).await;
+        assert!(matches!(
+            sessions.renew_fixed(
+                identity(),
+                7,
+                FixedRenewRequest {
+                    descriptor: legacy.descriptor.clone(),
+                    generation: 1,
+                    lease_millis: 60_000
+                }
+            ),
+            Err(RemoteError::InvalidArgument)
+        ));
+        sessions
+            .close_fixed(identity(), 7, &legacy.descriptor)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewable_renewal_rejects_fenced_epoch_and_removes_original_token() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        let mut f = Fixture::new().await;
+        let sessions = Sessions::new().unwrap();
+        let now = Instant::now();
+        let end = now + Duration::from_secs(5);
+        let opened = sessions
+            .open_renewable_fixed(
+                &f.state,
+                identity(),
+                7,
+                f.request(0),
+                end,
+                end,
+                now + Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        let descriptor = opened.opened.descriptor;
+        let held = sessions.lookup_fixed(identity(), 7, &descriptor).unwrap();
+        f.state = Arc::new(StateMachine::default());
+        f.apply(D1Command::Activate { shard: 7, epoch: 2 }).await;
+        assert!(matches!(
+            sessions
+                .renew_fixed_checked(
+                    &f.state,
+                    identity(),
+                    7,
+                    FixedRenewRequest {
+                        descriptor: descriptor.clone(),
+                        generation: 1,
+                        lease_millis: 60_000
+                    },
+                    end
+                )
+                .await,
+            Err(RemoteError::SessionUnavailable)
+        ));
+        assert!(held.failed.load(Ordering::Acquire));
+        assert!(sessions.lookup_fixed(identity(), 7, &descriptor).is_err());
+    }
+
+    #[tokio::test]
+    async fn renewable_expiry_removes_reachability_but_not_worker_permits() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        let f = Fixture::new().await;
+        let sessions = Sessions::new().unwrap();
+        let slots = SESSION_SLOTS.available_permits();
+        let now = Instant::now();
+        let end = now + Duration::from_secs(5);
+        let opened = sessions
+            .open_renewable_fixed(
+                &f.state,
+                identity(),
+                7,
+                f.request(0),
+                end,
+                end,
+                now + Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        let descriptor = opened.opened.descriptor;
+        let held = sessions.lookup_fixed(identity(), 7, &descriptor).unwrap();
+        held.lease.lock().unwrap().as_mut().unwrap().end = now - Duration::from_secs(1);
+        sessions.expire();
+        assert!(sessions.lookup_fixed(identity(), 7, &descriptor).is_err());
+        assert!(sessions
+            .renew_fixed(
+                identity(),
+                7,
+                FixedRenewRequest {
+                    descriptor,
+                    generation: 1,
+                    lease_millis: 60_000
+                }
+            )
+            .is_err());
+        assert_eq!(SESSION_SLOTS.available_permits(), slots - 1);
+        assert!(held.failed.load(Ordering::Acquire));
+        drop(held);
+        assert_eq!(SESSION_SLOTS.available_permits(), slots);
     }
 
     #[tokio::test]
