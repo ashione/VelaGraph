@@ -1,10 +1,10 @@
 //! Contract tests for the opt-in, append-only graph/v2 experiment.
-use rocksdb_sql_table::{
+use std::{collections::BTreeMap, sync::Arc};
+use velagraph::{
     experimental_graph::{AppendOnlyStore, CrossEdge, Direction, ExperimentalError, VertexRef},
     Edge, GraphRecordStore, KeyRange, KeyValue, LocalStorageNode, ReadView, ScanLimit,
     StorageAdmin, StorageNode, StorageNodeError, Value, Vertex, WriteOp, WriteRequest, WriteResult,
 };
-use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone)]
 struct Shared(Arc<LocalStorageNode>);
@@ -735,8 +735,8 @@ impl StorageNode for EdgePaged {
         range: KeyRange,
         limit: ScanLimit,
         view: &ReadView,
-        cursor: Option<&rocksdb_sql_table::ScanCursor>,
-    ) -> StorageResult<rocksdb_sql_table::ScanPage> {
+        cursor: Option<&velagraph::ScanCursor>,
+    ) -> StorageResult<velagraph::ScanPage> {
         let limit = if self.fault == 4 {
             ScanLimit::new(3, 4096)?
         } else {
@@ -900,8 +900,8 @@ fn edge_pages_reject_malformed_keys_envelopes_and_identity() {
     }
 }
 
-fn property_patch(value: Value) -> rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
-    rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
+fn property_patch(value: Value) -> velagraph::experimental_graph::EdgePropertyPatch {
+    velagraph::experimental_graph::EdgePropertyPatch {
         set: BTreeMap::from([("x".into(), value)]),
         ..Default::default()
     }
@@ -909,7 +909,7 @@ fn property_patch(value: Value) -> rocksdb_sql_table::experimental_graph::EdgePr
 
 #[test]
 fn edge_properties_reopen_exact_types_and_old_retries_preserve_new_values() {
-    use rocksdb_sql_table::experimental_graph::EdgePropertyPatch;
+    use velagraph::experimental_graph::EdgePropertyPatch;
     let dir = tempfile::tempdir().unwrap();
     let final_edge;
     let create;
@@ -987,7 +987,7 @@ fn edge_properties_reopen_exact_types_and_old_retries_preserve_new_values() {
 
 #[test]
 fn edge_property_validation_and_racing_cas_fail_without_writes() {
-    use rocksdb_sql_table::experimental_graph::EdgePropertyPatch;
+    use velagraph::experimental_graph::EdgePropertyPatch;
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let a = AppendOnlyStore::new(n.clone(), 7, 1);
@@ -1164,7 +1164,7 @@ fn edge_property_prepared_bytes_are_immutable_and_epoch_fencing_precedes_dedup()
 
 #[test]
 fn deleted_edges_reopen_reserve_identity_and_ignore_historical_retries() {
-    use rocksdb_sql_table::experimental_graph::EdgeRecord;
+    use velagraph::experimental_graph::EdgeRecord;
     let dir = tempfile::tempdir().unwrap();
     let (create, update, deletion, expected);
     {
@@ -1293,7 +1293,7 @@ fn deletion_cas_races_updates_and_rejects_residual_out_index() {
 
 #[test]
 fn record_pages_include_tombstones_and_charge_their_raw_bytes() {
-    use rocksdb_sql_table::experimental_graph::EdgeRecord;
+    use velagraph::experimental_graph::EdgeRecord;
     let dir = tempfile::tempdir().unwrap();
     {
         let n = node(dir.path());
@@ -1532,7 +1532,7 @@ fn independent_delete_preserves_other_source_same_id_and_unsubmitted_old_cas() {
     assert_eq!(incoming.len(), 1);
     assert_eq!(incoming[0].edge, ec.identity());
     match a.get_edge_record(7).unwrap().unwrap() {
-        rocksdb_sql_table::experimental_graph::EdgeRecord::Deleted(t) => {
+        velagraph::experimental_graph::EdgeRecord::Deleted(t) => {
             b.verify_deleted_reverse(&t).unwrap()
         }
         _ => panic!(),
@@ -1582,8 +1582,8 @@ fn independent_delete_commit_then_timeout_retry_is_historical() {
 
 #[test]
 fn simultaneous_update_delete_cas_has_one_winner_and_consistent_indexes() {
-    use rocksdb_sql_table::experimental_graph::EdgeRecord;
     use std::sync::Barrier;
+    use velagraph::experimental_graph::EdgeRecord;
 
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
@@ -1664,10 +1664,8 @@ fn simultaneous_update_delete_cas_has_one_winner_and_consistent_indexes() {
     }
 }
 
-fn vertex_property_patch(
-    value: Value,
-) -> rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
-    rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
+fn vertex_property_patch(value: Value) -> velagraph::experimental_graph::VertexPropertyPatch {
+    velagraph::experimental_graph::VertexPropertyPatch {
         set: BTreeMap::from([("x".into(), value)]),
         ..Default::default()
     }
@@ -1675,7 +1673,7 @@ fn vertex_property_patch(
 
 #[test]
 fn vertex_properties_preserve_identity_labels_types_snapshots_and_reopen_retries() {
-    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    use velagraph::experimental_graph::VertexPropertyPatch;
     let dir = tempfile::tempdir().unwrap();
     let identity = VertexRef {
         partition: 1,
@@ -1773,7 +1771,7 @@ fn vertex_properties_preserve_identity_labels_types_snapshots_and_reopen_retries
 
 #[test]
 fn vertex_property_validation_rejects_wrong_identity_stale_bytes_and_invalid_patches() {
-    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    use velagraph::experimental_graph::VertexPropertyPatch;
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let a = AppendOnlyStore::new(n.clone(), 7, 1);
@@ -1994,7 +1992,7 @@ fn vertex_property_lost_ack_dedups_and_changed_requests_conflict() {
 
 #[test]
 fn vertex_property_patch_admission_bounds_count_set_remove_and_payload_bytes() {
-    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    use velagraph::experimental_graph::VertexPropertyPatch;
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let a = AppendOnlyStore::new(n.clone(), 7, 1);
@@ -2076,7 +2074,7 @@ fn vertex_property_patch_admission_bounds_count_set_remove_and_payload_bytes() {
 
 #[test]
 fn vertex_property_nonempty_noop_commits_advance_sequence_and_fence_sibling_batches() {
-    use rocksdb_sql_table::experimental_graph::VertexPropertyPatch;
+    use velagraph::experimental_graph::VertexPropertyPatch;
     for patch in [
         vertex_property_patch(Value::Integer(7)),
         VertexPropertyPatch {

@@ -87,8 +87,8 @@ impl ElementPath {
         }
     }
 }
-fn retains_paths(query: &rocksdb_sql_table::ObservedGremlinQuery) -> bool {
-    use rocksdb_sql_table::ObservedGremlinStep as Step;
+fn retains_paths(query: &velagraph::ObservedGremlinQuery) -> bool {
+    use velagraph::ObservedGremlinStep as Step;
     // Exhaustive so a future path-dependent step cannot silently lose its data.
     query.steps().iter().any(|step| match step {
         Step::SimplePath | Step::CyclicPath | Step::Existing(GremlinStep::Path) => true,
@@ -327,10 +327,8 @@ enum StreamKind {
 
 /// Validate stream types before acquisition, including empty streams. No runtime
 /// row can turn an invalid vertex/edge transition into an apparent success.
-pub(crate) fn validate_steps(
-    query: &rocksdb_sql_table::ObservedGremlinQuery,
-) -> ExperimentalResult<()> {
-    use rocksdb_sql_table::ObservedGremlinStep as Step;
+pub(crate) fn validate_steps(query: &velagraph::ObservedGremlinQuery) -> ExperimentalResult<()> {
+    use velagraph::ObservedGremlinStep as Step;
     let mut stream = match query.start() {
         GremlinStart::Vertices(_) => StreamKind::Vertex,
         GremlinStart::Edges(_) => StreamKind::Edge,
@@ -349,7 +347,7 @@ pub(crate) fn validate_steps(
             // Preserve the error variant of the former v3 -> v2 vertex dispatch.
             if matches!(query.start(), GremlinStart::Vertices(_)) {
                 return Err(ExperimentalRouteError::Query(
-                    rocksdb_sql_table::Error::UnsupportedGremlinArgument(
+                    velagraph::Error::UnsupportedGremlinArgument(
                         "only is/dedup/limit/range/count may follow a v2 scalar projection".into(),
                     ),
                 ));
@@ -366,11 +364,9 @@ pub(crate) fn validate_steps(
                     ));
                 }
                 crate::selected_properties::validate_keys(keys).map_err(|_| {
-                    ExperimentalRouteError::Query(
-                        rocksdb_sql_table::Error::UnsupportedGremlinArgument(
-                            "valueMap requires one to eight distinct bounded keys".into(),
-                        ),
-                    )
+                    ExperimentalRouteError::Query(velagraph::Error::UnsupportedGremlinArgument(
+                        "valueMap requires one to eight distinct bounded keys".into(),
+                    ))
                 })?;
             }
             Step::Is(_) => {
@@ -426,7 +422,7 @@ pub(crate) fn validate_steps(
             ) => {}
         }
     }
-    if depth > rocksdb_sql_table::MAX_OBSERVED_GREMLIN_REPEAT_TIMES {
+    if depth > velagraph::MAX_OBSERVED_GREMLIN_REPEAT_TIMES {
         return Err(limit("v3 combined traversal depth exceeds 32"));
     }
     Ok(())
@@ -574,7 +570,7 @@ fn project_maps<R: TraversalRead + ?Sized>(
                     crate::remote::query::QueryFailure::ResourceExhausted => {
                         limit("v3 selected property map exceeds 2 KiB")
                     }
-                    _ => ExperimentalRouteError::Query(rocksdb_sql_table::Error::CorruptData(
+                    _ => ExperimentalRouteError::Query(velagraph::Error::CorruptData(
                         "invalid selected property map".into(),
                     )),
                 }
@@ -614,7 +610,7 @@ pub(crate) trait TraversalRead {
         start_partition: u32,
         text: &str,
     ) -> ExperimentalResult<Vec<ObservedRowV3>> {
-        use rocksdb_sql_table::{ObservedGremlinQuery, ObservedGremlinStep as Step};
+        use velagraph::{ObservedGremlinQuery, ObservedGremlinStep as Step};
         self.check()?;
         let query = ObservedGremlinQuery::parse(text).map_err(ExperimentalRouteError::Query)?;
         self.check()?;
@@ -863,7 +859,7 @@ pub(crate) trait TraversalRead {
                                 row.value = Some(Value::Integer(
                                     i64::try_from(row.element.order().0).map_err(|_| {
                                         ExperimentalRouteError::Query(
-                                            rocksdb_sql_table::Error::UnsupportedGremlinValue(
+                                            velagraph::Error::UnsupportedGremlinValue(
                                                 "id exceeds i64".into(),
                                             ),
                                         )
@@ -1006,7 +1002,7 @@ mod tests {
             "g.E(999).label().dedup().dedup().count()",
             "g.V(999).id().limit(2).dedup().limit(1)",
         ] {
-            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            let query = velagraph::ObservedGremlinQuery::parse(text).unwrap();
             validate_steps(&query).unwrap();
         }
         for text in [
@@ -1014,7 +1010,7 @@ mod tests {
             "g.E(999).label().dedup().hasLabel('x')",
             "g.V(999).id().dedup().path()",
         ] {
-            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            let query = velagraph::ObservedGremlinQuery::parse(text).unwrap();
             assert!(validate_steps(&query).is_err(), "{text}");
         }
         for text in [
@@ -1024,7 +1020,7 @@ mod tests {
             "g.V().path().dedup()",
         ] {
             assert!(
-                rocksdb_sql_table::ObservedGremlinQuery::parse(text).is_err(),
+                velagraph::ObservedGremlinQuery::parse(text).is_err(),
                 "{text}"
             );
         }
@@ -1052,7 +1048,7 @@ mod tests {
         assert!(matches!(
             dedup_rows(vec![row()], &mut work, || Ok(())),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         let mut work = Work {
@@ -1084,7 +1080,7 @@ mod tests {
             "g.E(999).range(1,2).label().range(0,1).is('x').dedup().count()",
             "g.V().repeat(out()).times(2).range(1,3).valueMap('x')",
         ] {
-            validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
+            validate_steps(&velagraph::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
         }
         for text in [
             "g.V(999).range(0,0).inV()",
@@ -1094,8 +1090,7 @@ mod tests {
             "g.V(999).range(0,0).repeat(out()).times(32).out()",
         ] {
             assert!(
-                validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap())
-                    .is_err(),
+                validate_steps(&velagraph::ObservedGremlinQuery::parse(text).unwrap()).is_err(),
                 "accepted {text}"
             );
         }
@@ -1234,7 +1229,7 @@ mod tests {
             "g.E(999).id().is(1).limit(1).is(1)",
             "g.V().repeat(out()).times(2).label().is('same')",
         ] {
-            validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
+            validate_steps(&velagraph::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
         }
         for text in [
             "g.V(999).is(1)",
@@ -1246,8 +1241,7 @@ mod tests {
             "g.V(999).id().is(1).values('x')",
         ] {
             assert!(
-                validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap())
-                    .is_err(),
+                validate_steps(&velagraph::ObservedGremlinQuery::parse(text).unwrap()).is_err(),
                 "accepted {text}"
             );
         }
@@ -1453,7 +1447,7 @@ mod tests {
             "g.E(1).bothV().repeat(__.out()).times(32).path()",
             "g.V(1).outE().inV().repeat(__.in()).times(31).dedup().id()",
         ] {
-            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            let query = velagraph::ObservedGremlinQuery::parse(text).unwrap();
             validate_steps(&query).unwrap();
         }
         for text in [
@@ -1463,7 +1457,7 @@ mod tests {
             "g.V(999).repeat(__.in()).times(32).out()",
             "g.V(999).outE().inV().repeat(__.out()).times(32)",
         ] {
-            let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+            let query = velagraph::ObservedGremlinQuery::parse(text).unwrap();
             assert!(validate_steps(&query).is_err(), "{text}");
         }
         for text in [
@@ -1476,7 +1470,7 @@ mod tests {
             "g.V(999).repeat(__.out()).times(1).repeat(__.in()).times(1)",
         ] {
             assert!(
-                rocksdb_sql_table::ObservedGremlinQuery::parse(text).is_err(),
+                velagraph::ObservedGremlinQuery::parse(text).is_err(),
                 "{text}"
             );
         }

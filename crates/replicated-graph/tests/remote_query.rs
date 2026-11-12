@@ -12,12 +12,6 @@ use replicated_graph::{
     },
     run_blocking,
 };
-use rocksdb_sql_table::{
-    experimental_graph::{AppendOnlyStore, CrossEdge, VertexRef},
-    Edge, Export, GraphRecordStore, GremlinRow, KeyRange, KeyValue, LocalStorageNode, PathElement,
-    ReadView, ScanLimit, StorageAdmin, StorageNode, StorageNodeError, Value, Vertex, WriteRequest,
-    WriteResult,
-};
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -29,6 +23,12 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::{sleep, timeout},
+};
+use velagraph::{
+    experimental_graph::{AppendOnlyStore, CrossEdge, VertexRef},
+    Edge, Export, GraphRecordStore, GremlinRow, KeyRange, KeyValue, LocalStorageNode, PathElement,
+    ReadView, ScanLimit, StorageAdmin, StorageNode, StorageNodeError, Value, Vertex, WriteRequest,
+    WriteResult,
 };
 
 const SHARD: u64 = 7;
@@ -73,8 +73,8 @@ impl StorageNode for Shared {
         range: KeyRange,
         limit: ScanLimit,
         view: &ReadView,
-        cursor: Option<&rocksdb_sql_table::ScanCursor>,
-    ) -> Result<rocksdb_sql_table::ScanPage, StorageNodeError> {
+        cursor: Option<&velagraph::ScanCursor>,
+    ) -> Result<velagraph::ScanPage, StorageNodeError> {
         self.0.scan_page(range, limit, view, cursor)
     }
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult, StorageNodeError> {
@@ -152,7 +152,7 @@ fn fixture() -> anyhow::Result<(Export, Vec<Vec<QueryRow>>)> {
                 .execute_gremlin(text)
                 .map(|r| r.rows.into_iter().map(qualified).collect())
         })
-        .collect::<rocksdb_sql_table::Result<Vec<_>>>()?;
+        .collect::<velagraph::Result<Vec<_>>>()?;
     let v2 = AppendOnlyStore::new(node.clone(), SHARD, 0);
     let outside = AppendOnlyStore::new(node.clone(), SHARD, 1);
     for (id, name) in [(1, "alice"), (2, "bob")] {

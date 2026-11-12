@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use rocksdb_sql_table::{
+use tempfile::TempDir;
+use velagraph::{
     Edge, Error, Export, GraphRecordStore, KeyRange, KeyValue, LocalStorageNode, ReadView,
     RequestId, ScanLimit, Sequence, StorageAdmin, StorageNode, StorageNodeError, Value, Vertex,
     WriteOp, WriteRequest, WriteResult,
 };
-use tempfile::TempDir;
 
 // Only a deadlock guard: channels, not elapsed time, determine race ordering.
 const GATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -87,7 +87,7 @@ enum Mutation {
 }
 
 impl Mutation {
-    fn apply(&self, store: &GraphRecordStore<ControlledNode>) -> rocksdb_sql_table::Result<()> {
+    fn apply(&self, store: &GraphRecordStore<ControlledNode>) -> velagraph::Result<()> {
         match self {
             Self::CreateVertex(vertex) => store.create_vertex(vertex),
             Self::CreateEdge(edge) => store.create_edge(edge),
@@ -114,7 +114,7 @@ fn assert_conflict(error: Error, expected: Sequence) {
 
 struct Race {
     winner: Export,
-    retry: rocksdb_sql_table::Result<()>,
+    retry: velagraph::Result<()>,
     after_retry: Export,
 }
 
@@ -417,7 +417,7 @@ fn legacy_adapter_rejects_graph_write_without_unconditional_fallback() {
         )
         .unwrap();
     assert_eq!(graph.node().unconditional_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(result.status, rocksdb_sql_table::WriteStatus::Committed);
+    assert_eq!(result.status, velagraph::WriteStatus::Committed);
     assert_eq!(result.sequence, before.sequence + 1);
     assert_eq!(result.applied_operations, 1);
     let after = node.admin().export().unwrap();

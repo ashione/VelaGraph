@@ -1,13 +1,13 @@
 //! Data-local fixed snapshots and bounded typed fragment execution.
 use super::*;
-use rocksdb_sql_table::{
+use std::sync::Mutex;
+use velagraph::{
     experimental_graph::{
         AppendOnlyStore, CrossEdge, Direction, EdgeRecord, ExperimentalError, VertexRef,
     },
     Export, KeyRange, KeyValue, ReadView, ScanCursor, ScanLimit, ScanPage, StorageAdmin,
     StorageNode, StorageNodeError, Vertex, WriteRequest, WriteResult,
 };
-use std::sync::Mutex;
 mod fixed_sessions;
 mod node_lease;
 
@@ -1388,7 +1388,7 @@ mod epoch_tests {
         // Build valid graph bytes off the async executor, using a disposable local DB.
         // Adapter exists only to let AppendOnlyStore share ownership of that DB.
         #[derive(Clone)]
-        struct FixtureNode(Arc<rocksdb_sql_table::LocalStorageNode>);
+        struct FixtureNode(Arc<velagraph::LocalStorageNode>);
         impl StorageNode for FixtureNode {
             fn read_view(&self) -> Result<ReadView, StorageNodeError> {
                 self.0.read_view()
@@ -1425,7 +1425,7 @@ mod epoch_tests {
         let (mut entries, label) = tokio::task::spawn_blocking(|| {
             let dir = tempfile::tempdir().unwrap();
             let node = FixtureNode(Arc::new(
-                rocksdb_sql_table::LocalStorageNode::open(dir.path(), 7).unwrap(),
+                velagraph::LocalStorageNode::open(dir.path(), 7).unwrap(),
             ));
             node.admin().set_epoch(1).unwrap();
             let store = AppendOnlyStore::new(node.clone(), 7, 0);
@@ -1436,7 +1436,7 @@ mod epoch_tests {
             source.properties.insert("null".into(), Value::Null);
             source.properties.insert(
                 "payload".into(),
-                rocksdb_sql_table::Value::Text("v".repeat(16 * 1024)),
+                velagraph::Value::Text("v".repeat(16 * 1024)),
             );
             for vertex in [source, Vertex::new(2)] {
                 store

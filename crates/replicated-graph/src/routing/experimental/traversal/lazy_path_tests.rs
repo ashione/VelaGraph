@@ -36,7 +36,7 @@ impl TraversalRead for SyntheticRead {
         let shard = u64::from(partition);
         Ok(AppendOnlyStore::new(
             crate::remote::query::FrozenNode {
-                view: rocksdb_sql_table::ReadView::from_entries(shard, 1, 0, BTreeMap::new())?,
+                view: velagraph::ReadView::from_entries(shard, 1, 0, BTreeMap::new())?,
                 end: std::time::Instant::now() + std::time::Duration::from_secs(5),
             },
             shard,
@@ -118,7 +118,7 @@ fn path_policy_uses_the_complete_validated_ast() {
         ("g.V().repeat(out()).times(32).cyclicPath().id()", true),
         ("g.V(999).simplePath().range(0,0).valueMap('x')", true),
     ] {
-        let query = rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap();
+        let query = velagraph::ObservedGremlinQuery::parse(text).unwrap();
         validate_steps(&query).unwrap();
         assert_eq!(retains_paths(&query), expected, "{text}");
     }

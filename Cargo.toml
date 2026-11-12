@@ -4,13 +4,13 @@ default-members = [".", "crates/d2-raft", "crates/replicated-graph"]
 resolver = "2"
 
 [package]
-name = "rocksdb-sql-table"
+name = "velagraph"
 version = "0.1.0"
 edition = "2021"
 description = "VelaGraph property-graph storage and Gremlin query kernel"
 
 [lib]
-name = "rocksdb_sql_table"
+name = "velagraph"
 path = "src/lib.rs"
 
 [dependencies]

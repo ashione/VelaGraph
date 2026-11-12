@@ -25,9 +25,17 @@ record encodings, graph errors in use, Gremlin query semantics and distributed
 protocols are unchanged. Existing graph data does not require a format migration.
 `GraphEngine`, `GraphRecordStore` and distributed APIs remain the graph entrypoints.
 
-The package name `rocksdb-sql-table` and import `rocksdb_sql_table` are retained
-for now; renaming every downstream import is separate from removing SQL behavior.
-This does not retain the old SQL implementation or promise SQL compatibility.
+## Rust package migration
+
+The root package was renamed from `rocksdb-sql-table` to `velagraph`, and the
+library import from `rocksdb_sql_table` to `velagraph`. Update Cargo dependencies,
+Rust imports and fully-qualified paths, and any `cargo -p rocksdb-sql-table`
+commands to `cargo -p velagraph`. No compatibility alias or SQL implementation
+is retained. Workspace graph consumers and examples use the new name.
+
+This is a source/package rename only. RocksDB remains the storage engine; graph
+files, key layouts, record encodings and distributed wire protocols are unchanged.
+Existing graph data needs no migration or rebuild because of this rename.
 
 Historical evidence documents may mention SQL test counts or state that a past
 change left SQL untouched. Those are observations for their named revisions,

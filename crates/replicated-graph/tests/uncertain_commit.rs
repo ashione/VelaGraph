@@ -1,7 +1,7 @@
 use d2_raft::{Cluster, D1Command, LogCommand};
 use replicated_graph::{run_blocking, ReplicatedStorageNode};
-use rocksdb_sql_table::{Error, GraphRecordStore, StorageNodeError, Vertex};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use velagraph::{Error, GraphRecordStore, StorageNodeError, Vertex};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_after_submit_then_exact_retry_and_epoch_fence() {
     tokio::time::timeout(Duration::from_secs(30), scenario())

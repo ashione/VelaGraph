@@ -1,10 +1,10 @@
 //! Shared bounded selected-vertex property contract for all query providers.
 use crate::remote::query::QueryFailure;
-use rocksdb_sql_table::Value;
 use serde::Serialize;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use velagraph::Value;
 
 pub(crate) const MAX_MAP_BYTES: usize = 2048;
 

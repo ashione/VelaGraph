@@ -12,13 +12,13 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use d2_raft::{D1Result, D1WriteRequest, D1WriteStatus};
-use rocksdb_sql_table::{
+use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
+use velagraph::{
     Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
     Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
     WriteResult, WriteStatus,
 };
-use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
 
 use crate::remote::{self, RemoteError};
 use crate::{application_error, poll_before_deadline, Result, BLOCKING_SCOPE};

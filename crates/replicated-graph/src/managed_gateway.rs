@@ -14,11 +14,11 @@ use d2_raft::{
     versioned_reads::{ReadLimit, Target},
     NodeHandle,
 };
-use rocksdb_sql_table::{
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use velagraph::{
     experimental_graph::{CrossEdge, EdgePropertyPatch, EdgeRef, VertexPropertyPatch, VertexRef},
     Value, Vertex,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[path = "managed_gateway_jobs.rs"]
 mod jobs;
 #[path = "managed_gateway_local.rs"]
@@ -1317,7 +1317,7 @@ async fn serve(
             | Operation::OpenLocalQueryAfter { .. }
             | Operation::FetchLocalQuery { .. }
     ) {
-        end.min(Instant::now() + rocksdb_sql_table::GREMLIN_DEADLINE)
+        end.min(Instant::now() + velagraph::GREMLIN_DEADLINE)
     } else {
         end
     };

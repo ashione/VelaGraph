@@ -2,12 +2,12 @@
 use d2_raft::{Cluster, D1Command, D1Result, LogCommand, NodeHandle};
 use openraft::{storage::RaftStateMachine, BasicNode};
 use replicated_graph::{run_blocking, ReplicatedStorageNode};
-use rocksdb_sql_table::{
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::time::{sleep, timeout};
+use velagraph::{
     Edge, Error, Export, GraphRecordStore, KeyRange, PreparedGraphMutation, ScanLimit, StorageNode,
     StorageNodeError, Value, Vertex,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::time::{sleep, timeout};
 
 type Graph = Arc<GraphRecordStore<ReplicatedStorageNode>>;
 fn graph(node: &NodeHandle) -> Graph {
@@ -19,14 +19,12 @@ fn graph(node: &NodeHandle) -> Graph {
 }
 async fn on<T: Send + 'static>(
     g: &Graph,
-    f: impl FnOnce(&GraphRecordStore<ReplicatedStorageNode>) -> rocksdb_sql_table::Result<T>
-        + Send
-        + 'static,
-) -> rocksdb_sql_table::Result<T> {
+    f: impl FnOnce(&GraphRecordStore<ReplicatedStorageNode>) -> velagraph::Result<T> + Send + 'static,
+) -> velagraph::Result<T> {
     let g = g.clone();
     run_blocking(move || f(&g)).await?
 }
-async fn commit(g: &Graph, p: &PreparedGraphMutation) -> rocksdb_sql_table::Result<()> {
+async fn commit(g: &Graph, p: &PreparedGraphMutation) -> velagraph::Result<()> {
     let p = p.clone();
     on(g, move |g| g.commit_prepared(&p)).await
 }
@@ -117,7 +115,7 @@ async fn converge(cluster: &Cluster, nodes: &[NodeHandle], current: usize) -> an
     }
     Ok(())
 }
-fn conflict(result: rocksdb_sql_table::Result<()>) {
+fn conflict(result: velagraph::Result<()>) {
     assert!(
         matches!(
             result,
@@ -571,7 +569,7 @@ async fn retained_views_bounded_scans_and_replicated_epoch_fencing() -> anyhow::
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paged_snapshot_survives_failover_without_switching_view() -> anyhow::Result<()> {
     timeout(Duration::from_secs(45), async {
-        use rocksdb_sql_table::{WriteOp, WriteRequest};
+        use velagraph::{WriteOp, WriteRequest};
         let cluster = Cluster::new();
         let dirs = (0..3)
             .map(|_| tempfile::tempdir())

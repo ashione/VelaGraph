@@ -1,14 +1,14 @@
 //! Regressions for rejecting a Tokio worker before taking the graph mutex.
 use d2_raft::{Cluster, D1Command, LogCommand};
 use replicated_graph::{run_blocking, ReplicatedStorageNode};
-use rocksdb_sql_table::{
-    Error, GraphRecordStore, KeyRange, KeyValue, ReadView, ScanLimit, Sequence, StorageAdmin,
-    StorageNode, StorageNodeError, Vertex, WriteRequest, WriteResult,
-};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
+};
+use velagraph::{
+    Error, GraphRecordStore, KeyRange, KeyValue, ReadView, ScanLimit, Sequence, StorageAdmin,
+    StorageNode, StorageNodeError, Vertex, WriteRequest, WriteResult,
 };
 
 type Result<T> = std::result::Result<T, StorageNodeError>;

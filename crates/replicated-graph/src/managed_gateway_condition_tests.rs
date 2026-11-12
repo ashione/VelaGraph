@@ -638,7 +638,7 @@ async fn conditional_self_loop_combines_one_part_and_preserves_unrelated_values(
     assert_eq!(
         now.observed_adjacency(
             entity(7, 1).vertex(),
-            rocksdb_sql_table::experimental_graph::Direction::Out
+            velagraph::experimental_graph::Direction::Out
         )
         .unwrap()
         .len(),
@@ -647,7 +647,7 @@ async fn conditional_self_loop_combines_one_part_and_preserves_unrelated_values(
     assert_eq!(
         now.observed_adjacency(
             entity(7, 1).vertex(),
-            rocksdb_sql_table::experimental_graph::Direction::In
+            velagraph::experimental_graph::Direction::In
         )
         .unwrap()
         .len(),

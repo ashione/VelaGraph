@@ -6,10 +6,6 @@ use replicated_graph::{
     routing::{experimental::ObservedRowV3, RemoteReplica, RouteResolver},
     run_blocking,
 };
-use rocksdb_sql_table::{
-    experimental_graph::{CrossEdge, VertexRef},
-    StorageNode, Vertex, WriteOp, WriteRequest,
-};
 use std::{
     collections::BTreeMap,
     process::{Child, Command, Stdio},
@@ -18,6 +14,10 @@ use std::{
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
+};
+use velagraph::{
+    experimental_graph::{CrossEdge, VertexRef},
+    StorageNode, Vertex, WriteOp, WriteRequest,
 };
 // Cumulative-work regressions intentionally verify thousands of primitive reads.
 // Allow the supported maximum session deadline under slower CI hosts.
@@ -194,7 +194,7 @@ async fn deleted_candidates_cannot_evade_global_work_budget() -> anyhow::Result<
                 matches!(
                     session.observed_gremlin_v3(1, query),
                     Err(ExperimentalRouteError::Query(
-                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        velagraph::Error::TraversalLimitExceeded(_)
                     ))
                 ),
                 "{query}"

@@ -8,13 +8,13 @@ use replicated_graph::{
     routing::{experimental::*, RemoteReplica, RouteResolver, ScanScope, ShardReadStamp},
     run_blocking,
 };
-use rocksdb_sql_table::{
-    experimental_graph::{CrossEdge, VertexRef},
-    GlobalScanOutput, GremlinRow, PathElement, Value, Vertex,
-};
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use std::{collections::BTreeMap, io::Read, net::SocketAddr, path::Path, time::Duration};
+use velagraph::{
+    experimental_graph::{CrossEdge, VertexRef},
+    GlobalScanOutput, GremlinRow, PathElement, Value, Vertex,
+};
 
 const MAX_INPUT: u64 = 1024 * 1024;
 const HELP: &str = "graph-client --config FILE --allow-insecure-development COMMAND\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nv1 server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
@@ -402,7 +402,7 @@ fn observed_json(result: ObservedTraversalV3) -> Json {
     json!({"version":1,"ok":true,"namespace":"experimental-v2","completeness":format!("{:?}",result.completeness),"metadata_sequence":result.metadata_sequence,"snapshots":stamps(&result.snapshots),"rows":result.rows.into_iter().map(observed_row).collect::<Vec<_>>()})
 }
 
-fn request_id(id: rocksdb_sql_table::RequestId) -> String {
+fn request_id(id: velagraph::RequestId) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -689,7 +689,7 @@ mod tests {
                 partition: 10,
                 id: 1,
             }),
-            ObservedPathElement::Edge(rocksdb_sql_table::experimental_graph::EdgeRef {
+            ObservedPathElement::Edge(velagraph::experimental_graph::EdgeRef {
                 partition: 10,
                 id: 7,
             }),
@@ -702,7 +702,7 @@ mod tests {
             observed_row(row),
             json!({"type":"path","elements":[{"type":"vertex","partition":10,"id":1},{"type":"edge","partition":10,"id":7},{"type":"vertex","partition":20,"id":1}]})
         );
-        let source = ObservedElementRef::Edge(rocksdb_sql_table::experimental_graph::EdgeRef {
+        let source = ObservedElementRef::Edge(velagraph::experimental_graph::EdgeRef {
             partition: 10,
             id: u64::MAX,
         });
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn failed_stage_retains_original_attempt_semantics_and_ids() {
         use replicated_graph::routing::RouteError;
-        use rocksdb_sql_table::StorageNodeError;
+        use velagraph::StorageNodeError;
         for (stage, outcome, ack) in [
             (Stage::Source, StageOutcome::Unknown, false),
             (Stage::Reverse, StageOutcome::Unknown, true),

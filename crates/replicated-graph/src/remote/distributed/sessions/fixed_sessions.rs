@@ -1267,14 +1267,14 @@ mod tests {
         }
         fn insert(
             entries: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-            batch: rocksdb_sql_table::experimental_graph::PreparedBatch,
+            batch: velagraph::experimental_graph::PreparedBatch,
         ) -> Vec<Vec<u8>> {
             let (request, _) = batch.into_conditional_request();
             request
                 .operations
                 .into_iter()
                 .map(|operation| {
-                    let rocksdb_sql_table::WriteOp::Put { key, value } = operation else {
+                    let velagraph::WriteOp::Put { key, value } = operation else {
                         panic!("creation fixture unexpectedly deletes a record");
                     };
                     assert!(entries.insert(key.clone(), value).is_none());

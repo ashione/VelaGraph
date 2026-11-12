@@ -4,9 +4,7 @@
 use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
 use d2_raft::NodeHandle;
-use rocksdb_sql_table::{
-    RequestId, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult,
-};
+use velagraph::{RequestId, StorageNode, StorageNodeError, WriteOp, WriteRequest, WriteResult};
 
 use crate::{adapter::Adapter, RemoteStorageNode, ReplicatedStorageNode};
 

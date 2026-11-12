@@ -1,4 +1,4 @@
-use rocksdb_sql_table::{
+use velagraph::{
     Error, GremlinQuery, GremlinStart, GremlinStep, ObservedGremlinQuery, ObservedGremlinStep,
     MAX_OBSERVED_GREMLIN_REPEAT_TIMES,
 };

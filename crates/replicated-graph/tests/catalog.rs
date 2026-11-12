@@ -11,8 +11,8 @@ use replicated_graph::{
     catalog::{Catalog, CatalogError, Placement, PreparedRegistration},
     run_blocking,
 };
-use rocksdb_sql_table::{StorageNodeError, WriteResult, WriteStatus};
 use tokio::time::{sleep, timeout};
+use velagraph::{StorageNodeError, WriteResult, WriteStatus};
 
 fn metadata() -> Placement {
     Placement {

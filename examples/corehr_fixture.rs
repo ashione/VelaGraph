@@ -1,16 +1,16 @@
 //! Offline fixture encoder, NOT a production StorageNode or mutation benchmark.
 //! Public v2 preparation validates/encodes records against frozen vertex views.
 //! Captured prepared operations are imported later through bounded Raft writes.
-use rocksdb_sql_table::{
-    experimental_graph::{AppendOnlyStore, CrossEdge, VertexRef},
-    *,
-};
 use std::{
     collections::BTreeMap,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
     sync::{Arc, Mutex},
+};
+use velagraph::{
+    experimental_graph::{AppendOnlyStore, CrossEdge, VertexRef},
+    *,
 };
 #[path = "corehr/model.rs"]
 mod model;

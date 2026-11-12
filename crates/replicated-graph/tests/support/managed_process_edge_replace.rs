@@ -1,6 +1,6 @@
 //! Atomic relationship replacement over real gateway and managed-node TCP.
 use super::*;
-use rocksdb_sql_table::experimental_graph::EdgeRef;
+use velagraph::experimental_graph::EdgeRef;
 
 fn edge(partition: u32, id: u64) -> QueryRow {
     QueryRow::Element(QualifiedElement::Edge { partition, id })
@@ -70,7 +70,7 @@ pub(super) async fn scenario() -> anyhow::Result<()> {
                     external_id: [external; 16],
                     mutation: Mutation::CreateVertex {
                         partition,
-                        vertex: VertexData::from(rocksdb_sql_table::Vertex::new(id)),
+                        vertex: VertexData::from(velagraph::Vertex::new(id)),
                     },
                 }),
             )
@@ -314,7 +314,7 @@ pub(super) async fn scenario() -> anyhow::Result<()> {
                 external_id: [8; 16],
                 mutation: Mutation::CreateVertex {
                     partition: 7,
-                    vertex: VertexData::from(rocksdb_sql_table::Vertex::new(3)),
+                    vertex: VertexData::from(velagraph::Vertex::new(3)),
                 },
             }),
         )

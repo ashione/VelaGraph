@@ -3,10 +3,6 @@
 use anyhow::Context;
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{run_blocking, RemoteStorageNode};
-use rocksdb_sql_table::{
-    Edge, Error, GraphRecordStore, GremlinRow, KeyRange, ScanLimit, StorageNode, StorageNodeError,
-    Value, Vertex,
-};
 use std::{
     collections::BTreeMap,
     process::{Child, Command, Stdio},
@@ -16,6 +12,10 @@ use std::{
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
+};
+use velagraph::{
+    Edge, Error, GraphRecordStore, GremlinRow, KeyRange, ScanLimit, StorageNode, StorageNodeError,
+    Value, Vertex,
 };
 
 #[path = "support/remote_evidence.rs"]
@@ -170,7 +170,7 @@ async fn scenario_with_evidence(
     let node = RemoteStorageNode::new(addresses[3 * leader + 2], 7, Duration::from_secs(2))?;
     let graph = Arc::new(GraphRecordStore::new(node, 7, 0));
     let g = graph.clone();
-    run_blocking(move || -> rocksdb_sql_table::Result<()> {
+    run_blocking(move || -> velagraph::Result<()> {
         assert_eq!(
             g.execute_gremlin("g.V().count()")?.rows,
             vec![GremlinRow::Count(0)]
@@ -284,11 +284,7 @@ async fn paged_snapshot_roundtrip(
     // prototype Raft transport's large-write/short-election timing behavior.
     let fixture = run_blocking(move || -> anyhow::Result<_> {
         let dir = tempfile::tempdir()?;
-        let local = GraphRecordStore::new(
-            rocksdb_sql_table::LocalStorageNode::open(dir.path(), 7)?,
-            7,
-            0,
-        );
+        let local = GraphRecordStore::new(velagraph::LocalStorageNode::open(dir.path(), 7)?, 7, 0);
         for id in 100..172 {
             let mut vertex = Vertex::new(id);
             vertex.labels.push("large".into());
@@ -347,7 +343,7 @@ async fn paged_snapshot_roundtrip(
     // Mutate after opening and fetching the first page, then finish the old
     // session. Its remaining pages must retain the same logical snapshot.
     let g = large_graph.clone();
-    run_blocking(move || -> rocksdb_sql_table::Result<()> {
+    run_blocking(move || -> velagraph::Result<()> {
         let mut vertex = g.get_vertex(108)?.expect("large vertex exists");
         vertex
             .properties
@@ -401,7 +397,7 @@ async fn paged_snapshot_roundtrip(
     assert_ne!(after.entries, before.entries);
     let expected = after.entries;
     let g = large_graph.clone();
-    run_blocking(move || -> rocksdb_sql_table::Result<()> {
+    run_blocking(move || -> velagraph::Result<()> {
         let node = g.node();
         let view = node.read_view()?;
         assert!(view.payload_bytes() > 2 * PAGE_BYTES);

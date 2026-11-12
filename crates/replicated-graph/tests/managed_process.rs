@@ -21,10 +21,6 @@ use replicated_graph::{
     managed_graph::GraphCohort,
     remote::query::{QualifiedElement, QueryCompleteness, QueryRow},
 };
-use rocksdb_sql_table::{
-    experimental_graph::{CrossEdge, VertexRef},
-    Value,
-};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,6 +31,10 @@ use std::{
     process::{Child, Command, Stdio},
     sync::Arc,
     time::Duration,
+};
+use velagraph::{
+    experimental_graph::{CrossEdge, VertexRef},
+    Value,
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -485,7 +485,7 @@ async fn scenario() -> anyhow::Result<()> {
     .is_err());
     // A member with no writes must still consume the terminal decision. A
     // participant-only watermark is not a whole-cohort readable version.
-    let vertex = rocksdb_sql_table::Vertex::new(2);
+    let vertex = velagraph::Vertex::new(2);
     let vertex_write = Write {
         external_id: [4; 16],
         mutation: Mutation::CreateVertex {
@@ -2075,8 +2075,7 @@ async fn verify_retained_lifecycle(
             Duration::from_secs(60),
         )
         .await?;
-    let candidate =
-        snapshot.prepare_vertex(7, &rocksdb_sql_table::Vertex::new(EXTENDED_WRITES + 1))?;
+    let candidate = snapshot.prepare_vertex(7, &velagraph::Vertex::new(EXTENDED_WRITES + 1))?;
     assert_ne!(candidate.id(), checkpoint.originals[&1].transaction_id);
     let recovered = graph
         .admit_request(
@@ -2289,10 +2288,8 @@ async fn verify_small_lifecycle(
             .context("saved original Plan missing")?;
         assert_eq!(first_plan.id(), original.transaction_id);
         assert_eq!(first_plan.validation_version(), ordinal - 1);
-        let candidate = snapshot.prepare_vertex(
-            7,
-            &rocksdb_sql_table::Vertex::new(SMALL_LIFECYCLE_WRITES + 1),
-        )?;
+        let candidate =
+            snapshot.prepare_vertex(7, &velagraph::Vertex::new(SMALL_LIFECYCLE_WRITES + 1))?;
         assert_ne!(candidate, first_plan);
         assert_ne!(candidate.id(), original.transaction_id);
         assert_eq!(

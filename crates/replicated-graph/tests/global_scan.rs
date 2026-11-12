@@ -6,10 +6,6 @@ use replicated_graph::{
     routing::{RemoteReplica, RouteError, RouteResolver, ScanScope},
     run_blocking, RemoteStorageNode,
 };
-use rocksdb_sql_table::{
-    Edge, Error, GlobalScanOutput, GremlinRow, QualifiedGremlinRow, StorageNode, Value, Vertex,
-    WriteOp, WriteRequest,
-};
 use std::{
     process::{Child, Command, Stdio},
     time::Duration,
@@ -17,6 +13,10 @@ use std::{
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
+};
+use velagraph::{
+    Edge, Error, GlobalScanOutput, GremlinRow, QualifiedGremlinRow, StorageNode, Value, Vertex,
+    WriteOp, WriteRequest,
 };
 
 const BUDGET: Duration = Duration::from_secs(20);

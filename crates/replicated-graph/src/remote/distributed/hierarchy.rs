@@ -1,7 +1,7 @@
 //! Native fixed-depth hierarchy execution. No retries, refreshed sessions or
 //! unbounded termination predicates; bags and cycles retain ordinary path identity.
 use super::*;
-const MAX_DEPTH: usize = rocksdb_sql_table::MAX_OBSERVED_GREMLIN_REPEAT_TIMES;
+const MAX_DEPTH: usize = velagraph::MAX_OBSERVED_GREMLIN_REPEAT_TIMES;
 
 pub(super) fn validate_depth(query: &GremlinQuery) -> Result<(), QueryFailure> {
     let mut depth = 0usize;

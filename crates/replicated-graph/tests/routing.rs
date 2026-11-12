@@ -9,8 +9,8 @@ use replicated_graph::{
     routing::{RouteError, RouteResolver, RoutedPreparedMutation, RoutedReadView},
     run_blocking,
 };
-use rocksdb_sql_table::{GremlinRow, KeyRange, ScanLimit, StorageNodeError, Value, Vertex};
 use tokio::time::{sleep, timeout};
+use velagraph::{GremlinRow, KeyRange, ScanLimit, StorageNodeError, Value, Vertex};
 
 const BUDGET: Duration = Duration::from_secs(20);
 fn placement(group: u64) -> Placement {
@@ -412,10 +412,9 @@ async fn routed_crud_and_retained_session_absolute_deadline() -> anyhow::Result<
             commit(&f.resolver, &p, BUDGET).await?;
         }
         let v = read(&f.resolver, 1).await?;
-        let edge = run_blocking(move || {
-            v.prepare_create_edge(&rocksdb_sql_table::Edge::new(10, 1, 2, "knows"))
-        })
-        .await??;
+        let edge =
+            run_blocking(move || v.prepare_create_edge(&velagraph::Edge::new(10, 1, 2, "knows")))
+                .await??;
         commit(&f.resolver, &edge, BUDGET).await?;
         let v = read(&f.resolver, 1).await?;
         let update = run_blocking(move || {

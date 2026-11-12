@@ -1,11 +1,11 @@
 //! Closed set of concrete quorum-reading adapters used by catalog and routing.
 use crate::{RemoteStorageNode, ReplicatedStorageNode, Result};
-use rocksdb_sql_table::{
+use std::{sync::Arc, time::Instant};
+use tokio::sync::Semaphore;
+use velagraph::{
     KeyRange, KeyValue, ReadView, ScanCursor, ScanLimit, ScanPage, Sequence, ShardId, StorageAdmin,
     StorageNode, WriteRequest, WriteResult,
 };
-use std::{sync::Arc, time::Instant};
-use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub(crate) enum Adapter {

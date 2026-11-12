@@ -1,6 +1,6 @@
 //! Reproducible warm local smoke measurements, not a service/RSS capacity claim.
-use rocksdb_sql_table::{Edge, Error, GraphEngine, GremlinQuery, Value, Vertex};
 use std::time::Instant;
+use velagraph::{Edge, Error, GraphEngine, GremlinQuery, Value, Vertex};
 
 fn measure(graph: &GraphEngine, name: &str, text: &str, repetitions: usize) {
     let query = GremlinQuery::parse(text).unwrap();

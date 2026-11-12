@@ -1,5 +1,5 @@
-use rocksdb_sql_table::{Edge, GraphRecordStore, LocalStorageNode, StorageNode, Value, Vertex};
 use tempfile::TempDir;
+use velagraph::{Edge, GraphRecordStore, LocalStorageNode, StorageNode, Value, Vertex};
 
 fn open_store(dir: &TempDir) -> GraphRecordStore<LocalStorageNode> {
     let node = LocalStorageNode::open(dir.path(), 7).expect("open node");
@@ -188,7 +188,7 @@ fn raw_adjacency(direction: &str, vertex: u64, label: &str, edge: u64) -> Vec<u8
 }
 
 fn inject_adjacency(store: &GraphRecordStore<LocalStorageNode>, key: Vec<u8>, value: Vec<u8>) {
-    use rocksdb_sql_table::{WriteOp, WriteRequest};
+    use velagraph::{WriteOp, WriteRequest};
     let view = store.node().read_view().unwrap();
     let mut request_id = [255; 16];
     request_id[8..].copy_from_slice(&view.sequence.to_be_bytes());
@@ -205,7 +205,7 @@ fn inject_adjacency(store: &GraphRecordStore<LocalStorageNode>, key: Vec<u8>, va
 
 #[test]
 fn corrupt_adjacency_rejects_reads_and_cascade_without_writes() {
-    use rocksdb_sql_table::Error;
+    use velagraph::Error;
     // Check both directions, including incident edges indexed under the wrong
     // direction, aliases hidden by deduplication, missing records and bad keys.
     for direction in ["out", "in"] {

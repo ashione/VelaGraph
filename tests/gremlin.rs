@@ -1,5 +1,5 @@
-use rocksdb_sql_table::{Edge, Error, GraphEngine, GremlinRow, PathElement, Value, Vertex};
 use tempfile::TempDir;
+use velagraph::{Edge, Error, GraphEngine, GremlinRow, PathElement, Value, Vertex};
 
 fn graph() -> (TempDir, GraphEngine) {
     let dir = tempfile::tempdir().expect("temp dir");

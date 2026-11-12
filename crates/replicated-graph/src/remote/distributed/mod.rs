@@ -2,11 +2,11 @@
 //! No snapshot downloads, retries, global consistency, or completeness claim.
 use super::*;
 use query::{QualifiedElement, QueryCompleteness, QueryFailure, QueryRow, QueryStamp};
-use rocksdb_sql_table::{
+use std::collections::{BTreeMap, BTreeSet};
+use velagraph::{
     GremlinStart, GremlinStep, ObservedGremlinQuery as GremlinQuery, ObservedGremlinStep as Step,
     Value,
 };
-use std::collections::{BTreeMap, BTreeSet};
 mod adjacency;
 pub(crate) mod fixed;
 pub(crate) mod fixed_execution;

@@ -1,19 +1,19 @@
 //! Isolated v2 graph experiment. Not a distributed transaction.
 use super::*;
 mod traversal;
-use rocksdb_sql_table::experimental_graph::{
-    AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRecord, EdgeRef,
-    ExperimentalError, PreparedBatch, VertexPropertyPatch, VertexRef,
-};
 pub(crate) use traversal::{validate_traversal, TraversalRead};
 pub use traversal::{
     ObservedElementRef, ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3,
     ObservedTraversal, ObservedTraversalV2, ObservedTraversalV3,
 };
+use velagraph::experimental_graph::{
+    AppendOnlyStore, CrossEdge, Direction, EdgePropertyPatch, EdgeRecord, EdgeRef,
+    ExperimentalError, PreparedBatch, VertexPropertyPatch, VertexRef,
+};
 
 #[derive(Debug)]
 pub enum ExperimentalRouteError {
-    Query(rocksdb_sql_table::Error),
+    Query(velagraph::Error),
     Unsupported(&'static str),
     Route(RouteError),
     Graph(ExperimentalError),
@@ -235,7 +235,7 @@ impl ExperimentalReadSession {
                     key.len()
                         + 64
                         + match value {
-                            rocksdb_sql_table::Value::Text(s) => s.len(),
+                            velagraph::Value::Text(s) => s.len(),
                             _ => 8,
                         },
                 );

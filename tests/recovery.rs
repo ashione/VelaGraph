@@ -16,8 +16,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use rocksdb_sql_table::{Edge, Error, GraphEngine, Value, Vertex};
 use tempfile::TempDir;
+use velagraph::{Edge, Error, GraphEngine, Value, Vertex};
 
 const MODE_ENV: &str = "ROCKSQL_CRASH_MODE";
 const DIR_ENV: &str = "ROCKSQL_CRASH_DIR";

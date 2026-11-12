@@ -1467,7 +1467,7 @@ async fn gremlin_projection_limit_count_order_and_static_empty_stream_rejection(
         "g.addV('person')",
     ] {
         let expected = crate::remote::query::graph_error(
-            rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap_err(),
+            velagraph::ObservedGremlinQuery::parse(text).unwrap_err(),
         );
         assert_eq!(
             call(

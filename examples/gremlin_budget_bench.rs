@@ -1,6 +1,6 @@
 //! Reproducible in-process Gremlin budget smoke benchmark, not a capacity claim.
-use rocksdb_sql_table::{Edge, Error, GraphEngine, GremlinQuery, Vertex};
 use std::time::Instant;
+use velagraph::{Edge, Error, GraphEngine, GremlinQuery, Vertex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

@@ -9,10 +9,6 @@ use replicated_graph::{
     },
     run_blocking,
 };
-use rocksdb_sql_table::{
-    experimental_graph::{CrossEdge, EdgeRef, ExperimentalError, VertexRef},
-    Vertex,
-};
 use std::{
     collections::BTreeMap,
     process::{Child, Command, Stdio},
@@ -21,6 +17,10 @@ use std::{
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
+};
+use velagraph::{
+    experimental_graph::{CrossEdge, EdgeRef, ExperimentalError, VertexRef},
+    Vertex,
 };
 // Cumulative-work regressions intentionally verify thousands of primitive reads.
 // Allow the supported maximum session deadline under slower CI hosts.
@@ -153,14 +153,14 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
                     (
                         "x".into(),
                         if id == 9 {
-                            rocksdb_sql_table::Value::Null
+                            velagraph::Value::Null
                         } else {
-                            rocksdb_sql_table::Value::Integer(1)
+                            velagraph::Value::Integer(1)
                         },
                     ),
-                    ("real".into(), rocksdb_sql_table::Value::Real(-0.0)),
-                    ("bool".into(), rocksdb_sql_table::Value::Boolean(true)),
-                    ("text".into(), rocksdb_sql_table::Value::Text("同值".into())),
+                    ("real".into(), velagraph::Value::Real(-0.0)),
+                    ("bool".into(), velagraph::Value::Boolean(true)),
+                    ("text".into(), velagraph::Value::Text("同值".into())),
                 ]),
             };
             let prepared = resolver
@@ -264,7 +264,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
         }
         let value = |source, id| R3::Value {
             source,
-            value: rocksdb_sql_table::Value::Integer(id),
+            value: velagraph::Value::Integer(id),
         };
         assert_eq!(
             s.observed_gremlin_v3(99, "g.V().id()")?.rows,
@@ -326,25 +326,25 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             (
                 "g.E().values('x').dedup()",
                 vec![
-                    (9, rocksdb_sql_table::Value::Null),
-                    (10, rocksdb_sql_table::Value::Integer(1)),
+                    (9, velagraph::Value::Null),
+                    (10, velagraph::Value::Integer(1)),
                 ],
             ),
             (
                 "g.E().values('text').dedup()",
-                vec![(9, rocksdb_sql_table::Value::Text("同值".into()))],
+                vec![(9, velagraph::Value::Text("同值".into()))],
             ),
             (
                 "g.E().values('real').dedup()",
-                vec![(9, rocksdb_sql_table::Value::Real(-0.0))],
+                vec![(9, velagraph::Value::Real(-0.0))],
             ),
             (
                 "g.E().values('bool').dedup()",
-                vec![(9, rocksdb_sql_table::Value::Boolean(true))],
+                vec![(9, velagraph::Value::Boolean(true))],
             ),
             (
                 "g.E().label().dedup()",
-                vec![(9, rocksdb_sql_table::Value::Text("K".into()))],
+                vec![(9, velagraph::Value::Text("K".into()))],
             ),
         ] {
             let actual = s.observed_gremlin_v3(1, text)?;
@@ -383,10 +383,10 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             );
         }
         for (key, value) in [
-            ("x", rocksdb_sql_table::Value::Null),
-            ("real", rocksdb_sql_table::Value::Real(-0.0)),
-            ("bool", rocksdb_sql_table::Value::Boolean(true)),
-            ("text", rocksdb_sql_table::Value::Text("同值".into())),
+            ("x", velagraph::Value::Null),
+            ("real", velagraph::Value::Real(-0.0)),
+            ("bool", velagraph::Value::Boolean(true)),
+            ("text", velagraph::Value::Text("同值".into())),
         ] {
             assert_eq!(
                 s.observed_gremlin_v3(1, &format!("g.E(9,9).values('{key}')"))?
@@ -418,7 +418,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             s.observed_gremlin_v3(1, "g.E(9).label()")?.rows,
             vec![R3::Value {
                 source: Element::Edge(er(1, 9)),
-                value: rocksdb_sql_table::Value::Text("K".into())
+                value: velagraph::Value::Text("K".into())
             }]
         );
         assert_eq!(
@@ -454,7 +454,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
             s.observed_gremlin_v3(1, "g.V(7).label()")?.rows,
             vec![R3::Value {
                 source: Element::Vertex(vr(1)),
-                value: rocksdb_sql_table::Value::Text("P1".into())
+                value: velagraph::Value::Text("P1".into())
             }]
         );
         // Consolidating the v3 evaluator must preserve v2 vertex-only behavior.
@@ -493,7 +493,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
         assert!(matches!(
             s.observed_gremlin_v3(1, "g.V(999).values('missing').has('x')"),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
+                velagraph::Error::UnsupportedGremlinArgument(_)
             ))
         ));
         // Edge traversers preserve qualified identity, per-input order and bag semantics.
@@ -670,7 +670,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
                 )
             ),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         let r = s.observed_gremlin(1, "g.V(7).both()")?;
@@ -821,7 +821,7 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Result<()> {
     use replicated_graph::routing::experimental::{ObservedRowV2, ObservedTraversal};
-    use rocksdb_sql_table::Value;
+    use velagraph::Value;
     // Compile-time regression: downstream users may still require Eq.
     fn requires_eq<T: Eq>() {}
     requires_eq::<ObservedRow>();
@@ -1014,7 +1014,7 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
         assert!(matches!(
             wide_session.observed_gremlin_v2(1, &format!("g.V({ids}).values('blob').limit(1)")),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         use replicated_graph::routing::experimental::ObservedRowV3 as R3;
@@ -1037,26 +1037,26 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({ids}).values('blob').limit(1)")),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({ids}).values('blob').dedup().limit(1)")),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         let more_ids = std::iter::repeat_n("90", 48).collect::<Vec<_>>().join(",");
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).has('missing').limit(1)")),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).bothV().dedup()")),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         // Endpoint transitions revalidate/charge edges in the original shared
@@ -1064,7 +1064,7 @@ async fn observed_projection_values_labels_and_frozen_provenance() -> anyhow::Re
         assert!(matches!(
             edges.observed_gremlin_v3(1, &format!("g.E({more_ids}).bothV().limit(1)")),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         assert_eq!(

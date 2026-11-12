@@ -2,8 +2,8 @@
 //! text matching, tokenization, parser alternatives, or weak-read fallback.
 use super::*;
 use crate::remote::query::QualifiedElement;
-use rocksdb_sql_table::experimental_graph::Direction;
-use rocksdb_sql_table::{
+use velagraph::experimental_graph::Direction;
+use velagraph::{
     GremlinStart, GremlinStep, ObservedGremlinQuery, ObservedGremlinStep, DEFAULT_GREMLIN_LIMIT,
 };
 
@@ -26,7 +26,7 @@ enum Output {
 fn error(failure: QueryFailure) -> Error {
     Error::Query(failure)
 }
-fn parse_error(cause: rocksdb_sql_table::Error) -> Error {
+fn parse_error(cause: velagraph::Error) -> Error {
     error(crate::remote::query::graph_error(cause))
 }
 fn parse(query: &Query) -> Result<Plan> {
@@ -390,9 +390,9 @@ use crate::routing::experimental::{
     ExperimentalResult, ExperimentalRouteError, ObservedElementRef, ObservedPathElement,
     ObservedRowV3, TraversalRead,
 };
-use rocksdb_sql_table::experimental_graph::{AppendOnlyStore, EdgeRecord, ExperimentalError};
+use velagraph::experimental_graph::{AppendOnlyStore, EdgeRecord, ExperimentalError};
 fn provider_error(cause: managed_graph::Error) -> ExperimentalRouteError {
-    use rocksdb_sql_table::StorageNodeError;
+    use velagraph::StorageNodeError;
     match cause {
         managed_graph::Error::Graph(e) => ExperimentalRouteError::Graph(e),
         managed_graph::Error::Storage(e) => e.into(),
@@ -428,7 +428,7 @@ impl TraversalRead for FixedRead<'_> {
     type Node = crate::remote::query::FrozenNode;
     fn check(&self) -> ExperimentalResult<()> {
         if Instant::now() >= self.end {
-            return Err(rocksdb_sql_table::StorageNodeError::Timeout { request_id: None }.into());
+            return Err(velagraph::StorageNodeError::Timeout { request_id: None }.into());
         }
         self.snapshot.version().map_err(provider_error)?;
         Ok(())
@@ -531,7 +531,7 @@ pub(super) fn execute_traversal(
 // not incorrectly cap the final stream; both directions can contribute 2,000
 // adjacency candidates per input before the common 10,000-row ceiling.
 fn traversal_maximum(query: &ObservedGremlinQuery) -> usize {
-    use rocksdb_sql_table::ObservedGremlinStep as Step;
+    use velagraph::ObservedGremlinStep as Step;
     let ids = match query.start() {
         GremlinStart::Vertices(ids) | GremlinStart::Edges(ids) => ids,
     };
@@ -614,7 +614,7 @@ impl TraversalPathShape {
 /// Checks shapes/provenance in whole results or page slices. Bag duplicates are
 /// legal; this cannot authenticate a trusted peer or prove graph completeness.
 pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &Binding) -> bool {
-    use rocksdb_sql_table::ObservedGremlinStep as Step;
+    use velagraph::ObservedGremlinStep as Step;
     let member = |partition: u32| {
         binding
             .cohort

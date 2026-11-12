@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rocksdb_sql_table::{
+use velagraph::{
     KeyRange, LocalStorageNode, ReadView, ScanLimit, StorageNode, StorageNodeError, WriteOp,
     WriteRequest,
 };
@@ -225,7 +225,7 @@ fn local_pages_keep_snapshot_and_check_epoch_on_every_page() {
 
 #[test]
 fn legacy_adapter_defaults_to_unsupported_and_invalid_ranges_are_rejected() {
-    use rocksdb_sql_table::{KeyValue, StorageAdmin, WriteResult};
+    use velagraph::{KeyValue, StorageAdmin, WriteResult};
     struct Legacy(LocalStorageNode);
     type Result<T> = std::result::Result<T, StorageNodeError>;
     impl StorageNode for Legacy {

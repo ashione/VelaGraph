@@ -30,13 +30,13 @@ use d2_raft::{
     D1Command, D1Error, D1Result, D1WriteRequest, D1WriteStatus, LogCommand, NodeHandle,
     StateMachine, TypeConfig,
 };
-use rocksdb_sql_table::{
+use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
+use velagraph::{
     Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
     Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
     WriteResult, WriteStatus, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
 };
-use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
 
 type Result<T> = std::result::Result<T, StorageNodeError>;
 thread_local! { static BLOCKING_SCOPE: Cell<bool> = const { Cell::new(false) }; }

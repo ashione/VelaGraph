@@ -1,4 +1,4 @@
-use rocksdb_sql_table::{
+use velagraph::{
     KeyRange, KeyValue, LocalStorageNode, ScanLimit, StorageNode, StorageNodeError, WriteOp,
     WriteRequest, WriteStatus,
 };
@@ -289,7 +289,7 @@ fn export_import_preserves_entries_epoch_and_sequence() {
 fn failed_import_leaves_target_empty() {
     let dir = tempfile::tempdir().unwrap();
     let target = node(&dir);
-    let export = rocksdb_sql_table::Export {
+    let export = velagraph::Export {
         shard: 7,
         epoch: 0,
         sequence: 1,
@@ -385,7 +385,7 @@ fn import_rejects_epoch_rollback_and_non_pristine_target() {
     let node = node(&dir);
     node.admin().set_epoch(2).unwrap();
 
-    let old_epoch = rocksdb_sql_table::Export {
+    let old_epoch = velagraph::Export {
         shard: 7,
         epoch: 1,
         sequence: 0,
@@ -406,7 +406,7 @@ fn import_rejects_epoch_rollback_and_non_pristine_target() {
         .unwrap();
     assert_eq!(node.read_view().unwrap().sequence, 2);
 
-    let non_pristine = rocksdb_sql_table::Export {
+    let non_pristine = velagraph::Export {
         shard: 7,
         epoch: 2,
         sequence: 3,
@@ -459,11 +459,7 @@ fn reopening_with_a_different_shard_is_rejected() {
     assert!(matches!(reopened, Err(StorageNodeError::Corrupt(_))));
 }
 
-fn node_get(
-    node: &LocalStorageNode,
-    key: &[u8],
-    view: &rocksdb_sql_table::ReadView,
-) -> Option<Vec<u8>> {
+fn node_get(node: &LocalStorageNode, key: &[u8], view: &velagraph::ReadView) -> Option<Vec<u8>> {
     node.get(key, view).unwrap()
 }
 
@@ -623,7 +619,7 @@ fn conditional_sequence_overflow_and_invalid_requests_write_nothing() {
     ));
     assert_eq!(node.admin().export().unwrap(), before);
     node.admin()
-        .import(rocksdb_sql_table::Export {
+        .import(velagraph::Export {
             shard: 7,
             epoch: 0,
             sequence: u64::MAX,
