@@ -679,20 +679,27 @@ under its aggregate budget. Process benchmarks cover 3/9/12 members with small
 graphs; larger histories/data, multi-host scaling and online resizing remain
 unproven, rather than inferred from these latency measurements.
 
-### 通用双时间图（规划，尚未实现）
+### 通用双时间图（单分片实验切片已实现，分布式目标未完成）
 
 [#196](https://github.com/ashione/VelaGraph/issues/196) 与
 [设计计划](BITEMPORAL_GRAPH_PLAN.md) 跟踪业务有效时间 T 与事务系统版本 V。
-现有 fixed-V 是事务一致视图，不是双时间。先冻结点/边有效区间、追溯修正、
-未来生效与同 V/T 遍历语义，再做单分片 oracle、真实分布式及全量 CoreHR 验证；
-不硬编码 HR，不自造 Gremlin 方言。区间路径、时态索引及保留/GC 各自验收。
-关联 #109/#110/#111、#191/#192 对象存储及 #193/#194 checkpoint；持久化载体
-不自动提供时间语义。本项仅新增规划，不改变运行时格式/限制或取代现有功能性能主线。
+现有 managed fixed-V 本身不是双时间；独立的单分片 temporal store 已实现
+下述本地 V/T 能力，不能将两个入口拼接成已交付分布式时态一致性。
+真实跨片同 V/T、全规模动态 CoreHR、区间路径、保留/GC 与恢复集成仍须分别验收；
+不硬编码 HR，不自造 Gremlin 方言。关联 #109/#110/#111、#191/#192 对象存储
+及 #193/#194 checkpoint；持久化载体不自动提供时间语义，也不取代原有功能性能主线。
 
-### #196 单分片持久化时间断言切片
+### #196 单分片持久化时间断言与邻接切片
 
 `temporal_store` 在独立、显式版本化数据库中保存 canonical 点/边修订，
-一次同步 WriteBatch 提交本地系统版本与有效区间，支持固定 V/T 的历史点读、
-端点可见性与 reopen/进程退出恢复验证。它不是 distributed cohort V，也没有
-接入时态邻接索引或既有双 DB checkpoint。显式 ID 的官方 Gremlin 点查询已
-复用原执行器；下一步做索引/遍历，再验证真实跨片同 V/T。详见 [范围与格式](TEMPORAL_STORE.md)，#196 不关闭。
+一次同步 WriteBatch 提交本地系统版本、有效区间及邻接候选索引，支持固定 V/T
+的历史点读、端点可见性与 reopen/进程退出恢复验证。显式 ID 的官方 Gremlin
+点查询和索引 out/in/both 遍历已复用原执行器；候选边及端点在同 V/T 重新解析，
+不能把不同时期的关系拼为路径。当前 format 2 显式拒绝旧实验 format 1 数据库，
+没有自动迁移或不完整索引回填。详见 [范围与格式](TEMPORAL_STORE.md)。
+
+它仍使用本地系统版本，不是 distributed cohort V；全局 V()/E() 起点仍未开放。
+**该第三个 temporal DB 不在既有双 DB checkpoint 或对象存储备份的覆盖范围内**，
+现有上传/恢复不能作为时态恢复证据。后续须单独集成一致 cut 的权威记录与索引来源，
+恢复校验成功后才开放目标视图查询；真实跨片同 V/T 与全规模验收继续跟踪 #196，
+本节更新不关闭该任务，也不声称整体分布式双时间已完成。
