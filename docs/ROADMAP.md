@@ -10,7 +10,7 @@
 [当前能力索引](CURRENT_STATUS.md)列出入口、源码/测试和开放工作；下列状态不是对未合并 PR 的验收。
 当前代码已超出最初 PR #1–#3 的单机 SQL 原型：
 
-- **内核**：属性图存储与标准 Gremlin 有界子集，单分片快照读、写事务与进程崩溃恢复测试；SQL 表引擎保留独立语义。
+- **内核**：属性图存储与标准 Gremlin 有界子集，单分片快照读、写事务与进程崩溃恢复测试；旧独立 SQL 表引擎已移除，见[迁移说明](SQL_REMOVAL.md)。
 - **分布式基础**：持久化 Raft 节点、版本化 D1 条件/幂等写、静态 catalog 与固定远程路由。自动路由收敛、成员变更和在线迁移尚未完成。
 - **实验查询**：显式 ID 跨分片 in/out、多跳、去重、过滤、计数与终结 valueMap；全局 V() 属性扫描及有界扫描→out/in→过滤/去重/count/valueMap 组合；有界原生层级 repeat；增量层级计数、实际顶点结果分页和所选属性分页。
 - **验收**：CoreHR 20 万人、5000 部门，人员/部门上下级和一人多部门，固定生成器与独立关系/属性 oracle，PR/main 全量 CI。此场景运行在同一云端机器的独立进程，每数据分片一个副本，不是多机吞吐、全局快照或高可用证明。
@@ -43,7 +43,7 @@ S1 archive reads、S2 coordinator checkpoint、S3 member checkpoint、S4 retaine
 | 存储基础 | 当前每片本地 RocksDB/Raft；后续评估对象存储权威、可丢弃本地缓存 | 当前实现明确；后续设计见 #191，尚未迁移 |
 | 两条线 | 内核线 + 分布式线，以窄存储接口解耦 | 已确认 |
 | 图模型 | 属性图（点/边/标签/属性），RDF 不作为当前目标 | 已实现基础模型 |
-| 查询语言 | 标准 Gremlin（Apache TinkerPop 官方语法）子集优先；不自造方言；SQL 作为后续分析接口 | 已确认 |
+| 查询语言 | 标准 Gremlin（Apache TinkerPop 官方语法）子集优先；不自造方言；旧 SQL 原型已移除，未来分析接口须单独论证 | 已确认 |
 | 一致性 | v1/K3 单分片事务；observed v2 分阶段写/独立快照；restricted managed 固定 cohort 事务与 certified V 已实现，general Global 仍拒绝 | 入口边界明确，完整 D4 未完成 |
 | 首批场景 | CoreHR：20 万人、5000 部门，上下级与多部门关系，支持逐步完善的通用查询 | 已选定并进入全量 CI |
 
@@ -219,7 +219,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 
 ## 8. Backlog（不排期）
 
-- **SQL 原型**：复合主键、`ALTER TABLE`/`DEFAULT`/`UNIQUE`、JOIN/子查询/CTE、DISTINCT 聚合与窗口函数；在图内核稳定后再评估，不与图能力抢首版资源。
+- **未来分析接口**：只有真实图查询需求证明必要时才评估；不恢复旧独立 SQL 表引擎，也不默认承担其兼容性。
 - **图能力**：更广的路径查询、最短路、社区检测与通用聚合。已实现的有限路径/层级 repeat 不能视为任意路径算法支持。
 - **运维**：多区域双活、跨云容灾、云托管控制台与计费；首版只做单区域集群。
 
@@ -658,3 +658,13 @@ terminal certification and original deadlines. Snapshot capture remains serial
 under its aggregate budget. Process benchmarks cover 3/9/12 members with small
 graphs; larger histories/data, multi-host scaling and online resizing remain
 unproven, rather than inferred from these latency measurements.
+
+### 通用双时间图（规划，尚未实现）
+
+[#196](https://github.com/ashione/VelaGraph/issues/196) 与
+[设计计划](BITEMPORAL_GRAPH_PLAN.md) 跟踪业务有效时间 T 与事务系统版本 V。
+现有 fixed-V 是事务一致视图，不是双时间。先冻结点/边有效区间、追溯修正、
+未来生效与同 V/T 遍历语义，再做单分片 oracle、真实分布式及全量 CoreHR 验证；
+不硬编码 HR，不自造 Gremlin 方言。区间路径、时态索引及保留/GC 各自验收。
+关联 #109/#110/#111、#191/#192 对象存储及 #193/#194 checkpoint；持久化载体
+不自动提供时间语义。本项仅新增规划，不改变运行时格式/限制或取代现有功能性能主线。

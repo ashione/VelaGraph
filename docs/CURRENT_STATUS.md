@@ -10,7 +10,7 @@ open work below was not merged at this review point.
 
 | Path | Entry and contract | Consistency and scope |
 | --- | --- | --- |
-| Local v1 kernel | `GraphEngine`; [K3](TRANSACTIONS.md), [Gremlin v0](QUERY_SPEC.md) | One partition/process; snapshot reads and explicit single-partition atomic transactions. No SQL/graph mixed transaction. |
+| Local v1 kernel | `GraphEngine`; [K3](TRANSACTIONS.md), [Gremlin v0](QUERY_SPEC.md) | One partition/process; snapshot reads and explicit single-partition atomic transactions. The legacy standalone SQL engine is removed ([migration](SQL_REMOVAL.md)). |
 | Replicated/routed v1 | `GraphRecordStore`, `ReplicatedStorageNode`, `RemoteStorageNode`, `RouteResolver`; [replicated](REPLICATED_GRAPH.md), [remote routing](REMOTE_ROUTING.md) | Per-shard leader-barrier views and exact conditional retry identities. Static placement, not cross-shard query snapshot isolation. |
 | Observed v2/routing-v3 | `ExperimentalReadSession`, server query/distributed query APIs; [v2](EXPERIMENTAL_CROSS_EDGES.md), [server queries](REMOTE_QUERY.md), [distributed queries](DISTRIBUTED_QUERY.md) | Qualified identities, per-shard snapshots, Unverified completeness. Cross-shard mutation batches are staged and non-atomic. Query shapes differ by entrypoint. |
 | Managed fixed cohort | `managed_graph`, `managed_gateway::Gateway`; [transactions](MANAGED_GRAPH_TRANSACTIONS.md), [gateway](MANAGED_GRAPH_GATEWAY.md), [fixed-V traversals](MANAGED_FIXED_TRAVERSALS.md) | Explicit empty-baseline cohort and complete member participation; typed coordinated writes, durable external-ID/original-Plan recovery and certified same-V sessions. Local or fixed remote nodes. No general catalog certification or automatic failover. |

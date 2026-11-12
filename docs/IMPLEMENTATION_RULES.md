@@ -103,14 +103,14 @@ git diff --check
 - Public types are documented and semver-relevant.
 - Do not expose internal key layouts or RocksDB handles as public API.
 - Breaking changes need a migration note; additive changes should be preferred.
-- Keep the SQL engine and graph engine independent; do not couple their errors
-  or storage.
+- Keep shared graph types and storage independent of unrelated language
+  frontends; the legacy SQL engine has been removed.
 
 ## R11 — Review and delivery
 
 - Self-review the full diff before every commit; fix findings first.
-- Keep changes scoped. Do not mix query-language work with SQL features or
-  distributed transactions.
+- Keep changes scoped. Do not mix query-language work with unrelated features
+  or distributed transactions.
 - CI must be green; do not merge with a known failing check.
 - The agent must not merge or approve its own PR; a person merges.
 
@@ -120,8 +120,8 @@ git diff --check
 - v0 graph is a single partition; cross-partition traversal is D5, cross-shard
   transactions are D4.
 - Storage-node interface changes follow `STORAGE_NODE_INTERFACE.md` once merged.
-- The SQL surface stays as documented; graph work must not silently change SQL
-  behavior.
+- The removed SQL surface is not a compatibility target; see
+  [the migration note](SQL_REMOVAL.md).
 
 ## PR checklist
 

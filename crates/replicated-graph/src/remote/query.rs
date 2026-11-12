@@ -437,18 +437,15 @@ pub(crate) fn graph_error(e: rocksdb_sql_table::Error) -> QueryFailure {
     use rocksdb_sql_table::Error::*;
     match e {
         GremlinParse(_) => QueryFailure::Parse,
-        UnsupportedGremlinStep(_)
-        | UnsupportedGremlinArgument(_)
-        | UnsupportedGremlinValue(_)
-        | Unsupported(_) => QueryFailure::Unsupported,
+        UnsupportedGremlinStep(_) | UnsupportedGremlinArgument(_) | UnsupportedGremlinValue(_) => {
+            QueryFailure::Unsupported
+        }
         GremlinComplexityLimit { .. } | TraversalLimitExceeded(_) => {
             QueryFailure::ResourceExhausted
         }
-        InvalidGremlinLimit(_)
-        | InvalidGremlinTraverser(_)
-        | InvalidTraversal(_)
-        | InvalidValue(_)
-        | InvalidLiteral(_) => QueryFailure::InvalidArgument,
+        InvalidGremlinLimit(_) | InvalidGremlinTraverser(_) | InvalidTraversal(_) => {
+            QueryFailure::InvalidArgument
+        }
         StorageNode(e) => storage_error(e),
         _ => QueryFailure::IncompleteOrCorrupt,
     }
