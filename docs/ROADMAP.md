@@ -14,7 +14,8 @@
 长度前缀 JSON/TCP，网络客户端按请求建立连接；现有 graph proto 是存储 record，
 并非 gRPC service。统一通信框架不修改持久化记录、共识或 Gremlin 语义。
 
-- **第一实际切片**：现有 remote query 的 open → fragment/page → close 完整路径，
+- **第一实际切片**：现有 remote snapshot 的 OpenSnapshot → Page → Close 完整路径，
+  复用原有有界 Sessions；随后立即推进 data-local query fragments，首片不是完整查询迁移。
   用版本化 Protobuf 和 gRPC adapter 复用原执行器；按已验证 peer 身份复用 channel，
   保留固定视图、顺序、错误与累计预算。真实多进程差分测试后清理替代的 JSON 路径，
   不长期维护两套业务实现，不把 JSON 装进 bytes 就当完成协议迁移。
@@ -41,6 +42,22 @@
 [gRPC deadline](https://grpc.io/docs/guides/deadlines/)、
 [流控边界](https://grpc.io/docs/guides/flow-control/) 和
 [Protobuf 演进](https://protobuf.dev/programming-guides/proto3/)。
+
+## 后续产品化：轻量交互式 graph portal
+
+[#220](https://github.com/ashione/VelaGraph/issues/220) 在 #218 的稳定 HTTP 查询、
+任务/分页/错误接口之后实现，当前仅规划。基础分布式读写、一致性与恢复是关键路径；
+高优先级 gRPC/HTTP 并行推进，portal 不抢占上述工作，也不重复 #122 运维观测平台。
+
+首版是只读查询工具：输入标准受支持 Gremlin，运行/取消，在图与表之间切换，
+点击点/边查看属性和 qualified ID。两种视图使用同一结果，保留多重边、路径、重数、
+类型及 missing/Null；展开邻居须显式请求并遵循同一固定视图，不能混合多个 V。
+显示状态、错误、耗时、V/可用 T、一致性和分页/展示限制；Unverified 不显示为 certified，
+恢复未就绪不显示为空图。渲染/分页有界、取消和过期可见，不把截断或失败当完整成功。
+
+先随服务自托管/loopback 验证真实浏览器到 HTTP 的成功及失败流程，再更新快速开始。
+首版不做写编辑器、集群管理、可视化建模或独立监控平台；不发布独立网站，不扩大
+CORS/权限或上传遥测。此 UI 只读范围不取消 #218 对外服务必须支持写入的要求。
 
 ## 1. 当前基线
 
