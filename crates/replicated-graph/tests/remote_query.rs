@@ -5,8 +5,8 @@ use replicated_graph::{
     remote::{
         self,
         query::{
-            query, QualifiedElement, QueryCompleteness, QueryFailure, QueryMode, QueryOutput,
-            QueryRequest, QueryResponse, QueryRow,
+            query as remote_query, QualifiedElement, QueryCompleteness, QueryFailure, QueryMode,
+            QueryOutput, QueryRequest, QueryResponse, QueryRow,
         },
         RemoteError, RemoteIdentity,
     },
@@ -286,6 +286,23 @@ async fn measured_query(
     });
     let result = query(proxy, Some(identity), req, BUDGET).await?;
     Ok((result, forward.await??))
+}
+
+// Failure-only context for this synthetic fixture. Do not add request text to
+// production diagnostics, and preserve the original typed result and budgets.
+async fn query(
+    endpoint: SocketAddr,
+    identity: Option<RemoteIdentity>,
+    req: QueryRequest,
+    budget: Duration,
+) -> Result<QueryResponse, RemoteError> {
+    let mode = req.mode;
+    let context: String = req.text.chars().take(160).collect();
+    let result = remote_query(endpoint, identity, req, budget).await;
+    if let Err(error) = &result {
+        eprintln!("query_fixture mode={mode:?} query={context:?} error={error}");
+    }
+    result
 }
 
 async fn raw_query(endpoint: SocketAddr, req: &QueryRequest) -> anyhow::Result<serde_json::Value> {

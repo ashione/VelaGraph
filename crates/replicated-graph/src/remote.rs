@@ -603,18 +603,7 @@ async fn execute(
             }
             let mut phase = diagnostic::Phase::new("open_snapshot_barrier", None, end);
             let barrier = raft.ensure_linearizable().await.map_err(|e| {
-                use openraft::error::{CheckIsLeaderError, Fatal, RaftError};
-                let reason = match &e {
-                    RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_)) => {
-                        "forward_to_leader"
-                    }
-                    RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_)) => {
-                        "quorum_not_enough"
-                    }
-                    RaftError::Fatal(Fatal::StorageError(_)) => "raft_storage",
-                    RaftError::Fatal(Fatal::Panicked) => "raft_panicked",
-                    RaftError::Fatal(Fatal::Stopped) => "raft_stopped",
-                };
+                let reason = diagnostic::read_barrier_kind(&e);
                 diagnostic::failure(format_args!("phase=open_snapshot_barrier reason={reason}"));
 
                 if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
