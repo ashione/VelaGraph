@@ -91,3 +91,10 @@ References:
 - [Certified cohort reads](CERTIFIED_COHORT_READS.md)
 - [Managed local gateway](MANAGED_LOCAL_GATEWAY.md)
 - [Atomic managed edge replacement](MANAGED_EDGE_REPLACEMENT.md)
+
+## Executable reference
+
+The [bounded semantic reference](BITEMPORAL_REFERENCE.md) implements the first
+single-shard in-memory oracle slice. It does not add durable records, Gremlin
+execution, distributed certification or history retention. #196 remains open;
+the document lists the concrete storage/executor integration still required.

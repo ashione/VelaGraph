@@ -39,3 +39,6 @@ pub use value::Value;
 
 /// Isolated, explicitly non-atomic append-only cross-partition experiment.
 pub mod experimental_graph;
+
+/// Experimental bounded semantic reference; not a durable temporal API.
+pub mod temporal_reference;
