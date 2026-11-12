@@ -28,6 +28,7 @@ mod diagnostic;
 pub mod distributed;
 pub mod managed;
 mod paged;
+pub use paged::grpc;
 pub mod query;
 pub use paged::{
     close_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified, snapshot_page,
@@ -166,6 +167,12 @@ enum Reply {
 /// permit until its handler completes. Shutdown cancels and joins handlers;
 /// cancellation never proves that an already submitted Raft write aborted.
 pub struct GraphService {
+    raft: openraft::Raft<TypeConfig>,
+    state: Arc<StateMachine>,
+    identity: RemoteIdentity,
+    shard: u64,
+    deadline: Duration,
+    admission: Arc<Semaphore>,
     address: SocketAddr,
     sessions: Arc<paged::Sessions>,
     stop: watch::Sender<bool>,
@@ -247,9 +254,12 @@ impl GraphService {
             .map_err(|_| RemoteError::Unavailable)?;
         let sessions = Arc::new(paged::Sessions::new()?);
         let worker_sessions = sessions.clone();
+        let service_raft = raft.clone();
+        let service_state = state.clone();
         let query_sessions = Arc::new(distributed::Sessions::new()?);
         let (stop, mut stopped) = watch::channel(false);
         let admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+        let service_admission = admission.clone();
         let task = tokio::spawn(async move {
             let sessions = worker_sessions;
             let mut cleanup = tokio::time::interval(Duration::from_millis(100));
@@ -410,6 +420,12 @@ impl GraphService {
             while handlers.join_next().await.is_some() {}
         });
         Ok(Self {
+            admission: service_admission,
+            raft: service_raft,
+            state: service_state,
+            identity,
+            shard,
+            deadline,
             address,
             sessions,
             stop,

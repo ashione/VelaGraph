@@ -1,0 +1,55 @@
+syntax = "proto3";
+package velagraph.internal.snapshot.v1;
+
+// Internal, read-only, trusted-network snapshot transfer. Not a public query API.
+// No JSON payloads; key/value bytes retain the existing storage record encoding.
+service SnapshotService {
+  rpc Open(OpenRequest) returns (Descriptor);
+  rpc Page(PageRequest) returns (PageResponse);
+  rpc Close(CloseRequest) returns (Empty);
+}
+message Identity { uint64 group = 1; uint64 node = 2; }
+message Context {
+  uint32 version = 1;
+  Identity identity = 2;
+  // Positive remaining operation budget, at most 60000 ms. grpc-timeout may
+  // shorten it further; never renews the snapshot's fixed lifetime.
+  uint64 timeout_millis = 3;
+}
+message Descriptor {
+  uint32 version = 1;
+  Identity identity = 2;
+  bytes incarnation = 3; // exactly 16 bytes
+  bytes session = 4; // exactly 16 bytes; bearer capability, not authentication
+  uint64 shard = 5;
+  uint64 epoch = 6;
+  uint64 sequence = 7;
+  uint64 rows = 8;
+  uint64 bytes = 9;
+}
+message Cursor {
+  bytes incarnation = 1;
+  bytes session = 2;
+  uint64 position = 3;
+  bytes token = 4;
+}
+message Entry { bytes key = 1; bytes value = 2; }
+message OpenRequest { Context context = 1; uint64 shard = 2; }
+message PageRequest { Context context = 1; Descriptor descriptor = 2; Cursor cursor = 3; }
+message PageResponse { Descriptor descriptor = 1; repeated Entry entries = 2; Cursor next = 3; }
+message CloseRequest { Context context = 1; Descriptor descriptor = 2; }
+message Empty {}
+// Status.details carries a typed reason; human-readable status text is not parsed.
+message ErrorDetail {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    NOT_LEADER = 1;
+    NOT_ACTIVATED = 2;
+    SESSION_UNAVAILABLE = 3;
+    FENCED = 4;
+  }
+  Reason reason = 1;
+  optional uint64 leader = 2;
+  optional uint64 requested_epoch = 3;
+  optional uint64 current_epoch = 4;
+}

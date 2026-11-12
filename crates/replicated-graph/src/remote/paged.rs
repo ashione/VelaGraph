@@ -1,5 +1,6 @@
 //! Fixed, bounded snapshot downloads. These are not on-demand remote ReadViews.
 use super::*;
+pub mod grpc;
 use std::{
     collections::BTreeMap,
     sync::{
