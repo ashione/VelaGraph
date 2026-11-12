@@ -626,3 +626,13 @@ terminal certification and original deadlines. Snapshot capture remains serial
 under its aggregate budget. Process benchmarks cover 3/9/12 members with small
 graphs; larger histories/data, multi-host scaling and online resizing remain
 unproven, rather than inferred from these latency measurements.
+
+### 通用双时间图（规划，尚未实现）
+
+[#196](https://github.com/ashione/VelaGraph/issues/196) 与
+[设计计划](BITEMPORAL_GRAPH_PLAN.md) 跟踪业务有效时间 T 与事务系统版本 V。
+现有 fixed-V 是事务一致视图，不是双时间。先冻结点/边有效区间、追溯修正、
+未来生效与同 V/T 遍历语义，再做单分片 oracle、真实分布式及全量 CoreHR 验证；
+不硬编码 HR，不自造 Gremlin 方言。区间路径、时态索引及保留/GC 各自验收。
+关联 #109/#110/#111、#191/#192 对象存储及 #193/#194 checkpoint；持久化载体
+不自动提供时间语义。本项仅新增规划，不改变运行时格式/限制或取代现有功能性能主线。
