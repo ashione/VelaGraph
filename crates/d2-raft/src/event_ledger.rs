@@ -17,6 +17,11 @@ use rocksdb::{Direction, IteratorMode, Snapshot, WriteBatch, DB};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 
+#[path = "ledger_row_witness.rs"]
+mod row_witness;
+use row_witness::RowWitness;
+type RowWitnesses = Option<Arc<[RowWitness]>>;
+
 pub(super) const PREFIX: &[u8] = b"sm/ledger/";
 const PREFIX_END: &[u8] = b"sm/ledger0";
 // Every byte-full nonfinal row contains > (4 MiB - 2 MiB) event bytes;
@@ -200,6 +205,8 @@ struct Row {
 }
 impl Row {
     fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        #[cfg(all(test, debug_assertions))]
+        ROW_DECODES.set(ROW_DECODES.get() + 1);
         anyhow::ensure!(bytes.len() <= MAX_ROW_BYTES, "ledger row exceeds bound");
         let row: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
@@ -250,6 +257,7 @@ pub(super) struct Loaded {
     journal: Journal,
     descriptor: Descriptor,
     tail: Tail,
+    row_witnesses: RowWitnesses,
 }
 impl Loaded {
     pub(super) fn journal(&self) -> &Journal {
@@ -280,13 +288,20 @@ impl Loaded {
 pub(super) struct Staged<'a> {
     candidate: &'a D1State,
     descriptor: Descriptor,
+    row_witnesses: RowWitnesses,
 }
 impl<'a> Staged<'a> {
-    fn new(candidate: &'a D1State, descriptor: Descriptor) -> anyhow::Result<Self> {
+    fn new(
+        candidate: &'a D1State,
+        descriptor: Descriptor,
+        row_witnesses: RowWitnesses,
+    ) -> anyhow::Result<Self> {
         descriptor.validate()?;
+        validate_row_witnesses(&descriptor, &row_witnesses)?;
         Ok(Self {
             candidate,
             descriptor,
+            row_witnesses,
         })
     }
 
@@ -304,6 +319,8 @@ impl<'a> Staged<'a> {
 #[cfg(test)]
 thread_local! {
     static RAW_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(debug_assertions)]
+    static ROW_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -317,7 +334,16 @@ pub(super) fn raw_walks() -> u64 {
 fn walk(
     snapshot: &Snapshot<'_>,
     descriptor: &Descriptor,
+    observe: impl FnMut(Command, &HistoryCursor, usize) -> anyhow::Result<()>,
+) -> anyhow::Result<Tail> {
+    walk_rows(snapshot, descriptor, observe, |_, _, _| {})
+}
+
+fn walk_rows(
+    snapshot: &Snapshot<'_>,
+    descriptor: &Descriptor,
     mut observe: impl FnMut(Command, &HistoryCursor, usize) -> anyhow::Result<()>,
+    mut observe_row: impl FnMut(u64, &[u8], &[u8]),
 ) -> anyhow::Result<Tail> {
     #[cfg(test)]
     RAW_WALKS.set(RAW_WALKS.get() + 1);
@@ -404,6 +430,7 @@ fn walk(
             observe(event, &cursor, size)?;
         }
         anyhow::ensure!(cursor.root == row.after_root, "ledger row root mismatch");
+        observe_row(first, &key, &value);
         tail = Some(Tail {
             events: original_events,
             first: row.first,
@@ -434,9 +461,17 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
     crate::transaction_decisions::assert_full_journal_allowed();
     let snapshot = db.snapshot();
     let mut journal = journal(descriptor.domain.authority.mode)?;
-    let tail = walk(&snapshot, descriptor, |event, _, _| {
-        replay(&mut journal, event)
-    })?;
+    let mut witnesses = build_row_witnesses(descriptor.domain.role).then(Vec::new);
+    let tail = walk_rows(
+        &snapshot,
+        descriptor,
+        |event, _, _| replay(&mut journal, event),
+        |first, key, value| {
+            if let Some(rows) = &mut witnesses {
+                rows.push(RowWitness::new(first, key, value));
+            }
+        },
+    )?;
     anyhow::ensure!(
         journal.cohort() == Some(&descriptor.domain.cohort),
         "ledger replay cohort mismatch"
@@ -445,6 +480,7 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
         journal,
         descriptor: descriptor.clone(),
         tail,
+        row_witnesses: witnesses.map(Arc::from),
     })
 }
 
@@ -455,6 +491,7 @@ pub(super) fn load(db: &DB, descriptor: &Descriptor) -> anyhow::Result<Loaded> {
 #[derive(Debug)]
 pub(super) struct PublishedArchiveCut {
     descriptor: Descriptor,
+    row_witnesses: RowWitnesses,
     metadata: Vec<u8>,
     decision_manifest: Vec<u8>,
     resolved_prefix: u64,
@@ -471,7 +508,7 @@ impl Loaded {
         decision_manifest: &[u8],
     ) -> anyhow::Result<PublishedArchiveCut> {
         self.validate_hydrated_state(state)?;
-        let staged = Staged::new(state, self.descriptor.clone())?;
+        let staged = Staged::new(state, self.descriptor.clone(), self.row_witnesses.clone())?;
         staged.published_cut(state, metadata, decision_manifest)
     }
 }
@@ -508,8 +545,10 @@ impl Staged<'_> {
                 == decision_manifest,
             "published archive decision manifest differs from staged state"
         );
+        validate_row_witnesses(descriptor, &self.row_witnesses)?;
         Ok(PublishedArchiveCut {
             descriptor: descriptor.clone(),
+            row_witnesses: self.row_witnesses.clone(),
             metadata: metadata.to_vec(),
             decision_manifest: decision_manifest.to_vec(),
             terminal_through: state
@@ -571,6 +610,164 @@ impl PublishedArchiveCut {
             root: self.descriptor.head_root,
         }
     }
+}
+
+fn build_row_witnesses(role: Role) -> bool {
+    #[cfg(test)]
+    if ORIGINAL_COORDINATOR_VERIFY.get() {
+        return false;
+    }
+    role == Role::Coordinator
+}
+
+fn validate_row_witnesses(descriptor: &Descriptor, witnesses: &RowWitnesses) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if ORIGINAL_COORDINATOR_VERIFY.get() {
+        return Ok(());
+    }
+    match (descriptor.domain.role, witnesses) {
+        (Role::Member, None) => Ok(()),
+        (Role::Coordinator, Some(rows)) => {
+            anyhow::ensure!(
+                rows.len() as u64 == descriptor.segment_count
+                    && rows.len() as u64 <= max_segments(descriptor.domain.cohort.profile)
+                    && rows.first().is_some_and(|row| row.first == 1)
+                    && rows.windows(2).all(|pair| pair[0].first < pair[1].first)
+                    && rows
+                        .last()
+                        .is_some_and(|row| row.first <= descriptor.event_count),
+                "invalid private row inventory"
+            );
+            let bytes = rows
+                .iter()
+                .try_fold(0u64, |total, row| total.checked_add(row.bytes))
+                .ok_or_else(|| anyhow::anyhow!("row inventory bytes overflow"))?;
+            anyhow::ensure!(
+                bytes == descriptor.encoded_bytes,
+                "row inventory byte total mismatch"
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("row inventory role mismatch"),
+    }
+}
+
+#[cfg(test)]
+thread_local! { static ORIGINAL_COORDINATOR_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(super) fn with_original_coordinator_verify<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ORIGINAL_COORDINATOR_VERIFY.set(self.0);
+        }
+    }
+    let _reset = Reset(ORIGINAL_COORDINATOR_VERIFY.replace(true));
+    run()
+}
+
+/// Complete byte coverage against a private, strictly minted coordinator witness.
+/// Every invocation rereads the namespace and applied marker. Only decoding of
+/// byte-identical sealed rows is elided, never their reads or integrity checks.
+fn verify_coordinator_rows(
+    snapshot: &Snapshot<'_>,
+    cut: &PublishedArchiveCut,
+) -> anyhow::Result<Tail> {
+    #[cfg(test)]
+    if ORIGINAL_COORDINATOR_VERIFY.get() {
+        return walk(snapshot, &cut.descriptor, |_, _, _| Ok(()));
+    }
+    #[cfg(test)]
+    RAW_WALKS.set(RAW_WALKS.get() + 1);
+    let descriptor = &cut.descriptor;
+    descriptor.validate()?;
+    anyhow::ensure!(
+        descriptor.domain.role == Role::Coordinator,
+        "row witness role mismatch"
+    );
+    let expected = cut
+        .row_witnesses
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing private row witnesses"))?;
+    anyhow::ensure!(
+        expected.len() as u64 == descriptor.segment_count,
+        "row witness count mismatch"
+    );
+    let applied: Option<LogId<NodeId>> = match snapshot.get(super::APPLIED_KEY)? {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => None,
+    };
+    anyhow::ensure!(
+        applied == descriptor.applied,
+        "ledger applied marker mismatch"
+    );
+    let mut count = 0usize;
+    let mut encoded = 0u64;
+    let mut tail = None;
+    for item in snapshot.iterator(IteratorMode::From(PREFIX, Direction::Forward)) {
+        let (key, value) = item?;
+        if !key.starts_with(PREFIX) {
+            break;
+        }
+        let witness = expected
+            .get(count)
+            .ok_or_else(|| anyhow::anyhow!("extra ledger row"))?;
+        anyhow::ensure!(
+            key.as_ref() == descriptor.domain.key(witness.first) && witness.matches(&key, &value),
+            "ledger row differs from private byte witness"
+        );
+        encoded = encoded
+            .checked_add(witness.bytes)
+            .ok_or_else(|| anyhow::anyhow!("ledger row byte overflow"))?;
+        count += 1;
+        if count == expected.len() {
+            let row = Row::decode(&value)?;
+            anyhow::ensure!(
+                row.domain == descriptor.domain
+                    && row.first == witness.first
+                    && row.after_root == descriptor.head_root
+                    && row
+                        .first
+                        .checked_add(row.events.len() as u64)
+                        .and_then(|n| n.checked_sub(1))
+                        == Some(descriptor.event_count),
+                "private tail boundary mismatch"
+            );
+            let before_count = row
+                .first
+                .checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("invalid private tail position"))?;
+            let mut event_bytes = 0usize;
+            for event in &row.events {
+                event_bytes = event_bytes
+                    .checked_add(event_size(event)?)
+                    .ok_or_else(|| anyhow::anyhow!("ledger tail byte overflow"))?;
+            }
+            anyhow::ensure!(
+                event_bytes <= MAX_HISTORY_PAGE_BYTES,
+                "private tail byte bound"
+            );
+            tail = Some(Tail {
+                first: row.first,
+                before: HistoryCursor {
+                    version: descriptor.domain.cohort.profile.history_version(),
+                    authority: descriptor.domain.authority.clone(),
+                    cohort: descriptor.domain.cohort.clone(),
+                    event_count: before_count,
+                    root: row.before_root,
+                },
+                count: row.events.len(),
+                events: row.events,
+                event_bytes,
+                encoded_bytes: witness.bytes,
+            });
+        }
+    }
+    anyhow::ensure!(
+        count == expected.len() && encoded == descriptor.encoded_bytes,
+        "incomplete ledger byte inventory"
+    );
+    tail.ok_or_else(|| anyhow::anyhow!("missing ledger tail"))
 }
 
 /// An operation-local snapshot verified against the private publication witness.
@@ -685,7 +882,7 @@ fn verify_active_inner<'db, 'cut>(
         }
         tail
     } else {
-        walk(&snapshot, &cut.descriptor, |_, _, _| Ok(())).map_err(super::ledger_read_error)?
+        verify_coordinator_rows(&snapshot, cut).map_err(super::ledger_read_error)?
     };
     Ok((
         VerifiedArchive {
@@ -1435,6 +1632,7 @@ pub(super) struct StagedActive<'a> {
     base_descriptor: Descriptor,
     base_terminal_through: u64,
     descriptor: Descriptor,
+    row_witnesses: RowWitnesses,
     // Operation-local output of the exact shared transitions below. These
     // records are handed to terminal staging and never retained by the cut.
     drained: Vec<Transaction>,
@@ -1604,8 +1802,10 @@ impl StagedActive<'_> {
             descriptor.applied,
             bytes,
         )?;
+        validate_row_witnesses(descriptor, &self.row_witnesses)?;
         Ok(PublishedArchiveCut {
             descriptor: descriptor.clone(),
+            row_witnesses: self.row_witnesses.clone(),
             metadata: metadata.to_vec(),
             decision_manifest: bytes.to_vec(),
             terminal_through: through,
@@ -1651,8 +1851,10 @@ impl StagedActive<'_> {
             descriptor.applied,
             decision_manifest,
         )?;
+        validate_row_witnesses(descriptor, &self.row_witnesses)?;
         Ok(PublishedArchiveCut {
             descriptor: descriptor.clone(),
+            row_witnesses: self.row_witnesses.clone(),
             metadata: metadata.to_vec(),
             decision_manifest: decision_manifest.to_vec(),
             terminal_through: checkpoint.resolved_prefix(),
@@ -1722,7 +1924,12 @@ pub(super) fn stage_active<'a>(
                 ..old.clone()
             },
             drained,
+            row_witnesses: before.cut.row_witnesses.clone(),
         });
+    }
+    let mut witnesses = before.cut.row_witnesses.as_ref().map(|rows| rows.to_vec());
+    if let Some(rows) = &mut witnesses {
+        rows.pop();
     }
     let mut cursor = before.tail.before.clone();
     let mut segments = old
@@ -1740,7 +1947,7 @@ pub(super) fn stage_active<'a>(
     for event in suffix {
         let size = event_size(event)?;
         if !fits(events.len(), bytes, size) {
-            write_active_row(
+            let witness = write_active_row(
                 batch,
                 before,
                 &mut cursor,
@@ -1749,6 +1956,9 @@ pub(super) fn stage_active<'a>(
                 &mut segments,
                 &mut encoded,
             )?;
+            if let (Some(rows), Some(witness)) = (&mut witnesses, witness) {
+                rows.push(witness);
+            }
             events.clear();
             bytes = 0;
         }
@@ -1757,7 +1967,7 @@ pub(super) fn stage_active<'a>(
             .checked_add(size)
             .ok_or_else(|| anyhow::anyhow!("raw tail bytes overflow"))?;
     }
-    write_active_row(
+    let witness = write_active_row(
         batch,
         before,
         &mut cursor,
@@ -1766,6 +1976,9 @@ pub(super) fn stage_active<'a>(
         &mut segments,
         &mut encoded,
     )?;
+    if let (Some(rows), Some(witness)) = (&mut witnesses, witness) {
+        rows.push(witness);
+    }
     let descriptor = Descriptor {
         version: old.version,
         domain: old.domain.clone(),
@@ -1787,6 +2000,7 @@ pub(super) fn stage_active<'a>(
         base_terminal_through: before.cut.terminal_through,
         descriptor,
         drained,
+        row_witnesses: witnesses.map(Arc::from),
     })
 }
 
@@ -1798,7 +2012,7 @@ fn write_active_row(
     event_bytes: usize,
     segments: &mut u64,
     encoded: &mut u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<RowWitness>> {
     anyhow::ensure!(!events.is_empty(), "empty staged ledger row");
     let domain = &before.cut.descriptor.domain;
     let after = cursor.extend(events).map_err(history_error)?;
@@ -1830,11 +2044,16 @@ fn write_active_row(
     *segments = segments
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("ledger segment count overflow"))?;
+    let witness = before
+        .cut
+        .row_witnesses
+        .as_ref()
+        .map(|_| RowWitness::new(first, &key, &value));
     if first != before.tail.first || events != before.tail.events.as_slice() {
         batch.put(key, value);
     }
     *cursor = after;
-    Ok(())
+    Ok(witness)
 }
 
 /// Exact current transaction from the same anchored cut as its E/R metadata.
@@ -2062,6 +2281,7 @@ pub(super) fn stage<'a>(
                     applied,
                     ..before.descriptor.clone()
                 },
+                before.row_witnesses.clone(),
             )
             .map(Some);
         }
@@ -2074,6 +2294,15 @@ pub(super) fn stage<'a>(
         ),
         None => (view.domain.zero_cursor()?, 0, 0),
     };
+    let mut witnesses = build_row_witnesses(view.domain.role).then(|| {
+        let mut rows = prior
+            .and_then(|loaded| loaded.row_witnesses.as_ref())
+            .map_or_else(Vec::new, |rows| rows.to_vec());
+        if prior.is_some() {
+            rows.pop();
+        }
+        rows
+    });
     let events = view.journal.events();
     while cursor.event_count < events.len() as u64 {
         let first = cursor.event_count as usize;
@@ -2100,6 +2329,9 @@ pub(super) fn stage<'a>(
         let unchanged = prior.is_some_and(|before| {
             row.first == before.tail.first && row.events.len() == before.tail.count
         });
+        if let Some(rows) = &mut witnesses {
+            rows.push(RowWitness::new(row.first, &key, &bytes));
+        }
         if !unchanged {
             batch.put(key, bytes);
         }
@@ -2114,7 +2346,7 @@ pub(super) fn stage<'a>(
         head_root: cursor.root,
         applied,
     };
-    Staged::new(candidate, descriptor).map(Some)
+    Staged::new(candidate, descriptor, witnesses.map(Arc::from)).map(Some)
 }
 fn row_end(events: &[Command], first: usize) -> anyhow::Result<(usize, usize)> {
     let mut end = first;
@@ -4440,5 +4672,193 @@ mod tests {
         let domain = View::of(&old).unwrap().domain;
         let descriptor = forge_domain(&db, domain, &impossible, &ends);
         assert!(load(&db, &descriptor).is_err());
+    }
+    #[test]
+    fn row_witness_complete_coverage_matches_original_and_decodes_only_tail() {
+        for count in [1, 31, 32, 33, 96] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let cut = persist_archive(&db, &history(count + 1), marker(1));
+            let old = with_original_coordinator_verify(|| verify_active(&db, &cut)).unwrap();
+            #[cfg(debug_assertions)]
+            let start = ROW_DECODES.get();
+            let new = verify_active(&db, &cut).unwrap();
+            #[cfg(debug_assertions)]
+            assert_eq!(ROW_DECODES.get() - start, 1);
+            assert_eq!(new.tail.events, old.tail.events);
+            assert_eq!(new.tail.before, old.tail.before);
+            assert_eq!(new.tail.first, old.tail.first);
+            assert_eq!(new.tail.count, old.tail.count);
+            assert_eq!(new.tail.event_bytes, old.tail.event_bytes);
+            assert_eq!(new.tail.encoded_bytes, old.tail.encoded_bytes);
+        }
+    }
+
+    #[test]
+    fn row_witness_rechecks_every_current_byte_and_full_marker() {
+        for fault in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let cut = persist_archive(&db, &history(97), marker(1));
+            verify_active(&db, &cut).unwrap();
+            let pinned = db.snapshot();
+            let raw = rows(&db);
+            match fault {
+                0..=2 => {
+                    let i = if fault == 2 { raw.len() - 1 } else { fault };
+                    let mut value = raw[i].1.clone();
+                    let middle = value.len() / 2;
+                    value[middle] ^= 1;
+                    db.put(&raw[i].0, value).unwrap();
+                }
+                3 => db.delete(&raw[1].0).unwrap(),
+                4 => db.put([PREFIX, b"extra"].concat(), b"extra").unwrap(),
+                5 => {
+                    db.delete(&raw[1].0).unwrap();
+                    db.put([PREFIX, b"renamed"].concat(), &raw[1].1).unwrap();
+                }
+                6 => {
+                    let mut value = raw[0].1.clone();
+                    value.push(b' ');
+                    db.put(&raw[0].0, value).unwrap();
+                }
+                8 => {
+                    let mut row = Row::decode(&raw[1].1).unwrap();
+                    let Command::Begin { participants, .. } = &mut row.events[0] else {
+                        panic!("expected Begin");
+                    };
+                    participants[0].intent[0] = 9;
+                    let value = serde_json::to_vec(&row).unwrap();
+                    assert_eq!(value.len(), raw[1].1.len());
+                    db.put(&raw[1].0, value).unwrap();
+                }
+                9 => {
+                    db.put(&raw[0].0, &raw[1].1).unwrap();
+                    db.put(&raw[1].0, &raw[0].1).unwrap();
+                }
+                _ => db
+                    .put(
+                        super::super::APPLIED_KEY,
+                        serde_json::to_vec(&Some(LogId::new(
+                            openraft::CommittedLeaderId::new(99, 88),
+                            1,
+                        )))
+                        .unwrap(),
+                    )
+                    .unwrap(),
+            }
+            let old = with_original_coordinator_verify(|| verify_active(&db, &cut))
+                .err()
+                .unwrap();
+            let new = verify_active(&db, &cut).err().unwrap();
+            assert_eq!(old, new, "fault {fault}");
+            verify_coordinator_rows(&pinned, &cut).unwrap();
+        }
+    }
+
+    #[test]
+    fn row_witness_bounds_are_constant_per_segment_and_member_has_none() {
+        assert_eq!(std::mem::size_of::<RowWitness>(), 48);
+        assert_eq!(max_segments(CapacityProfile::LegacyCountV1), 2122);
+        assert_eq!(max_segments(CapacityProfile::ByteBound16MiBV1), 7499);
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let state = tail_member_state(CapacityProfile::LegacyCountV1, 4, 2);
+        let cut = persist_archive(&db, &state, marker(1));
+        assert!(cut.row_witnesses.is_none());
+        verify_active(&db, &cut).unwrap();
+    }
+
+    #[test]
+    #[ignore = "paired real verifier cost, no whole-request speedup claim"]
+    fn row_witness_verification_cost() {
+        let build = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        for count in [1, 32, 128, 512] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let state = history(count + 1);
+            let cut = persist_archive(&db, &state, marker(1));
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..24 {
+                for slot in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let now = std::time::Instant::now();
+                    if slot == 0 {
+                        with_original_coordinator_verify(|| verify_active(&db, &cut)).unwrap();
+                    } else {
+                        verify_active(&db, &cut).unwrap();
+                    }
+                    if round >= 4 {
+                        times[slot].push(now.elapsed().as_micros());
+                    }
+                }
+            }
+            for t in &mut times {
+                t.sort_unstable();
+            }
+            eprintln!("ROW_WITNESS_VERIFY tx={count} original_median_us={} witness_median_us={} rows={} resident_witness_bytes={} samples=20 build={build}", times[0][10], times[1][10], cut.descriptor.segment_count, cut.row_witnesses.as_ref().unwrap().len()*std::mem::size_of::<RowWitness>());
+            eprintln!(
+                "ROW_WITNESS_VERIFY_SAMPLES original_us={:?} witness_us={:?}",
+                times[0], times[1]
+            );
+        }
+    }
+    #[test]
+    fn row_witness_cold_staged_and_blank_views_have_exact_provenance() {
+        for count in [1, 30, 31, 32, 33, 96] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let original = history(count + 1);
+            let cut = persist_archive(&db, &original, marker(1));
+            let loaded = load(&db, &cut.descriptor).unwrap();
+            assert_eq!(loaded.row_witnesses, cut.row_witnesses);
+            let verified = verify_active(&db, &cut).unwrap();
+            let checkpoint = cut.checkpoint.as_ref().clone();
+            let mut batch = WriteBatch::default();
+            let blank = stage_active(&mut batch, &verified, &checkpoint, &[], marker(2)).unwrap();
+            assert!(Arc::ptr_eq(
+                blank.row_witnesses.as_ref().unwrap(),
+                cut.row_witnesses.as_ref().unwrap()
+            ));
+            let old_witnesses = cut.row_witnesses.clone();
+            let event = begin(count + 1);
+            let mut next = checkpoint.clone();
+            next.apply(event.clone(), &mut |key| {
+                verified
+                    .lookup(key, &[])
+                    .map_err(|_| crate::transaction_decisions::Error::InvalidJournal)
+            })
+            .unwrap();
+            let changed = stage_active(
+                &mut batch,
+                &verified,
+                &next,
+                std::slice::from_ref(&event),
+                marker(2),
+            )
+            .unwrap();
+            assert!(!Arc::ptr_eq(
+                changed.row_witnesses.as_ref().unwrap(),
+                cut.row_witnesses.as_ref().unwrap()
+            ));
+            assert_eq!(old_witnesses, cut.row_witnesses);
+            let mut journal = original
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .full()
+                .unwrap()
+                .clone();
+            journal.replay_event(event).unwrap();
+            let next_state = state(journal);
+            let mut full_batch = WriteBatch::default();
+            let full = stage(&mut full_batch, None, Some(&next_state), marker(2), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(full.row_witnesses, changed.row_witnesses);
+        }
     }
 }
