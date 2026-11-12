@@ -42,3 +42,6 @@ pub mod experimental_graph;
 
 /// Experimental bounded semantic reference; not a durable temporal API.
 pub mod temporal_reference;
+
+/// Experimental durable local temporal assertions; no distributed certification.
+pub mod temporal_store;

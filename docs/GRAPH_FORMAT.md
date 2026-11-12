@@ -121,3 +121,11 @@ one CAS batch. IDs are never reused. Reads validate visible residual indexes and
 charge tombstone candidates before skipping them. Recovery and GC are unsupported.
 See [deletion contract and versioned format](EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion)
 for upgrade restrictions, bounds and attempt-local retry outcomes.
+
+## Experimental temporal assertions
+
+The separate, opt-in [temporal format 1](TEMPORAL_STORE.md) persists local
+bitemporal assertions with canonical v1 record payloads in a dedicated database.
+It is not a reinterpretation or migration of these keys, and has no distributed
+version or Gremlin integration yet. The document defines the explicit experimental
+format, point-read visibility, bounds and recovery exceptions.

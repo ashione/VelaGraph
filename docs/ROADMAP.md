@@ -668,3 +668,11 @@ unproven, rather than inferred from these latency measurements.
 不硬编码 HR，不自造 Gremlin 方言。区间路径、时态索引及保留/GC 各自验收。
 关联 #109/#110/#111、#191/#192 对象存储及 #193/#194 checkpoint；持久化载体
 不自动提供时间语义。本项仅新增规划，不改变运行时格式/限制或取代现有功能性能主线。
+
+### #196 单分片持久化时间断言切片
+
+`temporal_store` 在独立、显式版本化数据库中保存 canonical 点/边修订，
+一次同步 WriteBatch 提交本地系统版本与有效区间，支持固定 V/T 的历史点读、
+端点可见性与 reopen/进程退出恢复验证。它不是 distributed cohort V，也没有
+接入 Gremlin、时态邻接索引或既有双 DB checkpoint。下一步接官方查询执行器
+和索引，再验证真实跨片同 V/T。详见 [范围与格式](TEMPORAL_STORE.md)，#196 不关闭。

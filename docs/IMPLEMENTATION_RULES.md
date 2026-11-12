@@ -164,3 +164,13 @@ one conditional canonical Put preserves qualified identity, labels and adjacency
 with bounded patch admission and exact historical retry. Vertex deletion is
 explicitly Unsupported; absence of observed indexes is never a deletion proof.
 No v1, Gremlin syntax, live record format or distributed transaction change.
+
+### Experimental local temporal assertion scope
+
+The opt-in [temporal store](TEMPORAL_STORE.md) is an explicit R2/R4 scope exception
+for a new versioned dedicated namespace and interval-aware assertion semantics.
+Canonical graph payloads and validation are reused. Edge assertions can precede
+endpoints, but point reads expose an edge only when both endpoints exist at the
+same V/T. No v1/v2 write, deletion, tombstone or migration behavior changes.
+This exception provides no new Gremlin syntax, cross-partition transaction or
+purge/install permission.
