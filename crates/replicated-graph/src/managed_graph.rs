@@ -32,6 +32,8 @@ pub enum Error {
     Graph(#[from] ExperimentalError),
     #[error("storage: {0}")]
     Storage(#[from] StorageNodeError),
+    #[error("temporal records: {0}")]
+    Temporal(#[from] velagraph::temporal_store::TemporalStoreError),
     #[error("transaction identity or mapping mismatch")]
     Identity,
     #[error("transaction result uncertain; retain and retry the same plan")]
@@ -363,9 +365,60 @@ impl GraphSnapshot {
             .prepare_reverse(replacement)?;
         self.plan(vec![source, reverse, new_source, new_reverse])
     }
+    /// Bind business time once to this certified cohort snapshot. This borrows
+    /// the same session and original expiry; it cannot refresh V independently.
+    pub fn temporal(&self, valid_time: i64) -> TemporalSnapshot<'_> {
+        TemporalSnapshot {
+            graph: self,
+            valid_time,
+        }
+    }
+
+    /// One existing managed transaction can atomically publish vertex assertions
+    /// on several shards. No third temporal database is consulted or written.
+    /// Edges and arbitrary caller-supplied write operations remain unsupported.
+    pub fn prepare_temporal_vertices(
+        &self,
+        mutations: &BTreeMap<u32, Vec<velagraph::temporal_store::TemporalMutation>>,
+    ) -> Result<Plan> {
+        if mutations.is_empty()
+            || mutations.len() > self.views.len()
+            || mutations.values().map(Vec::len).sum::<usize>() > 256
+        {
+            return Err(Error::Capacity);
+        }
+        self.version()?;
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|_| Error::Uncertain)?;
+        if id == [0; 16] {
+            return Err(Error::Identity);
+        }
+        let mut batches = Vec::with_capacity(mutations.len());
+        let mut bytes = 0usize;
+        let mut operations = 0usize;
+        for (shard, changes) in mutations {
+            let view = self.views.get(&u64::from(*shard)).ok_or(Error::Identity)?;
+            let batch = velagraph::temporal_store::managed::prepare_vertices(view, changes, id)?;
+            operations = operations.saturating_add(batch.0.operations.len());
+            bytes = bytes.saturating_add(
+                batch
+                    .0
+                    .operations
+                    .iter()
+                    .map(|op| match op {
+                        WriteOp::Put { key, value } => key.len() + value.len(),
+                        WriteOp::Delete { key } => key.len(),
+                    })
+                    .sum::<usize>(),
+            );
+            if operations > d2_raft::MAX_BATCH_OPERATIONS || bytes > d2_raft::MAX_BATCH_BYTES {
+                return Err(Error::Capacity);
+            }
+            batches.push(batch);
+        }
+        self.plan_requests(id, batches)
+    }
     fn plan(&self, batches: Vec<PreparedBatch>) -> Result<Plan> {
-        let cohort = self.session.cohort()?.clone();
-        let authority = self.session.authority()?.clone();
         // Preserve the source request identity, including delete tombstones.
         // Select it before sorting participants, and retain it on every retry.
         let id = batches.first().ok_or(Error::Identity)?.request_id();
@@ -388,11 +441,25 @@ impl GraphSnapshot {
                 }
             }
         }
+        self.plan_requests(
+            id,
+            by_shard
+                .into_values()
+                .map(PreparedBatch::into_conditional_request)
+                .collect(),
+        )
+    }
+    fn plan_requests(
+        &self,
+        id: [u8; 16],
+        batches: Vec<(velagraph::WriteRequest, u64)>,
+    ) -> Result<Plan> {
+        let cohort = self.session.cohort()?.clone();
+        let authority = self.session.authority()?.clone();
         let mut parts = Vec::new();
         let mut bytes = 0usize;
         let mut operations = 0usize;
-        for batch in by_shard.into_values() {
-            let (request, sequence) = batch.into_conditional_request();
+        for (request, sequence) in batches {
             let member = cohort
                 .members
                 .iter()
@@ -454,6 +521,45 @@ impl GraphSnapshot {
             version: self.version()?,
             parts,
         })
+    }
+}
+
+/// Business-time view of the entire existing certified cohort. Global V and
+/// all member local heads derive from one SnapshotSession, never local latest.
+/// Point reads only in this slice; no cross-shard temporal traversal or global
+/// temporal recovery-readiness claim is made.
+pub struct TemporalSnapshot<'a> {
+    graph: &'a GraphSnapshot,
+    valid_time: i64,
+}
+impl TemporalSnapshot<'_> {
+    pub fn version(&self) -> Result<u64> {
+        self.graph.version()
+    }
+    pub fn valid_time(&self) -> i64 {
+        self.valid_time
+    }
+    pub fn local_version(&self, partition: u32) -> Result<u64> {
+        self.version()?;
+        let view = self
+            .graph
+            .views
+            .get(&u64::from(partition))
+            .ok_or(Error::Identity)?;
+        let version = velagraph::temporal_store::managed::local_version(view)?;
+        self.version()?;
+        Ok(version)
+    }
+    pub fn vertex(&self, vertex: VertexRef) -> Result<Option<Vertex>> {
+        self.version()?;
+        let view = self
+            .graph
+            .views
+            .get(&u64::from(vertex.partition))
+            .ok_or(Error::Identity)?;
+        let result = velagraph::temporal_store::managed::vertex(view, self.valid_time, vertex.id)?;
+        self.version()?;
+        Ok(result)
     }
 }
 

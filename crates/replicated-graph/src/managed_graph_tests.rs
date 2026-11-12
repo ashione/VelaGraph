@@ -1936,3 +1936,6 @@ fn member_parallelism_is_checked_without_contacting_endpoints() {
         assert_eq!(graph.member_parallelism, width);
     }
 }
+
+#[path = "managed_temporal_tests.rs"]
+mod temporal_tests;
