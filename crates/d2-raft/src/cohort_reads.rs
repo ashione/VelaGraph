@@ -229,6 +229,44 @@ pub async fn admit_endpoints<'a>(
     Ok(cut)
 }
 
+/// Wait for a complete, identity-bound safe prefix at least `minimum_version`.
+/// This is a causal lower bound, not a linearizable latest read. Waiting never
+/// repairs writes, substitutes endpoints, or resets the acquisition/TTL clock.
+/// Dropping this future cancels polling; no participant views have been opened.
+#[allow(clippy::too_many_arguments)]
+pub async fn admit_endpoints_at_least<'a>(
+    coordinator: NodeRef<'a>,
+    authority: Authority,
+    cohort: &Cohort,
+    members: Vec<(NodeRef<'a>, Target)>,
+    minimum_version: u64,
+    lifetime: Duration,
+    deadline: Instant,
+) -> Result<AdmittedCut<'a>, Error> {
+    if minimum_version > cohort.profile.max_transactions() as u64 {
+        return Err(Error::InvalidLimits);
+    }
+    let mut window = AcquisitionWindow::new(lifetime)?;
+    window.deadline = window.deadline.min(deadline);
+    window.check()?;
+    let cut = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(window.deadline),
+        admit_cut_inner(
+            coordinator,
+            authority,
+            cohort.coordinator_epoch,
+            members,
+            None,
+            window,
+            Some((cohort, minimum_version)),
+        ),
+    )
+    .await
+    .map_err(|_| window.timeout_error())??;
+    cut.check()?;
+    Ok(cut)
+}
+
 #[derive(Clone, Copy)]
 struct AcquisitionWindow {
     expires: Instant,
@@ -272,62 +310,96 @@ async fn admit_cut<'a>(
     version: Option<u64>,
     window: AcquisitionWindow,
 ) -> Result<AdmittedCut<'a>, Error> {
-    let summary = coordinator
-        .summary(&authority, coordinator_epoch)
-        .await
-        .map_err(|e| {
-            if e == managed_rpc::Error::Application(D1Error::VisibilityHistory) {
-                Error::UnboundCohort
-            } else {
-                Error::from(e)
-            }
-        })?;
-    let cohort = summary.cohort;
-    if cohort.coordinator_shard != authority.shard
-        || cohort.coordinator_epoch != coordinator_epoch
-        || members.len() != cohort.members.len()
-    {
-        return Err(Error::Identity);
-    }
-    for ((_, target), expected) in members.iter().zip(&cohort.members) {
-        if target.shard != expected.shard
-            || target.epoch != expected.epoch
-            || target.mode != expected.mode
-        {
-            return Err(Error::Identity);
-        }
-    }
-    let mut common = summary.resolved_prefix;
-    for (node, target) in &members {
-        window.check()?;
-        let info = node.visibility(target).await?;
-        if info.baseline_sequence != 0
-            || info.authority != authority
-            || info.cohort.as_ref() != Some(&cohort)
-        {
-            return Err(Error::Identity);
-        }
-        common = common.min(info.applied_prefix);
-    }
-    let version = version.unwrap_or(common);
-    if version > summary.resolved_prefix {
-        return Err(Error::Unresolved);
-    }
-    window.check()?;
-    let proof = coordinator
-        .terminal(&authority, coordinator_epoch, version)
-        .await?;
-    if proof.cohort() != &cohort {
-        return Err(Error::Identity);
-    }
-    Ok(AdmittedCut {
+    admit_cut_inner(
+        coordinator,
         authority,
-        cohort,
-        version,
-        proof,
+        coordinator_epoch,
         members,
+        version,
         window,
-    })
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_cut_inner<'a>(
+    coordinator: NodeRef<'a>,
+    authority: Authority,
+    coordinator_epoch: u64,
+    members: Vec<(NodeRef<'a>, Target)>,
+    version: Option<u64>,
+    window: AcquisitionWindow,
+    minimum: Option<(&Cohort, u64)>,
+) -> Result<AdmittedCut<'a>, Error> {
+    loop {
+        window.check()?;
+        let summary = coordinator
+            .summary(&authority, coordinator_epoch)
+            .await
+            .map_err(|e| {
+                if e == managed_rpc::Error::Application(D1Error::VisibilityHistory) {
+                    Error::UnboundCohort
+                } else {
+                    Error::from(e)
+                }
+            })?;
+        let cohort = summary.cohort;
+        if minimum.is_some_and(|(expected, _)| expected != &cohort) {
+            return Err(Error::Identity);
+        }
+        if cohort.coordinator_shard != authority.shard
+            || cohort.coordinator_epoch != coordinator_epoch
+            || members.len() != cohort.members.len()
+        {
+            return Err(Error::Identity);
+        }
+        for ((_, target), expected) in members.iter().zip(&cohort.members) {
+            if target.shard != expected.shard
+                || target.epoch != expected.epoch
+                || target.mode != expected.mode
+            {
+                return Err(Error::Identity);
+            }
+        }
+        let mut common = summary.resolved_prefix;
+        for (node, target) in &members {
+            window.check()?;
+            let info = node.visibility(target).await?;
+            if info.baseline_sequence != 0
+                || info.authority != authority
+                || info.cohort.as_ref() != Some(&cohort)
+            {
+                return Err(Error::Identity);
+            }
+            common = common.min(info.applied_prefix);
+        }
+        if minimum.is_some_and(|(_, floor)| common < floor) {
+            // Bounded rate and one original absolute deadline, even under constant
+            // writes. No terminal proof or data capture is allocated while behind.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        let version = version.unwrap_or(common);
+        if version > summary.resolved_prefix {
+            return Err(Error::Unresolved);
+        }
+        window.check()?;
+        let proof = coordinator
+            .terminal(&authority, coordinator_epoch, version)
+            .await?;
+        if proof.cohort() != &cohort {
+            return Err(Error::Identity);
+        }
+        return Ok(AdmittedCut {
+            authority,
+            cohort,
+            version,
+            proof,
+            members,
+            window,
+        });
+    }
 }
 
 async fn capture_cut(cut: AdmittedCut<'_>, limit: ReadLimit) -> Result<SnapshotSession, Error> {
@@ -955,6 +1027,110 @@ mod tests {
         .is_err());
         assert_eq!(next.version().unwrap(), 2);
         for node in [&a, &c] {
+            node.raft.shutdown().await.unwrap();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn minimum_version_waits_for_entire_cohort_and_never_downgrades() {
+        let _resources = crate::managed_rpc::test_resource_guard().await;
+        let cluster = Cluster::new();
+        let mut j = Journal::new([9; 16]).unwrap();
+        j.apply(Command::BindCohort { cohort: cohort() }).unwrap();
+        let c = start(&cluster, 9, &j).await;
+        let a = start(&cluster, 7, &j).await;
+        let b = start(&cluster, 8, &j).await;
+        commit(&c, &[(&a, 7)], 1, 0).await;
+        advance(&c, &a, 7, 1).await;
+        let members = || {
+            vec![
+                (NodeRef::Local(&a), target(7)),
+                (NodeRef::Local(&b), target(8)),
+            ]
+        };
+        let cohort = cohort();
+        // A nonparticipant still has to apply the terminal prefix. The legacy
+        // latest read remains allowed to select zero; the lower-bound read isn't.
+        assert_eq!(admitted(&c, &a, &b, None).await.unwrap().version(), 0);
+        let wait = admit_endpoints_at_least(
+            NodeRef::Local(&c),
+            authority(),
+            &cohort,
+            members(),
+            1,
+            Duration::from_secs(20),
+            Instant::now() + Duration::from_secs(10),
+        );
+        tokio::pin!(wait);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err());
+        advance(&c, &b, 8, 1).await;
+        let cut = wait.await.unwrap();
+        assert_eq!(cut.version(), 1);
+        let expires = cut.expires_at();
+        // Future writes cannot change the selected snapshot.
+        commit(&c, &[(&a, 7)], 2, 1).await;
+        advance(&c, &a, 7, 2).await;
+        advance(&c, &b, 8, 2).await;
+        let captured = capture_cut(cut, limit()).await.unwrap();
+        assert_eq!(captured.version().unwrap(), 1);
+        assert_eq!(captured.expires_at().unwrap(), expires);
+        assert_eq!(
+            captured.shard(7).unwrap().entries.get(b"x".as_slice()),
+            Some(&b"v1".to_vec())
+        );
+        let cut = admit_endpoints_at_least(
+            NodeRef::Local(&c),
+            authority(),
+            &cohort,
+            members(),
+            1,
+            Duration::from_secs(20),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cut.version(), 2); // lower bound, not exact historical version
+        let result = admit_endpoints_at_least(
+            NodeRef::Local(&c),
+            authority(),
+            &cohort,
+            members(),
+            3,
+            Duration::from_secs(20),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Unavailable)));
+        let mut wrong = cohort.clone();
+        wrong.members[0].mode = [42; 16];
+        assert!(matches!(
+            admit_endpoints_at_least(
+                NodeRef::Local(&c),
+                authority(),
+                &wrong,
+                members(),
+                0,
+                Duration::from_secs(20),
+                Instant::now() + Duration::from_secs(10)
+            )
+            .await,
+            Err(Error::Identity)
+        ));
+        // Cancellation before readiness creates no retained cut or lease.
+        let canceled = admit_endpoints_at_least(
+            NodeRef::Local(&c),
+            authority(),
+            &cohort,
+            members(),
+            3,
+            Duration::from_secs(20),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(100), canceled)
+            .await
+            .is_err());
+        for node in [&a, &b, &c] {
             node.raft.shutdown().await.unwrap();
         }
     }

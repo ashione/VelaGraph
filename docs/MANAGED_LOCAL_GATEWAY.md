@@ -307,3 +307,46 @@ fixed cohort, immutable full-partition captures, restricted Gremlin subset,
 whole-result sealing and retained-history costs remain. Removing those boundaries
 needs separately reviewed streaming operators, indexed versioned views and
 cohort/flow-control contracts; changing a concurrency setting is not that work.
+
+## Explicit read-your-writes lower bound
+
+`OpenLocalQueryAfter { minimum_version, ttl_millis, query, page_size }` is an
+additive short-query entrypoint. Pair `minimum_version` with the **same complete
+Request.binding** used for the write. After `WriteStatus::Committed { ordinal,
+.. }`, pass that ordinal (or the maximum of several committed ordinals from
+that binding). A pending, absent or aborted write is not evidence of a successful
+mutation. `visible: false` means this read may need to wait; it does not mean
+that reading performs recovery of the write.
+
+The gateway polls leader-observed coordinator/member readiness at most once
+per 50 ms after each full pass. It checks the complete fixed cohort, including
+nonparticipants in the write, and selects one common safe version V only when
+V >= minimum_version. It then uses the unchanged terminal-proof, fixed-node
+capture, parallel executor and immutable result validation. The reply is the
+existing `OpenLocalQuery` shape; client validation rejects any V below the floor.
+Once selected, V never changes, even if later writes commit while reading.
+Later writes may supersede a property: read-your-writes means the snapshot is
+not earlier than the write, not that its old value must still exist.
+
+Waiting shares the original request acquisition deadline and TTL with capture
+and execution. It does not extend either, allocate participant views before
+readiness, retry failed RPCs, skip unavailable members, or drive participant
+advancement. A lagging member eventually causes the existing timeout/Unknown
+error, not a stale success. Identity/capacity/corruption errors fail immediately.
+Dropping the admission future cancels polling; gateway disconnect handling and
+bounded in-flight work retain their existing contracts. Waiters consume the
+existing execution/work/memory reservations, so excessive waiting is bounded
+rather than an unbounded queue. This can reduce concurrent read capacity.
+
+`None` still selects the currently observed common prefix; `Some(T)` still
+requests exactly T. The new lower bound is not a linearizable latest read, a
+cross-cohort timestamp, an automatic client bookmark manager, or an extension
+to the renewable job/profile APIs. A minimum above this cohort's transaction
+profile capacity is invalid. No on-disk format or Gremlin syntax changes.
+
+Design references: [Neo4j Query API bookmarks](https://neo4j.com/docs/query-api/current/bookmarks/)
+wait for the represented committed state before executing; [MongoDB read
+concern](https://www.mongodb.com/docs/manual/reference/read-concern/) distinguishes
+causal sessions, snapshot reads and linearizable reads. VelaGraph's ordinal plus
+binding plays the lower-bound role but does not inherit either system's broader
+availability or causal-driver guarantees.
