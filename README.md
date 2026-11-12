@@ -1,565 +1,197 @@
-# VelaGraph (Experimental)
+# VelaGraph
 
-VelaGraph is an experimental **distributed property-graph engine** built on a RocksDB storage
-kernel, with a bounded standard Gremlin subset.
-The repository combines local graph storage and single-partition transactions
-with Raft-backed storage nodes, static remote routing, and bounded cross-shard
-query coordination. Graph records, adjacency and storage metadata live in
-RocksDB key spaces.
+**A Rust property-graph engine exploring consistent, bounded distributed queries.**
 
-Current graph work focuses on the CoreHR scenario: 200,000 people, 5,000
-departments, reporting hierarchies, and membership in multiple departments.
-The [full-scale CI scenario](.github/workflows/corehr.yml) exercises supported
-queries, hierarchy counts, and ordered vertex-identity result pages against
-generated reference data. This is functional validation on same-host independent
-processes, not a multi-machine performance or availability claim.
+VelaGraph combines a RocksDB graph kernel, standard Gremlin syntax, Raft-backed
+storage nodes and cross-shard query coordination. The goal is a general-purpose
+distributed graph system for changing, relationship-rich data, not an engine
+specialized for one dataset.
 
-## Choose the graph API
+> **Experimental, not production-ready.** Several APIs deliberately have different
+> consistency and capacity contracts. Choose the path below before building on it.
+> TCP services are unauthenticated plaintext for trusted development networks only.
 
-The repository has three distinct graph paths. Support and consistency do not
-transfer automatically between them:
+[Quick start](#quick-start) · [Capabilities](#choose-your-graph-path) ·
+[Architecture](#architecture) · [Roadmap](docs/ROADMAP.md) ·
+[Contribute](CONTRIBUTING.md)
 
-| Path | Current contract |
-| --- | --- |
-| Local v1 / K3 | `GraphEngine` owns one partition. Snapshot reads and explicit single-partition transactions are available. The D1 `GraphRecordStore` adapter additionally supports replicated v1 CRUD and Gremlin. |
-| Observed experimental v2 | Static routed and server-coordinated cross-shard queries, bounded hierarchy jobs and selected result/property pages. Cross-shard writes are staged, not atomic. Results carry per-shard snapshots and **Unverified** completeness, not one certified graph version. |
-| Managed fixed cohort | Explicitly activated empty-baseline cohort, durable external-ID/original-Plan recovery, coordinated typed vertex/edge writes and certified same-version sessions. The gateway can use local Raft handles or fixed remote endpoints. Partial application cannot open a newer certified V. This is a restricted experiment, not general D4/D5 completion. |
+## Why VelaGraph?
 
-Managed writes support vertex/edge creation, property patches, edge deletion,
-[atomic edge replacement](docs/MANAGED_EDGE_REPLACEMENT.md) and
-[conditional property patches](docs/MANAGED_GRAPH_GATEWAY.md#conditional-property-patches).
-Vertex deletion/cascades, arbitrary transaction programs, nonempty imported
-baseline certification and dynamic routing are not supported by this path.
-[Managed Traverse/TraversePage](docs/MANAGED_FIXED_TRAVERSALS.md) reuse the routing-v3
-executor, including qualified vertex/edge `id()`, element `dedup()` and scalar
-`values`/`label`/`id` deduplication and one bounded native out/in `repeat`, over
-one materialized cohort snapshot. Repeat supports exact-depth and post-body
-emission with combined depth at most 32 and unchanged cumulative resource limits.
-Terminal selected vertex `valueMap` returns bounded multi-property rows at the same V.
-Standard `is(literal)` filters projected values, labels and IDs with strict typed
-equality, composing with dedup, positional limits and terminal count.
-Bounded `range(low, high)` slices vertex, edge and scalar streams in their
-current order, with zero-based half-open bounds up to 1000.
-Standard `simplePath()`/`cyclicPath()` filter element traversers by repeated
-actual-object identity, preserving qualified paths and bags at the same V.
-They do not yet support data-local hierarchy jobs. The original gateway `Read` has its own smaller subset.
-
-A separate opt-in [data-local fixed-V gateway](docs/MANAGED_LOCAL_GATEWAY.md)
-retains certified views on participant nodes and reuses the distributed executor
-for explicit `g.V(ids)` with `out`/`in` and terminal `path`/`count`. It validates
-the whole immutable result before publishing replayable pages. Bounded shard-lane
-execution overlaps independent fixed-V fragments while preserving ordered bags,
-shared budgets and per-session sequencing. Deployment configuration can select
-one through eight lanes (three by default), without enlarging query budgets.
-[Fixed data membership](docs/FIXED_COHORT_MEMBERSHIP.md) is independently bounded
-at 64 members; widening a cohort does not enlarge lane width or capture budgets.
-The original operation retains its 10,000-row / 2 MiB / 100,000-operation capture
-budget. An explicit `LocalRead8MiBV1` query profile permits 8 MiB of captured
-payload with unchanged row/work/history/write/result limits and shared admission
-pools. This is not an 8 MiB write lifecycle or full managed CoreHR capacity claim,
-and does not replace old entrypoints or expand the separate query-job budget.
-
-An opt-in [bounded query-job lifecycle](docs/MANAGED_QUERY_JOBS.md) separates
-control RPCs from finite execution, with explicit same-V renewal, cancellation
-and complete-result publication. It preserves original short-lived APIs and
-does not enlarge capture/history budgets. This experimental candidate remains
-under validation.
-
-The older [explicit consistency API](docs/QUERY_CONSISTENCY_NEGOTIATION.md) still
-rejects `GlobalCommittedSnapshot`, including for jobs. Managed fixed-V sessions
-are a separate API; they do not silently upgrade observed reads. Even managed
-query rows retain Unverified **adjacency completeness** against arbitrary trusted
-low-level writes, distinct from their certified version.
-
-Both managed capacity profiles retain a **16 MiB reserved history budget** and
-separate intent, D1 retained-write and query budgets. Only new empty cohorts can
-select [ByteBound16MiBV1](docs/COHORT_CAPACITY_PROFILE.md), which replaces the legacy
-256-request/1,024-transaction count caps, not the lifetime byte bound. Active
-checkpoints and retained gateway control are merged, but cold recovery and complete
-SnapshotV1 still materialize history. No history GC or unlimited write lifetime is
-available. Managed query validation uses small cross-process graphs; the full-scale
-CoreHR scenario above remains on the observed path.
-
-Automatic routing/failover, online migration, authenticated/encrypted production
-transport and remote disaster recovery remain unfinished. Optional
-[submission phase timing](docs/MANAGED_SUBMISSION_TIMING.md) is disabled by default.
-See the [current capability and work index](docs/CURRENT_STATUS.md) for merged
-slices, remaining work and source/test references. VelaGraph is not yet a
-production-ready distributed database.
-
-The Rust package and library import are both named `velagraph`. The
-legacy standalone SQL engine and `rocksql` CLI have been removed; see the
-[migration note](docs/SQL_REMOVAL.md).
-
-## Direction and status
-
-| Track | Current state |
-| --- | --- |
-| Graph kernel | Property records, adjacency indexes, bounded traversal and standard Gremlin v0 are implemented. K3a snapshot read views, K3b single-partition write transactions, and K3c process-crash recovery are implemented. |
-| Distributed kernel | D1 has a single-shard local `StorageNode` adapter (opaque byte get/scan/batch_write, snapshot views, epoch fencing, idempotency, optional sequence-conditional batches, export/import) and a `GraphRecordStore` adapter with cross-instance stale-write rejection for vertices, edges, and adjacency; `GraphEngine` is not wired through it yet, and shard split/transfer is not done. D2 has a durable `openraft` 0.9.25 prototype with versioned replicated D1 write semantics and snapshot-preserved retry identities; `crates/replicated-graph` now connects `GraphRecordStore` to actual Raft through a bounded in-process D1 adapter, leader read barriers and retained prepared mutations for exact retries ([contract](docs/REPLICATED_GRAPH.md)). A separate [development-only TCP adapter](docs/REMOTE_GRAPH.md) now adds explicitly selected remote replicas and client-side Gremlin; a bounded [D3a static catalog](docs/D3_STATIC_CATALOG.md) now persists immutable placement in a dedicated metadata group, with quorum reads and conditional registration. Its fixed-candidate resolver pins read sessions and exact retry identities, with both in-process and [static remote](docs/REMOTE_ROUTING.md) endpoints; [bounded global V/E scans](docs/GLOBAL_SCAN.md) now merge partition-qualified results with ordered has/hasLabel filters, values/label projections and global limit/count, while migration, transport security and cross-partition transactions remain unsupported. Cross-shard edge traversal is available only through the separate opt-in observed-query experiment below. |
-
-An explicit [single-partition server query experiment](docs/REMOTE_QUERY.md) now
-executes v1 and observed v2 Gremlin on one pinned server snapshot, returning
-qualified results instead of transferring the whole shard. Existing client-side
-query APIs remain unchanged; v2 results are still Unverified.
-
-A separate [bounded distributed observed query
-experiment](docs/DISTRIBUTED_QUERY.md) now coordinates explicit vertex starts
-and up to three unrolled incoming/outgoing/bidirectional hops, or a
-[native bounded hierarchy repeat](docs/SERVER_HIERARCHY.md), across fixed data
-shards on server-retained snapshots. It uses a caller-maintained static catalog, not live metadata
-discovery, and still returns Unverified observations. Its separately bounded
-[incremental hierarchy count jobs](docs/HIERARCHY_COUNT_JOBS.md) API advances
-bounded native counts over a fixed snapshot vector without retaining full paths.
-It has a separate finite lease and explicit budgets; terminal emitted dedup shares
-identity state across traversal depths without suppressing cycles or increasing
-the identity cap. Count jobs do not return rows; separate [ordered hierarchy result jobs](docs/HIERARCHY_RESULT_PAGES.md) provide qualified vertex-identity pages, not property or path pages. A separate [global vertex scan](docs/SERVER_GLOBAL_SCAN.md) supports server-side
-filters/limit/count without downloading the graph to the coordinator. Its
-[bounded traversal composition](docs/GLOBAL_VERTEX_TRAVERSAL.md) can continue
-through out/in/both, one bounded repeat, filters, limits, dedup and terminal count or selected property maps,
-using separate cumulative scan/traversal budgets and the same fixed sessions.
-
-The detailed slice order and exit criteria are in [`docs/ROADMAP.md`](docs/ROADMAP.md);
-the transaction/recovery contract is in [`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md);
-the consensus decision is in [`docs/D2_CONSENSUS.md`](docs/D2_CONSENSUS.md).
-
-## Features
-
-| Area | Supported |
-| --- | --- |
-| Graph kernel | property vertices/edges, labels and typed properties, outgoing/incoming adjacency indexes, label-filtered traversal, cascade delete |
-| Graph transactions | snapshot-backed read views, single-partition write transactions with conservative conflict detection, one synced `WriteBatch` per commit, process-crash recovery tests |
-| Graph queries | standard Gremlin v0 (`V`/`E`, `out`/`in`/`both`, `has`/`hasLabel`, `values`/`id`/`label`, `limit`/`path`/`count`), 1–3 edge steps |
-
-General cross-partition graph transactions outside the restricted managed cohort
-are not supported. See [Limitations](#limitations).
-
-## Remote graph command-line client
-
-A development-only [`graph-client`](docs/GRAPH_CLIENT.md) now exposes catalog
-registration/lookup, v1 partition/global Gremlin and explicitly experimental v2
-creation/observed queries without writing Rust. The [three-process loopback
-demo](docs/GRAPH_DEMO.md) builds two same-ID vertices in different shards, creates
-a cross-shard edge and verifies a qualified path. Results retain snapshot vectors
-and experimental `Unverified` completeness; this is not a distributed transaction,
-production-secure service or durable client retry mechanism.
+- **Graph-first storage:** typed vertex/edge properties, adjacency indexes and
+  deterministic record encoding on RocksDB. The legacy SQL engine is removed.
+- **Standard language, explicit boundaries:** an officially parsed Gremlin subset;
+  unsupported steps and exhausted query budgets fail explicitly rather than
+  silently producing partial success.
+- **Consistent reads while data changes:** the restricted managed path coordinates
+  typed mutations and pins a certified version for a query. The experimental
+  observed path has a different, weaker contract.
+- **Evidence-driven development:** independent-process tests, recovery checks and
+  a CoreHR fixture with 200,000 people and 5,000 departments. CoreHR exercises
+  generic hierarchy and membership queries; it does not introduce HR-specific
+  execution rules.
 
 ## Quick start
 
-Prerequisites: a C++ toolchain and libclang (needed by `librocksdb-sys`), plus
-Rust 1.95 or newer. On macOS with the Xcode Command Line Tools:
+### Run a three-process graph demo
 
-```bash
-export LIBCLANG_PATH="$(dirname "$(xcrun --find clang)")/../lib"
-export RUSTFLAGS="-C link-arg=-Wl,-rpath,$LIBCLANG_PATH"
+Use Linux with a current stable Rust toolchain, a C++ compiler, Clang/libclang,
+Git and Python 3. CI uses Ubuntu and Rust stable. On Debian/Ubuntu the native
+packages are `build-essential clang libclang-dev`. The first build compiles
+RocksDB; allow time and several GiB of free disk space.
+
+```sh
+git clone https://github.com/ashione/VelaGraph.git
+cd VelaGraph
+cargo build --locked -p replicated-graph --bins
+python3 scripts/graph_client_demo.py \
+  --allow-insecure-development \
+  --node target/debug/graph-node \
+  --client target/debug/graph-client
 ```
 
-On Linux install `clang`/`libclang-dev` if your distribution splits them out.
+If libclang is not discovered, set `LIBCLANG_PATH` to the directory containing
+`libclang.so`. If you use `CARGO_TARGET_DIR`, adjust the two binary paths above.
 
-Build the workspace (the first build compiles RocksDB and takes a few minutes):
+The script starts one metadata process and two data processes on loopback,
+creates a cross-shard relationship, and verifies:
 
-```bash
-cargo build --workspace --locked
+```groovy
+g.V(1).outE('knows').inV().path()
 ```
 
-For a complete graph command-line walkthrough, follow the
-[three-process loopback demo](docs/GRAPH_DEMO.md). For embedded use, see below.
+The expected qualified path is **vertex 10:1 → edge 10:7 → vertex 20:1**.
+Completeness is **Unverified**. This demo uses non-atomic observed writes and
+single-voter groups; it demonstrates neither managed transactions nor node-loss
+tolerance. The plaintext flag is intentional: run only on a trusted development
+machine. The script stops its child processes and retains its printed temporary
+data/log directory for inspection. Repeated runs consume disk space.
 
-## Embedding
+See the [demo guide](docs/GRAPH_DEMO.md) for diagnostics and cleanup, and the
+[CLI reference](docs/GRAPH_CLIENT.md) for commands and configuration.
 
-### Graph kernel
+### Embed the local kernel
 
-`GraphEngine` is the local graph storage layer. It includes a standard Gremlin v0
-query subset, snapshot read views, and explicit single-partition write transactions.
-This `GraphEngine` API
-is local; the separate `GraphRecordStore`/replicated and managed APIs above provide
-the distributed experiments.
+The Rust package and import name are both **`velagraph`**. The local
+`GraphEngine` API supports vertices, edges, bounded Gremlin, snapshot views and
+explicit single-partition transactions. It is not itself a distributed client.
+See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
+and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
+Existing callers migrating from `rocksdb_sql_table` should read the
+[SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
+storage engine; removing SQL did not remove it.
 
-```rust
-use std::collections::BTreeMap;
-use velagraph::{Edge, GraphEngine, Value, Vertex};
+## Choose your graph path
 
-fn main() -> velagraph::Result<()> {
-    let graph = GraphEngine::open("./graph-data")?;
+Support in one row does **not** imply support in the others.
 
-    let mut ada = Vertex::new(1);
-    ada.labels.push("Person".into());
-    ada.properties.insert("name".into(), Value::Text("Ada".into()));
-    graph.create_vertex(&ada)?;
+| Path | What works now | Important boundary |
+| --- | --- | --- |
+| **Local v1 / K3** | Property graph CRUD, bounded Gremlin, snapshot views and single-partition transactions. A separate D1 graph-record adapter connects v1 to Raft. | Local edges stay in one partition. Explicit K3 commits sync their batch; local autocommit writes retain their older no-per-write-fsync behavior. |
+| **Observed cross-shard experiment** | Static remote routing, server-side traversal, bounded hierarchy jobs, global vertex scan composition and selected result/property pages. | Staged writes are not atomic across shards. Reads retain per-shard snapshots and **Unverified** completeness, not one certified graph version. |
+| **Managed fixed cohort** | Coordinated typed creates, property changes, edge deletion/replacement, durable request identity and same-version queries; optional data-local parallel execution and renewable query jobs. | Requires explicit activation from an empty baseline and fixed membership. No general transaction programs, vertex-delete/cascade API, dynamic placement or arbitrary imported-baseline certification. |
 
-    let mut grace = Vertex::new(2);
-    grace.labels.push("Person".into());
-    graph.create_vertex(&grace)?;
+Managed sessions keep one certified **V**, including across result pages and
+concurrent writes. They do not make arbitrary low-level writes safe or prove
+adjacency completeness. The older observed `GlobalCommittedSnapshot` option
+still rejects unsupported requests; it is not silently upgraded to managed reads.
 
-    let mut knows = Edge::new(10, 1, 2, "KNOWS");
-    knows.properties.insert("since".into(), Value::Integer(1843));
-    graph.create_edge(&knows)?;
+For exact supported steps and entrypoints, start with:
 
-    let outgoing = graph.out_edges(1, Some("KNOWS"))?;
-    assert_eq!(outgoing.len(), 1);
-    assert_eq!(outgoing[0].to, 2);
-    Ok(())
-}
-```
+- [Local query contract](docs/QUERY_SPEC.md)
+- [Observed distributed queries](docs/DISTRIBUTED_QUERY.md) and
+  [hierarchy result pages](docs/HIERARCHY_RESULT_PAGES.md)
+- [Managed graph gateway](docs/MANAGED_GRAPH_GATEWAY.md),
+  [fixed-version traversals](docs/MANAGED_FIXED_TRAVERSALS.md) and
+  [data-local gateway](docs/MANAGED_LOCAL_GATEWAY.md)
+- [Renewable query jobs](docs/MANAGED_QUERY_JOBS.md) and
+  [fixed-cohort membership](docs/FIXED_COHORT_MEMBERSHIP.md)
 
-### Bounded traversal
+### Capacity is explicit, not unlimited
 
-`GraphEngine::traverse` is the execution foundation for the query layer. It
-walks 1–3 hops over the outgoing, incoming, or both adjacency indexes, with an
-optional edge label and a result limit:
+The data-local managed executor supports 1–8 shard lanes (default 3), independent
+of the fixed cohort's 64-member structural bound. These are configuration bounds,
+not evidence of 64-node performance. Query capture, rows, work, leases and
+admission each have separate limits. The opt-in 8 MiB query capture profile is
+**not** a graph-size or process-memory ceiling and does not expand query jobs.
 
-```rust
-use velagraph::{GraphEngine, TraversalDirection, TraversalOptions};
-
-let graph = GraphEngine::open("./graph-data")?;
-let result = graph.traverse(
-    1,
-    &TraversalOptions {
-        max_hops: 3,
-        direction: TraversalDirection::Out,
-        label: Some("KNOWS".to_string()),
-        limit: 100,
-    },
-)?;
-for path in result.paths {
-    println!("{:?} via {:?}", path.vertices, path.edges);
-}
-```
-
-A vertex is visited at most once per request, so cycles terminate; results are
-deterministic (edge id ascending) and `truncated` is set when the path limit
-stopped exploration.
-
-### Gremlin v0
-
-The public graph query language is standard Gremlin text, parsed from Apache
-TinkerPop's official `Gremlin.g4` grammar via [`gremlin-rs`](https://crates.io/crates/gremlin-rs).
-No project-specific grammar or dialect is defined. `GraphEngine::gremlin`
-returns ordered rows:
-
-```rust
-use velagraph::{GraphEngine, GremlinRow};
-
-let graph = GraphEngine::open("./graph-data")?;
-let result = graph.gremlin("g.V().hasLabel('Person').out('KNOWS').limit(10)")?;
-for row in result.rows {
-    match row {
-        GremlinRow::Vertex(id) => println!("vertex {id}"),
-        GremlinRow::Value(value) => println!("value {}", value.render()),
-        other => println!("{other:?}"),
-    }
-}
-```
-
-The v0 subset is `V`/`E`, `out`/`in`/`both`, `has`/`hasLabel`,
-`values`/`id`/`label`, and `limit`/`path`/`count`; it allows at most 3 edge
-steps. Mutations, `outE`/`inE`/`bothE`, predicates, `repeat`, and the rest of
-Gremlin are rejected explicitly rather than downgraded. The normative subset,
-semantics, limits, and errors are in [`docs/QUERY_SPEC.md`](docs/QUERY_SPEC.md);
-implementation constraints are in
-[`docs/IMPLEMENTATION_RULES.md`](docs/IMPLEMENTATION_RULES.md).
-
-Graph keys are `graph/v1/p/<partition>/vertex/<id>` and
-`graph/v1/p/<partition>/edge/<id>` for records and
-`graph/v1/p/<partition>/out/<source>/<label>/<edge>` /
-`graph/v1/p/<partition>/in/<target>/<label>/<edge>` for adjacency. The `v1`
-segment versions the on-disk format and the partition segment lets a future
-distributed layer co-locate a vertex with its adjacency. Record payloads use a
-deterministic protobuf-compatible binary format; the schema and golden vectors
-are in [`docs/GRAPH_FORMAT.md`](docs/GRAPH_FORMAT.md). Edge creation and deletion
-update both adjacency indexes in one `WriteBatch`; deleting a vertex cascades to
-all incident edges. Writes use RocksDB's default WAL behavior (no per-statement
-fsync), so a process crash may lose the most recent writes. This is a
-single-process, single-partition `GraphEngine` API: vertex IDs and edge IDs are
-caller-supplied `u64` values, unique within their respective partition namespaces.
-Distributed APIs qualify identities with the partition. One `GraphEngine` owns
-one partition and has no Raft or cross-partition transaction integration. Both
-endpoints of a v1 edge must live in that partition; separate v2/managed APIs
-provide the cross-partition experiments without changing this v1 contract.
-Scalar property values are a deliberate first-milestone limit, not the final data model. The K3 single-partition
-transaction and recovery boundary is specified in
-[`docs/TRANSACTIONS.md`](docs/TRANSACTIONS.md). Snapshot-backed read views and
-single-partition write transactions with conservative conflict detection are
-implemented. A transaction commit uses one synced `WriteBatch`; a process-crash
-harness covers the before-commit and after-commit boundaries. Autocommit graph
-writes still use the old no-fsync behavior. This K3 API does not provide
-cross-partition transactions.
+Both managed capacity profiles retain a **16 MiB history budget**. Active
+checkpoints do not reclaim historical capacity; cold replay and complete
+snapshots still do history-sized work. There is no history GC or unlimited write
+lifetime. See [capacity profiles](docs/COHORT_CAPACITY_PROFILE.md) and the
+[current capability index](docs/CURRENT_STATUS.md) for the full boundaries.
 
 ## Architecture
 
-Graph key layouts and deterministic property-record encoding are specified in
-[GRAPH_FORMAT.md](docs/GRAPH_FORMAT.md). The local kernel uses RocksDB; D1-backed
-records and replicated adapters provide separately documented distributed paths.
-The graph `Value` representation and on-disk formats are unchanged by removal of
-the SQL engine.
-
-Source layout:
-
 ```text
-src/value.rs                 Shared graph property values
-src/graph.rs                 Local GraphEngine / K3 transactions
-src/graph_records.rs         D1-backed v1 graph records
-src/gremlin.rs               Official-parser Gremlin v0 execution
-crates/d2-raft/              Consensus, durable D1 and managed state machines
-crates/replicated-graph/     Adapters, routing, observed and managed graph APIs
-scripts/                    Demo, CoreHR and retained-lifecycle validation
-docs/                       Entry-specific contracts and historical evidence
+Standard Gremlin / typed graph mutations
+                 |
+   Local kernel  |  Remote routing / query coordinator
+                 |            |
+                 |   Raft-backed storage nodes
+                 |            |
+                 +------ RocksDB records and adjacency
 ```
 
-## Testing
+| Source | Responsibility |
+| --- | --- |
+| `src/graph.rs`, `src/graph_records.rs` | Local transactions and D1-backed graph records |
+| `src/gremlin.rs` | Official-parser query planning/execution |
+| `crates/d2-raft/` | Durable storage-node and consensus foundations |
+| `crates/replicated-graph/` | Routing, observed/managed APIs, query coordination and CLI |
+| `crates/checkpoint-object-store/` | Experimental immutable checkpoint transport |
+| `scripts/`, `docs/` | Reproducible scenarios, contracts and evidence |
 
-```bash
-cargo fmt --all --check
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-git diff --check
-```
+Local RocksDB/Raft remains the durable authority. The object-store library can
+upload/download immutable physical checkpoints and validates content hashes;
+S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
+not object-store-authoritative storage, remote-durable write acknowledgement or
+live-cluster recovery. Physical restoration is guarded for offline use. See the
+[physical checkpoint](docs/PHYSICAL_CHECKPOINT.md) and
+[object-store API](docs/OBJECT_STORE_CHECKPOINT_API.md) contracts.
 
-The graph and distributed suites cover CRUD, deterministic encoding, query
-semantics/budgets, conditional retry identities, fixed-V sessions, persistence,
-corruption and independent-process recovery. See the
-[source/test map](docs/CURRENT_STATUS.md#verification-and-source-map).
+## What is next?
 
-CI runs formatting, tests, and Clippy on Ubuntu for pushes to `main` and pull
-requests; see [.github/workflows/ci.yml](.github/workflows/ci.yml). The separate
-[CoreHR workflow](docs/COREHR_CI.md) requires both the full observed scenario and
-a fresh release 1,025-write managed lifecycle with recovery evidence. The long
-lifecycle test is ignored by ordinary debug tests, so `cargo test --locked` alone
-is not full acceptance. Historical result documents are evidence for their named
-source/binary, not a substitute for current-head CI.
+The [roadmap](docs/ROADMAP.md) and linked GitHub issues track acceptance criteria,
+not promises that an experimental slice is a finished database. Major remaining
+work includes:
 
-## Limitations
+- Broader generic distributed queries, scalable history/retention and verified
+  managed reads at full CoreHR scale.
+- Recovery, failover, placement and migration. A global checkpoint must restore
+  one coherent graph version before making that recovered view queryable;
+  independent physical backups alone do not establish this.
+- [Bitemporal graph semantics](docs/BITEMPORAL_GRAPH_PLAN.md): valid time and
+  system version. An [in-memory reference](docs/BITEMPORAL_REFERENCE.md) and
+  [durable local point-read slice](docs/TEMPORAL_STORE.md) are implemented.
+  The latter uses a separate RocksDB database and synced local versions; it is
+  connected to bounded official-Gremlin explicit-ID point queries, not temporal
+  adjacency/global scans, managed/cohort V or existing checkpoints.
+- Object-store-authoritative storage with disposable local caches, subject to
+  durability and recovery design; native S3/OSS/TOS deployment validation remains
+  separate from the current checkpoint transport.
+- Production security and, later, operational observability and visualization.
 
-The repository includes distributed experiments, but is not a production database:
+## Verification and contributing
 
-- `GraphEngine` K3 transactions stay
-  single-partition/single-process. Separate Raft/static-routing and managed-cohort
-  APIs exist, but general distributed transactions, automatic placement/failover
-  and online migration remain incomplete. A RocksDB directory has one owning
-  process; independent node processes use separate directories.
-- Graph TCP services require
-  trusted isolated networks; they lack production authentication, authorization
-  and TLS. Do not expose their low-level control or write APIs to untrusted peers.
+**External contributors are welcome.** Useful contributions include bug
+reproductions, documentation, query conformance tests, generic performance work
+and implementation of scoped roadmap items. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks and the issue/PR workflow.
 
-### Single-shard replicated Gremlin prototype
+[Ordinary CI](.github/workflows/ci.yml) runs formatting, tests and Clippy.
+[CoreHR CI](docs/COREHR_CI.md) separately exercises the full observed scenario and
+retained 1,025-write managed lifecycle/recovery. Object-store tests have their
+[own workflow](.github/workflows/object-store-checkpoint.yml).
+`cargo test --locked` does not run every ignored long test or every workspace
+member. Passing same-host tests is not proof of multi-machine performance or HA.
+Benchmark reports apply to their named source, binaries and workload, not every
+subsequent commit.
 
-The optional `replicated-graph` adapter also supports standard Gremlin v0 through
-`GraphRecordStore::execute_gremlin`. Each execution pins one leader-barrier D1
-view; scans and adjacency use bounded pages through the adapter. Use
-`replicated_graph::run_blocking` from async code. Retained `GraphRecordReadView`
-queries preserve their original sequence, while context and epoch checks remain
-active. This is an in-process, single-shard path, not a distributed query service.
-See [the query contract](docs/QUERY_SPEC.md) and
-[replicated graph limitations](docs/REPLICATED_GRAPH.md).
+## License
 
-### Query-owned memory admission
-
-Local and D1 Gremlin executions now share a per-execution 64 MiB logical byte
-budget for decoded records, intermediate rows/paths, query pages and result
-construction. Large-property queries can fail even below the row cap. This is
-not a process RSS or allocator limit; retained D1 snapshots and adapter-private
-allocations are separate. See [the accounting contract](docs/QUERY_MEMORY.md).
-
-### Bounded static routing
-
-`replicated_graph::routing::RouteResolver` selects fixed in-process replicas from
-a fresh metadata quorum read. Read sessions pin one adapter/view and deadline;
-prepared writes retain their original identity across explicit retries. All
-clones share admission limits across groups. See
-[the static routing contract](docs/D3_STATIC_CATALOG.md#bounded-in-process-route-resolver).
-The Linux-only same-host read gateway below is separate from this in-process
-resolver. Static remote graph protocols are available separately below; automatic
-membership changes, migration and cross-group ownership fencing remain unfinished.
-
-### Same-host read-only graph gateway
-
-On Linux, `replicated_graph::gateway` exposes bounded open/query/close sessions
-through a Unix domain socket in a trusted owner-only directory. Peer UID checks,
-fixed snapshots and deadlines, bounded frames and worker admission apply. See
-[the gateway contract](docs/GRAPH_UDS_GATEWAY.md). This is a same-host process
-boundary, not cross-host routing or a production network service. Existing D2
-TCP/control listeners remain outside this trust boundary. Their separate
-[resource limits](docs/D2_TCP_LIMITS.md) do not add authentication or make
-them production-secure.
-
-### Development-only cross-process graph access
-
-The optional [`graph-node` and `RemoteStorageNode`](docs/REMOTE_GRAPH.md) connect
-existing graph CRUD and client-side standard Gremlin to independent TCP Raft
-processes. Explicitly enable plaintext development mode and use only a trusted
-isolated network. This functional slice is single-shard, bounded, and does not
-perform automatic retries or claim validated remote graph failover recovery.
-
-### Static remote partition routing
-
-The development TCP service now supports a remote persistent catalog and static
-partition-to-data-group routing through `RouteResolver::new_remote`. See
-[configuration, identity checks and limits](docs/REMOTE_ROUTING.md). Normal CRUD
-and Gremlin are tested across nine independent processes (metadata plus two data
-groups). This is not production security, validated automatic failover, online
-migration, or cross-shard queries/transactions.
-
-### Isolated cross-shard edge experiment
-
-A separate [append-only graph/v2 experiment](docs/EXPERIMENTAL_CROSS_EDGES.md)
-supports qualified vertices and source-owned edges across shards, with explicit
-non-atomic staged writes and unknown/incomplete outcomes. Its out/in API returns
-index observations with **unverified completeness**, not complete Gremlin results.
-Its separate observed Gremlin API supports global/explicit vertex starts, directional
-hops, label/property filters, qualified paths, limits and counts while retaining that uncertainty.
-The additive `observed_gremlin_v2` result API also supports qualified `values(key)`
-and `label()` projections without weakening the original observed types' `Eq` API.
-V1 data and atomicity stay unchanged; v1 entities do not participate. No automatic
-repair, migration, failover guarantee or production deployment is implied.
-
-### Gremlin parser resource admission
-
-All Gremlin text entrypoints now reject more than 64 raw structural marks
-(`()[]{},.:;`) with typed `GremlinComplexityLimit` before invoking the official
-recursive parser. The existing 16 KiB cap alone did not prevent stack overflow
-from short repeated lists/chains. Marks inside strings/comments also count: this
-intentionally conservative compatibility restriction avoids a second lexer and
-malformed-string bypasses. See [query limits](docs/QUERY_SPEC.md#8-resource-limits).
-
-The isolated graph/v2 experiment additionally offers `observed_gremlin_v3`
-edge starts, filters and scalar projections with qualified edge provenance.
-Its bounded canonical pages validate observed indexes and endpoints, but every
-result remains Unverified, not a globally consistent or complete traversal.
-See [experimental edge observations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-edge-observations-v3).
-
-The observed v3 subset also supports `outE`/`inE`/`bothE` and
-`outV`/`inV`/`bothV`, with qualified mixed-element paths and bag semantics.
-`bothE` emits a self-loop once; `bothV` emits both endpoint positions, twice
-for a loop. These steps remain unsupported by legacy Gremlin APIs and do not
-make observed experimental indexes complete or globally consistent.
-
-The opt-in v2 coordinator also supports properties-only edge updates via
-`prepare_edge_properties` and `experimental_commit_mutation`. One immutable
-source-shard CAS preserves identity, label, endpoints and indexes; exact retries
-never overwrite newer properties. Null and explicit removal are distinct.
-No automatic recovery or distributed transaction is implied.
-See [edge property mutations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-edge-property-mutation).
-
-The opt-in `prepare_edge_delete` / `experimental_commit_mutation` pair deletes
-complete v2 edges using permanent versioned tombstones, never reusable EdgeRefs.
-Cross-shard deletion remains staged and can be incomplete; same-shard writes
-combine into one CAS batch. Observed queries verify residual indexes and charge
-tombstones against scan budgets. Upgrade all readers before first deletion;
-downgrade, automatic repair, tombstone GC and vertex deletion are unsupported.
-See [edge deletion](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-permanent-edge-deletion).
-
-Opt-in v2 vertex properties are available through `prepare_vertex_properties`
-and `experimental_commit_vertex_mutation`, retaining qualified identity and
-labels in one owner-shard CAS. Null/set/remove and historical retries are explicit.
-`prepare_vertex_delete` explicitly rejects deletion: observed empty adjacency
-cannot prove absence of all incoming/outgoing edges or fence other shards.
-See [vertex mutations](docs/EXPERIMENTAL_CROSS_EDGES.md#additive-vertex-property-mutation).
-
-Remote adapters now acquire complete local read views through fixed snapshot
-sessions and bounded pages: up to 64 MiB / one million rows, with 2 MiB pages,
-shared admission, fixed TTL and strict full-result validation. This remains a
-trusted plaintext experiment, not lazy remote reads or failover support. The
-legacy single-Snapshot RPC is unchanged. See [paged remote snapshots](docs/REMOTE_GRAPH.md#snapshot-consistency-and-limits).
-
-The experimental coordinator also supports [ordered hierarchy result pages](docs/HIERARCHY_RESULT_PAGES.md): explicit finite Gremlin repeat jobs evaluate against fixed shard snapshots before returning actual qualified-vertex pages. Preparation progress is separate from results, and count jobs retain their existing limits.
-
-[Fixed-snapshot property pages](docs/HIERARCHY_PROPERTY_PAGES.md) extend prepared hierarchy jobs with terminal standard valueMap projections. Property selection is declared before preparation; no fresh reads are attached to an already closed Ready snapshot.
-
-The bounded explicit-ID server path also supports terminal selected-property
-`valueMap`, so ordinary person/department joins can return several fields per
-vertex in one query. See [the map contract](docs/QUERY_SPEC.md#distributed-synchronous-selected-property-maps).
-It keeps the existing synchronous budgets and per-shard snapshot limits; this
-does not add global joins or general Gremlin support.
-
-Experimental [fixed-cohort snapshot sessions](docs/CERTIFIED_COHORT_READS.md) certify empty-baseline KV participants at one retained decision version. They do not enable the remote graph GlobalCommittedSnapshot API.
-
-Experimental [managed graph/v2 transactions](docs/MANAGED_GRAPH_TRANSACTIONS.md) connect vertex/edge creates, property updates and edge deletion to fixed-cohort commits and same-version reads. The gateway supports both in-process and fixed remote managed nodes; neither enables the older remote Global Gremlin API.
-
-The optional [durable request admission foundation](docs/DURABLE_GRAPH_REQUESTS.md) binds external IDs to exact transaction plans before prepare. The separate restricted TCP gateway below uses this foundation.
-
-### Experimental managed graph TCP gateway
-
-The separate `replicated_graph::managed_gateway` API exposes typed graph/v2
-mutations with durable external request IDs, read-only Status, explicit Abort,
-and fixed-version certified sessions with a small standard Gremlin point/adjacency
-subset over server-owned Raft handles. It is bounded plaintext for trusted networks, not multi-host Raft
-placement, authentication, remote Global Gremlin, indexed MVCC or production
-availability. See [the contract and limits](docs/MANAGED_GRAPH_GATEWAY.md).
-
-The additive [remote managed-node transport](docs/REMOTE_MANAGED_TRANSPORT.md)
-allows this managed gateway to use a coordinator and participants in independent
-processes. External Gremlin reads, canonical request identity and persisted-Plan
-recovery are unchanged. Same-version sessions require the complete cohort and
-matching retained terminal-prefix evidence. This trusted plaintext, fixed-endpoint
-slice does not enable the older remote GlobalCommittedSnapshot API or claim
-multi-machine validation, automatic failover, authentication/TLS or production
-D4/D5 completion.
-
-Managed fixed-cohort reads now use [exact segmented terminal-prefix evidence](docs/TERMINAL_PREFIX_EVIDENCE.md)
-at the chosen V rather than transferring the original request/Plan archive. This
-keeps old-V evidence independent of later archive growth without changing durable
-retry/recovery, retention limits, prepare/advance payloads or the older Global Unsupported
-boundary. Internal managed peers now require protocol v6; evidence remains O(V).
-
-[Durable request point recovery](docs/DURABLE_REQUEST_INDEX.md) returns one exact
-original external-ID/Plan binding without transferring the full Journal. Bound
-coordinators (current disk v16, with v15 migration support) project LookupRequest
-and HistoryPage directly from raw history, with bounded retained results and full namespace verification against a
-private, previously validated published cut. The duplicate request index is
-retired atomically after strict legacy validation. Every read still scans the
-whole history; this is not a speed or unlimited-lifetime claim.
-
-The bounded [durable terminal-segment index](docs/DURABLE_DECISION_SEGMENTS.md) now
-backs coordinator proofs and certified participant reads with exact absolute-ordinal
-disk segments. Complete history, all lifetime caps and whole snapshots remain;
-this is a recovery/read foundation, not unlimited writes or a performance claim.
-
-Managed decision catch-up now uses [bounded event suffixes and retained ordinal
-consumption](docs/INCREMENTAL_DECISION_CONSUMPTION.md) for every cohort member.
-Original event history remains durable authority, SHA-256 anchors have an explicit
-integrity assumption. Legacy cohorts retain 256-request/1,024-transaction count
-caps; both profiles retain the 16 MiB reserved history budget and independent
-local D1 limits.
-
-The [authoritative event ledger](docs/AUTHORITATIVE_EVENT_LEDGER.md) stores
-fixed-cohort Commands as the sole live decision authority. Merged
-[S2 coordinator](docs/COORDINATOR_ACTIVE_CHECKPOINT.md) and
-[S3 member checkpoints](docs/MEMBER_ACTIVE_CHECKPOINT.md) use disk v16/v17 and
-active state instead of resident/ordinary apply-candidate full Journals on bound
-durable paths. Actual earlier formats remain strict migration inputs. Full raw
-closure is still checked; cold replay, explicit full-history/terminal-proof paths
-and complete snapshots retain history-sized work. Metadata and current snapshot
-bytes remain resident, and resolving holes releases no historical capacity.
-Current internal managed RPC is v6; external gateway framing stays v1.
-
-New empty cohorts can explicitly select the [immutable byte-budget capacity
-profile](docs/COHORT_CAPACITY_PROFILE.md). Actual durable grants from every member
-precede admission; original IDs/Plans and old read versions remain retained.
-This profile replaces the legacy 256/1,024 count quotas with byte-derived guards,
-while the 16 MiB reserved Journal, local D1 limits, complete replay/snapshots and
-whole-frame bounds remain. Existing/default cohorts stay legacy; there is no
-online conversion or unlimited-lifetime claim. New managed peers require RPC v6; see the [retained gateway control contract](docs/RETAINED_GATEWAY_CONTROL.md).
-
-The [retained gateway control slice](docs/RETAINED_GATEWAY_CONTROL.md) replaces
-actual managed graph full-Journal control and Prepare with anchored point evidence
-and deterministic retained-cut preparation. Existing finite profiles and full
-terminal-proof/SnapshotV1 boundaries remain; no capacity increase is claimed.
-
-Global scan-to-traversal queries also accept terminal single-key `values(key)`
-after out/in or bounded repeat. Ordered bags, qualified scalar provenance and
-missing/Null semantics use the same retained shard sessions and budgets. Scan-only
-terminal values requires an explicit preceding vertex limit (1..1000); no-limit
-scan values and scalar post-processing remain unsupported. See the
-[composition contract](docs/GLOBAL_VERTEX_TRAVERSAL.md).
-
-See [bounded full-cohort catch-up](docs/BOUNDED_COHORT_FANOUT.md) for member fanout,
-unchanged consistency/resource contracts, and critical-path benchmark scope.
-
-### Experimental temporal storage
-
-The opt-in [durable temporal point-read slice](docs/TEMPORAL_STORE.md) stores
-append-only valid-time assertions in a dedicated local RocksDB database, with
-atomic synced local versions and historical V/T point reads. Explicit-ID official
-Gremlin point queries reuse the existing executor; global scans and adjacency
-remain unsupported. It does not connect to Raft, managed sessions or checkpoints;
-#196 remains open. Existing graph/v1/v2 semantics and formats are unchanged.
+Project-authored code and documentation default to [Apache-2.0](LICENSE), except
+where a file or component declares otherwise. The three existing workspace
+crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserved.
+See [licensing details](docs/LICENSING.md) and the
+[OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
+historical provenance audit or a complete dependency-attribution bundle.

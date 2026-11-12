@@ -12,7 +12,7 @@ Read these before changing behavior:
    implementation constraints.
 7. [`docs/STORAGE_NODE_INTERFACE.md`](docs/STORAGE_NODE_INTERFACE.md) — D1
    storage-node boundary.
-7. [`docs/D2_CONSENSUS.md`](docs/D2_CONSENSUS.md) — D2 Raft library decision and
+8. [`docs/D2_CONSENSUS.md`](docs/D2_CONSENSUS.md) — D2 Raft library decision and
    prototype slice.
 
 ## Non-negotiables
@@ -34,15 +34,20 @@ Read these before changing behavior:
 - Add tests for behavior, errors, limits, determinism, and reopen. Run:
   `cargo fmt --all --check`, `cargo test --locked`,
   `cargo clippy --all-targets --locked -- -D warnings`, `git diff --check`.
-- Self-review the full diff before every commit. Do not merge or approve your
-  own PR; a person merges.
+- Self-review the full diff before every commit. Do not approve or merge your
+  own PR. Maintainers control integration; a separately reviewing maintainer or
+  explicitly owner-authorized automation may merge after independent review and
+  applicable checks. These instructions do not themselves grant merge permission.
 
 ## Scope
 
-The current milestones are K2 (standard Gremlin subset), K3 (single-shard
-snapshot transactions), and D1 (storage-node interface). Do not implement
-cross-partition transactions, Raft, or Cypher as part of a query-layer change.
+The repository includes the local graph kernel, Raft-backed storage nodes,
+static routing, observed cross-shard queries and restricted managed-cohort
+transactions/reads. Consult `docs/CURRENT_STATUS.md`, the roadmap and the exact
+entrypoint contract rather than treating the original K2/K3/D1 milestone list as
+the current implementation inventory.
 
-The isolated v2 append-only storage experiment is a reviewed scope exception,
-extended only by the separately typed observed Gremlin subset in the same
-contract, not complete D5 or a distributed-transaction implementation.
+Keep each change scoped to its issue and acceptance criteria. A query-layer
+change must not silently alter consensus, cross-partition atomicity, storage
+formats or language support. Observed v2, managed fixed-version and local v1
+contracts remain distinct; progress in one is not completion of general D4/D5.
