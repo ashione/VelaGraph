@@ -29,8 +29,8 @@ Read these before changing behavior:
   to v1 APIs or claim its observed adjacency is complete.
 - Every traversal is bounded. Internal limits are errors, not `truncated`
   successes.
-- Preserve the SQL engine's documented behavior; do not couple SQL and graph
-  internals.
+- The legacy SQL engine is removed. Keep graph property types and errors
+  independent of SQL parsing or table schemas.
 - Add tests for behavior, errors, limits, determinism, and reopen. Run:
   `cargo fmt --all --check`, `cargo test --locked`,
   `cargo clippy --all-targets --locked -- -D warnings`, `git diff --check`.
