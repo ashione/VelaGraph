@@ -2,7 +2,7 @@
 
 > 当前阶段：已有单机图内核、Raft 存储节点、静态路由、有界 observed 跨分片查询及 restricted managed 事务/同版本读取。继续以真实写入、查询和恢复路径补齐功能与容量证据，以 CoreHR 持续验收；容错、在线迁移与生产安全分别推进，实验切片可用不代表 D3、D4、D5 已全部完成。
 
-**产品终局**：VelaGraph 的目标是成为以 KV（RocksDB）为单机存储的分布式属性图数据库，支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
+**产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
 ## 1. 当前基线
 
@@ -40,12 +40,44 @@ S1 archive reads、S2 coordinator checkpoint、S3 member checkpoint、S4 retaine
 
 | 项目 | 当前结论 | 状态 |
 |---|---|---|
-| 存储基础 | 单机 RocksDB，分片后每片一个本地引擎 | 已确认 |
+| 存储基础 | 当前每片本地 RocksDB/Raft；后续评估对象存储权威、可丢弃本地缓存 | 当前实现明确；后续设计见 #191，尚未迁移 |
 | 两条线 | 内核线 + 分布式线，以窄存储接口解耦 | 已确认 |
 | 图模型 | 属性图（点/边/标签/属性），RDF 不作为当前目标 | 已实现基础模型 |
 | 查询语言 | 标准 Gremlin（Apache TinkerPop 官方语法）子集优先；不自造方言；旧 SQL 原型已移除，未来分析接口须单独论证 | 已确认 |
 | 一致性 | v1/K3 单分片事务；observed v2 分阶段写/独立快照；restricted managed 固定 cohort 事务与 certified V 已实现，general Global 仍拒绝 | 入口边界明确，完整 D4 未完成 |
 | 首批场景 | CoreHR：20 万人、5000 部门，上下级与多部门关系，支持逐步完善的通用查询 | 已选定并进入全量 CI |
+
+## 对象存储与索引演进（后续计划，非已实现能力）
+
+统一跟踪 [#191](https://github.com/ashione/VelaGraph/issues/191)。当前本地
+RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推进通用功能与性能，
+本计划不以 CoreHR 特化或更换查询引擎换取单一场景指标。
+
+1. **先冻结 durability 契约，再做单分片 adapter 实验**：比较远端 WAL 确认
+   与独立复制日志层。若所有本地盘均可丢弃，写 ACK 必须等待远端 WAL 和必要的
+   跨片提交决定持久化；量化延迟、费用、可用性及 RPO/RTO。只在隔离测试夹具
+   验证丢弃缓存后的完整恢复，不直接迁移或删除现有权威文件。
+2. **快照 + 不可变索引 + 增量日志**：索引 N 与有界 delta 必须精确构成固定 V，
+   包括删除、tombstone 和 bag 语义。tail 缺失不得退回旧结果。PR #179 仅是
+   索引账本设计基础，不代表生产图索引完成；与 #110 的容量工作分别验收。
+3. **一致视图与写后读**：复用已合并 PR #188（#187）的 `OpenLocalQueryAfter` 显式版本下界，不重复实现；
+   自动 write bookmark、客户端因果会话及 job/profile 支持仍待补齐。
+   latest 在入场时固定安全 V，不随执行刷新；lower-bound 不等于线性化 latest。
+   单对象 CAS 不能替代跨片提交协议、完整 cohort 认证与 applied 水位。
+4. **恢复与升级设计门槛**：先明确 manifest generation/CAS、writer fencing、
+   持久快照保活、GC roots 与中断上传、格式兼容和滚动升级。复用 #109/#118，
+   #124 既有 purge/install 前置仍独立未完成；本计划不实现或绕过该前置。
+5. **同等场景 benchmark**：沿用 #111 的 20 万人/5000 部门独立 oracle，
+   对齐结果、查询语义、写 ACK durability、冷暖缓存、硬件和数据规模；分别报告
+   单 cell 与跨分片、p50/p95/p99、吞吐、RSS、远端请求费用及恢复，不把现有
+   observed 全量测试当 managed 全规模一致性证明。
+6. **观测与平台仍低优先级**：复用 #122，纳入缓存/远端 I/O、索引 lag、
+   commit/applied 水位及 lease/恢复诊断；必要验证信号先做，完整平台留到产品化。
+
+参考 [SlateDB write durability](https://slatedb.io/docs/design/writes/)、
+[persistent checkpoints](https://slatedb.io/docs/design/checkpoints/) 与
+[HydraDB architecture](https://github.com/hydra-db/hydradb/blob/af6344037bffb2a354bf32c2b312ba4921a1583f/architecture.md)。
+这些是设计参考，不表示已选定依赖、复用其代码或完成跨 cell 能力验证。
 
 ## 2. 两条线的交付边界
 
