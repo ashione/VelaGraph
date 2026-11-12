@@ -35,12 +35,30 @@ pub(super) fn kind(error: &RemoteError) -> &'static str {
 }
 pub(super) fn operation(op: &Operation) -> &'static str {
     match op {
+        Operation::Query(_) => "query",
         Operation::OpenSnapshot { .. } => "open_snapshot",
         Operation::SnapshotPage { .. } => "snapshot_page",
         Operation::CloseSnapshot { .. } => "close_snapshot",
         _ => "other",
     }
 }
+/// Classify without formatting Raft errors, which can contain peer/storage data.
+pub(super) fn read_barrier_kind(
+    error: &openraft::error::RaftError<
+        u64,
+        openraft::error::CheckIsLeaderError<u64, openraft::BasicNode>,
+    >,
+) -> &'static str {
+    use openraft::error::{CheckIsLeaderError, Fatal, RaftError};
+    match error {
+        RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_)) => "forward_to_leader",
+        RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_)) => "quorum_not_enough",
+        RaftError::Fatal(Fatal::StorageError(_)) => "raft_storage",
+        RaftError::Fatal(Fatal::Panicked) => "raft_panicked",
+        RaftError::Fatal(Fatal::Stopped) => "raft_stopped",
+    }
+}
+
 struct Line {
     bytes: [u8; MAX_BYTES],
     len: usize,
@@ -170,6 +188,47 @@ impl Drop for Phase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_barrier_categories_and_query_label_do_not_expose_payloads() {
+        use openraft::error::{
+            CheckIsLeaderError, Fatal, ForwardToLeader, QuorumNotEnough, RaftError,
+        };
+        let cases = [
+            (
+                RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader::empty())),
+                "forward_to_leader",
+            ),
+            (
+                RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(QuorumNotEnough {
+                    cluster: "private peer details".into(),
+                    got: [42].into_iter().collect(),
+                })),
+                "quorum_not_enough",
+            ),
+            (RaftError::Fatal(Fatal::Panicked), "raft_panicked"),
+            (RaftError::Fatal(Fatal::Stopped), "raft_stopped"),
+            (
+                RaftError::Fatal(Fatal::StorageError(openraft::StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::other("private storage path"),
+                ))),
+                "raft_storage",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(read_barrier_kind(&error), expected);
+        }
+        let request = super::super::query::QueryRequest {
+            shard: 7,
+            partition: 0,
+            mode: super::super::query::QueryMode::V1,
+            text: "private query text".into(),
+            timeout_millis: 5000,
+        };
+        assert_eq!(operation(&Operation::Query(request)), "query");
+    }
+
     #[test]
     fn disabled_utf8_total_cap_and_write_failure_are_bounded() {
         assert!(!enabled_value(None));
