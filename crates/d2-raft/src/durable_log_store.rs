@@ -81,6 +81,38 @@ impl DurableLogStore {
             inner: Arc::new(Mutex::new(DurableLogStoreInner { db })),
         })
     }
+    // Lock is retained across both physical checkpoints. No purge policy changes.
+    pub(crate) async fn checkpoint_pair(
+        &self,
+        applied: Option<LogId<NodeId>>,
+        snapshot: Option<LogId<NodeId>>,
+        path: &Path,
+        state_checkpoint: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let inner = self.inner.lock().await;
+        blocking_section(|| {
+            let purged = inner.last_purged()?;
+            anyhow::ensure!(
+                checkpoint_cut_leq(purged, snapshot) && checkpoint_cut_leq(snapshot, applied),
+                "checkpoint requires a durable snapshot covering the purged log boundary"
+            );
+            let last = inner.last_log_id()?.or(purged);
+            anyhow::ensure!(
+                checkpoint_cut_leq(applied, last),
+                "applied state exceeds retained Raft history"
+            );
+            if let Some(applied) = applied.filter(|a| Some(*a) > purged) {
+                let value = inner
+                    .db
+                    .get(log_key(applied.index))?
+                    .ok_or_else(|| anyhow::anyhow!("applied log entry missing"))?;
+                let entry: openraft::Entry<TypeConfig> = serde_json::from_slice(&value)?;
+                anyhow::ensure!(entry.log_id == applied, "applied log identity mismatch");
+            }
+            rocksdb::checkpoint::Checkpoint::new(&inner.db)?.create_checkpoint(path)?;
+            state_checkpoint()
+        })
+    }
 }
 
 impl DurableLogStoreInner {
@@ -547,4 +579,99 @@ mod tests {
             .unwrap();
         assert_eq!(store.limited_get_log_entries(1, 2).await.unwrap().len(), 1);
     }
+}
+
+fn checkpoint_cut_leq(a: Option<LogId<NodeId>>, b: Option<LogId<NodeId>>) -> bool {
+    match (a, b) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => a == b || (a.index < b.index && a < b),
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointLogBoundary {
+    pub purged: Option<LogId<NodeId>>,
+    pub last: Option<LogId<NodeId>>,
+    pub committed: Option<LogId<NodeId>>,
+    pub vote: Option<Vote<NodeId>>,
+}
+
+// Full validation runs on the immutable checkpoint, outside serving locks.
+pub(crate) fn validate_checkpoint_log(
+    path: &Path,
+    applied: Option<LogId<NodeId>>,
+    snapshot: Option<LogId<NodeId>>,
+) -> anyhow::Result<CheckpointLogBoundary> {
+    let inner = DurableLogStoreInner {
+        db: DB::open_for_read_only(&Options::default(), path, false)?,
+    };
+    let purged = inner.last_purged()?;
+    let last = inner.last_log_id()?.or(purged);
+    let committed = inner
+        .db
+        .get(COMMITTED_KEY)?
+        .map(|v| serde_json::from_slice::<Option<LogId<NodeId>>>(&v))
+        .transpose()?
+        .flatten();
+    let vote = inner
+        .db
+        .get(VOTE_KEY)?
+        .map(|v| serde_json::from_slice::<Vote<NodeId>>(&v))
+        .transpose()?;
+    anyhow::ensure!(
+        checkpoint_cut_leq(purged, snapshot)
+            && checkpoint_cut_leq(snapshot, applied)
+            && checkpoint_cut_leq(applied, last)
+            && checkpoint_cut_leq(committed, last),
+        "inconsistent checkpoint Raft boundaries"
+    );
+    let mut prior = purged;
+    let mut expected = purged.map_or(Some(0), |l| l.index.checked_add(1));
+    for item in inner
+        .db
+        .iterator(IteratorMode::From(LOG_PREFIX, Direction::Forward))
+    {
+        let (key, value) = item?;
+        if key.as_ref() >= LOG_PREFIX_END {
+            break;
+        }
+        let index = log_index(&key).ok_or_else(|| anyhow::anyhow!("invalid log key"))?;
+        anyhow::ensure!(Some(index) == expected, "noncontiguous checkpoint Raft log");
+        let entry: openraft::Entry<TypeConfig> = serde_json::from_slice(&value)?;
+        anyhow::ensure!(entry.log_id.index == index, "checkpoint log index mismatch");
+        anyhow::ensure!(
+            checkpoint_cut_leq(prior, Some(entry.log_id)),
+            "checkpoint log terms regress"
+        );
+        for cut in [applied, snapshot, committed].into_iter().flatten() {
+            if cut.index == index {
+                anyhow::ensure!(
+                    cut == entry.log_id,
+                    "checkpoint boundary log identity mismatch"
+                );
+            }
+        }
+        prior = Some(entry.log_id);
+        expected = index.checked_add(1);
+    }
+    Ok(CheckpointLogBoundary {
+        purged,
+        last,
+        committed,
+        vote,
+    })
+}
+
+#[test]
+fn checkpoint_cuts_require_index_and_full_identity() {
+    use openraft::CommittedLeaderId;
+    let a = LogId::new(CommittedLeaderId::new(1, 1), 4);
+    let same_index_other_term = LogId::new(CommittedLeaderId::new(2, 1), 4);
+    let lower_index_other_term = LogId::new(CommittedLeaderId::new(2, 1), 3);
+    assert!(checkpoint_cut_leq(None, Some(a)));
+    assert!(checkpoint_cut_leq(Some(a), Some(a)));
+    assert!(!checkpoint_cut_leq(Some(a), Some(same_index_other_term)));
+    assert!(!checkpoint_cut_leq(Some(a), Some(lower_index_other_term)));
 }

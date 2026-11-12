@@ -621,6 +621,7 @@ impl TcpNode {
             .validate()?,
         );
         create_data_dir(&config.data_dir)?;
+        crate::node::bind_durable_identity(&config.data_dir, 0, config.id)?;
         let log_store = DurableLogStore::open(config.data_dir.join("raft.db"))?;
         let state_machine = Arc::new(StateMachine::open(config.data_dir.join("state.db"))?);
         let raft = Raft::new(
