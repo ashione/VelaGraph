@@ -4,6 +4,17 @@
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
+## 发布里程碑
+
+按 [发布验收计划](RELEASE_PLAN.md) 从 **v0.0.1** 起发布实验版本：
+先固定拓扑 gRPC/HTTP 服务，再持续一致读写与恢复、弹性路由并发，最后观测与 Portal。
+验收通过后才打 tag/release，不把规划或单个 PR 合并当作发布完成。
+总跟踪 [#224](https://github.com/ashione/VelaGraph/issues/224)；新增缺口分别为
+[#221](https://github.com/ashione/VelaGraph/issues/221) 入口负载均衡/会话归属/连接复用、
+[#222](https://github.com/ashione/VelaGraph/issues/222) 动态发现/合格副本选择/分片迁移、
+[#223](https://github.com/ashione/VelaGraph/issues/223) 通用写并发。
+双时间、对象存储权威按独立切片验收，本体仍待基础 ready 后考虑；不承诺首版生产就绪。
+
 ## 1. 当前基线
 
 截至 2026-11-10，本次核对基于 main `a0b7147`（已合并 #142/#144/#146）。
