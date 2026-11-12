@@ -187,8 +187,11 @@ member. Passing same-host tests is not proof of multi-machine performance or HA.
 Benchmark reports apply to their named source, binaries and workload, not every
 subsequent commit.
 
-**Licensing:** the repository does not currently include a top-level license.
-Some workspace crates declare `MIT OR Apache-2.0`; this does not establish a
-repository-wide license. Existing [third-party notices](crates/d2-raft/NOTICE)
-remain applicable. Resolve applicable terms with the maintainers before
-redistribution or substantial contributions. This README adds no license grant.
+## License
+
+Project-authored code and documentation default to [Apache-2.0](LICENSE), except
+where a file or component declares otherwise. The three existing workspace
+crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserved.
+See [licensing details](docs/LICENSING.md) and the
+[OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
+historical provenance audit or a complete dependency-attribution bundle.

@@ -14,9 +14,10 @@ compatibility layers or dataset-specific shortcuts.
    large API, storage-format or architecture changes before implementing them.
 3. Check open PRs and comment on the issue before taking on substantial work to
    avoid duplication. Do not assume assignment or a review deadline.
-4. Confirm licensing for your contribution with the maintainers. The repository
-   currently has no top-level license; individual crate metadata is not a blanket
-   grant for the repository. This guide introduces no CLA or license choice.
+4. Read [licensing details](docs/LICENSING.md): project-authored material defaults
+   to Apache-2.0, with existing component and third-party exceptions. Check
+   provenance and preserve notices for external material. Ask maintainers when
+   applicable terms are unclear. No separate CLA or DCO is introduced.
 
 ## Development environment
 
@@ -120,5 +121,4 @@ focused, avoid sharing personal information and follow maintainer moderation.
 Do not put credentials, private datasets or exploit-ready security details in
 public issues or logs. Check the repository's Security tab for any available
 private reporting channel before disclosure. A dedicated security response
-process and repository-wide licensing remain maintainer decisions, not services
-promised by this document.
+process remains a maintainer decision, not a service promised by this document.
