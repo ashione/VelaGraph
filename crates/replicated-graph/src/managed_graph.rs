@@ -457,8 +457,13 @@ impl GraphSnapshot {
     }
 }
 
+/// Matches the existing process-wide managed RPC admission ceiling. Member
+/// count and query lane width are independent. Concurrent callers still share it.
+pub const MAX_MEMBER_PARALLELISM: usize = 4;
+pub const DEFAULT_MEMBER_PARALLELISM: usize = 3;
 /// Explicit fixed handle set; no discovery, ownership migration, or failover.
 pub struct GraphCohort<'a> {
+    member_parallelism: usize,
     coordinator: NodeRef<'a>,
     timing: Recorder,
     authority: Authority,
@@ -493,10 +498,20 @@ impl<'a> GraphCohort<'a> {
         Self {
             coordinator,
             timing: Recorder::default(),
+            member_parallelism: DEFAULT_MEMBER_PARALLELISM,
             authority,
             epoch,
             members,
         }
+    }
+    /// Bound independent member catch-up pipelines, separately from query lanes.
+    /// The immutable cohort, per-member order and overall deadlines are unchanged.
+    pub fn with_member_parallelism(mut self, width: usize) -> Result<Self> {
+        if !(1..=MAX_MEMBER_PARALLELISM).contains(&width) {
+            return Err(Error::Capacity);
+        }
+        self.member_parallelism = width;
+        Ok(self)
     }
     pub(crate) fn with_timing(mut self, timing: Recorder) -> Self {
         self.timing = timing;
@@ -692,9 +707,16 @@ impl<'a> GraphCohort<'a> {
                 if proof.cohort() != &plan.cohort || !proof.matches_transaction(tx) {
                     return Err(Error::Identity);
                 }
-                for (node, member) in &self.members {
-                    node.prefix_terminal(member, &proof).await?;
-                }
+                member_waves(
+                    &self.members,
+                    self.member_parallelism,
+                    |(node, member)| async {
+                        node.prefix_terminal(member, &proof)
+                            .await
+                            .map_err(Error::from)
+                    },
+                )
+                .await?;
                 Ok::<(), Error>(())
             })
             .await,
@@ -897,70 +919,120 @@ impl<'a> GraphCohort<'a> {
         if proof.cohort() != &plan.cohort || !proof.matches_transaction(transaction) {
             return Err(Error::Identity);
         }
-        for (node, target) in &self.members {
-            let history = self.timing.span(Phase::HistorySync);
-            let status = node
-                .history_status(&self.authority, target, &plan.cohort)
-                .await?;
-            let mut applied = status.applied_prefix;
-            let mut base = status.cursor;
-            // Pin only after observing this member, which may already retain
-            // events beyond its applied watermark or beyond another member's cut.
-            let mut page = self
-                .coordinator
-                .history_page(&self.authority, self.epoch, &base, None)
-                .await?;
-            let cut = page.cut.clone();
-            loop {
-                // An uncertain ACK retries the identical page before any new
-                // cursor/cut is selected. One retry and the outer deadline bound it.
-                let result = node.sync_history(&self.authority, target, &page).await;
-                let synced = match result {
-                    Err(managed_rpc::Error::Unavailable) => {
-                        node.sync_history(&self.authority, target, &page).await?
-                    }
-                    other => other?,
-                };
-                if synced.applied_prefix < applied {
-                    return Err(Error::Identity);
-                }
-                applied = synced.applied_prefix;
-                // Concurrent sync may have advanced the member farther. Continue
-                // from this checked page end, retaining this exact source cut;
-                // subsequent pages are verified exact overlapping retries locally.
-                base = page.end;
-                if base == cut {
-                    break;
-                }
-                page = self
-                    .coordinator
-                    .history_page(&self.authority, self.epoch, &base, Some(&cut))
+        member_waves(
+            &self.members,
+            self.member_parallelism,
+            |(node, target)| async {
+                let history = self.timing.span(Phase::HistorySync);
+                let status = node
+                    .history_status(&self.authority, target, &plan.cohort)
                     .await?;
-            }
-            drop(history);
-            let consume = self.timing.span(Phase::Consume);
-            // Each successful consume strictly increases applied, bounded by the
-            // admitted transaction cap. Concurrent consumption can already be ahead.
-            while applied < ordinal {
-                let requested = applied + 1;
-                let result = node
-                    .advance_retained(&self.authority, target, requested, &cut)
-                    .await;
-                applied = match result {
-                    Err(managed_rpc::Error::Unavailable) => {
-                        node.advance_retained(&self.authority, target, requested, &cut)
-                            .await?
+                let mut applied = status.applied_prefix;
+                let mut base = status.cursor;
+                // Pin only after observing this member, which may already retain
+                // events beyond its applied watermark or beyond another member's cut.
+                let mut page = self
+                    .coordinator
+                    .history_page(&self.authority, self.epoch, &base, None)
+                    .await?;
+                let cut = page.cut.clone();
+                loop {
+                    // An uncertain ACK retries the identical page before any new
+                    // cursor/cut is selected. One retry and the outer deadline bound it.
+                    let result = node.sync_history(&self.authority, target, &page).await;
+                    let synced = match result {
+                        Err(managed_rpc::Error::Unavailable) => {
+                            node.sync_history(&self.authority, target, &page).await?
+                        }
+                        other => other?,
+                    };
+                    if synced.applied_prefix < applied {
+                        return Err(Error::Identity);
                     }
-                    other => other?,
-                };
-            }
-            drop(consume);
-            let _visibility = self.timing.span(Phase::Visibility);
-            // A watermark or hash root alone is never the final V certificate.
-            node.prefix_terminal(target, &proof).await?;
-        }
-        Ok(())
+                    applied = synced.applied_prefix;
+                    // Concurrent sync may have advanced the member farther. Continue
+                    // from this checked page end, retaining this exact source cut;
+                    // subsequent pages are verified exact overlapping retries locally.
+                    base = page.end;
+                    if base == cut {
+                        break;
+                    }
+                    page = self
+                        .coordinator
+                        .history_page(&self.authority, self.epoch, &base, Some(&cut))
+                        .await?;
+                }
+                drop(history);
+                let consume = self.timing.span(Phase::Consume);
+                // Each successful consume strictly increases applied, bounded by the
+                // admitted transaction cap. Concurrent consumption can already be ahead.
+                while applied < ordinal {
+                    let requested = applied + 1;
+                    let result = node
+                        .advance_retained(&self.authority, target, requested, &cut)
+                        .await;
+                    applied = match result {
+                        Err(managed_rpc::Error::Unavailable) => {
+                            node.advance_retained(&self.authority, target, requested, &cut)
+                                .await?
+                        }
+                        other => other?,
+                    };
+                }
+                drop(consume);
+                let _visibility = self.timing.span(Phase::Visibility);
+                // A watermark or hash root alone is never the final V certificate.
+                node.prefix_terminal(target, &proof).await?;
+                Ok(())
+            },
+        )
+        .await
     }
+}
+
+/// Bounded owned waves, with no spawned or detached client tasks. Each member
+/// retains only its own current history page, and cancellation drops every lane.
+/// A failed wave prevents later waves; already-dispatched durable work can finish
+/// and must be recovered by the original transaction identity, never rolled back.
+async fn member_waves<'a, T, F, Fut>(members: &'a [T], width: usize, mut operation: F) -> Result<()>
+where
+    F: FnMut(&'a T) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use std::task::Poll;
+    for wave in members.chunks(width) {
+        let mut pending: Vec<_> = wave
+            .iter()
+            .map(|member| Some(Box::pin(operation(member))))
+            .collect();
+        let mut outcomes: Vec<_> = (0..pending.len()).map(|_| None).collect();
+        std::future::poll_fn(|cx| {
+            let mut ready = true;
+            for (lane, outcome) in pending.iter_mut().zip(&mut outcomes) {
+                if let Some(future) = lane {
+                    match future.as_mut().poll(cx) {
+                        Poll::Ready(result) => {
+                            *outcome = Some(result);
+                            *lane = None;
+                        }
+                        Poll::Pending => ready = false,
+                    }
+                }
+            }
+            if ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        // Drain the issued wave under the same outer deadline, then preserve
+        // cohort-order error precedence. Never start another wave on failure.
+        for outcome in outcomes {
+            outcome.expect("completed lane")?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

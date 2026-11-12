@@ -1113,6 +1113,13 @@ async fn history_peer(
     identity: managed_rpc::Identity,
     steps: Vec<(serde_json::Value, Option<serde_json::Value>)>,
 ) -> (managed_rpc::Client, tokio::task::JoinHandle<()>) {
+    history_peer_ordering(identity, steps, false).await
+}
+async fn history_peer_ordering(
+    identity: managed_rpc::Identity,
+    mut steps: Vec<(serde_json::Value, Option<serde_json::Value>)>,
+    unordered_pages: bool,
+) -> (managed_rpc::Client, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = managed_rpc::Client::new(
@@ -1122,7 +1129,7 @@ async fn history_peer(
     )
     .unwrap();
     let peer = tokio::spawn(async move {
-        for (expected, result) in steps {
+        while !steps.is_empty() {
             let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
                 .await
                 .unwrap()
@@ -1135,6 +1142,15 @@ async fn history_peer(
             assert_eq!(request["version"], 6);
             assert!(request["operation"].get("Journal").is_none());
             assert!(request["operation"].get("Advance").is_none());
+            let position = if unordered_pages && request["operation"].get("HistoryPage").is_some() {
+                steps
+                    .iter()
+                    .position(|(expected, _)| *expected == request["operation"])
+                    .expect("unexpected or repeated page")
+            } else {
+                0
+            };
+            let (expected, result) = steps.remove(position);
             assert_eq!(request["operation"], expected);
             let Some(result) = result else {
                 continue;
@@ -1233,6 +1249,11 @@ fn history_journal() -> Journal {
 #[tokio::test]
 async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_commands() {
     let _resources = REMOTE_FIXTURE.lock().await;
+    for width in [1, 3] {
+        check_exact_history_retries(width).await;
+    }
+}
+async fn check_exact_history_retries(width: usize) {
     use serde_json::json;
     let journal = history_journal();
     let base = journal.history_cursor_at(1).unwrap();
@@ -1262,7 +1283,7 @@ async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_c
     let page_first =
         json!({"HistoryPage": {"authority": authority(), "epoch": 1, "base": base, "cut": null}});
     let page_second = json!({"HistoryPage": {"authority": authority(), "epoch": 1, "base": first.end, "cut": cut}});
-    let (coordinator, coordinator_peer) = history_peer(
+    let (coordinator, coordinator_peer) = history_peer_ordering(
         history_identity(9),
         vec![
             (terminal, Some(json!({"Ok": {"Evidence": proof}}))),
@@ -1277,6 +1298,7 @@ async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_c
             (page_first, Some(json!({"Ok": {"HistoryPage": first}}))),
             (page_second, Some(json!({"Ok": {"HistoryPage": second}}))),
         ],
+        true,
     )
     .await;
     let mut clients = Vec::new();
@@ -1326,7 +1348,9 @@ async fn advance_to_uses_only_pinned_suffix_protocol_and_retries_exact_unknown_c
             (NodeRef::Remote(&clients[0]), target(7)),
             (NodeRef::Remote(&clients[1]), target(8)),
         ],
-    );
+    )
+    .with_member_parallelism(width)
+    .unwrap();
     graph
         .advance_to(&history_plan(), journal.transaction([20; 16]).unwrap())
         .await
@@ -1361,7 +1385,9 @@ async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
             (NodeRef::Remote(&member), target(7)),
             (NodeRef::Remote(&member), target(8)),
         ],
-    );
+    )
+    .with_member_parallelism(1)
+    .unwrap();
     assert!(matches!(
         graph
             .advance_to(&history_plan(), journal.transaction([20; 16]).unwrap())
@@ -1813,3 +1839,100 @@ async fn status_never_combines_target_with_a_different_same_ordinal_proof() {
 
 #[path = "managed_edge_replace_tests.rs"]
 mod edge_replace_tests;
+
+#[tokio::test]
+async fn member_waves_bound_work_and_stop_after_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let active = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let started = AtomicUsize::new(0);
+    struct Lease<'a>(&'a AtomicUsize);
+    impl Drop for Lease<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    for width in [1, 3, 4] {
+        member_waves(&(0..17).collect::<Vec<_>>(), width, |_| async {
+            started.fetch_add(1, Ordering::SeqCst);
+            let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _lease = Lease(&active);
+            peak.fetch_max(n, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(peak.swap(0, Ordering::SeqCst), width);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+    started.store(0, Ordering::SeqCst);
+    let failed = member_waves(&[0, 1, 2, 3, 4, 5], 3, |index| async {
+        started.fetch_add(1, Ordering::SeqCst);
+        let _lease = Lease(&active);
+        active.fetch_add(1, Ordering::SeqCst);
+        if *index == 1 {
+            Err(Error::Identity)
+        } else {
+            tokio::task::yield_now().await;
+            Ok(())
+        }
+    })
+    .await;
+    assert!(matches!(failed, Err(Error::Identity)));
+    assert_eq!(started.load(Ordering::SeqCst), 3);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    let error = member_waves(&[0, 1], 2, |index| async {
+        if *index == 0 {
+            tokio::task::yield_now().await;
+            Err(Error::Capacity)
+        } else {
+            Err(Error::Identity)
+        }
+    })
+    .await;
+    assert!(
+        matches!(error, Err(Error::Capacity)),
+        "cohort order, not completion order"
+    );
+    started.store(0, Ordering::SeqCst);
+    let mut run = Box::pin(member_waves(&[0, 1, 2, 3], 3, |_| async {
+        started.fetch_add(1, Ordering::SeqCst);
+        active.fetch_add(1, Ordering::SeqCst);
+        let _lease = Lease(&active);
+        std::future::pending::<Result<()>>().await
+    }));
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(run.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(started.load(Ordering::SeqCst), 3);
+    drop(run);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn member_parallelism_is_checked_without_contacting_endpoints() {
+    let client = managed_rpc::Client::new(
+        "127.0.0.1:1".parse().unwrap(),
+        history_identity(9),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    for width in [0, 5, 8, usize::MAX] {
+        assert!(matches!(
+            GraphCohort::from_endpoints(NodeRef::Remote(&client), authority(), 1, Vec::new())
+                .with_member_parallelism(width),
+            Err(Error::Capacity)
+        ));
+    }
+    for width in [1, 3, 4] {
+        let graph =
+            GraphCohort::from_endpoints(NodeRef::Remote(&client), authority(), 1, Vec::new())
+                .with_member_parallelism(width)
+                .unwrap();
+        assert_eq!(graph.member_parallelism, width);
+    }
+}

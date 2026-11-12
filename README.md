@@ -809,3 +809,6 @@ missing/Null semantics use the same retained shard sessions and budgets. Scan-on
 terminal values requires an explicit preceding vertex limit (1..1000); no-limit
 scan values and scalar post-processing remain unsupported. See the
 [composition contract](docs/GLOBAL_VERTEX_TRAVERSAL.md).
+
+See [bounded full-cohort catch-up](docs/BOUNDED_COHORT_FANOUT.md) for member fanout,
+unchanged consistency/resource contracts, and critical-path benchmark scope.
