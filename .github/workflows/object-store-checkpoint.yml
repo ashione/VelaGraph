@@ -74,9 +74,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
-          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
-          test -n "$libclang_path" && test "$libclang_path" != .
-          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+          # Hosted images may retain stale LLVM directories. Select a library
+          # clang-sys actually recognizes and verify that the loader can open it.
+          python3 - <<'PYTHON'
+          import ctypes, glob, os, pathlib
+          candidates = sorted(glob.glob('/usr/lib/llvm-*/lib/libclang.so') + glob.glob('/usr/lib/llvm-*/lib/libclang-*.so'))
+          for candidate in candidates:
+              try:
+                  library = ctypes.CDLL(candidate)
+                  getattr(library, 'clang_getClangVersion')
+              except (OSError, AttributeError):
+                  continue
+              directory = str(pathlib.Path(candidate).parent)
+              with open(os.environ['GITHUB_ENV'], 'a') as output:
+                  output.write('LIBCLANG_PATH=' + directory + '\n')
+              print('Verified LIBCLANG_PATH=' + directory)
+              break
+          else:
+              raise SystemExit('No loadable libclang.so/libclang-*.so found')
+          PYTHON
       - name: Cache physical test build (no checkpoint data)
         uses: Swatinem/rust-cache@v2
         with:
