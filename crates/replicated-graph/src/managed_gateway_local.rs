@@ -136,6 +136,32 @@ fn preflight_pages(
     before_deadline(end)?;
     preflight(binding, open_reply(profile, session, result))
 }
+// HTTP has a different preview envelope. Validate every future page before
+// delivering any HTTP page, including a session originally opened over TCP.
+fn preflight_http_pages(
+    session: &LocalSession,
+    result: &pages::Materialized,
+    end: Instant,
+) -> Result<()> {
+    for offset in (0..result.data.rows.len().max(1)).step_by(usize::from(result.size)) {
+        before_deadline(end)?;
+        http_codec::encode(&Ok(Reply::FetchLocalQuery {
+            session: session.clone(),
+            query: result.query.clone(),
+            cursor: result.cursors.get(&offset).cloned(),
+            page_size: result.size,
+            page: result.page(offset),
+        }))?;
+    }
+    before_deadline(end)
+}
+impl Retained {
+    pub(super) fn preflight_http(&self, session: &LocalSession, end: Instant) -> Result<()> {
+        live(self, end)?;
+        preflight_http_pages(session, &self.result, end)?;
+        live(self, end)
+    }
+}
 fn open_reply(
     profile: Option<LocalReadProfile>,
     session: &LocalSession,
@@ -669,6 +695,47 @@ mod boundary_tests {
                 d2_raft::D1Error::VisibilityReadLimit
             )),
             Error::Capacity
+        );
+    }
+}
+
+#[cfg(test)]
+mod http_boundary_tests {
+    use super::*;
+    #[test]
+    fn http_preflight_rejects_later_page_before_first_delivery() {
+        let session = LocalSession {
+            incarnation: [1; 16],
+            token: [2; 32],
+            version: 1,
+        };
+        let result = pages::Materialized {
+            query: Query {
+                partition: 7,
+                text: "g.V(1,2).valueMap('x')".into(),
+            },
+            size: 1,
+            data: QueryData {
+                completeness: QueryCompleteness::Unverified,
+                rows: vec![
+                    QueryRow::Count(1),
+                    QueryRow::PropertyMap {
+                        source: crate::remote::query::QualifiedElement::Vertex {
+                            partition: 7,
+                            id: 1,
+                        },
+                        properties: BTreeMap::from([("x".into(), vec![Value::Integer(0); 60_000])]),
+                    },
+                ],
+            },
+            offsets: BTreeMap::new(),
+            cursors: BTreeMap::new(),
+        };
+        // A small first page alone is insufficient to admit this result.
+        assert!(http_codec::encode(&Ok(open_reply(None, &session, &result))).is_ok());
+        assert_eq!(
+            preflight_http_pages(&session, &result, Instant::now() + Duration::from_secs(5)),
+            Err(Error::Capacity)
         );
     }
 }

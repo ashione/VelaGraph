@@ -19,6 +19,13 @@ use velagraph::{
     experimental_graph::{CrossEdge, EdgePropertyPatch, EdgeRef, VertexPropertyPatch, VertexRef},
     Value, Vertex,
 };
+#[path = "managed_gateway_http.rs"]
+mod http;
+#[path = "managed_gateway_http_codec.rs"]
+mod http_codec;
+#[path = "managed_gateway_invocation.rs"]
+mod invocation;
+pub use http::HttpService;
 #[path = "managed_gateway_jobs.rs"]
 mod jobs;
 #[path = "managed_gateway_local.rs"]
@@ -1253,6 +1260,12 @@ impl Gateway {
             task: Some(task),
         })
     }
+    /// Bind the bounded development-only public HTTP adapter to this already
+    /// validated live managed gateway. Offline restored nodes cannot create this
+    /// gateway; no restore marker or readiness override is provided here.
+    pub async fn bind_http(&self, bind: SocketAddr, deadline: Duration) -> Result<HttpService> {
+        http::bind(self.state.clone(), self.stop.subscribe(), bind, deadline).await
+    }
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
@@ -1273,24 +1286,6 @@ impl Drop for Gateway {
         let _ = self.stop.send(true);
     }
 }
-// An Open is not retained on cancellation, encode failure or a known send
-// failure. Successful kernel write is not proof the peer received the descriptor;
-// those unknowable lost replies are reclaimed by the ordinary TTL.
-struct OpenDelivery {
-    state: Arc<State>,
-    token: Option<[u8; 32]>,
-    local_token: Option<[u8; 32]>,
-}
-impl Drop for OpenDelivery {
-    fn drop(&mut self) {
-        if let Some(token) = self.local_token {
-            self.state.local_sessions.lock().unwrap().remove(&token);
-        }
-        if let Some(token) = self.token {
-            self.state.sessions.lock().unwrap().remove(&token);
-        }
-    }
-}
 async fn serve(
     mut socket: TcpStream,
     state: Arc<State>,
@@ -1298,151 +1293,19 @@ async fn serve(
     end: Instant,
 ) -> Result<()> {
     let request: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await?;
-    let end = if matches!(
-        request.operation,
-        Operation::StartLocalQueryJob { .. }
-            | Operation::GetLocalQueryJob { .. }
-            | Operation::RenewLocalQueryJob { .. }
-            | Operation::FetchLocalQueryJob { .. }
-            | Operation::CancelLocalQueryJob { .. }
-    ) {
-        end.min(Instant::now() + Duration::from_secs(5))
-    } else if matches!(
-        request.operation,
-        Operation::Read { .. }
-            | Operation::Traverse { .. }
-            | Operation::TraversePage { .. }
-            | Operation::OpenLocalQuery { .. }
-            | Operation::OpenLocalQueryWithProfile { .. }
-            | Operation::OpenLocalQueryAfter { .. }
-            | Operation::FetchLocalQuery { .. }
-    ) {
-        end.min(Instant::now() + velagraph::GREMLIN_DEADLINE)
-    } else {
-        end
-    };
-    if Instant::now() >= end {
-        return Err(Error::Unknown);
-    }
-    let result = if request.version != VERSION || request.request_id == [0; 16] {
-        Err(Error::Protocol)
-    } else if request.binding != state.config.binding {
-        Err(Error::Identity)
-    } else {
-        state.execute(request.operation, work.clone(), end).await
-    };
-    let mut delivery = OpenDelivery {
-        state: state.clone(),
-        local_token: match &result {
-            Ok(
-                Reply::OpenLocalQuery { session, .. }
-                | Reply::OpenLocalQueryWithProfile { session, .. },
-            ) => Some(session.token),
-            _ => None,
-        },
-        token: match &result {
-            Ok(Reply::OpenSession(s)) => Some(s.token),
-            _ => None,
-        },
-    };
-    let mut response = Response {
-        version: VERSION,
-        request_id: request.request_id,
-        binding: state.config.binding.clone(),
-        result,
-    };
-    // Retain the result reservation through encoding and the complete send,
-    // even when another request closes/expires the registry entry meanwhile.
-    let local_retained = match &response.result {
-        Ok(
-            Reply::OpenLocalQuery { session, .. }
-            | Reply::OpenLocalQueryWithProfile { session, .. }
-            | Reply::FetchLocalQuery { session, .. },
-        ) => Some(state.get_local(session)?),
-        _ => None,
-    };
-    let job_retained = match &response.result {
-        Ok(Reply::FetchLocalQueryJob { job, .. }) => Some(state.get_job(job)?),
-        _ => None,
-    };
-    let expiry = match &response.result {
-        Ok(
-            Reply::OpenSession(s)
-            | Reply::Read { session: s, .. }
-            | Reply::Traverse { session: s, .. }
-            | Reply::TraversePage { session: s, .. },
-        ) => Some(state.get(s)?.expires),
-        Ok(
-            Reply::OpenLocalQuery { session, .. }
-            | Reply::OpenLocalQueryWithProfile { session, .. }
-            | Reply::FetchLocalQuery { session, .. },
-        ) => Some(state.get_local(session)?.expires),
-        Ok(Reply::RenewLocalQueryJob { job, .. }) => Some(state.get_job(job)?.deadline()?),
-        _ => None,
-    };
-    let (bytes, success, local_retained, job_retained) = tokio::task::spawn_blocking(move || {
-        let _work = work;
-        let encoded = match encode(&response, MAX_RESPONSE_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                response.result = Err(Error::Capacity);
-                encode(&response, MAX_RESPONSE_BYTES)?
-            }
-        };
-        if expiry.is_some_and(|end| Instant::now() >= end)
-            || local_retained
-                .as_ref()
-                .is_some_and(|retained| retained.closed.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return Err(Error::SessionUnavailable);
-        }
-        if Instant::now() >= end {
-            return Err(Error::Unknown);
-        }
-        if let Some(job) = &job_retained {
-            job.live_ready()?;
-        }
-        Ok((
-            encoded,
-            response.result.is_ok(),
-            local_retained,
-            job_retained,
-        ))
-    })
-    .await
-    .map_err(|_| Error::Unknown)??;
-    if Instant::now() >= end {
-        return Err(Error::Unknown);
-    }
-    if let Some(retained) = &local_retained {
-        // The blocking encoder may finish before TTL while this task resumes
-        // after it. timeout_at alone can poll an immediately-ready write first.
-        local::live(retained, end)?;
-    }
-    if let Some(job) = &job_retained {
-        job.live_ready()?;
-    }
-    let write_end = expiry.map_or(end, |expiry| expiry.min(end));
-    let write_end = if let Some(job) = &job_retained {
-        write_end.min(job.deadline()?)
-    } else {
-        write_end
-    };
+    let invocation = invocation::Invocation::begin(state, request, work, end).await?;
+    let (bytes, mut invocation) = tokio::task::spawn_blocking(move || invocation.encode_tcp())
+        .await
+        .map_err(|_| Error::Unknown)??;
+    invocation.live()?;
     let sent = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(write_end),
+        tokio::time::Instant::from_std(invocation.delivery_end()?),
         write_bytes(&mut socket, &bytes),
     )
     .await
-    .map_err(|_| {
-        if expiry.is_some_and(|expiry| Instant::now() >= expiry) {
-            Error::SessionUnavailable
-        } else {
-            Error::Unknown
-        }
-    })?;
-    if sent.is_ok() && success {
-        delivery.token = None;
-        delivery.local_token = None;
+    .map_err(|_| invocation.live().err().unwrap_or(Error::Unknown))?;
+    if sent.is_ok() {
+        invocation.delivered();
     }
     sent
 }
