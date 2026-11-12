@@ -198,6 +198,8 @@ async fn handle(
             .map_err(|_| Error::Capacity)?;
         before_deadline(end)?;
         let operation = http_codec::decode(&path, &bytes)?;
+        let end = invocation::operation_end(&operation, end);
+        budget.send_replace(end);
         let request = Request {
             version: VERSION,
             request_id: random()?,

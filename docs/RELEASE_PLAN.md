@@ -12,8 +12,9 @@ can proceed in parallel; an umbrella issue is not closed by shipping one slice.
 
 Implementation boundary: [public managed service design](PUBLIC_SERVICE_DESIGN.md)
 (shared handlers, protocol parity, delivery ownership and readiness gates).
-The [HTTP-only library preview](PUBLIC_HTTP_PREVIEW.md) is an initial slice,
-not the final dual-protocol endpoint or a completed release gate.
+The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed public gRPC](PUBLIC_GRPC_SERVICE.md)
+and [service host](PUBLIC_SERVICE_CLI.md) are staged implementations, not proof of completed clean-startup or release
+gates. The finite preview feature/compatibility matrix must be explicit.
 
 Deliver a small usable service before promising elastic operation:
 

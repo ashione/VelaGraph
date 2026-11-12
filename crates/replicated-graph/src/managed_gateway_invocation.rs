@@ -21,6 +21,32 @@ impl Drop for OpenDelivery {
     }
 }
 
+pub(super) fn operation_end(operation: &Operation, end: Instant) -> Instant {
+    if matches!(
+        operation,
+        Operation::StartLocalQueryJob { .. }
+            | Operation::GetLocalQueryJob { .. }
+            | Operation::RenewLocalQueryJob { .. }
+            | Operation::FetchLocalQueryJob { .. }
+            | Operation::CancelLocalQueryJob { .. }
+    ) {
+        end.min(Instant::now() + Duration::from_secs(5))
+    } else if matches!(
+        operation,
+        Operation::Read { .. }
+            | Operation::Traverse { .. }
+            | Operation::TraversePage { .. }
+            | Operation::OpenLocalQuery { .. }
+            | Operation::OpenLocalQueryWithProfile { .. }
+            | Operation::OpenLocalQueryAfter { .. }
+            | Operation::FetchLocalQuery { .. }
+    ) {
+        end.min(Instant::now() + velagraph::GREMLIN_DEADLINE)
+    } else {
+        end
+    }
+}
+
 pub(super) struct Invocation {
     pub(super) response: Response,
     delivery: OpenDelivery,
@@ -37,29 +63,7 @@ impl Invocation {
         work: Arc<OwnedSemaphorePermit>,
         end: Instant,
     ) -> Result<Self> {
-        let end = if matches!(
-            request.operation,
-            Operation::StartLocalQueryJob { .. }
-                | Operation::GetLocalQueryJob { .. }
-                | Operation::RenewLocalQueryJob { .. }
-                | Operation::FetchLocalQueryJob { .. }
-                | Operation::CancelLocalQueryJob { .. }
-        ) {
-            end.min(Instant::now() + Duration::from_secs(5))
-        } else if matches!(
-            request.operation,
-            Operation::Read { .. }
-                | Operation::Traverse { .. }
-                | Operation::TraversePage { .. }
-                | Operation::OpenLocalQuery { .. }
-                | Operation::OpenLocalQueryWithProfile { .. }
-                | Operation::OpenLocalQueryAfter { .. }
-                | Operation::FetchLocalQuery { .. }
-        ) {
-            end.min(Instant::now() + velagraph::GREMLIN_DEADLINE)
-        } else {
-            end
-        };
+        let end = operation_end(&request.operation, end);
         if Instant::now() >= end {
             return Err(Error::Unknown);
         }
@@ -68,7 +72,12 @@ impl Invocation {
         } else if request.binding != state.config.binding {
             Err(Error::Identity)
         } else {
-            state.execute(request.operation, work.clone(), end).await
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(end),
+                state.execute(request.operation, work.clone(), end),
+            )
+            .await
+            .unwrap_or(Err(Error::Unknown))
         };
         let delivery = OpenDelivery {
             state: state.clone(),
@@ -165,6 +174,14 @@ impl Invocation {
             (&self.local_retained, &self.response.result)
         {
             retained.preflight_http(self.end)?;
+        }
+        self.live()
+    }
+    pub(super) fn preflight_grpc(&self) -> Result<()> {
+        if let (Some(retained), Ok(Reply::OpenLocalQuery { .. } | Reply::FetchLocalQuery { .. })) =
+            (&self.local_retained, &self.response.result)
+        {
+            retained.preflight_grpc(self.end)?;
         }
         self.live()
     }

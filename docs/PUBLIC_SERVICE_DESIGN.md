@@ -1,9 +1,9 @@
 # Public managed service: first implementation boundary
 
 Status: **final protocol implementation design, not a completed service**.
-An initial [HTTP-only library preview](PUBLIC_HTTP_PREVIEW.md) supplies a shared
-invocation/delivery seam; it does not implement the final protobuf contract or
-complete the dual-protocol/release gate. Reviewed against
+The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed gRPC slice](PUBLIC_GRPC_SERVICE.md)
+and [service host](PUBLIC_SERVICE_CLI.md) reuse a shared invocation/delivery seam.
+The final stable HTTP/schema, clean startup and full release gates remain open. Reviewed against
 main `365228e32efb939c8f9188e1b236a83c1c872b20` on 2026-11-12.
 Tracks [#218](https://github.com/ashione/VelaGraph/issues/218),
 [#221](https://github.com/ashione/VelaGraph/issues/221), and the

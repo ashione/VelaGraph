@@ -33,6 +33,7 @@ pub(super) struct Retained {
     // Immutable session/result/page sizing: one successful HTTP frame proof is
     // valid for every subsequent fetch. Failed/expired proofs are never cached.
     http_preflighted: std::sync::atomic::AtomicBool,
+    grpc_preflighted: std::sync::atomic::AtomicBool,
 }
 pub(super) fn snapshot_error(error: cohort_reads::Error) -> Error {
     managed_graph::Error::from(error).into()
@@ -159,6 +160,30 @@ fn preflight_http_pages(
     before_deadline(end)
 }
 impl Retained {
+    pub(super) fn preflight_grpc(&self, end: Instant) -> Result<()> {
+        live(self, end)?;
+        if !self
+            .grpc_preflighted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            for offset in
+                (0..self.result.data.rows.len().max(1)).step_by(usize::from(self.result.size))
+            {
+                before_deadline(end)?;
+                grpc_codec::encode_fetch(&Reply::FetchLocalQuery {
+                    session: self.descriptor.clone(),
+                    query: self.result.query.clone(),
+                    cursor: self.result.cursors.get(&offset).cloned(),
+                    page_size: self.result.size,
+                    page: self.result.page(offset),
+                })?;
+            }
+            live(self, end)?;
+            self.grpc_preflighted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        live(self, end)
+    }
     pub(super) fn preflight_http(&self, end: Instant) -> Result<()> {
         live(self, end)?;
         if !self
@@ -459,6 +484,7 @@ impl State {
                 result: materialized,
                 closed: std::sync::atomic::AtomicBool::new(false),
                 http_preflighted: std::sync::atomic::AtomicBool::new(false),
+                grpc_preflighted: std::sync::atomic::AtomicBool::new(false),
             });
             preflight_pages(
                 &binding,
@@ -545,6 +571,7 @@ mod boundary_tests {
             },
             closed: std::sync::atomic::AtomicBool::new(false),
             http_preflighted: std::sync::atomic::AtomicBool::new(false),
+            grpc_preflighted: std::sync::atomic::AtomicBool::new(false),
         };
         let end = now + Duration::from_secs(20);
         live(&retained, end).unwrap();
