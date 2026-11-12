@@ -96,6 +96,128 @@ fn ready(reply: Reply) -> (LocalSession, Query, QueryPage) {
         other => panic!("{other:?}"),
     }
 }
+#[test]
+fn explicit_profile_reply_binding_and_legacy_wire_shapes() {
+    let query = Query {
+        partition: 7,
+        text: "g.V(1).count()".into(),
+    };
+    let session = LocalSession {
+        incarnation: [1; 16],
+        token: [2; 32],
+        version: 7,
+    };
+    let page = QueryPage {
+        data: QueryData {
+            rows: vec![QueryRow::Count(1)],
+            completeness: QueryCompleteness::Unverified,
+        },
+        next: None,
+        offset: 0,
+        total: 1,
+    };
+    let legacy_op = Operation::OpenLocalQuery {
+        version: Some(7),
+        ttl_millis: 60_000,
+        query: query.clone(),
+        page_size: 1,
+    };
+    assert_eq!(
+        serde_json::to_string(&legacy_op).unwrap(),
+        r#"{"OpenLocalQuery":{"version":7,"ttl_millis":60000,"query":{"partition":7,"text":"g.V(1).count()"},"page_size":1}}"#
+    );
+    let session_wire = serde_json::to_value(&session).unwrap();
+    assert_eq!(session_wire.as_object().unwrap().len(), 3);
+    assert_eq!(
+        serde_json::from_value::<LocalSession>(session_wire).unwrap(),
+        session
+    );
+    let legacy = Reply::OpenLocalQuery {
+        session: session.clone(),
+        query: query.clone(),
+        page_size: 1,
+        page: page.clone(),
+    };
+    let response = |reply| Response {
+        version: VERSION,
+        request_id: [9; 16],
+        binding: bound(),
+        result: Ok(reply),
+    };
+    for profile in [
+        LocalReadProfile::Parity2MiBV1,
+        LocalReadProfile::LocalRead8MiBV1,
+    ] {
+        let operation = Operation::OpenLocalQueryWithProfile {
+            profile,
+            version: Some(7),
+            ttl_millis: 60_000,
+            query: query.clone(),
+            page_size: 1,
+        };
+        let request = Request {
+            version: VERSION,
+            request_id: [9; 16],
+            binding: bound(),
+            operation: operation.clone(),
+        };
+        let reply = Reply::OpenLocalQueryWithProfile {
+            profile,
+            session: session.clone(),
+            query: query.clone(),
+            page_size: 1,
+            page: page.clone(),
+        };
+        assert_eq!(
+            validate_reply(&request, response(reply.clone())),
+            Ok(reply.clone())
+        );
+        assert_eq!(
+            validate_reply(&request, response(legacy.clone())),
+            Err(Error::Identity)
+        );
+        let mut altered = reply.clone();
+        let Reply::OpenLocalQueryWithProfile {
+            profile: returned, ..
+        } = &mut altered
+        else {
+            unreachable!()
+        };
+        *returned = if profile == LocalReadProfile::Parity2MiBV1 {
+            LocalReadProfile::LocalRead8MiBV1
+        } else {
+            LocalReadProfile::Parity2MiBV1
+        };
+        assert_eq!(
+            validate_reply(&request, response(altered)),
+            Err(Error::Identity)
+        );
+        let old_request = Request {
+            version: VERSION,
+            request_id: [9; 16],
+            binding: bound(),
+            operation: legacy_op.clone(),
+        };
+        assert_eq!(
+            validate_reply(&old_request, response(reply.clone())),
+            Err(Error::Identity)
+        );
+        let mut stripped = serde_json::to_value(reply).unwrap();
+        stripped["OpenLocalQueryWithProfile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile");
+        assert!(serde_json::from_value::<Reply>(stripped).is_err());
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("FutureUnlimitedV2"),
+        ] {
+            let mut invalid = serde_json::to_value(&operation).unwrap();
+            invalid["OpenLocalQueryWithProfile"]["profile"] = value;
+            assert!(serde_json::from_value::<Operation>(invalid).is_err());
+        }
+    }
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fixed_local_result_replays_original_v_after_writes_and_node_loss() {
     let _gate = TEST_GATE.lock().await;
@@ -574,6 +696,36 @@ async fn fixed_local_qualified_bags_match_input_model() {
         let (session, query, page) =
             ready(call(&g, local_open(Some(8), text, 1000)).await.unwrap());
         assert_eq!(page.data.rows, expected, "{text}");
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            let Reply::OpenLocalQueryWithProfile {
+                profile: returned,
+                session: selected,
+                page: selected_page,
+                ..
+            } = call(
+                &g,
+                Operation::OpenLocalQueryWithProfile {
+                    profile,
+                    version: Some(8),
+                    ttl_millis: 60_000,
+                    query: query.clone(),
+                    page_size: 1000,
+                },
+            )
+            .await
+            .unwrap()
+            else {
+                panic!("expected selected profile reply")
+            };
+            assert_eq!(returned, profile);
+            assert_eq!(selected_page, page, "{text}: {profile:?}");
+            call(&g, Operation::CloseLocalQuery { session: selected })
+                .await
+                .unwrap();
+        }
         let Reply::OpenSession(old) = call(
             &g,
             Operation::OpenSession {
@@ -618,74 +770,113 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
     let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
     let f = Fixture::new().await;
     let (g, servers, graphs) = local_gateway(&f).await;
-    let mut routes = g.state.config.local_routes.clone().unwrap();
-    let real = routes[0].endpoint;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    routes[0].endpoint = listener.local_addr().unwrap();
-    let proxy = tokio::spawn(async move {
-        let (mut client, _) = listener.accept().await.unwrap();
-        let length = client.read_u32().await.unwrap();
-        assert!(length as usize <= crate::remote::MAX_FRAME_BYTES);
-        let mut body = vec![0; length as usize];
-        client.read_exact(&mut body).await.unwrap();
-        let mut upstream = TcpStream::connect(real).await.unwrap();
-        upstream.write_u32(length).await.unwrap();
-        upstream.write_all(&body).await.unwrap();
-        let length = upstream.read_u32().await.unwrap();
-        assert!(length as usize <= crate::remote::MAX_FRAME_BYTES);
-        let mut body = vec![0; length as usize];
-        upstream.read_exact(&mut body).await.unwrap();
-        let mut reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let proof = &mut reply["result"]["Ok"]["OpenFixedQuery"]["retained_proof"];
-        assert_eq!(proof["through"], 0);
-        // Independently valid exact V0 evidence, but from a different authority.
-        proof["authority"] = serde_json::to_value([66u8; 16]).unwrap();
-        let body = serde_json::to_vec(&reply).unwrap();
-        client.write_u32(body.len() as u32).await.unwrap();
-        client.write_all(&body).await.unwrap();
-        // A known identity-safe descriptor is closed even though its proof
-        // failed validation, instead of consuming the shared pool until TTL.
-        let (mut client, _) = listener.accept().await.unwrap();
-        let length = client.read_u32().await.unwrap();
-        let mut body = vec![0; length as usize];
-        client.read_exact(&mut body).await.unwrap();
-        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(request["operation"]["CloseFixedQuery"].is_object());
-        let mut upstream = TcpStream::connect(real).await.unwrap();
-        upstream.write_u32(length).await.unwrap();
-        upstream.write_all(&body).await.unwrap();
-        let length = upstream.read_u32().await.unwrap();
-        let mut body = vec![0; length as usize];
-        upstream.read_exact(&mut body).await.unwrap();
-        client.write_u32(length).await.unwrap();
-        client.write_all(&body).await.unwrap();
-    });
-    let client = |node: &OwnedNode| match node {
-        OwnedNode::Remote(c) => c.clone(),
-        _ => panic!(),
-    };
-    let bad = Gateway::bind_remote_local_queries(
-        RemoteConfig {
-            coordinator: client(&g.state.config.coordinator),
-            binding: bound(),
-            members: g.state.config.members.iter().map(client).collect(),
-        },
-        routes,
-        "127.0.0.1:0".parse().unwrap(),
-        Duration::from_secs(15),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        call(&bad, local_open(Some(0), "g.V(999).count()", 1)).await,
-        Err(Error::Identity)
-    );
-    tokio::time::timeout(Duration::from_secs(15), proxy)
+    for downgrade_profile in [false, true] {
+        let mut routes = g.state.config.local_routes.clone().unwrap();
+        let real = routes[0].endpoint;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        routes[0].endpoint = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut length = client.read_u32().await.unwrap();
+            assert!(length as usize <= crate::remote::MAX_FRAME_BYTES);
+            let mut body = vec![0; length as usize];
+            client.read_exact(&mut body).await.unwrap();
+            if downgrade_profile {
+                let mut request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let open = &mut request["operation"]["OpenFixedQuery"];
+                assert_eq!(open["profile"], "LocalRead8MiBV1");
+                open["profile"] = serde_json::json!("Parity2MiBV1");
+                open["capture_limit"]["bytes"] = serde_json::json!(2 * 1024 * 1024);
+                body = serde_json::to_vec(&request).unwrap();
+                length = body.len() as u32;
+            }
+            let mut upstream = TcpStream::connect(real).await.unwrap();
+            upstream.write_u32(length).await.unwrap();
+            upstream.write_all(&body).await.unwrap();
+            let length = upstream.read_u32().await.unwrap();
+            assert!(length as usize <= crate::remote::MAX_FRAME_BYTES);
+            let mut body = vec![0; length as usize];
+            upstream.read_exact(&mut body).await.unwrap();
+            let mut reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let descriptor = reply["result"]["Ok"]["OpenFixedQuery"]["descriptor"].clone();
+            let proof = &mut reply["result"]["Ok"]["OpenFixedQuery"]["retained_proof"];
+            assert_eq!(proof["through"], 0);
+            // Independently valid exact V0 evidence, but from a different authority.
+            if !downgrade_profile {
+                proof["authority"] = serde_json::to_value([66u8; 16]).unwrap();
+            } else {
+                assert!(descriptor.get("profile").is_none());
+            }
+            let body = serde_json::to_vec(&reply).unwrap();
+            client.write_u32(body.len() as u32).await.unwrap();
+            client.write_all(&body).await.unwrap();
+            // A known identity-safe descriptor is closed even though its proof
+            // failed validation, instead of consuming the shared pool until TTL.
+            let (mut client, _) = listener.accept().await.unwrap();
+            let length = client.read_u32().await.unwrap();
+            let mut body = vec![0; length as usize];
+            client.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(request["operation"]["CloseFixedQuery"].is_object());
+            assert_eq!(
+                request["operation"]["CloseFixedQuery"]["descriptor"],
+                descriptor
+            );
+            let mut upstream = TcpStream::connect(real).await.unwrap();
+            upstream.write_u32(length).await.unwrap();
+            upstream.write_all(&body).await.unwrap();
+            let length = upstream.read_u32().await.unwrap();
+            let mut body = vec![0; length as usize];
+            upstream.read_exact(&mut body).await.unwrap();
+            let closed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(closed["result"]["Ok"], "CloseFixedQuery");
+            client.write_u32(length).await.unwrap();
+            client.write_all(&body).await.unwrap();
+        });
+        let client = |node: &OwnedNode| match node {
+            OwnedNode::Remote(c) => c.clone(),
+            _ => panic!(),
+        };
+        let bad = Gateway::bind_remote_local_queries(
+            RemoteConfig {
+                coordinator: client(&g.state.config.coordinator),
+                binding: bound(),
+                members: g.state.config.members.iter().map(client).collect(),
+            },
+            routes,
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(15),
+        )
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(bad.retained_payload_charge(), 0);
-    bad.shutdown().await;
+        assert_eq!(
+            call(
+                &bad,
+                if downgrade_profile {
+                    Operation::OpenLocalQueryWithProfile {
+                        profile: LocalReadProfile::LocalRead8MiBV1,
+                        version: Some(0),
+                        ttl_millis: 60_000,
+                        query: Query {
+                            partition: 7,
+                            text: "g.V(999).count()".into(),
+                        },
+                        page_size: 1,
+                    }
+                } else {
+                    local_open(Some(0), "g.V(999).count()", 1)
+                }
+            )
+            .await,
+            Err(Error::Identity)
+        );
+        tokio::time::timeout(Duration::from_secs(15), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bad.retained_payload_charge(), 0);
+        bad.shutdown().await;
+    }
     g.shutdown().await;
     for graph in graphs {
         graph.shutdown().await;

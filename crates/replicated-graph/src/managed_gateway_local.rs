@@ -25,6 +25,7 @@ pub struct LocalSession {
 }
 pub(super) struct Retained {
     descriptor: LocalSession,
+    requested_profile: Option<LocalReadProfile>,
     pub(super) expires: Instant,
     _memory: OwnedSemaphorePermit,
     result: pages::Materialized,
@@ -114,6 +115,7 @@ pub(super) fn preflight(binding: &Binding, reply: Reply) -> Result<()> {
 }
 fn preflight_pages(
     binding: &Binding,
+    profile: Option<LocalReadProfile>,
     session: &LocalSession,
     result: &pages::Materialized,
     end: Instant,
@@ -132,15 +134,28 @@ fn preflight_pages(
         )?;
     }
     before_deadline(end)?;
-    preflight(
-        binding,
-        Reply::OpenLocalQuery {
+    preflight(binding, open_reply(profile, session, result))
+}
+fn open_reply(
+    profile: Option<LocalReadProfile>,
+    session: &LocalSession,
+    result: &pages::Materialized,
+) -> Reply {
+    match profile {
+        None => Reply::OpenLocalQuery {
             session: session.clone(),
             query: result.query.clone(),
             page_size: result.size,
             page: result.page(0),
         },
-    )
+        Some(profile) => Reply::OpenLocalQueryWithProfile {
+            profile,
+            session: session.clone(),
+            query: result.query.clone(),
+            page_size: result.size,
+            page: result.page(0),
+        },
+    }
 }
 
 pub(super) fn valid_page(
@@ -171,8 +186,10 @@ impl State {
         }
         Ok(found.clone())
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn open_local(
         &self,
+        requested_profile: Option<LocalReadProfile>,
         version: Option<u64>,
         ttl_millis: u64,
         query: Query,
@@ -228,12 +245,15 @@ impl State {
         }
         let expires = cut.expires_at();
         let acquire_end = end.min(cut.deadline());
+        let profile = requested_profile.unwrap_or_default();
+        let limit = profile.capture_limit();
         let remaining_limit = |rows: usize, bytes: usize, ops: usize| ReadLimit {
-            rows: fixed::CAPTURE_ROWS.saturating_sub(rows),
-            bytes: fixed::CAPTURE_BYTES.saturating_sub(bytes),
-            operations: fixed::CAPTURE_OPERATIONS.saturating_sub(ops),
+            rows: limit.rows.saturating_sub(rows),
+            bytes: limit.bytes.saturating_sub(bytes),
+            operations: limit.operations.saturating_sub(ops),
         };
         let make_open = |target: Target, limit: ReadLimit| fixed::FixedOpenRequest {
+            profile,
             target,
             proof: cut.proof().clone(),
             capture_limit: limit,
@@ -308,7 +328,7 @@ impl State {
                     ),
                 );
                 // Compare the complete retained certificate, not a boolean or V.
-                if opened.retained_proof != *cut.proof() {
+                if opened.descriptor.profile != profile || opened.retained_proof != *cut.proof() {
                     return Err(Error::Identity);
                 }
                 rows = rows
@@ -320,10 +340,7 @@ impl State {
                 operations = operations
                     .checked_add(opened.capture_cost.replay_operations)
                     .ok_or(Error::Capacity)?;
-                if rows > fixed::CAPTURE_ROWS
-                    || bytes > fixed::CAPTURE_BYTES
-                    || operations > fixed::CAPTURE_OPERATIONS
-                {
+                if rows > limit.rows || bytes > limit.bytes || operations > limit.operations {
                     return Err(Error::Capacity);
                 }
             }
@@ -385,6 +402,7 @@ impl State {
             }
             let retained = Arc::new(Retained {
                 descriptor,
+                requested_profile,
                 expires,
                 _memory: memory,
                 result: materialized,
@@ -392,6 +410,7 @@ impl State {
             });
             preflight_pages(
                 &binding,
+                retained.requested_profile,
                 &retained.descriptor,
                 &retained.result,
                 end.min(expires),
@@ -402,12 +421,11 @@ impl State {
         .await
         .map_err(|_| Error::Unknown)??;
         live(&retained, end)?;
-        let reply = Reply::OpenLocalQuery {
-            session: retained.descriptor.clone(),
-            query: retained.result.query.clone(),
-            page_size,
-            page: retained.result.page(0),
-        };
+        let reply = open_reply(
+            retained.requested_profile,
+            &retained.descriptor,
+            &retained.result,
+        );
         let mut sessions = self.local_sessions.lock().unwrap();
         if sessions.contains_key(&retained.descriptor.token) {
             return Err(Error::Unknown);
@@ -452,6 +470,7 @@ mod boundary_tests {
     fn local_send_check_rejects_expiry_and_close_after_encoding() {
         let now = Instant::now();
         let mut retained = Retained {
+            requested_profile: None,
             descriptor: LocalSession {
                 incarnation: [1; 16],
                 token: [1; 32],
@@ -545,12 +564,89 @@ mod boundary_tests {
         assert_eq!(
             preflight_pages(
                 &binding,
+                None,
                 &session,
                 &result,
                 Instant::now() + Duration::from_secs(5)
             ),
             Err(Error::Capacity)
         );
+    }
+    #[test]
+    fn explicit_profile_first_reply_uses_its_complete_larger_envelope() {
+        // Synthetic serializer boundary, not supported M1 grammar output.
+        let binding = Binding {
+            authority: Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
+            cohort: Cohort {
+                profile: Default::default(),
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                members: vec![Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                }],
+            },
+            mapping: Mapping::PartitionEqualsShardV1,
+        };
+        let session = LocalSession {
+            incarnation: [255; 16],
+            token: [255; 32],
+            version: u64::MAX,
+        };
+        let mut result = pages::Materialized {
+            query: Query {
+                partition: 7,
+                text: "g.V(1)".into(),
+            },
+            size: 1,
+            data: QueryData {
+                completeness: QueryCompleteness::Unverified,
+                rows: vec![QueryRow::Value {
+                    source: None,
+                    value: Value::Text(String::new()),
+                }],
+            },
+            offsets: BTreeMap::new(),
+            cursors: BTreeMap::new(),
+        };
+        let frame_len = |reply| {
+            serde_json::to_vec(&Response {
+                version: VERSION,
+                request_id: [255; 16],
+                binding: binding.clone(),
+                result: Ok(reply),
+            })
+            .unwrap()
+            .len()
+        };
+        let old_open = frame_len(open_reply(None, &session, &result));
+        let old_fetch = frame_len(Reply::FetchLocalQuery {
+            session: session.clone(),
+            query: result.query.clone(),
+            cursor: None,
+            page_size: 1,
+            page: result.page(0),
+        });
+        let padding = MAX_RESPONSE_BYTES - old_open.max(old_fetch);
+        result.data.rows = vec![QueryRow::Value {
+            source: None,
+            value: Value::Text("x".repeat(padding)),
+        }];
+        let end = Instant::now() + Duration::from_secs(5);
+        preflight_pages(&binding, None, &session, &result, end).unwrap();
+        for profile in [
+            LocalReadProfile::Parity2MiBV1,
+            LocalReadProfile::LocalRead8MiBV1,
+        ] {
+            assert_eq!(
+                preflight_pages(&binding, Some(profile), &session, &result, end),
+                Err(Error::Capacity)
+            );
+        }
     }
     #[test]
     fn capture_capacity_errors_do_not_become_unknown_or_identity() {

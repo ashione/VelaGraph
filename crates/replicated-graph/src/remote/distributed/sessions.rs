@@ -893,6 +893,7 @@ mod lifetime_tests {
             endpoint: "127.0.0.1:1".parse().unwrap(),
         };
         let descriptor = fixed::FixedDescriptor {
+            profile: fixed::LocalReadProfile::Parity2MiBV1,
             stamp: QueryStamp {
                 identity: route.identity,
                 shard,

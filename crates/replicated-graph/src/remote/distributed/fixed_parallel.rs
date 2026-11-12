@@ -313,6 +313,7 @@ mod tests {
                 endpoint: listener.local_addr().unwrap(),
             };
             let descriptor = fixed::FixedDescriptor {
+                profile: fixed::LocalReadProfile::Parity2MiBV1,
                 stamp: QueryStamp {
                     identity: route.identity,
                     shard,

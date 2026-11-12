@@ -53,9 +53,11 @@ shared budgets and per-session sequencing. Deployment configuration can select
 one through eight lanes (three by default), without enlarging query budgets.
 [Fixed data membership](docs/FIXED_COHORT_MEMBERSHIP.md) is independently bounded
 at 64 members; widening a cohort does not enlarge lane width or capture budgets.
-This M1 path keeps
-the existing 10,000-row / 2 MiB / 100,000-operation capture budget; it is not a
-large-scale managed capacity increase or a replacement for old entrypoints.
+The original operation retains its 10,000-row / 2 MiB / 100,000-operation capture
+budget. An explicit `LocalRead8MiBV1` query profile permits 8 MiB of captured
+payload with unchanged row/work/history/write/result limits and shared admission
+pools. This is not an 8 MiB write lifecycle or full managed CoreHR capacity claim,
+and does not replace old entrypoints or expand the separate query-job budget.
 
 An opt-in [bounded query-job lifecycle](docs/MANAGED_QUERY_JOBS.md) separates
 control RPCs from finite execution, with explicit same-V renewal, cancellation

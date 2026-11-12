@@ -11,6 +11,13 @@ Use a gateway configured with explicit managed graph routes. The additive
 operations are `StartLocalQueryJob`, `GetLocalQueryJob`, `RenewLocalQueryJob`,
 `FetchLocalQueryJob` and `CancelLocalQueryJob`.
 
+Jobs use only `Parity2MiBV1`: 10,000 captured rows, 2 MiB of payload and 100,000
+D1 replay operations. `StartLocalQueryJob` has no capture-profile selector. The
+separate 8 MiB opt-in belongs only to `OpenLocalQueryWithProfile`, not this
+lifecycle. Both renewable node-open validation and the session entrypoint reject
+an expanded capture profile before shared-pool admission, even when its requested
+bytes fit 2 MiB. Renewal cannot change a descriptor's profile.
+
 Start supplies a nonzero 16-byte operation ID, optional version, exact Query,
 page size and JobPolicy. It reserves the same shared session/memory and execution
 admission used by existing APIs before scheduling a tracked task. It returns an
