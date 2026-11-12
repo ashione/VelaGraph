@@ -175,6 +175,7 @@ pub struct GraphService {
     admission: Arc<Semaphore>,
     address: SocketAddr,
     sessions: Arc<paged::Sessions>,
+    query_sessions: Arc<distributed::Sessions>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
 }
@@ -257,6 +258,7 @@ impl GraphService {
         let service_raft = raft.clone();
         let service_state = state.clone();
         let query_sessions = Arc::new(distributed::Sessions::new()?);
+        let service_query_sessions = query_sessions.clone();
         let (stop, mut stopped) = watch::channel(false);
         let admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let service_admission = admission.clone();
@@ -428,6 +430,7 @@ impl GraphService {
             deadline,
             address,
             sessions,
+            query_sessions: service_query_sessions,
             stop,
             task: Some(task),
         })

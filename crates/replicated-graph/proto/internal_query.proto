@@ -1,0 +1,44 @@
+syntax = "proto3";
+package velagraph.internal.query.v1;
+// Internal observed data-local query fragments. No JSON or public query text.
+service QueryService {
+ rpc Open(OpenRequest) returns (Descriptor);
+ rpc Fragment(FragmentRequest) returns (FragmentResponse);
+ rpc Close(CloseRequest) returns (Empty);
+}
+message Empty {}
+message Identity { uint64 group = 1; uint64 node = 2; }
+message Context { uint32 version = 1; Identity identity = 2; uint64 timeout_millis = 3; }
+message QueryStamp { Identity identity = 1; uint64 shard = 2; uint64 epoch = 3; uint64 sequence = 4; }
+message Descriptor { QueryStamp stamp = 1; bytes incarnation = 2; bytes token = 3; }
+message OpenRequest { Context context = 1; uint64 shard = 2; }
+message CloseRequest { Context context = 1; Descriptor descriptor = 2; }
+message Cost { uint64 bytes = 1; uint64 work = 2; }
+message VertexId { uint32 partition = 1; uint64 id = 2; }
+message EdgeHop { uint64 id = 1; VertexId from = 2; VertexId to = 3; string label = 4; }
+message IncomingEdge { uint64 id = 1; uint32 partition = 2; string label = 3; }
+message Value { oneof kind { Empty null = 1; sint64 integer = 2; double real = 3; string text = 4; bool boolean = 5; } }
+message Filter { string key = 1; Value value = 2; }
+message Labels { repeated string labels = 1; }
+message ScanStep { oneof kind { Filter has = 1; Labels has_label = 2; uint64 limit = 3; } }
+message ScanRequest { uint32 partition = 1; optional uint64 after = 2; repeated ScanStep steps = 3; bool count = 4; }
+message ScanResult { optional uint64 next_after = 1; uint64 scanned = 2; uint64 matched = 3; repeated uint64 ids = 4; repeated uint64 limits = 5; }
+message HierarchyBatch { uint32 partition = 1; repeated Fragment fragments = 2; }
+message ResolveIncoming { VertexId target = 1; IncomingEdge edge = 2; }
+message Has { VertexId vertex = 1; string key = 2; Value value = 3; }
+message HasLabel { VertexId vertex = 1; repeated string labels = 2; }
+message Values { VertexId vertex = 1; string key = 2; }
+message Project { VertexId vertex = 1; repeated string keys = 2; }
+message Fragment { oneof kind { HierarchyBatch hierarchy_batch = 1; ScanRequest scan = 2; VertexId exists = 3; VertexId out = 4; VertexId in = 5; ResolveIncoming resolve_incoming = 6; EdgeHop verify_reverse = 7; Has has = 8; HasLabel has_label = 9; Values values = 10; Project project = 11; } }
+message FragmentRequest { Context context = 1; Descriptor descriptor = 2; Fragment fragment = 3; Cost remaining = 4; }
+message BatchValues { repeated FragmentValue values = 1; }
+message Edges { repeated EdgeHop edges = 1; }
+message Incoming { repeated IncomingEdge edges = 1; }
+message OptionalValue { Value value = 1; }
+// Repeated entries instead of protobuf map so duplicate keys are rejected.
+message Property { string key = 1; Value value = 2; }
+message Projected { VertexId vertex = 1; repeated Property properties = 2; }
+message FragmentValue { oneof kind { BatchValues hierarchy_batch = 1; ScanResult scan = 2; bool boolean = 3; Edges edges = 4; Incoming incoming = 5; EdgeHop edge = 6; OptionalValue value = 7; Projected projected = 8; } }
+message FragmentOutput { Descriptor descriptor = 1; Cost cost = 2; FragmentValue value = 3; }
+enum QueryFailure { QUERY_FAILURE_UNSPECIFIED = 0; PARSE = 1; UNSUPPORTED = 2; INVALID_ARGUMENT = 3; RESOURCE_EXHAUSTED = 4; TIMEOUT = 5; UNSUPPORTED_SCOPE = 6; INCOMPLETE_OR_CORRUPT = 7; UNAVAILABLE = 8; }
+message FragmentResponse { oneof result { FragmentOutput output = 1; QueryFailure failure = 2; } }
