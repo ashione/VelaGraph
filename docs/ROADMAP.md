@@ -611,3 +611,8 @@ preflight preserves empty-input rejection and each entrypoint's consistency
 boundary. This adds functionality without increasing materialized query capacity,
 changing session lifetime or claiming data-local fixed-V execution. See
 [the contract](MANAGED_FIXED_TRAVERSALS.md#strict-scalar-filtering).
+
+The managed data-local fixed-V path now separates [fixed cohort membership](FIXED_COHORT_MEMBERSHIP.md)
+(up to the existing 64-member protocol bound) from its one-to-eight query lanes.
+Observed fanout, global capture/history budgets, and immutable cohort ownership
+are unchanged; online expansion and membership beyond 64 remain future work.

@@ -5,7 +5,7 @@ use fixed_execution::NodeSession;
 use std::{future::Future, task::Poll};
 
 // Width is startup configuration, independent of query shape and graph data.
-// The existing eight-member protocol bounds staged lists/checks and RPCs.
+// The eight-lane execution ceiling bounds staged lists/checks and RPCs.
 pub(super) fn validate_width(width: usize) -> Result<(), QueryFailure> {
     if (1..=8).contains(&width) {
         Ok(())

@@ -51,6 +51,8 @@ the whole immutable result before publishing replayable pages. Bounded shard-lan
 execution overlaps independent fixed-V fragments while preserving ordered bags,
 shared budgets and per-session sequencing. Deployment configuration can select
 one through eight lanes (three by default), without enlarging query budgets.
+[Fixed data membership](docs/FIXED_COHORT_MEMBERSHIP.md) is independently bounded
+at 64 members; widening a cohort does not enlarge lane width or capture budgets.
 This M1 path keeps
 the existing 10,000-row / 2 MiB / 100,000-operation capture budget; it is not a
 large-scale managed capacity increase or a replacement for old entrypoints.

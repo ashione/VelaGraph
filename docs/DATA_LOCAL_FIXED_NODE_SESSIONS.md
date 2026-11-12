@@ -26,7 +26,7 @@ TLS, authorization, tenant isolation, automatic failover or forwarding.
 ## Open and capture
 
 The gateway must first check the supported AST, complete persisted cohort (at most
-eight members), partition=shard mapping and all fixed endpoint bindings. It must
+64 members), partition=shard mapping and all fixed endpoint bindings. It must
 admit one fixed version using the complete-cohort protocol, then run `preflight`
 for **every** member before opening any member. Unsupported scopes must not leave
 node sessions behind. Fixed open transports the exact `TerminalPrefix`, remaining

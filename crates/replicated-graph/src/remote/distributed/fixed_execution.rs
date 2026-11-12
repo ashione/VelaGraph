@@ -238,7 +238,9 @@ async fn execute_inner(
     let catalog = StaticCatalog {
         partitions: sessions.values().map(|s| s.route.clone()).collect(),
     };
-    catalog.validate().map_err(remote_failure)?;
+    catalog
+        .validate_bounded(fixed::MAX_MEMBERS, fixed::MAX_MEMBERS)
+        .map_err(remote_failure)?;
     let mut execution = Execution {
         catalog: &catalog,
         sessions: BTreeMap::new(),
@@ -254,7 +256,7 @@ async fn execute_inner(
         ceiling: CEILING,
     };
     let output = execution.run(request, &query).await?;
-    validate_output(&output, request).map_err(remote_failure)?;
+    validate_output_bounded(&output, request, fixed::MAX_MEMBERS).map_err(remote_failure)?;
     execution.check()?;
     Ok(output.rows)
 }

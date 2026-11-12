@@ -53,7 +53,7 @@ pub(super) fn request(query: &Query) -> DistributedRequest {
 pub(super) fn validate_routes(config: &RemoteConfig, routes: &[LocalGraphRoute]) -> Result<()> {
     let cohort = &config.binding.cohort;
     if routes.is_empty()
-        || routes.len() > 8
+        || routes.len() > fixed::MAX_MEMBERS
         || routes.len() != cohort.members.len()
         || routes.len() != config.members.len()
     {

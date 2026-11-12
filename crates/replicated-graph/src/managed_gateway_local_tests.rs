@@ -404,9 +404,9 @@ fn fixed_graph_routes_bind_complete_managed_identity() {
 }
 
 #[test]
-fn fixed_graph_nine_matching_routes_are_rejected_before_admission() {
+fn fixed_graph_protocol_member_limit_is_checked_before_admission() {
     let mut binding = bound();
-    binding.cohort.members = (10..19)
+    binding.cohort.members = (10..74)
         .map(|shard| d2_raft::transaction_decisions::Member {
             shard,
             epoch: 1,
@@ -459,6 +459,24 @@ fn fixed_graph_nine_matching_routes_are_rejected_before_admission() {
         binding,
         members,
     };
+    local::validate_routes(&config, &routes).unwrap();
+    let mut oversized = config.coordinator.identity().clone();
+    oversized
+        .cohort
+        .members
+        .push(d2_raft::transaction_decisions::Member {
+            shard: 74,
+            epoch: 1,
+            mode: [74; 16],
+        });
+    assert!(Client::new(
+        "127.0.0.1:12345".parse().unwrap(),
+        oversized,
+        Duration::from_secs(1)
+    )
+    .is_err());
+    // A caller cannot bypass the gateway bound with an extra configured route.
+    routes.push(routes[0].clone());
     assert_eq!(
         local::validate_routes(&config, &routes),
         Err(Error::Identity)
@@ -1398,3 +1416,65 @@ async fn fixed_local_parallel_query_measurement() {
 
 #[path = "managed_gateway_scaling_tests.rs"]
 mod scaling;
+
+#[test]
+fn fixed_graph_membership_accepts_protocol_bound_and_checks_late_routes() {
+    use d2_raft::transaction_decisions::Member;
+    for count in [9, 64] {
+        let mut cohort = binding();
+        cohort.members = (20..20 + count)
+            .map(|shard| Member {
+                shard,
+                epoch: 1,
+                mode: [shard as u8; 16],
+            })
+            .collect();
+        let id = |shard| Identity {
+            cohort: cohort.clone(),
+            ..identity(shard)
+        };
+        let client = |shard| {
+            Client::new(
+                format!("127.0.0.1:{}", 20000 + shard).parse().unwrap(),
+                id(shard),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        };
+        let config = RemoteConfig {
+            coordinator: client(9),
+            binding: Binding {
+                cohort: cohort.clone(),
+                ..bound()
+            },
+            members: (20..20 + count).map(client).collect(),
+        };
+        let routes: Vec<_> = (20..20 + count)
+            .map(|shard| LocalGraphRoute {
+                endpoint: format!("127.0.0.1:{}", 10000 + shard).parse().unwrap(),
+                identity: RemoteIdentity {
+                    group: shard,
+                    node: 1,
+                },
+                managed_identity: id(shard),
+            })
+            .collect();
+        local::validate_routes(&config, &routes).unwrap();
+        let mut wrong = routes.clone();
+        wrong.last_mut().unwrap().managed_identity.target.mode = [255; 16];
+        assert_eq!(
+            local::validate_routes(&config, &wrong),
+            Err(Error::Identity)
+        );
+        let mut duplicate = routes.clone();
+        duplicate.last_mut().unwrap().endpoint = routes[0].endpoint;
+        assert_eq!(
+            local::validate_routes(&config, &duplicate),
+            Err(Error::Identity)
+        );
+        assert_eq!(
+            local::validate_routes(&config, &routes[..routes.len() - 1]),
+            Err(Error::Identity)
+        );
+    }
+}

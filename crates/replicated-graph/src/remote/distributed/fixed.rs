@@ -8,6 +8,9 @@ use d2_raft::{
     versioned_reads::{ReadLimit, Target},
 };
 
+// Membership is independent of worker width and per-process session slots.
+pub(crate) const MAX_MEMBERS: usize = d2_raft::transaction_decisions::MAX_PARTICIPANTS;
+
 pub(crate) const CAPTURE_ROWS: usize = 10_000;
 pub(crate) const CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const CAPTURE_OPERATIONS: usize = 100_000;
@@ -109,7 +112,7 @@ impl FixedOpenRequest {
             || u32::try_from(shard).is_err()
             || target.epoch == 0
             || target.mode == [0; 16]
-            || self.proof.cohort().members.len() > 8
+            || self.proof.cohort().validate().is_err()
             || !self.proof.cohort().members.iter().any(|member| {
                 member.shard == shard && member.epoch == target.epoch && member.mode == target.mode
             })
@@ -422,6 +425,52 @@ mod tests {
             },
             ttl_millis: 5000,
             acquire_timeout_millis: 5000,
+        }
+    }
+    #[test]
+    fn fixed_membership_roundtrips_at_protocol_bound_without_weaker_identity() {
+        use d2_raft::transaction_decisions::{Command, Journal, Member};
+        for count in [9, MAX_MEMBERS] {
+            let cohort = Cohort {
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                members: (20..20 + count as u64)
+                    .map(|shard| Member {
+                        shard,
+                        epoch: 1,
+                        mode: [shard as u8; 16],
+                    })
+                    .collect(),
+                profile: Default::default(),
+            };
+            let mut journal = Journal::new([9; 16]).unwrap();
+            journal.apply(Command::BindCohort { cohort }).unwrap();
+            let mut open = request();
+            open.proof = journal.terminal_prefix(0).unwrap();
+            open.target = Target {
+                shard: 20,
+                epoch: 1,
+                mode: [20; 16],
+            };
+            let bytes = serde_json::to_vec(&open).unwrap();
+            let mut decoded: FixedOpenRequest = serde_json::from_slice(&bytes).unwrap();
+            decoded.validate(20).unwrap();
+            preflight(
+                RemoteIdentity { group: 20, node: 1 },
+                &decoded,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            decoded.target.mode = [21; 16];
+            assert!(decoded.validate(20).is_err());
+            let mut malformed = serde_json::to_value(&open).unwrap();
+            let members = malformed["proof"]["cohort"]["members"]
+                .as_array_mut()
+                .unwrap();
+            while members.len() <= MAX_MEMBERS {
+                members.push(members[0].clone());
+            }
+            assert!(serde_json::from_value::<FixedOpenRequest>(malformed).is_err());
         }
     }
     #[test]
