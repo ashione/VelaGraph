@@ -9,9 +9,10 @@ use crate::graph::{codec, validate_edge, validate_vertex};
 use crate::temporal_reference::{Interval, Key};
 use crate::{Edge, Vertex};
 
-const FORMAT_KEY: &[u8] = b"graph/temporal/v1/format";
-const HEAD_KEY: &[u8] = b"graph/temporal/v1/head";
-const RECORD_PREFIX: &[u8] = b"graph/temporal/v1/revision/";
+const FORMAT_KEY: &[u8] = b"graph/temporal/v2/format";
+const HEAD_KEY: &[u8] = b"graph/temporal/v2/head";
+const RECORD_PREFIX: &[u8] = b"graph/temporal/v2/revision/";
+const ADJACENCY_PREFIX: &[u8] = b"graph/temporal/v2/adjacency/";
 const MAX_BATCH: usize = 256;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READ_REVISIONS: usize = 4096;
@@ -31,7 +32,7 @@ pub enum TemporalStoreError {
     Limit,
     #[error("requested local system version is unavailable")]
     UnavailableVersion,
-    #[error("database is not a temporal v1 store")]
+    #[error("database is not a temporal v2 store")]
     IncompatibleStore,
     #[error("corrupt temporal record or metadata")]
     Corrupt,
@@ -89,7 +90,7 @@ impl TemporalStore {
         options.create_if_missing(true);
         let db = DB::open(&options, path)?;
         match db.get(FORMAT_KEY)? {
-            Some(value) if value == [1] => {
+            Some(value) if value == [2] => {
                 decode_version(db.get(HEAD_KEY)?.as_deref())?;
             }
             Some(_) => return Err(TemporalStoreError::IncompatibleStore),
@@ -99,7 +100,7 @@ impl TemporalStore {
                     return Err(TemporalStoreError::IncompatibleStore);
                 }
                 let mut batch = WriteBatch::default();
-                batch.put(FORMAT_KEY, [1]);
+                batch.put(FORMAT_KEY, [2]);
                 batch.put(HEAD_KEY, 0u64.to_be_bytes());
                 let mut write = WriteOptions::default();
                 write.set_sync(true);
@@ -137,7 +138,16 @@ impl TemporalStore {
             }
             let value = mutation.encode()?;
             bytes = bytes
-                .checked_add(value.len() + RECORD_PREFIX.len() + 21)
+                .checked_add(
+                    value.len()
+                        + RECORD_PREFIX.len()
+                        + 21
+                        + if matches!(mutation, TemporalMutation::Edge { .. }) {
+                            2 * (ADJACENCY_PREFIX.len() + 17 + 8)
+                        } else {
+                            0
+                        },
+                )
                 .ok_or(TemporalStoreError::Limit)?;
             if bytes > MAX_BATCH_BYTES {
                 return Err(TemporalStoreError::Limit);
@@ -150,6 +160,16 @@ impl TemporalStore {
         let mut batch = WriteBatch::default();
         for (i, (mutation, value)) in mutations.iter().zip(encoded).enumerate() {
             batch.put(revision_key(mutation.key(), version, i as u32), value);
+            if let TemporalMutation::Edge { edge, .. } = mutation {
+                for (incoming, vertex) in [(false, edge.from), (true, edge.to)] {
+                    let key = adjacency_key(vertex, incoming, edge.id);
+                    // Earliest system version is immutable. Candidates survive all
+                    // corrections/deletions; canonical resolution decides visibility.
+                    if self.db.get(&key)?.is_none() {
+                        batch.put(key, version.to_be_bytes());
+                    }
+                }
+            }
         }
         batch.put(HEAD_KEY, version.to_be_bytes());
         let mut write = WriteOptions::default();
@@ -277,6 +297,17 @@ fn decode_version(value: Option<&[u8]>) -> Result<u64> {
             .map_err(|_| TemporalStoreError::Corrupt)?,
     ))
 }
+fn adjacency_prefix(vertex: u64, incoming: bool) -> Vec<u8> {
+    let mut bytes = ADJACENCY_PREFIX.to_vec();
+    bytes.push(u8::from(incoming));
+    bytes.extend_from_slice(&vertex.to_be_bytes());
+    bytes
+}
+fn adjacency_key(vertex: u64, incoming: bool, edge: u64) -> Vec<u8> {
+    let mut bytes = adjacency_prefix(vertex, incoming);
+    bytes.extend_from_slice(&edge.to_be_bytes());
+    bytes
+}
 fn identity_prefix(key: Key) -> Vec<u8> {
     let mut bytes = RECORD_PREFIX.to_vec();
     let (kind, id) = match key {
@@ -371,7 +402,7 @@ mod tests {
     #[test]
     fn golden_keys_and_envelopes() {
         let key = revision_key(Key::Vertex(7), 2, 3);
-        let mut expected = b"graph/temporal/v1/revision/".to_vec();
+        let mut expected = b"graph/temporal/v2/revision/".to_vec();
         expected.extend([
             1, 0, 0, 0, 0, 0, 0, 0, 7, 255, 255, 255, 255, 255, 255, 255, 253, 0, 0, 0, 3,
         ]);
@@ -507,7 +538,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         {
             let store = TemporalStore::open(other.path()).unwrap();
-            store.db.put(FORMAT_KEY, [2]).unwrap();
+            store.db.put(FORMAT_KEY, [99]).unwrap();
         }
         assert!(matches!(
             TemporalStore::open(other.path()),
