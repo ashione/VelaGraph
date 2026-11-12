@@ -4,6 +4,61 @@
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
+## 高优先级：统一 gRPC/Protobuf 与对外服务接口
+
+[#218](https://github.com/ashione/VelaGraph/issues/218) 跟踪内部协议统一及对外
+**gRPC + HTTP 写入/查询服务**。按 2026-11-12 的方向提高优先级，与时态和
+分布式功能并行推进，不等最终 UI/平台产品化；以下是待交付计划，不是已支持声明。
+
+现有 Raft 使用换行 JSON/TCP，managed 成员、分片查询和 managed gateway 使用
+长度前缀 JSON/TCP，网络客户端按请求建立连接；现有 graph proto 是存储 record，
+并非 gRPC service。统一通信框架不修改持久化记录、共识或 Gremlin 语义。
+
+- **第一实际切片**：现有 remote snapshot 的 OpenSnapshot → Page → Close 完整路径，
+  复用原有有界 Sessions；随后立即推进 data-local query fragments，首片不是完整查询迁移。
+  用版本化 Protobuf 和 gRPC adapter 复用原执行器；按已验证 peer 身份复用 channel，
+  保留固定视图、顺序、错误与累计预算。真实多进程差分测试后清理替代的 JSON 路径，
+  不长期维护两套业务实现，不把 JSON 装进 bytes 就当完成协议迁移。
+- **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
+  分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
+- **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、
+  类型和错误语义，支持真实服务化写入与查询。不得向公开入口泄露内部 prepare/commit、
+  Raft 或 restore 管理操作。HTTP 是必要入口，不是另一个查询/事务引擎。
+- **必须共同验收**：原请求 ID/命令幂等与丢 ACK 状态恢复；提交与可读状态区分；
+  固定 V 的分页与游标绑定；查询 Start/Get/Renew/Fetch/Cancel；
+  剩余 deadline 传递及取消清理；容量拒绝、bounded queue/bytes/in-flight。
+  gRPC 流控不能替代应用层背压，RPC 超时不证明写入回滚。
+- **查询语义不拔高**：自动取得最新 certified consistent V 与最小 V 约束须保持原
+  一致性边界，不擅称线性一致；历史 V/T 仅开放已支持入口，observed 不冒充 managed。
+  恢复、装载和目标视图校验未完成不得 READY/查询，不能以进程存活替代可服务状态。
+- **版本与验证**：外部稳定 schema 与内部协议分离，保留被删除字段号/名，
+  明确 breaking version；不依赖非规范 Protobuf 编码改变持久化身份/哈希。
+  Rust 实现先验证 Go 生成客户端互通，HTTP 验证同一数据类型、写/查及失败结果。
+  同环境记录冷/热连接、p50/p95/p99、CPU、内存和网络字节，不预设 gRPC 必然更快。
+- 初始仅 loopback/受信环境；最小认证接口、独立 listener 和 readiness 随服务设计，
+  公开部署/权限变更另行处理。完整可观测性/UI 仍按低优先级 #122，不阻塞基础协议统一。
+
+参考 [etcd 服务分层](https://etcd.io/docs/v3.6/learning/api/)、
+[gRPC deadline](https://grpc.io/docs/guides/deadlines/)、
+[流控边界](https://grpc.io/docs/guides/flow-control/) 和
+[Protobuf 演进](https://protobuf.dev/programming-guides/proto3/)。
+
+## 后续产品化：轻量交互式 graph portal
+
+[#220](https://github.com/ashione/VelaGraph/issues/220) 在 #218 的稳定 HTTP 查询、
+任务/分页/错误接口之后实现，当前仅规划。基础分布式读写、一致性与恢复是关键路径；
+高优先级 gRPC/HTTP 并行推进，portal 不抢占上述工作，也不重复 #122 运维观测平台。
+
+首版是只读查询工具：输入标准受支持 Gremlin，运行/取消，在图与表之间切换，
+点击点/边查看属性和 qualified ID。两种视图使用同一结果，保留多重边、路径、重数、
+类型及 missing/Null；展开邻居须显式请求并遵循同一固定视图，不能混合多个 V。
+显示状态、错误、耗时、V/可用 T、一致性和分页/展示限制；Unverified 不显示为 certified，
+恢复未就绪不显示为空图。渲染/分页有界、取消和过期可见，不把截断或失败当完整成功。
+
+先随服务自托管/loopback 验证真实浏览器到 HTTP 的成功及失败流程，再更新快速开始。
+首版不做写编辑器、集群管理、可视化建模或独立监控平台；不发布独立网站，不扩大
+CORS/权限或上传遥测。此 UI 只读范围不取消 #218 对外服务必须支持写入的要求。
+
 ## 发布里程碑
 
 按 [发布验收计划](RELEASE_PLAN.md) 从 **v0.0.1** 起发布实验版本：
