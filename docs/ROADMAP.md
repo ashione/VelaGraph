@@ -18,7 +18,10 @@
   observed data-local query fragments 的 Open → Fragment → Close 由 [#227](https://github.com/ashione/VelaGraph/issues/227)
   跟踪，复用真实 query sessions/admission，显式选择 gRPC coordinator backend。
   详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；fixed/renewable、jobs、managed
-  和 Raft 尚未迁移，不能将 observed 切片当完整查询协议统一。
+  和 Raft 尚未全部迁移，不能将 observed 切片当完整查询协议统一。
+  [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
+  session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
+  managed control 与对外 gateway 协议仍不在该切片内。
   用版本化 Protobuf 和 gRPC adapter 复用原执行器；按已验证 peer 身份复用 channel，
   保留固定视图、顺序、错误与累计预算。真实多进程差分测试后清理替代的 JSON 路径，
   不长期维护两套业务实现，不把 JSON 装进 bytes 就当完成协议迁移。

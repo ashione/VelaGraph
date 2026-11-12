@@ -42,3 +42,101 @@ message FragmentValue { oneof kind { BatchValues hierarchy_batch = 1; ScanResult
 message FragmentOutput { Descriptor descriptor = 1; Cost cost = 2; FragmentValue value = 3; }
 enum QueryFailure { QUERY_FAILURE_UNSPECIFIED = 0; PARSE = 1; UNSUPPORTED = 2; INVALID_ARGUMENT = 3; RESOURCE_EXHAUSTED = 4; TIMEOUT = 5; UNSUPPORTED_SCOPE = 6; INCOMPLETE_OR_CORRUPT = 7; UNAVAILABLE = 8; }
 message FragmentResponse { oneof result { FragmentOutput output = 1; QueryFailure failure = 2; } }
+
+// Fixed-V and renewable query capabilities share the same typed fragments.
+service FixedQueryService {
+ rpc OpenFixed(FixedOpenEnvelope) returns (FixedOpened);
+ rpc OpenRenewable(RenewableOpenEnvelope) returns (RenewableFixedOpened);
+ rpc Renew(FixedRenewEnvelope) returns (FixedLeaseGrant);
+ rpc FragmentFixed(FixedFragmentEnvelope) returns (FixedFragmentResponse);
+ rpc CloseFixed(FixedCloseEnvelope) returns (Empty);
+}
+enum CapacityProfile { CAPACITY_PROFILE_UNSPECIFIED = 0; LEGACY_COUNT_V1 = 1; BYTE_BOUND16_MIB_V1 = 2; }
+enum LocalReadProfile { LOCAL_READ_PROFILE_UNSPECIFIED = 0; PARITY2_MIB_V1 = 1; LOCAL_READ8_MIB_V1 = 2; }
+enum TerminalDecision { TERMINAL_DECISION_UNSPECIFIED = 0; COMMIT = 1; ABORT = 2; }
+message Target { uint64 shard = 1; uint64 epoch = 2; bytes mode = 3; }
+message Authority { uint64 shard = 1; bytes mode = 2; }
+message Member { uint64 shard = 1; uint64 epoch = 2; bytes mode = 3; }
+message Cohort { uint64 coordinator_shard = 1; uint64 coordinator_epoch = 2; repeated Member members = 3; CapacityProfile profile = 4; }
+message Participant { uint64 shard = 1; uint64 epoch = 2; bytes mode = 3; bytes intent = 4; }
+message TerminalRecord { bytes id = 1; uint64 ordinal = 2; repeated Participant participants = 3; repeated bool prepared = 4; TerminalDecision decision = 5; }
+message TerminalSegment { repeated TerminalRecord records = 1; }
+message TerminalPrefix { uint32 format_version = 1; bytes authority = 2; Cohort cohort = 3; uint64 through = 4; repeated TerminalSegment segments = 5; }
+message ReadLimit { uint64 rows = 1; uint64 bytes = 2; uint64 operations = 3; }
+message FixedOpenRequest { LocalReadProfile profile = 1; Target target = 2; TerminalPrefix proof = 3; ReadLimit capture_limit = 4; uint64 ttl_millis = 5; uint64 acquire_timeout_millis = 6; }
+message RenewableFixedOpenRequest { FixedOpenRequest open = 1; uint64 hard_lifetime_millis = 2; }
+message FixedDescriptor { LocalReadProfile profile = 1; QueryStamp stamp = 2; bytes incarnation = 3; bytes token = 4; Authority authority = 5; Cohort cohort = 6; uint64 version = 7; bytes mode = 8; }
+message CaptureCost { uint64 rows = 1; uint64 bytes = 2; uint64 replay_operations = 3; }
+message FixedOpened { FixedDescriptor descriptor = 1; TerminalPrefix retained_proof = 2; CaptureCost capture_cost = 3; }
+message RenewableFixedOpened { FixedOpened opened = 1; FixedLeaseGrant grant = 2; }
+message FixedRenewRequest { FixedDescriptor descriptor = 1; uint64 generation = 2; uint64 lease_millis = 3; }
+message FixedLeaseGrant { FixedDescriptor descriptor = 1; uint64 generation = 2; uint64 granted_millis = 3; }
+message FixedFragmentRequest { FixedDescriptor descriptor = 1; uint64 request_sequence = 2; Fragment fragment = 3; Cost remaining = 4; }
+message FixedFragmentOutput { FixedDescriptor descriptor = 1; uint64 request_sequence = 2; Cost cost = 3; FragmentValue value = 4; }
+message FixedOpenEnvelope { Context context = 1; FixedOpenRequest request = 2; }
+message RenewableOpenEnvelope { Context context = 1; RenewableFixedOpenRequest request = 2; }
+message FixedRenewEnvelope { Context context = 1; FixedRenewRequest request = 2; }
+message FixedFragmentEnvelope { Context context = 1; FixedFragmentRequest request = 2; }
+message FixedCloseEnvelope { Context context = 1; FixedDescriptor descriptor = 2; }
+message FixedFragmentResponse { oneof result { FixedFragmentOutput output = 1; QueryFailure failure = 2; } }
+message FixedErrorDetail { ApplicationError application = 1000; }
+message ErrorPair { uint64 first = 1; uint64 current = 2; }
+enum CoordinatorError { COORDINATOR_ERROR_UNSPECIFIED = 0;
+ COORDINATOR_INVALID_IDENTITY = 1;
+ COORDINATOR_INVALID_PARTICIPANTS = 2;
+ COORDINATOR_IDENTITY_CONFLICT = 3;
+ COORDINATOR_UNKNOWN_TRANSACTION = 4;
+ COORDINATOR_UNKNOWN_PARTICIPANT = 5;
+ COORDINATOR_NOT_PREPARED = 6;
+ COORDINATOR_ALREADY_DECIDED = 7;
+ COORDINATOR_CAPACITY = 8;
+ COORDINATOR_CAPACITY_NOT_CONFIRMED = 9;
+ COORDINATOR_INVALID_JOURNAL = 10;
+ COORDINATOR_INCOMPATIBLE_HISTORY = 11;
+}
+message ApplicationError { oneof kind {
+ Empty not_activated = 1;
+ ErrorPair wrong_shard = 2;
+ ErrorPair fenced = 3;
+ ErrorPair conflict = 4;
+ Empty idempotency_conflict = 5;
+ Empty empty_batch = 6;
+ Empty batch_too_large = 7;
+ Empty sequence_overflow = 8;
+ Empty dedup_capacity = 9;
+ Empty invalid_dedup_capacity = 10;
+ ErrorPair capacity_conflict = 11;
+ Empty legacy_data_present = 12;
+ Empty legacy_write_disabled = 13;
+ Empty invalid_epoch = 14;
+ Empty managed_write_required = 15;
+ Empty managed_writes_not_enabled = 16;
+ Empty invalid_managed_mode = 17;
+ Empty managed_mode_conflict = 18;
+ Empty unverified_write_history = 19;
+ Empty visibility_not_enabled = 20;
+ Empty visibility_required = 21;
+ Empty visibility_history = 22;
+ Empty visibility_gap = 23;
+ Empty visibility_unresolved = 24;
+ Empty visibility_not_applied = 25;
+ Empty visibility_read_limit = 26;
+ Empty participant_only = 27;
+ Empty participant_not_enabled = 28;
+ Empty participant_authority = 29;
+ Empty participant_identity = 30;
+ Empty participant_busy = 31;
+ Empty participant_capacity = 32;
+ Empty participant_unknown = 33;
+ Empty participant_decision_conflict = 34;
+ Empty coordinator_only = 35;
+ Empty coordinator_not_enabled = 36;
+ Empty coordinator_requires_empty_shard = 37;
+ Empty decision_index_history = 38;
+ Empty decision_index_unavailable = 39;
+ Empty event_ledger_history = 40;
+ Empty event_ledger_unavailable = 41;
+ Empty request_index_history = 42;
+ Empty request_index_unavailable = 43;
+ CoordinatorError coordinator_rejected = 44;
+} }

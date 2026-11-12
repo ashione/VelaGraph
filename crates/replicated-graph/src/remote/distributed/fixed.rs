@@ -8,6 +8,76 @@ use d2_raft::{
     versioned_reads::{ReadLimit, Target},
 };
 
+/// Explicit deployment-selected transport, never probe or fall back after a call.
+#[derive(Clone)]
+pub(crate) enum Client {
+    Tcp {
+        endpoint: SocketAddr,
+        identity: RemoteIdentity,
+    },
+    Grpc(super::grpc::FixedClient),
+}
+impl Client {
+    pub(crate) async fn open(
+        &self,
+        request: FixedOpenRequest,
+        duration: Duration,
+    ) -> Result<FixedOpened, RemoteError> {
+        match self {
+            Self::Tcp { endpoint, identity } => open(*endpoint, *identity, request, duration).await,
+            Self::Grpc(client) => client.open(request, duration).await,
+        }
+    }
+    pub(crate) async fn renewable_open(
+        &self,
+        request: RenewableFixedOpenRequest,
+        duration: Duration,
+    ) -> Result<RenewableFixedOpened, RemoteError> {
+        match self {
+            Self::Tcp { endpoint, identity } => {
+                renewable_open(*endpoint, *identity, request, duration).await
+            }
+            Self::Grpc(client) => client.renewable_open(request, duration).await,
+        }
+    }
+    pub(crate) async fn renew(
+        &self,
+        request: FixedRenewRequest,
+        duration: Duration,
+    ) -> Result<FixedLeaseGrant, RemoteError> {
+        match self {
+            Self::Tcp { endpoint, identity } => {
+                renew(*endpoint, *identity, request, duration).await
+            }
+            Self::Grpc(client) => client.renew(request, duration).await,
+        }
+    }
+    pub(super) async fn fragment(
+        &self,
+        request: FixedFragmentRequest,
+        duration: Duration,
+    ) -> Result<Result<FixedFragmentOutput, QueryFailure>, RemoteError> {
+        match self {
+            Self::Tcp { endpoint, identity } => {
+                fragment(*endpoint, *identity, request, duration).await
+            }
+            Self::Grpc(client) => client.fragment(request, duration).await,
+        }
+    }
+    pub(crate) async fn close(
+        &self,
+        descriptor: FixedDescriptor,
+        duration: Duration,
+    ) -> Result<(), RemoteError> {
+        match self {
+            Self::Tcp { endpoint, identity } => {
+                close(*endpoint, *identity, descriptor, duration).await
+            }
+            Self::Grpc(client) => client.close(descriptor, duration).await,
+        }
+    }
+}
+
 // Membership is independent of worker width and per-process session slots.
 pub(crate) const MAX_MEMBERS: usize = d2_raft::transaction_decisions::MAX_PARTICIPANTS;
 
@@ -255,7 +325,7 @@ pub(crate) fn preflight(
 // Local preflight can be expensive for a full proof. It must not become an
 // unaccounted extension of the relative node lease sent afterwards. Network
 // delay remains a cross-clock uncertainty; the gateway's absolute TTL is final.
-fn narrow_open_deadlines(
+pub(super) fn narrow_open_deadlines(
     request: &mut FixedOpenRequest,
     elapsed: Duration,
     remaining: Duration,

@@ -182,6 +182,7 @@ async fn managed_node_child() -> anyhow::Result<()> {
     // Test-only lazy graph-port control: ordinary managed fixtures do not
     // start an extra service or allocate query sessions.
     let mut graph = None;
+    let mut grpc = None;
     fs::write(
         directory.join("ready.tmp"),
         serde_json::to_vec(&(std::process::id(), server.local_addr()))?,
@@ -205,9 +206,28 @@ async fn managed_node_child() -> anyhow::Result<()> {
             )?;
             graph = Some(service);
         }
+        // Opt-in typed transport for protocol differential fixtures only. It
+        // shares the existing managed GraphService and its fixed session pool.
+        if grpc.is_none() && directory.join("grpc.request").exists() {
+            if let Some(graph) = graph.as_ref() {
+                let service = replicated_graph::remote::grpc::GrpcSnapshotService::start(
+                    graph,
+                    "127.0.0.1:0".parse()?,
+                )
+                .await?;
+                atomic_json(
+                    &directory.join("grpc-ready.json"),
+                    &(std::process::id(), service.local_addr()),
+                )?;
+                grpc = Some(service);
+            }
+        }
         if directory.join("snapshot.request").exists() {
             node.raft.ensure_linearizable().await?;
             server.shutdown().await;
+            if let Some(grpc) = grpc {
+                grpc.shutdown().await;
+            }
             if let Some(graph) = graph {
                 graph.shutdown().await;
             }

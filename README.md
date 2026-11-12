@@ -139,8 +139,10 @@ An optional [typed gRPC snapshot endpoint](docs/INTERNAL_GRPC_SNAPSHOTS.md)
 provides `Open` / `Page` / `Close` over a reusable HTTP/2 channel. It shares the
 legacy TCP snapshot/session budgets. The same endpoint hosts the separate
 [typed observed query-fragment service](docs/INTERNAL_GRPC_QUERIES.md), selected
-explicitly with `graph-coordinator serve-grpc`. Fixed/managed queries, hierarchy
-jobs and Raft have **not** migrated; this is not the external HTTP/gRPC API.
+explicitly with `graph-coordinator serve-grpc`. A separate
+[typed fixed-version session service](docs/INTERNAL_GRPC_FIXED_QUERIES.md) is selected
+by the managed gateway's explicit gRPC graph-route constructor. Managed control,
+observed hierarchy jobs and Raft have **not** migrated; this is not the external API.
 
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;
