@@ -238,3 +238,11 @@ Select two CPU IDs actually available to the process. The fixture retains all
 page-size, sortedness, frozen-view, replay, post-mutation and Gremlin assertions;
 context on seed rows and snapshot stages distinguishes write preparation failures
 from page-transfer failures. No automatic replay or leader replacement is added.
+
+
+## Local physical backup baseline
+
+[Physical checkpoints](PHYSICAL_CHECKPOINT.md) capture the bound durable log and
+state-machine pair and validate a new-directory offline restore. This is not
+remote-durable ACK or safe live-cluster rejoin; restored old vote state is guarded
+against ordinary startup. See #193 and the separate object-store roadmap #191.

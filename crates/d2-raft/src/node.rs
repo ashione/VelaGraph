@@ -19,12 +19,25 @@ pub struct Node;
 pub struct NodeHandle {
     registry: Registry,
     registration: Arc<()>,
+    durable_logs: Option<DurableLogStore>,
     pub id: NodeId,
     pub raft: Raft,
     pub state_machine: Arc<StateMachine>,
 }
 
 impl NodeHandle {
+    /// Create a local two-DB backup of this replica, preserving node/group identity.
+    /// Writes briefly pause; this does not alter Raft acknowledgement durability.
+    pub async fn physical_checkpoint(&self, destination: impl AsRef<Path>) -> anyhow::Result<()> {
+        let logs = self
+            .durable_logs
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint requires a durable node"))?;
+        self.state_machine
+            .physical_checkpoint(logs, destination.as_ref(), self.group_id(), self.id)
+            .await
+    }
+
     /// Immutable in-process consensus group associated with this replica.
     pub fn group_id(&self) -> GroupId {
         self.registry.group_id()
@@ -66,6 +79,7 @@ impl Node {
         Ok(NodeHandle {
             registry,
             registration,
+            durable_logs: None,
             id,
             raft,
             state_machine,
@@ -103,8 +117,14 @@ impl Node {
             policy: policy.clone(),
             from: id,
         };
-        let raft =
-            openraft::Raft::new(id, config, network, log_store, state_machine.clone()).await?;
+        let raft = openraft::Raft::new(
+            id,
+            config,
+            network,
+            log_store.clone(),
+            state_machine.clone(),
+        )
+        .await?;
         let registration = match registry.register(id, raft.clone()).await {
             Ok(registration) => registration,
             Err(error) => {
@@ -115,6 +135,7 @@ impl Node {
         Ok(NodeHandle {
             registry,
             registration,
+            durable_logs: Some(log_store),
             id,
             raft,
             state_machine,
@@ -234,7 +255,17 @@ impl Default for Cluster {
 /// Versioned identity is written before creating either database. A partial or
 /// unknown identity fails closed. Legacy nonempty directories belong to group 0;
 /// they cannot silently acquire a new nonzero identity.
-fn bind_durable_identity(dir: &Path, group_id: GroupId, node_id: NodeId) -> anyhow::Result<()> {
+pub(crate) fn bind_durable_identity(
+    dir: &Path,
+    group_id: GroupId,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !dir.join("RESTORE_INCOMPLETE").exists(),
+        "incomplete checkpoint restore"
+    );
+    anyhow::ensure!(!dir.join("RESTORED_OFFLINE_ONLY").exists(),
+        "restored backup is offline-only; live consensus rejoin requires a separate recovery protocol");
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     #[serde(deny_unknown_fields)]
     struct Identity {

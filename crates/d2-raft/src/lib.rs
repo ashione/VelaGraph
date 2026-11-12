@@ -51,3 +51,5 @@ pub use tcp::{
     ControlResponse, NodeStatus, TcpNode, TcpNodeConfig,
 };
 pub use types::{ApplyResult, LogCommand, NodeId, TypeConfig, WriteOp};
+
+pub use state_machine::physical_checkpoint::restore_physical_checkpoint;

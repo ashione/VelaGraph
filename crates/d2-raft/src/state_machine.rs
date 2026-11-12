@@ -4346,3 +4346,6 @@ mod retained_source_role_tests {
         );
     }
 }
+
+#[path = "physical_checkpoint.rs"]
+pub(crate) mod physical_checkpoint;
