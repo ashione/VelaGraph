@@ -554,3 +554,11 @@ scan values and scalar post-processing remain unsupported. See the
 
 See [bounded full-cohort catch-up](docs/BOUNDED_COHORT_FANOUT.md) for member fanout,
 unchanged consistency/resource contracts, and critical-path benchmark scope.
+
+### Experimental temporal storage
+
+The opt-in [durable temporal point-read slice](docs/TEMPORAL_STORE.md) stores
+append-only valid-time assertions in a dedicated local RocksDB database, with
+atomic synced local versions and historical V/T point reads. It does not yet
+connect to Gremlin, Raft, managed distributed sessions or existing checkpoints;
+#196 remains open. Existing graph/v1/v2 semantics and formats are unchanged.

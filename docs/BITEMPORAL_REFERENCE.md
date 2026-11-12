@@ -75,3 +75,8 @@ for semantic tests, not a new persisted property encoding.
 4. Define durable retention and checkpoint format evidence before offering
    historical recovery. No purge/install, #124 workaround, GC, schema migration
    or remote upload is performed by this slice. #196 remains open.
+
+A subsequent [durable local point-read slice](TEMPORAL_STORE.md) persists
+canonical Vertex/Edge assertions and version metadata atomically. The volatile
+reference above remains separate; neither slice implies distributed temporal
+queries or completion of #196.
