@@ -12,12 +12,12 @@ use d2_raft::{
     managed_rpc::{self, NodeRef},
     versioned_reads, D1Error, D1WriteRequest, NodeHandle,
 };
-use rocksdb_sql_table::experimental_graph::{
-    AppendOnlyStore, CrossEdge, EdgeRecord, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
-};
-use rocksdb_sql_table::{ReadView, StorageNodeError, Vertex, WriteOp};
 use std::collections::BTreeMap;
 use std::time::Duration;
+use velagraph::experimental_graph::{
+    AppendOnlyStore, CrossEdge, EdgeRecord, EdgeRef, ExperimentalError, PreparedBatch, VertexRef,
+};
+use velagraph::{ReadView, StorageNodeError, Vertex, WriteOp};
 
 #[path = "managed_property_conditions.rs"]
 mod conditions;
@@ -216,9 +216,9 @@ impl GraphSnapshot {
     pub fn observed_adjacency(
         &self,
         vertex: VertexRef,
-        direction: rocksdb_sql_table::experimental_graph::Direction,
+        direction: velagraph::experimental_graph::Direction,
     ) -> Result<Vec<CrossEdge>> {
-        use rocksdb_sql_table::experimental_graph::Direction;
+        use velagraph::experimental_graph::Direction;
         let entries = self
             .store(vertex.partition)?
             .observed_index(vertex.id, direction)?;
@@ -242,7 +242,7 @@ impl GraphSnapshot {
                     key.len()
                         + 64
                         + match value {
-                            rocksdb_sql_table::Value::Text(s) => s.len(),
+                            velagraph::Value::Text(s) => s.len(),
                             _ => 8,
                         },
                 );
@@ -266,7 +266,7 @@ impl GraphSnapshot {
     pub fn prepare_vertex_properties(
         &self,
         vertex: VertexRef,
-        patch: &rocksdb_sql_table::experimental_graph::VertexPropertyPatch,
+        patch: &velagraph::experimental_graph::VertexPropertyPatch,
     ) -> Result<Plan> {
         let current = self
             .vertex(vertex)?
@@ -282,7 +282,7 @@ impl GraphSnapshot {
         &self,
         vertex: VertexRef,
         conditions: &PropertyConditions,
-        patch: &rocksdb_sql_table::experimental_graph::VertexPropertyPatch,
+        patch: &velagraph::experimental_graph::VertexPropertyPatch,
     ) -> Result<Plan> {
         conditions::validate(conditions)?;
         let current = self
@@ -296,7 +296,7 @@ impl GraphSnapshot {
     pub fn prepare_edge_properties(
         &self,
         edge: EdgeRef,
-        patch: &rocksdb_sql_table::experimental_graph::EdgePropertyPatch,
+        patch: &velagraph::experimental_graph::EdgePropertyPatch,
     ) -> Result<Plan> {
         let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;
         let source = self
@@ -313,7 +313,7 @@ impl GraphSnapshot {
         &self,
         edge: EdgeRef,
         conditions: &PropertyConditions,
-        patch: &rocksdb_sql_table::experimental_graph::EdgePropertyPatch,
+        patch: &velagraph::experimental_graph::EdgePropertyPatch,
     ) -> Result<Plan> {
         conditions::validate(conditions)?;
         let current = self.edge(edge)?.ok_or(ExperimentalError::NotFound(edge))?;

@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rocksdb_sql_table::{Edge, Error, GraphEngine, TraversalDirection, TraversalOptions, Vertex};
 use tempfile::TempDir;
+use velagraph::{Edge, Error, GraphEngine, TraversalDirection, TraversalOptions, Vertex};
 
 fn open(path: &Path) -> GraphEngine {
     GraphEngine::open(path).expect("open graph")

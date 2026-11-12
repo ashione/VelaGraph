@@ -1,5 +1,5 @@
 use super::*;
-use rocksdb_sql_table::Value;
+use velagraph::Value;
 
 struct FourShards {
     cluster: Cluster,

@@ -7,9 +7,6 @@ use replicated_graph::{
     routing::{RemoteReplica, RouteError, RouteResolver},
     run_blocking, RemoteStorageNode,
 };
-use rocksdb_sql_table::{
-    Edge, GremlinRow, KeyRange, ScanLimit, StorageNode, StorageNodeError, Value, Vertex,
-};
 use std::{
     net::SocketAddr,
     process::{Child, Command, Stdio},
@@ -18,6 +15,9 @@ use std::{
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
+};
+use velagraph::{
+    Edge, GremlinRow, KeyRange, ScanLimit, StorageNode, StorageNodeError, Value, Vertex,
 };
 
 const BUDGET: Duration = Duration::from_secs(30);

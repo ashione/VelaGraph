@@ -1,7 +1,7 @@
-use rocksdb_sql_table::{
+use tempfile::TempDir;
+use velagraph::{
     Edge, Error, GraphRecordStore, LocalStorageNode, StorageNode, StorageNodeError, Value, Vertex,
 };
-use tempfile::TempDir;
 
 fn store(dir: &TempDir) -> GraphRecordStore<LocalStorageNode> {
     GraphRecordStore::new(LocalStorageNode::open(dir.path(), 7).unwrap(), 7, 0)
@@ -177,11 +177,11 @@ struct RetryNode {
     inner: std::sync::Arc<LocalStorageNode>,
     lose_reply: bool,
     allow_reads: bool,
-    submitted: std::sync::Mutex<Vec<(rocksdb_sql_table::WriteRequest, Option<u64>)>>,
+    submitted: std::sync::Mutex<Vec<(velagraph::WriteRequest, Option<u64>)>>,
 }
 
 impl StorageNode for RetryNode {
-    fn read_view(&self) -> Result<rocksdb_sql_table::ReadView, StorageNodeError> {
+    fn read_view(&self) -> Result<velagraph::ReadView, StorageNodeError> {
         if !self.allow_reads {
             return Err(StorageNodeError::Storage(
                 "validation reads unavailable".into(),
@@ -193,32 +193,32 @@ impl StorageNode for RetryNode {
     fn get(
         &self,
         key: &[u8],
-        view: &rocksdb_sql_table::ReadView,
+        view: &velagraph::ReadView,
     ) -> Result<Option<Vec<u8>>, StorageNodeError> {
         self.inner.get(key, view)
     }
 
     fn scan(
         &self,
-        range: rocksdb_sql_table::KeyRange,
-        limit: rocksdb_sql_table::ScanLimit,
-        view: &rocksdb_sql_table::ReadView,
-    ) -> Result<Vec<rocksdb_sql_table::KeyValue>, StorageNodeError> {
+        range: velagraph::KeyRange,
+        limit: velagraph::ScanLimit,
+        view: &velagraph::ReadView,
+    ) -> Result<Vec<velagraph::KeyValue>, StorageNodeError> {
         self.inner.scan(range, limit, view)
     }
 
     fn batch_write(
         &self,
-        request: rocksdb_sql_table::WriteRequest,
-    ) -> Result<rocksdb_sql_table::WriteResult, StorageNodeError> {
+        request: velagraph::WriteRequest,
+    ) -> Result<velagraph::WriteResult, StorageNodeError> {
         self.batch_write_conditional(request, None)
     }
 
     fn batch_write_conditional(
         &self,
-        request: rocksdb_sql_table::WriteRequest,
+        request: velagraph::WriteRequest,
         condition: Option<u64>,
-    ) -> Result<rocksdb_sql_table::WriteResult, StorageNodeError> {
+    ) -> Result<velagraph::WriteResult, StorageNodeError> {
         self.submitted
             .lock()
             .unwrap()
@@ -230,7 +230,7 @@ impl StorageNode for RetryNode {
         Ok(result)
     }
 
-    fn admin(&self) -> &dyn rocksdb_sql_table::StorageAdmin {
+    fn admin(&self) -> &dyn velagraph::StorageAdmin {
         self.inner.admin()
     }
 }

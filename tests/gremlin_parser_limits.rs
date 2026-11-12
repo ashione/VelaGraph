@@ -1,9 +1,9 @@
 //! Run parser stress cases in child processes: a regression must fail this test,
 //! not abort the test runner that is coordinating the rest of the suite.
-use rocksdb_sql_table::{
+use std::process::Command;
+use velagraph::{
     Error, GremlinQuery, GremlinStart, ObservedGremlinQuery, MAX_GREMLIN_STRUCTURAL_MARKS,
 };
-use std::process::Command;
 
 #[test]
 fn parser_stress_isolated() {

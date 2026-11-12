@@ -1,8 +1,8 @@
 //! Bounded, exact stored-value preconditions. These are not Gremlin predicates.
 use super::{Error, Result};
-use rocksdb_sql_table::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use velagraph::Value;
 
 /// Expected presence or exact tagged property value. Stored Null is not Missing.
 /// Finite Real values compare by bits, so -0.0 and +0.0 differ. Other variants

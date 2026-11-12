@@ -3,7 +3,7 @@ use super::*;
 mod edges;
 pub(crate) use edges::{validate_steps as validate_traversal, TraversalRead};
 pub use edges::{ObservedElementRef, ObservedRowV3, ObservedTraversalV3};
-use rocksdb_sql_table::{GremlinQuery, GremlinStart, GremlinStep, Value};
+use velagraph::{GremlinQuery, GremlinStart, GremlinStep, Value};
 
 /// The value is an observation, never a certified complete traversal result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,9 +88,7 @@ impl Work {
     }
 }
 fn limit(message: &str) -> ExperimentalRouteError {
-    ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(
-        message.into(),
-    ))
+    ExperimentalRouteError::Query(velagraph::Error::TraversalLimitExceeded(message.into()))
 }
 struct Row {
     vertex: VertexRef,
@@ -165,7 +163,7 @@ impl ExperimentalReadSession {
         for step in query.steps() {
             if scalar && !matches!(step, GremlinStep::Limit(_) | GremlinStep::Count) {
                 return Err(ExperimentalRouteError::Query(
-                    rocksdb_sql_table::Error::UnsupportedGremlinArgument(
+                    velagraph::Error::UnsupportedGremlinArgument(
                         "only limit/count may follow a v2 scalar projection".into(),
                     ),
                 ));
@@ -456,7 +454,7 @@ mod tests {
         assert!(matches!(
             work.charge(1),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         let mut work = Work {

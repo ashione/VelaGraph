@@ -34,7 +34,7 @@ fn path_filters_preflight_empty_streams_before_any_reads() {
         "g.E(999).inV().repeat(out()).times(32).emit().cyclicPath().path()",
         "g.V(999).simplePath().id().is(1).dedup().range(0,0).count()",
     ] {
-        validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
+        validate_steps(&velagraph::ObservedGremlinQuery::parse(text).unwrap()).unwrap();
     }
     for text in [
         "g.V(999).id().simplePath()",
@@ -45,7 +45,7 @@ fn path_filters_preflight_empty_streams_before_any_reads() {
         "g.V(999).simplePath().repeat(out()).times(32).out()",
     ] {
         assert!(
-            validate_steps(&rocksdb_sql_table::ObservedGremlinQuery::parse(text).unwrap()).is_err(),
+            validate_steps(&velagraph::ObservedGremlinQuery::parse(text).unwrap()).is_err(),
             "{text}"
         );
     }

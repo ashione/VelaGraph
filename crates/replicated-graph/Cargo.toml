@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
-rocksdb-sql-table = { path = "../.." }
+velagraph = { path = "../.." }
 d2-raft = { path = "../d2-raft" }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }

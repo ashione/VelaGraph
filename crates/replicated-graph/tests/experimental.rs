@@ -12,13 +12,6 @@ use replicated_graph::{
     },
     run_blocking,
 };
-use rocksdb_sql_table::{
-    experimental_graph::{
-        CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError, VertexPropertyPatch,
-        VertexRef,
-    },
-    StorageNode, StorageNodeError, Value, Vertex, WriteOp, WriteRequest,
-};
 use std::{
     collections::{BTreeMap, BTreeSet},
     process::{Child, Command, Stdio},
@@ -27,6 +20,13 @@ use std::{
 use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
+};
+use velagraph::{
+    experimental_graph::{
+        CrossEdge, Direction, EdgePropertyPatch, EdgeRef, ExperimentalError, VertexPropertyPatch,
+        VertexRef,
+    },
+    StorageNode, StorageNodeError, Value, Vertex, WriteOp, WriteRequest,
 };
 const BUDGET: Duration = Duration::from_secs(20);
 // Keep the two process fixtures from competing for ephemeral-port startup.
@@ -183,7 +183,7 @@ async fn scenario() -> anyhow::Result<()> {
         large.labels.push("Large".into());
         large.properties.insert(
             "blob".into(),
-            rocksdb_sql_table::Value::Text("x".repeat(700_000)),
+            velagraph::Value::Text("x".repeat(700_000)),
         );
         let prepared_large = resolver
             .experimental_read_session(BUDGET)?
@@ -436,7 +436,7 @@ async fn scenario() -> anyhow::Result<()> {
         }
         assert!(session.observed_gremlin(1, "g.V(7).valueMap('typed')").is_err());
         assert!(session.observed_gremlin_v2(1, "g.V(7).valueMap('typed')").is_err());
-        assert!(matches!(session.observed_gremlin_v3(1, "g.V(99).valueMap('blob')"), Err(ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(_)))));
+        assert!(matches!(session.observed_gremlin_v3(1, "g.V(99).valueMap('blob')"), Err(ExperimentalRouteError::Query(velagraph::Error::TraversalLimitExceeded(_)))));
         for (text, partitions) in [
             ("g.V(7).repeat(in('K')).times(2)", vec![1, 1, 2, 1]),
             (
@@ -662,7 +662,7 @@ async fn scenario() -> anyhow::Result<()> {
         assert!(matches!(
             session.observed_gremlin(1, "g.V(7).repeat(out())"),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
+                velagraph::Error::UnsupportedGremlinStep(_)
             ))
         ));
         assert!(session
@@ -677,7 +677,7 @@ async fn scenario() -> anyhow::Result<()> {
             assert!(matches!(
                 session.observed_gremlin(1, &oversized),
                 Err(ExperimentalRouteError::Query(
-                    rocksdb_sql_table::Error::GremlinComplexityLimit { .. }
+                    velagraph::Error::GremlinComplexityLimit { .. }
                 ))
             ));
         }
@@ -703,7 +703,7 @@ async fn scenario() -> anyhow::Result<()> {
         assert!(matches!(
             session.observed_gremlin(1, &repeated_large),
             Err(ExperimentalRouteError::Query(
-                rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                velagraph::Error::TraversalLimitExceeded(_)
             ))
         ));
         // Filters and terminal output caps cannot refund preceding acquisition.
@@ -713,7 +713,7 @@ async fn scenario() -> anyhow::Result<()> {
                 matches!(
                     session.observed_gremlin(1, &query),
                     Err(ExperimentalRouteError::Query(
-                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        velagraph::Error::TraversalLimitExceeded(_)
                     ))
                 ),
                 "{query}"
@@ -921,7 +921,7 @@ async fn scenario() -> anyhow::Result<()> {
                 matches!(
                     &result,
                     Err(ExperimentalRouteError::Query(
-                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        velagraph::Error::TraversalLimitExceeded(_)
                     ))
                 ),
                 "query={text}, result={result:?}, age_before_probe={age_before_probe:?}, age_after_probe={:?} (ages include session capture)",
@@ -937,7 +937,7 @@ async fn scenario() -> anyhow::Result<()> {
             matches!(
                 &result,
                 Err(ExperimentalRouteError::Query(
-                    rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                    velagraph::Error::TraversalLimitExceeded(_)
                 ))
             ),
             "{result:?}"

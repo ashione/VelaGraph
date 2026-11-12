@@ -8,8 +8,8 @@ use replicated_graph::{
     managed_graph::{self, GraphCohort, Outcome},
     remote::query::{QualifiedElement, QueryCompleteness, QueryRow},
 };
-use rocksdb_sql_table::{Value, Vertex};
 use std::{collections::BTreeSet, time::Instant};
+use velagraph::{Value, Vertex};
 
 const TTL: Duration = Duration::from_secs(60);
 const QUERY: &str = "g.V(1,5,1).path()";

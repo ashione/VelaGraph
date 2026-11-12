@@ -87,8 +87,7 @@ See the [current capability and work index](docs/CURRENT_STATUS.md) for merged
 slices, remaining work and source/test references. VelaGraph is not yet a
 production-ready distributed database.
 
-The Rust package name `rocksdb-sql-table` and library import
-`rocksdb_sql_table` remain unchanged to avoid unrelated dependency churn. The
+The Rust package and library import are both named `velagraph`. The
 legacy standalone SQL engine and `rocksql` CLI have been removed; see the
 [migration note](docs/SQL_REMOVAL.md).
 
@@ -178,9 +177,9 @@ the distributed experiments.
 
 ```rust
 use std::collections::BTreeMap;
-use rocksdb_sql_table::{Edge, GraphEngine, Value, Vertex};
+use velagraph::{Edge, GraphEngine, Value, Vertex};
 
-fn main() -> rocksdb_sql_table::Result<()> {
+fn main() -> velagraph::Result<()> {
     let graph = GraphEngine::open("./graph-data")?;
 
     let mut ada = Vertex::new(1);
@@ -210,7 +209,7 @@ walks 1–3 hops over the outgoing, incoming, or both adjacency indexes, with an
 optional edge label and a result limit:
 
 ```rust
-use rocksdb_sql_table::{GraphEngine, TraversalDirection, TraversalOptions};
+use velagraph::{GraphEngine, TraversalDirection, TraversalOptions};
 
 let graph = GraphEngine::open("./graph-data")?;
 let result = graph.traverse(
@@ -239,7 +238,7 @@ No project-specific grammar or dialect is defined. `GraphEngine::gremlin`
 returns ordered rows:
 
 ```rust
-use rocksdb_sql_table::{GraphEngine, GremlinRow};
+use velagraph::{GraphEngine, GremlinRow};
 
 let graph = GraphEngine::open("./graph-data")?;
 let result = graph.gremlin("g.V().hasLabel('Person').out('KNOWS').limit(10)")?;

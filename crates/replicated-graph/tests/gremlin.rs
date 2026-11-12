@@ -2,12 +2,12 @@
 use d2_raft::{Cluster, D1Command, D1Result, LogCommand, NodeHandle};
 use openraft::{storage::RaftStateMachine, BasicNode};
 use replicated_graph::{run_blocking, ReplicatedStorageNode};
-use rocksdb_sql_table::{
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::time::{sleep, timeout};
+use velagraph::{
     Edge, Error, GraphEngine, GraphRecordStore, GremlinQuery, GremlinRow, StorageNodeError, Value,
     Vertex,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::time::{sleep, timeout};
 
 type Graph = Arc<GraphRecordStore<ReplicatedStorageNode>>;
 fn graph(node: &NodeHandle) -> Graph {
@@ -19,10 +19,8 @@ fn graph(node: &NodeHandle) -> Graph {
 }
 async fn on<T: Send + 'static>(
     g: &Graph,
-    f: impl FnOnce(&GraphRecordStore<ReplicatedStorageNode>) -> rocksdb_sql_table::Result<T>
-        + Send
-        + 'static,
-) -> rocksdb_sql_table::Result<T> {
+    f: impl FnOnce(&GraphRecordStore<ReplicatedStorageNode>) -> velagraph::Result<T> + Send + 'static,
+) -> velagraph::Result<T> {
     let g = g.clone();
     run_blocking(move || f(&g)).await?
 }
@@ -114,7 +112,7 @@ async fn converge(cluster: &Cluster, nodes: &[NodeHandle], current: usize) -> an
     Ok(())
 }
 
-fn seed(g: &GraphRecordStore<ReplicatedStorageNode>) -> rocksdb_sql_table::Result<()> {
+fn seed(g: &GraphRecordStore<ReplicatedStorageNode>) -> velagraph::Result<()> {
     for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
         let mut v = Vertex::new(id);
         v.labels.push("person".into());
@@ -130,7 +128,7 @@ fn seed(g: &GraphRecordStore<ReplicatedStorageNode>) -> rocksdb_sql_table::Resul
 // fixtures, including rejected syntax and unsupported-step error categories.
 fn crosscheck_semantic_corpus(
     replicated: &GraphRecordStore<ReplicatedStorageNode>,
-) -> rocksdb_sql_table::Result<()> {
+) -> velagraph::Result<()> {
     let dir = tempfile::tempdir().expect("local semantic fixture directory");
     let local = GraphEngine::open(dir.path())?;
     for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {

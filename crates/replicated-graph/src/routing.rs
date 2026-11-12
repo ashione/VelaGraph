@@ -14,12 +14,12 @@ use std::{
 };
 
 use d2_raft::NodeHandle;
-use rocksdb_sql_table::{
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use velagraph::{
     Edge, GraphRecordStore, GremlinResult, KeyRange, KeyValue, PreparedGraphMutation, ReadView,
     RequestId, ScanCursor, ScanLimit, ScanPage, StorageNode, StorageNodeError, Vertex,
     WriteRequest, WriteResult,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     adapter::Adapter,
@@ -59,14 +59,14 @@ pub struct ShardReadStamp {
 pub struct GlobalScanResult {
     pub metadata_sequence: u64,
     pub snapshots: Vec<ShardReadStamp>,
-    pub result: rocksdb_sql_table::GlobalScanOutput,
+    pub result: velagraph::GlobalScanOutput,
 }
 
 #[derive(Debug)]
 pub enum RouteError {
     Storage(StorageNodeError),
     Catalog(CatalogError),
-    Graph(rocksdb_sql_table::Error),
+    Graph(velagraph::Error),
     InvalidArgument(&'static str),
     MissingPartition(u32),
     MissingReplica { group: u64, node: u64 },
@@ -101,10 +101,10 @@ impl From<CatalogError> for RouteError {
         }
     }
 }
-impl From<rocksdb_sql_table::Error> for RouteError {
-    fn from(e: rocksdb_sql_table::Error) -> Self {
+impl From<velagraph::Error> for RouteError {
+    fn from(e: velagraph::Error) -> Self {
         match e {
-            rocksdb_sql_table::Error::StorageNode(e) => Self::Storage(e),
+            velagraph::Error::StorageNode(e) => Self::Storage(e),
             e => Self::Graph(e),
         }
     }
@@ -357,13 +357,13 @@ impl RouteResolver {
         timeout: Duration,
         mut observer: impl FnMut(Option<u64>) -> Result<()>,
     ) -> Result<GlobalScanResult> {
-        let plan = rocksdb_sql_table::GlobalScanPlan::parse(query)?;
+        let plan = velagraph::GlobalScanPlan::parse(query)?;
         if timeout.is_zero() || timeout > MAX_OPERATION_TIMEOUT {
             return Err(RouteError::InvalidArgument(
                 "timeout must be positive and at most 60 seconds",
             ));
         }
-        let op = self.start(timeout.min(rocksdb_sql_table::GREMLIN_DEADLINE))?;
+        let op = self.start(timeout.min(velagraph::GREMLIN_DEADLINE))?;
         let catalog = select_read(&self.metadata.replicas, &op, None, |id| {
             self.catalogs[&id]
                 .scoped(op.end, self.dispatches.clone())
@@ -470,7 +470,7 @@ impl RouteResolver {
         let views = stores
             .iter()
             .map(|(partition, store)| Ok((*partition, store.read_view()?)))
-            .collect::<rocksdb_sql_table::Result<Vec<_>>>()?;
+            .collect::<velagraph::Result<Vec<_>>>()?;
         let result = plan.execute(&views, &|| op.check(None).map_err(Into::into))?;
         op.check(None)?;
         Ok(GlobalScanResult {
@@ -623,7 +623,7 @@ pub(crate) struct PinnedNode {
     op: Arc<Operation>,
 }
 impl StorageNode for PinnedNode {
-    fn admin(&self) -> &dyn rocksdb_sql_table::StorageAdmin {
+    fn admin(&self) -> &dyn velagraph::StorageAdmin {
         self.adapter.admin()
     }
     fn check_execution_context(&self) -> std::result::Result<(), StorageNodeError> {
@@ -1017,7 +1017,7 @@ mod global_scan_tests {
     use super::*;
     use d2_raft::{Cluster, D1Command, LogCommand};
     use openraft::BasicNode;
-    use rocksdb_sql_table::GlobalScanOutput;
+    use velagraph::GlobalScanOutput;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1068,7 +1068,7 @@ mod global_scan_tests {
     // Minimal canonical vertex fixture using GRAPH_FORMAT and
     // EXPERIMENTAL_CROSS_EDGES envelopes. Raw test-only batches avoid 10,002
     // Raft commits; production writes still use validated append preparation.
-    fn bare_v2_vertex(partition: u32, id: u64) -> rocksdb_sql_table::WriteOp {
+    fn bare_v2_vertex(partition: u32, id: u64) -> velagraph::WriteOp {
         let mut key = b"graph/v2/p/".to_vec();
         key.extend(partition.to_be_bytes());
         key.extend(b"/vertex/");
@@ -1086,12 +1086,12 @@ mod global_scan_tests {
         value.extend(partition.to_le_bytes());
         value.extend([34, record.len() as u8]);
         value.extend(record);
-        rocksdb_sql_table::WriteOp::Put { key, value }
+        velagraph::WriteOp::Put { key, value }
     }
 
     // Canonical raw fixtures avoid thousands of Raft commits in budget tests.
-    fn bare_v2_edge(partition: u32, id: u64) -> Vec<rocksdb_sql_table::WriteOp> {
-        use rocksdb_sql_table::WriteOp;
+    fn bare_v2_edge(partition: u32, id: u64) -> Vec<velagraph::WriteOp> {
+        use velagraph::WriteOp;
         let key = |kind: &[u8], id: u64| {
             [
                 b"graph/v2/p/".as_slice(),
@@ -1129,7 +1129,7 @@ mod global_scan_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn observed_edge_pages_global_order_and_shared_work_budget() {
         use super::experimental::{ExperimentalRouteError, ObservedRowV3 as R};
-        use rocksdb_sql_table::experimental_graph::EdgeRef;
+        use velagraph::experimental_graph::EdgeRef;
         let root = Cluster::new();
         let meta = start(&root, 10).await;
         let data = start(&root, 20).await;
@@ -1183,17 +1183,53 @@ mod global_scan_tests {
             checks.remove(0); // outgoing/incoming then each endpoint
             checks.extend([bare_v2_vertex(1, 1), bare_v2_vertex(1, 2)]);
             for (index, restore) in checks.into_iter().enumerate() {
-                let key = match &restore { rocksdb_sql_table::WriteOp::Put { key, .. } => key.clone(), _ => unreachable!() };
-                adapter.batch_write(WriteRequest { shard:20,epoch:1,request_id:[20 + index as u8 * 2;16],operations:vec![rocksdb_sql_table::WriteOp::Delete {key}] }).unwrap();
-                let broken = resolver.experimental_read_session(Duration::from_secs(60)).unwrap();
+                let key = match &restore {
+                    velagraph::WriteOp::Put { key, .. } => key.clone(),
+                    _ => unreachable!(),
+                };
+                adapter
+                    .batch_write(WriteRequest {
+                        shard: 20,
+                        epoch: 1,
+                        request_id: [20 + index as u8 * 2; 16],
+                        operations: vec![velagraph::WriteOp::Delete { key }],
+                    })
+                    .unwrap();
+                let broken = resolver
+                    .experimental_read_session(Duration::from_secs(60))
+                    .unwrap();
                 for q in ["g.E(1)", "g.E().hasLabel('Missing').count()"] {
-                    assert!(matches!(broken.observed_gremlin_v3(1,q), Err(ExperimentalRouteError::Graph(rocksdb_sql_table::experimental_graph::ExperimentalError::Incomplete(_)))), "{index} {q}");
+                    assert!(
+                        matches!(
+                            broken.observed_gremlin_v3(1, q),
+                            Err(ExperimentalRouteError::Graph(
+                                velagraph::experimental_graph::ExperimentalError::Incomplete(_)
+                            ))
+                        ),
+                        "{index} {q}"
+                    );
                 }
-                adapter.batch_write(WriteRequest { shard:20,epoch:1,request_id:[21 + index as u8 * 2;16],operations:vec![restore] }).unwrap();
+                adapter
+                    .batch_write(WriteRequest {
+                        shard: 20,
+                        epoch: 1,
+                        request_id: [21 + index as u8 * 2; 16],
+                        operations: vec![restore],
+                    })
+                    .unwrap();
             }
             for p in [1, 2] {
                 for (chunk, first) in (201..=5000).step_by(1000).enumerate() {
-                    adapter.batch_write(WriteRequest {shard:20,epoch:1,request_id:[40 + p as u8 * 5 + chunk as u8;16],operations:(first..=(first+999).min(5000)).flat_map(|id|bare_v2_edge(p,id)).collect()}).unwrap();
+                    adapter
+                        .batch_write(WriteRequest {
+                            shard: 20,
+                            epoch: 1,
+                            request_id: [40 + p as u8 * 5 + chunk as u8; 16],
+                            operations: (first..=(first + 999).min(5000))
+                                .flat_map(|id| bare_v2_edge(p, id))
+                                .collect(),
+                        })
+                        .unwrap();
                 }
             }
             let current = resolver
@@ -1215,7 +1251,7 @@ mod global_scan_tests {
                     matches!(
                         current.observed_gremlin_v3(999, q),
                         Err(ExperimentalRouteError::Query(
-                            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                            velagraph::Error::TraversalLimitExceeded(_)
                         ))
                     ),
                     "{q}"
@@ -1244,7 +1280,7 @@ mod global_scan_tests {
                     matches!(
                         latest.observed_gremlin_v3(999, q),
                         Err(ExperimentalRouteError::Query(
-                            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                            velagraph::Error::TraversalLimitExceeded(_)
                         ))
                     ),
                     "{q}"
@@ -1267,7 +1303,7 @@ mod global_scan_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn observed_global_vertex_pages_share_acquisition_and_filter_budgets() {
         use super::experimental::{AdjacencyCompleteness, ExperimentalRouteError, ObservedRow};
-        use rocksdb_sql_table::experimental_graph::VertexRef;
+        use velagraph::experimental_graph::VertexRef;
 
         let root = Cluster::new();
         let meta = start(&root, 10).await;
@@ -1365,14 +1401,14 @@ mod global_scan_tests {
             assert!(matches!(
                 within.observed_gremlin(999, "g.V().has('missing').count()"),
                 Err(ExperimentalRouteError::Query(
-                    rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                    velagraph::Error::TraversalLimitExceeded(_)
                 ))
             ));
             for query in ["g.V().values('missing').count()", "g.V().label().limit(1)"] {
                 assert!(matches!(
                     within.observed_gremlin_v2(999, query),
                     Err(ExperimentalRouteError::Query(
-                        rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                        velagraph::Error::TraversalLimitExceeded(_)
                     ))
                 ));
             }
@@ -1406,7 +1442,7 @@ mod global_scan_tests {
                     matches!(
                         result,
                         Err(ExperimentalRouteError::Query(
-                            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
+                            velagraph::Error::TraversalLimitExceeded(_)
                         ))
                     ),
                     "{query}: {result:?}"
@@ -1440,7 +1476,7 @@ mod global_scan_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn global_filters_reload_properties_only_from_pinned_views() {
-        use rocksdb_sql_table::{GremlinRow, QualifiedGremlinRow, Value};
+        use velagraph::{GremlinRow, QualifiedGremlinRow, Value};
         let root = Cluster::new();
         let meta = start(&root, 10).await;
         let data = start(&root, 20).await;
@@ -1730,7 +1766,7 @@ mod global_scan_tests {
                     shard,
                     epoch: 1,
                     request_id: [9; 16],
-                    operations: vec![rocksdb_sql_table::WriteOp::Put {
+                    operations: vec![velagraph::WriteOp::Put {
                         key: b"opaque-outside-graph".to_vec(),
                         value: vec![7; 9 * 1024 * 1024],
                     }],

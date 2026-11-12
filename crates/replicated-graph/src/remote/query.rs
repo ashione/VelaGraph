@@ -1,8 +1,8 @@
 //! Explicit single-partition server execution on one immutable shard snapshot.
 //! Plaintext trusted-network experiment: no retry, failover or global guarantee.
 use super::*;
-use rocksdb_sql_table::{GremlinRow, PathElement, Value};
 use serde::{Deserialize, Serialize};
+use velagraph::{GremlinRow, PathElement, Value};
 
 pub const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
 pub const MAX_QUERY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -154,7 +154,7 @@ struct MapShape {
     start_ids: Option<Vec<u64>>,
 }
 fn admitted_extensions(request: &QueryRequest) -> (bool, Option<MapShape>) {
-    use rocksdb_sql_table::{ObservedGremlinQuery, ObservedGremlinStep as Step};
+    use velagraph::{ObservedGremlinQuery, ObservedGremlinStep as Step};
     if request.mode != QueryMode::V2Observed {
         return (false, None);
     }
@@ -172,7 +172,7 @@ fn admitted_extensions(request: &QueryRequest) -> (bool, Option<MapShape>) {
         Some(Step::ValueMap(keys)) => Some(MapShape {
             keys: keys.clone(),
             start_ids: match parsed.start() {
-                rocksdb_sql_table::GremlinStart::Vertices(ids)
+                velagraph::GremlinStart::Vertices(ids)
                     if parsed.steps().iter().all(|step| {
                         matches!(
                             step,
@@ -182,9 +182,9 @@ fn admitted_extensions(request: &QueryRequest) -> (bool, Option<MapShape>) {
                                 | Step::CyclicPath
                                 | Step::Dedup
                                 | Step::Existing(
-                                    rocksdb_sql_table::GremlinStep::HasLabel(_)
-                                        | rocksdb_sql_table::GremlinStep::Has { .. }
-                                        | rocksdb_sql_table::GremlinStep::Limit(_)
+                                    velagraph::GremlinStep::HasLabel(_)
+                                        | velagraph::GremlinStep::Has { .. }
+                                        | velagraph::GremlinStep::Limit(_)
                                 )
                         )
                     }) =>
@@ -233,7 +233,7 @@ fn validate_output(
             QueryRow::Path(path) => {
                 let maximum = if output.mode == QueryMode::V2Observed && repeated_path {
                     // 32 expanded edges plus an optional edge-start endpoint.
-                    2 * rocksdb_sql_table::MAX_OBSERVED_GREMLIN_REPEAT_TIMES + 2
+                    2 * velagraph::MAX_OBSERVED_GREMLIN_REPEAT_TIMES + 2
                 } else {
                     33
                 };
@@ -332,7 +332,7 @@ async fn execute_query_inner(
     let result = run_query_worker(permit, move || {
         let run = || -> QueryResponse {
             check(end)?;
-            let view = rocksdb_sql_table::ReadView::from_entries(
+            let view = velagraph::ReadView::from_entries(
                 snapshot.shard,
                 snapshot.epoch,
                 snapshot.sequence,
@@ -345,8 +345,7 @@ async fn execute_query_inner(
             };
             let rows = match request.mode {
                 QueryMode::V1 => {
-                    let graph =
-                        rocksdb_sql_table::GraphRecordStore::new(node, shard, request.partition);
+                    let graph = velagraph::GraphRecordStore::new(node, shard, request.partition);
                     let result = graph.execute_gremlin(&request.text).map_err(graph_error)?;
                     result
                         .rows
@@ -433,8 +432,8 @@ impl io::Write for QueryWriter {
         Ok(())
     }
 }
-pub(crate) fn graph_error(e: rocksdb_sql_table::Error) -> QueryFailure {
-    use rocksdb_sql_table::Error::*;
+pub(crate) fn graph_error(e: velagraph::Error) -> QueryFailure {
+    use velagraph::Error::*;
     match e {
         GremlinParse(_) => QueryFailure::Parse,
         UnsupportedGremlinStep(_) | UnsupportedGremlinArgument(_) | UnsupportedGremlinValue(_) => {
@@ -450,8 +449,8 @@ pub(crate) fn graph_error(e: rocksdb_sql_table::Error) -> QueryFailure {
         _ => QueryFailure::IncompleteOrCorrupt,
     }
 }
-pub(crate) fn storage_error(e: rocksdb_sql_table::StorageNodeError) -> QueryFailure {
-    use rocksdb_sql_table::StorageNodeError::*;
+pub(crate) fn storage_error(e: velagraph::StorageNodeError) -> QueryFailure {
+    use velagraph::StorageNodeError::*;
     match e {
         Timeout { .. } => QueryFailure::Timeout,
         ResourceExhausted(_) => QueryFailure::ResourceExhausted,
@@ -483,10 +482,10 @@ fn v1_row(partition: u32, row: GremlinRow) -> QueryRow {
 /// Internal read-only adapter: no live metadata reads or snapshot replacement.
 #[derive(Clone)]
 pub(crate) struct FrozenNode {
-    pub(crate) view: rocksdb_sql_table::ReadView,
+    pub(crate) view: velagraph::ReadView,
     pub(crate) end: std::time::Instant,
 }
-use rocksdb_sql_table::{
+use velagraph::{
     Export, KeyRange, KeyValue, ReadView, ScanCursor, ScanLimit, ScanPage, StorageAdmin,
     StorageNode, StorageNodeError, WriteRequest, WriteResult,
 };

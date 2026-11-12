@@ -430,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
             let session = resolver.experimental_read_session(BUDGET);
             let session_error_category = session.as_ref().err().map(|error| match error {
                 ExperimentalRouteError::Route(RouteError::Storage(
-                    rocksdb_sql_table::StorageNodeError::ResourceExhausted(_),
+                    velagraph::StorageNodeError::ResourceExhausted(_),
                 )) => "ResourceExhausted",
                 _ => "Unexpected",
             });
@@ -459,22 +459,22 @@ async fn main() -> anyhow::Result<()> {
                             ensure!(expect_error, "unexpected client error {query}: {e:?}");
                             let category = match &e {
                                     ExperimentalRouteError::Unsupported(_)
-                                    | ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
-                                        | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
-                                        | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)) => "Unsupported",
-                                    ExperimentalRouteError::Query(rocksdb_sql_table::Error::TraversalLimitExceeded(_)) => "ResourceExhausted",
-                                    ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)) => "InvalidArgument",
+                                    | ExperimentalRouteError::Query(velagraph::Error::UnsupportedGremlinStep(_)
+                                        | velagraph::Error::UnsupportedGremlinArgument(_)
+                                        | velagraph::Error::UnsupportedGremlinValue(_)) => "Unsupported",
+                                    ExperimentalRouteError::Query(velagraph::Error::TraversalLimitExceeded(_)) => "ResourceExhausted",
+                                    ExperimentalRouteError::Query(velagraph::Error::InvalidGremlinLimit(0)) => "InvalidArgument",
                                     _ => "Unexpected",
                                 };
                             if let Some(expected) = c["client_expected_error"].as_str() {
                                 ensure!(category == expected, "client error category {category} != {expected}: {query}: {e:?}");
                             }
                             if client_unsupported { ensure!(matches!(&e, ExperimentalRouteError::Unsupported(_)), "server-only client case must explicitly reject Unsupported: {e:?}"); }
-                            ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(rocksdb_sql_table::Error::InvalidGremlinLimit(0)))) || matches!(&e,
-                                ExperimentalRouteError::Query(rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
-                                | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
-                                | rocksdb_sql_table::Error::UnsupportedGremlinValue(_)
-                                | rocksdb_sql_table::Error::TraversalLimitExceeded(_))), "unexpected error category: {e:?}");
+                            ensure!(client_unsupported || (c["name"] == "global_zero_limit_count" && matches!(&e, ExperimentalRouteError::Query(velagraph::Error::InvalidGremlinLimit(0)))) || matches!(&e,
+                                ExperimentalRouteError::Query(velagraph::Error::UnsupportedGremlinStep(_)
+                                | velagraph::Error::UnsupportedGremlinArgument(_)
+                                | velagraph::Error::UnsupportedGremlinValue(_)
+                                | velagraph::Error::TraversalLimitExceeded(_))), "unexpected error category: {e:?}");
                             json!({"expected_rejection":format!("{e:?}"),"error_category":category})
                         }
                     };
@@ -482,7 +482,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 Err(e) => {
                     ensure!(phase == "legacy", "later client phase acquisition failed: {phase}: {e:?}");
-                    ensure!(matches!(&e, ExperimentalRouteError::Route(RouteError::Storage(rocksdb_sql_table::StorageNodeError::ResourceExhausted(_)))), "unexpected session failure: {e:?}");
+                    ensure!(matches!(&e, ExperimentalRouteError::Route(RouteError::Storage(velagraph::StorageNodeError::ResourceExhausted(_)))), "unexpected session failure: {e:?}");
                     ensure!(manifest["shards"].as_array().unwrap().iter().map(|s|s["kv_rows"].as_u64().unwrap()).sum::<u64>() > replicated_graph::routing::MAX_SCAN_VIEW_ROWS as u64 || manifest["shards"].as_array().unwrap().iter().map(|s|s["raw_bytes"].as_u64().unwrap()).sum::<u64>() > replicated_graph::routing::MAX_SCAN_VIEW_BYTES as u64, "small session unexpectedly rejected");
                     // One full-fixture admission failure, not three retries.
                     break;
@@ -625,7 +625,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod projection_tests {
     use super::*;
-    use rocksdb_sql_table::{experimental_graph::VertexRef, Value as PropertyValue};
+    use velagraph::{experimental_graph::VertexRef, Value as PropertyValue};
 
     #[test]
     fn scalar_empty_hint_does_not_retype_nonempty_rows() {

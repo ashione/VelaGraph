@@ -8,7 +8,10 @@ Raft log and state-machine pair bound to that handle. In-memory nodes reject it.
 `restore_physical_checkpoint(backup, new_directory, group_id, node_id)` verifies
 and copies a backup for the **same** replica identity. Recovery output is offline-only: old votes/commit metadata must never be
 reintroduced directly into a live cluster, even after stopping the original replica. The API does not start a node or change quorum
-membership. There is not yet a TCP control endpoint or object-store uploader.
+membership. There is not yet a TCP control endpoint. The separate
+[`checkpoint-object-store` transport](OBJECT_STORE_CHECKPOINT_API.md) can upload
+an immutable completed checkpoint and download it to a new directory. The
+physical validator and offline-only recovery guard still apply after download.
 
 ## Consistent cut
 
@@ -57,7 +60,8 @@ which RocksDB can hard-link to source files on the same filesystem.
 No recovery removes, rewrites, or overrides existing data. A local backup on the
 same device does not survive loss of that device. Successful writes after the cut
 are absent from this backup. Existing synchronous local-WAL / Raft ACK semantics
-are unchanged. Remote manifest publication, remote-durable ACK, log archival,
+are unchanged. Immutable remote manifest publication is implemented by the
+separate transport; remote-durable write ACK, log archival,
 fencing, retention/GC, cross-shard restore and rolling upgrades remain separate
 work. Restoring one old replica is not proof of safe whole-cluster disaster
 recovery; operators must follow the existing consensus membership constraints.
@@ -71,3 +75,9 @@ continued writes and duplicate request results in a wholly isolated test registr
 paths, wrong identity, corrupted files, incomplete manifest/restore and uncovered
 purge boundaries. These are correctness tests, not representative backup-size or
 latency benchmarks, remote upload tests or a multi-shard recovery proof.
+
+The separate transport CI also exercises a real two-DB physical checkpoint
+roundtrip through a temporary SeaweedFS S3-compatible service, followed by offline
+restore validation. This is not certification against AWS S3, OSS or TOS, live
+cluster rejoin, or a global consistent checkpoint. See the
+[transport verification boundary](OBJECT_STORE_CHECKPOINT_API.md).

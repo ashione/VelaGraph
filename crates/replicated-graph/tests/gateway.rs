@@ -25,7 +25,7 @@ use replicated_graph::{
     routing::RouteResolver,
     run_blocking,
 };
-use rocksdb_sql_table::{GremlinRow, Value, Vertex};
+use velagraph::{GremlinRow, Value, Vertex};
 
 const BUDGET: Duration = Duration::from_secs(10);
 const CHILD_ENV: &str = "GRAPH_UDS_FIXTURE";

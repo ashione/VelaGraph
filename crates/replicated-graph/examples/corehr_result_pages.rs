@@ -540,7 +540,7 @@ fn projected_oracle(
     identities: &[QualifiedElement],
     keys: &[&str],
 ) -> Vec<ProjectedRow> {
-    use rocksdb_sql_table::Value as PropertyValue;
+    use velagraph::Value as PropertyValue;
     identities
         .iter()
         .map(|source| {
@@ -1018,7 +1018,7 @@ fn independent_relationship_oracle_preserves_bfs_and_root_bags() {
 
 #[test]
 fn independent_projection_oracle_covers_full_fixture_and_missing_values() {
-    use rocksdb_sql_table::Value as PropertyValue;
+    use velagraph::Value as PropertyValue;
     let input = model::Model::new(200000, 5000);
     let cases = projection_cases(input.people);
     assert_eq!(cases.len(), 7);

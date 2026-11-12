@@ -14,7 +14,7 @@ use replicated_graph::{
     },
     managed_graph::{GraphCohort, GraphSnapshot},
 };
-use rocksdb_sql_table::{Value, Vertex};
+use velagraph::{Value, Vertex};
 use std::{
     fs,
     net::SocketAddr,
@@ -240,7 +240,7 @@ fn verify(snapshot: &GraphSnapshot, version: u64) -> anyhow::Result<()> {
     assert_eq!(snapshot.version()?, version);
     for i in 1..=version {
         assert_eq!(
-            snapshot.vertex(rocksdb_sql_table::experimental_graph::VertexRef {
+            snapshot.vertex(velagraph::experimental_graph::VertexRef {
                 partition: 1 + (i % 3) as u32,
                 id: i
             })?,
@@ -249,7 +249,7 @@ fn verify(snapshot: &GraphSnapshot, version: u64) -> anyhow::Result<()> {
     }
     let i = version + 1;
     assert_eq!(
-        snapshot.vertex(rocksdb_sql_table::experimental_graph::VertexRef {
+        snapshot.vertex(velagraph::experimental_graph::VertexRef {
             partition: 1 + (i % 3) as u32,
             id: i
         })?,

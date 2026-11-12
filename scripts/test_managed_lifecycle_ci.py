@@ -340,7 +340,7 @@ class HandoffFixture:
         self.records = []
         files = {'source.rs': 'synthetic project source\n'}
         lock = 'version = 4\n'
-        for name, path in [('rocksdb-sql-table', 'Cargo.toml'),
+        for name, path in [('velagraph', 'Cargo.toml'),
                            ('d2-raft', 'crates/d2-raft/Cargo.toml'),
                            ('replicated-graph', 'crates/replicated-graph/Cargo.toml')]:
             files[path] = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'

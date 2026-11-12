@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rocksdb_sql_table::{Edge, Error, GraphEngine, Value, Vertex};
 use tempfile::TempDir;
+use velagraph::{Edge, Error, GraphEngine, Value, Vertex};
 
 fn open(path: &Path) -> GraphEngine {
     GraphEngine::open(path).expect("open graph")

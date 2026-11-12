@@ -2,7 +2,6 @@
 //! This is not a cross-host service or multi-tenant authorization boundary.
 //! Directory owners and root are trusted; no write/admin operation is exposed.
 use crate::routing::{RouteError, RouteResolver};
-use rocksdb_sql_table::{GremlinResult, GremlinRow, PathElement, StorageNodeError, Value};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -19,6 +18,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use velagraph::{GremlinResult, GremlinRow, PathElement, StorageNodeError, Value};
 
 /// Maximum live connection workers per server, including expiring work.
 pub const MAX_CONNECTIONS: usize = 8;
@@ -203,14 +203,12 @@ fn route_error(e: RouteError) -> RemoteError {
             _ => RemoteError::Storage {},
         },
         RouteError::Graph(e) => match e {
-            rocksdb_sql_table::Error::GremlinParse(_) => RemoteError::Syntax {},
-            rocksdb_sql_table::Error::UnsupportedGremlinStep(_)
-            | rocksdb_sql_table::Error::UnsupportedGremlinArgument(_)
-            | rocksdb_sql_table::Error::UnsupportedGremlinValue(_) => RemoteError::Unsupported {},
-            rocksdb_sql_table::Error::TraversalLimitExceeded(_)
-            | rocksdb_sql_table::Error::GremlinComplexityLimit { .. } => {
-                RemoteError::ResourceExhausted {}
-            }
+            velagraph::Error::GremlinParse(_) => RemoteError::Syntax {},
+            velagraph::Error::UnsupportedGremlinStep(_)
+            | velagraph::Error::UnsupportedGremlinArgument(_)
+            | velagraph::Error::UnsupportedGremlinValue(_) => RemoteError::Unsupported {},
+            velagraph::Error::TraversalLimitExceeded(_)
+            | velagraph::Error::GremlinComplexityLimit { .. } => RemoteError::ResourceExhausted {},
             _ => RemoteError::Graph {},
         },
         RouteError::InvalidArgument(_) | RouteError::MissingPartition(_) => {
@@ -799,7 +797,7 @@ mod tests {
     fn parser_complexity_is_a_remote_resource_error() {
         assert_eq!(
             route_error(RouteError::Graph(
-                rocksdb_sql_table::Error::GremlinComplexityLimit {
+                velagraph::Error::GremlinComplexityLimit {
                     marks: 65,
                     limit: 64,
                 }

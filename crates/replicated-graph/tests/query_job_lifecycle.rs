@@ -18,7 +18,6 @@ use replicated_graph::{
     },
     remote::query::{QualifiedElement, QueryCompleteness, QueryRow},
 };
-use rocksdb_sql_table::Value;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -30,6 +29,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use velagraph::Value;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

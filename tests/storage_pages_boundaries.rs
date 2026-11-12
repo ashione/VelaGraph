@@ -1,8 +1,8 @@
-use rocksdb_sql_table::{
+use std::collections::BTreeMap;
+use velagraph::{
     KeyRange, LocalStorageNode, ReadView, ScanLimit, StorageNode, StorageNodeError, WriteOp,
     WriteRequest,
 };
-use std::collections::BTreeMap;
 
 #[test]
 fn exhaustive_binary_ranges_budgets_and_variable_page_limits() {
@@ -81,7 +81,7 @@ fn exhaustive_binary_ranges_budgets_and_variable_page_limits() {
 fn cloned_snapshot_and_cursor_are_send_sync_and_replay_concurrently() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ReadView>();
-    assert_send_sync::<rocksdb_sql_table::ScanCursor>();
+    assert_send_sync::<velagraph::ScanCursor>();
     let view =
         ReadView::from_entries(7, 0, 1, (0u8..100).map(|k| (vec![k], vec![k])).collect()).unwrap();
     let cloned = view.clone();

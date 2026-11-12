@@ -20,9 +20,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use rocksdb_sql_table::{
-    KeyRange, LocalStorageNode, ScanLimit, StorageNode, WriteOp, WriteRequest,
-};
+use velagraph::{KeyRange, LocalStorageNode, ScanLimit, StorageNode, WriteOp, WriteRequest};
 
 const KEYS: usize = 100_000;
 const VALUE_BYTES: usize = 100;

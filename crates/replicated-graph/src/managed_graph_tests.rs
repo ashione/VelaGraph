@@ -1,7 +1,7 @@
 use super::*;
 use d2_raft::transaction_decisions::{Journal, Member};
 use d2_raft::{participant_driver, Cluster, D1Command, D1Result, LogCommand};
-use rocksdb_sql_table::experimental_graph::Direction;
+use velagraph::experimental_graph::Direction;
 fn authority() -> Authority {
     Authority {
         shard: 9,
@@ -511,15 +511,15 @@ async fn abort_does_not_require_unavailable_participants_or_nonparticipants() {
     }
 }
 
-fn edge_patch(value: i64) -> rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
-    rocksdb_sql_table::experimental_graph::EdgePropertyPatch {
-        set: BTreeMap::from([("weight".into(), rocksdb_sql_table::Value::Integer(value))]),
+fn edge_patch(value: i64) -> velagraph::experimental_graph::EdgePropertyPatch {
+    velagraph::experimental_graph::EdgePropertyPatch {
+        set: BTreeMap::from([("weight".into(), velagraph::Value::Integer(value))]),
         remove: Default::default(),
     }
 }
-fn vertex_patch(value: i64) -> rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
-    rocksdb_sql_table::experimental_graph::VertexPropertyPatch {
-        set: BTreeMap::from([("rank".into(), rocksdb_sql_table::Value::Integer(value))]),
+fn vertex_patch(value: i64) -> velagraph::experimental_graph::VertexPropertyPatch {
+    velagraph::experimental_graph::VertexPropertyPatch {
+        set: BTreeMap::from([("rank".into(), velagraph::Value::Integer(value))]),
         remove: Default::default(),
     }
 }
@@ -574,11 +574,11 @@ async fn edge_property_read_dependency_conflicts_when_only_target_changes() {
     let now = snapshot(&graph).await;
     assert_eq!(
         now.edge(e.identity()).unwrap().unwrap().properties["weight"],
-        rocksdb_sql_table::Value::Integer(3)
+        velagraph::Value::Integer(3)
     );
     assert_eq!(
         now.vertex(e.to).unwrap().unwrap().properties["rank"],
-        rocksdb_sql_table::Value::Integer(2)
+        velagraph::Value::Integer(2)
     );
     assert_eq!(old.edge(e.identity()).unwrap(), Some(e));
     for node in [&a, &b, &c] {
@@ -791,7 +791,7 @@ async fn same_shard_self_loop_mutations_and_tombstone_identity_survive_reopen() 
         .unwrap();
     assert_eq!(
         old.edge(e.identity()).unwrap().unwrap().properties["weight"],
-        rocksdb_sql_table::Value::Integer(5)
+        velagraph::Value::Integer(5)
     );
     assert!(matches!(
         graph.execute(&deletion).await.unwrap(),
