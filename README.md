@@ -32,42 +32,36 @@ specialized for one dataset.
 
 ## Quick start
 
-### Run a three-process graph demo
+### Try one graph query
 
-Use Linux with a current stable Rust toolchain, a C++ compiler, Clang/libclang,
-Git and Python 3. CI uses Ubuntu and Rust stable. On Debian/Ubuntu the native
-packages are `build-essential clang libclang-dev`. The first build compiles
-RocksDB; allow time and several GiB of free disk space.
+Requires a current stable Rust toolchain and the native RocksDB build dependencies
+(C++ compiler and Clang/libclang). See [setup](CONTRIBUTING.md#development-environment)
+if they are not installed. The first build compiles RocksDB and needs time and
+several GiB of disk; this is a source build, not a prebuilt download.
 
 ```sh
 git clone https://github.com/ashione/VelaGraph.git
 cd VelaGraph
-cargo build --locked -p replicated-graph --bins
-python3 scripts/graph_client_demo.py \
-  --allow-insecure-development \
-  --node target/debug/graph-node \
-  --client target/debug/graph-client
+cargo run --locked -p velagraph --example quickstart
 ```
 
-If libclang is not discovered, set `LIBCLANG_PATH` to the directory containing
-`libclang.so`. If you use `CARGO_TARGET_DIR`, adjust the two binary paths above.
-
-The script starts one metadata process and two data processes on loopback,
-creates a cross-shard relationship, and verifies:
-
-```groovy
-g.V(1).outE('knows').inV().path()
+```text
+Created: Ada --KNOWS--> Grace
+Query: g.V(1).out('KNOWS').values('name')
+Result: Grace
+Temporary graph removed. No server was started.
 ```
 
-The expected qualified path is **vertex 10:1 → edge 10:7 → vertex 20:1**.
-Completeness is **Unverified**. This demo uses non-atomic observed writes and
-single-voter groups; it demonstrates neither managed transactions nor node-loss
-tolerance. The plaintext flag is intentional: run only on a trusted development
-machine. The script stops its child processes and retains its printed temporary
-data/log directory for inspection. Repeated runs consume disk space.
+This [small executable example](examples/quickstart.rs) creates two vertices and
+one edge, executes standard Gremlin and removes its temporary database on normal
+completion. It opens no ports and can be run repeatedly. Forced process termination
+may leave a temporary directory. This is the **local kernel**, not a distributed
+consistency demonstration.
 
-See the [demo guide](docs/GRAPH_DEMO.md) for diagnostics and cleanup, and the
-[CLI reference](docs/GRAPH_CLIENT.md) for commands and configuration.
+**Next:** [run the three-process distributed demo](docs/GRAPH_DEMO.md) for
+cross-shard observed queries, or read [CONTRIBUTING](CONTRIBUTING.md) for development
+and tests. The distributed demo uses plaintext loopback, single-voter groups and
+explicit Unverified completeness; it does not establish node-loss tolerance.
 
 ### Embed the local kernel
 
