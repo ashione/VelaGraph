@@ -207,3 +207,52 @@ excluded. The timing test is manually invoked and has no environment-dependent
 pass threshold. Whole `velagraph` package validation: 247 passed, 0 failed,
 4 ignored helpers/manual timing; all-target package clippy, fmt and diff checks
 passed. Other workspace packages were not rerun for this isolated change.
+
+## Managed state-machine vertex slice (#196)
+
+`GraphSnapshot::prepare_temporal_vertices` now prepares bounded vertex assertions
+for one or more members of an **existing** managed cohort. It returns the existing
+`Plan`: Commit/Abort, original-ID retries, durable request admission and shard CAS
+all use the existing protocol, not another temporal coordinator. The dedicated
+`TemporalStore` above is neither opened nor imported by this path. Edge assertions
+and cross-shard temporal traversal are rejected/not exposed in this slice.
+
+`GraphSnapshot::temporal(T)` binds a business instant to that snapshot's certified
+cohort V and original expiry. Point reads use the corresponding member's immutable
+`ReadView`, never its current database. The mapping is:
+
+`cohort V -> certified member local_sequence -> temporal head in those entries`.
+
+The temporal head is a consecutive count of that member's committed temporal
+batches, **not** the local sequence or cohort V. Untouched members and aborted
+transactions do not advance it. A two-member correction remains invisible until
+the existing cohort protocol can certify its complete prefix. Reads of an older
+session remain at their original V/T while newer writes apply. Unknown members,
+expired sessions, invalid intervals, overlapping assertions, unsupported edge
+mutations and malformed temporal metadata return errors, not partial answers.
+The new point adapter reuses format-2 revision keys/envelopes and graph codecs.
+No new format, migration, Gremlin dialect or wall-clock-to-V mapping is introduced.
+
+Limits: at most 256 assertions per transaction, the existing managed 16 MiB/operation
+limits, and at most 4096 candidate revisions / 64 MiB per point read. Encoded batches
+are checked incrementally against the aggregate limit. The original bounded
+snapshot materialization and retained-history limits still apply; this is not an
+indexed distributed-history performance claim. The immutable business-time view
+borrows its parent session rather than adding another session registry or lease.
+
+### Durability and recovery boundary
+
+These managed assertions, format marker and local head are opaque bytes in the
+**existing state-machine database**, committed atomically with the existing shard
+CAS/transaction state. Durable-node reopen can therefore recover them with that
+state machine; no third temporal DB is required for this placement. Original
+request recovery and retained certified V still use existing checks.
+
+This does **not** make the standalone `TemporalStore` part of the two-DB physical
+checkpoint. There is no API accepting that independent DB as a managed member,
+no import fallback, and no production temporal gateway wired to it. No global
+checkpoint manifest, restore/rejoin READY gate, live installation, history GC or
+purge-fence bypass is added. A locally reopened member is not proof of a completely
+restored cohort. Global checkpoint recovery remains separately blocked until all
+required members/coordinator, topology, cut and temporal data are validated before
+query admission. Do not advertise this slice as production temporal recovery.
