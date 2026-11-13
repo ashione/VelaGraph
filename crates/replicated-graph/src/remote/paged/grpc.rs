@@ -221,6 +221,15 @@ impl Handler {
         context: Option<wire::Context>,
         operation: Operation,
     ) -> Result<(Reply, Instant), RemoteError> {
+        self.execute_until(context, operation, Instant::now() + self.deadline)
+            .await
+    }
+    pub(in crate::remote) async fn execute_until(
+        &self,
+        context: Option<wire::Context>,
+        operation: Operation,
+        admitted_end: Instant,
+    ) -> Result<(Reply, Instant), RemoteError> {
         let context = context.ok_or(RemoteError::InvalidArgument)?;
         let identity = context.identity.ok_or(RemoteError::InvalidArgument)?;
         if context.version != VERSION {
@@ -229,10 +238,15 @@ impl Handler {
         if context.timeout_millis == 0 || context.timeout_millis > 60_000 {
             return Err(RemoteError::InvalidArgument);
         }
-        let end = Instant::now()
-            + self
-                .deadline
-                .min(Duration::from_millis(context.timeout_millis));
+        let end = admitted_end.min(
+            Instant::now()
+                + self
+                    .deadline
+                    .min(Duration::from_millis(context.timeout_millis)),
+        );
+        if Instant::now() >= end {
+            return Err(RemoteError::Timeout { request_id: None });
+        }
         tokio::time::timeout_at(
             end,
             super::super::execute(
@@ -256,6 +270,8 @@ impl Handler {
 }
 #[derive(Clone, Copy)]
 struct ResponseDeadline(Instant);
+#[derive(Clone, Copy)]
+pub(in crate::remote) struct RequestDeadline(pub Instant);
 pub(in crate::remote) fn response<T>(value: T, end: Instant) -> tonic::Response<T> {
     let mut response = tonic::Response::new(value);
     response.extensions_mut().insert(ResponseDeadline(end));
@@ -367,7 +383,7 @@ where
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
-    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
         let Ok(permit) = self.admission.clone().try_acquire_owned() else {
             return Box::pin(async { Ok(status(RemoteError::ResourceExhausted).into_http()) });
         };
@@ -378,6 +394,7 @@ where
             .and_then(grpc_timeout)
             .map_or(self.deadline, |d| d.min(self.deadline));
         let end = Instant::now() + budget;
+        request.extensions_mut().insert(RequestDeadline(end));
         let future = self.inner.call(request);
         Box::pin(async move {
             let response = future.await?;
@@ -540,6 +557,7 @@ impl GrpcSnapshotService {
                     }),
                 },
             );
+            let operations_service = super::super::operations_grpc::service(handler.clone());
             let fixed_service = distributed::grpc::fixed_service(handler.clone());
             let query_service = distributed::grpc::service(handler.clone());
             let service = SnapshotServiceServer::new(handler)
@@ -555,6 +573,11 @@ impl GrpcSnapshotService {
                 })
                 .add_service(AdmittedService {
                     inner: query_service,
+                    admission: admission.clone(),
+                    deadline,
+                })
+                .add_service(AdmittedService {
+                    inner: operations_service,
                     admission: admission.clone(),
                     deadline,
                 })

@@ -41,6 +41,9 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
 - **driver/control 切片**：[#251](https://github.com/ashione/VelaGraph/issues/251) 将 process-node
   --control 与 d2-ctl/send_control 的九项操作统一为 typed gRPC，复用原 handler、容量与 deadline，
   同端口替换旧 newline JSON，不保留自动 fallback；见 [control transport](CONTROL_GRPC.md)。
+- **单分片操作切片**：[#254](https://github.com/ashione/VelaGraph/issues/254) 为 Probe/Metadata/Write
+  增加 typed gRPC 服务与显式 CLI，复用原 handler、写入身份及容量边界。旧 catalog/routing adapter
+  和 GraphService listener 的完整迁移/退役仍是后续验收项，不能视为 #218 全部完成。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、

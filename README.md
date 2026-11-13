@@ -162,6 +162,11 @@ TCP ingress and remaining legacy/Unix listeners still need retirement;
 [process-node driver/control](docs/CONTROL_GRPC.md) now uses typed gRPC too;
 these internal observed endpoints are not the public managed API.
 
+Single-shard Probe/Metadata/Write also have an explicit
+[typed RPC service and CLI](docs/SHARD_OPERATIONS_GRPC.md). Legacy catalog/routing adapters remain
+separate migration work; this does not complete the all-RPC inventory.
+
+
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,

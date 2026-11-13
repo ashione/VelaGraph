@@ -1,3 +1,4 @@
+mod rpc;
 use anyhow::{bail, ensure, Context, Result};
 use replicated_graph::{
     catalog::{Catalog, Placement},
@@ -17,7 +18,7 @@ use velagraph::{
 };
 
 const MAX_INPUT: u64 = 1024 * 1024;
-const HELP: &str = "graph-client --config FILE --allow-insecure-development COMMAND\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nv1 server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
+const HELP: &str = "graph-client --allow-insecure-development COMMAND\nLegacy catalog commands require --config FILE; rpc commands use --endpoint.\nrpc probe|metadata --endpoint ADDR --group N --node N --shard N [--timeout-ms N]\nrpc write --endpoint ADDR --group N --node N --shard N --file WRITE.json [--timeout-ms N]\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nv1 server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,6 +316,9 @@ pub async fn run(args: Vec<String>) -> Result<Json> {
         }
     }
     ensure!(trusted, "plaintext clients require --allow-insecure-development; use only a trusted isolated network");
+    if words.first().is_some_and(|word| word == "rpc") {
+        return rpc::run(&words, opts).await;
+    }
     let config: Config = read_json(&take(&mut opts, "--config")?)?;
     let command = parse_command(&words, opts)?;
     let client = config.client()?;
@@ -546,6 +550,11 @@ pub fn error_json(error: &anyhow::Error) -> Json {
     let details = error
         .downcast_ref::<WriteFailure>()
         .map(|e| e.details.clone())
+        .or_else(|| {
+            error
+                .downcast_ref::<remote::RemoteError>()
+                .map(|e| json!({"kind":"rpc_error","details":e,"message":e.to_string()}))
+        })
         .unwrap_or_else(|| json!({"kind":"command_error","message":format!("{error:#}")}));
     json!({"version":1,"ok":false,"error":details})
 }

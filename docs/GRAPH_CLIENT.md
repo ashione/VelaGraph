@@ -173,3 +173,11 @@ vertex `valueMap` under the [shared bounded contract](MANAGED_FIXED_TRAVERSALS.m
 Its JSON row has `type: "property_map"`, a qualified vertex `source`, and
 canonical `properties` containing singleton lists of tagged Values. Missing keys
 are omitted; explicit Null remains `["Null"]`. The result remains Unverified.
+
+## Explicit single-shard RPC commands
+
+`graph-client rpc probe|metadata|write` uses typed gRPC and requires an explicit
+endpoint/group/node/shard instead of catalog configuration. See
+[shard operations](SHARD_OPERATIONS_GRPC.md) for examples and write-outcome limits.
+Other catalog/experimental commands retain their documented legacy transport;
+there is no automatic fallback or implicit migration.
