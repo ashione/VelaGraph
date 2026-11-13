@@ -84,3 +84,11 @@ test's 30 seconds. The transport migration does not relax that deadline or claim
 to fix large indivisible-entry latency. Standard D1 mutation limits and external
 APIs remain the supported application path; direct raw Raft callers must enforce
 both transport capacity and viable RPC latency before submitting a command.
+
+## Accepted socket policy
+
+Custom incoming streams explicitly enable `TCP_NODELAY` on accepted sockets.
+Tonic builder defaults do not configure caller-supplied IO. See
+[scope, regression coverage and controlled evidence](GRPC_SOCKET_POLICY.md).
+This changes neither Raft deadlines nor consistency; #247 remains an unresolved
+original-cause investigation.
