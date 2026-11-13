@@ -47,16 +47,19 @@ configured deadline; it does not reverse committed state.
 
 ## Service migration selection
 
-`graph-service --internal-grpc` explicitly selects gRPC for **both** configured
-managed coordinator/member endpoints and graph fragment/session endpoints. All
-addresses in that configuration must name the corresponding gRPC listeners.
-Omitting the flag retains the old transport for migration differential tests;
-there is no per-call fallback. This is temporary migration selection, not the
-final architecture or permission to retain two transports indefinitely.
+`graph-service` now always uses typed gRPC for **both** configured managed
+coordinator/member endpoints and graph fragment/session endpoints. All addresses
+must name the corresponding gRPC listeners. The temporary `--internal-grpc`
+selection flag is removed and rejected, rather than retained as a redundant alias.
+Legacy managed endpoints fail the startup identity probe. A graph channel
+connection is not typed-service readiness: incompatible graph endpoints fail
+the first graph operation, without fallback. This completes
+[#242](https://github.com/ashione/VelaGraph/issues/242), not the entire RPC inventory.
+Library-level old transports remain only until their own replacement/removal gates.
 
 The public HTTP adapter remains supported by design. In-process Rust calls,
 RocksDB filesystem I/O, and S3-compatible object-store HTTP are not custom
-inter-node graph transports and are not replaced by this flag.
+inter-node graph transports and are not replaced by this service migration.
 
 ## Remaining communication inventory
 
@@ -65,8 +68,8 @@ inter-node graph transports and are not replaced by this flag.
 | Public managed HTTP and typed gRPC | Shared domain handlers; loopback preview |
 | Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC available; old TCP retained for migration parity |
 | Managed coordinator/member control and writes | This typed gRPC slice; explicit client/server selection |
-| Raft peer replication, votes, snapshot transfer | Separate migration; do not infer coverage from managed gRPC |
-| Observed hierarchy jobs | Separate migration; existing bespoke TCP remains until its own acceptance |
+| Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control remains JSON/TCP |
+| Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); coordinator ingress remains TCP/JSON |
 | Legacy gateway listener, test/control drivers | Still need migration/removal; an unused compatibility listener is not all-RPC completion |
 
 The exit gate is to make supported service paths RPC-only, remove superseded

@@ -143,10 +143,11 @@ explicitly with `graph-coordinator serve-grpc`. A separate
 [typed fixed-version session service](docs/INTERNAL_GRPC_FIXED_QUERIES.md) is selected
 by the managed gateway's explicit gRPC graph-route constructor.
 [Typed managed control/write RPC](docs/INTERNAL_GRPC_MANAGED.md) adds explicit
-coordinator/member gRPC clients and listeners; `graph-service --internal-grpc`
-selects these plus gRPC graph routes without fallback. Observed hierarchy jobs,
-Raft and removal of the remaining legacy transports are separate migration work;
-these internal endpoints are not the public API.
+coordinator/member gRPC clients and listeners; `graph-service` now always uses
+these plus gRPC graph routes without a transport switch or fallback. Observed
+hierarchy shard jobs and [Raft peers](docs/RAFT_GRPC.md) also have typed gRPC paths.
+Coordinator job ingress, driver control and remaining legacy listeners still need
+migration/removal; these internal endpoints are not the public API.
 
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;

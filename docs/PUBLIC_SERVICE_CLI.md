@@ -78,9 +78,13 @@ preview encoding. They are semantically equivalent adapters, not the same wire
 format or a claim that HTTP is protobuf JSON. A session opened over either
 protocol can be fetched/closed through the other on this same gateway.
 
-This host does not change existing internal RPC protocols. Existing managed
-control and graph paths remain their currently supported transports. It does not
-merge or depend on an unmerged internal gRPC change.
+This host exclusively uses typed gRPC for managed coordinator/member control and
+graph fragment/session routes. Configure their gRPC listener addresses. The former
+`--internal-grpc` switch is removed; legacy managed endpoints fail the startup identity probe, without fallback.
+A connected graph channel does not prove typed-service readiness; a wrong graph
+endpoint fails its first operation. The startup announcement is not a graph health
+check. Other library/test/control entrypoints
+and the unpublished compatibility listener remain separate #218 cleanup work.
 
 ## Process acceptance scope
 
