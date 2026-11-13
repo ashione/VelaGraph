@@ -16,6 +16,7 @@ use tonic::{
     Status,
 };
 use wire::{
+    fixed_session_service_server::{FixedSessionService, FixedSessionServiceServer},
     query_service_server::{QueryService, QueryServiceServer},
     write_service_server::{WriteService, WriteServiceServer},
 };
@@ -189,6 +190,40 @@ impl QueryService for Handler {
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::close(request.into_inner()).map_err(codec::error)?;
         self.run(call, operation, budget, codec::encode_close).await
+    }
+}
+
+#[tonic::async_trait]
+impl FixedSessionService for Handler {
+    async fn open(&self, request: tonic::Request<wire::FixedOpenRequest>) -> std::result::Result<tonic::Response<wire::FixedOpenResponse>, Status> {
+        let call = admitted(&request)?;
+        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
+        let operation = codec::fixed_open(request.into_inner()).map_err(codec::error)?;
+        self.run(call, operation, budget, codec::encode_fixed_open).await
+    }
+    async fn read(&self, request: tonic::Request<wire::FixedQueryRequest>) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
+        let call = admitted(&request)?;
+        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
+        let operation = codec::fixed_read(request.into_inner()).map_err(codec::error)?;
+        self.run(call, operation, budget, codec::encode_fixed_query).await
+    }
+    async fn traverse(&self, request: tonic::Request<wire::FixedQueryRequest>) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
+        let call = admitted(&request)?;
+        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
+        let operation = codec::fixed_traverse(request.into_inner()).map_err(codec::error)?;
+        self.run(call, operation, budget, codec::encode_fixed_query).await
+    }
+    async fn page(&self, request: tonic::Request<wire::FixedPageRequest>) -> std::result::Result<tonic::Response<wire::FixedPageResponse>, Status> {
+        let call = admitted(&request)?;
+        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
+        let operation = codec::fixed_page(request.into_inner()).map_err(codec::error)?;
+        self.run(call, operation, budget, codec::encode_fixed_page).await
+    }
+    async fn close(&self, request: tonic::Request<wire::FixedCloseRequest>) -> std::result::Result<tonic::Response<wire::FixedCloseResponse>, Status> {
+        let call = admitted(&request)?;
+        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
+        let operation = codec::fixed_close(request.into_inner()).map_err(codec::error)?;
+        self.run(call, operation, budget, codec::encode_fixed_close).await
     }
 }
 #[derive(Clone)]
@@ -461,6 +496,9 @@ pub(super) async fn bind(
         let writes = WriteServiceServer::new(handler.clone())
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
+        let fixed = FixedSessionServiceServer::new(handler.clone())
+            .max_decoding_message_size(MAX_REQUEST_BYTES)
+            .max_encoding_message_size(MAX_RESPONSE_BYTES);
         let queries = QueryServiceServer::new(handler)
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
@@ -473,6 +511,11 @@ pub(super) async fn bind(
             .max_concurrent_streams(Some(MAX_CONNECTIONS as u32))
             .add_service(Admitted {
                 inner: writes,
+                state: state.clone(),
+                deadline,
+            })
+            .add_service(Admitted {
+                inner: fixed,
                 state: state.clone(),
                 deadline,
             })

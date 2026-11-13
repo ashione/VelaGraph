@@ -494,6 +494,176 @@ async fn grpc_channel(address: SocketAddr) -> anyhow::Result<tonic::transport::C
             .await?,
     )
 }
+fn fixed_request(session: &pb::FixedSession, text: &str) -> pb::FixedQueryRequest {
+    pb::FixedQueryRequest {
+        context: context(),
+        session: Some(session.clone()),
+        query: Some(pb::Query {
+            partition: 7,
+            text: text.into(),
+        }),
+    }
+}
+fn assert_reason(status: &tonic::Status, reason: pb::error_detail::Reason) {
+    assert_eq!(
+        pb::ErrorDetail::decode(status.details()).unwrap().reason,
+        reason as i32
+    );
+}
+async fn verify_fixed_session_after_delete(
+    client: &mut pb::fixed_session_service_client::FixedSessionServiceClient<tonic::transport::Channel>,
+    session: &pb::FixedSession,
+) -> anyhow::Result<()> {
+    use pb::error_detail::Reason;
+    let element = |partition, id, edge| pb::QualifiedElement {
+        kind: Some(if edge {
+            pb::qualified_element::Kind::Edge(pb::Entity { partition, id })
+        } else {
+            pb::qualified_element::Kind::Vertex(pb::Entity { partition, id })
+        }),
+    };
+    let expected = pb::Row {
+        kind: Some(pb::row::Kind::Path(pb::Path {
+            elements: vec![element(7, 1, false), element(7, 10, true), element(8, 2, false)],
+        })),
+    };
+    let old = client
+        .traverse(fixed_request(session, "g.V(1).out().path()"))
+        .await?
+        .into_inner();
+    assert_eq!(old.session.as_ref(), Some(session));
+    assert_eq!(old.query.unwrap().text, "g.V(1).out().path()");
+    let data = old.data.unwrap();
+    assert_eq!(data.rows, vec![expected.clone()]);
+    assert_eq!(data.completeness, pb::Completeness::Unverified as i32);
+    let read = client
+        .read(fixed_request(session, "g.V(1).outE()"))
+        .await?
+        .into_inner();
+    assert_eq!(read.session.as_ref(), Some(session));
+    assert_eq!(
+        read.data.unwrap().rows,
+        vec![pb::Row {
+            kind: Some(pb::row::Kind::Element(element(7, 10, true))),
+        }]
+    );
+    let unsupported = client
+        .traverse(fixed_request(session, "g.V(1).inV()"))
+        .await
+        .unwrap_err();
+    assert_reason(&unsupported, Reason::QueryUnsupported);
+    let mut changed = session.clone();
+    changed.version += 1;
+    let wrong_version = client
+        .traverse(fixed_request(&changed, "g.V(1)"))
+        .await
+        .unwrap_err();
+    assert_reason(&wrong_version, Reason::IdentityMismatch);
+    changed = session.clone();
+    changed.incarnation[0] ^= 1;
+    let wrong_owner = client
+        .read(fixed_request(&changed, "g.V(1)"))
+        .await
+        .unwrap_err();
+    assert_reason(&wrong_owner, Reason::SessionUnavailable);
+    // Duplicate starts preserve bags; replay preserves the complete envelope.
+    let first_request = pb::FixedPageRequest {
+        context: context(),
+        session: Some(session.clone()),
+        query: Some(pb::Query {
+            partition: 7,
+            text: "g.V(1,1).out().path()".into(),
+        }),
+        cursor: None,
+        page_size: 1,
+    };
+    let first = client.page(first_request.clone()).await?.into_inner();
+    let page = first.page.as_ref().unwrap();
+    assert_eq!((page.offset, page.total), (0, 2));
+    assert_eq!(page.rows, vec![expected.clone()]);
+    assert_eq!(client.page(first_request.clone()).await?.into_inner(), first);
+    let mut next_request = first_request.clone();
+    next_request.cursor = page.next.clone();
+    assert!(next_request.cursor.is_some());
+    let last = client.page(next_request.clone()).await?.into_inner();
+    let page = last.page.as_ref().unwrap();
+    assert_eq!((page.offset, page.total), (1, 2));
+    assert_eq!(page.rows, vec![expected]);
+    assert_eq!(page.next, None);
+    assert_eq!(client.page(next_request.clone()).await?.into_inner(), last);
+    next_request.cursor.as_mut().unwrap().token[0] ^= 1;
+    let bad_cursor = client.page(next_request).await.unwrap_err();
+    assert_reason(&bad_cursor, Reason::IdentityMismatch);
+    let mut changed_query = first_request;
+    changed_query.query.as_mut().unwrap().text = "g.V(1)".into();
+    let bad_query = client.page(changed_query).await.unwrap_err();
+    assert_reason(&bad_query, Reason::IdentityMismatch);
+    let fresh = client
+        .open(pb::FixedOpenRequest {
+            context: context(),
+            version: Some(4),
+            ttl_millis: 60_000,
+        })
+        .await?
+        .into_inner()
+        .session
+        .unwrap();
+    assert_eq!(fresh.version, 4);
+    let current = client
+        .traverse(fixed_request(&fresh, "g.V(1).out().path()"))
+        .await?
+        .into_inner();
+    assert!(current.data.unwrap().rows.is_empty());
+    let closed = client
+        .close(pb::FixedCloseRequest {
+            context: context(),
+            session: Some(fresh.clone()),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(closed.session, Some(fresh.clone()));
+    let closed_read = client
+        .read(fixed_request(&fresh, "g.V(1)"))
+        .await
+        .unwrap_err();
+    assert_reason(&closed_read, Reason::SessionUnavailable);
+    let zero = client
+        .open(pb::FixedOpenRequest {
+            context: context(),
+            version: Some(0),
+            ttl_millis: 60_000,
+        })
+        .await?
+        .into_inner()
+        .session
+        .unwrap();
+    assert_eq!(zero.version, 0);
+    assert!(client
+        .traverse(fixed_request(&zero, "g.V()"))
+        .await?
+        .into_inner()
+        .data
+        .unwrap()
+        .rows
+        .is_empty());
+    client
+        .close(pb::FixedCloseRequest {
+            context: context(),
+            session: Some(zero),
+        })
+        .await?;
+    // An unavailable exact future V must fail, never substitute current V.
+    let unavailable = client
+        .open(pb::FixedOpenRequest {
+            context: context(),
+            version: Some(100),
+            ttl_millis: 60_000,
+        })
+        .await
+        .unwrap_err();
+    assert_reason(&unavailable, Reason::RejectedOutcomeUncertain);
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_process_public_http_grpc_consistency_and_restart() -> anyhow::Result<()> {
     public_scenario().await
@@ -536,7 +706,9 @@ async fn public_scenario() -> anyhow::Result<()> {
     assert_eq!(replayed, written);
     let channel = grpc_channel(service.grpc).await?;
     let mut grpc_writes = pb::write_service_client::WriteServiceClient::new(channel.clone());
-    let mut grpc_queries = pb::query_service_client::QueryServiceClient::new(channel);
+    let mut grpc_queries = pb::query_service_client::QueryServiceClient::new(channel.clone());
+    let mut fixed_queries =
+        pb::fixed_session_service_client::FixedSessionServiceClient::new(channel);
     // HTTP then gRPC replay use exactly one canonical managed command/decision.
     let grpc_replay = grpc_writes.submit(edge_proto()).await?.into_inner();
     assert_eq!(grpc_replay.external_id, vec![3; 16]);
@@ -562,8 +734,22 @@ async fn public_scenario() -> anyhow::Result<()> {
         opened["result"]["page"]["rows"],
         json!([{"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"},{"type":"edge","partition":7,"id":"10"},{"type":"vertex","partition":8,"id":"2"}]}])
     );
+    // FixedSession is a separate contract: capture once, then run multiple
+    // bounded queries at that V. It is not the data-local query token above.
+    let fixed_session = fixed_queries
+        .open(pb::FixedOpenRequest {
+            context: context(),
+            version: None,
+            ttl_millis: 60_000,
+        })
+        .await?
+        .into_inner()
+        .session
+        .unwrap();
+    assert_eq!(fixed_session.version, 3);
     let(status,deleted)=post(service.address,"/preview1/writes:submit",json!({"external_id":"04040404040404040404040404040404","mutation":{"type":"delete_edge","edge":{"partition":7,"id":"10"}}})).await?;
     assert_eq!(status, 200, "{deleted}");
+    verify_fixed_session_after_delete(&mut fixed_queries, &fixed_session).await?;
     let fetch = json!({"session":session,"query":query,"cursor":null,"page_size":1});
     let (status, old) = post(service.address, "/preview1/queries:fetch", fetch.clone()).await?;
     assert_eq!(status, 200, "{old}");
@@ -648,6 +834,7 @@ async fn public_scenario() -> anyhow::Result<()> {
     assert_eq!(status, 410, "{closed}");
     drop(grpc_writes);
     drop(grpc_queries);
+    drop(fixed_queries);
     service.graceful_stop().await?;
     let mut service =
         ServiceProcess::start(&config_path, directory.path().join("service2.stdout")).await?;
@@ -669,6 +856,14 @@ async fn public_scenario() -> anyhow::Result<()> {
         pb::ErrorDetail::decode(stale_rpc.details())?.reason,
         pb::error_detail::Reason::SessionUnavailable as i32
     );
+    let mut fixed_queries =
+        pb::fixed_session_service_client::FixedSessionServiceClient::new(channel.clone());
+    let stale_fixed = fixed_queries
+        .traverse(fixed_request(&fixed_session, "g.V(1).out().path()"))
+        .await
+        .unwrap_err();
+    assert_reason(&stale_fixed, pb::error_detail::Reason::SessionUnavailable);
+    drop(fixed_queries);
     let mut grpc_writes = pb::write_service_client::WriteServiceClient::new(channel);
     assert_eq!(
         grpc_writes.status(edge_proto()).await?.into_inner(),

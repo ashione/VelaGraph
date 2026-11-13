@@ -1,7 +1,8 @@
 # Typed public managed gRPC slice
 
 The loopback service exposes `velagraph.public.managed.v1.WriteService`
-(Submit, Status, Abort) and `QueryService` (Open, Fetch, Close). The schema is
+(Submit, Status, Abort), `QueryService` (Open, Fetch, Close), and
+`FixedSessionService` (Open, Read, Traverse, Page, Close). The schema is
 [`public_managed.proto`](../crates/replicated-graph/proto/public_managed.proto);
 generated Rust clients and messages are exported at
 `replicated_graph::managed_gateway::public_proto`. This is an experimental
@@ -26,7 +27,9 @@ supported transport; this public slice does not claim they all became gRPC.
 HTTP remains the isolated [preview JSON contract](PUBLIC_HTTP_PREVIEW.md), not
 protobuf JSON. gRPC carries real typed protobuf messages, not opaque JSON bytes.
 The same domain write ID/command replays across adapters, and a session can be
-fetched or closed through either on its owner gateway. Converting tokens between
+fetched or closed through either on its owner gateway for the data-local
+`QueryService` contract. The separate `FixedSessionService` is gRPC-only; the
+HTTP preview does not expose these fixed-snapshot operations. Converting tokens between
 protobuf bytes and HTTP lowercase hex does not change their identity. A final
 stable HTTP/protobuf-JSON contract and migration/removal of the preview schema
 remain separate work; do not preserve two permanent business implementations.
@@ -55,6 +58,34 @@ still uses the existing domain rules. In particular, an empty conditional patch
 is invalid rather than an unconditional write. The canonical durable command is
 computed from the domain mutation, never from protobuf field order/bytes.
 
+## Fixed-snapshot sessions: separate from data-local query sessions
+
+[#266](https://github.com/ashione/VelaGraph/issues/266) adds typed access to the
+existing fixed-snapshot operations. `FixedSessionService.Open` captures the
+bounded complete managed cohort once. Omitted `version` means the latest safe
+certified version at admission; `version: 0` means exact zero, not latest.
+Subsequent Read, Traverse and Page requests retain that exact V even when later
+writes or deletions become visible. No minimum-version wait is added here.
+
+`FixedSession` and the existing data-local `Session` are different protobuf
+messages and different server registries. They are not interchangeable. Unlike
+`QueryService.Open`, fixed Open does not execute and retain one query: a client
+can run multiple bounded queries against its captured snapshot. `Read` preserves
+the earlier restricted single-start read subset; `Traverse` uses the existing
+fixed traversal executor. Neither accepts arbitrary Gremlin or new grammar.
+`Page` materializes one bounded traversal and binds its replayable cursor to the
+session, query and page size. A different paged query on that same retained
+result is rejected, not silently recomputed. Unpaged traversal does not replace
+that result. Close, expiry, a wrong incarnation or restart invalidates the token;
+requests never recapture latest automatically.
+
+All methods share the original Invocation/admission/deadline and response
+ownership machinery. Fixed snapshot acquisition, retained results and individual
+messages keep their existing capacity limits. This is not a data-local scaling
+improvement. HTTP parity for this additional service and the five asynchronous
+managed job operations remain future work. The legacy library Gateway is not
+removed until its remaining semantics have replacements; #218 remains open.
+
 ## Errors and ownership
 
 Application errors use gRPC status with a typed `ErrorDetail` reason. Preserve
@@ -76,8 +107,8 @@ structural budget, avoiding a server response its generated client must reject.
 The optional generation script reproduces all checked-codec hooks; normal builds
 do not run protoc or require a JVM.
 
-Every future gRPC page envelope is checked before the first gRPC page is
-returned. A successful proof is cached on the immutable retained result,
+For data-local `QueryService`, every future gRPC page envelope is checked
+before the first gRPC page is returned. A successful proof is cached on the immutable retained result,
 including the first gRPC use of an HTTP/TCP-created session. Subsequent fetches
 still check liveness/expiry and encode their own page, without quadratic
 whole-result revalidation. Failed checks are not cached.
@@ -113,7 +144,11 @@ exercises a short RPC budget and short retained lease, and checks shared permits
 and undelivered sessions are reclaimed while a prior committed write is still
 recoverable. The [process test](PUBLIC_SERVICE_CLI.md#process-acceptance-scope)
 adds three independent data/control nodes, a separate dual-protocol service and
-client process. Record actual exact-commit results; source presence is not a pass.
+client process. Its fixed-session assertions cover a cross-partition edge at
+V3 remaining visible after deletion at V4, complete Read/Traverse rows, duplicate
+start bag pagination/replay, changed query/cursor/version/incarnation rejection,
+closed sessions, an unavailable future V, and restart invalidation. Record
+actual exact-commit results; source presence is not a pass.
 
 Global checkpoint restoration, multi-replica failover, multi-host throughput,
 authentication, browser-origin protection and stable final HTTP v1 remain out of

@@ -32,7 +32,7 @@ python3 - "$root/crates/replicated-graph/src/managed_gateway_public_proto.rs" <<
 import pathlib,sys
 p=pathlib.Path(sys.argv[1]); s=p.read_text()
 needle="tonic_prost::ProstCodec::default()"
-assert s.count(needle)==12, "public RPC codec count changed; review the schema budget"
+assert s.count(needle)==22, "public RPC codec count changed; review the schema budget"
 p.write_text(s.replace(needle,"crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default()"))
 PYCODE
 rustfmt --edition 2021 "$root/crates/replicated-graph/src/managed_gateway_public_proto.rs"

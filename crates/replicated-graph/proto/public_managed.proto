@@ -105,3 +105,24 @@ message ErrorDetail {
   }
   Reason reason = 1;
 }
+
+// A bounded materialized certified snapshot, not QueryService's single-query
+// data-local result. Tokens cannot be used interchangeably. Same public listener.
+service FixedSessionService {
+  rpc Open(FixedOpenRequest) returns (FixedOpenResponse);
+  rpc Read(FixedQueryRequest) returns (FixedQueryResponse);
+  rpc Traverse(FixedQueryRequest) returns (FixedQueryResponse);
+  rpc Page(FixedPageRequest) returns (FixedPageResponse);
+  rpc Close(FixedCloseRequest) returns (FixedCloseResponse);
+}
+message FixedSession { bytes incarnation = 1; bytes token = 2; uint64 version = 3; }
+// Absence selects latest once; present zero selects exact V=0, not latest.
+message FixedOpenRequest { Context context = 1; optional uint64 version = 2; uint64 ttl_millis = 3; }
+message FixedOpenResponse { FixedSession session = 1; }
+message FixedQueryRequest { Context context = 1; FixedSession session = 2; Query query = 3; }
+message QueryData { repeated Row rows = 1; Completeness completeness = 2; }
+message FixedQueryResponse { FixedSession session = 1; Query query = 2; QueryData data = 3; }
+message FixedPageRequest { Context context = 1; FixedSession session = 2; Query query = 3; Cursor cursor = 4; uint32 page_size = 5; }
+message FixedPageResponse { FixedSession session = 1; Query query = 2; Cursor cursor = 3; uint32 page_size = 4; Page page = 5; }
+message FixedCloseRequest { Context context = 1; FixedSession session = 2; }
+message FixedCloseResponse { FixedSession session = 1; }
