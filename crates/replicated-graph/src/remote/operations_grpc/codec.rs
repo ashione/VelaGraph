@@ -30,7 +30,7 @@ pub(super) fn request(
         }),
     })
 }
-pub(super) fn failure(v: RemoteError) -> wire::RemoteFailure {
+pub(in crate::remote) fn failure(v: RemoteError) -> wire::RemoteFailure {
     use wire::remote_failure::Kind as K;
     wire::RemoteFailure {
         kind: Some(match v {
@@ -47,7 +47,7 @@ pub(super) fn failure(v: RemoteError) -> wire::RemoteFailure {
         }),
     }
 }
-pub(super) fn unfailure(v: wire::RemoteFailure) -> Result<RemoteError, RemoteError> {
+pub(in crate::remote) fn unfailure(v: wire::RemoteFailure) -> Result<RemoteError, RemoteError> {
     use wire::remote_failure::Kind as K;
     Ok(match v.kind.ok_or(RemoteError::Protocol)? {
         K::NotLeader(v) => RemoteError::NotLeader { leader: v.leader },

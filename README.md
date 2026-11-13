@@ -144,13 +144,16 @@ Standard Gremlin / typed graph mutations
 | `crates/checkpoint-object-store/` | Experimental immutable checkpoint transport |
 | `scripts/`, `docs/` | Reproducible scenarios, contracts and evidence |
 
-An optional [typed gRPC snapshot endpoint](docs/INTERNAL_GRPC_SNAPSHOTS.md)
-provides `Open` / `Page` / `Close` over a reusable HTTP/2 channel. It shares the
-legacy TCP snapshot/session budgets. The same endpoint hosts the separate
+The [typed gRPC graph endpoint](docs/INTERNAL_GRPC_SNAPSHOTS.md)
+provides `Open` / `Page` / `Close` over a reusable HTTP/2 channel. It retains the existing snapshot/session budgets without starting a legacy TCP listener. The same endpoint hosts the separate
 [typed observed query-fragment service](docs/INTERNAL_GRPC_QUERIES.md), selected
 explicitly with `graph-coordinator serve-grpc`. A separate
 [typed fixed-version session service](docs/INTERNAL_GRPC_FIXED_QUERIES.md) is selected
 by the managed gateway's explicit gRPC graph-route constructor.
+The default storage adapter uses a [bounded Metadata RPC stream](docs/METADATA_STREAM.md)
+for each read freshness check, while Probe/Write remain unary and snapshots remain
+paged. It caches transport, never epoch results; explicit stream/connection budgets
+and slow-reader availability limits still apply.
 [Typed managed control/write RPC](docs/INTERNAL_GRPC_MANAGED.md) adds explicit
 coordinator/member gRPC clients and listeners; `graph-service` now always uses
 these plus gRPC graph routes without a transport switch or fallback. It opens only
@@ -163,8 +166,10 @@ TCP ingress and remaining legacy/Unix listeners still need retirement;
 these internal observed endpoints are not the public managed API.
 
 Single-shard Probe/Metadata/Write also have an explicit
-[typed RPC service and CLI](docs/SHARD_OPERATIONS_GRPC.md). Legacy catalog/routing adapters remain
-separate migration work; this does not complete the all-RPC inventory.
+[typed RPC service and CLI](docs/SHARD_OPERATIONS_GRPC.md). Catalog/routing adapters now use typed snapshots/operations by default;
+graph-node --graph is a single typed listener and --grpc-snapshot is removed.
+Explicit library legacy fixtures and coordinator/gateway/Unix entrypoints remain
+separate retirement work; this does not complete the all-RPC inventory.
 
 
 Local RocksDB/Raft remains the durable authority. The object-store library can

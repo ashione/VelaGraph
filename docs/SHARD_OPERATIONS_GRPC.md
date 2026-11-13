@@ -26,9 +26,9 @@ This is plaintext development transport behind the existing
 
 ## CLI
 
-Use the address printed as `grpc-snapshot=...` by `graph-node --grpc-snapshot ADDR`.
-That historical listener name now hosts multiple typed graph services. Do not
-supply the legacy `graph=...` TCP address. No automatic protocol detection occurs.
+Use the address printed as `graph=...` by `graph-node --graph ADDR`. This is now
+the sole typed graph endpoint. The old `--grpc-snapshot` split-port option is
+removed; no automatic protocol detection occurs.
 
 ```sh
 graph-client --allow-insecure-development rpc probe \
@@ -60,12 +60,10 @@ own bounded budgets. The CLI wraps connect plus its one operation in a single
 total timeout. Already committed mutations cannot be undone by
 cancelling a response.
 
-Legacy `GraphService` TCP APIs and `RemoteStorageNode` catalog/routing adapters
-remain explicit migration paths, not fallback paths of this service. Existing
-`graph-client` catalog/experimental commands are not silently switched by adding
-these `rpc` commands. Their complete read/write dependencies must be migrated and
-old listeners retired in a follow-up. #218 remains open; this slice is not an
-all-RPC, multi-host availability or performance-completion claim.
+The default `RemoteStorageNode` catalog/routing chain also uses typed RPC after
+#256. Explicit library legacy/parity services remain separately inventoried;
+`graph-node` never opens those listeners. #218 remains open for other legacy
+coordinator/gateway/Unix paths. This is not a multi-host HA or performance claim.
 
 ## Validation
 

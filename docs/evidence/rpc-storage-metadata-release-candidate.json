@@ -1,0 +1,856 @@
+{
+  "source": "e6a73c5a34d1be4301dffbb6f67a616c637fd5f6",
+  "tree": "0e2df89d5165c80be3632f0e7c8bf7cfb11890e3",
+  "actual_profile": "release optimized defaults; debug_assertions=false",
+  "binary_sha256": "14cb929c1ee034811d6adcbf768dbd94ff5a2dce63d044aa828002c90db453c5",
+  "measurement_context": "Parent and sibling cargo/tests paused for quiet same-binary four-lane run; shared host, not dedicated hardware",
+  "metadata_checks": {
+    "rounds": 12,
+    "each_n": 1000,
+    "each_actual_metadata_calls": 1000
+  },
+  "summary": {
+    "grpc_adapter_get": {
+      "total_ms": [
+        52.12889,
+        52.898688,
+        51.187521
+      ],
+      "p50_us": [
+        45.858,
+        45.878,
+        45.187
+      ],
+      "p95_us": [
+        85.997,
+        82.593,
+        82.963
+      ],
+      "p99_us": [
+        136.944,
+        159.067,
+        134.6
+      ]
+    },
+    "grpc_cold_connect": {
+      "total_ms": [
+        0.94929
+      ]
+    },
+    "grpc_reused": {
+      "total_ms": [
+        111.560327,
+        116.899137,
+        93.007576
+      ],
+      "p50_us": [
+        97.565,
+        113.589,
+        78.337
+      ],
+      "p95_us": [
+        169.561,
+        170.428,
+        150.384
+      ],
+      "p99_us": [
+        304.913,
+        249.53,
+        224.984
+      ]
+    },
+    "grpc_snapshot": {
+      "total_ms": [
+        6.211758000000001
+      ],
+      "p50_us": [
+        560.963
+      ],
+      "p95_us": [
+        1042.719
+      ],
+      "p99_us": [
+        1042.719
+      ]
+    },
+    "grpc_stream": {
+      "total_ms": [
+        57.660767,
+        48.895577,
+        60.625992
+      ],
+      "p50_us": [
+        51.867,
+        47.481,
+        59.388
+      ],
+      "p95_us": [
+        88.131,
+        73.048,
+        82.302
+      ],
+      "p99_us": [
+        171.445,
+        115.392,
+        129.483
+      ]
+    },
+    "tcp_direct": {
+      "total_ms": [
+        98.656959,
+        80.433977,
+        71.107973
+      ],
+      "p50_us": [
+        85.998,
+        67.28,
+        62.613
+      ],
+      "p95_us": [
+        148.0,
+        135.922,
+        112.387
+      ],
+      "p99_us": [
+        241.068,
+        221.499,
+        173.407
+      ]
+    },
+    "tcp_snapshot": {
+      "total_ms": [
+        3.02988
+      ],
+      "p50_us": [
+        227.198
+      ],
+      "p95_us": [
+        926.236
+      ],
+      "p99_us": [
+        926.236
+      ]
+    }
+  },
+  "records": [
+    {
+      "benchmark": "metadata_transport",
+      "lane": "grpc_cold_connect",
+      "total_ms": 0.94929
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "tcp_direct",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 85.998,
+      "p95_us": 148.0,
+      "p99_us": 241.068,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 98.656959
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_reused",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 97.565,
+      "p95_us": 169.561,
+      "p99_us": 304.913,
+      "phases": {
+        "client_await": {
+          "calls": 1000,
+          "mean_us": 108.348928
+        },
+        "client_finish": {
+          "calls": 1000,
+          "mean_us": 0.8299529999999999
+        },
+        "client_prepare": {
+          "calls": 1000,
+          "mean_us": 1.61138
+        },
+        "client_total": {
+          "calls": 1000,
+          "mean_us": 111.377006
+        },
+        "server_decode": {
+          "calls": 1000,
+          "mean_us": 0.050605
+        },
+        "server_encode": {
+          "calls": 1000,
+          "mean_us": 0.097536
+        },
+        "server_execute": {
+          "calls": 1000,
+          "mean_us": 0.894335
+        },
+        "server_logical_request": {
+          "calls": 1000,
+          "mean_us": 1.380771
+        },
+        "server_logical_response": {
+          "calls": 1000,
+          "mean_us": 0.945105
+        }
+      },
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 111.560327
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_stream",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 51.867,
+      "p95_us": 88.131,
+      "p99_us": 171.445,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 57.660767
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_adapter_get",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 45.858,
+      "p95_us": 85.997,
+      "p99_us": 136.944,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 52.12889
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_reused",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 113.589,
+      "p95_us": 170.428,
+      "p99_us": 249.53,
+      "phases": {
+        "client_await": {
+          "calls": 1000,
+          "mean_us": 111.83904799999999
+        },
+        "client_finish": {
+          "calls": 1000,
+          "mean_us": 1.195222
+        },
+        "client_prepare": {
+          "calls": 1000,
+          "mean_us": 2.89702
+        },
+        "client_total": {
+          "calls": 1000,
+          "mean_us": 116.64067999999999
+        },
+        "server_decode": {
+          "calls": 1000,
+          "mean_us": 0.06236
+        },
+        "server_encode": {
+          "calls": 1000,
+          "mean_us": 0.142344
+        },
+        "server_execute": {
+          "calls": 1000,
+          "mean_us": 0.958716
+        },
+        "server_logical_request": {
+          "calls": 1000,
+          "mean_us": 1.556644
+        },
+        "server_logical_response": {
+          "calls": 1000,
+          "mean_us": 0.983718
+        }
+      },
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 116.899137
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_stream",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 47.481,
+      "p95_us": 73.048,
+      "p99_us": 115.392,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 48.895577
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_adapter_get",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 45.878,
+      "p95_us": 82.593,
+      "p99_us": 159.067,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 52.898688
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "tcp_direct",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 67.28,
+      "p95_us": 135.922,
+      "p99_us": 221.499,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 80.433977
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_stream",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 59.388,
+      "p95_us": 82.302,
+      "p99_us": 129.483,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 60.625992
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_adapter_get",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 45.187,
+      "p95_us": 82.963,
+      "p99_us": 134.6,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 51.187521
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "tcp_direct",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 62.613,
+      "p95_us": 112.387,
+      "p99_us": 173.407,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 71.107973
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_reused",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 78.337,
+      "p95_us": 150.384,
+      "p99_us": 224.984,
+      "phases": {
+        "client_await": {
+          "calls": 1000,
+          "mean_us": 90.075799
+        },
+        "client_finish": {
+          "calls": 1000,
+          "mean_us": 0.8391580000000001
+        },
+        "client_prepare": {
+          "calls": 1000,
+          "mean_us": 1.518467
+        },
+        "client_total": {
+          "calls": 1000,
+          "mean_us": 92.819131
+        },
+        "server_decode": {
+          "calls": 1000,
+          "mean_us": 0.0503
+        },
+        "server_encode": {
+          "calls": 1000,
+          "mean_us": 0.102851
+        },
+        "server_execute": {
+          "calls": 1000,
+          "mean_us": 0.708052
+        },
+        "server_logical_request": {
+          "calls": 1000,
+          "mean_us": 1.39741
+        },
+        "server_logical_response": {
+          "calls": 1000,
+          "mean_us": 0.8988400000000001
+        }
+      },
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 93.007576
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "tcp_snapshot",
+      "metadata_calls": 0,
+      "n": 10,
+      "p50_us": 227.198,
+      "p95_us": 926.236,
+      "p99_us": 926.236,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 3.02988
+    },
+    {
+      "benchmark": "metadata_transport",
+      "debug_assertions": false,
+      "lane": "grpc_snapshot",
+      "metadata_calls": 0,
+      "n": 10,
+      "p50_us": 560.963,
+      "p95_us": 1042.719,
+      "p99_us": 1042.719,
+      "phases": {
+        "client_await": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_finish": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_prepare": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "client_total": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_decode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_encode": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_execute": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_request": {
+          "calls": 0,
+          "mean_us": 0.0
+        },
+        "server_logical_response": {
+          "calls": 0,
+          "mean_us": 0.0
+        }
+      },
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 6.211758000000001
+    }
+  ]
+}

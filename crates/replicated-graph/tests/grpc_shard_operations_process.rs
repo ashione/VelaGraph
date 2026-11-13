@@ -71,8 +71,6 @@ impl Cluster {
                 "--control",
                 &addresses[4 * i + 1].to_string(),
                 "--graph",
-                &addresses[4 * i + 2].to_string(),
-                "--grpc-snapshot",
                 &addresses[4 * i + 3].to_string(),
                 "--shard",
                 "7",
@@ -165,10 +163,7 @@ async fn scenario() -> anyhow::Result<()> {
     let mut client = Client::connect(endpoint, identity, BUDGET).await?;
     client.probe(SHARD).await?;
     let initial = client.metadata(SHARD).await?;
-    assert_eq!(
-        initial,
-        remote::metadata_identified(cluster.tcp(cluster.leader), identity, SHARD, BUDGET).await?
-    );
+    assert_eq!(initial, (SHARD, 3, 0));
     let request = write(1, Some(initial.2));
     assert!(
         matches!(client.write(request.clone()).await?, D1Result::Write { status: D1WriteStatus::Committed, sequence, applied_operations: 1 } if sequence == initial.2+1)
@@ -256,15 +251,11 @@ async fn scenario() -> anyhow::Result<()> {
     }
     // Metadata deliberately retains the existing local-read semantics. It is
     // not a leader barrier and must not be advertised as a linearizable read.
-    assert_eq!(
-        other.metadata(SHARD).await?,
-        remote::metadata_identified(
-            cluster.tcp(follower),
-            cluster.identity(follower),
-            SHARD,
-            BUDGET
-        )
-        .await?
+    let local = other.metadata(SHARD).await?;
+    assert_eq!((local.0, local.1), (SHARD, 3));
+    assert!(
+        local.2 <= committed.2,
+        "follower local metadata cannot be ahead of committed leader"
     );
     let mut too_many = write(3, None);
     too_many.operations = vec![WriteOp::Delete { key: vec![1] }; d2_raft::MAX_BATCH_OPERATIONS + 1];
@@ -286,7 +277,10 @@ async fn scenario() -> anyhow::Result<()> {
     assert_eq!(client.metadata(SHARD).await?, committed);
     malformed(endpoint, identity).await?;
     late_body_cannot_commit(endpoint, identity).await?;
-    // Wrong protocol never falls back. The legacy endpoint remains comparison-only.
+    // Wrong protocol never falls back. The retired legacy port must not listen.
+    assert!(TcpStream::connect(cluster.tcp(cluster.leader))
+        .await
+        .is_err());
     if let Ok(mut wrong_transport) = Client::connect(
         cluster.tcp(cluster.leader),
         identity,
@@ -304,6 +298,8 @@ async fn scenario() -> anyhow::Result<()> {
     assert_eq!(client.metadata(SHARD).await?, committed);
     cli_checks(endpoint, cluster.tcp(cluster.leader), identity, committed.2).await?;
     unknown_outcome(endpoint, identity).await?;
+    cached_adapter_unknown_outcome(endpoint, identity).await?;
+    server_query_cli(endpoint, identity).await?;
     Ok(())
 }
 
@@ -491,6 +487,62 @@ async fn unknown_outcome(endpoint: SocketAddr, identity: RemoteIdentity) -> anyh
     Ok(())
 }
 
+async fn cached_adapter_unknown_outcome(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+) -> anyhow::Result<()> {
+    use replicated_graph::{run_blocking, RemoteStorageNode};
+    use velagraph::{StorageNode, StorageNodeError, WriteRequest, WriteStatus};
+    let proxy = Proxy::start(endpoint).await?;
+    let adapter = RemoteStorageNode::new_identified(
+        proxy.address,
+        identity.group,
+        identity.node,
+        SHARD,
+        Duration::from_millis(500),
+    )?;
+    let mut direct = Client::connect(endpoint, identity, BUDGET).await?;
+    let epoch = direct.metadata(SHARD).await?.1;
+    let request = |id| WriteRequest {
+        shard: SHARD,
+        epoch,
+        request_id: [id; 16],
+        operations: vec![velagraph::WriteOp::Put {
+            key: b"cached-adapter-unknown-outcome".to_vec(),
+            value: vec![id],
+        }],
+    };
+    // Warm the same cached channel with a completed write, then lose its next reply.
+    let warm = adapter.clone();
+    let warm_request = request(11);
+    run_blocking(move || warm.batch_write(warm_request)).await??;
+    let before = direct.metadata(SHARD).await?.2;
+    let pending_adapter = adapter.clone();
+    let pending_request = request(12);
+    proxy.paused.send(true)?;
+    let pending = tokio::spawn(run_blocking(move || {
+        pending_adapter.batch_write(pending_request)
+    }));
+    timeout(BUDGET, proxy.blocked.notified())
+        .await
+        .context("cached write reply gate")?;
+    let result = timeout(Duration::from_secs(2), pending).await???;
+    assert!(
+        matches!(result, Err(StorageNodeError::Timeout {request_id:Some(id)}) if id == [12;16]),
+        "cached adapter must preserve ambiguous write identity: {result:?}"
+    );
+    proxy.paused.send(false)?;
+    ensure!(
+        direct.metadata(SHARD).await?.2 == before + 1,
+        "cached write committed despite a missing reply"
+    );
+    // Only an explicit application resubmission resolves the ambiguous outcome.
+    let replay = request(12);
+    let result = run_blocking(move || adapter.batch_write(replay)).await??;
+    ensure!(result.status == WriteStatus::Duplicate && result.sequence == before + 1);
+    Ok(())
+}
+
 async fn late_body_cannot_commit(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
@@ -611,5 +663,95 @@ async fn late_body_cannot_commit(
         "expired request wrote its value"
     );
     snapshots.close(descriptor, BUDGET).await?;
+    Ok(())
+}
+
+// The product node now has one graph endpoint: storage routing and both text
+// query CLI modes must work on it, not only the low-level operations service.
+async fn server_query_cli(endpoint: SocketAddr, identity: RemoteIdentity) -> anyhow::Result<()> {
+    use replicated_graph::{run_blocking, RemoteStorageNode};
+    use velagraph::{experimental_graph::AppendOnlyStore, GraphRecordStore, Value, Vertex};
+    let node =
+        RemoteStorageNode::new_identified(endpoint, identity.group, identity.node, SHARD, BUDGET)?;
+    run_blocking(move || -> anyhow::Result<()> {
+        let mut vertex = Vertex::new(777);
+        vertex
+            .properties
+            .insert("name".into(), Value::Text("rpc-query".into()));
+        GraphRecordStore::new(node.clone(), SHARD, 23).create_vertex(&vertex)?;
+        AppendOnlyStore::new(node.clone(), SHARD, 24)
+            .prepare_vertex(&vertex)?
+            .submit(&node)?;
+        Ok(())
+    })
+    .await??;
+    let dir = tempfile::tempdir()?;
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "version":1, "timeout_ms":5000,
+            "metadata":{"shard":99,"group":88,"epoch":1,"replicas":[1]},
+            "metadata_node":1,
+            "metadata_nodes":[{"group":88,"node":1,"endpoint":"127.0.0.1:9"}],
+            "data_nodes":[{"group":identity.group,"node":identity.node,"endpoint":endpoint}]
+        }))?,
+    )?;
+    for (mode, partition) in [("v1", 23), ("experimental", 24)] {
+        let output = dir.path().join(format!("{mode}.json"));
+        let file = std::fs::File::create(&output)?;
+        let mut child = Process(
+            Command::new(env!("CARGO_BIN_EXE_graph-client"))
+                .env("TOKIO_WORKER_THREADS", "2")
+                .args([
+                    "--allow-insecure-development",
+                    "--config",
+                    config.to_str().unwrap(),
+                    mode,
+                    "server-query",
+                    "--group",
+                    &identity.group.to_string(),
+                    "--node",
+                    &identity.node.to_string(),
+                    "--shard",
+                    &SHARD.to_string(),
+                    "--partition",
+                    &partition.to_string(),
+                    "--query",
+                    "g.V(777).values('name')",
+                ])
+                .stdout(Stdio::from(file))
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+        let status = timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(status) = child.0.try_wait()? {
+                    return Ok::<_, std::io::Error>(status);
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        assert!(status.success(), "{mode} typed server-query CLI failed");
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(output)?)?;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["execution"], "server");
+        let rows = result["output"]["rows"].as_array().context("query rows")?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "selected vertex must produce exactly one value"
+        );
+        let source = if mode == "v1" {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({"Vertex":{"partition":partition,"id":777}})
+        };
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"Value":{"source":source,"value":{"Text":"rpc-query"}}})
+        );
+    }
     Ok(())
 }

@@ -1,5 +1,7 @@
 //! Typed single-shard operations on the existing graph gRPC endpoint.
 //! No forwarding, retry, legacy fallback or new consistency semantics.
+#[cfg(test)]
+use super::metadata_benchmark::{phase, Phase};
 use super::{
     paged::grpc, D1Result, D1WriteRequest, Operation, RemoteError, RemoteIdentity, Reply,
     MAX_DEADLINE, MAX_FRAME_BYTES, VERSION,
@@ -12,7 +14,7 @@ pub mod wire {
     include!("operations_grpc/operations_proto.rs");
 }
 pub(crate) mod bounded;
-mod codec;
+pub(in crate::remote) mod codec;
 use wire::shard_operations_client::ShardOperationsClient;
 use wire::shard_operations_server::{ShardOperations, ShardOperationsServer};
 
@@ -115,12 +117,22 @@ impl ShardOperations for grpc::Handler {
             group: identity.group,
             node: identity.node,
         };
+        #[cfg(test)]
+        let measured = Instant::now();
         let op = codec::operation(
             r.operation
                 .ok_or_else(|| grpc::status(RemoteError::InvalidArgument))?,
         )
         .map_err(grpc::status)?;
+        #[cfg(test)]
+        phase(identity.group, Phase::ServerDecode, measured);
+        #[cfg(test)]
+        let measured = Instant::now();
         logical_request(identity, &op, end).map_err(grpc::status)?;
+        #[cfg(test)]
+        phase(identity.group, Phase::ServerLogicalRequest, measured);
+        #[cfg(test)]
+        let measured = Instant::now();
         let request_id = match &op {
             Operation::Write(w) => Some(w.request_id),
             _ => None,
@@ -135,7 +147,15 @@ impl ShardOperations for grpc::Handler {
             .await
             .map(|(reply, _)| reply)
             .map_err(|e| retain_id(e, request_id));
+        #[cfg(test)]
+        phase(identity.group, Phase::ServerExecute, measured);
+        #[cfg(test)]
+        let measured = Instant::now();
         logical_response(&result, end).map_err(grpc::status)?;
+        #[cfg(test)]
+        phase(identity.group, Phase::ServerLogicalResponse, measured);
+        #[cfg(test)]
+        let measured = Instant::now();
         let response = codec::response(result).map_err(grpc::status)?;
         if response.encoded_len() > MAX_FRAME_BYTES {
             return Err(grpc::status(RemoteError::ResourceExhausted));
@@ -143,6 +163,8 @@ impl ShardOperations for grpc::Handler {
         if Instant::now() >= end {
             return Err(grpc::status(RemoteError::Timeout { request_id }));
         }
+        #[cfg(test)]
+        phase(identity.group, Phase::ServerEncode, measured);
         Ok(grpc::response(response, end))
     }
 }
@@ -154,10 +176,12 @@ fn retain_id(e: RemoteError, id: Option<[u8; 16]>) -> RemoteError {
 }
 /// One RPC per operation; the original write identity survives ambiguous timeouts.
 /// Connect and each operation have separate bounded budgets; operations never replay.
+#[derive(Clone)]
 pub struct Client {
     channel: Channel,
     identity: RemoteIdentity,
     timeout: Duration,
+    absolute_deadline: Option<Instant>,
 }
 impl Client {
     pub async fn connect(
@@ -182,15 +206,27 @@ impl Client {
             channel,
             identity,
             timeout,
+            absolute_deadline: None,
         })
     }
+    pub(crate) fn with_deadline(mut self, end: Instant) -> Self {
+        self.absolute_deadline = Some(end);
+        self
+    }
     async fn call(&mut self, op: Operation) -> Result<Reply, RemoteError> {
-        let end = Instant::now() + self.timeout;
+        #[cfg(test)]
+        let total = Instant::now();
+        let end = self.absolute_deadline.map_or_else(
+            || Instant::now() + self.timeout,
+            |end| end.min(Instant::now() + self.timeout),
+        );
         let id = match &op {
             Operation::Write(w) => Some(w.request_id),
             _ => None,
         };
         let future = async {
+            #[cfg(test)]
+            let measured = Instant::now();
             let _permit = super::CLIENT_ADMISSION
                 .try_acquire()
                 .map_err(|_| RemoteError::ResourceExhausted)?;
@@ -213,19 +249,32 @@ impl Client {
             let mut client = ShardOperationsClient::new(self.channel.clone())
                 .max_decoding_message_size(MAX_FRAME_BYTES)
                 .max_encoding_message_size(MAX_FRAME_BYTES);
+            #[cfg(test)]
+            phase(self.identity.group, Phase::ClientPrepare, measured);
+            #[cfg(test)]
+            let measured = Instant::now();
             let response = client
                 .call(request)
                 .await
                 .map_err(grpc::remote_status)?
                 .into_inner();
+            #[cfg(test)]
+            phase(self.identity.group, Phase::ClientAwait, measured);
+            #[cfg(test)]
+            let measured = Instant::now();
             let result = codec::reply(response)?;
             logical_response(&result, end)?;
+            #[cfg(test)]
+            phase(self.identity.group, Phase::ClientFinish, measured);
             result
         };
-        timeout_at(end, future)
+        let result = timeout_at(end, future)
             .await
             .map_err(|_| RemoteError::Timeout { request_id: id })?
-            .map_err(|e| retain_id(e, id))
+            .map_err(|e| retain_id(e, id));
+        #[cfg(test)]
+        phase(self.identity.group, Phase::ClientTotal, total);
+        result
     }
     pub async fn probe(&mut self, shard: u64) -> Result<(), RemoteError> {
         match self.call(Operation::Probe { shard }).await? {
@@ -249,6 +298,33 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn expired_absolute_cap_rejects_before_channel_dispatch_and_keeps_write_id() {
+        let mut client = Client {
+            channel: Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            identity: RemoteIdentity { group: 1, node: 1 },
+            timeout: MAX_DEADLINE,
+            absolute_deadline: None,
+        }
+        .with_deadline(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            client.probe(7).await,
+            Err(RemoteError::Timeout { request_id: None })
+        ));
+        let write = D1WriteRequest {
+            shard: 7,
+            epoch: 1,
+            request_id: [3; 16],
+            expected_sequence: None,
+            operations: vec![d2_raft::WriteOp::Put {
+                key: vec![1],
+                value: vec![2],
+            }],
+        };
+        assert!(
+            matches!(client.write(write).await,Err(RemoteError::Timeout{request_id:Some(id)}) if id==[3;16])
+        );
+    }
     #[test]
     fn canonical_write_boundary_matches_legacy_request_not_compact_protobuf() {
         let identity = RemoteIdentity { group: 1, node: 2 };

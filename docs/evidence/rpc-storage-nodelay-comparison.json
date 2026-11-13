@@ -1,0 +1,39 @@
+{
+  "kind": "same-host diagnostic, not general benchmark",
+  "baseline_local_commit": "4a944aed310b84d799d12af5ba088c646ac5057e",
+  "baseline_tree": "812a0d7173ec7d314f1225c75c0def46a1767636",
+  "combined_local_commit": "9fc9a0b5cd3a58c7e542b4a79ced1fcf8eab44d2",
+  "combined_tree": "cfc0dd722e7a22dc00125843b23c0ad0a7257f72",
+  "independent_policy_pr": 257,
+  "scope_deadline_seconds": 20,
+  "baseline": {
+    "failed_query": "g.V(1).out().has('missing').out().out().count()",
+    "query_index": 29,
+    "loop_elapsed_seconds": 19.7669,
+    "error": "Graph(Storage(Timeout { request_id: None }))"
+  },
+  "candidate": {
+    "queries": 38,
+    "oracle_seconds": 7.4328,
+    "whole_scenario_seconds": 30.37,
+    "result": "passed"
+  },
+  "original_tcp": {
+    "commit": "26ff73ce999b4e87cbebe8df163ebad1f68609d6",
+    "instrumentation": "only per-query elapsed logging added",
+    "oracle_seconds": 2.862844499,
+    "whole_scenario_seconds": 26.66,
+    "result": "passed",
+    "complex_tests": {
+      "deletion_budget_seconds": 57.97,
+      "experimental_suite_seconds": 45.5,
+      "result": "passed"
+    }
+  },
+  "channel_cache_initial": {
+    "audit_observed_independent": "passed",
+    "deletion_budget": "failed timeout",
+    "experimental": "failed original60s resource-probe scope; age before44.672s",
+    "status": "not accepted; profiling remaining regression"
+  }
+}

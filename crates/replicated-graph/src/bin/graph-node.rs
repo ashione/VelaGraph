@@ -8,7 +8,7 @@ use std::io::Write;
 
 use anyhow::{bail, Context};
 use d2_raft::{D1Command, D1Result, LogCommand, TcpNode, TcpNodeConfig};
-use replicated_graph::remote::GraphService;
+use replicated_graph::remote::{grpc::GrpcSnapshotService, GraphState};
 use std::time::Duration;
 
 #[tokio::main]
@@ -20,7 +20,6 @@ async fn main() -> anyhow::Result<()> {
     let mut data_dir = None;
     let mut bootstrap = None;
     let mut graph_addr = None;
-    let mut grpc_snapshot_addr = None;
     let mut shard = None;
     let mut epoch = None;
     let mut trusted = false;
@@ -28,9 +27,9 @@ async fn main() -> anyhow::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-insecure-development" => trusted = true,
-            "--grpc-snapshot" => {
-                grpc_snapshot_addr = Some(args.next().context("--grpc-snapshot needs a value")?)
-            }
+            "--grpc-snapshot" => bail!(
+                "--grpc-snapshot was removed; --graph is the single typed gRPC graph endpoint"
+            ),
             "--graph" => graph_addr = Some(args.next().context("--graph needs a value")?),
             "--shard" => shard = Some(args.next().context("--shard needs a value")?),
             "--epoch" => epoch = Some(args.next().context("--epoch needs a value")?),
@@ -99,20 +98,10 @@ async fn main() -> anyhow::Result<()> {
         }
     })
     .await??;
-    let service =
-        GraphService::start_identified(&node, graph_addr, group, shard, Duration::from_secs(3))
-            .await?;
-    let grpc_snapshot = if let Some(address) = grpc_snapshot_addr {
-        Some(
-            replicated_graph::remote::grpc::GrpcSnapshotService::start(&service, address.parse()?)
-                .await?,
-        )
-    } else {
-        None
-    };
-    if let Some(grpc) = &grpc_snapshot {
-        println!("grpc-snapshot={}", grpc.local_addr());
-    }
+    let state = GraphState::from_tcp(&node, group, shard, Duration::from_secs(3))?;
+    let service = GrpcSnapshotService::start(&state, graph_addr).await?;
+    // The adapter owns its state references and lifecycle, not a hidden TCP service.
+    drop(state);
     eprintln!("WARNING: plaintext unauthenticated development service; trusted network only");
     println!("graph={}", service.local_addr());
     println!(
@@ -123,9 +112,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Run until the parent kills this process or SIGINT.
     tokio::signal::ctrl_c().await?;
-    if let Some(grpc) = grpc_snapshot {
-        grpc.shutdown().await;
-    }
     service.shutdown().await;
     node.shutdown().await;
     Ok(())

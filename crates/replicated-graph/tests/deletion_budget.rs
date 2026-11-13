@@ -2,7 +2,7 @@
 use replicated_graph::routing::experimental::ExperimentalRouteError;
 use replicated_graph::{
     catalog::{Catalog, Placement},
-    remote::{snapshot_identified, RemoteIdentity},
+    remote::{grpc::paged_snapshot as snapshot_identified, RemoteIdentity},
     routing::{experimental::ObservedRowV3, RemoteReplica, RouteResolver},
     run_blocking,
 };

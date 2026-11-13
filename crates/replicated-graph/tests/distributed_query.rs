@@ -1,5 +1,7 @@
 //! Real independent data processes; coordinator runs in this test process.
 //! This verifies distributed query semantics, not failover or transport security.
+#[path = "support/legacy_graph_node.rs"]
+mod legacy_graph_node;
 use anyhow::{ensure, Context};
 use replicated_graph::{
     catalog::{Catalog, Placement},
@@ -111,6 +113,7 @@ struct Group {
     process: Process,
     _dir: tempfile::TempDir,
     route: PartitionRoute,
+    grpc: SocketAddr,
 }
 impl Group {
     async fn start(partition: u32, shard: u64) -> anyhow::Result<Self> {
@@ -120,14 +123,16 @@ impl Group {
         let raft_addr = raft.local_addr()?;
         let control_addr = control.local_addr()?;
         let endpoint = graph.local_addr()?;
+        let grpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let grpc = grpc_listener.local_addr()?;
         let dir = tempfile::tempdir()?;
-        drop((raft, control, graph));
+        drop((raft, control, graph, grpc_listener));
         let identity = RemoteIdentity {
             group: shard,
             node: 1,
         };
         let process = Process(
-            Command::new(env!("CARGO_BIN_EXE_graph-node"))
+            legacy_graph_node::command()
                 .env("TOKIO_WORKER_THREADS", "2")
                 .args([
                     "--allow-insecure-development",
@@ -141,6 +146,8 @@ impl Group {
                     &control_addr.to_string(),
                     "--graph",
                     &endpoint.to_string(),
+                    "--grpc-snapshot",
+                    &grpc.to_string(),
                     "--shard",
                     &shard.to_string(),
                     "--epoch",
@@ -168,6 +175,7 @@ impl Group {
         .await?;
         Ok(Self {
             process,
+            grpc,
             _dir: dir,
             route: PartitionRoute {
                 partition,
@@ -624,6 +632,7 @@ fn legacy_oracle(
     let data = routes.iter().map(replica).collect::<Vec<_>>();
     let resolver = RouteResolver::new_remote(metadata_placement, &[replica(&metadata)], &data)?;
     let session = resolver.experimental_read_session(BUDGET)?;
+    let oracle_started = std::time::Instant::now();
     let mut out = Vec::new();
     for text in [
         "g.V(1).out('knows').path()",
@@ -665,7 +674,14 @@ fn legacy_oracle(
         "g.V(1).in().in().limit(1).in().path()",
         "g.V(999).in().count()",
     ] {
-        let observed = session.observed_gremlin_v3(0, text)?;
+        let query_started = std::time::Instant::now();
+        let observed = session.observed_gremlin_v3(0, text)
+            .with_context(|| format!("legacy semantic oracle over typed storage: {text}; query_elapsed={:?}; total_elapsed={:?}", query_started.elapsed(), oracle_started.elapsed()))?;
+        eprintln!(
+            "legacy oracle query_elapsed={:?} total_elapsed={:?} text={text}",
+            query_started.elapsed(),
+            oracle_started.elapsed()
+        );
         let rows = observed
             .rows
             .into_iter()
@@ -756,8 +772,11 @@ async fn scenario() -> anyhow::Result<()> {
     a.seed(a_data).await?;
     b.seed(b_data).await?;
     let metadata = Group::start(99, 110).await?;
-    let metadata_route = metadata.route.clone();
-    let oracle_routes = vec![a.route.clone(), b.route.clone()];
+    let mut metadata_route = metadata.route.clone();
+    metadata_route.endpoint = metadata.grpc;
+    let mut oracle_routes = vec![a.route.clone(), b.route.clone()];
+    oracle_routes[0].endpoint = a.grpc;
+    oracle_routes[1].endpoint = b.grpc;
     let oracle = run_blocking(move || legacy_oracle(metadata_route, oracle_routes)).await??;
     let ap = AuditProxy::start(a.route.endpoint).await?;
     let bp = AuditProxy::start(b.route.endpoint).await?;

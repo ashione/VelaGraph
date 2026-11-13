@@ -1,4 +1,6 @@
 //! Real TCP/three-process pushdown; no failover or transport-security claims.
+#[path = "support/legacy_graph_node.rs"]
+mod legacy_graph_node;
 use anyhow::{ensure, Context};
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{
@@ -15,7 +17,7 @@ use replicated_graph::{
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -350,7 +352,7 @@ async fn scenario() -> anyhow::Result<()> {
         .collect::<std::io::Result<Vec<_>>>()?;
     let mut processes = Vec::new();
     for i in 0..3 {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_graph-node"));
+        let mut c = legacy_graph_node::command();
         // Keep fixture runtime threads bounded on high-core shared hosts.
         c.env("TOKIO_WORKER_THREADS", "2");
         c.args([

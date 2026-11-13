@@ -170,3 +170,10 @@ message JobPage { bytes token = 1; uint64 cursor = 2; optional uint64 next_curso
 message JobProgress { bytes token = 1; uint64 next_sequence = 2; bool complete = 3; optional uint64 count = 4; Completeness completeness = 5; repeated QueryStamp snapshots = 6; }
 message CoordinatorJobOutput { oneof kind { JobProjectedPage projected_page = 1; JobPreparing preparing = 2; JobPage page = 3; JobProgress progress = 4; Empty cancelled = 5; } }
 message CoordinatorJobResponse { oneof result { CoordinatorJobOutput output = 1; QueryFailure failure = 2; } }
+
+// Single-partition text execution shares the original executor and row contract.
+service SingleQueryService { rpc Query(SingleQueryRequest) returns (SingleQueryResponse); }
+enum SingleQueryMode { SINGLE_QUERY_MODE_UNSPECIFIED = 0; V1 = 1; V2_OBSERVED = 2; }
+message SingleQueryRequest { Context context = 1; uint64 shard = 2; uint32 partition = 3; SingleQueryMode mode = 4; string text = 5; }
+message SingleQueryOutput { uint32 partition = 1; SingleQueryMode mode = 2; Completeness completeness = 3; QueryStamp snapshot = 4; repeated QueryRow rows = 5; }
+message SingleQueryResponse { oneof result { SingleQueryOutput output = 1; QueryFailure failure = 2; } }

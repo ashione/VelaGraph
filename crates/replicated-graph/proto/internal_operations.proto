@@ -12,3 +12,8 @@ message NotLeader { optional uint64 leader = 1; }
 message Timeout { optional bytes request_id = 1; }
 message RemoteFailure { oneof kind { NotLeader not_leader = 1; velagraph.internal.managed.v1.ApplicationError application = 2; Empty invalid_argument = 3; Empty resource_exhausted = 4; Empty unavailable = 5; Timeout timeout = 6; Empty session_unavailable = 7; Empty protocol = 8; } }
 message Response { uint32 version = 1; oneof result { Empty probe = 2; Metadata metadata = 3; WriteResult write = 4; RemoteFailure error = 5; } }
+// Reuses the channel without reusing a Metadata result. Every message executes
+// the original local-epoch check. IDs are strictly increasing within one stream.
+service MetadataService { rpc Exchange(stream MetadataRequest) returns (stream MetadataResponse); }
+message MetadataRequest { uint32 version = 1; uint64 id = 2; Identity identity = 3; uint64 shard = 4; uint64 timeout_millis = 5; }
+message MetadataResponse { uint32 version = 1; uint64 id = 2; oneof result { Metadata metadata = 3; RemoteFailure error = 4; } }

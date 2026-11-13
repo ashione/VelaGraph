@@ -1,7 +1,7 @@
 # Static remote catalog and graph routing (development only)
 
 This increment connects the existing immutable catalog and bounded resolver to
-independent TCP server processes. It closes the normal partition-aware path:
+independent gRPC server processes. It closes the normal partition-aware path:
 metadata quorum snapshot → fixed data group/replica selection → graph snapshot,
 prepared CRUD, and client-side standard Gremlin. It is **not D3 completion**:
 no route cache, membership changes, automatic failover guarantees, migration,
@@ -104,3 +104,10 @@ leader replacement, partitions, ambiguous committed-write recovery or remote
 snapshot installation during graph traffic. It proves no cross-shard snapshot
 or atomic transaction, online migration, authenticated isolation or power-loss
 safety. Those remain separate future work rather than implied by normal routing.
+
+## RPC-only default storage chain
+
+`RemoteStorageNode::new_identified` uses typed probe/metadata/write and paged
+snapshots. Identity-free `new` is removed: provide the configured group/node.
+Catalog/routing keep the same candidate selection, epoch checks, prepared-write
+identity and absolute scoped deadlines; they never fall back to legacy JSON.

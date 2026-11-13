@@ -44,6 +44,14 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
 - **单分片操作切片**：[#254](https://github.com/ashione/VelaGraph/issues/254) 为 Probe/Metadata/Write
   增加 typed gRPC 服务与显式 CLI，复用原 handler、写入身份及容量边界。旧 catalog/routing adapter
   和 GraphService listener 的完整迁移/退役仍是后续验收项，不能视为 #218 全部完成。
+- **默认存储链与listener退役**：[#256](https://github.com/ashione/VelaGraph/issues/256) 将
+  RemoteStorageNode/catalog/routing默认链、单分片server-query切到typed RPC；graph-node仅
+  --graph一个typed入口，拒绝旧--grpc-snapshot双端口选项。旧wire专项测试使用test-only子进程
+  fixture保留断言，不恢复产品legacy listener。其余library/coordinator/gateway/Unix退役仍待验收。
+- **通用Metadata RPC成本**：[#258](https://github.com/ashione/VelaGraph/issues/258) 是 #256 的性能验收前置项。
+  使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
+  场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/
+  资源饱和及原复杂用例共同验收，见 [Metadata stream](METADATA_STREAM.md)。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、

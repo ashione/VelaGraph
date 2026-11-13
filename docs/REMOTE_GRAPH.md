@@ -25,7 +25,7 @@ Startup explicitly activates D1 with the supplied shard/epoch. Each process
 waits up to 30 seconds for activation; only a leader can submit it. Existing
 stored ownership must match exactly. Startup never changes an existing epoch.
 Use `--bootstrap` only for first initialization, not a populated cluster restart.
-Send SIGINT for graceful shutdown. The legacy `d2-ctl <control> status` exposes
+Send SIGINT for graceful shutdown. The typed-RPC `d2-ctl <control> status` exposes
 leader ID; callers select its configured graph address themselves. Leader hints
 are IDs, never trusted arbitrary network addresses.
 
@@ -33,7 +33,7 @@ Construct the adapter on a live Tokio runtime, then execute synchronous graph
 work through `run_blocking`:
 
 ```rust,ignore
-let node = RemoteStorageNode::new("127.0.0.1:7301".parse()?, 7,
+let node = RemoteStorageNode::new_identified("127.0.0.1:7301".parse()?, 0, 1, 7,
                                   Duration::from_secs(2))?;
 let graph = Arc::new(GraphRecordStore::new(node, 7, 0));
 run_blocking(move || {
@@ -43,9 +43,12 @@ run_blocking(move || {
 ```
 
 The endpoint must be the current leader for new views and writes. There is no
-automatic leader discovery, forwarding, retry, failover, or connection pool.
-The Rust library is the client interface; there is no HTTP or general-purpose
-remote Gremlin server. All six existing graph CRUD operations and the existing
+automatic leader discovery, forwarding, application retry, or failover.
+Clones reuse successful unary Channels and a separate bounded Metadata stream;
+these are transport reuse, not an endpoint/leader-discovery pool.
+The default adapter uses typed gRPC for probe/metadata/write and bounded snapshot
+download. `--graph` is the only graph listener; `--grpc-snapshot` is rejected.
+Server-query CLI uses the explicit single-partition typed query service. All six existing graph CRUD operations and the existing
 supported Gremlin subset use the same graph formats and parser, unchanged.
 
 ## Snapshot consistency and limits
@@ -54,17 +57,20 @@ A snapshot RPC performs a leader/quorum read barrier, then captures shard,
 epoch, sequence, and opaque entries under one state-machine lock. No partial
 snapshot succeeds. The client executes Gremlin against the resulting immutable
 `ReadView`. Each point/scan/page operation checks the selected server's locally
-applied epoch through a separate metadata RPC; it never substitutes a newer
-snapshot. This is not a new linearizable barrier: a replica may not yet know a
+applied epoch through a new message on the bounded metadata RPC stream; no
+epoch result is cached and it never substitutes a newer snapshot. This is not a new linearizable barrier: a replica may not yet know a
 new ownership epoch. A retained view is historical, and an unavailable selected
 server can prevent using it even though the bytes are copied locally.
+See [Metadata stream](METADATA_STREAM.md) for correlation, connection and stream
+budgets, deadline handling, slow-reader availability limits, and validation.
 
 `RemoteStorageNode::read_view` now downloads a fixed server session through
 bounded pages, then constructs the same **complete local `ReadView`**. It is
 not an on-demand remote view: all shard bytes are transferred before success.
 Point reads, local scan cursors and Gremlin retain their existing semantics.
 The old `snapshot` / `snapshot_identified` APIs and single `Snapshot` RPC remain
-available with their original 2 MiB / 100,000-row limits, without silent fallback.
+only as explicit legacy library/parity APIs with their original 2 MiB /
+100,000-row limits; graph-node no longer serves that wire. There is no fallback.
 
 `open_snapshot` performs the barrier and captures one immutable copy. Its
 versioned descriptor binds server group/node, random startup incarnation,
@@ -85,8 +91,8 @@ after Close/expiry. Page response copies are separately bounded by the existing
 16-handler cap times 2 MiB, plus at most 16 MiB encoded frame per handler.
 A fixed 60-second lifetime starts at admission and is never renewed by paging;
 a 100-ms cleanup loop reclaims expired sessions. Close releases the registry
-reference. Disconnected clients or lost Open responses rely on TTL; connections
-are single-RPC and do not own the session. Shutdown drops all registry state.
+reference. Disconnected clients or lost Open responses rely on TTL; channels
+do not own the session. Shutdown drops all registry state.
 Process restart changes incarnation and cannot resume prior sessions.
 `GraphService::snapshot_stats` reports locally reserved sessions/payload, pages
 served and expired sessions; it adds no remote administrative endpoint.
@@ -107,13 +113,19 @@ successful results after the deadline.
 Active complete-download assembly has process-wide admission of 16 operations,
 128 MiB payload and four million rows. These permits cover download assembly,
 not caller-retained returned snapshots/ReadViews. Payload plus row/object and
-frame caps are not exact heap/RSS guarantees. Wire JSON bodies remain capped at
-16 MiB, including byte-array expansion, with a four-byte big-endian length
-prefix. A legal local D1 batch may not fit the remote frame and fails explicitly.
+frame caps are not exact heap/RSS guarantees. Typed unary shard operations
+preserve the historical 16 MiB canonical-JSON logical budget (including byte-array
+expansion) in addition to protobuf wire/allocation limits; JSON is not the new
+wire format. The explicit legacy library retains its length-prefixed JSON frame.
+A legal local D1 batch may not fit the remote budget and fails explicitly.
 Existing D1 writes, dedup and query execution limits are unchanged.
 
-The server admits at most 16 concurrent connections; adapter clones share 32
-outstanding operations. Direct async clients share a 16-RPC process-wide cap.
+The typed graph listener admits at most 32 concurrent connections, including
+snapshots and dedicated metadata Channels. This is a finite total, not a promise
+that 16 independent adapters can use every protocol simultaneously. Metadata has
+16 shared stream slots in GraphState; its per-message work shares the existing
+16-operation admission. Adapter clones share 32 outstanding operations. Direct
+async clients share a 16-RPC process-wide cap.
 Deadlines are positive and at most 60 seconds. Frames and operations have absolute deadlines.
 Service shutdown cancels and joins connection handlers; already submitted Raft
 commands may still commit. Socket

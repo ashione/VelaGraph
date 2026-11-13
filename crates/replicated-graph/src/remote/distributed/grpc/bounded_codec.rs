@@ -56,12 +56,12 @@ fn decode_checked<U: Message + Default + BoundedMessage, B: Buf>(buf: &mut B) ->
         return Err(limit());
     }
     let ingress_limit = match schema {
-        Schema::CoordinatorQueryRequest | Schema::CoordinatorJobRequest => {
-            Some(crate::remote::query::MAX_QUERY_TEXT_BYTES + 1024)
-        }
-        Schema::CoordinatorQueryResponse | Schema::CoordinatorJobResponse => {
-            Some(super::super::MAX_WIRE)
-        }
+        Schema::SingleQueryRequest
+        | Schema::CoordinatorQueryRequest
+        | Schema::CoordinatorJobRequest => Some(crate::remote::query::MAX_QUERY_TEXT_BYTES + 1024),
+        Schema::SingleQueryResponse
+        | Schema::CoordinatorQueryResponse
+        | Schema::CoordinatorJobResponse => Some(super::super::MAX_WIRE),
         _ => None,
     };
     if ingress_limit.is_some_and(|max| buf.remaining() > max) {
@@ -80,6 +80,9 @@ fn limit() -> Status {
 }
 #[derive(Clone, Copy)]
 pub enum Schema {
+    SingleQueryRequest,
+    SingleQueryOutput,
+    SingleQueryResponse,
     CoordinatorValue,
     CoordinatorQueryRequest,
     QualifiedElement,
@@ -179,6 +182,9 @@ const MAX_TERMINAL_SEGMENTS: usize =
 #[rustfmt::skip]
 fn fields(s: Schema) -> &'static [Field] {
  match s {
+ Schema::SingleQueryRequest => &[Field {tag:1,kind:Kind::Child(Schema::Context),max:1,repeated:false}, Field {tag:2,kind:Kind::Varint,max:1,repeated:false}, Field {tag:3,kind:Kind::Varint,max:1,repeated:false}, Field {tag:4,kind:Kind::Varint,max:1,repeated:false}, Field {tag:5,kind:Kind::Bytes(None),max:1,repeated:false}],
+ Schema::SingleQueryOutput => &[Field {tag:1,kind:Kind::Varint,max:1,repeated:false},Field {tag:2,kind:Kind::Varint,max:1,repeated:false},Field {tag:3,kind:Kind::Varint,max:1,repeated:false},Field {tag:4,kind:Kind::Child(Schema::QueryStamp),max:1,repeated:false},Field {tag:5,kind:Kind::Child(Schema::QueryRow),max:crate::remote::query::MAX_QUERY_ROWS,repeated:true}],
+ Schema::SingleQueryResponse => &[Field {tag:1,kind:Kind::Child(Schema::SingleQueryOutput),max:1,repeated:false},Field {tag:2,kind:Kind::Varint,max:1,repeated:false}],
  Schema::CoordinatorQueryRequest => &[Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Bytes(None), max: 1, repeated: false }],
  Schema::QualifiedElement => &[Field { tag: 1, kind: Kind::Child(Schema::VertexId), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::VertexId), max: 1, repeated: false }],
  Schema::QueryPath => &[Field { tag: 1, kind: Kind::Child(Schema::QualifiedElement), max: super::super::MAX_WIRE, repeated: true }],
@@ -340,6 +346,15 @@ fn scan(schema: Schema, mut data: &[u8], depth: usize, batches: usize) -> Result
         let size = match (field.kind, wt) {
             (Kind::Varint, 0) => {
                 let n = varint(&mut data)?;
+                if ((matches!(schema, Schema::SingleQueryRequest) && matches!(tag, 3 | 4))
+                    || (matches!(schema, Schema::SingleQueryOutput) && matches!(tag, 1..=3))
+                    || (matches!(schema, Schema::SingleQueryResponse) && tag == 2)
+                    || (matches!(schema, Schema::Context) && tag == 1))
+                    && n > u32::MAX as u64
+                {
+                    return Err(bad());
+                }
+
                 if matches!(schema, Schema::TerminalRecord) && tag == 5 {
                     match n {
                         1 => 8,
@@ -422,6 +437,7 @@ fn scan(schema: Schema, mut data: &[u8], depth: usize, batches: usize) -> Result
         | Schema::QualifiedElement
         | Schema::QueryRow
         | Schema::CoordinatorQueryResponse
+        | Schema::SingleQueryResponse
         | Schema::CoordinatorJobOutput
         | Schema::CoordinatorJobResponse => Some(counts.iter().sum::<usize>()),
         Schema::CoordinatorJobRequest => Some(counts[2..].iter().sum::<usize>()),
@@ -780,4 +796,35 @@ mod coordinator_tests {
             request
         );
     }
+}
+
+impl BoundedMessage for wire::SingleQueryRequest {
+    fn schema() -> Schema {
+        Schema::SingleQueryRequest
+    }
+}
+impl BoundedMessage for wire::SingleQueryResponse {
+    fn schema() -> Schema {
+        Schema::SingleQueryResponse
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn single_query_prescan_rejects_duplicate_result_overflow_and_oversize() {
+    for bytes in [vec![0x10, 1, 0x10, 2], vec![0x0a, 0, 0x10, 1]] {
+        assert!(decode_checked::<wire::SingleQueryResponse, _>(&mut bytes.as_slice()).is_err());
+    }
+    // Mode 2^32+1 must not truncate to V1.
+    let overflow = [0x20, 0x81, 0x80, 0x80, 0x80, 0x10];
+    assert!(decode_checked::<wire::SingleQueryRequest, _>(&mut overflow.as_slice()).is_err());
+    let request = wire::SingleQueryRequest {
+        context: None,
+        shard: 7,
+        partition: 0,
+        mode: 1,
+        text: "x".repeat(crate::remote::query::MAX_QUERY_TEXT_BYTES + 1024),
+    }
+    .encode_to_vec();
+    assert!(decode_checked::<wire::SingleQueryRequest, _>(&mut request.as_slice()).is_err());
 }
