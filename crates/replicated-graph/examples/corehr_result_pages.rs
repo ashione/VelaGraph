@@ -932,8 +932,7 @@ async fn execute(
     }
     .await;
     if let Some(token) = saved_token {
-        let cancel =
-            rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
+        let cancel = rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
         let after = rpc::job(
             endpoint,
             Request::Read { token, cursor: 0 },

@@ -192,8 +192,7 @@ async fn execute_job(
         anyhow::bail!("driver request ceiling exceeded")
     }).await.map_err(|_|anyhow::anyhow!("135-second driver safety timeout")).and_then(|r|r);
     if let Some(token) = token_saved {
-        let cancel =
-            rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
+        let cancel = rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
         let unavailable = rpc::job(
             endpoint,
             Request::Advance { token, sequence: 0 },
@@ -275,8 +274,7 @@ async fn cancel_active_job(endpoint: std::net::SocketAddr) -> anyhow::Result<()>
         anyhow::bail!("partial job unexpectedly completed")
     };
     ensure!(t == token && s == next_sequence + 1 && snapshots == v);
-    let cancel =
-        rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await??;
+    let cancel = rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await??;
     ensure!(matches!(cancel, Output::Cancelled));
     let after = rpc::job(
         endpoint,
