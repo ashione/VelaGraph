@@ -146,8 +146,8 @@ Standard Gremlin / typed graph mutations
 
 The [typed gRPC graph endpoint](docs/INTERNAL_GRPC_SNAPSHOTS.md)
 provides `Open` / `Page` / `Close` over a reusable HTTP/2 channel. It retains the existing snapshot/session budgets without starting a legacy TCP listener. The same endpoint hosts the separate
-[typed observed query-fragment service](docs/INTERNAL_GRPC_QUERIES.md), selected
-explicitly with `graph-coordinator serve-grpc`. A separate
+[typed observed query-fragment service](docs/INTERNAL_GRPC_QUERIES.md), used by
+`graph-coordinator serve` by default. A separate
 [typed fixed-version session service](docs/INTERNAL_GRPC_FIXED_QUERIES.md) is selected
 by the managed gateway's explicit gRPC graph-route constructor.
 The default storage adapter uses a [bounded Metadata RPC stream](docs/METADATA_STREAM.md)
@@ -160,7 +160,8 @@ these plus gRPC graph routes without a transport switch or fallback. It opens on
 the configured public HTTP/gRPC listeners, not an unused legacy gateway port. Observed
 hierarchy shard jobs and [Raft peers](docs/RAFT_GRPC.md) also have typed gRPC paths.
 Observed coordinator query/job ingress now has a typed gRPC service: use
-`graph-coordinator serve-grpc` and client commands with `--grpc`. Legacy coordinator
+`graph-coordinator serve` and unflagged query/hierarchy client commands. The old
+`serve-grpc` command and `--grpc` flag are rejected. Legacy library coordinator
 TCP ingress and remaining legacy library TCP listeners still need retirement;
 [process-node driver/control](docs/CONTROL_GRPC.md) now uses typed gRPC too;
 these internal observed endpoints are not the public managed API.
@@ -230,3 +231,4 @@ crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserve
 See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
+

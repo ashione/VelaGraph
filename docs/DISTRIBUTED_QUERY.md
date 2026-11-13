@@ -9,9 +9,9 @@ v1 queries and client-side observed traversal APIs retain their contracts.
 
 `remote::distributed::CoordinatorService` is the retained legacy TCP service.
 The typed gRPC ingress is `remote::distributed::grpc::GrpcCoordinatorService`,
-selected by `graph-coordinator serve-grpc`; clients use `query --grpc` or
+used by default by `graph-coordinator serve`; clients use `query` or
 `CoordinatorClient::query`. See [transport and migration](INTERNAL_GRPC_QUERIES.md).
-Both reuse the same executor and observed semantics below. The legacy service's
+Both reuse the same executor and observed semantics below. The shared
 `StaticCatalog { partitions: Vec<PartitionRoute> }` is immutable startup
 configuration. Each route identifies a partition, shard, epoch, replica identity
 and endpoint. This entrypoint does **not** read a live metadata catalog and does

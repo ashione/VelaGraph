@@ -1340,6 +1340,26 @@ async fn scenario() -> anyhow::Result<()> {
             vec![QueryRow::Count(1)]
         );
     }
+    // The shipped CLI is typed-only; the surrounding legacy executor oracle
+    // remains explicit and unchanged for differential coverage.
+    let cli_service = distributed::grpc::GrpcCoordinatorService::start(
+        "127.0.0.1:0".parse()?,
+        StaticCatalog {
+            partitions: vec![
+                PartitionRoute {
+                    endpoint: a.grpc,
+                    ..a.route.clone()
+                },
+                PartitionRoute {
+                    endpoint: b.grpc,
+                    ..b.route.clone()
+                },
+            ],
+        },
+        BUDGET,
+    )
+    .await?;
+    let cli_endpoint = cli_service.local_addr();
     let cli = run_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_graph-coordinator"))
             .env("TOKIO_WORKER_THREADS", "2")
@@ -1347,7 +1367,7 @@ async fn scenario() -> anyhow::Result<()> {
                 "query",
                 "--allow-insecure-development",
                 "--endpoint",
-                &endpoint.to_string(),
+                &cli_endpoint.to_string(),
                 "--partition",
                 "0",
                 "--query",
@@ -1363,6 +1383,8 @@ async fn scenario() -> anyhow::Result<()> {
     );
     let cli_output: distributed::DistributedOutput = serde_json::from_slice(&cli.stdout)?;
     assert_eq!(cli_output.rows, vec![QueryRow::Count(4)]);
+
+    cli_service.shutdown().await;
 
     assert_eq!(
         ap.forbidden.load(Ordering::SeqCst) + bp.forbidden.load(Ordering::SeqCst),
