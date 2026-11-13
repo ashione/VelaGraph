@@ -111,8 +111,9 @@ duplicate scan does not remove O(history) work or establish an end-to-end
 Submit/lifecycle speedup. Legacy/in-memory fallback remains separately checked.
 
 Observed coordinator queries and hierarchy jobs have typed gRPC ingress (#248),
-selected by `serve-grpc` plus `--grpc` clients; shared observed execution/Jobs
-contracts remain unchanged. Legacy coordinator ingress remains retirement work,
+used by default by `serve` and unflagged query/hierarchy clients (#260).
+`serve-grpc` and `--grpc` are rejected; shared observed execution/Jobs contracts
+remain unchanged. Legacy library coordinator ingress remains retirement work,
 not a fixed/managed consistency endpoint. See [transport](INTERNAL_GRPC_QUERIES.md).
 
 The public graph-service host now initializes listener-free managed `Service`

@@ -6,32 +6,33 @@ download whole snapshots into a coordinator and does not wrap JSON in protobuf.
 The graph-node `--graph ADDRESS` endpoint hosts snapshots and this separate
 query service; no additional legacy listener is opened.
 
-## Explicit selection
+## Default coordinator transport
 
 Start graph nodes with the usual trusted-network options and
 `--graph 127.0.0.1:PORT`. Catalog `endpoint` fields name those gRPC ports:
 
 ```sh
-graph-coordinator serve-grpc --endpoint 127.0.0.1:9400 \
+graph-coordinator serve --endpoint 127.0.0.1:9400 \
   --catalog grpc-catalog.json --allow-insecure-development
 ```
 
-`serve-grpc` now exposes typed `CoordinatorService.Query` and `.Job` ingress as
-well as gRPC shard backends. Clients must explicitly select `--grpc`, for example:
+`serve` exposes typed `CoordinatorService.Query` and `.Job` ingress and uses
+gRPC shard backends. All query and `hierarchy-*` CLI commands use typed gRPC:
 
 ```sh
-graph-coordinator query --grpc --endpoint 127.0.0.1:9400 \
+graph-coordinator query --endpoint 127.0.0.1:9400 \
   --partition 1 --query 'g.V(1)' --allow-insecure-development
 ```
 
-The same flag applies to every `hierarchy-*` command. `GrpcCoordinatorService`
-and `CoordinatorClient` are the corresponding library APIs. This is a deliberate
-wire change to the CLI `serve-grpc` command; old unflagged TCP clients must migrate.
+`serve-grpc` and the `--grpc` flag are removed and rejected. `GrpcCoordinatorService`
+and `CoordinatorClient` are the corresponding library APIs. Existing deployments
+must migrate both ends together: `serve` no longer accepts the old TCP wire, and
+unflagged clients no longer speak it. Catalog endpoints must name typed shard ports.
 The legacy library `CoordinatorService::start_grpc` still means TCP ingress with
-gRPC shard backends for differential tests; it is not the new typed ingress API.
-Existing `serve`/`CoordinatorService::start` and unflagged clients explicitly
-select legacy TCP. These retained paths remain retirement work under #218. There is no
-protocol probing, fallback, application-request retry, or leader-following.
+gRPC shard backends for differential tests; `CoordinatorService::start` and
+`jobs::request` retain explicit legacy library behavior. These are not CLI modes
+and remain retirement work under #218. There is no protocol probing, fallback,
+application-request retry, or leader-following.
 The tonic channel may reconnect a transport connection; this is not application
 replay or reopening a lost query session. A wrong port or
 identity fails. One channel per unique shard is established during startup and

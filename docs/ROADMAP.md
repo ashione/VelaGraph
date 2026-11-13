@@ -22,7 +22,8 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   跟踪，复用真实 query sessions/admission，显式选择 gRPC coordinator backend。
   详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；observed hierarchy jobs 的 shard
   OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径；[#248](https://github.com/ashione/VelaGraph/issues/248)
-  增加 coordinator observed Query/Job typed gRPC 入口，serve-grpc 与 --grpc 客户端复用原执行器、
+  增加 coordinator observed Query/Job typed gRPC 入口；#260 将 serve/query/jobs 默认统一为 typed RPC，
+  退役 serve-grpc 与 --grpc CLI 选择，保留明确的 legacy library 差分测试；复用原执行器、
   Jobs 状态机及累计预算。旧 coordinator TCP/Unix/兼容入口仍待退役，不能视作全部删除。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；

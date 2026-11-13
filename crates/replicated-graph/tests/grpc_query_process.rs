@@ -1,5 +1,7 @@
 //! Real independent shard processes; TCP versus typed gRPC fragment transport.
 //! Observed semantics only: this does not claim managed/fixed or Raft migration.
+#[path = "support/coordinator_cli.rs"]
+mod coordinator_cli;
 #[path = "support/legacy_graph_node.rs"]
 mod legacy_graph_node;
 use anyhow::Context;
@@ -1077,7 +1079,7 @@ async fn coordinator_ingress_checks(
         Command::new(env!("CARGO_BIN_EXE_graph-coordinator"))
             .env("TOKIO_WORKER_THREADS", "2")
             .args([
-                "serve-grpc",
+                "serve",
                 "--endpoint",
                 &endpoint.to_string(),
                 "--catalog",
@@ -1130,6 +1132,19 @@ async fn coordinator_ingress_checks(
             "coordinator ingress parity: {text}"
         );
     }
+    coordinator_cli::check(
+        endpoint,
+        legacy,
+        serde_json::to_value(client.query(request("g.V(1).count()"), BUDGET).await??)?,
+        hierarchy_count(
+            endpoint,
+            true,
+            "g.V(1).repeat(__.out('knows')).emit().times(2).count()",
+        )
+        .await?,
+        hierarchy_rows(endpoint, true).await?,
+    )
+    .await?;
     let text = "g.V(1,1).repeat(__.out('knows')).emit().times(2).count()";
     assert_eq!(
         hierarchy_count(endpoint, true, text)
