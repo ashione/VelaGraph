@@ -365,16 +365,14 @@ async fn scenario() -> anyhow::Result<()> {
         distributed::consistency::ReadConsistency::IndependentShardSnapshots,
         distributed::consistency::ReadConsistency::GlobalCommittedSnapshot,
     ] {
-        assert!(
-            distributed::consistency::query_with_consistency(
-                grpc.local_addr(),
-                request("g.V(1).count()"),
-                required,
-                BUDGET
-            )
-            .await
-            .is_err()
-        );
+        assert!(distributed::consistency::query_with_consistency(
+            grpc.local_addr(),
+            request("g.V(1).count()"),
+            required,
+            BUDGET
+        )
+        .await
+        .is_err());
     }
     for text in [
         "g.V(1).repeat(__.out('knows')).times(1).count()",
