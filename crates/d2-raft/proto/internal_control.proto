@@ -1,0 +1,27 @@
+syntax = "proto3";
+package velagraph.internal.control.v1;
+import "internal_managed.proto";
+service ControlService { rpc Call(ControlRequest) returns (ControlResponse); }
+message Empty {}
+message CapacityRequest { uint64 shard = 1; uint64 epoch = 2; }
+message SetCapacityRequest { uint64 shard = 1; uint64 epoch = 2; uint64 expected_bytes = 3; uint64 new_bytes = 4; }
+message Member { uint64 id = 1; string addr = 2; }
+message Initialize { repeated Member members = 1; }
+message AddLearner { uint64 id = 1; string addr = 2; bool blocking = 3; }
+message ChangeMembership { repeated uint64 ids = 1; }
+message Write { string key = 1; string value = 2; }
+message Key { string key = 1; }
+message ControlRequest { uint32 version = 1; uint64 timeout_millis = 2; oneof command { CapacityRequest capacity = 3; SetCapacityRequest set_capacity = 4; Initialize initialize = 5; AddLearner add_learner = 6; ChangeMembership change_membership = 7; Write write = 8; Key read = 9; Key get = 10; Empty status = 11; } }
+message Capacity { uint64 bytes_limit = 1; uint64 retained_bytes = 2; uint64 retained_requests = 3; uint64 max_requests = 4; uint64 max_bytes = 5; }
+message CapacityResponse { oneof result { Capacity capacity = 1; velagraph.internal.managed.v1.ApplicationError error = 2; } }
+message HistorySynced { velagraph.internal.managed.v1.HistoryCursor cursor = 1; uint64 applied_prefix = 2; }
+message Activated { uint64 shard = 1; uint64 epoch = 2; }
+enum WriteStatus { WRITE_STATUS_UNSPECIFIED = 0; COMMITTED = 1; DUPLICATE = 2; }
+message ManagedWritesEnabled { bytes mode_id = 1; uint64 activated_sequence = 2; }
+message ManagedWrite { bytes mode_id = 1; uint64 sequence = 2; WriteStatus status = 3; uint64 applied_operations = 4; }
+message WriteResult { uint64 sequence = 1; WriteStatus status = 2; uint64 applied_operations = 3; }
+message ApplicationResult { oneof result { HistorySynced history_synced = 1; uint64 visibility = 2; velagraph.internal.managed.v1.Status participant = 3; uint64 coordinator = 4; Activated activated = 5; uint64 epoch = 6; uint64 dedup_capacity = 7; ManagedWritesEnabled managed_enabled = 8; ManagedWrite managed_write = 9; WriteResult write = 10; } }
+message AdminResponse { oneof result { ApplicationResult value = 1; velagraph.internal.managed.v1.ApplicationError error = 2; } }
+message OptionalValue { optional string value = 1; }
+message NodeStatus { uint64 id = 1; optional uint64 leader = 2; uint64 applied = 3; uint64 last_log = 4; }
+message ControlResponse { oneof result { CapacityResponse capacity = 1; AdminResponse admin = 2; Empty ack = 3; uint64 index = 4; OptionalValue value = 5; NodeStatus status = 6; string error = 7; } }

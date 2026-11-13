@@ -11,7 +11,7 @@ use tonic::{
     Status,
 };
 #[derive(Clone)]
-pub(super) struct AdmittedService<S> {
+pub(crate) struct AdmittedService<S> {
     inner: S,
     admission: Arc<Semaphore>,
     deadline: Duration,
@@ -38,7 +38,7 @@ where
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
-    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
         let Ok(permit) = self.admission.clone().try_acquire_owned() else {
             return Box::pin(async {
                 Ok(Status::resource_exhausted("raft inbound capacity").into_http())
@@ -50,15 +50,32 @@ where
             .and_then(|v| v.to_str().ok())
             .and_then(grpc_timeout)
             .map_or(self.deadline, |d| d.min(self.deadline));
-        let end = Instant::now() + budget;
         let connection = request.extensions().get::<ConnectionStop>().cloned();
-        let watcher = connection.map(|c| Watchdog::new(end, c));
+        let end = connection
+            .as_ref()
+            .and_then(|c| c.1)
+            .map_or(Instant::now() + budget, |accepted| {
+                accepted.min(Instant::now() + budget)
+            });
+        request.extensions_mut().insert(RequestDeadline(end));
+        let watcher = connection.clone().map(|c| Watchdog::new(end, c));
         let future = self.inner.call(request);
         Box::pin(async move {
             let response = match tokio::time::timeout_at(end, future).await {
                 Ok(r) => r?,
                 Err(_) => return Ok(Status::deadline_exceeded("raft deadline").into_http()),
             };
+            let response_end = response
+                .extensions()
+                .get::<RequestDeadline>()
+                .map_or(end, |d| d.0.min(end));
+            let watcher = if response_end < end {
+                drop(watcher);
+                connection.map(|c| Watchdog::new(response_end, c))
+            } else {
+                watcher
+            };
+            let end = response_end;
             Ok(response.map(|body| {
                 tonic::body::Body::new(AdmittedBody {
                     body,
@@ -118,7 +135,7 @@ impl http_body::Body for AdmittedBody {
 }
 
 impl<S> AdmittedService<S> {
-    pub(super) fn new(inner: S, limit: usize, deadline: Duration) -> Self {
+    pub(crate) fn new(inner: S, limit: usize, deadline: Duration) -> Self {
         Self {
             inner,
             admission: Arc::new(Semaphore::new(limit)),
@@ -134,11 +151,12 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-pub(super) struct LimitedIo {
+pub(crate) struct LimitedIo {
     socket: TcpStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
     stop: ConnectionStop,
     cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    _lifetime: Option<Watchdog>,
 }
 impl tonic::transport::server::Connected for LimitedIo {
     type ConnectInfo = ConnectionStop;
@@ -180,7 +198,7 @@ impl AsyncWrite for LimitedIo {
     }
 }
 
-pub(super) fn incoming(
+pub(crate) fn incoming(
     listener: TcpListener,
     stop: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = io::Result<LimitedIo>> {
@@ -192,7 +210,8 @@ pub(super) fn incoming(
                 let token = stop.child_token();
                 Ok(LimitedIo {
                     socket,
-                    stop: ConnectionStop(token.clone()),
+                    _lifetime: None,
+                    stop: ConnectionStop(token.clone(), None),
                     _permit: permit,
                     cancelled: Box::pin(token.cancelled_owned()),
                 })
@@ -202,7 +221,9 @@ pub(super) fn incoming(
 }
 
 #[derive(Clone)]
-pub(super) struct ConnectionStop(CancellationToken);
+pub(crate) struct ConnectionStop(CancellationToken, Option<Instant>);
+#[derive(Clone, Copy)]
+pub(crate) struct RequestDeadline(pub(crate) Instant);
 // Independent of Body::poll_frame: HTTP/2 zero-window peers may never poll it.
 struct Watchdog(tokio::task::JoinHandle<()>);
 impl Watchdog {
@@ -218,20 +239,87 @@ impl Drop for Watchdog {
         self.0.abort();
     }
 }
+// Control retains its original four accepted sockets and accept-to-close budget.
+// Raft's incoming() above deliberately keeps its existing behavior.
+type PermitFuture = Pin<
+    Box<
+        dyn Future<Output = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>>
+            + Send,
+    >,
+>;
+pub(crate) struct BudgetIncoming {
+    listener: TcpListener,
+    permits: Arc<Semaphore>,
+    acquiring: Option<PermitFuture>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    stop: CancellationToken,
+    lifetime: Duration,
+}
+pub(crate) fn incoming_with_limits(
+    listener: TcpListener,
+    stop: CancellationToken,
+    limit: usize,
+    lifetime: Duration,
+) -> BudgetIncoming {
+    BudgetIncoming {
+        listener,
+        permits: Arc::new(Semaphore::new(limit)),
+        acquiring: None,
+        permit: None,
+        stop,
+        lifetime,
+    }
+}
+impl tokio_stream::Stream for BudgetIncoming {
+    type Item = io::Result<LimitedIo>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.permit.is_none() {
+            if self.acquiring.is_none() {
+                self.acquiring = Some(Box::pin(self.permits.clone().acquire_owned()));
+            }
+            match self.acquiring.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(None),
+                Poll::Ready(Ok(permit)) => {
+                    self.acquiring = None;
+                    self.permit = Some(permit);
+                }
+            }
+        }
+        match self.listener.poll_accept(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok((socket, _))) => {
+                let token = self.stop.child_token();
+                let end = Instant::now() + self.lifetime;
+                let stop = ConnectionStop(token.clone(), Some(end));
+                let lifetime = Watchdog::new(end, stop.clone());
+                Poll::Ready(Some(Ok(LimitedIo {
+                    socket,
+                    stop,
+                    _permit: self.permit.take().unwrap(),
+                    cancelled: Box::pin(token.cancelled_owned()),
+                    _lifetime: Some(lifetime),
+                })))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn unpolled_response_budget_expires_and_completed_call_keeps_channel() {
         let token = CancellationToken::new();
-        let _watcher = Watchdog::new(Instant::now(), ConnectionStop(token.clone()));
+        let _watcher = Watchdog::new(Instant::now(), ConnectionStop(token.clone(), None));
         tokio::time::timeout(Duration::from_secs(1), token.cancelled())
             .await
             .unwrap();
         let token = CancellationToken::new();
         let watcher = Watchdog::new(
             Instant::now() + Duration::from_secs(60),
-            ConnectionStop(token.clone()),
+            ConnectionStop(token.clone(), None),
         );
         drop(watcher);
         tokio::task::yield_now().await;

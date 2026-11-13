@@ -164,11 +164,9 @@ async fn scenario() -> anyhow::Result<()> {
         control_addrs.insert(id, format!("127.0.0.1:{}", ports[index * 2 + 1]));
         data_dirs.insert(id, tempfile::tempdir()?);
     }
-    let bootstrap_spec = raft_addrs
-        .iter()
-        .map(|(id, addr)| format!("{id}={addr}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    // Grow membership through the typed control endpoint, rather than only
+    // exercising a startup bootstrap shortcut.
+    let bootstrap_spec = format!("1={}", raft_addrs[&1]);
     for id in 1..=3 {
         let bootstrap = (id == 1).then_some(bootstrap_spec.as_str());
         let data_dir = data_dirs[&id].path().to_string_lossy().into_owned();
@@ -188,6 +186,31 @@ async fn scenario() -> anyhow::Result<()> {
     }
 
     let leader = leader_of(&control_addrs, 10_000).await?;
+    assert_eq!(leader, 1);
+    for id in [2, 3] {
+        assert!(matches!(
+            send_control(
+                &control_addrs[&leader],
+                ControlRequest::AddLearner {
+                    id,
+                    addr: raft_addrs[&id].clone(),
+                    blocking: true,
+                }
+            )
+            .await?,
+            ControlResponse::Index(_)
+        ));
+    }
+    assert!(matches!(
+        send_control(
+            &control_addrs[&leader],
+            ControlRequest::ChangeMembership {
+                ids: [1, 2, 3].into_iter().collect(),
+            }
+        )
+        .await?,
+        ControlResponse::Index(_)
+    ));
     for i in 0..50 {
         write(
             &control_addrs[&leader],
@@ -196,6 +219,11 @@ async fn scenario() -> anyhow::Result<()> {
         )
         .await?;
     }
+    assert!(
+        matches!(send_control(&control_addrs[&leader], ControlRequest::Read {
+        key: "k49".into(),
+    }).await?, ControlResponse::Value(Some(value)) if value == "v49")
+    );
     for control in control_addrs.values() {
         for i in [0_usize, 49] {
             wait_value(control, &format!("k{i:02}"), &format!("v{i:02}"), 10_000).await?;

@@ -68,10 +68,11 @@ inter-node graph transports and are not replaced by this service migration.
 | Public managed HTTP and typed gRPC | Shared domain handlers; loopback preview |
 | Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC available; old TCP retained for migration parity |
 | Managed coordinator/member control and writes | This typed gRPC slice; explicit client/server selection |
-| Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control remains JSON/TCP |
+| Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control is typed gRPC (#251) |
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), legacy TCP ingress retained for retirement |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
-| Legacy library gateway listener, test/control drivers | Still need separate migration/removal; graph-service no longer starts this listener |
+| Single-shard GraphService Probe/Metadata/Write and legacy query envelopes | Remaining framed TCP paths; snapshot/query gRPC does not imply mutation-envelope migration |
+| Legacy library gateway/coordinator and Unix read gateway | Still need separate retirement/migration; graph-service no longer starts the hidden legacy listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
 framing/client/server paths after independent differential review, and test that
@@ -99,7 +100,7 @@ share its session/job cleanup and stop signal. Expiry runs even when no requests
 arrive; shutdown/drop stops both adapters and cancels retained jobs/sessions, but
 does not undo a durable write or resolve an unknown outcome. The legacy `Gateway`
 wrapper still provides explicitly selected TCP library entrypoints. Removing that
-wrapper and other control/observed ingress paths remains #218 work.
+wrapper and other legacy/Unix ingress paths remains #218 work.
 
 Validation includes actual-process owned socket-inode checks on Linux: only the
 announced public ports listen. Lifecycle tests keep adapter handles alive while
