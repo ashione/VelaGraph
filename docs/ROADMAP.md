@@ -8,18 +8,20 @@
 
 [#218](https://github.com/ashione/VelaGraph/issues/218) 跟踪内部协议统一及对外
 **gRPC + HTTP 写入/查询服务**。按 2026-11-12 的方向提高优先级，与时态和
-分布式功能并行推进，不等最终 UI/平台产品化；以下是待交付计划，不是已支持声明。
+分布式功能并行推进，不等最终 UI/平台产品化；以下区分已交付切片与剩余验收，不将协议切片等同于完整发布。
 
-现有 Raft 使用换行 JSON/TCP，managed 成员、分片查询和 managed gateway 使用
-长度前缀 JSON/TCP，网络客户端按请求建立连接；现有 graph proto 是存储 record，
-并非 gRPC service。统一通信框架不修改持久化记录、共识或 Gremlin 语义。
+截至 main `fa202c51`（2026-11-13），Raft peer、managed control/write、snapshot、
+observed fragments/hierarchy shard jobs、fixed/renewable sessions 已有 typed gRPC。
+`graph-service` 内部 managed 与 graph routes 已强制 gRPC。旧 driver/control、
+coordinator job 入口和兼容 listener 尚未全部清理；详见
+[通信清单](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory)。
+存储 record proto 与 RPC service schema 分离；迁移不修改持久化记录、共识或 Gremlin 语义。
 
 - **已交付基础切片**：remote snapshot 的 typed gRPC OpenSnapshot → Page → Close（#226）。
   observed data-local query fragments 的 Open → Fragment → Close 由 [#227](https://github.com/ashione/VelaGraph/issues/227)
   跟踪，复用真实 query sessions/admission，显式选择 gRPC coordinator backend。
   详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；observed hierarchy jobs 的 shard
-  OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径，但 coordinator job 入口仍是旧协议。fixed/renewable、managed
-  和 Raft 尚未全部迁移，不能将 observed 切片当完整查询协议统一。
+  OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径，但 coordinator job 入口仍是旧协议。不能将这些已交付切片当作旧入口和兼容路径已全部删除。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
   managed control 与对外 gateway 协议仍不在该切片内。
@@ -28,7 +30,7 @@
   不长期维护两套业务实现，不把 JSON 装进 bytes 就当完成协议迁移。
 - **managed control/write 切片**：[#235](https://github.com/ashione/VelaGraph/issues/235)
   将现有 18 项 coordinator/member 操作映射到 typed gRPC，复用原状态机、身份、
-  幂等与历史证明；详见 [内部 managed RPC](INTERNAL_GRPC_MANAGED.md)。显式
+  幂等与历史证明；详见 [内部 managed RPC](INTERNAL_GRPC_MANAGED.md)。
   [#242](https://github.com/ashione/VelaGraph/issues/242) 将服务入口的 managed 与 graph
   路由固定为 gRPC，移除临时选择开关；旧 library/control/coordinator 入口与隐藏兼容
   listener 仍须逐项迁移或删除，不能将服务入口切换当作统一通信已完成。
@@ -132,7 +134,7 @@ S1 archive reads、S2 coordinator checkpoint、S3 member checkpoint、S4 retaine
 - [#108](https://github.com/ashione/VelaGraph/issues/108) / [#109](https://github.com/ashione/VelaGraph/issues/109)：已交付上述读取/active/control 切片，未完成有界冷恢复、完整流式快照、闭合 checkpoint/credit reuse 或生命周期扩展。不能把已合并 #113 再列为待实现，也不能因此关闭父任务。
 - [#124](https://github.com/ashione/VelaGraph/issues/124) / [#118](https://github.com/ashione/VelaGraph/issues/118)：durable purge/install 安全前置与文件流式 snapshot 仍未交付；本次文档刷新不发布其实现或声称恢复安全问题已解决。
 - [#110](https://github.com/ashione/VelaGraph/issues/110) → [#111](https://github.com/ashione/VelaGraph/issues/111)：先给 certified V 接通可验证的 data-local 查询/资源契约，再验收全规模 managed CoreHR。已合并的 id/dedup 是语义补齐，不是容量扩大。
-- [#127](https://github.com/ashione/VelaGraph/issues/127)：gateway phase timing 已由 #133 合并；[#143](https://github.com/ashione/VelaGraph/pull/143) 的生命周期归因在本次核对时仍未合并。#146 已合并 active durable HistoryStatus 的单次 verified cut，关闭 #145；仍逐请求校验完整 raw/terminal，不缓存、不放宽容量，也不证明整体 Submit/lifecycle 倍速。见[限定与验证](HISTORY_STATUS_VALIDATION.md)。
+- [#127](https://github.com/ashione/VelaGraph/issues/127)：gateway phase timing 已由 #133 合并；[#143](https://github.com/ashione/VelaGraph/pull/143) 的生命周期归因也已合并；这些诊断不等于完整产品观测能力。#146 已合并 active durable HistoryStatus 的单次 verified cut，关闭 #145；仍逐请求校验完整 raw/terminal，不缓存、不放宽容量，也不证明整体 Submit/lifecycle 倍速。见[限定与验证](HISTORY_STATUS_VALIDATION.md)。
 - [#128](https://github.com/ashione/VelaGraph/issues/128)：failure-only paged-snapshot diagnostics 已由 #131 合并；原偶发失败根因仍未确认，单次绿灯不等于根因修复。
 - [#122](https://github.com/ashione/VelaGraph/issues/122)：产品观测性、调优和运维视图仍为低优先级计划，不把诊断计时当成完整产品监控。
 

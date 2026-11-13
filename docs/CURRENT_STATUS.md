@@ -1,10 +1,10 @@
 # Current capability and work index
 
-Reviewed on **2026-11-10** against main
-[`a0b7147`](https://github.com/ashione/VelaGraph/commit/a0b7147682c6ec0a9379120365171dc23642257c).
+Reviewed on **2026-11-13** against main
+[`fa202c51`](https://github.com/ashione/VelaGraph/commit/fa202c51).
 This is an API and implementation index, not a new benchmark or an assertion that
 all milestone exit criteria have passed. Linked PRs/issues show later changes;
-open work below was not merged at this review point.
+the remaining outcomes below must not be inferred from a merged dependency slice.
 
 ## Choose an entrypoint
 
@@ -61,7 +61,7 @@ fail explicitly. Public graph mutations here are typed APIs, not Gremlin scripts
   type/presence identity and original CAS/Plan on retry. Vertex deletion/cascades,
   endpoint/label mutation and arbitrary application transactions remain unsupported.
 
-Managed Traverse/TraversePage first materialize a cohort snapshot, then execute
+The original managed Traverse/TraversePage APIs first materialize a cohort snapshot, then execute
 locally over it. They support one bounded native out/in repeat with optional post-body emit and
 combined depth at most 32, within unchanged cumulative limits. They do **not**
 support data-local distributed fragments or hierarchy jobs. Terminal selected
@@ -70,6 +70,25 @@ payload and 100,000 replay operations. A retained complete result has at most
 10,000 rows/1 MiB serialized bytes; paging does not increase those bounds. Consult
 [the full contract](MANAGED_FIXED_TRAVERSALS.md) for defaults, deadlines and
 additional cumulative work/memory limits. These are ceilings, not capacity SLAs.
+
+### Data-local execution and public service now available
+
+The separate [data-local gateway](MANAGED_LOCAL_GATEWAY.md) keeps graph data on
+participants, executes a bounded supported subset at certified V and merges
+ordered fragments with 1–8 shard lanes. [Renewable jobs](MANAGED_QUERY_JOBS.md)
+are a separate lifecycle. Neither makes the original materialized Traverse API
+data-local or completes full-scale managed CoreHR acceptance.
+
+The [graph-service CLI](PUBLIC_SERVICE_CLI.md) hosts HTTP `/preview1` and typed
+public gRPC over shared handlers/budgets. Its internal managed and graph routes
+are gRPC-only. This is a loopback development preview requiring an already
+activated fixed cohort, not cluster bootstrap, production serving or global
+restore. Graph channel connection is not typed-service readiness; an incompatible
+graph endpoint can fail its first query even after a startup announcement.
+
+A separate [managed temporal vertex slice](TEMPORAL_STORE.md#managed-state-machine-vertex-slice-196)
+uses existing member state machines and fixed V/T point reads. It does not import
+the standalone temporal database or expose temporal edges/public temporal queries.
 
 ## Storage and protocol boundaries
 
@@ -90,8 +109,14 @@ authority; no cross-request cache or capacity increase is added. Removing one
 duplicate scan does not remove O(history) work or establish an end-to-end
 Submit/lifecycle speedup. Legacy/in-memory fallback remains separately checked.
 
-Current internal managed peers require **RPC v6**; external managed gateway
-framing remains **v1**. These are different version namespaces. Bound durable
+The retained legacy managed TCP protocol uses **RPC v6** and legacy gateway
+framing **v1**. Typed managed gRPC has its own versioned service/Context; public
+gRPC, HTTP preview and durable formats are separate version namespaces. See
+[internal managed RPC](INTERNAL_GRPC_MANAGED.md),
+[Raft gRPC](RAFT_GRPC.md) and [public gRPC](PUBLIC_GRPC_SERVICE.md).
+Raft peer traffic is now typed gRPC (no mixed old/new Raft wire cluster support);
+driver/control and other compatibility paths remain in the
+[communication inventory](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory). Bound durable
 coordinator/member metadata is **v16/v17**. Historical v5/v8/v9/v10/v11–v15
 references in foundational documents describe actual legacy modes/migration
 inputs and earlier slices, not permission to run mixed-version peers or downgrade.
@@ -121,13 +146,16 @@ not the future remote disaster-recovery backup plan in [D6a](ROADMAP.md#d6a-远�
 | [#108](https://github.com/ashione/VelaGraph/issues/108), [#109](https://github.com/ashione/VelaGraph/issues/109) | Remaining full-history paths, bounded cold recovery/snapshot closure and any separately reviewed finite-lifecycle expansion. S1–S4 are merged; their parent work is not complete. |
 | [#124](https://github.com/ashione/VelaGraph/issues/124) → [#118](https://github.com/ashione/VelaGraph/issues/118) | Purge/install publication safety prerequisite, then owned file-backed snapshot delivery and safe spool accounting. Neither means bounded install or a lifted 16 MiB budget. |
 | [#110](https://github.com/ashione/VelaGraph/issues/110) → [#111](https://github.com/ashione/VelaGraph/issues/111) | Data-local certified-V query capacity, then full 200,000-person/5,000-department managed dynamic consistency with an independent oracle and recovery evidence. #111 also depends on #109. |
-| [#127](https://github.com/ashione/VelaGraph/issues/127) | Gateway phase timing is merged in #133; further lifecycle/resource attribution, remote subphases and controlled overhead evidence remain. [#143](https://github.com/ashione/VelaGraph/pull/143) is open at this review point. |
+| [#127](https://github.com/ashione/VelaGraph/issues/127) | Gateway phase timing is merged in #133; further lifecycle/resource attribution, remote subphases and controlled overhead evidence remain. [#143](https://github.com/ashione/VelaGraph/pull/143) is merged; its diagnostics do not complete product observability. |
 | [#128](https://github.com/ashione/VelaGraph/issues/128) | Bounded paged-snapshot failure diagnostics landed in #131. The original intermittent failure's cause remains unproven; a green rerun alone is not a root-cause fix. |
 | [#122](https://github.com/ashione/VelaGraph/issues/122) | Low-priority product observability/tuning/operations plan, separate from test diagnostics. |
 
 Automatic routing convergence, online migration, production transport security,
-full D4/D5 acceptance, multi-machine availability/performance and remote backups
-remain separate milestones. Neither a merged narrow slice nor a completed
+full D4/D5 acceptance and multi-machine availability/performance remain separate
+milestones. [Physical checkpoints](PHYSICAL_CHECKPOINT.md) and
+[object-store transport](OBJECT_STORE_CHECKPOINT_API.md) are implemented narrow
+slices: restoration remains guarded offline-only, not global checkpoint recovery,
+live rejoin or object-store-authoritative storage. Neither a merged narrow slice nor a completed
 same-host functional fixture closes them.
 
 ## Verification and source map
