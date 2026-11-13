@@ -3,7 +3,7 @@
 use anyhow::{bail, Context};
 use d2_raft::managed_rpc::{Client, Identity};
 use replicated_graph::{
-    managed_gateway::{Binding, Gateway, LocalGraphRoute, RemoteConfig},
+    managed_gateway::{Binding, LocalGraphRoute, RemoteConfig, Service},
     remote::RemoteIdentity,
 };
 use serde::Deserialize;
@@ -164,18 +164,9 @@ async fn main() -> anyhow::Result<()> {
     let options = options(std::env::args().skip(1))?;
     let deadline = Duration::from_millis(options.timeout_ms);
     let (config, routes) = read_config(Path::new(&options.config))?.routes(deadline)?;
-    // This extra legacy managed listener is deliberately loopback/ephemeral.
-    // Its address is not published as a public service interface.
-    let gateway = Gateway::bind_remote_local_queries_grpc(
-        config,
-        routes,
-        "127.0.0.1:0".parse()?,
-        deadline,
-        3,
-        1,
-    )
-    .await
-    .context("managed cohort validation failed; not serving")?;
+    let gateway = Service::remote_local_queries_grpc(config, routes, deadline, 3, 1)
+        .await
+        .context("managed cohort validation failed; not serving")?;
     let http = match gateway.bind_http(options.http, deadline).await {
         Ok(http) => http,
         Err(error) => {

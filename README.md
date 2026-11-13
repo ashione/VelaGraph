@@ -153,7 +153,8 @@ explicitly with `graph-coordinator serve-grpc`. A separate
 by the managed gateway's explicit gRPC graph-route constructor.
 [Typed managed control/write RPC](docs/INTERNAL_GRPC_MANAGED.md) adds explicit
 coordinator/member gRPC clients and listeners; `graph-service` now always uses
-these plus gRPC graph routes without a transport switch or fallback. Observed
+these plus gRPC graph routes without a transport switch or fallback. It opens only
+the configured public HTTP/gRPC listeners, not an unused legacy gateway port. Observed
 hierarchy shard jobs and [Raft peers](docs/RAFT_GRPC.md) also have typed gRPC paths.
 Coordinator job ingress, driver control and remaining legacy listeners still need
 migration/removal; these internal endpoints are not the public API.

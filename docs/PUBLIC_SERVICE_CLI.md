@@ -12,7 +12,7 @@ canonical commands, query sessions and resource budgets.
 The coordinator and all configured members must already be live, activated and
 bound to the same persisted managed authority/cohort. Each participant must have
 its matching managed graph service. The CLI verifies the configured identities
-through `Gateway::bind_remote_local_queries_grpc` startup. It cannot
+through `Service::remote_local_queries_grpc` startup. It cannot
 activate an arbitrary cohort, clear an offline restore marker or force READY.
 No query falls back to observed per-shard views.
 
@@ -40,9 +40,8 @@ A failed second bind shuts down the first listener and gateway before returning
 a startup error. The state
 `serving_live_managed_cohort` describes this process, **not** proof that a global
 checkpoint was loaded or that future requests cannot fail. It explicitly reports
-`restore_supported: false` and `production_ready: false`. The existing managed
-TCP adapter is hosted on an unpublished ephemeral loopback port; that internal
-compatibility listener is not a supported public endpoint.
+`restore_supported: false` and `production_ready: false`. The managed state lifecycle opens no compatibility TCP listener. Only the
+configured public HTTP and optional gRPC listeners are bound.
 
 Ctrl-C and, on Unix, SIGTERM trigger orderly gRPC, HTTP and managed-gateway
 shutdown.
@@ -83,8 +82,8 @@ graph fragment/session routes. Configure their gRPC listener addresses. The form
 `--internal-grpc` switch is removed; legacy managed endpoints fail the startup identity probe, without fallback.
 A connected graph channel does not prove typed-service readiness; a wrong graph
 endpoint fails its first operation. The startup announcement is not a graph health
-check. Other library/test/control entrypoints
-and the unpublished compatibility listener remain separate #218 cleanup work.
+check. Other library/test/control entrypoints, including explicitly selected legacy
+Gateway listeners, remain separate #218 cleanup work.
 
 ## Process acceptance scope
 

@@ -1915,3 +1915,82 @@ async fn http_idle_and_incomplete_body_share_tcp_admission_and_deadline() {
     g.shutdown().await;
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_free_service_expires_and_releases_sessions_on_shutdown_or_drop() {
+    let _guard = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    for graceful in [true, false] {
+        let (service, address) =
+            Service::start(fixture.config().into(), None, Duration::from_secs(15), None)
+                .await
+                .unwrap();
+        assert_eq!(address, None);
+        let http = service
+            .bind_http("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+            .await
+            .unwrap();
+        let grpc = service
+            .bind_grpc("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+            .await
+            .unwrap();
+        let public_addresses = [http.local_addr(), grpc.local_addr()];
+        let state = service.state.clone();
+        for ttl in [100, 5000] {
+            let permit = Arc::new(state.connections.clone().acquire_owned().await.unwrap());
+            state
+                .execute(
+                    Operation::OpenSession {
+                        version: None,
+                        ttl_millis: ttl,
+                    },
+                    permit,
+                    Instant::now() + Duration::from_secs(15),
+                )
+                .await
+                .unwrap();
+            assert!(service.retained_payload_charge() > 0);
+            if ttl == 100 {
+                // No request invokes expire(): the independent lifecycle must do it.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !state.sessions.lock().unwrap().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(service.retained_payload_charge(), 0);
+            }
+        }
+        if graceful {
+            service.shutdown().await;
+        } else {
+            drop(service);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.sessions.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state
+            .jobs_stopping
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(state.memory.available_permits(), MAX_SESSIONS);
+        // Keep adapter handles alive: the shared stop signal must stop them,
+        // rather than relying on their handles being dropped by the caller.
+        for address in public_addresses {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while TcpStream::connect(address).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        http.shutdown().await;
+        grpc.shutdown().await;
+    }
+    fixture.stop().await;
+}

@@ -32,8 +32,10 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   将现有 18 项 coordinator/member 操作映射到 typed gRPC，复用原状态机、身份、
   幂等与历史证明；详见 [内部 managed RPC](INTERNAL_GRPC_MANAGED.md)。
   [#242](https://github.com/ashione/VelaGraph/issues/242) 将服务入口的 managed 与 graph
-  路由固定为 gRPC，移除临时选择开关；旧 library/control/coordinator 入口与隐藏兼容
-  listener 仍须逐项迁移或删除，不能将服务入口切换当作统一通信已完成。
+  路由固定为 gRPC，移除临时选择开关；[#244](https://github.com/ashione/VelaGraph/issues/244)
+  将 Service 生命周期与旧 TCP listener 解耦，graph-service 只绑定配置的公开端口，
+  保留会话过期和 shutdown/drop 清理。旧 library/control/coordinator 入口仍须逐项
+  迁移或删除，不能将服务入口切换当作统一通信已完成。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、

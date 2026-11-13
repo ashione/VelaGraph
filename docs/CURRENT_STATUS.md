@@ -109,6 +109,11 @@ authority; no cross-request cache or capacity increase is added. Removing one
 duplicate scan does not remove O(history) work or establish an end-to-end
 Submit/lifecycle speedup. Legacy/in-memory fallback remains separately checked.
 
+The public graph-service host now initializes listener-free managed `Service`
+state: only configured HTTP/gRPC listeners are opened. Expiration and shutdown/drop
+cleanup remain shared; explicitly selected library `Gateway` TCP entrypoints are
+still pending #218 cleanup. See [service host](PUBLIC_SERVICE_CLI.md).
+
 The retained legacy managed TCP protocol uses **RPC v6** and legacy gateway
 framing **v1**. Typed managed gRPC has its own versioned service/Context; public
 gRPC, HTTP preview and durable formats are separate version namespaces. See

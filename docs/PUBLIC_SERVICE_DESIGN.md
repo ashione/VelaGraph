@@ -47,14 +47,16 @@ contract. Do not copy Bolt's discard/commit semantics into managed writes.
 | `managed_gateway::canonical` | Exact original external ID, binding and canonical command | Convert both wire schemas into the same domain mutation before canonicalization. Never hash protobuf bytes. |
 | `serve`, `OpenDelivery`, retained guards | Admission held during work, new-session cleanup on failed delivery, expiry checks during send | Move delivery ownership into a transport-neutral guard held through response-body completion/drop; returning a handler future is too early. |
 | `OpenLocalQuery`, `OpenLocalQueryAfter`, `FetchLocalQuery` | Complete bounded execution, one certified V and replayable immutable pages | Preserve the actual query subset, full-result metadata and owner-bound cursor. No observed fallback. |
-| `Gateway::bind_config` | Validates configuration and certified zero baseline before binding | Baseline V=0 is not evidence that a requested restored cut has loaded. Add target-specific startup/readiness state; do not advertise global restore. |
+| `Service::start` (legacy `Gateway::bind_config` delegates) | Validates configuration and certified zero baseline before binding | Baseline V=0 is not evidence that a requested restored cut has loaded. Add target-specific startup/readiness state; do not advertise global restore. |
 | `State::connections`, `memory`, `submit` | Shared finite admission, retention, serialized submit | All adapters must consume these same budgets. Two protocols cannot double capacity or create unbounded queues. |
 
 Internal observed/fixed transports (#228/#230), the public adapters/CLI
 (#232/#234), managed control (#237), Raft peers (#239), observed hierarchy shard
 jobs (#236) and RPC-only service routes (#243) are merged. Public HTTP/gRPC share
 `Invocation` and delivery ownership; `graph-service` uses gRPC managed/graph
-clients. Remaining legacy ingress/listeners are tracked by #218. These slices do
+clients. The listener-free `Service` owns cleanup/stop state; the legacy `Gateway`
+wrapper explicitly opts into TCP, while graph-service opens no hidden listener.
+Remaining legacy ingress/listeners are tracked by #218. These slices do
 not implement stable HTTP v1, global restore readiness or complete the release.
 
 The seam table above records the design responsibilities: the shared handler,

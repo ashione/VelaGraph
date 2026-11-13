@@ -70,7 +70,8 @@ inter-node graph transports and are not replaced by this service migration.
 | Managed coordinator/member control and writes | This typed gRPC slice; explicit client/server selection |
 | Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control remains JSON/TCP |
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); coordinator ingress remains TCP/JSON |
-| Legacy gateway listener, test/control drivers | Still need migration/removal; an unused compatibility listener is not all-RPC completion |
+| graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
+| Legacy library gateway listener, test/control drivers | Still need separate migration/removal; graph-service no longer starts this listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
 framing/client/server paths after independent differential review, and test that
@@ -89,3 +90,18 @@ then the existing managed lifecycle/CoreHR gate, ordinary workspace tests,
 formatting and Clippy on the exact candidate commit. Record passed, failed and
 not-run stages separately. A short process test is not a substitute for the
 1,025-write retained-history/recovery acceptance.
+
+## Listener-free service lifecycle
+
+`managed_gateway::Service::remote_local_queries_grpc` initializes the same bounded
+managed state without opening a compatibility TCP listener. HTTP and gRPC adapters
+share its session/job cleanup and stop signal. Expiry runs even when no requests
+arrive; shutdown/drop stops both adapters and cancels retained jobs/sessions, but
+does not undo a durable write or resolve an unknown outcome. The legacy `Gateway`
+wrapper still provides explicitly selected TCP library entrypoints. Removing that
+wrapper and other control/observed ingress paths remains #218 work.
+
+Validation includes actual-process owned socket-inode checks on Linux: only the
+announced public ports listen. Lifecycle tests keep adapter handles alive while
+dropping/shutting down Service, check listeners close, and verify expired/retained
+session reservations are released. These tests are not multi-host recovery proof.
