@@ -37,7 +37,7 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   [#242](https://github.com/ashione/VelaGraph/issues/242) 将服务入口的 managed 与 graph
   路由固定为 gRPC，移除临时选择开关；[#244](https://github.com/ashione/VelaGraph/issues/244)
   将 Service 生命周期与旧 TCP listener 解耦，graph-service 只绑定配置的公开端口，
-  保留会话过期和 shutdown/drop 清理。旧 library/coordinator/Unix 入口仍须逐项
+  保留会话过期和 shutdown/drop 清理。旧 library/coordinator 入口仍须逐项
   迁移或删除，不能将服务入口切换当作统一通信已完成。
 - **driver/control 切片**：[#251](https://github.com/ashione/VelaGraph/issues/251) 将 process-node
   --control 与 d2-ctl/send_control 的九项操作统一为 typed gRPC，复用原 handler、容量与 deadline，
@@ -48,7 +48,7 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
 - **默认存储链与listener退役**：[#256](https://github.com/ashione/VelaGraph/issues/256) 将
   RemoteStorageNode/catalog/routing默认链、单分片server-query切到typed RPC；graph-node仅
   --graph一个typed入口，拒绝旧--grpc-snapshot双端口选项。旧wire专项测试使用test-only子进程
-  fixture保留断言，不恢复产品legacy listener。其余library/coordinator/gateway/Unix退役仍待验收。
+  fixture保留断言，不恢复产品legacy listener。其余library/coordinator/gateway退役仍待验收。
 - **通用Metadata RPC成本**：[#258](https://github.com/ashione/VelaGraph/issues/258) 是 #256 的性能验收前置项。
   使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
   场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/
