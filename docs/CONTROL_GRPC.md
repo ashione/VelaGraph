@@ -69,7 +69,8 @@ Legacy newline JSON clients fail explicitly. All node/control clients in an
 experiment must use the new binary; do not rely on mixed wire versions. The
 in-process deterministic test transport and stored data formats are unchanged.
 Remaining single-shard GraphService Probe/Metadata/Write envelopes and legacy
-graph/Unix entrypoints are still tracked in #218. Typed snapshot/query services
+graph/library entrypoints are still tracked in #218. The separate Unix read
+gateway is retired (#262). Typed snapshot/query services
 do not by themselves migrate those mutation/probe envelopes.
 
 ## Verification

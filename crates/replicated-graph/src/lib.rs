@@ -4,8 +4,7 @@
 //! operations from async code; direct synchronous calls on Tokio workers fail
 //! explicitly instead of nesting `block_on` or blocking the executor. The host
 //! runtime must remain running. The optional [`routing`] module adds bounded
-//! static local and remote routing. On Linux, `gateway` adds a same-host read-only UDS
-//! interface with OS peer identity checks. The optional `remote` service and
+//! static local and remote routing. The optional `remote` service and
 //! `RemoteStorageNode` add typed plaintext gRPC for trusted development networks.
 //! No cross-host authentication or production availability guarantee is provided.
 mod adapter;
@@ -17,8 +16,6 @@ pub mod remote;
 pub mod remote_storage;
 mod selected_properties;
 pub use remote_storage::RemoteStorageNode;
-#[cfg(target_os = "linux")]
-pub mod gateway;
 pub mod routing;
 
 use std::cell::Cell;

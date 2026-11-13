@@ -5,9 +5,9 @@ three independent Raft server processes: graph vertex/edge CRUD, exact prepared
 mutation replay, point reads, and standard Gremlin queries. It is not a
 production service. All graph, Raft, and control ports are plaintext and
 unauthenticated. Use only on an isolated trusted development network. There is
-no authorization, TLS, tenant separation, or secret management. The new service
-does not relax the existing Linux UDS gateway's peer identity checks and does
-not add graph writes to the legacy control protocol.
+no authorization, TLS, tenant separation, or secret management. The former UDS
+gateway is retired; plaintext RPC does not replace its OS peer-identity boundary.
+This service does not add graph writes to the legacy control protocol.
 
 ## Run
 

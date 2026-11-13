@@ -24,7 +24,7 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径；[#248](https://github.com/ashione/VelaGraph/issues/248)
   增加 coordinator observed Query/Job typed gRPC 入口；#260 将 serve/query/jobs 默认统一为 typed RPC，
   退役 serve-grpc 与 --grpc CLI 选择，保留明确的 legacy library 差分测试；复用原执行器、
-  Jobs 状态机及累计预算。旧 coordinator TCP/Unix/兼容入口仍待退役，不能视作全部删除。
+  Jobs 状态机及累计预算。旧 coordinator/gateway library TCP 兼容入口仍待退役，不能视作全部删除。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
   managed control 与对外 gateway 协议仍不在该切片内。
@@ -37,7 +37,7 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   [#242](https://github.com/ashione/VelaGraph/issues/242) 将服务入口的 managed 与 graph
   路由固定为 gRPC，移除临时选择开关；[#244](https://github.com/ashione/VelaGraph/issues/244)
   将 Service 生命周期与旧 TCP listener 解耦，graph-service 只绑定配置的公开端口，
-  保留会话过期和 shutdown/drop 清理。旧 library/coordinator/Unix 入口仍须逐项
+  保留会话过期和 shutdown/drop 清理。旧 library/coordinator 入口仍须逐项
   迁移或删除，不能将服务入口切换当作统一通信已完成。
 - **driver/control 切片**：[#251](https://github.com/ashione/VelaGraph/issues/251) 将 process-node
   --control 与 d2-ctl/send_control 的九项操作统一为 typed gRPC，复用原 handler、容量与 deadline，
@@ -48,7 +48,7 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
 - **默认存储链与listener退役**：[#256](https://github.com/ashione/VelaGraph/issues/256) 将
   RemoteStorageNode/catalog/routing默认链、单分片server-query切到typed RPC；graph-node仅
   --graph一个typed入口，拒绝旧--grpc-snapshot双端口选项。旧wire专项测试使用test-only子进程
-  fixture保留断言，不恢复产品legacy listener。其余library/coordinator/gateway/Unix退役仍待验收。
+  fixture保留断言，不恢复产品legacy listener。其余library/coordinator/gateway退役仍待验收。
 - **通用Metadata RPC成本**：[#258](https://github.com/ashione/VelaGraph/issues/258) 是 #256 的性能验收前置项。
   使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
   场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/
@@ -401,9 +401,9 @@ global concurrency quota or a heap/RSS hard limit.
 
 固定进程内 `(group,node)` registry 上，新增 fresh metadata quorum lookup、有限候选/leader hint、共享绝对 deadline 与 admission 的路由。读 session 固定原 adapter/view，prepared 写重试保持原 request ID/epoch/sequence；未知结果不内部重试，Conflict/Fenced 终止。此项不含网络客户端、缓存、成员变更或迁移，D3 仍未完成。契约见 `D3_STATIC_CATALOG.md`。
 
-### Same-host graph UDS gateway
+### Same-host graph UDS gateway — retired (#262)
 
-Linux 上新增只读 UDS gateway，以受信任目录、socket 权限和 peer UID 限制同主机进程访问。每连接固定一个 resolver snapshot 和 deadline，只支持 open/read/close；帧、响应、并发和慢客户端等待有界。它不是跨主机 replica transport、生产网络服务、写协议或 D3 完成。契约见 `GRAPH_UDS_GATEWAY.md`。
+移除旧 Linux UDS JSON listener/client，不保留隐式回退。进程内 RouteResolver 的固定视图、deadline、fencing 与资源回收继续保留并回归；对外服务使用已配置的 HTTP/gRPC managed API，其认证及一致性契约并非旧 UDS 的等价替代。迁移和测试覆盖见 `GRAPH_UDS_GATEWAY.md`。其他 legacy library TCP 路径仍由 #218 跟踪，本项不宣称全部通信迁移完成。
 
 ### D2 TCP resource safety
 
@@ -825,3 +825,4 @@ unproven, rather than inferred from these latency measurements.
 现有上传/恢复不能作为时态恢复证据。后续须单独集成一致 cut 的权威记录与索引来源，
 恢复校验成功后才开放目标视图查询；真实跨片同 V/T 与全规模验收继续跟踪 #196，
 本节更新不关闭该任务，也不声称整体分布式双时间已完成。
+

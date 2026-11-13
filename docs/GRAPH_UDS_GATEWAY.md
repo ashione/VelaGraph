@@ -1,112 +1,56 @@
-# Same-host read-only graph gateway v1
+# Unix read gateway retirement (#262)
 
-This Linux-only library exposes the existing static graph resolver to other
-processes on the same host through a Unix domain socket. It is **not** a
-cross-host replica transport, production network service, Gremlin Server,
-GraphSON endpoint, multi-tenant authorization system, or completion of D3.
-The existing D2 TCP/control listeners are unchanged and remain outside this
-security boundary. Do not expose those listeners as an alternative graph API.
+The experimental Linux-only `replicated_graph::gateway` module and its
+length-prefixed JSON Unix socket client/server are removed. This is an explicit
+breaking library API removal before v0.0.1, not a compatible wire upgrade.
+There is no replacement Unix listener, fallback transport, automatic reconnect,
+or automatic exposure of another endpoint. Stored graph, catalog and Raft data
+formats are unchanged; no data migration is required.
 
-## Trust and lifecycle
+## Migration boundaries
 
-The embedding application owns and keeps the Raft runtime running, constructs
-one `RouteResolver`, and passes a clone to `GatewayServer::bind`. All admitted
-connections share its existing operation/dispatch pools. The gateway does not
-create a catalog or register replicas on behalf of a remote caller.
+- Embedders can keep using `routing::RouteResolver::read_view` and its retained
+  `RoutedReadView`. It pins the chosen snapshot, placement and original absolute
+  deadline. The application keeps the Raft runtime alive and calls synchronous
+  graph operations through `run_blocking`. Dropping all view clones releases
+  the session. This is an in-process API, not a new network gateway.
+- Configured managed cohorts can use [graph-service](PUBLIC_SERVICE_CLI.md)
+  through public HTTP or typed gRPC with the same managed handlers. These APIs
+  require the documented cohort/baseline and supported query contracts; they
+  are **not** a drop-in arbitrary single-partition UDS session replacement.
+- The [typed storage/routing](RPC_STORAGE_ROUTING.md) and observed coordinator
+  services are trusted internal/development APIs with separate consistency
+  contracts. A fresh query is not a substitute for several reads on one pinned
+  view. Do not expose internal administrative services as a public replacement.
+- Unix directory mode and peer-UID checks had an OS-local trust boundary.
+  Plaintext loopback RPC does not reproduce it. Keep services on the documented
+  trusted development boundary; this retirement adds no authentication or TLS.
+- An old application's stale socket file is operator-owned. Stop the old
+  process and inspect/remove the path explicitly; the new library does not
+  unlink it or silently bind another port.
 
-Use an operator-managed directory owned by the service UID with mode `0700`.
-The socket is mode `0600`. Existing socket paths are rejected, not silently
-unlinked. Peer credentials must match the configured UID; the client also
-checks the expected server UID. This authorizes that OS identity to read the
-partitions exposed by the resolver. It is not a per-partition ACL and does not
-protect against root or an attacker controlling the trusted UID.
+## Regression inventory
 
-An unclean server exit can leave a stale socket. Confirm the old server has
-stopped and explicitly remove that path before restarting. Never delete an
-unknown socket merely because connecting to it failed. A restarted server does
-not restore sessions. Clients must explicitly open a new session, which may
-observe a newer snapshot.
+The removed `tests/gateway.rs` suite exercised a removed protocol: Unix path and
+UID checks, JSON framing/length rejection, socket idle/slow-peer handling and
+Unix-specific connection admission/restart. Retaining those tests would retain
+the obsolete server. Their deletion is **not** evidence of equivalent gRPC
+security or resource bounds.
 
-## Protocol and snapshots
+Domain behavior stays covered by the unmodified routing implementation and
+retained `tests/routing.rs` suite:
 
-Each connection opens at most one read session. Requests are sequential, with
-no multiplexing, session tokens, write endpoint, admin endpoint or raw D1 API.
-Frames have a four-byte unsigned big-endian length followed by UTF-8 JSON.
-Lengths are checked before body allocation. Requests are at most 64 KiB and
-responses at most 1 MiB. Response serialization uses a bounded writer rather
-than building an unbounded buffer and checking afterward. Compression is absent.
+- `failover_keeps_retained_pages_and_queries_historical_then_fences_epoch`:
+  an old view remains at sequence 2 after a new write and leader change, while
+  the fresh view is sequence 3; both Gremlin counts and old pagination are
+  checked. Mutating Gremlin is rejected; epoch fencing remains explicit.
+- `routed_crud_and_retained_session_absolute_deadline`: retained view and clone
+  expire without deadline renewal, while a fresh view works.
+- `independent_expired_sessions_still_consume_slots_and_runtime_rejects`:
+  expired but retained handles still charge admission and release on drop.
+- Typed service process tests remain separate gates for their actual protocols;
+  their success does not imply Unix peer-UID authorization or a complete #218.
 
-The v1 operations are:
-
-- `open_read`: protocol version `1`, partition ID, and positive `budget_ms`
-  not exceeding 60,000. Returns the pinned data sequence, epoch and metadata
-  sequence after the existing metadata and data leader barriers.
-- `gremlin`: standard Gremlin text executed on that exact retained view.
-- `close`: closes the session and releases its resources.
-
-Unknown operations, fields, versions and malformed JSON fail explicitly.
-Write/prepare/commit/admin requests and mutating Gremlin are rejected. The
-existing official-grammar parser and documented Gremlin subset are reused.
-No query-language, stored graph, catalog or Raft encoding changes are made.
-The wire representation is project-specific JSON, not GraphSON.
-
-The client includes connection/open work in one total local monotonic budget.
-The server fixes its session deadline at open and never renews it on requests.
-The remaining budget is passed to the resolver; metadata lookup, candidate
-selection, read barriers, execution and successful responses cannot obtain a
-fresh operation budget. Existing epoch fencing and query limits remain active.
-Loss of leadership never silently moves a retained session to a new snapshot.
-The existing limitation that an isolated replica may not know a newer epoch
-still applies; this gateway does not add instantaneous revocation.
-
-## Resource and failure contract
-
-At most eight connections are admitted before a connection worker is started.
-There is no unbounded user-space connection or work queue. Each connection
-executes one operation at a time. Connection workers retain their admission
-slots until synchronous work actually exits, including after disconnect or
-expiry. The underlying resolver still shares its 32-operation and 32-dispatch
-caps across clones. Independently constructed servers/resolvers are separate
-pools, not a process-wide quota.
-
-Header/body reads and response writes have bounded deadlines, so a peer cannot
-retain a connection indefinitely by trickling bytes or refusing to read.
-The configured I/O timeout also bounds idle time between requests, even if
-the overall session budget has time remaining. An idle session expires without
-requiring another request. Close, EOF and
-transport failure discard its view. Disconnect during synchronous query work
-is observed when that bounded work returns; it is not a guarantee of preemptive
-cancellation. Parsing, allocation, copying and destruction remain cooperative.
-No late success or partial/truncated result is substituted for an error.
-
-The query executor retains its 16 KiB query-text limit, row/hop caps, five-second
-cooperative query deadline and 64 MiB logical query-memory budget. The response
-frame cap is an additional limit: a valid query may fail because its serialized
-result exceeds 1 MiB. These are not total RSS/allocator limits. Retained snapshots
-and adapter-private work keep their existing separately documented bounds.
-
-The client treats remote errors as terminal for its session and performs no
-automatic reconnect, replay or snapshot refresh. Treat
-transport/protocol failure as loss of the session and explicitly decide whether
-to open a new one. No durable writes are available in v1. A future write protocol
-must preserve a durable immutable prepared envelope, including request ID,
-placement, expected sequence and mutation bytes, across unknown outcomes and
-server restarts; an ephemeral server token or freshly prepared retry is not
-sufficient.
-
-## Verification scope
-
-The gateway tests use real child processes on one Linux host, not only in-memory
-or Unix socket pairs. They cover fixed versus new connection snapshots, protocol
-rejection and length bounds, slow peers, directory/UID checks, capacity, cleanup,
-and server restart. Test fixture writes stay outside the public wire protocol.
-These tests do not establish cross-host authentication, TLS, tenant isolation,
-network partition behavior, production availability or process RSS bounds.
-
-## Dependencies
-
-This slice reuses locked `serde`, `serde_json` and `thiserror` for strict wire
-DTOs and typed errors (MIT OR Apache-2.0). Linux `rustix` supplies peer
-credentials and nonblocking Unix socket creation without handwritten unsafe
-system calls (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT). These crates
-were already in the workspace lockfile; no new crate versions are introduced.
+Historical benchmark documents mentioning Unix tests describe their original
+runs, not a currently available API. The remaining legacy library managed and
+coordinator transports remain separate #218 retirement work.

@@ -72,7 +72,8 @@ inter-node graph transports and are not replaced by this service migration.
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), default CLI transport (#260); legacy library TCP ingress retained for retirement |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
 | Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Explicit library legacy fixtures remain separately retained |
-| Legacy library gateway/coordinator and Unix read gateway | Still need separate retirement/migration; graph-service no longer starts the hidden legacy listener |
+| Legacy library gateway/coordinator | Still need separate retirement/migration; graph-service no longer starts the hidden legacy listener |
+| Unix read gateway | Removed under #262; [migration and retained semantic coverage](GRAPH_UDS_GATEWAY.md). No replacement Unix listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
 framing/client/server paths after independent differential review, and test that
@@ -100,9 +101,10 @@ share its session/job cleanup and stop signal. Expiry runs even when no requests
 arrive; shutdown/drop stops both adapters and cancels retained jobs/sessions, but
 does not undo a durable write or resolve an unknown outcome. The legacy `Gateway`
 wrapper still provides explicitly selected TCP library entrypoints. Removing that
-wrapper and other legacy/Unix ingress paths remains #218 work.
+wrapper and other legacy library TCP ingress paths remains #218 work.
 
 Validation includes actual-process owned socket-inode checks on Linux: only the
 announced public ports listen. Lifecycle tests keep adapter handles alive while
 dropping/shutting down Service, check listeners close, and verify expired/retained
 session reservations are released. These tests are not multi-host recovery proof.
+
