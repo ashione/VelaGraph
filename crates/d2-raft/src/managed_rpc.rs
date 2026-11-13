@@ -26,6 +26,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
 use tokio::task::{JoinHandle, JoinSet};
 
+/// Typed, versioned internal gRPC transport. No public administration methods.
+pub mod grpc;
+pub(crate) mod grpc_codec;
+
 /// JSON framing limit, enforced before allocation and while serialization runs.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const PROTOCOL_VERSION: u32 = 6;
@@ -593,6 +597,7 @@ async fn send(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), Error> {
 #[derive(Clone)]
 pub struct Client {
     address: SocketAddr,
+    transport: Option<Arc<grpc::Transport>>,
     identity: Identity,
     timeout: Duration,
     slots: Arc<Semaphore>,
@@ -605,12 +610,24 @@ impl Client {
         valid_timeout(timeout)?;
         Ok(Self {
             address,
+            transport: None,
             identity,
             timeout,
             slots: outbound_slots().clone(),
             bounded_wait: false,
             nonce: Arc::new(AtomicU64::new(1)),
         })
+    }
+    /// Explicit typed gRPC endpoint. Never falls back to the legacy TCP protocol.
+    /// The channel is shared by clones and reconnects do not replay operations.
+    pub fn new_grpc(
+        address: SocketAddr,
+        identity: Identity,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        let mut client = Self::new(address, identity, timeout)?;
+        client.transport = Some(Arc::new(grpc::Transport::new(address, timeout)?));
+        Ok(client)
     }
     /// Opt into bounded FIFO waiting for the existing process-wide RPC slots.
     /// Four active allocations plus four additional admitted calls are bounded
@@ -803,6 +820,27 @@ impl Client {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| Error::Capacity)?;
             let operation_tag = operation.tag();
+            if let Some(transport) = &self.transport {
+                let reply = transport
+                    .call(
+                        Request {
+                            version: PROTOCOL_VERSION,
+                            identity: self.identity.clone(),
+                            nonce,
+                            operation,
+                        },
+                        deadline,
+                    )
+                    .await?;
+                if reply.version != PROTOCOL_VERSION
+                    || reply.operation != operation_tag
+                    || reply.identity != self.identity
+                    || reply.nonce != nonce
+                {
+                    return Err(Error::Identity);
+                }
+                return reply.result;
+            }
             let bytes = encode(Request {
                 version: PROTOCOL_VERSION,
                 identity: self.identity.clone(),

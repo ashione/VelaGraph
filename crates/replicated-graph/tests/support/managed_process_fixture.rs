@@ -161,23 +161,57 @@ async fn managed_node_child() -> anyhow::Result<()> {
             }
         }
     }
+    // Opt-in transport selection is a test fixture property, never negotiation
+    // or fallback. Existing fixtures continue to use only their original TCP.
+    let managed_grpc = directory.join("managed-grpc.request").exists();
     let own_identity = identity_in(shard, config.cohort.clone());
     let server = if shard == 9 && config.cohort.profile == CapacityProfile::ByteBound16MiBV1 {
         let members = config
             .members
             .iter()
             .map(|(member, address)| {
-                Client::new(
+                let construct = if managed_grpc {
+                    Client::new_grpc
+                } else {
+                    Client::new
+                };
+                construct(
                     *address,
                     identity_in(*member, config.cohort.clone()),
                     BUDGET,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Server::bind_byte_bound_coordinator(node.clone(), own_identity, members, address, BUDGET)
-            .await?
+        if managed_grpc {
+            ManagedFixtureServer::Grpc(
+                d2_raft::managed_rpc::grpc::Server::bind_byte_bound_coordinator(
+                    node.clone(),
+                    own_identity,
+                    members,
+                    address,
+                    BUDGET,
+                )
+                .await?,
+            )
+        } else {
+            ManagedFixtureServer::Tcp(
+                Server::bind_byte_bound_coordinator(
+                    node.clone(),
+                    own_identity,
+                    members,
+                    address,
+                    BUDGET,
+                )
+                .await?,
+            )
+        }
+    } else if managed_grpc {
+        ManagedFixtureServer::Grpc(
+            d2_raft::managed_rpc::grpc::Server::bind(node.clone(), own_identity, address, BUDGET)
+                .await?,
+        )
     } else {
-        Server::bind(node.clone(), own_identity, address, BUDGET).await?
+        ManagedFixtureServer::Tcp(Server::bind(node.clone(), own_identity, address, BUDGET).await?)
     };
     // Test-only lazy graph-port control: ordinary managed fixtures do not
     // start an extra service or allocate query sessions.
@@ -242,6 +276,25 @@ async fn managed_node_child() -> anyhow::Result<()> {
                 },
             )?;
             return Ok(());
+        }
+    }
+}
+
+enum ManagedFixtureServer {
+    Tcp(Server),
+    Grpc(d2_raft::managed_rpc::grpc::Server),
+}
+impl ManagedFixtureServer {
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Tcp(server) => server.local_addr(),
+            Self::Grpc(server) => server.local_addr(),
+        }
+    }
+    async fn shutdown(self) {
+        match self {
+            Self::Tcp(server) => server.shutdown().await,
+            Self::Grpc(server) => server.shutdown().await,
         }
     }
 }
@@ -395,7 +448,12 @@ impl Process {
         Ok(())
     }
     fn client(&self) -> anyhow::Result<Client> {
-        Ok(Client::new(
+        let construct = if self.directory.path().join("managed-grpc.request").exists() {
+            Client::new_grpc
+        } else {
+            Client::new
+        };
+        Ok(construct(
             self.address,
             identity_in(self.shard, self.config.cohort.clone()),
             BUDGET,
