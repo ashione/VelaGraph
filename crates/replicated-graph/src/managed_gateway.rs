@@ -1092,6 +1092,11 @@ impl State {
 /// durable request. A lost/late response always leaves the write outcome unknown.
 pub struct Gateway {
     address: SocketAddr,
+    service: Service,
+}
+/// Managed state and cleanup lifecycle, independent of any legacy TCP listener.
+/// Public HTTP/gRPC adapters share this state and stop signal.
+pub struct Service {
     state: Arc<State>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
@@ -1171,30 +1176,8 @@ impl Gateway {
         parallelism: usize,
         member_parallelism: usize,
     ) -> Result<Self> {
-        check_deadline(deadline)?;
-        if !(1..=MAX_LOCAL_QUERY_PARALLELISM).contains(&parallelism)
-            || !(1..=managed_graph::MAX_MEMBER_PARALLELISM).contains(&member_parallelism)
-        {
-            return Err(Error::Protocol);
-        }
-        local::validate_routes(&config, &routes)?;
-        let end = Instant::now() + deadline;
-        let mut clients = BTreeMap::new();
-        for route in &routes {
-            let client = crate::remote::distributed::grpc::FixedClient::connect(
-                route.endpoint,
-                route.identity,
-                end.saturating_duration_since(Instant::now()),
-            )
-            .await
-            .map_err(local::remote_error)?;
-            clients.insert(route.managed_identity.target.shard, client);
-        }
-        let mut config: OwnedConfig = config.into();
-        config.local_routes = Some(routes);
-        config.local_grpc = Some(clients);
-        config.local_query_parallelism = parallelism;
-        config.member_parallelism = member_parallelism;
+        let config =
+            grpc_local_config(config, routes, deadline, parallelism, member_parallelism).await?;
         Self::bind_config(config, bind, deadline, None).await
     }
 
@@ -1255,6 +1238,46 @@ impl Gateway {
         deadline: Duration,
         timing: Option<timing::Sender>,
     ) -> Result<Self> {
+        let (service, address) = Service::start(config, Some(bind), deadline, timing).await?;
+        Ok(Self {
+            service,
+            address: address.ok_or(Error::Unknown)?,
+        })
+    }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+    pub async fn shutdown(self) {
+        self.service.shutdown().await;
+    }
+}
+impl std::ops::Deref for Gateway {
+    type Target = Service;
+    fn deref(&self) -> &Service {
+        &self.service
+    }
+}
+impl Service {
+    /// Initialize typed gRPC internal routes without opening a legacy TCP listener.
+    /// This validates the managed baseline, not graph-service protocol readiness.
+    pub async fn remote_local_queries_grpc(
+        config: RemoteConfig,
+        routes: Vec<LocalGraphRoute>,
+        deadline: Duration,
+        parallelism: usize,
+        member_parallelism: usize,
+    ) -> Result<Self> {
+        let config =
+            grpc_local_config(config, routes, deadline, parallelism, member_parallelism).await?;
+        let (service, _) = Self::start(config, None, deadline, None).await?;
+        Ok(service)
+    }
+    async fn start(
+        config: OwnedConfig,
+        bind: Option<SocketAddr>,
+        deadline: Duration,
+        timing: Option<timing::Sender>,
+    ) -> Result<(Self, Option<SocketAddr>)> {
         check_deadline(deadline)?;
         config.validate()?;
         let state = Arc::new(State {
@@ -1286,8 +1309,15 @@ impl Gateway {
         )
         .await
         .map_err(|_| Error::Unknown)??;
-        let listener = TcpListener::bind(bind).await.map_err(|_| Error::Unknown)?;
-        let address = listener.local_addr().map_err(|_| Error::Unknown)?;
+        let listener = match bind {
+            Some(bind) => Some(TcpListener::bind(bind).await.map_err(|_| Error::Unknown)?),
+            None => None,
+        };
+        let address = listener
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()
+            .map_err(|_| Error::Unknown)?;
         let (stop, mut stopped) = watch::channel(false);
         let worker = state.clone();
         let task = tokio::spawn(async move {
@@ -1298,7 +1328,12 @@ impl Gateway {
                     _ = stopped.changed() => break,
                     _ = cleanup.tick() => { worker.expire(); continue; },
                     _ = handlers.join_next(), if !handlers.is_empty() => continue,
-                    accepted = listener.accept() => accepted,
+                    accepted = async {
+                        match &listener {
+                            Some(listener) => listener.accept().await,
+                            None => std::future::pending().await,
+                        }
+                    } => accepted,
                 };
                 let Ok((socket, _)) = accepted else {
                     break;
@@ -1328,12 +1363,14 @@ impl Gateway {
             worker.sessions.lock().unwrap().clear();
             worker.local_sessions.lock().unwrap().clear();
         });
-        Ok(Self {
+        Ok((
+            Self {
+                state,
+                stop,
+                task: Some(task),
+            },
             address,
-            state,
-            stop,
-            task: Some(task),
-        })
+        ))
     }
     /// Bind the bounded development-only public HTTP adapter to this already
     /// validated live managed gateway. Offline restored nodes cannot create this
@@ -1345,9 +1382,6 @@ impl Gateway {
     /// Only loopback listeners are accepted; no restore or authentication bypass.
     pub async fn bind_grpc(&self, bind: SocketAddr, deadline: Duration) -> Result<GrpcService> {
         grpc::bind(self.state.clone(), self.stop.subscribe(), bind, deadline).await
-    }
-    pub fn local_addr(&self) -> SocketAddr {
-        self.address
     }
     /// Conservative logical reservation for snapshots, bounded result/cursor
     /// storage, scratch copies and active captures; not an allocator/RSS bound.
@@ -1361,7 +1395,7 @@ impl Gateway {
         }
     }
 }
-impl Drop for Gateway {
+impl Drop for Service {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
     }
@@ -1720,6 +1754,40 @@ async fn write_bytes(socket: &mut TcpStream, bytes: &[u8]) -> Result<()> {
         .map_err(|_| Error::Unknown)?;
     socket.write_all(bytes).await.map_err(|_| Error::Unknown)
 }
+async fn grpc_local_config(
+    config: RemoteConfig,
+    routes: Vec<LocalGraphRoute>,
+    deadline: Duration,
+    parallelism: usize,
+    member_parallelism: usize,
+) -> Result<OwnedConfig> {
+    check_deadline(deadline)?;
+    if !(1..=MAX_LOCAL_QUERY_PARALLELISM).contains(&parallelism)
+        || !(1..=managed_graph::MAX_MEMBER_PARALLELISM).contains(&member_parallelism)
+    {
+        return Err(Error::Protocol);
+    }
+    local::validate_routes(&config, &routes)?;
+    let end = Instant::now() + deadline;
+    let mut clients = BTreeMap::new();
+    for route in &routes {
+        let client = crate::remote::distributed::grpc::FixedClient::connect(
+            route.endpoint,
+            route.identity,
+            end.saturating_duration_since(Instant::now()),
+        )
+        .await
+        .map_err(local::remote_error)?;
+        clients.insert(route.managed_identity.target.shard, client);
+    }
+    let mut config: OwnedConfig = config.into();
+    config.local_routes = Some(routes);
+    config.local_grpc = Some(clients);
+    config.local_query_parallelism = parallelism;
+    config.member_parallelism = member_parallelism;
+    Ok(config)
+}
+
 #[cfg(test)]
 #[path = "managed_gateway_tests.rs"]
 mod tests;

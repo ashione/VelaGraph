@@ -346,6 +346,8 @@ impl ServiceProcess {
                                 && ready["production_ready"] == false,
                             "scope metadata changed"
                         );
+                        #[cfg(target_os = "linux")]
+                        assert_only_public_listeners(child.id(), &ready)?;
                         return Ok::<_, anyhow::Error>((
                             ready["http"]
                                 .as_str()
@@ -805,5 +807,51 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
             "legacy endpoints must never announce serving"
         );
     }
+    Ok(())
+}
+
+// Inspect this process's owned socket inodes, not every socket in its network
+// namespace. A hidden ephemeral compatibility listener must fail this check.
+#[cfg(target_os = "linux")]
+fn assert_only_public_listeners(pid: u32, ready: &Value) -> anyhow::Result<()> {
+    let mut inodes = std::collections::BTreeSet::new();
+    for fd in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        if let Ok(link) = fs::read_link(fd?.path()) {
+            let link = link.to_string_lossy();
+            if let Some(inode) = link
+                .strip_prefix("socket:[")
+                .and_then(|v| v.strip_suffix(']'))
+            {
+                inodes.insert(inode.to_string());
+            }
+        }
+    }
+    let mut ports = std::collections::BTreeSet::new();
+    for protocol in ["tcp", "tcp6"] {
+        for line in fs::read_to_string(format!("/proc/{pid}/net/{protocol}"))?
+            .lines()
+            .skip(1)
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() > 9 && fields[3] == "0A" && inodes.contains(fields[9]) {
+                let port = fields[1].rsplit(':').next().context("listener port")?;
+                ports.insert(u16::from_str_radix(port, 16)?);
+            }
+        }
+    }
+    let expected = ["http", "grpc"]
+        .into_iter()
+        .map(|name| {
+            Ok(ready[name]
+                .as_str()
+                .context("public address")?
+                .parse::<SocketAddr>()?
+                .port())
+        })
+        .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+    anyhow::ensure!(
+        ports == expected,
+        "unexpected process listeners: {ports:?}, expected {expected:?}"
+    );
     Ok(())
 }
