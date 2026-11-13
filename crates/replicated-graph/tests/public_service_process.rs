@@ -313,7 +313,7 @@ struct ServiceProcess {
     _output: PathBuf,
 }
 impl ServiceProcess {
-    async fn start(config: &Path, output: PathBuf, internal_grpc: bool) -> anyhow::Result<Self> {
+    async fn start(config: &Path, output: PathBuf) -> anyhow::Result<Self> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
         command.args([
             "--config",
@@ -326,9 +326,6 @@ impl ServiceProcess {
             "--timeout-ms",
             "15000",
         ]);
-        if internal_grpc {
-            command.arg("--internal-grpc");
-        }
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(fs::File::create(&output)?))
@@ -497,28 +494,20 @@ async fn grpc_channel(address: SocketAddr) -> anyhow::Result<tonic::transport::C
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_process_public_http_grpc_consistency_and_restart() -> anyhow::Result<()> {
-    public_scenario(false).await
+    public_scenario().await
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn four_process_public_service_with_internal_grpc() -> anyhow::Result<()> {
-    public_scenario(true).await
-}
-async fn public_scenario(internal_grpc: bool) -> anyhow::Result<()> {
+async fn public_scenario() -> anyhow::Result<()> {
     let (coordinator, a, b) = tokio::try_join!(
-        NodeProcess::start(9, internal_grpc),
-        NodeProcess::start(7, internal_grpc),
-        NodeProcess::start(8, internal_grpc)
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
     )?;
     let directory = tempfile::tempdir()?;
     let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
     let config_path = directory.path().join("service.json");
     fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    let mut service = ServiceProcess::start(
-        &config_path,
-        directory.path().join("service1.stdout"),
-        internal_grpc,
-    )
-    .await?;
+    let mut service =
+        ServiceProcess::start(&config_path, directory.path().join("service1.stdout")).await?;
     let pids = [
         std::process::id(),
         service.child.id(),
@@ -658,12 +647,8 @@ async fn public_scenario(internal_grpc: bool) -> anyhow::Result<()> {
     drop(grpc_writes);
     drop(grpc_queries);
     service.graceful_stop().await?;
-    let mut service = ServiceProcess::start(
-        &config_path,
-        directory.path().join("service2.stdout"),
-        internal_grpc,
-    )
-    .await?;
+    let mut service =
+        ServiceProcess::start(&config_path, directory.path().join("service2.stdout")).await?;
     let (status, stale) = post(service.address, "/preview1/queries:fetch", fetch).await?;
     assert_eq!(status, 410, "{stale}");
     let channel = grpc_channel(service.grpc).await?;
@@ -703,9 +688,6 @@ async fn public_scenario(internal_grpc: bool) -> anyhow::Result<()> {
     let bad_path = directory.path().join("bad.json");
     fs::write(&bad_path, serde_json::to_vec(&invalid)?)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
-    if internal_grpc {
-        command.arg("--internal-grpc");
-    }
     let failure = command
         .args([
             "--allow-insecure-development",
@@ -723,9 +705,6 @@ async fn public_scenario(internal_grpc: bool) -> anyhow::Result<()> {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
     let grpc_address = occupied.local_addr()?.to_string();
     let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
-    if internal_grpc {
-        command.arg("--internal-grpc");
-    }
     let failure = command
         .args([
             "--allow-insecure-development",
@@ -741,5 +720,90 @@ async fn public_scenario(internal_grpc: bool) -> anyhow::Result<()> {
         .output()?;
     assert!(!failure.status.success());
     assert!(failure.stdout.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Result<()> {
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, false),
+        NodeProcess::start(7, false),
+        NodeProcess::start(8, false)
+    )?;
+    let (grpc_coordinator, grpc_a, grpc_b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    // Independently reject legacy control, legacy graph, and both. A failure
+    // on one path must not conceal fallback on the other.
+    for (legacy_control, legacy_graph) in [(true, true), (true, false), (false, true)] {
+        let (c, ca, cb) = if legacy_control {
+            (&coordinator, &a, &b)
+        } else {
+            (&grpc_coordinator, &grpc_a, &grpc_b)
+        };
+        let (ga, gb) = if legacy_graph {
+            (&a, &b)
+        } else {
+            (&grpc_a, &grpc_b)
+        };
+        let config = json!({"binding":binding(),"coordinator":{"endpoint":c.ready.control,"identity":identity(9)},"members":[{"endpoint":ca.ready.control,"identity":identity(7),"graph_endpoint":ga.ready.graph},{"endpoint":cb.ready.control,"identity":identity(8),"graph_endpoint":gb.ready.graph}]});
+        let path = directory.path().join("legacy.json");
+        fs::write(&path, serde_json::to_vec(&config)?)?;
+        if !legacy_control {
+            // Connecting a Channel only proves a transport connection, not a
+            // typed graph service. The first graph operation must fail rather
+            // than retrying the legacy protocol. No fake read/write probe is
+            // added to startup merely to test readiness.
+            let service =
+                ServiceProcess::start(&path, directory.path().join("mixed.stdout")).await?;
+            let (status, body) = post(service.address, "/preview1/queries:open",
+                json!({"read":{"type":"latest"},"ttl_millis":1000,"query":{"partition":7,"text":"g.V(1)"},"page_size":1})).await?;
+            assert_eq!(
+                status, 503,
+                "wrong graph transport must be unavailable: {body}"
+            );
+            drop(service);
+            continue;
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
+        command.args([
+            "--allow-insecure-development",
+            "--config",
+            path.to_str().context("path")?,
+            "--http",
+            "127.0.0.1:0",
+            "--grpc",
+            "127.0.0.1:0",
+            "--timeout-ms",
+            "1000",
+        ]);
+        let output = directory.path().join("rejected.stdout");
+        let mut child = command
+            .stdout(Stdio::from(fs::File::create(&output)?))
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("legacy service did not exit within budget: {other:?}");
+                }
+            }
+        };
+        assert!(!status.success());
+        assert!(
+            fs::read(&output)?.is_empty(),
+            "legacy endpoints must never announce serving"
+        );
+    }
     Ok(())
 }
