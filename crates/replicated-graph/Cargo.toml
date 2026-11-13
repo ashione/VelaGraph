@@ -18,6 +18,10 @@ thiserror = "2"
 getrandom = "0.3"
 tonic = "0.14"
 http-body = "1"
+# Public HTTP adapter: reuse the maintained, already-locked HTTP stack (MIT).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tokio-util = "0.7"
 prost = "0.14"
 tonic-prost = "0.14"
@@ -28,6 +32,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 rustix = { version = "1", features = ["net", "process"] }
 
 [dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
 h2 = "0.4"
 # Existing locked official crates: SHA-256 content integrity and safe anchored fs I/O.
 sha2 = "=0.10.9"

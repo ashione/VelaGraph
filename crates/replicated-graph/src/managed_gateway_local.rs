@@ -30,6 +30,9 @@ pub(super) struct Retained {
     _memory: OwnedSemaphorePermit,
     result: pages::Materialized,
     pub(super) closed: std::sync::atomic::AtomicBool,
+    // Immutable session/result/page sizing: one successful HTTP frame proof is
+    // valid for every subsequent fetch. Failed/expired proofs are never cached.
+    http_preflighted: std::sync::atomic::AtomicBool,
 }
 pub(super) fn snapshot_error(error: cohort_reads::Error) -> Error {
     managed_graph::Error::from(error).into()
@@ -135,6 +138,40 @@ fn preflight_pages(
     }
     before_deadline(end)?;
     preflight(binding, open_reply(profile, session, result))
+}
+// HTTP has a different preview envelope. Validate every future page before
+// delivering any HTTP page, including a session originally opened over TCP.
+fn preflight_http_pages(
+    session: &LocalSession,
+    result: &pages::Materialized,
+    end: Instant,
+) -> Result<()> {
+    for offset in (0..result.data.rows.len().max(1)).step_by(usize::from(result.size)) {
+        before_deadline(end)?;
+        http_codec::encode(&Ok(Reply::FetchLocalQuery {
+            session: session.clone(),
+            query: result.query.clone(),
+            cursor: result.cursors.get(&offset).cloned(),
+            page_size: result.size,
+            page: result.page(offset),
+        }))?;
+    }
+    before_deadline(end)
+}
+impl Retained {
+    pub(super) fn preflight_http(&self, end: Instant) -> Result<()> {
+        live(self, end)?;
+        if !self
+            .http_preflighted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            preflight_http_pages(&self.descriptor, &self.result, end)?;
+            live(self, end)?;
+            self.http_preflighted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        live(self, end)
+    }
 }
 fn open_reply(
     profile: Option<LocalReadProfile>,
@@ -422,6 +459,7 @@ impl State {
                 _memory: memory,
                 result: materialized,
                 closed: std::sync::atomic::AtomicBool::new(false),
+                http_preflighted: std::sync::atomic::AtomicBool::new(false),
             });
             preflight_pages(
                 &binding,
@@ -507,18 +545,29 @@ mod boundary_tests {
                 cursors: BTreeMap::new(),
             },
             closed: std::sync::atomic::AtomicBool::new(false),
+            http_preflighted: std::sync::atomic::AtomicBool::new(false),
         };
         let end = now + Duration::from_secs(20);
         live(&retained, end).unwrap();
+        assert!(!retained
+            .http_preflighted
+            .load(std::sync::atomic::Ordering::Acquire));
+        retained.preflight_http(end).unwrap();
+        assert!(retained
+            .http_preflighted
+            .load(std::sync::atomic::Ordering::Acquire));
+        retained.preflight_http(end).unwrap();
         // The encoder can complete before TTL while the awaiting task resumes
         // afterwards. The same mandatory pre-send check must reject this state.
         retained.expires = now;
         assert_eq!(live(&retained, end), Err(Error::SessionUnavailable));
+        assert_eq!(retained.preflight_http(end), Err(Error::SessionUnavailable));
         retained.expires = now + Duration::from_secs(10);
         retained
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(live(&retained, end), Err(Error::SessionUnavailable));
+        assert_eq!(retained.preflight_http(end), Err(Error::SessionUnavailable));
     }
     #[test]
     fn seal_checks_late_full_envelope_before_ready() {
@@ -670,6 +719,47 @@ mod boundary_tests {
                 d2_raft::D1Error::VisibilityReadLimit
             )),
             Error::Capacity
+        );
+    }
+}
+
+#[cfg(test)]
+mod http_boundary_tests {
+    use super::*;
+    #[test]
+    fn http_preflight_rejects_later_page_before_first_delivery() {
+        let session = LocalSession {
+            incarnation: [1; 16],
+            token: [2; 32],
+            version: 1,
+        };
+        let result = pages::Materialized {
+            query: Query {
+                partition: 7,
+                text: "g.V(1,2).valueMap('x')".into(),
+            },
+            size: 1,
+            data: QueryData {
+                completeness: QueryCompleteness::Unverified,
+                rows: vec![
+                    QueryRow::Count(1),
+                    QueryRow::PropertyMap {
+                        source: crate::remote::query::QualifiedElement::Vertex {
+                            partition: 7,
+                            id: 1,
+                        },
+                        properties: BTreeMap::from([("x".into(), vec![Value::Integer(0); 60_000])]),
+                    },
+                ],
+            },
+            offsets: BTreeMap::new(),
+            cursors: BTreeMap::new(),
+        };
+        // A small first page alone is insufficient to admit this result.
+        assert!(http_codec::encode(&Ok(open_reply(None, &session, &result))).is_ok());
+        assert_eq!(
+            preflight_http_pages(&session, &result, Instant::now() + Duration::from_secs(5)),
+            Err(Error::Capacity)
         );
     }
 }

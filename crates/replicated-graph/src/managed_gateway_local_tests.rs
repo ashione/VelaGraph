@@ -1810,3 +1810,143 @@ async fn causal_lower_bound_local_query_round_trip_and_timeout() {
     }
     f.stop().await;
 }
+
+async fn http_post(
+    address: SocketAddr,
+    path: &str,
+    value: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    use axum::body::{to_bytes, Body};
+    let stream = TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .unwrap();
+    let connection = tokio::spawn(connection);
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = to_bytes(Body::new(response.into_body()), MAX_RESPONSE_BYTES)
+        .await
+        .unwrap();
+    connection.await.unwrap().unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_http_shared_writes_queries_and_tcp_fixed_view() {
+    use serde_json::json;
+    let _test = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    assert!(matches!(
+        g.bind_http("0.0.0.0:0".parse().unwrap(), Duration::from_secs(15))
+            .await,
+        Err(Error::Rejected)
+    ));
+    let http = g
+        .bind_http("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+        .await
+        .unwrap();
+    let write = json!({"external_id":"01010101010101010101010101010101","mutation":{"type":"create_vertex","partition":7,"vertex":{"id":"1","labels":["person"],"properties":{"name":{"type":"text","value":"Alice"}}}}});
+    let (status, first) =
+        http_post(http.local_addr(), "/preview1/writes:submit", write.clone()).await;
+    assert_eq!(status, 200, "{first}");
+    let (_, replay) = http_post(http.local_addr(), "/preview1/writes:status", write.clone()).await;
+    assert_eq!(first, replay);
+    let tcp = call(
+        &g,
+        Operation::Status(Write {
+            external_id: [1; 16],
+            mutation: Mutation::CreateVertex {
+                partition: 7,
+                vertex: VertexData {
+                    id: 1,
+                    labels: vec!["person".into()],
+                    properties: BTreeMap::from([("name".into(), Value::Text("Alice".into()))]),
+                },
+            },
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        tcp,
+        Reply::Write {
+            status: WriteStatus::Committed { visible: true, .. },
+            ..
+        }
+    ));
+    let query = json!({"partition":7,"text":"g.V(1,2)"});
+    let open = json!({"read":{"type":"latest"},"ttl_millis":60000,"query":query,"page_size":1});
+    let (status, result) = http_post(http.local_addr(), "/preview1/queries:open", open).await;
+    assert_eq!(status, 200, "{result}");
+    let session = result["result"]["session"].clone();
+    assert!(session["version"].is_string(), "{result}");
+    let write2 = json!({"external_id":"02020202020202020202020202020202","mutation":{"type":"create_vertex","partition":7,"vertex":{"id":"2","labels":["person"],"properties":{"name":{"type":"text","value":"Bob"}}}}});
+    assert_eq!(
+        http_post(http.local_addr(), "/preview1/writes:submit", write2)
+            .await
+            .0,
+        200
+    );
+    let (status, old) = http_post(
+        http.local_addr(),
+        "/preview1/queries:fetch",
+        json!({"session":session,"query":query,"cursor":null,"page_size":1}),
+    )
+    .await;
+    assert_eq!(status, 200, "{old}");
+    assert_eq!(old["result"]["session"], session);
+    assert_eq!(old["result"]["page"]["total"], 1);
+    assert_eq!(old["result"]["page"]["rows"][0]["element"]["id"], "1");
+    let (status, fresh) = http_post(http.local_addr(), "/preview1/queries:open", json!({"read":{"type":"minimum","version":"2"},"ttl_millis":60000,"query":query,"page_size":1})).await;
+    assert_eq!(status, 200, "{fresh}");
+    assert_eq!(fresh["result"]["page"]["total"], 2);
+    assert_eq!(
+        http_post(
+            http.local_addr(),
+            "/preview1/queries:close",
+            json!({"session":fresh["result"]["session"]})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        http_post(
+            http.local_addr(),
+            "/preview1/queries:close",
+            json!({"session":session})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_ne!(
+        http_post(
+            http.local_addr(),
+            "/preview1/queries:fetch",
+            json!({"session":session,"query":query,"cursor":null,"page_size":1})
+        )
+        .await
+        .0,
+        200
+    );
+    http.shutdown().await;
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    f.stop().await;
+}

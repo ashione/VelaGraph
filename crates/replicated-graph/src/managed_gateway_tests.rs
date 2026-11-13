@@ -1,3 +1,4 @@
+use super::invocation::OpenDelivery;
 use super::*;
 // The client intentionally has a process-wide eight-call cap. Keep independent
 // fixture tests from consuming each other's admission budget under parallel CI.
@@ -1810,3 +1811,107 @@ mod condition_tests;
 mod local_tests;
 #[path = "managed_gateway_replace_tests.rs"]
 mod replace_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_invocation_drop_cleans_new_session_and_holds_admission() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    let work = Arc::new(g.state.connections.clone().try_acquire_owned().unwrap());
+    let invocation = invocation::Invocation::begin(
+        g.state.clone(),
+        Request {
+            version: VERSION,
+            request_id: [42; 16],
+            binding: bound(),
+            operation: Operation::OpenSession {
+                version: None,
+                ttl_millis: 60_000,
+            },
+        },
+        work,
+        Instant::now() + Duration::from_secs(15),
+    )
+    .await
+    .unwrap();
+    assert_eq!(g.state.connections.available_permits(), MAX_CONNECTIONS - 1);
+    assert_eq!(g.retained_payload_charge(), SESSION_CHARGE);
+    let token = match &invocation.response.result {
+        Ok(Reply::OpenSession(session)) => session.clone(),
+        other => panic!("{other:?}"),
+    };
+    let (bytes, invocation) = tokio::task::spawn_blocking(move || invocation.encode_tcp())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!bytes.is_empty());
+    assert_eq!(g.state.connections.available_permits(), MAX_CONNECTIONS - 1);
+    drop(invocation); // cancelled or undelivered response: never call delivered
+    assert_eq!(g.state.connections.available_permits(), MAX_CONNECTIONS);
+    assert_eq!(g.retained_payload_charge(), 0);
+    assert_eq!(
+        call(&g, Operation::Close { session: token }).await,
+        Err(Error::SessionUnavailable)
+    );
+    g.shutdown().await;
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_idle_and_incomplete_body_share_tcp_admission_and_deadline() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    let http = g
+        .bind_http("127.0.0.1:0".parse().unwrap(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let mut sockets = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        sockets.push(TcpStream::connect(http.local_addr()).await.unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while g.state.connections.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(call(&g, Operation::Status(create(99, 7, 99)))
+        .await
+        .is_err());
+    drop(sockets);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while g.state.connections.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut stalled = TcpStream::connect(http.local_addr()).await.unwrap();
+    stalled.write_all(b"POST /preview1/writes:submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\nX-Velagraph-Timeout-Ms: 20\r\n\r\n{").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stalled.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while g.state.connections.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        call(&g, Operation::Status(create(99, 7, 99)))
+            .await
+            .unwrap(),
+        Reply::Write {
+            status: WriteStatus::Absent,
+            ..
+        }
+    ));
+    http.shutdown().await;
+    g.shutdown().await;
+    f.stop().await;
+}

@@ -10,6 +10,11 @@ can proceed in parallel; an umbrella issue is not closed by shipping one slice.
 
 ## v0.0.1 — bounded fixed-topology experimental service
 
+Implementation boundary: [public managed service design](PUBLIC_SERVICE_DESIGN.md)
+(shared handlers, protocol parity, delivery ownership and readiness gates).
+The [HTTP-only library preview](PUBLIC_HTTP_PREVIEW.md) is an initial slice,
+not the final dual-protocol endpoint or a completed release gate.
+
 Deliver a small usable service before promising elastic operation:
 
 - One reproducible loopback startup and clean-environment write/query examples.
