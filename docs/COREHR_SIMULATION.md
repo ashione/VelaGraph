@@ -7,6 +7,15 @@ fixture and database evidence, and
 runs 2,000-person smoke and 200,000-person full workloads. The final JSONL record
 must say `complete: true`; a partial output is not a passing run.
 
+The three executable acceptance examples use typed gRPC for readiness, fixture
+writes, snapshot verification, coordinator queries/jobs and shard execution.
+The shared example client helper includes connection setup inside each existing
+caller deadline and never retries writes. RPC deadlines receive only the budget
+remaining after connection setup; no phase silently starts a new full timeout.
+No legacy TCP listener is re-enabled
+for CoreHR; its data, query oracle, capacity checks and timeout budgets remain
+unchanged.
+
 ## Model and independent oracle
 
 - 200,000 people, 5,000 departments, globally distinct IDs.

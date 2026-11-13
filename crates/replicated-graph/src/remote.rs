@@ -39,9 +39,9 @@ pub use paged::grpc;
 pub mod query;
 pub mod single_query_grpc;
 pub use paged::{
-    close_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified, snapshot_page,
-    SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES, MAX_PAGE_ROWS,
-    MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS, SESSION_TTL,
+    close_snapshot, grpc_paged_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified,
+    snapshot_page, SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES,
+    MAX_PAGE_ROWS, MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS, SESSION_TTL,
 };
 
 static CLIENT_ADMISSION: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);

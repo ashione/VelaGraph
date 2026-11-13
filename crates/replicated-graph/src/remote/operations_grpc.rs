@@ -209,7 +209,9 @@ impl Client {
             absolute_deadline: None,
         })
     }
-    pub(crate) fn with_deadline(mut self, end: Instant) -> Self {
+    /// Apply a caller-owned absolute deadline across connection and operation.
+    /// A scoped clone must not be retained as an unscoped reusable client.
+    pub fn with_deadline(mut self, end: Instant) -> Self {
         self.absolute_deadline = Some(end);
         self
     }

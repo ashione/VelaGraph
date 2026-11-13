@@ -1,11 +1,14 @@
 //! Real loopback Raft processes, bounded fixture import, oracle-checked queries.
+#[allow(dead_code)]
+#[path = "support/rpc.rs"]
+mod rpc;
+
 use anyhow::{ensure, Context};
 use replicated_graph::{
     catalog::{Catalog, Placement},
     remote::{
-        self,
         distributed::{
-            self, CoordinatorService, DistributedRequest, PartitionRoute, StaticCatalog,
+            grpc::GrpcCoordinatorService, DistributedRequest, PartitionRoute, StaticCatalog,
         },
         query::{QualifiedElement, QueryCompleteness, QueryFailure, QueryRow},
         RemoteIdentity,
@@ -94,7 +97,7 @@ impl Group {
         };
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if remote::probe_identified(
+                if rpc::probe(
                     a[2],
                     RemoteIdentity { group: g, node: 1 },
                     shard,
@@ -299,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
             id[..8].copy_from_slice(&batch.to_le_bytes());
             id[8..].copy_from_slice(b"corehr01");
             let t = Instant::now();
-            let response = remote::write_identified(
+            let response = rpc::write(
                 group.replica.endpoint,
                 RemoteIdentity {
                     group: group.placement.group,
@@ -363,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
     // Exact byte verification of every canonical vertex/edge and both indexes.
     for group in &groups[1..] {
         let t = Instant::now();
-        let snap = remote::paged_snapshot_identified(
+        let snap = replicated_graph::remote::grpc_paged_snapshot(
             group.replica.endpoint,
             RemoteIdentity {
                 group: group.placement.group,
@@ -491,7 +494,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(())
     }).await??;
-    let service = CoordinatorService::start(
+    let service = GrpcCoordinatorService::start(
         "127.0.0.1:0".parse()?,
         StaticCatalog {
             partitions: groups[1..]
@@ -519,7 +522,7 @@ async fn main() -> anyhow::Result<()> {
         let mut sample_results = Vec::new();
         for _ in 0..if supported { 7 } else { 1 } {
             let t = Instant::now();
-            let result = distributed::query(
+            let result = rpc::query(
                 service.local_addr(),
                 DistributedRequest {
                     start_partition: c["partition"].as_u64().unwrap() as u32,
@@ -577,7 +580,7 @@ async fn main() -> anyhow::Result<()> {
         let mut current = start;
         let mut chain = Vec::new();
         for _ in 0..64 {
-            let output = distributed::query(
+            let output = rpc::query(
                 service.local_addr(),
                 DistributedRequest {
                     start_partition: 1 + (current % 3) as u32,

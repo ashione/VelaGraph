@@ -190,3 +190,19 @@ then releases application and verifies commit, explicit same-ID Duplicate,
 exact sequence increment and stored value. It does not infer a write rollback
 from a timeout or claim cross-host fault coverage. Independent review corrected
 transport accounting to pinned Hyper's 400 KiB send / 1 MiB receive defaults.
+
+## First exact-head CI integration finding
+
+PR #259 head `07034bd3` failed CoreHR smoke startup in run `43440274350`:
+`smoke-queries` exhausted its original 30-second readiness wait. The node had
+moved to gRPC, but the three CoreHR executable examples still called the legacy
+probe/write/snapshot and coordinator transports. This is a migration omission,
+not evidence of a flaky runner or permission problem. The failed artifact
+`14045833169` retains stderr and node logs.
+
+The correction migrates those examples to existing typed RPC clients and the
+typed coordinator on both ingress and shard routes. It preserves the original
+fixture, oracle, budgets and failure assertions; it neither restores the old
+listener nor changes timeout/test profiles. Local Rust execution was unavailable
+after the cloud environment reset, so this correction requires fresh exact-head
+CI rather than inheriting earlier local pass claims.

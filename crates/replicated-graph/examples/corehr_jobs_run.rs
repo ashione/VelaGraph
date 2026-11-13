@@ -1,11 +1,14 @@
 //! Real loopback Raft processes, bounded fixture import, oracle-checked queries.
+#[allow(dead_code)]
+#[path = "support/rpc.rs"]
+mod rpc;
+
 use anyhow::{ensure, Context};
 use replicated_graph::{
     catalog::{Catalog, Placement},
     remote::{
-        self,
         distributed::{
-            self, CoordinatorService, DistributedRequest, PartitionRoute, StaticCatalog,
+            grpc::GrpcCoordinatorService, DistributedRequest, PartitionRoute, StaticCatalog,
         },
         query::{QualifiedElement, QueryCompleteness, QueryFailure, QueryRow},
         RemoteIdentity,
@@ -143,7 +146,7 @@ async fn execute_job(
     phase: &str,
     sample: usize,
 ) -> anyhow::Result<Value> {
-    use replicated_graph::remote::distributed::jobs::{self, Output, Request};
+    use replicated_graph::remote::distributed::jobs::{Output, Request};
     let started = Instant::now();
     let mut token_saved = None;
     let mut times = Vec::new();
@@ -157,7 +160,7 @@ async fn execute_job(
         let mut fixed=None;
         for round in 0..20000u64 {
             let tick=Instant::now();
-            let response=jobs::request(endpoint,request,Duration::from_secs(5)).await?;
+            let response=rpc::job(endpoint,request,Duration::from_secs(5)).await?;
             times.push(tick.elapsed().as_secs_f64()*1000.);
             let output=match response {
                 Ok(v)=>v,
@@ -178,7 +181,7 @@ async fn execute_job(
                 ensure!(case.error.is_none() && count==case.count,"unexpected completed count {count:?}");
                 let elapsed=started.elapsed().as_secs_f64();
                 let replay_started=Instant::now();
-                let replay=jobs::request(endpoint,Request::Advance{token,sequence:next_sequence.checked_sub(1).context("completed without advance")?},Duration::from_secs(5)).await??;
+                let replay=rpc::job(endpoint,Request::Advance{token,sequence:next_sequence.checked_sub(1).context("completed without advance")?},Duration::from_secs(5)).await??;
                 let Output::Progress{token:t,next_sequence:s,complete:c,count:n,completeness:k,snapshots:v}=replay else {anyhow::bail!("replay cancelled")};
                 ensure!(t==token && s==next_sequence && c && n==count && k==completeness && v==snapshots,"completed replay changed output");
                 completed=true;
@@ -190,8 +193,8 @@ async fn execute_job(
     }).await.map_err(|_|anyhow::anyhow!("135-second driver safety timeout")).and_then(|r|r);
     if let Some(token) = token_saved {
         let cancel =
-            jobs::request(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
-        let unavailable = jobs::request(
+            rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
+        let unavailable = rpc::job(
             endpoint,
             Request::Advance { token, sequence: 0 },
             Duration::from_secs(5),
@@ -230,8 +233,8 @@ async fn execute_job(
     result
 }
 async fn cancel_active_job(endpoint: std::net::SocketAddr) -> anyhow::Result<()> {
-    use replicated_graph::remote::distributed::jobs::{self, Output, Request};
-    let start = jobs::request(
+    use replicated_graph::remote::distributed::jobs::{Output, Request};
+    let start = rpc::job(
         endpoint,
         Request::Start {
             start_partition: 2,
@@ -251,7 +254,7 @@ async fn cancel_active_job(endpoint: std::net::SocketAddr) -> anyhow::Result<()>
     else {
         anyhow::bail!("unexpected start result")
     };
-    let progress = jobs::request(
+    let progress = rpc::job(
         endpoint,
         Request::Advance {
             token,
@@ -273,9 +276,9 @@ async fn cancel_active_job(endpoint: std::net::SocketAddr) -> anyhow::Result<()>
     };
     ensure!(t == token && s == next_sequence + 1 && snapshots == v);
     let cancel =
-        jobs::request(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await??;
+        rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await??;
     ensure!(matches!(cancel, Output::Cancelled));
-    let after = jobs::request(
+    let after = rpc::job(
         endpoint,
         Request::Advance { token, sequence: s },
         Duration::from_secs(5),
@@ -372,7 +375,7 @@ impl Group {
         };
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if remote::probe_identified(
+                if rpc::probe(
                     a[2],
                     RemoteIdentity { group: g, node: 1 },
                     shard,
@@ -577,7 +580,7 @@ async fn main() -> anyhow::Result<()> {
             id[..8].copy_from_slice(&batch.to_le_bytes());
             id[8..].copy_from_slice(b"corehr01");
             let t = Instant::now();
-            let response = remote::write_identified(
+            let response = rpc::write(
                 group.replica.endpoint,
                 RemoteIdentity {
                     group: group.placement.group,
@@ -641,7 +644,7 @@ async fn main() -> anyhow::Result<()> {
     // Exact byte verification of every canonical vertex/edge and both indexes.
     for group in &groups[1..] {
         let t = Instant::now();
-        let snap = remote::paged_snapshot_identified(
+        let snap = replicated_graph::remote::grpc_paged_snapshot(
             group.replica.endpoint,
             RemoteIdentity {
                 group: group.placement.group,
@@ -776,7 +779,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(())
     }).await??;
-    let service = CoordinatorService::start(
+    let service = GrpcCoordinatorService::start(
         "127.0.0.1:0".parse()?,
         StaticCatalog {
             partitions: groups[1..]
@@ -803,7 +806,7 @@ async fn main() -> anyhow::Result<()> {
         );
         let result=async {
             for query in ["g.V(1).repeat(__.in('reports_to')).emit().times(32).count()","g.V(1).repeat(__.in('reports_to')).emit().times(32).limit(1)"] {
-                let response=distributed::query(service.local_addr(),DistributedRequest{start_partition:2,text:query.into(),timeout_millis:5000},Duration::from_secs(6)).await?;
+                let response=rpc::query(service.local_addr(),DistributedRequest{start_partition:2,text:query.into(),timeout_millis:5000},Duration::from_secs(6)).await?;
                 ensure!(matches!(response,Err(QueryFailure::ResourceExhausted)),"old synchronous broad traversal no longer rejected");
                 println!("{}",json!({"event":"synchronous_guard","query":query,"expected_rejection":"ResourceExhausted"}));
             }
@@ -841,7 +844,7 @@ async fn main() -> anyhow::Result<()> {
         let mut sample_results = Vec::new();
         for _ in 0..if supported { 7 } else { 1 } {
             let t = Instant::now();
-            let result = distributed::query(
+            let result = rpc::query(
                 service.local_addr(),
                 DistributedRequest {
                     start_partition: c["partition"].as_u64().unwrap() as u32,
@@ -899,7 +902,7 @@ async fn main() -> anyhow::Result<()> {
         let mut current = start;
         let mut chain = Vec::new();
         for _ in 0..64 {
-            let output = distributed::query(
+            let output = rpc::query(
                 service.local_addr(),
                 DistributedRequest {
                     start_partition: 1 + (current % 3) as u32,
