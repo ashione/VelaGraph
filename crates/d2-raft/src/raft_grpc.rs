@@ -18,7 +18,7 @@ use tonic::{
     transport::{Channel, Endpoint},
     Request, Response, Status,
 };
-mod admission;
+pub(crate) mod admission;
 mod bounded;
 mod codec;
 pub mod wire {

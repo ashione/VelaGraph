@@ -88,7 +88,8 @@ async fn outbound_limit_releases_on_cancellation() {
 
 #[tokio::test]
 async fn inbound_admission_recovers_after_client_disconnect() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _guard = OUTBOUND_TEST_LOCK.lock().await;
+    use tokio::io::AsyncWriteExt;
     let dir = tempfile::tempdir().unwrap();
     let node = TcpNode::start(TcpNodeConfig {
         id: 1,
@@ -101,23 +102,24 @@ async fn inbound_admission_recovers_after_client_disconnect() {
     let mut held = Vec::new();
     for _ in 0..4 {
         let mut socket = TcpStream::connect(&node.control_addr).await.unwrap();
-        socket.write_all(b"{").await.unwrap();
+        socket.write_all(b"PRI * HTTP/2.0\r\n").await.unwrap();
         held.push(socket);
     }
-    let mut queued = TcpStream::connect(&node.control_addr).await.unwrap();
-    queued.write_all(b"\"Status\"\n").await.unwrap();
-    let mut byte = [0];
-    assert!(timeout(Duration::from_millis(100), queued.read(&mut byte))
+    let address = node.control_addr.clone();
+    let mut queued =
+        tokio::spawn(async move { send_control(&address, ControlRequest::Status).await });
+    assert!(timeout(Duration::from_millis(100), &mut queued)
         .await
         .is_err());
     drop(held.pop());
-    assert_eq!(
-        timeout(Duration::from_secs(1), queued.read(&mut byte))
+    assert!(matches!(
+        timeout(Duration::from_secs(1), queued)
             .await
             .unwrap()
+            .unwrap()
             .unwrap(),
-        1
-    );
+        d2_raft::ControlResponse::Status(_)
+    ));
     drop(held);
     node.shutdown().await;
 }

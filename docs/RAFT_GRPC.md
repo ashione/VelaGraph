@@ -5,7 +5,7 @@ Tracking: [#238](https://github.com/ashione/VelaGraph/issues/238), part of [#218
 `TcpNode` now runs **Raft peer traffic** using the versioned
 `velagraph.internal.raft.v1.RaftService`: Vote, Append and InstallSnapshot.
 The lifecycle type retains its existing name; the independent `d2-ctl` control
-port still uses newline JSON. This is not completion of all internal transport
+port now uses its separate [typed control service](CONTROL_GRPC.md). This is not completion of all internal transport
 migration. The in-process registry remains a deterministic testing transport.
 
 ## Contract

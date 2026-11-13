@@ -13,6 +13,7 @@
 mod blocking;
 pub mod capacity_policy;
 pub mod cohort_reads;
+pub mod control_grpc;
 mod coordinator_state;
 mod d1;
 mod decision_segments;

@@ -2,7 +2,7 @@
 
 Current transport update: process-node Raft peers now use [typed gRPC v1](RAFT_GRPC.md);
 the original prototype history below retains its historical TCP terminology. The
-separate driver control port remains JSON/TCP. Mixed Raft wire versions are not supported.
+separate driver control port uses [typed control gRPC](CONTROL_GRPC.md). Mixed Raft wire versions are not supported.
 
 Status: decision accepted; a three-node prototype is implemented in
 `crates/d2-raft`, including a three-OS-process TCP integration test. The TCP node
@@ -132,12 +132,12 @@ the value on every process, kills the leader, elects a new leader, writes again,
 and restarts the old leader against its original durable directory to verify
 recovery and catch-up. The node binaries can also be started on separate hosts;
 `d2-node --bootstrap` uses the same `initialize_cluster`/`TcpNode::bootstrap` API
-exposed by the crate, and `d2-ctl` drives status, writes and reads. The TCP
-framing is newline-delimited JSON carrying the openraft request/response types.
+exposed by the crate, and `d2-ctl` drives status, writes and reads. The current peer and control endpoints use separate typed gRPC services; the
+original newline-JSON prototype wire is no longer accepted.
 
 This proves cross-process consensus, serialization and process-restart recovery,
 not production network security or OS-crash durability. The transport has no
-TLS, authentication, or connection pooling, and the control port is an
+TLS or authentication, and the control port is an
 operations/test helper. Bounded framing, admission, total deadlines and tracked
 shutdown are specified in [D2 TCP limits](D2_TCP_LIMITS.md); these are resource
 safeguards, not production authentication or authorization.

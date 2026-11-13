@@ -158,7 +158,8 @@ the configured public HTTP/gRPC listeners, not an unused legacy gateway port. Ob
 hierarchy shard jobs and [Raft peers](docs/RAFT_GRPC.md) also have typed gRPC paths.
 Observed coordinator query/job ingress now has a typed gRPC service: use
 `graph-coordinator serve-grpc` and client commands with `--grpc`. Legacy coordinator
-TCP ingress, driver control and remaining legacy listeners still need retirement;
+TCP ingress and remaining legacy/Unix listeners still need retirement;
+[process-node driver/control](docs/CONTROL_GRPC.md) now uses typed gRPC too;
 these internal observed endpoints are not the public managed API.
 
 Local RocksDB/Raft remains the durable authority. The object-store library can

@@ -125,7 +125,8 @@ gRPC, HTTP preview and durable formats are separate version namespaces. See
 [internal managed RPC](INTERNAL_GRPC_MANAGED.md),
 [Raft gRPC](RAFT_GRPC.md) and [public gRPC](PUBLIC_GRPC_SERVICE.md).
 Raft peer traffic is now typed gRPC (no mixed old/new Raft wire cluster support);
-driver/control and other compatibility paths remain in the
+driver/control is now a separate [typed gRPC service](CONTROL_GRPC.md); remaining
+legacy/Unix compatibility paths remain in the
 [communication inventory](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory). Bound durable
 coordinator/member metadata is **v16/v17**. Historical v5/v8/v9/v10/v11–v15
 references in foundational documents describe actual legacy modes/migration

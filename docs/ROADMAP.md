@@ -23,7 +23,7 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；observed hierarchy jobs 的 shard
   OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径；[#248](https://github.com/ashione/VelaGraph/issues/248)
   增加 coordinator observed Query/Job typed gRPC 入口，serve-grpc 与 --grpc 客户端复用原执行器、
-  Jobs 状态机及累计预算。旧 coordinator TCP/control/兼容入口仍待退役，不能视作全部删除。
+  Jobs 状态机及累计预算。旧 coordinator TCP/Unix/兼容入口仍待退役，不能视作全部删除。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
   managed control 与对外 gateway 协议仍不在该切片内。
@@ -36,8 +36,11 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   [#242](https://github.com/ashione/VelaGraph/issues/242) 将服务入口的 managed 与 graph
   路由固定为 gRPC，移除临时选择开关；[#244](https://github.com/ashione/VelaGraph/issues/244)
   将 Service 生命周期与旧 TCP listener 解耦，graph-service 只绑定配置的公开端口，
-  保留会话过期和 shutdown/drop 清理。旧 library/control/coordinator 入口仍须逐项
+  保留会话过期和 shutdown/drop 清理。旧 library/coordinator/Unix 入口仍须逐项
   迁移或删除，不能将服务入口切换当作统一通信已完成。
+- **driver/control 切片**：[#251](https://github.com/ashione/VelaGraph/issues/251) 将 process-node
+  --control 与 d2-ctl/send_control 的九项操作统一为 typed gRPC，复用原 handler、容量与 deadline，
+  同端口替换旧 newline JSON，不保留自动 fallback；见 [control transport](CONTROL_GRPC.md)。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、
@@ -392,11 +395,12 @@ Linux 上新增只读 UDS gateway，以受信任目录、socket 权限和 peer U
 
 ### D2 TCP resource safety
 
-Legacy newline-JSON v0 now bounds frame allocation/encoding, concurrent handlers
-and outbound exchanges, uses shared total deadlines, and tracks shutdown of
-connections. Oversized batches can be reduced through openraft hints. Control
-remains unauthenticated and intended only for trusted isolated tests; this is
-not production transport security or D3 completion. See `D2_TCP_LIMITS.md`.
+The former newline-JSON transport is replaced by separate typed Raft and control
+gRPC services. Original logical payload/write accounting, bounded admission,
+total deadlines and tracked shutdown remain; protobuf decoding is allocation
+bounded. Oversized Raft batches retain openraft hints. Control remains
+unauthenticated and development-only, not production administration or D3
+completion. See `D2_TCP_LIMITS.md` and `CONTROL_GRPC.md`.
 
 ### Functional remote graph prototype
 

@@ -74,7 +74,7 @@ The new coordinator ingress covers ordinary observed queries and the existing
 Start/StartRows/Read/Advance/Cancel jobs, with typed output/failure oneofs, snapshot
 stamps and property values. It exposes no fixed/managed Consistent RPC. A caller
 using an unknown method receives an explicit gRPC Unimplemented response. Legacy
-coordinator, driver/control and Unix gateway paths still require retirement or
+coordinator and Unix gateway paths still require retirement or
 migration; this is not completion of #218.
 
 The original job state machine retains cumulative budgets, shard parallelism,

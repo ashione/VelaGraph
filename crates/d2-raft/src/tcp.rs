@@ -1,197 +1,24 @@
-//! Process node lifecycle and legacy control transport.
-//!
-//! Raft peers now use typed gRPC (see `raft_grpc`). The separate d2-ctl control
-//! port retains its legacy newline JSON protocol until its own migration.
+//! Process node lifecycle. Raft peers and driver control use separate typed gRPC services.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::{BasicNode, Config};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{timeout_at, Instant};
+use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
-use crate::blocking::blocking_section;
 use crate::durable_log_store::DurableLogStore;
 use crate::state_machine::StateMachine;
 use crate::types::{LogCommand, NodeId, TypeConfig};
 
 pub type Raft = openraft::Raft<TypeConfig>;
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(3);
-/// Legacy newline JSON protocol, unchanged on the wire (no negotiation).
-pub const TCP_PROTOCOL_VERSION: u16 = 0;
-const MAX_LINE: usize = 64 * 1024 * 1024;
-const CONNECTIONS_PER_LISTENER: usize = 4;
-static OUTBOUND: Semaphore = Semaphore::const_new(16);
-
-// The frame includes the newline. Check before extending, never read_line into
-// an unbounded String. BufReader itself uses only its fixed-size read buffer.
-async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
-    let mut frame = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete JSON frame",
-            ));
-        }
-        let newline = available.iter().position(|b| *b == b'\n');
-        let count = newline.map_or(available.len(), |n| n + 1);
-        if count > MAX_LINE - frame.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "JSON frame exceeds limit",
-            ));
-        }
-        reserve_frame(&mut frame, count)?;
-        frame.extend_from_slice(&available[..count]);
-        reader.consume(count);
-        if newline.is_some() {
-            return Ok(frame);
-        }
-        if frame.len() == MAX_LINE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "JSON frame missing delimiter within limit",
-            ));
-        }
-    }
-}
-
-// Grow geometrically for small JSON tokens, but never request capacity beyond
-// the frame cap (including the delimiter). Allocator bookkeeping is excluded.
-fn reserve_frame(bytes: &mut Vec<u8>, additional: usize) -> io::Result<()> {
-    let needed = bytes.len() + additional;
-    if needed > bytes.capacity() {
-        let capacity = needed.max(bytes.capacity().saturating_mul(2)).min(MAX_LINE);
-        bytes
-            .try_reserve_exact(capacity - bytes.len())
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
-struct FrameWriter {
-    bytes: Vec<u8>,
-    deadline: Instant,
-}
-impl io::Write for FrameWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if Instant::now() >= self.deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "JSON encoding deadline",
-            ));
-        }
-        if bytes.len() > MAX_LINE - 1 - self.bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "JSON encoding exceeds limit",
-            ));
-        }
-        reserve_frame(&mut self.bytes, bytes.len())?;
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-fn encode_frame<T: Serialize>(value: &T, deadline: Instant) -> anyhow::Result<Vec<u8>> {
-    blocking_section(|| {
-        let mut writer = FrameWriter {
-            bytes: Vec::new(),
-            deadline,
-        };
-        // Coalesce serde's tiny punctuation/numeric writes. The fixed buffer is
-        // additional scratch space, not extra permitted frame bytes. Flush
-        // through FrameWriter before accepting the final deadline or delimiter.
-        {
-            let mut buffered = std::io::BufWriter::with_capacity(8192, &mut writer);
-            serde_json::to_writer(&mut buffered, value)?;
-            std::io::Write::flush(&mut buffered).map_err(serde_json::Error::io)?;
-        }
-        if Instant::now() >= deadline {
-            return Err(serde_json::Error::io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "JSON encoding deadline",
-            ))
-            .into());
-        }
-        reserve_frame(&mut writer.bytes, 1)?;
-        writer.bytes.push(b'\n');
-        Ok(writer.bytes)
-    })
-}
-
-async fn exchange_json<Q: Serialize, R: DeserializeOwned>(
-    addr: &str,
-    request: &Q,
-    budget: Duration,
-) -> anyhow::Result<R> {
-    let deadline = Instant::now() + budget.min(RPC_TIMEOUT);
-    let _permit = OUTBOUND
-        .try_acquire()
-        .map_err(|_| anyhow::anyhow!("outbound RPC capacity exhausted"))?;
-    let result = timeout_at(deadline, async {
-        let payload = encode_frame(request, deadline)?;
-        let mut stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        stream.write_all(&payload).await?;
-        let frame = read_frame(&mut BufReader::new(stream)).await?;
-        let reply = blocking_section(|| serde_json::from_slice(&frame))?;
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "RPC deadline expired during decode"
-        );
-        Ok::<R, anyhow::Error>(reply)
-    })
-    .await;
-    result.map_err(|_| anyhow::anyhow!("{addr}: RPC deadline expired"))?
-}
-
-// Own every connection task. Shutdown stops admission, cancels active handlers,
-// and joins them before the listener task finishes.
-async fn serve(
-    listener: TcpListener,
-    raft: Raft,
-    state: Arc<StateMachine>,
-    mut stop: watch::Receiver<bool>,
-) {
-    let mut connections = JoinSet::new();
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.changed() => break,
-            _ = connections.join_next(), if !connections.is_empty() => {},
-            accepted = listener.accept(), if connections.len() < CONNECTIONS_PER_LISTENER => {
-                let (stream, _) = match accepted {
-                    Ok(value) => value,
-                    Err(error) => { tracing::warn!(%error, "listener accept failed"); break; }
-                };
-                let raft = raft.clone();
-                let state = state.clone();
-                let deadline = Instant::now() + RPC_TIMEOUT;
-                connections.spawn(async move {
-                    let work = async {
-                        handle_control_connection(stream, raft, state, deadline).await
-                    };
-                    // Do not log attacker-controlled JSON or payloads.
-                    let _ = timeout_at(deadline, work).await;
-                });
-            }
-        }
-    }
-    connections.shutdown().await;
-}
+pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const MAX_LINE: usize = 64 * 1024 * 1024;
 
 /// Initialize a new cluster with the given voter addresses.
 ///
@@ -293,27 +120,19 @@ impl ControlResponse {
     }
 }
 
-async fn exchange_control(addr: &str, request: &ControlRequest) -> anyhow::Result<ControlResponse> {
-    exchange_json(addr, request, RPC_TIMEOUT).await
-}
-
-/// Send one control command and return the decoded response.
+/// Send exactly one typed control RPC. A timeout leaves mutation outcome unknown;
+/// the client does not automatically retry or fall back to a legacy protocol.
 pub async fn send_control(addr: &str, request: ControlRequest) -> anyhow::Result<ControlResponse> {
-    exchange_control(addr, &request).await?.into_result()
+    crate::control_grpc::request(addr, request)
+        .await?
+        .into_result()
 }
 
-async fn handle_control_connection(
-    stream: TcpStream,
+pub(crate) async fn execute_control(
     raft: Raft,
     state_machine: Arc<StateMachine>,
-    deadline: Instant,
-) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(stream);
-    let frame = read_frame(&mut reader).await?;
-    let request: ControlRequest = blocking_section(|| serde_json::from_slice(&frame))?;
-    anyhow::ensure!(Instant::now() < deadline, "control deadline expired");
-    drop(frame);
-    let mut stream = reader.into_inner();
+    request: ControlRequest,
+) -> ControlResponse {
     let response = match request {
         ControlRequest::D1Capacity { shard, epoch } => match raft.ensure_linearizable().await {
             Ok(_) => ControlResponse::D1Capacity(state_machine.d1_capacity(shard, epoch).await),
@@ -360,12 +179,9 @@ async fn handle_control_connection(
             // Keep 1 KiB for the fixed command/log/vote envelope. Raw public
             // Raft handles remain caller-managed and can submit larger entries.
             if key.len().saturating_add(value.len()) > (MAX_LINE - 1024) / 4 {
-                let response =
-                    ControlResponse::Err("control write exceeds replication payload budget".into());
-                stream
-                    .write_all(&encode_frame(&response, deadline)?)
-                    .await?;
-                return Ok(());
+                return ControlResponse::Err(
+                    "control write exceeds replication payload budget".into(),
+                );
             }
             match raft.client_write(LogCommand::put(key, value)).await {
                 Ok(response) => match response.data.d1 {
@@ -397,9 +213,7 @@ async fn handle_control_connection(
             })
         }
     };
-    let payload = encode_frame(&response, deadline)?;
-    stream.write_all(&payload).await?;
-    Ok(())
+    response
 }
 
 fn create_data_dir(path: &Path) -> anyhow::Result<()> {
@@ -463,7 +277,7 @@ impl TcpNode {
             raft.clone(),
             receiver.clone(),
         ));
-        let control_task = tokio::spawn(serve(
+        let control_task = tokio::spawn(crate::control_grpc::serve(
             control_listener,
             raft.clone(),
             state_machine.clone(),
@@ -510,105 +324,5 @@ impl TcpNode {
             let _ = self.raft.shutdown().await;
         });
         let _ = cleanup.await;
-    }
-}
-
-#[cfg(test)]
-mod framing_tests {
-    use super::*;
-    use tokio::io::{duplex, AsyncReadExt};
-
-    #[tokio::test]
-    async fn oversize_without_newline_fails_before_consuming_extra_bytes() {
-        let bytes = vec![b'x'; MAX_LINE + 32];
-        let mut reader = BufReader::with_capacity(8192, bytes.as_slice());
-        let error = read_frame(&mut reader).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let mut remaining = Vec::new();
-        reader.read_to_end(&mut remaining).await.unwrap();
-        assert_eq!(remaining, vec![b'x'; 32]);
-    }
-
-    #[tokio::test]
-    async fn exact_frame_boundary_and_multiple_frames() {
-        let mut bytes = vec![b' '; MAX_LINE];
-        bytes[MAX_LINE - 1] = b'\n';
-        bytes.extend_from_slice(b"\"Status\"\n");
-        let mut reader = BufReader::new(bytes.as_slice());
-        assert_eq!(read_frame(&mut reader).await.unwrap().len(), MAX_LINE);
-        assert_eq!(read_frame(&mut reader).await.unwrap(), b"\"Status\"\n");
-        assert_eq!(
-            read_frame(&mut reader).await.unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-        let mut reader = BufReader::new(&b"\"Status\""[..]);
-        assert_eq!(
-            read_frame(&mut reader).await.unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-    }
-
-    #[test]
-    fn encoding_is_bounded_for_requests_and_responses_including_escapes() {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let value = "x".repeat(MAX_LINE - 3);
-        let encoded = encode_frame(&value, deadline).unwrap();
-        assert_eq!(encoded.len(), MAX_LINE);
-        assert!(encoded.capacity() <= MAX_LINE);
-        let oversized = "x".repeat(MAX_LINE - 2);
-        assert!(encode_frame(&oversized, deadline).is_err());
-        // JSON escaping, not the input string length, determines the limit.
-        let response = ControlResponse::Value(Some("\0".repeat(MAX_LINE / 6)));
-        assert!(encode_frame(&response, deadline).is_err());
-        assert!(encode_frame(&ControlRequest::Status, Instant::now()).is_err());
-        assert_eq!(
-            encode_frame(&ControlRequest::Status, deadline).unwrap(),
-            b"\"Status\"\n"
-        );
-        assert_eq!(TCP_PROTOCOL_VERSION, 0);
-    }
-
-    #[test]
-    fn buffered_encoding_preserves_wire_bytes_and_deadline_error_kind() {
-        for size in [0, 1, 8191, 8192, 8193, 65536] {
-            let value = vec![255_u8; size];
-            let mut expected = serde_json::to_vec(&value).unwrap();
-            expected.push(b'\n');
-            assert_eq!(
-                encode_frame(&value, Instant::now() + Duration::from_secs(5)).unwrap(),
-                expected
-            );
-            let error = encode_frame(&value, Instant::now()).unwrap_err();
-            assert_eq!(
-                error
-                    .downcast_ref::<serde_json::Error>()
-                    .unwrap()
-                    .io_error_kind(),
-                Some(io::ErrorKind::TimedOut)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn slow_frame_uses_one_deadline_not_one_timeout_per_chunk() {
-        let (mut sender, receiver) = duplex(64);
-        let task = tokio::spawn(async move {
-            for _ in 0..20 {
-                if sender.write_all(b" ").await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-        let start = Instant::now();
-        assert!(timeout_at(
-            start + Duration::from_millis(50),
-            read_frame(&mut BufReader::new(receiver))
-        )
-        .await
-        .is_err());
-        assert!(start.elapsed() < Duration::from_secs(1));
-        task.abort();
-        let _ = task.await;
     }
 }
