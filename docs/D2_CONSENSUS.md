@@ -1,5 +1,9 @@
 # D2 consensus decision: openraft v0
 
+Current transport update: process-node Raft peers now use [typed gRPC v1](RAFT_GRPC.md);
+the original prototype history below retains its historical TCP terminology. The
+separate driver control port remains JSON/TCP. Mixed Raft wire versions are not supported.
+
 Status: decision accepted; a three-node prototype is implemented in
 `crates/d2-raft`, including a three-OS-process TCP integration test. The TCP node
 uses a durable RocksDB Raft log and a persisted opaque key/value state machine

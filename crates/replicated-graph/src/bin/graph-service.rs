@@ -21,13 +21,16 @@ struct Options {
     http: SocketAddr,
     grpc: Option<SocketAddr>,
     timeout_ms: u64,
+    internal_grpc: bool,
 }
 fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
     let (mut config, mut http, mut grpc, mut timeout_ms) = (None, None, None, None);
     let mut trusted = false;
+    let mut internal_grpc = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-insecure-development" if !trusted => trusted = true,
+            "--internal-grpc" if !internal_grpc => internal_grpc = true,
             "--config" if config.is_none() => {
                 config = Some(args.next().context("--config needs a file")?)
             }
@@ -75,6 +78,7 @@ fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
         http,
         grpc,
         timeout_ms,
+        internal_grpc,
     })
 }
 #[derive(Deserialize)]
@@ -119,8 +123,13 @@ fn read_config(path: &Path) -> anyhow::Result<ServiceConfig> {
     Ok(config)
 }
 impl ServiceConfig {
-    fn routes(self, deadline: Duration) -> anyhow::Result<(RemoteConfig, Vec<LocalGraphRoute>)> {
-        let coordinator = Client::new(
+    fn routes(
+        self,
+        deadline: Duration,
+        grpc: bool,
+    ) -> anyhow::Result<(RemoteConfig, Vec<LocalGraphRoute>)> {
+        let client = if grpc { Client::new_grpc } else { Client::new };
+        let coordinator = client(
             self.coordinator.endpoint,
             self.coordinator.identity,
             deadline,
@@ -136,7 +145,7 @@ impl ServiceConfig {
                 },
                 managed_identity: member.identity.clone(),
             });
-            members.push(Client::new(member.endpoint, member.identity, deadline)?);
+            members.push(client(member.endpoint, member.identity, deadline)?);
         }
         Ok((
             RemoteConfig {
@@ -162,13 +171,24 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let options = options(std::env::args().skip(1))?;
     let deadline = Duration::from_millis(options.timeout_ms);
-    let (config, routes) = read_config(Path::new(&options.config))?.routes(deadline)?;
+    let (config, routes) =
+        read_config(Path::new(&options.config))?.routes(deadline, options.internal_grpc)?;
     // This extra legacy managed listener is deliberately loopback/ephemeral.
     // Its address is not published as a public service interface.
-    let gateway =
-        Gateway::bind_remote_local_queries(config, routes, "127.0.0.1:0".parse()?, deadline)
-            .await
-            .context("managed cohort validation failed; not serving")?;
+    let gateway = if options.internal_grpc {
+        Gateway::bind_remote_local_queries_grpc(
+            config,
+            routes,
+            "127.0.0.1:0".parse()?,
+            deadline,
+            3,
+            1,
+        )
+        .await
+    } else {
+        Gateway::bind_remote_local_queries(config, routes, "127.0.0.1:0".parse()?, deadline).await
+    }
+    .context("managed cohort validation failed; not serving")?;
     let http = match gateway.bind_http(options.http, deadline).await {
         Ok(http) => http,
         Err(error) => {
@@ -263,6 +283,22 @@ mod tests {
             "127.0.0.1:0"
         ])
         .is_err());
+    }
+    #[test]
+    fn internal_transport_selection_is_explicit_and_not_repeatable() {
+        let base = [
+            "--allow-insecure-development",
+            "--config",
+            "x",
+            "--http",
+            "127.0.0.1:0",
+        ];
+        assert!(!parse(&base).unwrap().internal_grpc);
+        let mut args = base.to_vec();
+        args.push("--internal-grpc");
+        assert!(parse(&args).unwrap().internal_grpc);
+        args.push("--internal-grpc");
+        assert!(parse(&args).is_err());
     }
     #[test]
     fn repeated_flags_and_bad_budgets_reject() {

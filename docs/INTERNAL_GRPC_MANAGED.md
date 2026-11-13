@@ -1,0 +1,88 @@
+# Typed managed coordinator/member gRPC
+
+Implementation slice of [#218](https://github.com/ashione/VelaGraph/issues/218),
+tracked by [#235](https://github.com/ashione/VelaGraph/issues/235). This changes
+transport, not the restricted fixed-cohort transaction or consistency contract.
+It is not completion of the all-RPC migration.
+
+## Contract and deployment
+
+`d2_raft::managed_rpc::grpc::Server` and `Client::new_grpc` use the versioned
+`velagraph.internal.managed.v1.ManagedService` schema in
+`crates/d2-raft/proto/internal_managed.proto`. All 18 original internal operations
+have typed protobuf payloads and replies: coordinator commands/summary/terminal
+proof/journal; request and target lookup; member preparation, retained preparation,
+visibility/prefix/read; capacity confirmation/grant; and retained-history
+status/page/sync/advance. No protobuf field is a JSON envelope. Canonical durable
+commands and proof hashes remain the original domain encoding, never arbitrary
+protobuf bytes. Journal evidence is replayed through the original validation;
+terminal proofs use their checked constructor.
+
+The gRPC listener is **internal trusted plaintext**, not an authenticated public
+API. Do not expose it via the public graph listener. Public writes/queries stay
+on the separate public HTTP/gRPC services. It cannot activate a new cohort,
+restore a graph, or override readiness. Startup runs the original leader-observed
+role/cohort readiness probe. Capacity confirmation uses the explicitly configured
+member clients; selecting gRPC requires gRPC clients for those members too.
+
+Clients cache one HTTP/2 channel per explicitly constructed endpoint/identity;
+clones share the channel. Full identity, operation tag and nonce are checked in
+each reply. There is no peer replacement, protocol negotiation, fallback to TCP,
+or automatic application retry. A transport failure after a write has an unknown
+outcome: retain the original external ID and canonical command and use the
+existing status/recovery protocol. Reconnecting a channel is not rollback.
+
+The shared managed client admission remains four active calls and four bounded
+additional waiters, including legacy clients; CPU work retains the existing
+process-wide slots through actual completion. The gRPC listener admits at most
+four active calls through request decode, execution and response delivery, with
+eight bounded connections. Pre-prost scanning bounds each collection and total
+allocation. The 32 MiB frame limit is a transport bound, not a graph-size limit.
+Calls retain the decreasing caller budget, capped by the server deadline. A
+response watchdog cancels its connection if HTTP/2 flow control prevents progress;
+this conservatively fails other calls on that same channel rather than retaining
+unbounded stalled responses. Application mutation outcome remains unknown after
+cancellation. Shutdown stops acceptance and closes owned connections within the
+configured deadline; it does not reverse committed state.
+
+## Service migration selection
+
+`graph-service --internal-grpc` explicitly selects gRPC for **both** configured
+managed coordinator/member endpoints and graph fragment/session endpoints. All
+addresses in that configuration must name the corresponding gRPC listeners.
+Omitting the flag retains the old transport for migration differential tests;
+there is no per-call fallback. This is temporary migration selection, not the
+final architecture or permission to retain two transports indefinitely.
+
+The public HTTP adapter remains supported by design. In-process Rust calls,
+RocksDB filesystem I/O, and S3-compatible object-store HTTP are not custom
+inter-node graph transports and are not replaced by this flag.
+
+## Remaining communication inventory
+
+| Path | State after this slice |
+| --- | --- |
+| Public managed HTTP and typed gRPC | Shared domain handlers; loopback preview |
+| Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC available; old TCP retained for migration parity |
+| Managed coordinator/member control and writes | This typed gRPC slice; explicit client/server selection |
+| Raft peer replication, votes, snapshot transfer | Separate migration; do not infer coverage from managed gRPC |
+| Observed hierarchy jobs | Separate migration; existing bespoke TCP remains until its own acceptance |
+| Legacy gateway listener, test/control drivers | Still need migration/removal; an unused compatibility listener is not all-RPC completion |
+
+The exit gate is to make supported service paths RPC-only, remove superseded
+framing/client/server paths after independent differential review, and test that
+no hidden fallback remains. #218 stays open until that gate and all other
+communication paths pass. No global recovery or multi-host HA claim follows from
+same-host independent-process transport tests.
+
+## Reproduction
+
+Generated Rust is checked in. Normal builds do not require protoc. Maintainers
+may regenerate it with `scripts/generate-internal-managed-proto.sh`, which retains
+the bounded codec hook; protobuf field numbers/names must not be reused.
+
+Run the managed codec/adversarial tests and `grpc_managed_process` process tests,
+then the existing managed lifecycle/CoreHR gate, ordinary workspace tests,
+formatting and Clippy on the exact candidate commit. Record passed, failed and
+not-run stages separately. A short process test is not a substitute for the
+1,025-write retained-history/recovery acceptance.

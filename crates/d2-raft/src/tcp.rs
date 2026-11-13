@@ -1,8 +1,7 @@
-//! Real TCP transport for the D2 prototype.
+//! Process node lifecycle and legacy control transport.
 //!
-//! One Raft node per process; peers reach each other through newline-delimited
-//! JSON RPC. The wire types are the openraft request/response values, so the
-//! consensus decisions stay identical to the in-process tests.
+//! Raft peers now use typed gRPC (see `raft_grpc`). The separate d2-ctl control
+//! port retains its legacy newline JSON protocol until its own migration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -10,14 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::error::{
-    InstallSnapshotError, PayloadTooLarge, RPCError, RaftError, RemoteError, Unreachable,
-};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
 use openraft::{BasicNode, Config};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -167,39 +158,12 @@ async fn exchange_json<Q: Serialize, R: DeserializeOwned>(
     result.map_err(|_| anyhow::anyhow!("{addr}: RPC deadline expired"))?
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-enum RaftRpc {
-    Vote(VoteRequest<NodeId>),
-    AppendEntries(AppendEntriesRequest<TypeConfig>),
-    InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum RaftReply {
-    Vote(Result<VoteResponse<NodeId>, RaftError<NodeId>>),
-    AppendEntries(Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>),
-    InstallSnapshot(
-        Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>,
-    ),
-}
-
-fn io_unreachable(addr: &str, message: impl Into<String>) -> Unreachable {
-    Unreachable::new(&io::Error::new(
-        io::ErrorKind::NotConnected,
-        format!("{addr}: {}", message.into()),
-    ))
-}
-
-async fn exchange(addr: &str, request: &RaftRpc, option: RPCOption) -> anyhow::Result<RaftReply> {
-    exchange_json(addr, request, option.hard_ttl()).await
-}
-
 // Own every connection task. Shutdown stops admission, cancels active handlers,
 // and joins them before the listener task finishes.
 async fn serve(
     listener: TcpListener,
     raft: Raft,
-    state: Option<Arc<StateMachine>>,
+    state: Arc<StateMachine>,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut connections = JoinSet::new();
@@ -218,10 +182,7 @@ async fn serve(
                 let deadline = Instant::now() + RPC_TIMEOUT;
                 connections.spawn(async move {
                     let work = async {
-                        match state {
-                            Some(state) => handle_control_connection(stream, raft, state, deadline).await,
-                            None => handle_raft_connection(stream, raft, deadline).await,
-                        }
+                        handle_control_connection(stream, raft, state, deadline).await
                     };
                     // Do not log attacker-controlled JSON or payloads.
                     let _ = timeout_at(deadline, work).await;
@@ -230,144 +191,6 @@ async fn serve(
         }
     }
     connections.shutdown().await;
-}
-
-async fn handle_raft_connection(
-    stream: TcpStream,
-    raft: Raft,
-    deadline: Instant,
-) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(stream);
-    let frame = read_frame(&mut reader).await?;
-    let request: RaftRpc = blocking_section(|| serde_json::from_slice(&frame))?;
-    anyhow::ensure!(Instant::now() < deadline, "request deadline expired");
-    drop(frame);
-    let mut stream = reader.into_inner();
-    let reply = match request {
-        RaftRpc::Vote(request) => RaftReply::Vote(raft.vote(request).await),
-        RaftRpc::AppendEntries(request) => {
-            RaftReply::AppendEntries(raft.append_entries(request).await)
-        }
-        RaftRpc::InstallSnapshot(request) => {
-            RaftReply::InstallSnapshot(raft.install_snapshot(request).await)
-        }
-    };
-    let payload = encode_frame(&reply, deadline)?;
-    stream.write_all(&payload).await?;
-    Ok(())
-}
-
-/// Factory used by a single node to dial every peer's advertised address.
-#[derive(Clone, Copy, Default)]
-pub struct TcpNetworkFactory;
-
-#[derive(Clone)]
-pub struct TcpNetwork {
-    target: NodeId,
-    addr: String,
-}
-
-impl RaftNetworkFactory<TypeConfig> for TcpNetworkFactory {
-    type Network = TcpNetwork;
-
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-        TcpNetwork {
-            target,
-            addr: node.addr.clone(),
-        }
-    }
-}
-
-fn remote<T>(
-    target: NodeId,
-    result: Result<T, RaftError<NodeId>>,
-) -> Result<T, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-    result.map_err(|error| RPCError::RemoteError(RemoteError::new(target, error)))
-}
-
-fn remote_snapshot(
-    target: NodeId,
-    result: Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>,
-) -> Result<
-    InstallSnapshotResponse<NodeId>,
-    RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-> {
-    result.map_err(|error| RPCError::RemoteError(RemoteError::new(target, error)))
-}
-
-impl RaftNetwork<TypeConfig> for TcpNetwork {
-    async fn append_entries(
-        &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
-        option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let can_split = rpc.entries.len() > 1;
-        let entries_hint = (rpc.entries.len() / 2).max(1) as u64;
-        let reply = exchange(&self.addr, &RaftRpc::AppendEntries(rpc), option)
-            .await
-            .map_err(|error| {
-                // Openraft must split an oversized aggregate batch instead of
-                // retrying the identical batch forever as an unreachable peer.
-                // Encoding budget exhaustion also shrinks multi-entry batches;
-                // network timeouts never do. A single entry cannot be split.
-                if error.downcast_ref::<serde_json::Error>().is_some_and(|e| {
-                    e.io_error_kind() == Some(io::ErrorKind::InvalidData)
-                        || (can_split && e.io_error_kind() == Some(io::ErrorKind::TimedOut))
-                }) {
-                    RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint(entries_hint))
-                } else {
-                    RPCError::Unreachable(io_unreachable(&self.addr, error.to_string()))
-                }
-            })?;
-        match reply {
-            RaftReply::AppendEntries(result) => remote(self.target, result),
-            _ => Err(RPCError::Unreachable(io_unreachable(
-                &self.addr,
-                "unexpected reply variant",
-            ))),
-        }
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: InstallSnapshotRequest<TypeConfig>,
-        option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        let reply = exchange(&self.addr, &RaftRpc::InstallSnapshot(rpc), option)
-            .await
-            .map_err(|error| {
-                RPCError::Unreachable(io_unreachable(&self.addr, error.to_string()))
-            })?;
-        match reply {
-            RaftReply::InstallSnapshot(result) => remote_snapshot(self.target, result),
-            _ => Err(RPCError::Unreachable(io_unreachable(
-                &self.addr,
-                "unexpected reply variant",
-            ))),
-        }
-    }
-
-    async fn vote(
-        &mut self,
-        rpc: VoteRequest<NodeId>,
-        option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let reply = exchange(&self.addr, &RaftRpc::Vote(rpc), option)
-            .await
-            .map_err(|error| {
-                RPCError::Unreachable(io_unreachable(&self.addr, error.to_string()))
-            })?;
-        match reply {
-            RaftReply::Vote(result) => remote(self.target, result),
-            _ => Err(RPCError::Unreachable(io_unreachable(
-                &self.addr,
-                "unexpected reply variant",
-            ))),
-        }
-    }
 }
 
 /// Initialize a new cluster with the given voter addresses.
@@ -627,18 +450,23 @@ impl TcpNode {
         let raft = Raft::new(
             config.id,
             raft_config,
-            TcpNetworkFactory,
+            crate::raft_grpc::GrpcNetworkFactory,
             log_store,
             state_machine.clone(),
         )
         .await?;
 
         let (stop, receiver) = watch::channel(false);
-        let raft_task = tokio::spawn(serve(raft_listener, raft.clone(), None, receiver.clone()));
+        let raft_task = tokio::spawn(crate::raft_grpc::serve(
+            raft_listener,
+            config.id,
+            raft.clone(),
+            receiver.clone(),
+        ));
         let control_task = tokio::spawn(serve(
             control_listener,
             raft.clone(),
-            Some(state_machine.clone()),
+            state_machine.clone(),
             receiver,
         ));
         Ok(Self {

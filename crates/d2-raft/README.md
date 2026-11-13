@@ -1,5 +1,10 @@
 # d2-raft
 
+## Raft peer transport update
+
+Process-node Raft now uses typed gRPC v1 (Vote/Append/InstallSnapshot), not newline JSON.
+The independent driver control port is still JSON/TCP. See [wire contract and upgrade constraints](../../docs/RAFT_GRPC.md).
+
 An openraft prototype for D2. It proves the consensus seam with a durable
 RocksDB log and an applied opaque key/value state machine shaped for D1 batches.
 The TCP node also runs across real OS processes. A versioned D1 application command now carries shard/epoch fencing, conditional

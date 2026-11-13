@@ -2,7 +2,7 @@
 //!
 //! This crate proves the openraft integration before D1 wiring lands. It has
 //! two transports: an in-process network for deterministic tests, and a TCP
-//! transport that runs one node per OS process. The TCP node and the durable
+//! socket transport with typed gRPC Raft, one node per OS process. The node and durable
 //! cluster tests persist Raft log and state-machine data in RocksDB.
 //!
 #![allow(clippy::result_large_err)] // openraft trait signatures fix the error type; boxing would break the trait contract.
@@ -23,6 +23,7 @@ mod network;
 mod node;
 pub mod participant_driver;
 pub mod participant_writes;
+pub mod raft_grpc;
 pub mod request_index;
 pub mod request_plans;
 pub mod retained_prepare;
