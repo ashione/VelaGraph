@@ -193,7 +193,9 @@ Use the same typed Query/Page/Context vocabulary, but a distinct JobHandle with
 
 JobPolicy carries idle/execution/lifetime milliseconds separately from Context's
 control-call deadline. Start replay compares the decoded domain arguments, not
-protobuf bytes. Do not expose minimum-version or expanded-profile selectors that
+protobuf bytes. Existing input validation precedes replay-key comparison: changed
+valid arguments return Identity, while malformed queries, page sizes or policies
+retain their original validation errors. Do not change this error precedence. Do not expose minimum-version or expanded-profile selectors that
 the existing job operation does not support.
 
 Status carries an explicit phase enum, optional V/total and optional typed domain
