@@ -37,8 +37,8 @@ The admitted grammar remains nonempty explicit `g.V(ids)`, up to three out/in
 steps, and optional terminal path/count. Ordered bags, qualified identities,
 parallel edges and original endpoint/reverse checks are preserved. Scans, repeat,
 values, limit and other unsupported shapes still reject. This is a generic
-lifecycle, not a claim of arbitrary Gremlin support. SQL and observed-query APIs
-are unchanged.
+lifecycle, not a claim of arbitrary Gremlin support. Observed-query APIs are
+unchanged; the legacy SQL engine is removed.
 
 The gateway enters Capturing, Running, Sealing and Ready. Ready is published only
 after the complete bounded result and every possible page envelope pass checks.
@@ -234,7 +234,7 @@ existing public RPC status mapper combines some error categories.
 | Gate | Evidence needed on the implementation candidate |
 | --- | --- |
 | Typed conversion | Round trips for every phase, exact zero versus absent V, empty versus absent cursor, all failure variants, uint64 generation limits; malformed/duplicate/unknown fields rejected. |
-| Admission and replay | Same-ID/same-arguments Start returns same handle; changed valid query, page size, policy or V returns Identity; invalid inputs retain validation-first errors; unsupported grammar and full shared pool fail without creating work. |
+| Admission and replay | Same-ID/same-arguments Start returns same handle; changed valid query, page size, policy or V returns Identity; invalid inputs retain validation-first errors; unsupported grammar and full shared pool fail without creating work. Same-ID replay of retained Cancelled/Failed jobs returns the original handle; after hard-lifetime eviction the ID may admit new work, not durable exactly-once execution. |
 | Lost delivery | Drop Start response, replay original request and observe one job. Disconnect Get/Fetch without cancelling the job. Disconnect Renew cannot strand a pending round. |
 | Fixed result | Independent small non-HR oracle with qualified IDs, parallel edges and ordered bags; later writes/deletes do not alter V or page replay; no rows before complete sealing. |
 | Renewal races | Capturing Busy; committed replay does not extend expiry; concurrent pending renewal, wrong generation, node-grant failure, last-read transition, expiry and cancellation use original linearization. |
