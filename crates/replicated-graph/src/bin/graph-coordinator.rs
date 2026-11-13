@@ -11,8 +11,11 @@
 //! Encode those bytes as 32 hexadecimal digits for subsequent commands. Tokens
 //! are temporary bearer credentials: keep them private. Each invocation sends
 //! one request only, with no automatic advancement, retry, or polling.
+//! serve-grpc exposes typed gRPC ingress and shard routes. Client commands use
+//! --grpc for this endpoint; unflagged clients target the legacy serve listener.
 use anyhow::{bail, Context};
 use replicated_graph::remote::distributed::{
+    grpc::{CoordinatorClient, GrpcCoordinatorService},
     jobs::{request, Output, Request},
     query, CoordinatorService, DistributedRequest, StaticCatalog,
 };
@@ -29,6 +32,7 @@ enum Command {
 struct Options {
     endpoint: SocketAddr,
     timeout_ms: u64,
+    client_grpc: bool,
     command: Command,
 }
 
@@ -54,9 +58,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     let (mut page_size, mut cursor) = (None, None);
     let mut timeout_ms = 5000u64;
     let mut trusted = false;
+    let mut client_grpc = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-insecure-development" => trusted = true,
+            "--grpc" => {
+                anyhow::ensure!(!client_grpc, "--grpc must not be repeated");
+                client_grpc = true;
+            }
             "--endpoint" => {
                 endpoint = Some(
                     args.next()
@@ -126,6 +135,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     let endpoint = endpoint.context("--endpoint is required")?;
     let command = match command.as_str() {
         "serve" | "serve-grpc" => {
+            anyhow::ensure!(!client_grpc, "--grpc is client-only; use serve-grpc");
             anyhow::ensure!(
                 partition.is_none() && text.is_none() && token.is_none() && sequence.is_none(),
                 "query and job flags are not accepted by serve"
@@ -190,6 +200,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     Ok(Options {
         endpoint,
         timeout_ms,
+        client_grpc,
         command,
     })
 }
@@ -199,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
     let Options {
         endpoint,
         timeout_ms,
+        client_grpc,
         command,
     } = parse_args(std::env::args().skip(1))?;
     let timeout = Duration::from_millis(timeout_ms);
@@ -210,14 +222,17 @@ async fn main() -> anyhow::Result<()> {
                 "catalog configuration exceeds 64 KiB"
             );
             let catalog: StaticCatalog = serde_json::from_reader(file)?;
-            let service = if grpc {
-                CoordinatorService::start_grpc(endpoint, catalog, timeout).await?
+            if grpc {
+                let service = GrpcCoordinatorService::start(endpoint, catalog, timeout).await?;
+                println!("coordinator={}", service.local_addr());
+                tokio::signal::ctrl_c().await?;
+                service.shutdown().await;
             } else {
-                CoordinatorService::start(endpoint, catalog, timeout).await?
-            };
-            println!("coordinator={}", service.local_addr());
-            tokio::signal::ctrl_c().await?;
-            service.shutdown().await;
+                let service = CoordinatorService::start(endpoint, catalog, timeout).await?;
+                println!("coordinator={}", service.local_addr());
+                tokio::signal::ctrl_c().await?;
+                service.shutdown().await;
+            }
         }
         Command::Query { partition, text } => {
             let request = DistributedRequest {
@@ -226,12 +241,34 @@ async fn main() -> anyhow::Result<()> {
                 timeout_millis: timeout_ms,
             };
             // Typed failure is printed as an error, never as a partial result.
-            let output = query(endpoint, request, timeout).await??;
+            let end = tokio::time::Instant::now() + timeout;
+            let output = if client_grpc {
+                let client = CoordinatorClient::connect(endpoint, timeout).await?;
+                client
+                    .query(
+                        request,
+                        end.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                    .await??
+            } else {
+                query(endpoint, request, timeout).await??
+            };
             println!("{}", serde_json::to_string(&output)?);
         }
         Command::Job(job) => {
             // One explicit request; an incomplete Progress is not a count result.
-            let output: Output = request(endpoint, job, timeout).await??;
+            let end = tokio::time::Instant::now() + timeout;
+            let output: Output = if client_grpc {
+                let client = CoordinatorClient::connect(endpoint, timeout).await?;
+                client
+                    .job(
+                        job,
+                        end.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                    .await??
+            } else {
+                request(endpoint, job, timeout).await??
+            };
             println!("{}", serde_json::to_string(&output)?);
         }
     }
@@ -241,6 +278,34 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_clients_are_explicit_and_servers_reject_client_flag() {
+        let grpc = parse(
+            "query",
+            &["--partition", "1", "--query", "g.V(1)", "--grpc"],
+        )
+        .unwrap();
+        assert!(grpc.client_grpc);
+        assert!(
+            !parse("query", &["--partition", "1", "--query", "g.V(1)"])
+                .unwrap()
+                .client_grpc
+        );
+        assert!(parse(
+            "query",
+            &["--partition", "1", "--query", "g.V(1)", "--grpc", "--grpc"]
+        )
+        .is_err());
+        for command in ["serve", "serve-grpc"] {
+            assert!(parse(command, &["--catalog", "x", "--grpc"]).is_err());
+        }
+        assert!(
+            parse("hierarchy-cancel", &["--token", TOKEN, "--grpc"])
+                .unwrap()
+                .client_grpc
+        );
+    }
 
     const TOKEN: &str = "00112233445566778899aAbBcCdDeEfF";
 

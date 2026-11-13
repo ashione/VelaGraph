@@ -69,7 +69,7 @@ inter-node graph transports and are not replaced by this service migration.
 | Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC available; old TCP retained for migration parity |
 | Managed coordinator/member control and writes | This typed gRPC slice; explicit client/server selection |
 | Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control remains JSON/TCP |
-| Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); coordinator ingress remains TCP/JSON |
+| Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), legacy TCP ingress retained for retirement |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
 | Legacy library gateway listener, test/control drivers | Still need separate migration/removal; graph-service no longer starts this listener |
 

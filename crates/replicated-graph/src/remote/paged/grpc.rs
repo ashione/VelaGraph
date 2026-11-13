@@ -340,10 +340,10 @@ impl SnapshotService for Handler {
 // Admission spans protobuf decoding, execution, encoding and body consumption.
 // Never free a budget merely because a Page response has been constructed.
 #[derive(Clone)]
-struct AdmittedService<S> {
-    inner: S,
-    admission: Arc<Semaphore>,
-    deadline: Duration,
+pub(in crate::remote) struct AdmittedService<S> {
+    pub(in crate::remote) inner: S,
+    pub(in crate::remote) admission: Arc<Semaphore>,
+    pub(in crate::remote) deadline: Duration,
 }
 impl<S: tonic::server::NamedService> tonic::server::NamedService for AdmittedService<S> {
     const NAME: &'static str = S::NAME;
@@ -443,10 +443,10 @@ impl http_body::Body for AdmittedBody {
 
 // Bound accepted HTTP/2 connections as well as admitted operations. The permit
 // lives with the socket, not merely with the accept future or request handler.
-struct LimitedIo {
-    socket: TcpStream,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-    cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+pub(in crate::remote) struct LimitedIo {
+    pub(in crate::remote) socket: TcpStream,
+    pub(in crate::remote) _permit: tokio::sync::OwnedSemaphorePermit,
+    pub(in crate::remote) cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
 }
 impl tonic::transport::server::Connected for LimitedIo {
     type ConnectInfo = <TcpStream as tonic::transport::server::Connected>::ConnectInfo;

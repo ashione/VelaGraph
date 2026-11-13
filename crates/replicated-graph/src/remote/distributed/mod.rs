@@ -922,14 +922,28 @@ async fn execute_transport(
 }
 
 fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, QueryFailure> {
+    bounded_serialize(value, end, true).map(|(bytes, _)| bytes)
+}
+// Preserve existing logical output accounting for typed wire transports without
+// constructing a second serialized payload or changing result capacity.
+fn bounded_encoded_size<T: Serialize>(value: &T, end: Instant) -> Result<usize, QueryFailure> {
+    bounded_serialize(value, end, false).map(|(_, size)| size)
+}
+fn bounded_serialize<T: Serialize>(
+    value: &T,
+    end: Instant,
+    collect: bool,
+) -> Result<(Vec<u8>, usize), QueryFailure> {
     struct Writer {
         bytes: Vec<u8>,
+        size: usize,
+        collect: bool,
         end: Instant,
         until_deadline_check: usize,
     }
     impl io::Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > MAX_WIRE.saturating_sub(self.bytes.len()) {
+            if bytes.len() > MAX_WIRE.saturating_sub(self.size) {
                 return Err(io::Error::other("bounded query encoding"));
             }
             // serde emits many tiny tokens. Amortize small-write checks over
@@ -942,7 +956,10 @@ fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, Quer
                 self.until_deadline_check = 8192;
             }
             self.until_deadline_check = self.until_deadline_check.saturating_sub(bytes.len());
-            self.bytes.extend_from_slice(bytes);
+            self.size += bytes.len();
+            if self.collect {
+                self.bytes.extend_from_slice(bytes);
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -951,6 +968,8 @@ fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, Quer
     }
     let mut writer = Writer {
         bytes: Vec::new(),
+        size: 0,
+        collect,
         end,
         until_deadline_check: 0,
     };
@@ -964,7 +983,7 @@ fn bounded_encode<T: Serialize>(value: &T, end: Instant) -> Result<Vec<u8>, Quer
     })?;
     // The final incomplete interval must not publish an expired result.
     check(end)?;
-    Ok(writer.bytes)
+    Ok((writer.bytes, writer.size))
 }
 
 /// Dedicated coordinator endpoint; it cannot mutate graph state or choose endpoints from a request.
@@ -1572,10 +1591,17 @@ mod tests {
             let encoded = bounded_encode(&value, end).unwrap();
             assert_eq!(encoded, serde_json::to_vec(&value).unwrap());
             assert_eq!(encoded.len(), length + 2);
+            assert_eq!(bounded_encoded_size(&value, end).unwrap(), encoded.len());
         }
         for length in [MAX_WIRE - 1, MAX_WIRE, MAX_WIRE + 1] {
             assert_eq!(
                 bounded_encode(&"x".repeat(length), end).unwrap_err(),
+                QueryFailure::ResourceExhausted
+            );
+        }
+        for length in [MAX_WIRE - 1, MAX_WIRE, MAX_WIRE + 1] {
+            assert_eq!(
+                bounded_encoded_size(&"x".repeat(length), end).unwrap_err(),
                 QueryFailure::ResourceExhausted
             );
         }
