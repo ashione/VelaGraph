@@ -129,6 +129,7 @@ mod tests {
             partitions: Vec::new(),
         };
         let mut execution = Execution {
+            grpc_clients: None,
             fixed_sessions: None,
             control: None,
             fixed_parallelism: 3,

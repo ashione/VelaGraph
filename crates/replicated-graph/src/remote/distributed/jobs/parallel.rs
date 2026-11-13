@@ -203,6 +203,7 @@ pub(super) async fn run(
             let sessions = job.sessions.clone();
             futures.push(Box::pin(async move {
                 let mut execution = Execution {
+                    grpc_clients: None,
                     fixed_sessions: None,
                     control: None,
                     fixed_parallelism: 3,

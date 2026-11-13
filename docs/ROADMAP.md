@@ -14,8 +14,11 @@
 长度前缀 JSON/TCP，网络客户端按请求建立连接；现有 graph proto 是存储 record，
 并非 gRPC service。统一通信框架不修改持久化记录、共识或 Gremlin 语义。
 
-- **第一实际切片**：现有 remote snapshot 的 OpenSnapshot → Page → Close 完整路径，
-  复用原有有界 Sessions；随后立即推进 data-local query fragments，首片不是完整查询迁移。
+- **已交付基础切片**：remote snapshot 的 typed gRPC OpenSnapshot → Page → Close（#226）。
+  observed data-local query fragments 的 Open → Fragment → Close 由 [#227](https://github.com/ashione/VelaGraph/issues/227)
+  跟踪，复用真实 query sessions/admission，显式选择 gRPC coordinator backend。
+  详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；fixed/renewable、jobs、managed
+  和 Raft 尚未迁移，不能将 observed 切片当完整查询协议统一。
   用版本化 Protobuf 和 gRPC adapter 复用原执行器；按已验证 peer 身份复用 channel，
   保留固定视图、顺序、错误与累计预算。真实多进程差分测试后清理替代的 JSON 路径，
   不长期维护两套业务实现，不把 JSON 装进 bytes 就当完成协议迁移。

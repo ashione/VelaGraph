@@ -242,6 +242,7 @@ async fn execute_inner(
         .validate_bounded(fixed::MAX_MEMBERS, fixed::MAX_MEMBERS)
         .map_err(remote_failure)?;
     let mut execution = Execution {
+        grpc_clients: None,
         catalog: &catalog,
         sessions: BTreeMap::new(),
         fixed_sessions: Some(sessions),

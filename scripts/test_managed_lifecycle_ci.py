@@ -18,7 +18,9 @@ from unittest.mock import patch
 import managed_lifecycle_ci as gate
 
 
-def artifact(root):
+def artifact(root, per_unit=False):
+    executable = (root / 'target/release/build/replicated-graph/8aeb7834ed459655/out/managed_process-8aeb7834ed459655'
+                  if per_unit else root / 'target/release/deps/managed_process-abcdef')
     return {'reason': 'compiler-artifact',
             'manifest_path': str(root / 'crates/replicated-graph/Cargo.toml'),
             'target': {'name': 'managed_process', 'kind': ['test'], 'test': True,
@@ -27,8 +29,8 @@ def artifact(root):
                         'debuginfo': 0, 'overflow_checks': False},
             'features': [],
             'package_id': 'path+' + (root / 'crates/replicated-graph').as_uri() + '#0.1.0',
-            'filenames': [str(root / 'target/release/deps/managed_process-abcdef')],
-            'executable': str(root / 'target/release/deps/managed_process-abcdef')}
+            'filenames': [str(executable)],
+            'executable': str(executable)}
 
 
 def output(name=gate.TEST, result='ok', passed=1, ignored=0, running=1):
@@ -116,6 +118,32 @@ class ValidatorTests(unittest.TestCase):
                         [selected, {'reason': 'build-finished', 'success': False}]):
             with self.assertRaises(ValueError):
                 gate.select_artifact(changed, root)
+
+    def test_exact_cargo_release_layouts_preserve_path_and_filename_closure(self):
+        root = pathlib.Path('/synthetic')
+        for per_unit in (False, True):
+            good = artifact(root, per_unit)
+            gate.validate_handoff_artifact(good, root)
+            paths = [
+                '/outside/target/release/deps/managed_process-abcdef',
+                str(root / 'target/debug/deps/managed_process-abcdef'),
+                str(root / 'target/release/build/other/8aeb7834ed459655/out/managed_process-8aeb7834ed459655'),
+                str(root / 'target/release/build/replicated-graph/ffffffffffffffff/out/managed_process-8aeb7834ed459655'),
+                str(root / 'target/release/build/replicated-graph/abcdef/out/managed_process-abcdef'),
+                str(root / 'target/release/build/replicated-graph/8aeb7834ed459655/managed_process-8aeb7834ed459655'),
+                str(root / 'target/release/build/replicated-graph/8aeb7834ed459655/out/other-8aeb7834ed459655'),
+                str(root / 'target/release/deps/../elsewhere/managed_process-abcdef'),
+            ]
+            for path in paths:
+                bad = copy.deepcopy(good)
+                bad.update(executable=path, filenames=[path])
+                with self.subTest(per_unit=per_unit, path=path), self.assertRaises(ValueError):
+                    gate.validate_handoff_artifact(bad, root)
+            for names in ([], [good['executable'], '/extra'], ['/other']):
+                bad = copy.deepcopy(good)
+                bad['filenames'] = names
+                with self.subTest(per_unit=per_unit, filenames=names), self.assertRaises(ValueError):
+                    gate.validate_handoff_artifact(bad, root)
 
     def test_exact_test_pass_required(self):
         gate.validate_output(output(), 0)
@@ -324,13 +352,13 @@ class ValidatorTests(unittest.TestCase):
 
 class HandoffFixture:
     # Synthetic ELF header only, never execute it. All subprocesses are mocked.
-    def __init__(self, root):
+    def __init__(self, root, per_unit=False):
         self.root = root
         self.build = root / 'target/build-results'
         self.download = root / 'target/download'
         self.download.mkdir(parents=True)
         self.archive = self.download / 'handoff.zip'
-        self.selected = artifact(root)
+        self.selected = artifact(root, per_unit)
         self.binary = pathlib.Path(self.selected['executable'])
         self.binary.parent.mkdir(parents=True)
         header = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + b'\0' * 9,
@@ -551,6 +579,20 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(digest, gate.sha256(fixture.binary))
             self.assertEqual({p.name for p in out.iterdir()}, set(gate.HANDOFF_LIMITS) | {'artifact-service.json'})
             self.assertEqual({p.name for p in out.iterdir() if p.stat().st_mode & 0o111}, {'managed_process'})
+
+    def test_cargo_per_unit_release_handoff_keeps_all_provenance_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HandoffFixture(pathlib.Path(directory), per_unit=True).prepare()
+            out = fixture.root / 'results'
+            out.mkdir()
+            with fixture.context(), patch.object(gate.subprocess, 'run') as run:
+                source = gate.source_snapshot(fixture.root, out)
+                (out / 'source.json').write_text(json.dumps(source))
+                selected, executable, digest = gate.accept_handoff(fixture.root, out, fixture.archive, source)
+            run.assert_not_called()
+            self.assertEqual(selected, fixture.selected)
+            self.assertEqual(executable.read_bytes(), fixture.binary.read_bytes())
+            self.assertEqual(digest, gate.sha256(fixture.binary))
 
     def test_build_and_runtime_checkout_paths_may_differ_without_rebinding_source(self):
         with tempfile.TemporaryDirectory() as directory:
