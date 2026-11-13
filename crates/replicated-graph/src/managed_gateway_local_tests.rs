@@ -1950,3 +1950,109 @@ async fn public_http_shared_writes_queries_and_tcp_fixed_view() {
     }
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_grpc_zero_window_deadlines_release_shared_work_and_new_open() {
+    use prost::Message;
+    use public_proto as pb;
+    let _test = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    committed(&call(&g, Operation::Submit(create(1, 7, 1))).await.unwrap());
+    let grpc = g
+        .bind_grpc("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+        .await
+        .unwrap();
+    // Different causes: first context deadline, then retained query lease.
+    for (rpc_ms, ttl_ms) in [(200, 60_000), (5_000, 750)] {
+        let stream = TcpStream::connect(grpc.local_addr()).await.unwrap();
+        let (mut sender, connection) = h2::client::Builder::new()
+            .initial_window_size(0)
+            .handshake::<_, axum::body::Bytes>(stream)
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "http://{}/velagraph.public.managed.v1.QueryService/Open",
+                grpc.local_addr()
+            ))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+        let (response, mut send) = sender.send_request(request, false).unwrap();
+        let payload = pb::OpenRequest {
+            context: Some(pb::Context {
+                version: 1,
+                timeout_millis: rpc_ms,
+            }),
+            read: Some(pb::ReadSelector {
+                kind: Some(pb::read_selector::Kind::Latest(pb::Empty {})),
+            }),
+            ttl_millis: ttl_ms,
+            query: Some(pb::Query {
+                partition: 7,
+                text: "g.V(1).count()".into(),
+            }),
+            page_size: 1,
+        }
+        .encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        send.send_data(frame.into(), true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            response.headers().get("grpc-status").is_none(),
+            "{:?}",
+            response.headers()
+        );
+        let mut unread = response.into_body(); // keep zero stream window; never release capacity
+        assert_eq!(g.retained_payload_charge(), SESSION_CHARGE);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while g.state.connections.available_permits() != MAX_CONNECTIONS
+                || g.retained_payload_charge() != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("watchdog must reclaim flow-controlled work and undelivered open");
+        let result = tokio::time::timeout(Duration::from_secs(1), unread.data())
+            .await
+            .unwrap();
+        assert!(
+            !matches!(result, Some(Ok(_))),
+            "zero window cannot deliver a data frame"
+        );
+        drop(sender);
+        drop(unread);
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .unwrap();
+        // Connection cancellation is not a transaction abort or state reset.
+        assert!(matches!(
+            call(&g, Operation::Status(create(1, 7, 1))).await.unwrap(),
+            Reply::Write {
+                status: WriteStatus::Committed { visible: true, .. },
+                ..
+            }
+        ));
+    }
+    grpc.shutdown().await;
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    f.stop().await;
+}

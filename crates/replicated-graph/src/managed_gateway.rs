@@ -26,6 +26,14 @@ mod http_codec;
 #[path = "managed_gateway_invocation.rs"]
 mod invocation;
 pub use http::HttpService;
+#[path = "managed_gateway_grpc.rs"]
+mod grpc;
+#[path = "managed_gateway_grpc_codec.rs"]
+mod grpc_codec;
+/// Typed versioned public managed gRPC messages and generated clients.
+#[path = "managed_gateway_public_proto.rs"]
+pub mod public_proto;
+pub use grpc::GrpcService;
 #[path = "managed_gateway_jobs.rs"]
 mod jobs;
 #[path = "managed_gateway_local.rs"]
@@ -1332,6 +1340,11 @@ impl Gateway {
     /// gateway; no restore marker or readiness override is provided here.
     pub async fn bind_http(&self, bind: SocketAddr, deadline: Duration) -> Result<HttpService> {
         http::bind(self.state.clone(), self.stop.subscribe(), bind, deadline).await
+    }
+    /// Bind the typed public gRPC adapter to the same live managed state.
+    /// Only loopback listeners are accepted; no restore or authentication bypass.
+    pub async fn bind_grpc(&self, bind: SocketAddr, deadline: Duration) -> Result<GrpcService> {
+        grpc::bind(self.state.clone(), self.stop.subscribe(), bind, deadline).await
     }
     pub fn local_addr(&self) -> SocketAddr {
         self.address

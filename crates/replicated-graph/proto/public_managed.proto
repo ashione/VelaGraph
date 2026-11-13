@@ -1,0 +1,107 @@
+syntax = "proto3";
+package velagraph.public.managed.v1;
+
+// Public loopback/trusted development API. It does not expose internal Raft,
+// participant control, restore, or topology changes. Plaintext is not auth.
+service WriteService {
+  rpc Submit(WriteRequest) returns (WriteResponse);
+  rpc Status(WriteRequest) returns (WriteResponse);
+  rpc Abort(WriteRequest) returns (WriteResponse);
+}
+service QueryService {
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  rpc Close(CloseRequest) returns (CloseResponse);
+}
+message Empty {}
+message Context { uint32 version = 1; uint64 timeout_millis = 2; }
+message Scalar {
+  oneof kind {
+    Empty null = 1;
+    sint64 integer = 2;
+    double real = 3;
+    string text = 4;
+    bool boolean = 5;
+  }
+}
+message Property { string key = 1; Scalar value = 2; }
+message Entity { uint32 partition = 1; uint64 id = 2; }
+message Vertex { uint64 id = 1; repeated string labels = 2; repeated Property properties = 3; }
+message Edge { uint64 id = 1; Entity from = 2; Entity to = 3; string label = 4; repeated Property properties = 5; }
+message Patch { repeated Property set = 1; repeated string remove = 2; }
+message Condition { oneof kind { Empty missing = 1; Scalar value = 2; } }
+message PropertyCondition { string key = 1; Condition condition = 2; }
+message CreateVertex { uint32 partition = 1; Vertex vertex = 2; }
+message CreateEdge { Edge edge = 1; }
+message PatchEntity { Entity entity = 1; Patch patch = 2; }
+message ConditionalPatch { Entity entity = 1; Patch patch = 2; repeated PropertyCondition conditions = 3; }
+message ReplaceEdge { Entity edge = 1; Edge replacement = 2; }
+message Mutation {
+  oneof kind {
+    CreateVertex create_vertex = 1;
+    CreateEdge create_edge = 2;
+    PatchEntity patch_vertex = 3;
+    PatchEntity patch_edge = 4;
+    ConditionalPatch patch_vertex_if = 5;
+    ConditionalPatch patch_edge_if = 6;
+    Entity delete_edge = 7;
+    ReplaceEdge replace_edge = 8;
+  }
+}
+// Reuse the same nonzero 16-byte external_id AND exact domain mutation after
+// an uncertain reply. Protobuf bytes are not the durable canonical command.
+message WriteRequest { Context context = 1; bytes external_id = 2; Mutation mutation = 3; }
+message TerminalDecision { uint64 ordinal = 1; bool visible = 2; }
+message WriteResponse {
+  bytes external_id = 1;
+  optional bytes transaction_id = 2;
+  oneof status {
+    Empty absent = 3;
+    Empty pending = 4;
+    TerminalDecision committed = 5;
+    TerminalDecision aborted = 6;
+  }
+}
+message Query { uint32 partition = 1; string text = 2; }
+message ReadSelector { oneof kind { Empty latest = 1; uint64 exact = 2; uint64 minimum = 3; } }
+// Version is immutable for the session. Tokens identify this gateway lifetime;
+// they are not credentials and cannot be redirected to another gateway.
+message Session { bytes incarnation = 1; bytes token = 2; uint64 version = 3; }
+message Cursor { bytes token = 1; }
+message OpenRequest { Context context = 1; ReadSelector read = 2; uint64 ttl_millis = 3; Query query = 4; uint32 page_size = 5; }
+message FetchRequest { Context context = 1; Session session = 2; Query query = 3; Cursor cursor = 4; uint32 page_size = 5; }
+message CloseRequest { Context context = 1; Session session = 2; }
+message QualifiedElement { oneof kind { Entity vertex = 1; Entity edge = 2; } }
+message Path { repeated QualifiedElement elements = 1; }
+message SelectedProperty { string key = 1; repeated Scalar values = 2; }
+message PropertyMap { QualifiedElement source = 1; repeated SelectedProperty properties = 2; }
+message ValueRow { QualifiedElement source = 1; Scalar value = 2; }
+message Row { oneof kind { QualifiedElement element = 1; Path path = 2; uint64 count = 3; PropertyMap property_map = 4; ValueRow value = 5; } }
+enum Completeness { COMPLETENESS_UNSPECIFIED = 0; SINGLE_PARTITION = 1; UNVERIFIED = 2; }
+message Page { repeated Row rows = 1; Completeness completeness = 2; Cursor next = 3; uint32 offset = 4; uint32 total = 5; }
+message OpenResponse { Session session = 1; Query query = 2; uint32 page_size = 3; Page page = 4; }
+message FetchResponse { Session session = 1; Query query = 2; Cursor cursor = 3; uint32 page_size = 4; Page page = 5; }
+message CloseResponse { Session session = 1; }
+// Stable domain detail carried in Status.details. Transport disconnection may
+// have no detail: it must never be interpreted as an aborted write.
+message ErrorDetail {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    INVALID_ARGUMENT = 1;
+    IDENTITY_MISMATCH = 2;
+    RESOURCE_EXHAUSTED = 3;
+    REJECTED_OUTCOME_UNCERTAIN = 4;
+    PRECONDITION_FAILED = 5;
+    OUTCOME_UNKNOWN = 6;
+    SESSION_UNAVAILABLE = 7;
+    JOB_BUSY = 8;
+    QUERY_SYNTAX = 9;
+    QUERY_UNSUPPORTED = 10;
+    QUERY_INVALID_ARGUMENT = 11;
+    QUERY_RESOURCE_EXHAUSTED = 12;
+    QUERY_DEADLINE = 13;
+    QUERY_INCOMPLETE_OR_CORRUPT = 14;
+    QUERY_UNAVAILABLE = 15;
+  }
+  Reason reason = 1;
+}

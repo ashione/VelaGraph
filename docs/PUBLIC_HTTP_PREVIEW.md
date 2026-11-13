@@ -2,9 +2,10 @@
 
 This is an **experimental library entrypoint**, not the v0.0.1 release or the
 final protobuf/HTTP contract. It uses the existing certified managed gateway
-business implementation. Public gRPC, a standalone service executable and a
-one-command service startup remain work in progress under
-[#218](https://github.com/ashione/VelaGraph/issues/218). See the separate
+business implementation. A [typed public gRPC adapter](PUBLIC_GRPC_SERVICE.md) and
+[standalone service host](PUBLIC_SERVICE_CLI.md) are separate slices sharing this
+managed business path. A final stable dual-protocol contract and clean cluster
+startup packaging remain work under [#218](https://github.com/ashione/VelaGraph/issues/218). See the separate
 [shared service design](PUBLIC_SERVICE_DESIGN.md).
 
 ## Host and lifecycle
@@ -127,7 +128,7 @@ writes or imply a distributed transaction abort.
 
 Focused tests exercise real loopback HTTP with the same managed gateway as TCP,
 strict codecs and delivery/admission ownership. These are not multi-machine
-benchmarks, global restore tests or release-gate evidence. Independent-process
-service tests, generated gRPC interoperability, clean startup examples and exact
-CI/release checks remain required before v0.0.1. Test results must be read from
+benchmarks, global restore tests or release-gate evidence. The separate [dual-protocol process test](PUBLIC_SERVICE_CLI.md) adds actual
+independent processes and cross-protocol semantics. Clean startup packaging and exact CI/release checks remain required before
+v0.0.1; the finite preview feature/compatibility matrix must be explicit. Test results must be read from
 the exact submitted commit rather than inferred from this document.
