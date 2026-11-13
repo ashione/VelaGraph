@@ -1,0 +1,14 @@
+syntax = "proto3";
+package velagraph.internal.operations.v1;
+import "internal_managed.proto";
+service ShardOperations { rpc Call(Request) returns (Response); }
+message Identity { uint64 group = 1; uint64 node = 2; }
+message Empty {}
+message Request { uint32 version = 1; Identity identity = 2; uint64 timeout_millis = 3; oneof operation { uint64 probe = 4; uint64 metadata = 5; velagraph.internal.managed.v1.D1WriteRequest write = 6; } }
+message Metadata { uint64 shard = 1; uint64 epoch = 2; uint64 sequence = 3; }
+enum WriteStatus { WRITE_STATUS_UNSPECIFIED = 0; COMMITTED = 1; DUPLICATE = 2; }
+message WriteResult { uint64 sequence = 1; WriteStatus status = 2; uint64 applied_operations = 3; }
+message NotLeader { optional uint64 leader = 1; }
+message Timeout { optional bytes request_id = 1; }
+message RemoteFailure { oneof kind { NotLeader not_leader = 1; velagraph.internal.managed.v1.ApplicationError application = 2; Empty invalid_argument = 3; Empty resource_exhausted = 4; Empty unavailable = 5; Timeout timeout = 6; Empty session_unavailable = 7; Empty protocol = 8; } }
+message Response { uint32 version = 1; oneof result { Empty probe = 2; Metadata metadata = 3; WriteResult write = 4; RemoteFailure error = 5; } }

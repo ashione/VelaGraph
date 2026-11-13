@@ -28,6 +28,7 @@ pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
 mod diagnostic;
 pub mod distributed;
 pub mod managed;
+pub mod operations_grpc;
 mod paged;
 mod read_barrier;
 pub use paged::grpc;

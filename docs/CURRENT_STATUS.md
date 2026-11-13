@@ -119,6 +119,11 @@ state: only configured HTTP/gRPC listeners are opened. Expiration and shutdown/d
 cleanup remain shared; explicitly selected library `Gateway` TCP entrypoints are
 still pending #218 cleanup. See [service host](PUBLIC_SERVICE_CLI.md).
 
+Single-shard Probe/Metadata/Write also have an explicit
+[typed RPC service and CLI](SHARD_OPERATIONS_GRPC.md). Legacy catalog/routing adapters remain
+separate migration work; this does not complete the all-RPC inventory.
+
+
 The retained legacy managed TCP protocol uses **RPC v6** and legacy gateway
 framing **v1**. Typed managed gRPC has its own versioned service/Context; public
 gRPC, HTTP preview and durable formats are separate version namespaces. See

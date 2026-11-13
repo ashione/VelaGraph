@@ -71,7 +71,7 @@ inter-node graph transports and are not replaced by this service migration.
 | Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control is typed gRPC (#251) |
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), legacy TCP ingress retained for retirement |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
-| Single-shard GraphService Probe/Metadata/Write and legacy query envelopes | Remaining framed TCP paths; snapshot/query gRPC does not imply mutation-envelope migration |
+| Single-shard Probe/Metadata/Write | [Typed service and explicit RPC CLI](SHARD_OPERATIONS_GRPC.md) (#254); old GraphService/RemoteStorageNode routes remain explicit retirement work, not fallback |
 | Legacy library gateway/coordinator and Unix read gateway | Still need separate retirement/migration; graph-service no longer starts the hidden legacy listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
