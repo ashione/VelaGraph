@@ -49,6 +49,27 @@
 [流控边界](https://grpc.io/docs/guides/flow-control/) 和
 [Protobuf 演进](https://protobuf.dev/programming-guides/proto3/)。
 
+## 已吸收的架构方向：通用执行、路由与可持续一致视图
+
+2026-11-13 对照 NebulaGraph Community 3.8 后，采用其职责分层、图语义批量
+RPC/算子下推和元数据驱动路由的原则，不照搬固定分片数、较弱跨图隔离或业务特化。
+具体决策、当前边界、验收与官方来源见 [架构演进计划](ARCHITECTURE_EVOLUTION.md)。
+
+- #218/#221：Query、Graph Storage、Meta/Control 边界明确；D1/Raft 保持图无关，
+  HTTP/gRPC 共用 handler，统一通信不等于已完成分布式优化。
+- #110/#111：通用批量邻接展开、过滤/投影/局部聚合下推、跨片 frontier 合并和背压；
+  独立 oracle 验证同 V、bag/顺序/完整结果，高出度与偏斜负载不使用 CoreHR 特化。
+- #221/#222：入口负载均衡与分片所有权分开；版本化路由、旧 owner fencing、
+  baseline/delta 交接及失败回滚；在线迁移仍须恢复与成员变更前置。
+- #109/#110/#223：研究参与者范围协调及 indexed MVCC/历史回收，保持 latest
+  入场固定 V、精确原 ID 重试与历史承诺；不是放宽限额或授权直接删除历史。
+- #191/#193/#196：恢复完整认证 cut 和所有必要数据后才 READY；checkpoint 运输、
+  全局恢复、对象存储权威分别验收，保留 #124 独立前置，不绕过已有阻塞。
+
+优先级保持：RPC 统一先行；通用查询与持续写入/恢复为核心，路由设计并行、弹性启用
+依赖安全门槛；对象存储权威、Portal/完整观测后续。复用现有 issue 和 #224 发布阶段，
+不新增重复总目标，不因本规划合入关闭实现 issue，也不将尚未合并的 RPC PR 列为完成。
+
 ## 后续产品化：轻量交互式 graph portal
 
 [#220](https://github.com/ashione/VelaGraph/issues/220) 在 #218 的稳定 HTTP 查询、
