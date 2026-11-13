@@ -291,6 +291,26 @@ pub(super) async fn execute_query(
     .unwrap_or(Ok(Reply::Query(Err(QueryFailure::Timeout))))
 }
 
+fn query_barrier_failure(error: RemoteError) -> Result<Reply, RemoteError> {
+    match error {
+        RemoteError::Timeout { .. } => Ok(Reply::Query(Err(QueryFailure::Timeout))),
+        other => Err(other),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn query_barrier_timeout_preserves_query_failure_contract() {
+    assert!(matches!(
+        query_barrier_failure(RemoteError::Timeout { request_id: None }),
+        Ok(Reply::Query(Err(QueryFailure::Timeout)))
+    ));
+    assert!(matches!(
+        query_barrier_failure(RemoteError::NotLeader { leader: Some(2) }),
+        Err(RemoteError::NotLeader { leader: Some(2) })
+    ));
+}
+
 async fn execute_query_inner(
     raft: openraft::Raft<TypeConfig>,
     state: Arc<StateMachine>,
@@ -303,17 +323,9 @@ async fn execute_query_inner(
     let permit = QUERY_ADMISSION
         .try_acquire()
         .map_err(|_| RemoteError::ResourceExhausted)?;
-    raft.ensure_linearizable().await.map_err(|e| {
-        let reason = diagnostic::read_barrier_kind(&e);
-        diagnostic::failure(format_args!("phase=query_barrier reason={reason}"));
-        if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
-            RemoteError::NotLeader {
-                leader: hint.leader_id,
-            }
-        } else {
-            RemoteError::Unavailable
-        }
-    })?;
+    if let Err(error) = super::read_barrier::confirm(&raft, end, "query_barrier").await {
+        return query_barrier_failure(error);
+    }
     if Instant::now() >= end {
         return Ok(Reply::Query(Err(QueryFailure::Timeout)));
     }

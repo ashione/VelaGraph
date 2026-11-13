@@ -683,3 +683,79 @@ async fn failure_status_collection_is_bounded_when_control_peers_do_not_reply() 
     drop(listeners);
     Ok(())
 }
+
+/// Investigation only: process scheduling pause, not a production timeout fix.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled #247 scheduling experiment"]
+async fn investigate_read_confirmation_scheduling_window() -> anyhow::Result<()> {
+    struct Resume(Vec<u32>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                let _ = Command::new("kill")
+                    .args(["-CONT", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    for (pause_ms, follower_count, budget_ms) in [
+        (0_u64, 0, 10000),
+        (40, 2, 10000),
+        (180, 2, 10000),
+        (180, 1, 10000),
+        (180, 2, 50),
+    ] {
+        for attempt in 1..=3 {
+            let cluster = Cluster::start().await?;
+            let client =
+                SnapshotClient::connect(cluster.grpc(), cluster.identity(), BUDGET).await?;
+            // Allow readiness traffic to finish before applying a controlled pause.
+            sleep(Duration::from_millis(100)).await;
+            let mut paused = Resume(Vec::new());
+            if pause_ms > 0 {
+                for (i, process) in cluster._processes.iter().enumerate() {
+                    if i != cluster.leader && paused.0.len() < follower_count {
+                        let pid = process.0.id();
+                        ensure!(Command::new("kill")
+                            .args(["-STOP", &pid.to_string()])
+                            .status()?
+                            .success());
+                        paused.0.push(pid);
+                    }
+                }
+            }
+            let resume = tokio::spawn(async move {
+                sleep(Duration::from_millis(pause_ms)).await;
+                drop(paused);
+            });
+            let started = std::time::Instant::now();
+            let result = client.open(SHARD, Duration::from_millis(budget_ms)).await;
+            let elapsed = started.elapsed();
+            resume.await?;
+            eprintln!("EXPERIMENT pause_ms={pause_ms} follower_count={follower_count} budget_ms={budget_ms} attempt={attempt} selected_leader={} elapsed_us={} result={}", cluster.leader + 1, elapsed.as_micros(), match &result { Ok(_) => "ok", Err(RemoteError::Timeout { .. }) => "timeout", Err(_) => "other_error" });
+            if budget_ms == 50 {
+                ensure!(
+                    matches!(result, Err(RemoteError::Timeout { .. })),
+                    "short budget must fail closed: {result:?}"
+                );
+            } else {
+                ensure!(
+                    result.is_ok(),
+                    "bounded read confirmation must recover: {result:?}"
+                );
+            }
+            if let Ok(descriptor) = result {
+                client.close(descriptor, BUDGET).await?;
+            }
+            sleep(Duration::from_millis(80)).await;
+            eprintln!(
+                "EXPERIMENT recovered_status {}",
+                cluster.failure_status().await
+            );
+            let recovered = client.open(SHARD, BUDGET).await;
+            ensure!(recovered.is_ok(), "recovered read failed: {recovered:?}");
+        }
+    }
+    Ok(())
+}

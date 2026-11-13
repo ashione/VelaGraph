@@ -1,5 +1,6 @@
 //! Bounded plaintext TCP D1 transport for trusted development networks only.
-//! No authentication, TLS, forwarding or retry is provided. Managed write activation
+//! No authentication, TLS, forwarding or mutation replay is provided. Only read
+//! quorum confirmation has bounded retry within the original deadline. Managed write activation
 //! is an explicit irreversible protocol transition, not an authorization boundary.
 //! Ordinary connections carry one request/response. Opt-in hierarchy channels
 //! reuse a bounded, sequential connection tied to one fixed query session.
@@ -28,6 +29,7 @@ mod diagnostic;
 pub mod distributed;
 pub mod managed;
 mod paged;
+mod read_barrier;
 pub use paged::grpc;
 pub mod query;
 pub use paged::{
@@ -498,9 +500,9 @@ async fn execute(
             // Start the node lease before preflight/barrier/capture, never afterwards.
             let lease_end = Instant::now() + Duration::from_millis(request.ttl_millis);
             distributed::fixed::preflight(identity, &request, end.min(lease_end))?;
-            raft.ensure_linearizable()
+            read_barrier::confirm(&raft, end.min(lease_end), "read_barrier")
                 .await
-                .map_err(|_| RemoteError::Unavailable)?;
+                .map_err(read_barrier::without_leader_hint)?;
             query_sessions
                 .open_fixed(
                     &state,
@@ -522,9 +524,9 @@ async fn execute(
                 .min(lease_end)
                 .min(admitted + Duration::from_millis(request.open.acquire_timeout_millis));
             distributed::fixed::renewable_preflight(identity, &request, end)?;
-            raft.ensure_linearizable()
+            read_barrier::confirm(&raft, end, "read_barrier")
                 .await
-                .map_err(|_| RemoteError::Unavailable)?;
+                .map_err(read_barrier::without_leader_hint)?;
             query_sessions
                 .open_renewable_fixed(
                     &state,
@@ -560,9 +562,9 @@ async fn execute(
                 return Err(RemoteError::InvalidArgument);
             }
             let end = end.min(Instant::now() + Duration::from_millis(timeout_millis));
-            raft.ensure_linearizable()
+            read_barrier::confirm(&raft, end, "read_barrier")
                 .await
-                .map_err(|_| RemoteError::Unavailable)?;
+                .map_err(read_barrier::without_leader_hint)?;
             query_sessions
                 .open(&state, identity, shard, end)
                 .await
@@ -574,9 +576,9 @@ async fn execute(
             }
             let end = end.min(Instant::now() + Duration::from_secs(5));
             tokio::time::timeout_at(end, async {
-                raft.ensure_linearizable()
+                read_barrier::confirm(&raft, end, "read_barrier")
                     .await
-                    .map_err(|_| RemoteError::Unavailable)?;
+                    .map_err(read_barrier::without_leader_hint)?;
                 query_sessions
                     .open_hierarchy(&state, identity, shard, end)
                     .await
@@ -605,18 +607,7 @@ async fn execute(
                 return Err(RemoteError::InvalidArgument);
             }
             let mut phase = diagnostic::Phase::new("open_snapshot_barrier", None, end);
-            let barrier = raft.ensure_linearizable().await.map_err(|e| {
-                let reason = diagnostic::read_barrier_kind(&e);
-                diagnostic::failure(format_args!("phase=open_snapshot_barrier reason={reason}"));
-
-                if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
-                    RemoteError::NotLeader {
-                        leader: hint.leader_id,
-                    }
-                } else {
-                    RemoteError::Unavailable
-                }
-            });
+            let barrier = read_barrier::confirm(&raft, end, "open_snapshot_barrier").await;
             if barrier.is_err() {
                 phase.finish(&barrier);
             }
@@ -646,15 +637,7 @@ async fn execute(
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
             }
-            raft.ensure_linearizable().await.map_err(|e| {
-                if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
-                    RemoteError::NotLeader {
-                        leader: hint.leader_id,
-                    }
-                } else {
-                    RemoteError::Unavailable
-                }
-            })?;
+            read_barrier::confirm(&raft, end, "read_barrier").await?;
             let (actual, _, _) = state
                 .d1_metadata()
                 .await
@@ -681,15 +664,7 @@ async fn execute(
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
             }
-            raft.ensure_linearizable().await.map_err(|e| {
-                if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
-                    RemoteError::NotLeader {
-                        leader: hint.leader_id,
-                    }
-                } else {
-                    RemoteError::Unavailable
-                }
-            })?;
+            read_barrier::confirm(&raft, end, "read_barrier").await?;
             let view = state
                 .d1_read_snapshot(MAX_SNAPSHOT_ROWS, MAX_SNAPSHOT_BYTES)
                 .await
