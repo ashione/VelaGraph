@@ -1,4 +1,4 @@
-//! Verify the prototype across three real OS processes and TCP sockets.
+//! Verify the prototype across three real OS processes and gRPC Raft sockets.
 //!
 //! The processes are started from the `d2-node` binary. No node shares memory
 //! with another node or with the test driver.

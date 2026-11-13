@@ -125,14 +125,14 @@ async fn inbound_admission_recovers_after_client_disconnect() {
 #[tokio::test]
 async fn oversized_aggregate_append_returns_split_hint() {
     let _guard = OUTBOUND_TEST_LOCK.lock().await;
-    use d2_raft::{tcp::TcpNetworkFactory, LogCommand, TypeConfig};
+    use d2_raft::{raft_grpc::GrpcNetworkFactory, LogCommand, TypeConfig};
     use openraft::{
         error::RPCError,
         network::{RPCOption, RaftNetwork, RaftNetworkFactory},
         raft::AppendEntriesRequest,
         BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Vote,
     };
-    let mut factory = TcpNetworkFactory;
+    let mut factory = GrpcNetworkFactory;
     let mut client = factory
         .new_client(
             2,
@@ -141,11 +141,11 @@ async fn oversized_aggregate_append_returns_split_hint() {
             },
         )
         .await;
-    // Each entry individually fits. Together their JSON byte arrays do not.
+    // Each entry individually fits. Together their protobuf messages do not.
     let entries: Vec<Entry<TypeConfig>> = (1..=2)
         .map(|index| Entry {
             log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
-            payload: EntryPayload::Normal(LogCommand::put(b"k", vec![255; 9 * 1024 * 1024])),
+            payload: EntryPayload::Normal(LogCommand::put(b"k", vec![255; 33 * 1024 * 1024])),
         })
         .collect();
     let error = client
