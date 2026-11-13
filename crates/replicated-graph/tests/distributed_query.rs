@@ -1357,7 +1357,8 @@ async fn scenario() -> anyhow::Result<()> {
             ],
         },
         BUDGET,
-    ).await?;
+    )
+    .await?;
     let cli_endpoint = cli_service.local_addr();
     let cli = run_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_graph-coordinator"))

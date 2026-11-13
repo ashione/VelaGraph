@@ -1136,9 +1136,15 @@ async fn coordinator_ingress_checks(
         endpoint,
         legacy,
         serde_json::to_value(client.query(request("g.V(1).count()"), BUDGET).await??)?,
-        hierarchy_count(endpoint, true, "g.V(1).repeat(__.out('knows')).emit().times(2).count()").await?,
+        hierarchy_count(
+            endpoint,
+            true,
+            "g.V(1).repeat(__.out('knows')).emit().times(2).count()",
+        )
+        .await?,
         hierarchy_rows(endpoint, true).await?,
-    ).await?;
+    )
+    .await?;
     let text = "g.V(1,1).repeat(__.out('knows')).emit().times(2).count()";
     assert_eq!(
         hierarchy_count(endpoint, true, text)

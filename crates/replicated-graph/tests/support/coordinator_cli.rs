@@ -45,19 +45,32 @@ pub async fn check(
     ];
     let result = invoke(endpoint, args.clone()).await?;
     anyhow::ensure!(result.status.success(), "default CLI query failed");
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&result.stdout)?, expected_query);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.stdout)?,
+        expected_query
+    );
     let mut wrong_wire = args.clone();
     wrong_wire.extend(["--timeout-ms".into(), "300".into()]);
     assert!(!invoke(legacy, wrong_wire).await?.status.success());
     let mut retired = args;
     retired.push("--grpc".into());
     assert!(!invoke(endpoint, retired).await?.status.success());
-    assert!(!invoke(endpoint, vec!["serve-grpc".into(), "--catalog".into(), "unused".into()])
-        .await?.status.success());
+    assert!(!invoke(
+        endpoint,
+        vec!["serve-grpc".into(), "--catalog".into(), "unused".into()]
+    )
+    .await?
+    .status
+    .success());
 
     for rows in [false, true] {
         let mut args = vec![
-            if rows { "hierarchy-rows-start" } else { "hierarchy-start" }.into(),
+            if rows {
+                "hierarchy-rows-start"
+            } else {
+                "hierarchy-start"
+            }
+            .into(),
             "--partition".into(),
             "0".into(),
             "--query".into(),
@@ -65,30 +78,57 @@ pub async fn check(
                 "g.V(1).repeat(__.out('knows')).emit().times(2)"
             } else {
                 "g.V(1).repeat(__.out('knows')).emit().times(2).count()"
-            }.into(),
+            }
+            .into(),
         ];
-        if rows { args.extend(["--page-size".into(), "1".into()]); }
+        if rows {
+            args.extend(["--page-size".into(), "1".into()]);
+        }
         let mut output = job(endpoint, args).await?;
         let token = match &output {
-            Output::Progress { token, .. } | Output::Preparing { token, .. } =>
-                token.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            Output::Progress { token, .. } | Output::Preparing { token, .. } => token
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             _ => anyhow::bail!("unexpected start response"),
         };
         let mut finished = false;
         for _ in 0..100 {
             let (done, sequence) = match &output {
-                Output::Progress { complete, next_sequence, count, .. } => {
-                    if *complete { assert_eq!(*count, Some(expected_count)); }
+                Output::Progress {
+                    complete,
+                    next_sequence,
+                    count,
+                    ..
+                } => {
+                    if *complete {
+                        assert_eq!(*count, Some(expected_count));
+                    }
                     (*complete, *next_sequence)
                 }
-                Output::Preparing { ready, next_sequence, .. } => (*ready, *next_sequence),
+                Output::Preparing {
+                    ready,
+                    next_sequence,
+                    ..
+                } => (*ready, *next_sequence),
                 _ => anyhow::bail!("unexpected advance response"),
             };
-            if done { finished = true; break; }
-            let args = vec!["hierarchy-advance".into(), "--token".into(), token.clone(),
-                "--sequence".into(), sequence.to_string()];
+            if done {
+                finished = true;
+                break;
+            }
+            let args = vec![
+                "hierarchy-advance".into(),
+                "--token".into(),
+                token.clone(),
+                "--sequence".into(),
+                sequence.to_string(),
+            ];
             output = job(endpoint, args.clone()).await?;
-            assert_eq!(serde_json::to_value(&output)?, serde_json::to_value(job(endpoint, args).await?)?);
+            assert_eq!(
+                serde_json::to_value(&output)?,
+                serde_json::to_value(job(endpoint, args).await?)?
+            );
         }
         anyhow::ensure!(finished, "CLI job did not finish");
         if rows {
@@ -96,24 +136,59 @@ pub async fn check(
             let mut cursor = 0;
             let mut done = false;
             for _ in 0..100 {
-                let args = vec!["hierarchy-read".into(), "--token".into(), token.clone(),
-                    "--cursor".into(), cursor.to_string()];
+                let args = vec![
+                    "hierarchy-read".into(),
+                    "--token".into(),
+                    token.clone(),
+                    "--cursor".into(),
+                    cursor.to_string(),
+                ];
                 let page = job(endpoint, args.clone()).await?;
-                assert_eq!(serde_json::to_value(&page)?, serde_json::to_value(job(endpoint, args).await?)?);
-                let Output::Page { done: last, next_cursor, rows, .. } = page else {
+                assert_eq!(
+                    serde_json::to_value(&page)?,
+                    serde_json::to_value(job(endpoint, args).await?)?
+                );
+                let Output::Page {
+                    done: last,
+                    next_cursor,
+                    rows,
+                    ..
+                } = page
+                else {
                     anyhow::bail!("unexpected page response");
                 };
                 assert!(rows.len() <= 1);
                 actual_rows.extend(rows);
-                if last { done = true; break; }
+                if last {
+                    done = true;
+                    break;
+                }
                 cursor = next_cursor.context("missing cursor")?;
             }
             anyhow::ensure!(done, "CLI pages did not finish");
             assert_eq!(actual_rows, expected_rows);
         }
-        assert!(matches!(job(endpoint, vec!["hierarchy-cancel".into(), "--token".into(), token.clone()]).await?, Output::Cancelled));
-        assert!(!invoke(endpoint, vec!["hierarchy-advance".into(), "--token".into(), token,
-            "--sequence".into(), "0".into()]).await?.status.success());
+        assert!(matches!(
+            job(
+                endpoint,
+                vec!["hierarchy-cancel".into(), "--token".into(), token.clone()]
+            )
+            .await?,
+            Output::Cancelled
+        ));
+        assert!(!invoke(
+            endpoint,
+            vec![
+                "hierarchy-advance".into(),
+                "--token".into(),
+                token,
+                "--sequence".into(),
+                "0".into()
+            ]
+        )
+        .await?
+        .status
+        .success());
     }
     Ok(())
 }
