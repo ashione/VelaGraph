@@ -12,12 +12,12 @@ unbounded recursion, or global start are admitted by this API.
 
 ## Typed coordinator transport
 
-`graph-coordinator serve-grpc` accepts typed gRPC jobs and uses gRPC shard routes.
-Pass `--grpc` to `hierarchy-start`, `hierarchy-rows-start`, `hierarchy-read`,
-`hierarchy-advance` and `hierarchy-cancel` for this endpoint; library callers use
-`distributed::grpc::CoordinatorClient::job`. All operations reuse the same Jobs
-state machine below. The older `jobs::request` and unflagged CLI commands target
-explicit legacy TCP listeners, without protocol probing or fallback. See
+`graph-coordinator serve` accepts typed gRPC jobs and uses gRPC shard routes.
+All `hierarchy-*` CLI commands use it without a transport flag; `serve-grpc` and
+`--grpc` are rejected. Library callers use `distributed::grpc::CoordinatorClient::job`.
+All operations reuse the same Jobs state machine below. The older `jobs::request`
+remains an explicit legacy library fixture, not a CLI mode. No protocol probing
+or fallback is performed. See
 [typed transport](INTERNAL_GRPC_QUERIES.md) for migration and bounded decode rules.
 
 ## Progress is not a result

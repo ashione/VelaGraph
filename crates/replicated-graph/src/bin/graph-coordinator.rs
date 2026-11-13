@@ -11,19 +11,19 @@
 //! Encode those bytes as 32 hexadecimal digits for subsequent commands. Tokens
 //! are temporary bearer credentials: keep them private. Each invocation sends
 //! one request only, with no automatic advancement, retry, or polling.
-//! serve-grpc exposes typed gRPC ingress and shard routes. Client commands use
-//! --grpc for this endpoint; unflagged clients target the legacy serve listener.
+//! All commands use typed gRPC; serve-grpc and --grpc were temporary migration
+//! switches and are rejected. There is no protocol probing or legacy fallback.
 use anyhow::{bail, Context};
 use replicated_graph::remote::distributed::{
     grpc::{CoordinatorClient, GrpcCoordinatorService},
-    jobs::{request, Output, Request},
-    query, CoordinatorService, DistributedRequest, StaticCatalog,
+    jobs::{Output, Request},
+    DistributedRequest, StaticCatalog,
 };
 use std::{net::SocketAddr, time::Duration};
 
 #[derive(Debug)]
 enum Command {
-    Serve { catalog: String, grpc: bool },
+    Serve { catalog: String },
     Query { partition: u32, text: String },
     Job(Request),
 }
@@ -32,12 +32,11 @@ enum Command {
 struct Options {
     endpoint: SocketAddr,
     timeout_ms: u64,
-    client_grpc: bool,
     command: Command,
 }
 
 const COMMANDS: &str =
-    "expected serve, serve-grpc, query, hierarchy-start, hierarchy-rows-start, hierarchy-read, hierarchy-advance, or hierarchy-cancel";
+    "expected serve, query, hierarchy-start, hierarchy-rows-start, hierarchy-read, hierarchy-advance, or hierarchy-cancel";
 
 fn parse_token(value: &str) -> anyhow::Result<[u8; 16]> {
     anyhow::ensure!(
@@ -58,14 +57,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     let (mut page_size, mut cursor) = (None, None);
     let mut timeout_ms = 5000u64;
     let mut trusted = false;
-    let mut client_grpc = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-insecure-development" => trusted = true,
-            "--grpc" => {
-                anyhow::ensure!(!client_grpc, "--grpc must not be repeated");
-                client_grpc = true;
-            }
+            "--grpc" => bail!("--grpc was removed; all coordinator commands use typed gRPC"),
             "--endpoint" => {
                 endpoint = Some(
                     args.next()
@@ -134,15 +129,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     );
     let endpoint = endpoint.context("--endpoint is required")?;
     let command = match command.as_str() {
-        "serve" | "serve-grpc" => {
-            anyhow::ensure!(!client_grpc, "--grpc is client-only; use serve-grpc");
+        "serve-grpc" => bail!("serve-grpc was removed; use serve (typed gRPC only)"),
+        "serve" => {
             anyhow::ensure!(
                 partition.is_none() && text.is_none() && token.is_none() && sequence.is_none(),
                 "query and job flags are not accepted by serve"
             );
             Command::Serve {
                 catalog: catalog.context("--catalog is required")?,
-                grpc: command == "serve-grpc",
             }
         }
         "query" | "hierarchy-start" | "hierarchy-rows-start" => {
@@ -200,7 +194,6 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     Ok(Options {
         endpoint,
         timeout_ms,
-        client_grpc,
         command,
     })
 }
@@ -210,29 +203,21 @@ async fn main() -> anyhow::Result<()> {
     let Options {
         endpoint,
         timeout_ms,
-        client_grpc,
         command,
     } = parse_args(std::env::args().skip(1))?;
     let timeout = Duration::from_millis(timeout_ms);
     match command {
-        Command::Serve { catalog, grpc } => {
+        Command::Serve { catalog } => {
             let file = std::fs::File::open(catalog)?;
             anyhow::ensure!(
                 file.metadata()?.len() <= 64 * 1024,
                 "catalog configuration exceeds 64 KiB"
             );
             let catalog: StaticCatalog = serde_json::from_reader(file)?;
-            if grpc {
-                let service = GrpcCoordinatorService::start(endpoint, catalog, timeout).await?;
-                println!("coordinator={}", service.local_addr());
-                tokio::signal::ctrl_c().await?;
-                service.shutdown().await;
-            } else {
-                let service = CoordinatorService::start(endpoint, catalog, timeout).await?;
-                println!("coordinator={}", service.local_addr());
-                tokio::signal::ctrl_c().await?;
-                service.shutdown().await;
-            }
+            let service = GrpcCoordinatorService::start(endpoint, catalog, timeout).await?;
+            println!("coordinator={}", service.local_addr());
+            tokio::signal::ctrl_c().await?;
+            service.shutdown().await;
         }
         Command::Query { partition, text } => {
             let request = DistributedRequest {
@@ -242,33 +227,25 @@ async fn main() -> anyhow::Result<()> {
             };
             // Typed failure is printed as an error, never as a partial result.
             let end = tokio::time::Instant::now() + timeout;
-            let output = if client_grpc {
-                let client = CoordinatorClient::connect(endpoint, timeout).await?;
-                client
-                    .query(
-                        request,
-                        end.saturating_duration_since(tokio::time::Instant::now()),
-                    )
-                    .await??
-            } else {
-                query(endpoint, request, timeout).await??
-            };
+            let client = CoordinatorClient::connect(endpoint, timeout).await?;
+            let output = client
+                .query(
+                    request,
+                    end.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await??;
             println!("{}", serde_json::to_string(&output)?);
         }
         Command::Job(job) => {
             // One explicit request; an incomplete Progress is not a count result.
             let end = tokio::time::Instant::now() + timeout;
-            let output: Output = if client_grpc {
-                let client = CoordinatorClient::connect(endpoint, timeout).await?;
-                client
-                    .job(
-                        job,
-                        end.saturating_duration_since(tokio::time::Instant::now()),
-                    )
-                    .await??
-            } else {
-                request(endpoint, job, timeout).await??
-            };
+            let client = CoordinatorClient::connect(endpoint, timeout).await?;
+            let output: Output = client
+                .job(
+                    job,
+                    end.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await??;
             println!("{}", serde_json::to_string(&output)?);
         }
     }
@@ -280,31 +257,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_clients_are_explicit_and_servers_reject_client_flag() {
-        let grpc = parse(
-            "query",
-            &["--partition", "1", "--query", "g.V(1)", "--grpc"],
-        )
-        .unwrap();
-        assert!(grpc.client_grpc);
-        assert!(
-            !parse("query", &["--partition", "1", "--query", "g.V(1)"])
-                .unwrap()
-                .client_grpc
-        );
-        assert!(parse(
-            "query",
-            &["--partition", "1", "--query", "g.V(1)", "--grpc", "--grpc"]
-        )
-        .is_err());
+    fn retired_transport_switches_are_rejected() {
         for command in ["serve", "serve-grpc"] {
             assert!(parse(command, &["--catalog", "x", "--grpc"]).is_err());
         }
-        assert!(
-            parse("hierarchy-cancel", &["--token", TOKEN, "--grpc"])
-                .unwrap()
-                .client_grpc
-        );
+        assert!(parse("serve-grpc", &["--catalog", "x"]).is_err());
+        assert!(parse(
+            "query",
+            &["--partition", "1", "--query", "g.V(1)", "--grpc"]
+        )
+        .is_err());
+        assert!(parse("hierarchy-cancel", &["--token", TOKEN, "--grpc"]).is_err());
     }
 
     const TOKEN: &str = "00112233445566778899aAbBcCdDeEfF";
@@ -411,21 +374,6 @@ mod tests {
         )
         .is_err());
         assert!(parse("bogus", &[]).is_err());
-    }
-
-    #[test]
-    fn grpc_backend_requires_explicit_server_command() {
-        assert!(matches!(
-            parse("serve-grpc", &["--catalog", "grpc.json"])
-                .unwrap()
-                .command,
-            Command::Serve { grpc: true, .. }
-        ));
-        assert!(matches!(
-            parse("serve", &["--catalog", "tcp.json"]).unwrap().command,
-            Command::Serve { grpc: false, .. }
-        ));
-        assert!(parse("serve-grpc", &["--catalog", "x", "--query", "g.V()"]).is_err());
     }
 
     #[test]
