@@ -29,7 +29,8 @@ identity/certification checks. A stopping gateway rejects new work.
 Both HTTP and legacy managed TCP share the same eight admission slots, retained
 query budgets and submit serialization. The first HTTP implementation accepts
 one request per connection (`Connection: close` behavior); persistent HTTP client
-connections and gRPC are not advertised. A maintained Hyper/Axum HTTP stack is
+connections are not advertised. The separate typed public gRPC adapter is now
+implemented and shares these same budgets; see [its contract](PUBLIC_GRPC_SERVICE.md). A maintained Hyper/Axum HTTP stack is
 used, not a custom HTTP parser. Axum, Hyper and hyper-util are existing locked
 MIT dependencies; they are now direct dependencies for this adapter. No new
 crate package or version was introduced.
@@ -48,8 +49,7 @@ The envelope identifies `api: "velagraph.http.preview1"`. This is **not protobuf
 JSON**: integer identities/versions and Integer property values are canonical
 decimal strings, while binary IDs/tokens are lowercase hex. `partition`, page
 size/offset/total and lease milliseconds are bounded JSON integers. This preview
-schema is intentionally isolated under `/preview1`; the planned public gRPC and
-HTTP v1 contract may replace it, without an indefinite preview compatibility
+schema is intentionally isolated under `/preview1`; a future stable HTTP v1 contract may replace it, without an indefinite preview compatibility
 layer. No stable v1 client compatibility is promised here.
 
 | POST action | Body |

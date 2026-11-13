@@ -12,7 +12,8 @@ For performance claims: commit/build, workload/resources and repeated measuremen
 ## Review checklist
 - [ ] Issue and acceptance criteria are linked.
 - [ ] Tests cover relevant behavior, errors, limits and recovery.
-- [ ] Documentation/examples match the implementation.
+- [ ] Affected README, examples/CLI, architecture, current-status index and roadmap updated in this PR (or no-change rationale stated).
+- [ ] Implemented behavior, planned work and historical test evidence are clearly separated.
 - [ ] No secrets, private data, generated databases or unrelated artifacts.
 - [ ] Changes are generic, with no workload-specific shortcuts or dead paths.
 - [ ] Ready for independent review; remaining gaps are explicit.

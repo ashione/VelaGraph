@@ -9,7 +9,8 @@ specialized for one dataset.
 
 > **Experimental, not production-ready.** Several APIs deliberately have different
 > consistency and capacity contracts. Choose the path below before building on it.
-> TCP services are unauthenticated plaintext for trusted development networks only.
+> Network services are unauthenticated plaintext development endpoints; the public
+> HTTP/gRPC preview is loopback-only, not production-ready.
 
 [Quick start](#quick-start) · [Capabilities](#choose-your-graph-path) ·
 [Architecture](#architecture) · [Roadmap](docs/ROADMAP.md) ·
@@ -62,6 +63,14 @@ consistency demonstration.
 cross-shard observed queries, or read [CONTRIBUTING](CONTRIBUTING.md) for development
 and tests. The distributed demo uses plaintext loopback, single-voter groups and
 explicit Unverified completeness; it does not establish node-loss tolerance.
+
+### Serve an already activated managed cohort
+
+The [graph-service guide](docs/PUBLIC_SERVICE_CLI.md) documents the loopback
+HTTP/gRPC preview, configuration and exact launch command. It requires existing
+activated managed nodes and their gRPC endpoints; it is not a one-command cluster
+bootstrap or restore workflow. HTTP `/preview1` is not the final protobuf JSON
+contract. See the guide's readiness and lifecycle limits before exposing a client.
 
 ### Embed the local kernel
 
@@ -173,7 +182,10 @@ work includes:
   [durable local temporal slice](docs/TEMPORAL_STORE.md) are implemented.
   The latter uses a separate RocksDB database and synced local versions; it is
   connected to bounded official-Gremlin explicit-ID point queries and indexed
-  out/in/both traversal, not global scans, managed/cohort V or existing checkpoints.
+  out/in/both traversal, not global scans, managed/cohort V or existing checkpoints. A separate
+  [managed vertex assertion slice](docs/TEMPORAL_STORE.md#managed-state-machine-vertex-slice-196)
+  stores temporal vertices in existing member state machines and reads at fixed V/T;
+  it does not add temporal edges, a public temporal service or global recovery.
 - Object-store-authoritative storage with disposable local caches, subject to
   durability and recovery design; native S3/OSS/TOS deployment validation remains
   separate from the current checkpoint transport.

@@ -1,10 +1,11 @@
 # Public managed service: first implementation boundary
 
-Status: **final protocol implementation design, not a completed service**.
+Status: **target design with implemented loopback preview slices**.
 The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed gRPC slice](PUBLIC_GRPC_SERVICE.md)
 and [service host](PUBLIC_SERVICE_CLI.md) reuse a shared invocation/delivery seam.
 The final stable HTTP/schema, clean startup and full release gates remain open. Reviewed against
-main `365228e32efb939c8f9188e1b236a83c1c872b20` on 2026-11-12.
+main `fa202c51` on 2026-11-13. The source of truth for runnable endpoints is the
+linked preview/CLI contracts, not the proposed stable routes below.
 Tracks [#218](https://github.com/ashione/VelaGraph/issues/218),
 [#221](https://github.com/ashione/VelaGraph/issues/221), and the
 [v0.0.1 acceptance gate](RELEASE_PLAN.md). No release gate is marked complete.
@@ -12,7 +13,7 @@ Tracks [#218](https://github.com/ashione/VelaGraph/issues/218),
 ## Decision and reference systems
 
 Use one managed application service with two thin public adapters: typed
-`velagraph.public.v1` gRPC and HTTP/JSON. They call the same in-process handler,
+`velagraph.public.managed.v1` gRPC and HTTP/JSON. They call the same in-process handler,
 not one another over an extra loopback TCP hop, and do not select independent
 write or query engines. Internal node/control/Raft services stay on separate
 listeners and cannot be reached through public method dispatch.
@@ -49,12 +50,16 @@ contract. Do not copy Bolt's discard/commit semantics into managed writes.
 | `Gateway::bind_config` | Validates configuration and certified zero baseline before binding | Baseline V=0 is not evidence that a requested restored cut has loaded. Add target-specific startup/readiness state; do not advertise global restore. |
 | `State::connections`, `memory`, `submit` | Shared finite admission, retention, serialized submit | All adapters must consume these same budgets. Two protocols cannot double capacity or create unbounded queues. |
 
-[#228](https://github.com/ashione/VelaGraph/pull/228) is observed internal query
-transport, and [#230](https://github.com/ashione/VelaGraph/pull/230) is its stacked
-fixed/renewable internal transport. Neither is the public service. The initial
-public adapters can use main's existing managed business path. Do not copy those
-unmerged commits into this work, retarget a stacked change prematurely, or
-replace their independent integration gates.
+Internal observed/fixed transports (#228/#230), the public adapters/CLI
+(#232/#234), managed control (#237), Raft peers (#239), observed hierarchy shard
+jobs (#236) and RPC-only service routes (#243) are merged. Public HTTP/gRPC share
+`Invocation` and delivery ownership; `graph-service` uses gRPC managed/graph
+clients. Remaining legacy ingress/listeners are tracked by #218. These slices do
+not implement stable HTTP v1, global restore readiness or complete the release.
+
+The seam table above records the design responsibilities: the shared handler,
+canonical mapping and delivery guards now exist; target-specific restore readiness
+and the final wire contract still require implementation/acceptance.
 
 ## Finite first endpoint contract
 
@@ -208,9 +213,10 @@ same workload/source/build. Include at least:
   test is counted as verified global restore.
 
 Record focused checks separately from complete release CI, and attach failures
-as well as successes. The HTTP preview has focused coverage; the complete dual-protocol and
-independent-process acceptance matrix above remains outstanding.
-Only after these gates pass can README advertise the service quickstart; after
-independent review and exact-head integration the release tracker may record
-this bounded slice. No performance, production or full-gRPC-migration claim is
+as well as successes. The implemented preview has independent-process dual-protocol
+coverage in `public_service_process`, plus adapter-level lifecycle tests. See
+[the exact implemented matrix](PUBLIC_SERVICE_CLI.md#process-acceptance-scope).
+That does not complete every target-design requirement above, the final HTTP
+contract, clean cluster bootstrap or restore readiness. README may link this
+bounded preview with its prerequisites; release acceptance remains separate. No performance, production or full-gRPC-migration claim is
 inferred from introducing HTTP/2.

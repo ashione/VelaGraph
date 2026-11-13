@@ -96,6 +96,16 @@ and [checkpoint transport](docs/OBJECT_STORE_CHECKPOINT_API.md).
   command and repeated results. Separate single-host functional validation from
   distributed throughput or availability claims.
 
+### Documentation freshness is part of feature delivery
+
+Every behavior-changing PR must inspect the affected README entry, runnable
+examples/CLI guide, architecture contract, `docs/CURRENT_STATUS.md` and roadmap.
+Update the affected documents in the same PR, or state why each needs no change.
+Record the supported path, defaults, removed flags, limitations and verification
+scope; distinguish implemented behavior from planned acceptance. Do not wait for a
+separate end-of-project documentation sweep. Preserve historical benchmark reports
+as dated evidence rather than relabelling old measurements as current results.
+
 ## Pull requests
 
 Open a **draft PR** early for work in progress. Link the issue with `Refs #N`;

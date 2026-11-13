@@ -12,7 +12,7 @@ canonical commands, query sessions and resource budgets.
 The coordinator and all configured members must already be live, activated and
 bound to the same persisted managed authority/cohort. Each participant must have
 its matching managed graph service. The CLI verifies the configured identities
-through the existing `Gateway::bind_remote_local_queries` startup. It cannot
+through `Gateway::bind_remote_local_queries_grpc` startup. It cannot
 activate an arbitrary cohort, clear an offline restore marker or force READY.
 No query falls back to observed per-shard views.
 
