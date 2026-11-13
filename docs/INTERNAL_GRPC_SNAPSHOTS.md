@@ -107,3 +107,10 @@ latency improvements. See the PR for exact commands and outcomes.
 5. Move managed and Raft RPC families in separate reviewed slices; external
    gRPC/HTTP write/query APIs share the application layer, not this internal
    snapshot service or its authority boundary.
+
+## Unresolved seed quorum evidence
+
+[Snapshot seed investigation](SNAPSHOT_QUORUM_INVESTIGATION.md) tracks #247's
+single observed CI read-barrier failure and failure-only fixture diagnostics.
+Successful reruns are not a fix; the fixture preserves the original error and
+collects bounded post-error replica status without mutation retry.

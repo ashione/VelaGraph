@@ -140,7 +140,7 @@ impl Cluster {
     }
     async fn seed(&self) -> anyhow::Result<()> {
         let node = RemoteStorageNode::new(self.tcp(), SHARD, BUDGET)?;
-        run_blocking(move || -> velagraph::Result<()> {
+        let result = run_blocking(move || -> anyhow::Result<()> {
             let graph = GraphRecordStore::new(node, SHARD, 0);
             // Over one page, without relying on fabricated storage-key layouts.
             for id in 1..=36 {
@@ -149,12 +149,61 @@ impl Cluster {
                 vertex
                     .properties
                     .insert("payload".into(), Value::Text("x".repeat(64 * 1024)));
-                graph.create_vertex(&vertex)?;
+                graph
+                    .create_vertex(&vertex)
+                    .with_context(|| format!("snapshot fixture seed vertex {id}/36"))?;
             }
             Ok(())
         })
-        .await??;
+        .await
+        .context("snapshot fixture seed blocking task")
+        .and_then(|result| result);
+        if let Err(error) = result {
+            // Observation only, after failure: never retry a mutation or treat
+            // a later healthy status as proof that the failed barrier succeeded.
+            return Err(error.context(self.failure_status().await));
+        }
         Ok(())
+    }
+    async fn failure_status(&self) -> String {
+        let mut pending = JoinSet::new();
+        for i in 0..3 {
+            let address = self.addresses[4 * i + 1];
+            pending.spawn(async move {
+                let response = timeout(
+                    Duration::from_millis(300),
+                    send_control(&address.to_string(), ControlRequest::Status),
+                )
+                .await;
+                let summary = match response {
+                    Ok(Ok(ControlResponse::Status(s))) => format!(
+                        "node={} leader={:?} applied={} last_log={}",
+                        s.id, s.leader, s.applied, s.last_log
+                    ),
+                    Ok(Ok(_)) => format!("node={} unexpected_status", i + 1),
+                    Ok(Err(_)) => format!("node={} status_unavailable", i + 1),
+                    Err(_) => format!("node={} status_timeout", i + 1),
+                };
+                (i, summary)
+            });
+        }
+        let mut summaries = Vec::new();
+        while let Some(result) = pending.join_next().await {
+            summaries.push(match result {
+                Ok(summary) => summary,
+                Err(_) => (3, "diagnostic_task_failed".to_string()),
+            });
+        }
+        summaries.sort_by_key(|(i, _)| *i);
+        format!(
+            "snapshot fixture failure observation (after error, selected_leader={}): {}",
+            self.leader + 1,
+            summaries
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     }
 }
 
@@ -573,4 +622,64 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
         Ok::<(), anyhow::Error>(())
     })
     .await?
+}
+
+/// A failed quorum must remain an error. Later status observations are evidence,
+/// not retries or a replacement for the original linearizable barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_quorum_loss_preserves_stage_and_bounded_status_evidence() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(45), async {
+        let mut cluster = Cluster::start().await?;
+        for (i, process) in cluster._processes.iter_mut().enumerate() {
+            if i != cluster.leader {
+                process.0.kill()?;
+                process.0.wait()?;
+            }
+        }
+        let error = timeout(Duration::from_secs(12), cluster.seed())
+            .await?
+            .expect_err("seed must not succeed without a quorum");
+        let evidence = format!("{error:#}");
+        ensure!(
+            evidence.contains("seed vertex 1/36"),
+            "missing seed stage: {evidence}"
+        );
+        ensure!(evidence.contains("after error, selected_leader="));
+        for id in 1..=3 {
+            ensure!(evidence.contains(&format!("node={id} ")));
+        }
+        ensure!(matches!(
+            error.downcast_ref::<velagraph::Error>(),
+            Some(velagraph::Error::StorageNode(
+                velagraph::StorageNodeError::Unavailable(_)
+            ))
+        ));
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn failure_status_collection_is_bounded_when_control_peers_do_not_reply() -> anyhow::Result<()>
+{
+    let mut listeners = Vec::new();
+    let mut addresses = Vec::new();
+    for _ in 0..12 {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        addresses.push(listener.local_addr()?);
+        listeners.push(listener);
+    }
+    let cluster = Cluster {
+        addresses,
+        leader: 0,
+        _processes: Vec::new(),
+        _dirs: Vec::new(),
+    };
+    // Connections can enter the backlog, but no endpoint serves a response.
+    let evidence = timeout(Duration::from_secs(3), cluster.failure_status()).await?;
+    for id in 1..=3 {
+        ensure!(evidence.contains(&format!("node={id} status_timeout")));
+    }
+    drop(listeners);
+    Ok(())
 }
