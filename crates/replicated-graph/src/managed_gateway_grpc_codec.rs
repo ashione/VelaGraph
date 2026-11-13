@@ -576,7 +576,7 @@ mod tests {
             ttl_millis: 500,
         };
         assert_eq!(
-            fixed_open(request.clone()).unwrap(),
+            fixed_open(request).unwrap(),
             Operation::OpenSession {
                 version: Some(0),
                 ttl_millis: 500
@@ -585,7 +585,7 @@ mod tests {
         assert_eq!(
             fixed_open(pb::FixedOpenRequest {
                 version: None,
-                ..request.clone()
+                ..request
             })
             .unwrap(),
             Operation::OpenSession {
@@ -595,12 +595,12 @@ mod tests {
         );
         assert!(fixed_open(pb::FixedOpenRequest {
             context: None,
-            ..request.clone()
+            ..request
         })
         .is_err());
         assert!(fixed_open(pb::FixedOpenRequest {
             ttl_millis: 0,
-            ..request.clone()
+            ..request
         })
         .is_err());
         assert!(fixed_open(pb::FixedOpenRequest {
