@@ -37,40 +37,44 @@ impl Transport {
             .connect_lazy();
         Ok(Self { channel })
     }
-    pub(super) async fn call(
+    pub(super) fn call(
         &self,
         request: Request,
         deadline: tokio::time::Instant,
-    ) -> Result<Reply, Error> {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .ok_or(Error::Unavailable)?;
-        // Floor, never extend the original caller's budget.
-        let millis: u64 = remaining
-            .as_millis()
-            .try_into()
-            .map_err(|_| Error::Capacity)?;
-        if millis == 0 {
-            return Err(Error::Unavailable);
-        }
-        let message = cpu(move || codec::request_to_wire(request, millis)).await?;
-        if message.encoded_len() > MAX_FRAME_BYTES {
-            return Err(Error::Capacity);
-        }
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .ok_or(Error::Unavailable)?;
-        let mut request = tonic::Request::new(message);
-        request.set_timeout(remaining);
-        let mut client = ManagedServiceClient::new(self.channel.clone())
-            .max_decoding_message_size(MAX_FRAME_BYTES)
-            .max_encoding_message_size(MAX_FRAME_BYTES);
-        let reply = client
-            .call(request)
-            .await
-            .map_err(remote_status)?
-            .into_inner();
-        cpu(move || codec::reply_from_wire(reply)).await
+    ) -> Pin<Box<dyn Future<Output = Result<Reply, Error>> + Send + '_>> {
+        // Keep the generated HTTP/2 future out of nested managed transaction
+        // future layouts. This is transport allocation, not a larger thread stack.
+        Box::pin(async move {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or(Error::Unavailable)?;
+            // Floor, never extend the original caller's budget.
+            let millis: u64 = remaining
+                .as_millis()
+                .try_into()
+                .map_err(|_| Error::Capacity)?;
+            if millis == 0 {
+                return Err(Error::Unavailable);
+            }
+            let message = cpu(move || codec::request_to_wire(request, millis)).await?;
+            if message.encoded_len() > MAX_FRAME_BYTES {
+                return Err(Error::Capacity);
+            }
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or(Error::Unavailable)?;
+            let mut request = tonic::Request::new(message);
+            request.set_timeout(remaining);
+            let mut client = ManagedServiceClient::new(self.channel.clone())
+                .max_decoding_message_size(MAX_FRAME_BYTES)
+                .max_encoding_message_size(MAX_FRAME_BYTES);
+            let reply = client
+                .call(request)
+                .await
+                .map_err(remote_status)?
+                .into_inner();
+            cpu(move || codec::reply_from_wire(reply)).await
+        })
     }
 }
 fn status(error: Error) -> Status {
