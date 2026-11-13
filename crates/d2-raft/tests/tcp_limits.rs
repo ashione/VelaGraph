@@ -35,12 +35,20 @@ async fn flood_and_slow_clients_do_not_outlive_shutdown() -> anyhow::Result<()> 
         // sockets. Shutdown must cancel and join all admitted handlers now.
         timeout(Duration::from_secs(1), node.shutdown()).await?;
         for mut stream in streams {
-            let mut byte = [0];
-            let result = timeout(Duration::from_secs(1), stream.read(&mut byte)).await?;
-            assert!(
-                matches!(result, Ok(0) | Err(_)),
-                "connection survived shutdown"
-            );
+            // HTTP/2 may have already sent SETTINGS/GOAWAY before shutdown.
+            // Drain bounded frames until EOF/reset rather than mistaking them
+            // for a surviving socket.
+            timeout(Duration::from_secs(1), async {
+                let mut bytes = [0; 4096];
+                for _ in 0..16 {
+                    match stream.read(&mut bytes).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+                panic!("connection survived shutdown");
+            })
+            .await?;
         }
         // Joining handlers releases every server-owned state-machine Arc/DB.
         let reopened = start(dir.path()).await?;

@@ -1,0 +1,57 @@
+syntax = "proto3";
+package velagraph.internal.raft.v1;
+import "internal_managed.proto";
+// A breaking replacement for newline JSON Raft. No fallback or mixed peers.
+service RaftService {
+  rpc Vote(VoteRequest) returns (VoteResponse);
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc InstallSnapshot(SnapshotRequest) returns (SnapshotResponse);
+}
+message Empty {}
+message Vote { uint64 term = 1; uint64 node = 2; bool committed = 3; }
+message LogId { uint64 term = 1; uint64 node = 2; uint64 index = 3; }
+message Node { uint64 id = 1; string address = 2; }
+message Voters { repeated uint64 ids = 1; }
+message Membership { repeated Voters configurations = 1; repeated Node nodes = 2; }
+message VoteRequest { uint32 version = 1; uint64 target = 2; Vote vote = 3; LogId last_log = 4; }
+message VoteResponse { Vote vote = 1; bool granted = 2; LogId last_log = 3; }
+message Entry { LogId log_id = 1; oneof payload { Empty blank = 2; LogCommand command = 3; Membership membership = 4; } }
+message LogCommand { oneof kind { Empty noop = 1; Batch batch = 2; D1Command d1 = 3; } }
+message Batch { repeated velagraph.internal.managed.v1.WriteOp operations = 1; }
+message EpochChange { uint64 shard = 1; uint64 expected_epoch = 2; uint64 new_epoch = 3; }
+message CapacityChange { uint64 shard = 1; uint64 epoch = 2; uint64 expected_bytes = 3; uint64 new_bytes = 4; }
+message EnableReads { velagraph.internal.managed.v1.Target target = 1; velagraph.internal.managed.v1.Journal journal = 2; }
+message EnableByteReads { velagraph.internal.managed.v1.Target target = 1; velagraph.internal.managed.v1.Journal journal = 2; bytes generation_nonce = 3; }
+message EnableParticipant { velagraph.internal.managed.v1.Target target = 1; velagraph.internal.managed.v1.Authority authority = 2; }
+message Prepare { velagraph.internal.managed.v1.Authority authority = 1; velagraph.internal.managed.v1.Participant participant = 2; velagraph.internal.managed.v1.D1WriteRequest request = 3; }
+message Resolve { velagraph.internal.managed.v1.Authority authority = 1; velagraph.internal.managed.v1.Participant participant = 2; bytes id = 3; velagraph.internal.managed.v1.TerminalDecision decision = 4; }
+message Coordinator { velagraph.internal.managed.v1.Target target = 1; velagraph.internal.managed.v1.Command command = 2; }
+message EnableManaged { velagraph.internal.managed.v1.Target target = 1; uint64 expected_sequence = 2; }
+message ManagedWrite { bytes mode = 1; velagraph.internal.managed.v1.D1WriteRequest request = 2; }
+message D1Command { oneof kind {
+ velagraph.internal.managed.v1.Target activate = 1;
+ EpochChange set_epoch = 2;
+ CapacityChange set_capacity = 3;
+ velagraph.internal.managed.v1.D1WriteRequest write = 4;
+ EnableReads enable_reads = 5;
+ EnableByteReads enable_byte_reads = 6;
+ velagraph.internal.managed.v1.Advance advance_visibility = 7;
+ velagraph.internal.managed.v1.SyncHistory sync_history = 8;
+ velagraph.internal.managed.v1.AdvanceRetained advance_retained = 9;
+ EnableParticipant enable_participant = 10;
+ velagraph.internal.managed.v1.RetainedPrepare prepare_retained = 11;
+ Prepare prepare_participant = 12;
+ Resolve resolve_participant = 13;
+ velagraph.internal.managed.v1.Target enable_coordinator = 14;
+ Coordinator coordinator = 15;
+ EnableManaged enable_managed = 16;
+ ManagedWrite managed_write = 17;
+} }
+message AppendRequest { uint32 version = 1; uint64 target = 2; Vote vote = 3; LogId previous = 4; repeated Entry entries = 5; LogId committed = 6; }
+message Partial { LogId matching = 1; }
+message AppendResponse { oneof result { Empty success = 1; Partial partial = 2; Empty conflict = 3; Vote higher_vote = 4; } }
+message SnapshotMeta { LogId last_log = 1; LogId membership_log = 2; Membership membership = 3; string id = 4; }
+message SnapshotRequest { uint32 version = 1; uint64 target = 2; Vote vote = 3; SnapshotMeta meta = 4; uint64 offset = 5; bytes data = 6; bool done = 7; }
+message Segment { string id = 1; uint64 offset = 2; }
+message SnapshotMismatch { Segment expected = 1; Segment received = 2; }
+message SnapshotResponse { oneof result { Vote vote = 1; SnapshotMismatch mismatch = 2; } }
