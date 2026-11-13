@@ -17,9 +17,21 @@ graph-coordinator serve-grpc --endpoint 127.0.0.1:9400 \
   --catalog grpc-catalog.json --allow-insecure-development
 ```
 
-The ordinary `query` client still talks to the coordinator's existing interface.
-`CoordinatorService::start_grpc` is the equivalent library entrypoint. Existing
-`serve`/`CoordinatorService::start` continue to explicitly select TCP. There is no
+`serve-grpc` now exposes typed `CoordinatorService.Query` and `.Job` ingress as
+well as gRPC shard backends. Clients must explicitly select `--grpc`, for example:
+
+```sh
+graph-coordinator query --grpc --endpoint 127.0.0.1:9400 \
+  --partition 1 --query 'g.V(1)' --allow-insecure-development
+```
+
+The same flag applies to every `hierarchy-*` command. `GrpcCoordinatorService`
+and `CoordinatorClient` are the corresponding library APIs. This is a deliberate
+wire change to the CLI `serve-grpc` command; old unflagged TCP clients must migrate.
+The legacy library `CoordinatorService::start_grpc` still means TCP ingress with
+gRPC shard backends for differential tests; it is not the new typed ingress API.
+Existing `serve`/`CoordinatorService::start` and unflagged clients explicitly
+select legacy TCP. These retained paths remain retirement work under #218. There is no
 protocol probing, fallback, application-request retry, or leader-following.
 The tonic channel may reconnect a transport connection; this is not application
 replay or reopening a lost query session. A wrong port or
@@ -58,10 +70,12 @@ selected clients; it never falls back to the old shard transport.
 The gRPC-backed coordinator supports observed hierarchy count/row jobs but still
 rejects explicit consistency requests with typed `Unsupported`. Fixed/renewable
 query sessions have a separate [managed-gateway gRPC entrypoint](INTERNAL_GRPC_FIXED_QUERIES.md).
-The coordinator's **client-facing query/job envelope is still legacy TCP/JSON**;
-this slice migrates only coordinator-to-shard job sessions. Managed control and
-Raft also remain separate migrations. Do not interpret this slice as completion
-of the protocol-unification roadmap.
+The new coordinator ingress covers ordinary observed queries and the existing
+Start/StartRows/Read/Advance/Cancel jobs, with typed output/failure oneofs, snapshot
+stamps and property values. It exposes no fixed/managed Consistent RPC. A caller
+using an unknown method receives an explicit gRPC Unimplemented response. Legacy
+coordinator, driver/control and Unix gateway paths still require retirement or
+migration; this is not completion of #218.
 
 The original job state machine retains cumulative budgets, shard parallelism,
 immutable page/replay behavior, cancellation and leases. Explicit TCP selection
@@ -82,3 +96,20 @@ including hierarchy count jobs, snapshot stamps and repeated Advance replay.
 Codec tests cover typed shapes and malformed messages. Existing snapshot and
 legacy query suites remain regression gates. Successful tests establish semantic
 compatibility for this slice, not a throughput improvement or production readiness.
+
+## Typed coordinator ingress limits and lifecycle
+
+One shared Jobs registry and two admitted operations serve the entire endpoint.
+Admission covers decode, execution and response-body consumption; accepted
+connections are also bounded. Protobuf pre-scans reject oversized/repeated or
+malformed structures before allocation. Existing traversal, result and retained
+job ceilings remain unchanged. Server and caller remaining deadlines shorten
+execution and delivery; no application request is transparently retried.
+
+The registry expires idle jobs every 100ms. Shutdown/drop stops listening, cancels
+connections/in-flight calls and releases local retained jobs/slots. Remote shard
+views may remain until their existing hierarchy lease expires (120 seconds);
+shutdown is not a synchronous remote-view close guarantee. An Advance timeout can
+consume its registry entry; a lost Start response can leave an unknown token until
+lease expiry. Neither case is proof that nothing happened. Existing replay and
+cancel contracts in [hierarchy jobs](HIERARCHY_COUNT_JOBS.md) remain authoritative.

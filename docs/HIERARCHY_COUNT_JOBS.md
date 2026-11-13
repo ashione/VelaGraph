@@ -10,6 +10,16 @@ the two existing post-emit modulator orders are accepted. Optional edge labels
 are supported. No filters, other hops, limit, path, vertex pages, nested repeat,
 unbounded recursion, or global start are admitted by this API.
 
+## Typed coordinator transport
+
+`graph-coordinator serve-grpc` accepts typed gRPC jobs and uses gRPC shard routes.
+Pass `--grpc` to `hierarchy-start`, `hierarchy-rows-start`, `hierarchy-read`,
+`hierarchy-advance` and `hierarchy-cancel` for this endpoint; library callers use
+`distributed::grpc::CoordinatorClient::job`. All operations reuse the same Jobs
+state machine below. The older `jobs::request` and unflagged CLI commands target
+explicit legacy TCP listeners, without protocol probing or fallback. See
+[typed transport](INTERNAL_GRPC_QUERIES.md) for migration and bounded decode rules.
+
 ## Progress is not a result
 
 Start pins every configured shard and returns a token, `next_sequence: 0`, and
