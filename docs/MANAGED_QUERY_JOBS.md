@@ -37,8 +37,8 @@ The admitted grammar remains nonempty explicit `g.V(ids)`, up to three out/in
 steps, and optional terminal path/count. Ordered bags, qualified identities,
 parallel edges and original endpoint/reverse checks are preserved. Scans, repeat,
 values, limit and other unsupported shapes still reject. This is a generic
-lifecycle, not a claim of arbitrary Gremlin support. SQL and observed-query APIs
-are unchanged.
+lifecycle, not a claim of arbitrary Gremlin support. Observed-query APIs are
+unchanged; the legacy SQL engine is removed.
 
 The gateway enters Capturing, Running, Sealing and Ready. Ready is published only
 after the complete bounded result and every possible page envelope pass checks.
@@ -165,3 +165,97 @@ See [design and official-system research](BOUNDED_QUERY_LIFECYCLE_DESIGN.md).
 All exact-head regression and CI outcomes, including failures, must be recorded
 before acceptance. New API success never substitutes for the unchanged original
 pin, observed CoreHR or release1025 gates.
+
+## Planned typed public job service (#268)
+
+**Design only, not an available API.** This section records the migration target
+against main `d9399e7b`. It neither expands the lifecycle above nor retires the
+legacy managed gateway. The related fixed-session work (#266 / #267) is separate:
+materialized fixed sessions, synchronous local query sessions and jobs must not
+share interchangeable tokens. #218 remains the transport umbrella.
+
+### Contract and adapter boundary
+
+Add `ManagedQueryJobService` to the existing
+`velagraph.public.managed.v1` endpoint. Reuse `State`,
+`Invocation::begin/live/delivery_end`, `Handler::run`, admission, workers,
+executor and error mapping. No new listener, executor or transparent retry layer.
+Use the same typed Query/Page/Context vocabulary, but a distinct JobHandle with
+16-byte incarnation and 32-byte token; neither is a credential.
+
+| Proposed RPC | Existing operation | Request and response contract |
+| --- | --- | --- |
+| Start | StartLocalQueryJob | Nonzero 16-byte operation ID, optional exact version (absence means latest at the worker's read-cut admission, not at Start RPC or job-slot admission; explicit zero remains exact zero), Query, page size, required JobPolicy. Return operation ID and handle only. |
+| Get | GetLocalQueryJob | Exact handle; return handle and phase/status. No partial rows, implicit renewal or mutation of selected V. |
+| Renew | RenewLocalQueryJob | Exact handle and expected generation; return handle, generation and remaining milliseconds. Remaining time is anchored at this call's send time, not its receive time. |
+| Fetch | FetchLocalQueryJob | Handle, original Query/page size and optional cursor. Return those bindings, fixed V and complete immutable page. Absent cursor is first page; malformed present cursor is not absence. |
+| Cancel | CancelLocalQueryJob | Exact handle; return terminal status. A successful cancellation is not immediate physical resource release. |
+
+JobPolicy carries idle/execution/lifetime milliseconds separately from Context's
+control-call deadline. Start replay compares the decoded domain arguments, not
+protobuf bytes. Existing input validation precedes replay-key comparison: changed
+valid arguments return Identity, while malformed queries, page sizes or policies
+retain their original validation errors. Do not change this error precedence. Do not expose minimum-version or expanded-profile selectors that
+the existing job operation does not support.
+
+Status carries an explicit phase enum, optional V/total and optional typed domain
+failure. Ready requires both V and total and no failure; active phases expose
+neither V, total nor failure. Terminal results follow the existing
+`jobs::valid_status` rules. RPC failure and a successfully retrieved failed-job
+status are different outcomes. Preserve domain failure distinctions, including
+unsupported scope, rather than silently collapsing them merely because the
+existing public RPC status mapper combines some error categories.
+
+### Ownership and bounds that must survive transport replacement
+
+- Start's admitted task belongs to the gateway. Unlike a new synchronous session
+  open, a failed response delivery must not remove it. Recovery from a lost Start
+  response uses the same operation ID and complete arguments while its record is
+  retained. A restart invalidates the handle; durable job recovery is out of scope.
+- A dropped Renew must execute the existing pending-round cleanup guard. Running
+  requires grants from all still-needed original descriptors; Capturing is Busy.
+  Replaying the last committed renewal preserves expiry/generation while remaining
+  time decreases. Neither delayed completion nor retry resurrects expired work.
+- Fetch retains the job reservation through encoding/delivery and checks Ready
+  and deadline again. Cancellation/expiry wins over later publication; bytes
+  already sent cannot be recalled. Get or Fetch never extends the idle lease.
+- Keep the original control-call cap, idle/execution/hard deadlines, parity
+  capture profile, shared pools and accumulated work budgets. Terminal metadata
+  retains its shared slot until hard lifetime, as described above.
+- Extend the allocation-free schema-aware protobuf prescan for all new requests
+  and responses. Reject unknown enum values, missing required messages, duplicate
+  fields/oneofs, oversized collections and wrong token widths before unsafe
+  allocation or domain execution. Keep both protobuf wire limits and original
+  logical page-envelope preflight; smaller protobuf encoding is not permission
+  to accept results rejected by existing budgets.
+
+### Required evidence matrix
+
+| Gate | Evidence needed on the implementation candidate |
+| --- | --- |
+| Typed conversion | Round trips for every phase, exact zero versus absent V, empty versus absent cursor, all failure variants, uint64 generation limits; malformed/duplicate/unknown fields rejected. |
+| Admission and replay | Same-ID/same-arguments Start returns same handle; changed valid query, page size, policy or V returns Identity; invalid inputs retain validation-first errors; unsupported grammar and full shared pool fail without creating work. Same-ID replay of retained Cancelled/Failed jobs returns the original handle; after hard-lifetime eviction the ID may admit new work, not durable exactly-once execution. |
+| Lost delivery | Drop Start response, replay original request and observe one job. Disconnect Get/Fetch without cancelling the job. Disconnect Renew cannot strand a pending round. |
+| Fixed result | Independent small non-HR oracle with qualified IDs, parallel edges and ordered bags; later writes/deletes do not alter V or page replay; no rows before complete sealing. |
+| Renewal races | Capturing Busy; committed replay does not extend expiry; concurrent pending renewal, wrong generation, node-grant failure, last-read transition, expiry and cancellation use original linearization. |
+| Cancellation and shutdown | Cancel then Fetch rejected; cancelled/failed/expired status remains identifiable until hard expiry; reservation remains held while worker/encoder owns it; shutdown joins owned work. |
+| Fencing and recovery | Wrong incarnation/token/query/cursor/page size rejected; restart invalidates handles. No endpoint replacement, fresh-V recapture or automatic new operation ID after uncertainty. |
+| Resource parity | Exact/over-boundary logical and protobuf envelopes, original capture/result/work limits, simultaneous old/new API admission; no test timeout or assertion weakening. |
+| Process and regression | Actual public gRPC client/server lifecycle using managed graph routes; compare typed results/errors with legacy semantics, not only codec mocks. Independent review and exact-head CI/CoreHR, retaining original pin and release1025 gates. |
+
+Existing deterministic tests in `managed_gateway_jobs.rs` and
+`managed_query_lifecycle.rs`, plus `tests/query_job_lifecycle.rs` and its
+support fixture, are the semantic base. Extend or reuse them rather than creating
+another query engine or accepting observed-query evidence as managed-job proof.
+Transport-only performance claims require separate matched measurements.
+
+### Delivery sequence
+
+1. Review this matrix independently of #267; design approval is not implementation
+   completion. Keep #268 open and linked to its implementation PR.
+2. After #267 integrates, add schema/generated bindings, bounded codec, adapter and
+   lifecycle tests on current main. This avoids competing edits to shared public
+   proto/generated/handler files while preserving a single endpoint.
+3. Record exact candidate evidence and update this document plus public transport
+   inventories. Only then assess legacy retirement in its own verified slice;
+   do not remove unconverted operations or declare #218 complete.
