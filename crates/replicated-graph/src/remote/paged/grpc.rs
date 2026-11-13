@@ -1,6 +1,7 @@
 //! Typed gRPC snapshot transfer. Trusted-network plaintext only, not authentication.
 //! Shared endpoint/admission for separate typed snapshot and observed-query services.
 //! Neither is the public API or Raft RPC.
+pub use super::grpc_paged_snapshot as paged_snapshot;
 use super::*;
 use prost::Message;
 use std::{
@@ -501,7 +502,9 @@ impl AsyncWrite for LimitedIo {
         Pin::new(&mut self.socket).poll_shutdown(cx)
     }
 }
-/// Optional separate endpoint; it shares Raft/state, not a JSON proxy connection.
+/// Typed graph endpoint with snapshot, query and shard-operation services.
+/// Binding from GraphState opens no legacy TCP listener. Explicit parity callers
+/// may pass a legacy GraphService through its GraphState dereference.
 /// Use on a trusted isolated network only. Identity matching is not authentication.
 pub struct GrpcSnapshotService {
     address: SocketAddr,
@@ -512,7 +515,10 @@ pub struct GrpcSnapshotService {
     deadline: Duration,
 }
 impl GrpcSnapshotService {
-    pub async fn start(source: &GraphService, bind: SocketAddr) -> Result<Self, RemoteError> {
+    pub async fn start(
+        source: &super::super::GraphState,
+        bind: SocketAddr,
+    ) -> Result<Self, RemoteError> {
         let deadline = source.deadline;
         let listener = TcpListener::bind(bind)
             .await
@@ -534,6 +540,14 @@ impl GrpcSnapshotService {
         let admission = source.admission.clone();
         let hard_stop = CancellationToken::new();
         let connection_stop = hard_stop.clone();
+        let metadata_stop = hard_stop.child_token();
+        let metadata_service = super::super::metadata_stream_server::service(
+            handler.clone(),
+            admission.clone(),
+            source.metadata_streams.clone(),
+            deadline,
+            metadata_stop.clone(),
+        );
         let (stop, mut stopped) = watch::channel(false);
         let cleanup = sessions.clone();
         let query_cleanup = source.query_sessions.clone();
@@ -541,10 +555,10 @@ impl GrpcSnapshotService {
             let shutdown = async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
-                    tokio::select! { _ = stopped.changed() => break, _ = interval.tick() => { cleanup.expire(); query_cleanup.expire(); } }
+                    tokio::select! { _ = stopped.changed() => { metadata_stop.cancel(); break }, _ = interval.tick() => { cleanup.expire(); query_cleanup.expire(); } }
                 }
             };
-            let connections = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+            let connections = Arc::new(Semaphore::new(super::super::MAX_GRAPH_CONNECTIONS));
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).filter_map(
                 move |accepted| match accepted {
                     Err(error) => Some(Err(error)),
@@ -560,6 +574,7 @@ impl GrpcSnapshotService {
                 },
             );
             let operations_service = super::super::operations_grpc::service(handler.clone());
+            let single_query_service = super::super::single_query_grpc::service(handler.clone());
             let fixed_service = distributed::grpc::fixed_service(handler.clone());
             let query_service = distributed::grpc::service(handler.clone());
             let service = SnapshotServiceServer::new(handler)
@@ -568,6 +583,7 @@ impl GrpcSnapshotService {
             let _ = tonic::transport::Server::builder()
                 .timeout(deadline)
                 .max_concurrent_streams(Some(MAX_IN_FLIGHT as u32))
+                .add_service(metadata_service)
                 .add_service(AdmittedService {
                     inner: service,
                     admission: admission.clone(),
@@ -580,6 +596,11 @@ impl GrpcSnapshotService {
                 })
                 .add_service(AdmittedService {
                     inner: operations_service,
+                    admission: admission.clone(),
+                    deadline,
+                })
+                .add_service(AdmittedService {
+                    inner: single_query_service,
                     admission: admission.clone(),
                     deadline,
                 })

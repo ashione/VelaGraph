@@ -96,7 +96,7 @@ pub enum QueryFailure {
 pub type QueryResponse = Result<QueryOutput, QueryFailure>;
 
 impl QueryRequest {
-    fn validate(&self) -> Result<(), RemoteError> {
+    pub(super) fn validate(&self) -> Result<(), RemoteError> {
         if self.text.len() > MAX_QUERY_TEXT_BYTES {
             return Err(RemoteError::ResourceExhausted);
         }
@@ -583,6 +583,30 @@ impl StorageAdmin for FrozenNode {
             "frozen query is read only".into(),
         ))
     }
+}
+
+// Both legacy and typed clients validate exactly the same complete result shape.
+pub(super) fn validate_rpc_response(
+    request: &QueryRequest,
+    response: &QueryResponse,
+    identity: RemoteIdentity,
+    end: Instant,
+) -> Result<(), RemoteError> {
+    let (repeated, keys) = admitted_extensions(request);
+    if let Ok(output) = response {
+        validate_output(
+            output,
+            (request.shard, request.partition, request.mode),
+            Some(identity),
+            repeated,
+            keys.as_ref(),
+            end,
+        )?;
+    }
+    if Instant::now() >= end {
+        return Err(RemoteError::Timeout { request_id: None });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

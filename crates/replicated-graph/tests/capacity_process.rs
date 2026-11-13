@@ -84,7 +84,7 @@ async fn scenario() -> anyhow::Result<()> {
                             .await
                     {
                         if s.leader == Some((i + 1) as u64)
-                            && remote::probe_identified(
+                            && probe_identified(
                                 addresses[3 * i + 2],
                                 remote::RemoteIdentity {
                                     group: 0,
@@ -118,8 +118,12 @@ async fn scenario() -> anyhow::Result<()> {
             ),
             other => anyhow::bail!("unexpected capacity: {other:?}"),
         }
-        let write = remote::write(
+        let write = write_identified(
             addresses[3 * leader + 2],
+            remote::RemoteIdentity {
+                group: 0,
+                node: (leader + 1) as u64,
+            },
             request.clone(),
             Duration::from_secs(10),
         )
@@ -180,4 +184,38 @@ async fn scenario() -> anyhow::Result<()> {
     }
     drop(processes);
     Ok(())
+}
+
+async fn probe_identified(
+    endpoint: std::net::SocketAddr,
+    identity: remote::RemoteIdentity,
+    shard: u64,
+    budget: Duration,
+) -> Result<(), remote::RemoteError> {
+    tokio::time::timeout(budget, async {
+        remote::operations_grpc::Client::connect(endpoint, identity, budget)
+            .await?
+            .probe(shard)
+            .await
+    })
+    .await
+    .map_err(|_| remote::RemoteError::Timeout { request_id: None })?
+}
+async fn write_identified(
+    endpoint: std::net::SocketAddr,
+    identity: remote::RemoteIdentity,
+    request: d2_raft::D1WriteRequest,
+    budget: Duration,
+) -> Result<d2_raft::D1Result, remote::RemoteError> {
+    let id = request.request_id;
+    tokio::time::timeout(budget, async {
+        remote::operations_grpc::Client::connect(endpoint, identity, budget)
+            .await?
+            .write(request)
+            .await
+    })
+    .await
+    .map_err(|_| remote::RemoteError::Timeout {
+        request_id: Some(id),
+    })?
 }

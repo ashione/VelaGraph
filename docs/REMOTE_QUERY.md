@@ -8,11 +8,11 @@ and `experimental observed-query` commands are unchanged.
 
 ## Explicit scope and semantics
 
-`replicated_graph::remote::query::query(endpoint, identity, request, deadline)`
-issues one request over one connection to one explicitly selected replica. It
+`replicated_graph::remote::single_query_grpc::query(endpoint, identity, request, deadline)`
+issues one typed request over gRPC to one explicitly selected replica. It
 never follows leader hints, reconnects, retries, substitutes a snapshot, or falls
 back to client-side execution. `identity` checks group/node configuration, not
-authentication. Nonzero-group services require it as before. The request names
+authentication. All callers provide the configured group/node identity. The request names
 one shard and one partition. It does not consult a placement catalog.
 
 - `QueryMode::V1` reuses `GraphRecordStore::execute_gremlin`, the official-grammar
@@ -225,3 +225,7 @@ scalar/modulated/repeat-body forms reject before reads; filters do not hide
 upstream integrity/scope failures or enlarge budgets. V1, legacy observed v1/v2
 and separate server-coordinator/job entrypoints remain unchanged. See the
 [shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters).
+
+The old `remote::query::query` JSON API remains only for explicit library legacy
+fixtures. Product graph-node exposes the typed service on --graph, and
+graph-client server-query uses it without protocol fallback.

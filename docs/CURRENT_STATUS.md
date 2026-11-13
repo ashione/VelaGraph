@@ -1,7 +1,8 @@
 # Current capability and work index
 
-Reviewed on **2026-11-13** against main
-[`fa202c51`](https://github.com/ashione/VelaGraph/commit/fa202c51).
+Reviewed on **2026-11-13** with main baseline
+[`045debf`](https://github.com/ashione/VelaGraph/commit/045debfbd5ccce8ae7331fdac02fd886e251037d)
+and the #256/#258 default-storage RPC migration in this change.
 This is an API and implementation index, not a new benchmark or an assertion that
 all milestone exit criteria have passed. Linked PRs/issues show later changes;
 the remaining outcomes below must not be inferred from a merged dependency slice.
@@ -120,8 +121,14 @@ cleanup remain shared; explicitly selected library `Gateway` TCP entrypoints are
 still pending #218 cleanup. See [service host](PUBLIC_SERVICE_CLI.md).
 
 Single-shard Probe/Metadata/Write also have an explicit
-[typed RPC service and CLI](SHARD_OPERATIONS_GRPC.md). Legacy catalog/routing adapters remain
-separate migration work; this does not complete the all-RPC inventory.
+[typed RPC service and CLI](SHARD_OPERATIONS_GRPC.md). Catalog/routing adapters now use typed snapshots/operations by default;
+graph-node --graph is a single typed listener and --grpc-snapshot is removed.
+Per-read Metadata uses a [bounded stream](METADATA_STREAM.md), retaining every
+applied-epoch check; Probe/Write stay unary. Original default-debug regressions
+and resource/freshness evidence remain the #258 acceptance gate, not a changed
+test profile or a loopback p50 improvement alone.
+Explicit library legacy fixtures and coordinator/gateway/Unix entrypoints remain
+separate retirement work; this does not complete the all-RPC inventory.
 
 
 The retained legacy managed TCP protocol uses **RPC v6** and legacy gateway

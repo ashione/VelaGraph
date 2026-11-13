@@ -1,19 +1,15 @@
-# Internal gRPC snapshot transport (first migration slice)
+# Internal gRPC snapshot transport
 
-This optional, **plaintext trusted-network** endpoint implements typed Protobuf
-`Open`, `Page`, and `Close` using tonic/HTTP2. It is not a JSON-over-gRPC bridge and
-it is **not** the public graph write/Gremlin query service. It does not migrate
-Raft, managed transactions or hierarchy channels. The same endpoint now also hosts
-the separate [observed data-local query service](INTERNAL_GRPC_QUERIES.md); the
-snapshot RPC contract here remains unchanged.
-Those remain on their existing transports. Related tracking: #218.
+`graph-node --graph ADDRESS` hosts typed snapshot, fragment/session, single-shard
+operation and query RPC services on one graph endpoint. Raft and driver/control
+use their separate RPC ports. This is plaintext trusted-network development
+transport, not authentication. Tracking: #218 and #256.
 
 ## Start and use
 
-Add `--grpc-snapshot 127.0.0.1:50051` to the existing `graph-node` invocation,
-which still requires `--graph` and `--allow-insecure-development`. Neither
-identity matching nor session bearer tokens authenticate the caller. Keep both
-ports isolated from untrusted clients; TLS/authorization are not implemented.
+Use `--graph 127.0.0.1:50051` with `--allow-insecure-development` and the usual
+node/storage arguments. The redundant `--grpc-snapshot` option is removed and
+rejected; there is no hidden legacy graph TCP listener. Upgrade callers together.
 
 Rust callers use `remote::grpc::SnapshotClient::connect(address, identity,
 deadline)`, then `open(shard, remaining_budget)`, `page(descriptor, cursor,
@@ -23,19 +19,20 @@ retries, leader forwarding, endpoint discovery, or JSON fallback. The channel ma
 reconnect after a connection failure, but does not replay an application RPC.
 
 The caller owns the **whole-operation deadline** and passes the remaining budget
-at each step. A new call must not reset an overall download deadline. This slice
-exposes page primitives, not a new complete-download helper. Close on success and
+at each step. A new call must not reset an overall download deadline. `remote::grpc::paged_snapshot` provides the complete bounded download used by
+RemoteStorageNode; it retains one absolute deadline through connect, pages and close. Close on success and
 on failures when remaining budget permits. Lost Open responses and abandoned
 sessions expire after the original fixed lifetime; cancellation does not consume
 a page cursor or renew the session.
 
 ## Shared semantics and limits
 
-The TCP and gRPC ports share the exact same Raft/state handles and snapshot
-session pool. Open uses the existing leader read barrier and atomic capture.
+Listener-free `GraphState` owns the shared Raft/state handles and snapshot
+session pool. Explicit library legacy fixtures can share it with gRPC, but
+the product graph-node does not start a TCP listener. Open uses the existing leader read barrier and atomic capture.
 Page uses the existing descriptor/cursor/epoch validation and frozen entries;
 Close releases the same session. A token opened by either protocol can be used or
-closed through the other during migration. Cross-protocol calls cannot exceed
+closed through the other in explicit library/parity fixtures. Cross-protocol calls cannot exceed
 the shared four sessions / 128 MiB retained-byte budget. Tokens remain random
 16-byte capabilities tied to an incarnation, descriptor and cursor position.
 
@@ -46,8 +43,10 @@ the shared four sessions / 128 MiB retained-byte budget. Tokens remain random
 - Existing 16-operation service admission is shared with TCP, from decode through
   response-body EOF/drop, not only handler execution. Client calls use
   the existing process-wide 16-operation admission. Overload fails explicitly.
-- gRPC accepts at most 16 live connections and 16 HTTP2 streams per connection;
-  request messages are capped at 4 KiB before protobuf decoding. No compression
+- The typed graph listener accepts at most 32 live connections (including the
+  adapter's separately reused Metadata Channel) and 16 HTTP2 streams per connection;
+  snapshot request messages are capped at 4 KiB before protobuf decoding. Metadata
+  streams have their [own explicit resource budget](METADATA_STREAM.md). No compression
   is enabled. These are operation/payload bounds, not an RSS guarantee.
 - Positive operation budgets are at most 60 seconds and capped by the configured
   server deadline. `grpc-timeout` and a client `timeout_at` bound transport work;

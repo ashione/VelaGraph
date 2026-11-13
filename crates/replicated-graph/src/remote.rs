@@ -22,21 +22,27 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SNAPSHOT_ROWS: usize = 100_000;
 pub const MAX_IN_FLIGHT: usize = 16;
+/// Total sockets, including dedicated metadata streams, unary RPC and snapshots.
+pub const MAX_GRAPH_CONNECTIONS: usize = 2 * MAX_IN_FLIGHT;
 const VERSION: u32 = 1;
 /// Largest accepted client or server operation budget.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(60);
 mod diagnostic;
 pub mod distributed;
 pub mod managed;
+pub(crate) mod metadata_stream_client;
+pub(crate) mod metadata_stream_server;
 pub mod operations_grpc;
 mod paged;
 mod read_barrier;
 pub use paged::grpc;
 pub mod query;
+pub mod single_query_grpc;
 pub use paged::{
-    close_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified, snapshot_page,
-    SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES, MAX_PAGE_ROWS,
-    MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS, SESSION_TTL,
+    close_snapshot, grpc_paged_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified,
+    snapshot_page, SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES,
+    MAX_PAGE_ROWS, MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS,
+    SESSION_TTL,
 };
 
 static CLIENT_ADMISSION: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
@@ -166,21 +172,95 @@ enum Reply {
     Managed(managed::Output),
 }
 
-/// A separate graph port. Deadlines must be positive and at most 60 seconds. Dropping stops acceptance; in-flight work retains its
-/// permit until its handler completes. Shutdown cancels and joins handlers;
-/// cancellation never proves that an already submitted Raft write aborted.
-pub struct GraphService {
+/// Transport-independent graph state. Construction opens no socket and spawns
+/// no task. Each bound adapter owns its cleanup/stop loop; adapters share the
+/// same session and admission budgets, not independent copies.
+pub struct GraphState {
     raft: openraft::Raft<TypeConfig>,
     state: Arc<StateMachine>,
     identity: RemoteIdentity,
     shard: u64,
     deadline: Duration,
     admission: Arc<Semaphore>,
-    address: SocketAddr,
+    metadata_streams: Arc<Semaphore>,
     sessions: Arc<paged::Sessions>,
     query_sessions: Arc<distributed::Sessions>,
+}
+impl GraphState {
+    pub fn from_tcp(
+        node: &d2_raft::tcp::TcpNode,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        Self::from_parts(
+            node.id,
+            node.raft.clone(),
+            node.state_machine.clone(),
+            group,
+            shard,
+            deadline,
+        )
+    }
+    pub fn from_managed(
+        node: &d2_raft::NodeHandle,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        if group != node.group_id() {
+            return Err(RemoteError::InvalidArgument);
+        }
+        Self::from_parts(
+            node.id,
+            node.raft.clone(),
+            node.state_machine.clone(),
+            group,
+            shard,
+            deadline,
+        )
+    }
+    fn from_parts(
+        node: u64,
+        raft: openraft::Raft<TypeConfig>,
+        state: Arc<StateMachine>,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        checked_deadline(deadline, None)?;
+        Ok(Self {
+            raft,
+            state,
+            identity: RemoteIdentity { group, node },
+            shard,
+            deadline,
+            admission: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            metadata_streams: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            sessions: Arc::new(paged::Sessions::new()?),
+            query_sessions: Arc::new(distributed::Sessions::new()?),
+        })
+    }
+    /// Local diagnostics only; no remote administration endpoint.
+    pub fn snapshot_stats(&self) -> SnapshotStats {
+        self.sessions.stats()
+    }
+}
+
+/// Explicit legacy TCP adapter for library/parity callers. Construct GraphState
+/// and a typed gRPC adapter instead for a graph node without a legacy listener.
+/// Shutdown cancels/joins handlers; submitted Raft writes may still commit.
+pub struct GraphService {
+    shared: GraphState,
+    address: SocketAddr,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+}
+impl std::ops::Deref for GraphService {
+    type Target = GraphState;
+    fn deref(&self) -> &GraphState {
+        &self.shared
+    }
 }
 impl GraphService {
     pub async fn start(
@@ -248,23 +328,19 @@ impl GraphService {
         shard: u64,
         deadline: Duration,
     ) -> Result<Self, RemoteError> {
-        let identity = RemoteIdentity { group, node };
-        checked_deadline(deadline, None)?;
+        let shared =
+            GraphState::from_parts(node, raft.clone(), state.clone(), group, shard, deadline)?;
+        let identity = shared.identity;
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|_| RemoteError::Unavailable)?;
         let address = listener
             .local_addr()
             .map_err(|_| RemoteError::Unavailable)?;
-        let sessions = Arc::new(paged::Sessions::new()?);
-        let worker_sessions = sessions.clone();
-        let service_raft = raft.clone();
-        let service_state = state.clone();
-        let query_sessions = Arc::new(distributed::Sessions::new()?);
-        let service_query_sessions = query_sessions.clone();
+        let worker_sessions = shared.sessions.clone();
+        let query_sessions = shared.query_sessions.clone();
         let (stop, mut stopped) = watch::channel(false);
-        let admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
-        let service_admission = admission.clone();
+        let admission = shared.admission.clone();
         let task = tokio::spawn(async move {
             let sessions = worker_sessions;
             let mut cleanup = tokio::time::interval(Duration::from_millis(100));
@@ -425,15 +501,8 @@ impl GraphService {
             while handlers.join_next().await.is_some() {}
         });
         Ok(Self {
-            admission: service_admission,
-            raft: service_raft,
-            state: service_state,
-            identity,
-            shard,
-            deadline,
+            shared,
             address,
-            sessions,
-            query_sessions: service_query_sessions,
             stop,
             task: Some(task),
         })
@@ -649,6 +718,8 @@ async fn execute(
             Ok(Reply::Probe)
         }
         Operation::Metadata { shard: requested } => {
+            #[cfg(test)]
+            metadata_benchmark::record(identity.group);
             if requested != shard {
                 return Err(RemoteError::InvalidArgument);
             }
@@ -1595,3 +1666,6 @@ mod transport_boundary_tests {
         assert_eq!(permits.available_permits(), 1);
     }
 }
+
+#[cfg(test)]
+mod metadata_benchmark;

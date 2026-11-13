@@ -1,5 +1,7 @@
 //! Real three-process TCP/gRPC snapshot differential tests. This is not a
 //! throughput benchmark, authenticated transport, or a query/Raft migration test.
+#[path = "support/legacy_graph_node.rs"]
+mod legacy_graph_node;
 use anyhow::{ensure, Context};
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{
@@ -60,7 +62,7 @@ impl Cluster {
         drop(reserved);
         let mut processes = Vec::new();
         for i in 0..3 {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_graph-node"));
+            let mut command = legacy_graph_node::command();
             command.env("TOKIO_WORKER_THREADS", "2").args([
                 "--allow-insecure-development",
                 "--id",
@@ -139,7 +141,13 @@ impl Cluster {
         self.addresses[4 * self.leader + 3]
     }
     async fn seed(&self) -> anyhow::Result<()> {
-        let node = RemoteStorageNode::new(self.tcp(), SHARD, BUDGET)?;
+        let node = RemoteStorageNode::new_identified(
+            self.grpc(),
+            self.identity().group,
+            self.identity().node,
+            SHARD,
+            BUDGET,
+        )?;
         let result = run_blocking(move || -> anyhow::Result<()> {
             let graph = GraphRecordStore::new(node, SHARD, 0);
             // Over one page, without relying on fabricated storage-key layouts.
@@ -329,7 +337,13 @@ async fn differential() -> anyhow::Result<()> {
     ensure!(pages > 1);
 
     // A new write cannot mutate either already admitted view.
-    let node = RemoteStorageNode::new(cluster.tcp(), SHARD, BUDGET)?;
+    let node = RemoteStorageNode::new_identified(
+        cluster.grpc(),
+        cluster.identity().group,
+        cluster.identity().node,
+        SHARD,
+        BUDGET,
+    )?;
     run_blocking(move || GraphRecordStore::new(node, SHARD, 0).create_vertex(&Vertex::new(999)))
         .await??;
     let a = remote::snapshot_page(

@@ -1,14 +1,18 @@
 //! Full ordered result-page checks against the synthetic input relationship list.
 //! Usage: corehr_result_pages FIXTURE EMPTY_RUN_DIR GRAPH_NODE_BINARY
 //! Default fixture: 200000 people / 5000 departments; smaller smoke fixtures work too.
+#[allow(dead_code)]
+#[path = "support/rpc.rs"]
+mod rpc;
+
 use anyhow::{ensure, Context};
 use replicated_graph::{
     catalog::Placement,
     remote::{
-        self,
         distributed::{
-            jobs::{self, Output, ProjectedRow, Request},
-            CoordinatorService, PartitionRoute, StaticCatalog,
+            grpc::GrpcCoordinatorService,
+            jobs::{Output, ProjectedRow, Request},
+            PartitionRoute, StaticCatalog,
         },
         query::{QualifiedElement, QueryCompleteness, QueryFailure, QueryStamp},
         RemoteIdentity,
@@ -94,7 +98,7 @@ impl Group {
         };
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if remote::probe_identified(
+                if rpc::probe(
                     a[2],
                     RemoteIdentity { group: g, node: 1 },
                     shard,
@@ -234,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
             id[..8].copy_from_slice(&batch.to_le_bytes());
             id[8..].copy_from_slice(b"corehr01");
             let t = Instant::now();
-            let response = remote::write_identified(
+            let response = rpc::write(
                 group.replica.endpoint,
                 RemoteIdentity {
                     group: group.placement.group,
@@ -298,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
     // Exact byte verification of every canonical vertex/edge and both indexes.
     for group in &groups[..] {
         let t = Instant::now();
-        let snap = remote::paged_snapshot_identified(
+        let snap = replicated_graph::remote::grpc_paged_snapshot(
             group.replica.endpoint,
             RemoteIdentity {
                 group: group.placement.group,
@@ -323,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
             json!({"event":"all_kv_verified","shard":group.placement.shard,"rows":n,"seconds":t.elapsed().as_secs_f64()})
         );
     }
-    let service = CoordinatorService::start(
+    let service = GrpcCoordinatorService::start(
         "127.0.0.1:0".parse()?,
         StaticCatalog {
             partitions: groups[..]
@@ -746,7 +750,7 @@ async fn execute(
         let mut fixed = None;
         let mut sequence = 0;
         let (token, stamps) = loop {
-            let output = match jobs::request(endpoint,request,Duration::from_secs(5)).await? {
+            let output = match rpc::job(endpoint,request,Duration::from_secs(5)).await? {
                 Ok(output) => output,
                 Err(error) => {
                     ensure!(expect_rejection && error==QueryFailure::ResourceExhausted,
@@ -804,7 +808,7 @@ async fn execute(
         let mut empty_property_maps = 0usize;
         loop {
             let tick = Instant::now();
-            let output = jobs::request(
+            let output = rpc::job(
                 endpoint,
                 Request::Read { token, cursor },
                 Duration::from_secs(5),
@@ -849,7 +853,7 @@ async fn execute(
             if let Some(previous) = last_response.replace((cursor, serialized.clone())) {
                 // Replay an earlier page after reading a later one: no moving cursor.
                 if pages == 1 {
-                    let replay = jobs::request(
+                    let replay = rpc::job(
                         endpoint,
                         Request::Read {
                             token,
@@ -882,7 +886,7 @@ async fn execute(
             (expected.len() / 2 / case.page_size) * case.page_size,
             cursor,
         ] {
-            let output = jobs::request(
+            let output = rpc::job(
                 endpoint,
                 Request::Read {
                     token,
@@ -928,9 +932,8 @@ async fn execute(
     }
     .await;
     if let Some(token) = saved_token {
-        let cancel =
-            jobs::request(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
-        let after = jobs::request(
+        let cancel = rpc::job(endpoint, Request::Cancel { token }, Duration::from_secs(5)).await;
+        let after = rpc::job(
             endpoint,
             Request::Read { token, cursor: 0 },
             Duration::from_secs(5),

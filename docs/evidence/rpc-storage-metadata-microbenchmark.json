@@ -1,0 +1,180 @@
+{
+  "head": "9fc9a0b5cd3a58c7e542b4a79ced1fcf8eab44d2",
+  "working_tree": "includes shared channel cache + ignored diagnostic test",
+  "environment": {
+    "cpus": 9,
+    "kernel": "Linux 6.18.57",
+    "runtime_workers": 2,
+    "build": "test-unoptimized"
+  },
+  "rows": [
+    {
+      "benchmark": "metadata_transport",
+      "lane": "grpc_cold_connect",
+      "total_ms": 0.549647
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "tcp_direct",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 222.861,
+      "p95_us": 346.715,
+      "p99_us": 480.714,
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 238.377779
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_reused",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 748.021,
+      "p95_us": 1006.976,
+      "p99_us": 1258.239,
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 818.647538
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_adapter_get",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 763.524,
+      "p95_us": 1079.984,
+      "p99_us": 3273.803,
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 1019.244115
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_reused",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 769.984,
+      "p95_us": 942.299,
+      "p99_us": 1107.656,
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 787.162683
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_adapter_get",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 798.466,
+      "p95_us": 1420.48,
+      "p99_us": 3578.265,
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 1011.19402
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "tcp_direct",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 235.68,
+      "p95_us": 404.941,
+      "p99_us": 538.861,
+      "round": 1,
+      "runtime_workers": 2,
+      "total_ms": 262.559023
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_adapter_get",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 738.958,
+      "p95_us": 942.54,
+      "p99_us": 1287.723,
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 776.21932
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "tcp_direct",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 224.453,
+      "p95_us": 353.715,
+      "p99_us": 528.986,
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 240.456134
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_reused",
+      "metadata_calls": 1000,
+      "n": 1000,
+      "p50_us": 745.788,
+      "p95_us": 1112.367,
+      "p99_us": 3091.142,
+      "round": 2,
+      "runtime_workers": 2,
+      "total_ms": 932.888411
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "tcp_snapshot",
+      "metadata_calls": 0,
+      "n": 10,
+      "p50_us": 1150.83,
+      "p95_us": 7547.702,
+      "p99_us": 7547.702,
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 19.597562999999997
+    },
+    {
+      "benchmark": "metadata_transport",
+      "build": "test-unoptimized",
+      "lane": "grpc_snapshot",
+      "metadata_calls": 0,
+      "n": 10,
+      "p50_us": 2760.711,
+      "p95_us": 5140.096,
+      "p99_us": 5140.096,
+      "round": 0,
+      "runtime_workers": 2,
+      "total_ms": 30.103540000000002
+    }
+  ],
+  "median_of_rounds": {
+    "tcp_direct": {
+      "total_ms": 240.456134,
+      "p50_us": 224.453,
+      "p95_us": 353.715,
+      "p99_us": 528.986
+    },
+    "grpc_reused": {
+      "total_ms": 818.647538,
+      "p50_us": 748.021,
+      "p95_us": 1006.976,
+      "p99_us": 1258.239
+    },
+    "grpc_adapter_get": {
+      "total_ms": 1011.19402,
+      "p50_us": 763.524,
+      "p95_us": 1079.984,
+      "p99_us": 3273.803
+    }
+  }
+}

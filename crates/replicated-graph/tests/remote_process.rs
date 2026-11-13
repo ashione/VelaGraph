@@ -133,8 +133,12 @@ async fn scenario_with_evidence(
                     send_control(&addresses[3 * i + 1].to_string(), ControlRequest::Status).await
                 {
                     if s.leader == Some((i + 1) as u64)
-                        && replicated_graph::remote::snapshot(
+                        && replicated_graph::remote::grpc::paged_snapshot(
                             addresses[3 * i + 2],
+                            replicated_graph::remote::RemoteIdentity {
+                                group: 0,
+                                node: (i + 1) as u64,
+                            },
                             7,
                             Duration::from_millis(300),
                         )
@@ -152,8 +156,12 @@ async fn scenario_with_evidence(
     timeout(Duration::from_secs(5), async {
         for i in 0..3 {
             loop {
-                if replicated_graph::remote::metadata(
+                if metadata_identified(
                     addresses[3 * i + 2],
+                    replicated_graph::remote::RemoteIdentity {
+                        group: 0,
+                        node: (i + 1) as u64,
+                    },
                     7,
                     Duration::from_millis(300),
                 )
@@ -167,7 +175,13 @@ async fn scenario_with_evidence(
         }
     })
     .await?;
-    let node = RemoteStorageNode::new(addresses[3 * leader + 2], 7, Duration::from_secs(2))?;
+    let node = RemoteStorageNode::new_identified(
+        addresses[3 * leader + 2],
+        0,
+        (leader + 1) as u64,
+        7,
+        Duration::from_secs(2),
+    )?;
     let graph = Arc::new(GraphRecordStore::new(node, 7, 0));
     let g = graph.clone();
     run_blocking(move || -> velagraph::Result<()> {
@@ -238,15 +252,31 @@ async fn scenario_with_evidence(
     // A caller chooses the target explicitly. Followers never pretend to serve
     // a new linearizable view; no transparent forwarding or automatic replay.
     let follower = (leader + 1) % 3;
-    let follower_node =
-        RemoteStorageNode::new(addresses[3 * follower + 2], 7, Duration::from_secs(2))?;
+    let follower_node = RemoteStorageNode::new_identified(
+        addresses[3 * follower + 2],
+        0,
+        (follower + 1) as u64,
+        7,
+        Duration::from_secs(2),
+    )?;
     assert!(matches!(
         run_blocking(move || follower_node.read_view()).await?,
         Err(StorageNodeError::NotLeader { .. })
     ));
-    let other = RemoteStorageNode::new(addresses[3 * leader + 2], 99, Duration::from_secs(2))?;
+    let other = RemoteStorageNode::new_identified(
+        addresses[3 * leader + 2],
+        0,
+        (leader + 1) as u64,
+        99,
+        Duration::from_secs(2),
+    )?;
     assert!(run_blocking(move || other.read_view()).await?.is_err());
-    let paged = paged_snapshot_roundtrip(addresses[3 * leader + 2], evidence.as_deref()).await;
+    let paged = paged_snapshot_roundtrip(
+        addresses[3 * leader + 2],
+        (leader + 1) as u64,
+        evidence.as_deref(),
+    )
+    .await;
     if paged.is_err() {
         if let Some(evidence) = &evidence {
             evidence.record(
@@ -266,16 +296,24 @@ async fn scenario_with_evidence(
 // so a 2 MiB page budget necessarily requires at least three nonempty pages.
 async fn paged_snapshot_roundtrip(
     endpoint: std::net::SocketAddr,
+    node_id: u64,
     evidence: Option<&remote_evidence::Evidence>,
 ) -> anyhow::Result<()> {
-    use replicated_graph::remote::{close_snapshot, open_snapshot, paged_snapshot, snapshot_page};
+    use replicated_graph::remote::{
+        grpc::{paged_snapshot, SnapshotClient},
+        RemoteIdentity,
+    };
+    let identity = RemoteIdentity {
+        group: 0,
+        node: node_id,
+    };
     const PAGE_BYTES: usize = 2 * 1024 * 1024;
     const PAYLOAD_BYTES: usize = 64 * 1024;
     let budget = Duration::from_secs(20);
     // A generous per-operation budget avoids turning debug JSON serialization
     // of multiple MiB into an incidental timing assertion.
     let large_graph = Arc::new(GraphRecordStore::new(
-        RemoteStorageNode::new(endpoint, 7, budget)?,
+        RemoteStorageNode::new_identified(endpoint, 0, node_id, 7, budget)?,
         7,
         0,
     ));
@@ -301,8 +339,9 @@ async fn paged_snapshot_roundtrip(
         let mut request_id = [0; 16];
         request_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
         request_id[8..].copy_from_slice(b"paged-fi");
-        replicated_graph::remote::write(
+        write_identified(
             endpoint,
+            identity,
             d2_raft::D1WriteRequest {
                 shard: 7,
                 epoch: 3,
@@ -315,7 +354,7 @@ async fn paged_snapshot_roundtrip(
         .await
         .with_context(|| format!("paged fixture seed row {index}"))?;
     }
-    let before = paged_snapshot(endpoint, 7, budget)
+    let before = paged_snapshot(endpoint, identity, 7, budget)
         .await
         .inspect_err(|_| {
             if let Some(evidence) = evidence {
@@ -326,7 +365,9 @@ async fn paged_snapshot_roundtrip(
             }
         })
         .context("initial paged download")?;
-    let descriptor = open_snapshot(endpoint, None, 7, budget)
+    let snapshots = SnapshotClient::connect(endpoint, identity, budget).await?;
+    let descriptor = snapshots
+        .open(7, budget)
         .await
         .context("open pinned snapshot")?;
     assert_eq!(descriptor.shard, before.shard);
@@ -334,7 +375,8 @@ async fn paged_snapshot_roundtrip(
     assert_eq!(descriptor.sequence, before.sequence);
     assert_eq!(descriptor.rows, before.entries.len());
     assert!(descriptor.bytes > 2 * PAGE_BYTES);
-    let first = snapshot_page(endpoint, None, descriptor.clone(), None, budget)
+    let first = snapshots
+        .page(descriptor.clone(), None, budget)
         .await
         .context("first pinned page")?;
     assert!(first.next.is_some());
@@ -369,7 +411,9 @@ async fn paged_snapshot_roundtrip(
         pages += 1;
         assert!(pages <= descriptor.rows, "pagination must make progress");
         let Some(cursor) = page.next else { break };
-        page = snapshot_page(endpoint, None, descriptor.clone(), Some(cursor), budget).await?;
+        page = snapshots
+            .page(descriptor.clone(), Some(cursor), budget)
+            .await?;
     }
     assert!(pages >= 3);
     assert_eq!(entries.len(), descriptor.rows);
@@ -382,14 +426,12 @@ async fn paged_snapshot_roundtrip(
     );
     assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
     assert_eq!(entries, before.entries);
-    let replay = snapshot_page(endpoint, None, descriptor.clone(), None, budget).await?;
+    let replay = snapshots.page(descriptor.clone(), None, budget).await?;
     assert_eq!(replay.entries, first_entries);
-    close_snapshot(endpoint, None, descriptor.clone(), budget).await?;
-    assert!(snapshot_page(endpoint, None, descriptor, None, budget)
-        .await
-        .is_err());
+    snapshots.close(descriptor.clone(), budget).await?;
+    assert!(snapshots.page(descriptor, None, budget).await.is_err());
 
-    let after = paged_snapshot(endpoint, 7, budget)
+    let after = paged_snapshot(endpoint, identity, 7, budget)
         .await
         .context("final paged download")?;
     assert_eq!(after.sequence, before.sequence + 3);
@@ -443,4 +485,38 @@ async fn paged_snapshot_roundtrip(
     })
     .await??;
     Ok(())
+}
+
+async fn metadata_identified(
+    endpoint: std::net::SocketAddr,
+    identity: replicated_graph::remote::RemoteIdentity,
+    shard: u64,
+    budget: Duration,
+) -> Result<(u64, u64, u64), replicated_graph::remote::RemoteError> {
+    tokio::time::timeout(budget, async {
+        replicated_graph::remote::operations_grpc::Client::connect(endpoint, identity, budget)
+            .await?
+            .metadata(shard)
+            .await
+    })
+    .await
+    .map_err(|_| replicated_graph::remote::RemoteError::Timeout { request_id: None })?
+}
+async fn write_identified(
+    endpoint: std::net::SocketAddr,
+    identity: replicated_graph::remote::RemoteIdentity,
+    request: d2_raft::D1WriteRequest,
+    budget: Duration,
+) -> Result<d2_raft::D1Result, replicated_graph::remote::RemoteError> {
+    let id = request.request_id;
+    tokio::time::timeout(budget, async {
+        replicated_graph::remote::operations_grpc::Client::connect(endpoint, identity, budget)
+            .await?
+            .write(request)
+            .await
+    })
+    .await
+    .map_err(|_| replicated_graph::remote::RemoteError::Timeout {
+        request_id: Some(id),
+    })?
 }

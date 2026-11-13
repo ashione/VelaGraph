@@ -1,5 +1,7 @@
 //! Real independent shard processes; TCP versus typed gRPC fragment transport.
 //! Observed semantics only: this does not claim managed/fixed or Raft migration.
+#[path = "support/legacy_graph_node.rs"]
+mod legacy_graph_node;
 use anyhow::Context;
 use replicated_graph::{
     remote::{
@@ -106,7 +108,7 @@ impl Group {
             node: 1,
         };
         let process = Process(
-            Command::new(env!("CARGO_BIN_EXE_graph-node"))
+            legacy_graph_node::command()
                 .env("TOKIO_WORKER_THREADS", "2")
                 .args([
                     "--allow-insecure-development",

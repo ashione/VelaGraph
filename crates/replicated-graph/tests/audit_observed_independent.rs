@@ -2,7 +2,7 @@
 use replicated_graph::routing::experimental::{ExperimentalRouteError, ObservedPathElement};
 use replicated_graph::{
     catalog::{Catalog, Placement},
-    remote::{snapshot_identified, RemoteIdentity},
+    remote::{grpc::paged_snapshot as snapshot_identified, RemoteIdentity},
     routing::{
         experimental::{AdjacencyCompleteness, ObservedRow},
         RemoteReplica, RouteResolver,
@@ -662,17 +662,19 @@ async fn audit_observed_identity_order_and_frozen() -> anyhow::Result<()> {
         // Three bounded adjacency steps still share one cumulative work budget;
         // alternating edge/endpoint stages cannot reset it or hide it with limit.
         let repeated = std::iter::repeat_n("7", 36).collect::<Vec<_>>().join(",");
-        assert!(matches!(
-            s.observed_gremlin_v3(
-                1,
-                &format!(
-                    "g.V({repeated}).bothE().bothV().bothE().bothV().bothE().bothV().limit(1)"
-                )
+        let result = s.observed_gremlin_v3(
+            1,
+            &format!("g.V({repeated}).bothE().bothV().bothE().bothV().bothE().bothV().limit(1)"),
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(ExperimentalRouteError::Query(
+                    velagraph::Error::TraversalLimitExceeded(_)
+                ))
             ),
-            Err(ExperimentalRouteError::Query(
-                velagraph::Error::TraversalLimitExceeded(_)
-            ))
-        ));
+            "cumulative traversal budget must win before wall deadline: {result:?}"
+        );
         let r = s.observed_gremlin(1, "g.V(7).both()")?;
         assert_eq!(r.completeness, AdjacencyCompleteness::Unverified);
         assert_eq!(

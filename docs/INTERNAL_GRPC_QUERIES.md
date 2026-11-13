@@ -1,16 +1,15 @@
 # Typed internal data-local query transport
 
-This opt-in slice transports **observed** query sessions and data-local fragments
+This service transports **observed** query sessions and data-local fragments
 using `velagraph.internal.query.v1.QueryService` over gRPC/Protobuf. It does not
 download whole snapshots into a coordinator and does not wrap JSON in protobuf.
-The existing graph-node `--grpc-snapshot ADDRESS` endpoint hosts both the snapshot
-service and this separate query service during migration.
+The graph-node `--graph ADDRESS` endpoint hosts snapshots and this separate
+query service; no additional legacy listener is opened.
 
 ## Explicit selection
 
-Start graph nodes with the usual trusted-network options plus
-`--grpc-snapshot 127.0.0.1:PORT`. Construct a separate static catalog whose
-`endpoint` fields name those gRPC ports, then run:
+Start graph nodes with the usual trusted-network options and
+`--graph 127.0.0.1:PORT`. Catalog `endpoint` fields name those gRPC ports:
 
 ```sh
 graph-coordinator serve-grpc --endpoint 127.0.0.1:9400 \

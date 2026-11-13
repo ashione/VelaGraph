@@ -2,7 +2,7 @@
 //! global query/routing semantics; this is not replication or failover evidence.
 use replicated_graph::{
     catalog::{Catalog, Placement},
-    remote::{snapshot_identified, RemoteIdentity},
+    remote::{grpc::paged_snapshot as snapshot_identified, RemoteIdentity},
     routing::{RemoteReplica, RouteError, RouteResolver, ScanScope},
     run_blocking, RemoteStorageNode,
 };

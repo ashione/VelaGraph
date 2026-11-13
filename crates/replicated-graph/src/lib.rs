@@ -6,7 +6,7 @@
 //! runtime must remain running. The optional [`routing`] module adds bounded
 //! static local and remote routing. On Linux, `gateway` adds a same-host read-only UDS
 //! interface with OS peer identity checks. The optional `remote` service and
-//! `RemoteStorageNode` add plaintext TCP for trusted development networks.
+//! `RemoteStorageNode` add typed plaintext gRPC for trusted development networks.
 //! No cross-host authentication or production availability guarantee is provided.
 mod adapter;
 pub mod catalog;

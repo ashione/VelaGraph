@@ -3,7 +3,7 @@
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{
     catalog::{Catalog, CatalogError, Placement},
-    remote::{snapshot_identified, RemoteIdentity},
+    remote::{grpc::paged_snapshot as snapshot_identified, RemoteIdentity},
     routing::{RemoteReplica, RouteError, RouteResolver},
     run_blocking, RemoteStorageNode,
 };
@@ -125,7 +125,7 @@ impl Group {
         timeout(Duration::from_secs(10), async {
             for replica in &replicas {
                 loop {
-                    if replicated_graph::remote::metadata_identified(
+                    if metadata_identified(
                         replica.endpoint,
                         RemoteIdentity {
                             group,
@@ -354,4 +354,21 @@ async fn scenario() -> anyhow::Result<()> {
     })
     .await??;
     Ok(())
+}
+
+async fn metadata_identified(
+    endpoint: std::net::SocketAddr,
+    identity: RemoteIdentity,
+    shard: u64,
+    deadline: Duration,
+) -> Result<(u64, u64, u64), replicated_graph::remote::RemoteError> {
+    let end = tokio::time::Instant::now() + deadline;
+    tokio::time::timeout_at(end, async {
+        replicated_graph::remote::operations_grpc::Client::connect(endpoint, identity, deadline)
+            .await?
+            .metadata(shard)
+            .await
+    })
+    .await
+    .map_err(|_| replicated_graph::remote::RemoteError::Timeout { request_id: None })?
 }

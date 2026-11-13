@@ -486,14 +486,78 @@ async fn download(
     let _download = DOWNLOAD_ADMISSION
         .try_acquire()
         .map_err(|_| RemoteError::ResourceExhausted)?;
-    let descriptor = open_snapshot(
+    download_complete(DownloadTransport::Legacy { endpoint, identity }, shard, end).await
+}
+/// Typed full snapshot download with the same aggregate limits and validator as
+/// the legacy explicit transport. No fallback or protocol detection.
+pub async fn grpc_paged_snapshot(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    shard: u64,
+    deadline: Duration,
+) -> Result<RemoteSnapshot, RemoteError> {
+    let end = checked_deadline(deadline, None)?;
+    let _download = DOWNLOAD_ADMISSION
+        .try_acquire()
+        .map_err(|_| RemoteError::ResourceExhausted)?;
+    let client = grpc::SnapshotClient::connect(
         endpoint,
         identity,
-        shard,
         end.saturating_duration_since(Instant::now()),
     )
-    .await
-    .inspect_err(|error| {
+    .await?;
+    download_complete(DownloadTransport::Grpc(client), shard, end).await
+}
+enum DownloadTransport {
+    Legacy {
+        endpoint: SocketAddr,
+        identity: Option<RemoteIdentity>,
+    },
+    Grpc(grpc::SnapshotClient),
+}
+impl DownloadTransport {
+    async fn open(&self, shard: u64, end: Instant) -> Result<SnapshotDescriptor, RemoteError> {
+        check_time(end)?;
+        let budget = end.saturating_duration_since(Instant::now());
+        match self {
+            Self::Legacy { endpoint, identity } => {
+                open_snapshot(*endpoint, *identity, shard, budget).await
+            }
+            Self::Grpc(client) => client.open(shard, budget).await,
+        }
+    }
+    async fn page(
+        &self,
+        descriptor: SnapshotDescriptor,
+        cursor: Option<SnapshotCursor>,
+        end: Instant,
+    ) -> Result<SnapshotPage, RemoteError> {
+        check_time(end)?;
+        let budget = end.saturating_duration_since(Instant::now());
+        match self {
+            Self::Legacy { endpoint, identity } => {
+                snapshot_page(*endpoint, *identity, descriptor, cursor, budget).await
+            }
+            Self::Grpc(client) => client.page(descriptor, cursor, budget).await,
+        }
+    }
+    async fn close(&self, descriptor: SnapshotDescriptor, end: Instant) -> Result<(), RemoteError> {
+        check_time(end)?;
+        let budget = end.saturating_duration_since(Instant::now());
+        match self {
+            Self::Legacy { endpoint, identity } => {
+                close_snapshot(*endpoint, *identity, descriptor, budget).await
+            }
+            Self::Grpc(client) => client.close(descriptor, budget).await,
+        }
+    }
+}
+async fn download_complete(
+    transport: DownloadTransport,
+    shard: u64,
+    end: Instant,
+) -> Result<RemoteSnapshot, RemoteError> {
+    let descriptor = transport.open(shard, end).await.inspect_err(|error| {
         diagnostic::failure(format_args!(
             "phase=download_open reason={}",
             diagnostic::kind(error)
@@ -518,20 +582,15 @@ async fn download(
         let mut ordinal = 0usize;
         loop {
             check_time(end)?;
-            let page = snapshot_page(
-                endpoint,
-                identity,
-                descriptor.clone(),
-                cursor,
-                end.saturating_duration_since(Instant::now()),
-            )
-            .await
-            .inspect_err(|error| {
-                diagnostic::failure(format_args!(
-                    "phase=download_page ordinal={ordinal} reason={}",
-                    diagnostic::kind(error)
-                ));
-            })?;
+            let page = transport
+                .page(descriptor.clone(), cursor, end)
+                .await
+                .inspect_err(|error| {
+                    diagnostic::failure(format_args!(
+                        "phase=download_page ordinal={ordinal} reason={}",
+                        diagnostic::kind(error)
+                    ));
+                })?;
             ordinal += 1;
             for (key, value) in page.entries {
                 check_time(end)?;
@@ -567,13 +626,7 @@ async fn download(
     // Best effort within the original budget, never masking a primary error.
     // Cancellation or an expired deadline leaves only a fixed-TTL resource.
     if Instant::now() < end {
-        let _ = close_snapshot(
-            endpoint,
-            identity,
-            descriptor,
-            end.saturating_duration_since(Instant::now()),
-        )
-        .await;
+        let _ = transport.close(descriptor, end).await;
     }
     result.and_then(|view| {
         check_time(end)?;

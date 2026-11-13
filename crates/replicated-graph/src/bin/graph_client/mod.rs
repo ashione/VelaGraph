@@ -18,7 +18,7 @@ use velagraph::{
 };
 
 const MAX_INPUT: u64 = 1024 * 1024;
-const HELP: &str = "graph-client --allow-insecure-development COMMAND\nLegacy catalog commands require --config FILE; rpc commands use --endpoint.\nrpc probe|metadata --endpoint ADDR --group N --node N --shard N [--timeout-ms N]\nrpc write --endpoint ADDR --group N --node N --shard N --file WRITE.json [--timeout-ms N]\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nv1 server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
+const HELP: &str = "graph-client --allow-insecure-development COMMAND\nCatalog commands require --config FILE; rpc commands use --endpoint.\nrpc probe|metadata --endpoint ADDR --group N --node N --shard N [--timeout-ms N]\nrpc write --endpoint ADDR --group N --node N --shard N --file WRITE.json [--timeout-ms N]\nconfig-check\ncatalog lookup --partition N\ncatalog register --partition N --file PLACEMENT.json\nv1 query --partition N --query GREMLIN\nv1 global-query --query GREMLIN\nv1 server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental server-query --group N --node N --shard N --partition N --query GREMLIN\nexperimental vertex create --partition N --file VERTEX.json\nexperimental edge create --from PARTITION:ID --to PARTITION:ID --id N --label LABEL\nexperimental observed-query --start-partition N --query GREMLIN\nAll stdout is versioned JSON. Plaintext trusted development networks only. Writes are single attempts, not durable retry sessions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,9 +338,9 @@ pub async fn run(args: Vec<String>) -> Result<Json> {
             .find(|r| r.group == group && r.node == node)
             .context("explicit query replica is not in data_nodes")?
             .endpoint;
-        let output = remote::query::query(
+        let output = remote::single_query_grpc::query(
             endpoint,
-            Some(remote::RemoteIdentity { group, node }),
+            remote::RemoteIdentity { group, node },
             QueryRequest {
                 shard,
                 partition,

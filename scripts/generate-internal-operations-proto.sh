@@ -36,7 +36,7 @@ rm -f "$root/crates/replicated-graph/src/remote/operations_grpc/velagraph.intern
 python3 - "$root/crates/replicated-graph/src/remote/operations_grpc/operations_proto.rs" <<'PYCODE'
 import pathlib,sys
 p=pathlib.Path(sys.argv[1]); s=p.read_text()
-assert s.count("tonic_prost::ProstCodec::default()") == 2
+assert s.count("tonic_prost::ProstCodec::default()") == 4
 p.write_text(s.replace("tonic_prost::ProstCodec::default()", "crate::remote::operations_grpc::bounded::BoundedCodec::default()"))
 PYCODE
 rustfmt --edition 2021 "$root/crates/replicated-graph/src/remote/operations_grpc/operations_proto.rs"

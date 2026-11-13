@@ -1,4 +1,4 @@
-//! Synchronous graph adapter for the trusted-network plaintext TCP service.
+//! Synchronous graph adapter for the trusted-network typed gRPC service.
 //!
 //! Construct on a live Tokio runtime and invoke graph work through `run_blocking`.
 //! Snapshots are bounded full copies; all data reads use the pinned copy. Each
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use d2_raft::{D1Result, D1WriteRequest, D1WriteStatus};
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use velagraph::{
     Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
     Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
@@ -32,15 +32,23 @@ pub struct RemoteStorageNode {
     shard: ShardId,
     deadline: Duration,
     absolute_deadline: Option<Instant>,
-    identity: Option<remote::RemoteIdentity>,
+    identity: remote::RemoteIdentity,
     runtime: Handle,
     admission: Arc<Semaphore>,
+    client: Arc<OnceCell<remote::operations_grpc::Client>>,
+    metadata_client: remote::metadata_stream_client::Client,
 }
 
 impl RemoteStorageNode {
-    /// Capture the runtime that dispatches TCP I/O. The endpoint must serve the
-    /// requested shard; construction performs no I/O and never activates D1.
-    pub fn new(endpoint: SocketAddr, shard: ShardId, deadline: Duration) -> Result<Self> {
+    /// Capture the runtime that dispatches typed RPC I/O. Every request validates
+    /// the explicit group/node identity; construction performs no I/O or D1 activation.
+    pub fn new_identified(
+        endpoint: SocketAddr,
+        group: u64,
+        node: u64,
+        shard: ShardId,
+        deadline: Duration,
+    ) -> Result<Self> {
         if deadline.is_zero()
             || deadline > remote::MAX_DEADLINE
             || Instant::now().checked_add(deadline).is_none()
@@ -55,24 +63,15 @@ impl RemoteStorageNode {
             shard,
             deadline,
             absolute_deadline: None,
-            identity: None,
+            identity: remote::RemoteIdentity { group, node },
             runtime,
             admission: Arc::new(Semaphore::new(32)),
+            client: Arc::new(OnceCell::new()),
+            metadata_client: remote::metadata_stream_client::Client::new(
+                endpoint,
+                remote::RemoteIdentity { group, node },
+            ),
         })
-    }
-
-    /// Explicit immutable server identity for static multi-group routing.
-    /// Unlike `new`, every RPC includes and validates both group and node ID.
-    pub fn new_identified(
-        endpoint: SocketAddr,
-        group: u64,
-        node: u64,
-        shard: ShardId,
-        deadline: Duration,
-    ) -> Result<Self> {
-        let mut adapter = Self::new(endpoint, shard, deadline)?;
-        adapter.identity = Some(remote::RemoteIdentity { group, node });
-        Ok(adapter)
     }
 
     pub(crate) fn scoped(&self, shard: ShardId, end: Instant, admission: Arc<Semaphore>) -> Self {
@@ -83,17 +82,52 @@ impl RemoteStorageNode {
         node
     }
 
-    pub(crate) fn probe_leader(&self) -> Result<()> {
-        let (endpoint, identity, shard, deadline) =
-            (self.endpoint, self.identity, self.shard, self.deadline);
-        match identity {
-            Some(identity) => self.dispatch(None, async move {
-                remote::probe_identified(endpoint, identity, shard, deadline)
-                    .await
-                    .map_err(|e| map_error(e, shard, 0, None))
-            }),
-            None => self.read_view().map(|_| ()),
+    fn operation_deadline(&self) -> Instant {
+        self.absolute_deadline
+            .unwrap_or_else(|| Instant::now() + self.deadline)
+    }
+
+    fn client(
+        &self,
+        end: Instant,
+    ) -> impl Future<Output = std::result::Result<remote::operations_grpc::Client, RemoteError>>
+           + Send
+           + 'static {
+        let cache = self.client.clone();
+        let (endpoint, identity, budget) = (self.endpoint, self.identity, self.deadline);
+        async move {
+            let end = tokio::time::Instant::from_std(end);
+            if tokio::time::Instant::now() >= end {
+                return Err(RemoteError::Timeout { request_id: None });
+            }
+            // Waiters and the initializer share each caller's absolute deadline.
+            // Cache only a successful channel; no application RPC is replayed.
+            let client = tokio::time::timeout_at(
+                end,
+                cache.get_or_try_init(|| {
+                    remote::operations_grpc::Client::connect(endpoint, identity, budget)
+                }),
+            )
+            .await
+            .map_err(|_| RemoteError::Timeout { request_id: None })??;
+            Ok(client.clone().with_deadline(end))
         }
+    }
+
+    pub(crate) fn probe_leader(&self) -> Result<()> {
+        let shard = self.shard;
+        let end = self.operation_deadline();
+        let client = self.client(end);
+        self.dispatch(None, async move {
+            if Instant::now() >= end {
+                return Err(StorageNodeError::Timeout { request_id: None });
+            }
+            let mut client = client.await.map_err(|e| map_error(e, shard, 0, None))?;
+            client
+                .probe(shard)
+                .await
+                .map_err(|e| map_error(e, shard, 0, None))
+        })
     }
 
     fn dispatch<T, F>(&self, request_id: Option<RequestId>, future: F) -> Result<T>
@@ -143,17 +177,17 @@ impl RemoteStorageNode {
                 "view belongs to a different shard".into(),
             ));
         }
-        let (endpoint, shard, deadline, epoch) =
-            (self.endpoint, self.shard, self.deadline, view.epoch);
-        let identity = self.identity;
+        let (shard, epoch) = (self.shard, view.epoch);
+        let end = self.operation_deadline();
+        let client = self.metadata_client.clone();
         self.dispatch(None, async move {
-            let (current_shard, current, _) = match identity {
-                Some(identity) => {
-                    remote::metadata_identified(endpoint, identity, shard, deadline).await
-                }
-                None => remote::metadata(endpoint, shard, deadline).await,
+            if Instant::now() >= end {
+                return Err(StorageNodeError::Timeout { request_id: None });
             }
-            .map_err(|e| map_error(e, shard, epoch, None))?;
+            let (current_shard, current, _) = client
+                .metadata(shard, tokio::time::Instant::from_std(end))
+                .await
+                .map_err(|e| map_error(e, shard, epoch, None))?;
             if current_shard != shard {
                 return Err(StorageNodeError::Corrupt(
                     "remote metadata shard mismatch".into(),
@@ -229,14 +263,13 @@ impl StorageNode for RemoteStorageNode {
             .unwrap_or_else(|| Instant::now() + self.deadline);
         let identity = self.identity;
         self.dispatch(None, async move {
-            let deadline = end.saturating_duration_since(Instant::now());
-            let snapshot = match identity {
-                Some(identity) => {
-                    remote::paged_snapshot_identified(endpoint, identity, shard, deadline).await
-                }
-                None => remote::paged_snapshot(endpoint, shard, deadline).await,
+            if Instant::now() >= end {
+                return Err(StorageNodeError::Timeout { request_id: None });
             }
-            .map_err(|e| map_error(e, shard, 0, None))?;
+            let deadline = end.saturating_duration_since(Instant::now());
+            let snapshot = remote::grpc::paged_snapshot(endpoint, identity, shard, deadline)
+                .await
+                .map_err(|e| map_error(e, shard, 0, None))?;
             // Transport validated all rows and metadata before exposing a result.
             // Move into the existing complete local view, checking the same
             // absolute deadline throughout this bounded synchronous assembly.
@@ -306,13 +339,8 @@ impl StorageNode for RemoteStorageNode {
                 "D1 batch limit exceeded".into(),
             ));
         }
-        let (endpoint, shard, deadline, epoch, id) = (
-            self.endpoint,
-            self.shard,
-            self.deadline,
-            request.epoch,
-            request.request_id,
-        );
+        let end = self.operation_deadline();
+        let (shard, epoch, id) = (self.shard, request.epoch, request.request_id);
         let request = D1WriteRequest {
             shard,
             epoch,
@@ -327,15 +355,20 @@ impl StorageNode for RemoteStorageNode {
                 })
                 .collect(),
         };
-        let identity = self.identity;
+        let client = self.client(end);
         self.dispatch(Some(id), async move {
-            let result = match identity {
-                Some(identity) => {
-                    remote::write_identified(endpoint, identity, request, deadline).await
-                }
-                None => remote::write(endpoint, request, deadline).await,
+            if Instant::now() >= end {
+                return Err(StorageNodeError::Timeout {
+                    request_id: Some(id),
+                });
             }
-            .map_err(|e| map_error(e, shard, epoch, Some(id)))?;
+            let mut client = client
+                .await
+                .map_err(|e| map_error(e, shard, epoch, Some(id)))?;
+            let result = client
+                .write(request)
+                .await
+                .map_err(|e| map_error(e, shard, epoch, Some(id)))?;
             match result {
                 D1Result::Write {
                     sequence,
@@ -387,16 +420,21 @@ mod tests {
     #[test]
     fn constructor_requires_runtime() {
         assert!(matches!(
-            RemoteStorageNode::new(endpoint(), 7, Duration::from_secs(1)),
+            RemoteStorageNode::new_identified(endpoint(), 1, 1, 7, Duration::from_secs(1)),
             Err(StorageNodeError::InvalidArgument(_))
         ));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_guard_limits_and_timeout_identity() {
-        let adapter = RemoteStorageNode::new(endpoint(), 7, Duration::from_millis(20)).unwrap();
-        assert!(RemoteStorageNode::new(endpoint(), 7, Duration::ZERO).is_err());
-        assert!(RemoteStorageNode::new(endpoint(), 7, Duration::from_secs(61)).is_err());
+        let adapter =
+            RemoteStorageNode::new_identified(endpoint(), 1, 1, 7, Duration::from_millis(20))
+                .unwrap();
+        assert!(RemoteStorageNode::new_identified(endpoint(), 1, 1, 7, Duration::ZERO).is_err());
+        assert!(
+            RemoteStorageNode::new_identified(endpoint(), 1, 1, 7, Duration::from_secs(61))
+                .is_err()
+        );
         assert!(matches!(
             adapter.read_view(),
             Err(StorageNodeError::Unsupported(_))
@@ -492,7 +530,8 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let adapter = {
             let _entered = runtime.enter();
-            RemoteStorageNode::new(endpoint(), 7, Duration::from_millis(50)).unwrap()
+            RemoteStorageNode::new_identified(endpoint(), 1, 1, 7, Duration::from_millis(50))
+                .unwrap()
         };
         drop(runtime);
         assert!(
@@ -542,5 +581,222 @@ mod routing_deadline_tests {
             Err(StorageNodeError::ResourceExhausted(_))
         ));
         drop(held);
+    }
+}
+
+#[cfg(test)]
+mod channel_cache_tests {
+    use super::*;
+    use crate::remote::operations_grpc::wire;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio_stream::StreamExt;
+    use tokio_util::sync::CancellationToken;
+
+    struct CountedIo {
+        io: tokio::net::TcpStream,
+        active: Arc<AtomicUsize>,
+        closed: Pin<Box<dyn Future<Output = ()> + Send>>,
+    }
+    impl Drop for CountedIo {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl tonic::transport::server::Connected for CountedIo {
+        type ConnectInfo = ();
+        fn connect_info(&self) {}
+    }
+    impl AsyncRead for CountedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.closed.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for CountedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+    use std::io;
+    #[derive(Clone)]
+    struct Probe(Arc<AtomicUsize>);
+    #[tonic::async_trait]
+    impl wire::shard_operations_server::ShardOperations for Probe {
+        async fn call(
+            &self,
+            _: tonic::Request<wire::Request>,
+        ) -> std::result::Result<tonic::Response<wire::Response>, tonic::Status> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(wire::Response {
+                version: 1,
+                result: Some(wire::response::Result::Probe(wire::Empty {})),
+            }))
+        }
+    }
+    async fn until(mut predicate: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !predicate() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("bounded lifecycle condition");
+    }
+    #[tokio::test]
+    async fn concurrent_scopes_share_channel_reconnect_and_release() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let generation = Arc::new(std::sync::Mutex::new(CancellationToken::new()));
+        let (a, b, g) = (accepted.clone(), active.clone(), generation.clone());
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |item| {
+            item.map(|io| {
+                a.fetch_add(1, Ordering::SeqCst);
+                b.fetch_add(1, Ordering::SeqCst);
+                CountedIo {
+                    io,
+                    active: b.clone(),
+                    closed: Box::pin(g.lock().unwrap().clone().cancelled_owned()),
+                }
+            })
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let service =
+            wire::shard_operations_server::ShardOperationsServer::new(Probe(calls.clone()));
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let node =
+            RemoteStorageNode::new_identified(address, 1, 1, 7, Duration::from_secs(2)).unwrap();
+        let short = node.scoped(
+            7,
+            Instant::now() + Duration::from_millis(200),
+            node.admission.clone(),
+        );
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let scope = short.clone();
+            workers.spawn(async move {
+                scope
+                    .client(scope.operation_deadline())
+                    .await
+                    .unwrap()
+                    .probe(7)
+                    .await
+                    .unwrap();
+            });
+        }
+        while let Some(result) = workers.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        // First short scope is not cached as the permanent channel budget.
+        node.client(node.operation_deadline())
+            .await
+            .unwrap()
+            .probe(7)
+            .await
+            .unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        {
+            let mut old = generation.lock().unwrap();
+            old.cancel();
+            *old = CancellationToken::new();
+        }
+        until(|| active.load(Ordering::SeqCst) == 0).await;
+        let mut attempts = 0;
+        let mut recovered = false;
+        // Only explicitly issued read-only operations may test reconnection.
+        for _ in 0..10 {
+            attempts += 1;
+            let result = node
+                .client(node.operation_deadline())
+                .await
+                .unwrap()
+                .probe(7)
+                .await;
+            if result.is_ok() {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(recovered);
+        assert!(accepted.load(Ordering::SeqCst) >= 2);
+        assert!(
+            calls.load(Ordering::SeqCst) <= 9 + attempts,
+            "no application replay"
+        );
+        drop(short);
+        drop(node);
+        until(|| active.load(Ordering::SeqCst) == 0).await;
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_initializer_and_waiter_do_not_poison_cache() {
+        let node = RemoteStorageNode::new_identified(
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            1,
+            7,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let cache = node.client.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            cache
+                .get_or_init(|| async {
+                    let _ = started.send(());
+                    std::future::pending::<remote::operations_grpc::Client>().await
+                })
+                .await;
+        });
+        ready.await.unwrap();
+        assert!(matches!(
+            node.client(Instant::now() + Duration::from_millis(10))
+                .await,
+            Err(RemoteError::Timeout { .. })
+        ));
+        assert!(node.client.get().is_none());
+        holder.abort();
+        let _ = holder.await;
+        assert!(node.client.get().is_none());
+        // A later initializer gets the permit; a failed connection is not cached.
+        assert!(node
+            .client(Instant::now() + Duration::from_millis(100))
+            .await
+            .is_err());
+        assert!(node.client.get().is_none());
     }
 }

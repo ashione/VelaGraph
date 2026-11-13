@@ -179,5 +179,6 @@ are omitted; explicit Null remains `["Null"]`. The result remains Unverified.
 `graph-client rpc probe|metadata|write` uses typed gRPC and requires an explicit
 endpoint/group/node/shard instead of catalog configuration. See
 [shard operations](SHARD_OPERATIONS_GRPC.md) for examples and write-outcome limits.
-Other catalog/experimental commands retain their documented legacy transport;
-there is no automatic fallback or implicit migration.
+Catalog/routing and server-query commands now use typed RPC too; configuration
+endpoints must name graph-node --graph gRPC listeners. Upgrade node/client
+binaries together; there is no automatic fallback or mixed-wire detection.
