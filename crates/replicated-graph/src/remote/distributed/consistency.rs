@@ -61,6 +61,16 @@ impl Request {
     }
 }
 
+pub(super) fn unsupported(end: Instant) -> Result<Vec<u8>, QueryFailure> {
+    bounded_encode(
+        &Response {
+            version: 1,
+            result: Err(QueryFailure::Unsupported),
+        },
+        end,
+    )
+}
+
 pub(super) async fn handle(
     catalog: Arc<StaticCatalog>,
     jobs: &jobs::Jobs,

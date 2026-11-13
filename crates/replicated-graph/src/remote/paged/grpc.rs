@@ -1,5 +1,6 @@
 //! Typed gRPC snapshot transfer. Trusted-network plaintext only, not authentication.
-//! Separate from the public API and from data-local query fragments/Raft RPC.
+//! Shared endpoint/admission for separate typed snapshot and observed-query services.
+//! Neither is the public API or Raft RPC.
 use super::*;
 use prost::Message;
 use std::{
@@ -25,7 +26,7 @@ use wire::snapshot_service_server::{SnapshotService, SnapshotServiceServer};
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = MAX_PAGE_BYTES + MAX_PAGE_ROWS * 32 + 1024;
 
-fn status(error: RemoteError) -> Status {
+pub(in crate::remote) fn status(error: RemoteError) -> Status {
     let (code, reason) = match &error {
         RemoteError::NotLeader { .. } => (Code::FailedPrecondition, "not_leader"),
         RemoteError::Application(D1Error::NotActivated) => {
@@ -69,7 +70,7 @@ fn status(error: RemoteError) -> Status {
     };
     Status::with_details(code, reason, detail.encode_to_vec().into())
 }
-fn remote_status(error: Status) -> RemoteError {
+pub(in crate::remote) fn remote_status(error: Status) -> RemoteError {
     let detail = wire::ErrorDetail::decode(error.details()).ok();
     match (
         error.code(),
@@ -198,7 +199,7 @@ impl TryFrom<wire::Cursor> for SnapshotCursor {
     }
 }
 #[derive(Clone)]
-struct Handler {
+pub(in crate::remote) struct Handler {
     raft: openraft::Raft<TypeConfig>,
     state: Arc<StateMachine>,
     identity: RemoteIdentity,
@@ -208,20 +209,25 @@ struct Handler {
     deadline: Duration,
 }
 impl Handler {
-    async fn execute(
+    pub(in crate::remote) async fn execute(
         &self,
         context: Option<wire::Context>,
         operation: Operation,
     ) -> Result<(Reply, Instant), Status> {
-        let context = context.ok_or_else(|| status(RemoteError::InvalidArgument))?;
-        let identity = context
-            .identity
-            .ok_or_else(|| status(RemoteError::InvalidArgument))?;
+        self.execute_raw(context, operation).await.map_err(status)
+    }
+    pub(in crate::remote) async fn execute_raw(
+        &self,
+        context: Option<wire::Context>,
+        operation: Operation,
+    ) -> Result<(Reply, Instant), RemoteError> {
+        let context = context.ok_or(RemoteError::InvalidArgument)?;
+        let identity = context.identity.ok_or(RemoteError::InvalidArgument)?;
         if context.version != VERSION {
-            return Err(status(RemoteError::Protocol));
+            return Err(RemoteError::Protocol);
         }
         if context.timeout_millis == 0 || context.timeout_millis > 60_000 {
-            return Err(status(RemoteError::InvalidArgument));
+            return Err(RemoteError::InvalidArgument);
         }
         let end = Instant::now()
             + self
@@ -244,14 +250,13 @@ impl Handler {
             ),
         )
         .await
-        .map_err(|_| status(RemoteError::Timeout { request_id: None }))?
+        .map_err(|_| RemoteError::Timeout { request_id: None })?
         .map(|reply| (reply, end))
-        .map_err(status)
     }
 }
 #[derive(Clone, Copy)]
 struct ResponseDeadline(Instant);
-fn response<T>(value: T, end: Instant) -> tonic::Response<T> {
+pub(in crate::remote) fn response<T>(value: T, end: Instant) -> tonic::Response<T> {
     let mut response = tonic::Response::new(value);
     response.extensions_mut().insert(ResponseDeadline(end));
     response
@@ -335,17 +340,24 @@ impl SnapshotService for Handler {
 // Admission spans protobuf decoding, execution, encoding and body consumption.
 // Never free a budget merely because a Page response has been constructed.
 #[derive(Clone)]
-struct AdmittedService {
-    inner: SnapshotServiceServer<Handler>,
+struct AdmittedService<S> {
+    inner: S,
     admission: Arc<Semaphore>,
     deadline: Duration,
 }
-impl tonic::server::NamedService for AdmittedService {
-    const NAME: &'static str =
-        <SnapshotServiceServer<Handler> as tonic::server::NamedService>::NAME;
+impl<S: tonic::server::NamedService> tonic::server::NamedService for AdmittedService<S> {
+    const NAME: &'static str = S::NAME;
 }
-impl<B> Service<http::Request<B>> for AdmittedService
+impl<B, S> Service<http::Request<B>> for AdmittedService<S>
 where
+    S: Service<
+            http::Request<B>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
     B: http_body::Body + Send + 'static,
     B::Error: Into<tonic::codegen::StdError> + Send + 'static,
 {
@@ -499,7 +511,7 @@ impl GrpcSnapshotService {
             identity: source.identity,
             shard: source.shard,
             sessions: sessions.clone(),
-            query_sessions: Arc::new(distributed::Sessions::new()?),
+            query_sessions: source.query_sessions.clone(),
             deadline,
         };
         let admission = source.admission.clone();
@@ -507,11 +519,12 @@ impl GrpcSnapshotService {
         let connection_stop = hard_stop.clone();
         let (stop, mut stopped) = watch::channel(false);
         let cleanup = sessions.clone();
+        let query_cleanup = source.query_sessions.clone();
         let task = tokio::spawn(async move {
             let shutdown = async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
-                    tokio::select! { _ = stopped.changed() => break, _ = interval.tick() => cleanup.expire() }
+                    tokio::select! { _ = stopped.changed() => break, _ = interval.tick() => { cleanup.expire(); query_cleanup.expire(); } }
                 }
             };
             let connections = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
@@ -527,6 +540,8 @@ impl GrpcSnapshotService {
                     }),
                 },
             );
+            let fixed_service = distributed::grpc::fixed_service(handler.clone());
+            let query_service = distributed::grpc::service(handler.clone());
             let service = SnapshotServiceServer::new(handler)
                 .max_decoding_message_size(REQUEST_LIMIT)
                 .max_encoding_message_size(RESPONSE_LIMIT);
@@ -535,6 +550,16 @@ impl GrpcSnapshotService {
                 .max_concurrent_streams(Some(MAX_IN_FLIGHT as u32))
                 .add_service(AdmittedService {
                     inner: service,
+                    admission: admission.clone(),
+                    deadline,
+                })
+                .add_service(AdmittedService {
+                    inner: query_service,
+                    admission: admission.clone(),
+                    deadline,
+                })
+                .add_service(AdmittedService {
+                    inner: fixed_service,
                     admission,
                     deadline,
                 })

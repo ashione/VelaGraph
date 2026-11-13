@@ -431,17 +431,21 @@ impl State {
                     .saturating_duration_since(sent),
             );
             let end = job.deadline()?.min(sent + self.job_rpc_budget).min(rpc_end);
-            let grant = fixed::renew(
+            let transport = self.config.fixed_transport(
                 node.route.endpoint,
                 node.route.identity,
-                fixed::FixedRenewRequest {
-                    descriptor: node.descriptor.clone(),
-                    generation: proposed.generation,
-                    lease_millis,
-                },
-                end.saturating_duration_since(sent),
-            )
-            .await;
+                node.route.shard,
+            )?;
+            let grant = transport
+                .renew(
+                    fixed::FixedRenewRequest {
+                        descriptor: node.descriptor.clone(),
+                        generation: proposed.generation,
+                        lease_millis,
+                    },
+                    end.saturating_duration_since(sent),
+                )
+                .await;
             match grant {
                 Ok(grant)
                     if grant.descriptor == node.descriptor
@@ -641,16 +645,16 @@ impl State {
             let requested_lease = request.open.ttl_millis;
             let requested_profile = request.open.profile;
             let sent = Instant::now();
-            let opened = fixed::renewable_open(
-                route.endpoint,
-                route.identity,
-                request,
-                acquire_end
-                    .saturating_duration_since(sent)
-                    .min(self.job_rpc_budget),
-            )
-            .await
-            .map_err(local::remote_error)?;
+            let transport = self.config.local_transport(route)?;
+            let opened = transport
+                .renewable_open(
+                    request,
+                    acquire_end
+                        .saturating_duration_since(sent)
+                        .min(self.job_rpc_budget),
+                )
+                .await
+                .map_err(local::remote_error)?;
             let descriptor = &opened.opened.descriptor;
             if descriptor.authority != *cut.authority()
                 || descriptor.cohort != *cut.cohort()
@@ -678,7 +682,8 @@ impl State {
                     descriptor.clone(),
                     opened.opened.capture_cost.bytes,
                     opened.opened.capture_cost.rows,
-                ),
+                )
+                .with_transport(transport),
             );
             if descriptor.profile != requested_profile
                 || opened.opened.retained_proof != *cut.proof()

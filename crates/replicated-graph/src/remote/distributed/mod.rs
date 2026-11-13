@@ -14,6 +14,7 @@ mod fixed_parallel;
 use adjacency::Direction;
 pub(in crate::remote) mod channel;
 pub mod consistency;
+pub mod grpc;
 mod hierarchy;
 pub mod jobs;
 mod projection;
@@ -427,6 +428,7 @@ fn dedup_vertices(
 }
 struct Execution<'a> {
     catalog: &'a StaticCatalog,
+    grpc_clients: Option<&'a BTreeMap<u64, grpc::QueryClient>>,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     fixed_sessions: Option<&'a mut BTreeMap<u64, fixed_execution::NodeSession>>,
     control: Option<fixed_execution::ExecutionControl>,
@@ -503,7 +505,14 @@ impl Execution<'_> {
             },
             ..request
         };
-        let reply = if let Some(slot) = connection {
+        let reply = if let Some(clients) = self.grpc_clients {
+            clients
+                .get(&route.shard)
+                .ok_or(QueryFailure::Unavailable)?
+                .fragment(request, self.end.saturating_duration_since(Instant::now()))
+                .await
+                .map(Reply::QueryFragment)
+        } else if let Some(slot) = connection {
             let (reply, returned) = channel::call(
                 route.endpoint,
                 route.identity,
@@ -790,6 +799,19 @@ impl Execution<'_> {
             if Instant::now() >= self.end {
                 break;
             }
+            if let Some(clients) = self.grpc_clients {
+                if let Some(client) = clients.get(&route.shard) {
+                    let _ = client
+                        .close(
+                            descriptor.clone(),
+                            self.end
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(20)),
+                        )
+                        .await;
+                }
+                continue;
+            }
             let _ = rpc(
                 route.endpoint,
                 Some(route.identity),
@@ -811,6 +833,15 @@ async fn execute(
     request: DistributedRequest,
     end: Instant,
 ) -> DistributedResponse {
+    execute_transport(catalog, request, end, None).await
+}
+
+async fn execute_transport(
+    catalog: &StaticCatalog,
+    request: DistributedRequest,
+    end: Instant,
+    grpc_clients: Option<&BTreeMap<u64, grpc::QueryClient>>,
+) -> DistributedResponse {
     let _permit = COORDINATORS
         .try_acquire()
         .map_err(|_| QueryFailure::ResourceExhausted)?;
@@ -821,6 +852,7 @@ async fn execute(
         control: None,
         fixed_parallelism: 3,
         catalog,
+        grpc_clients,
         ceiling: CEILING,
         scan_cost: Cost {
             bytes: 4096,
@@ -847,17 +879,26 @@ async fn execute(
                 execution.cost.charge(1024, 1, execution.ceiling)?;
             }
             let remaining = end.saturating_duration_since(Instant::now());
-            let reply = rpc(
-                route.endpoint,
-                Some(route.identity),
-                Operation::OpenQuery {
-                    shard: route.shard,
-                    timeout_millis: remaining.as_millis().min(MAX_TIMEOUT as u128) as u64,
-                },
-                remaining,
-                None,
-            )
-            .await
+            let reply = if let Some(clients) = grpc_clients {
+                clients
+                    .get(&route.shard)
+                    .ok_or(QueryFailure::Unavailable)?
+                    .open(route.shard, remaining)
+                    .await
+                    .map(Reply::OpenQuery)
+            } else {
+                rpc(
+                    route.endpoint,
+                    Some(route.identity),
+                    Operation::OpenQuery {
+                        shard: route.shard,
+                        timeout_millis: remaining.as_millis().min(MAX_TIMEOUT as u128) as u64,
+                    },
+                    remaining,
+                    None,
+                )
+                .await
+            }
             .map_err(remote_failure)?;
             let Reply::OpenQuery(descriptor) = reply else {
                 return Err(QueryFailure::IncompleteOrCorrupt);
@@ -939,8 +980,43 @@ impl CoordinatorService {
         catalog: StaticCatalog,
         deadline: Duration,
     ) -> Result<Self, RemoteError> {
+        Self::start_transport(bind, catalog, deadline, false).await
+    }
+    /// Explicit observed-query-only gRPC backend. Catalog endpoints must be gRPC.
+    /// Jobs and fixed/managed consistency are rejected, never sent to legacy TCP.
+    pub async fn start_grpc(
+        bind: SocketAddr,
+        catalog: StaticCatalog,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        Self::start_transport(bind, catalog, deadline, true).await
+    }
+    async fn start_transport(
+        bind: SocketAddr,
+        catalog: StaticCatalog,
+        deadline: Duration,
+        grpc: bool,
+    ) -> Result<Self, RemoteError> {
         catalog.validate()?;
-        checked_deadline(deadline, None)?;
+        let setup_end = checked_deadline(deadline, None)?;
+        let mut clients = BTreeMap::new();
+        if grpc {
+            for route in &catalog.partitions {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    clients.entry(route.shard)
+                {
+                    entry.insert(
+                        grpc::QueryClient::connect(
+                            route.endpoint,
+                            route.identity,
+                            setup_end.saturating_duration_since(Instant::now()),
+                        )
+                        .await?,
+                    );
+                }
+            }
+        }
+        let clients = grpc.then(|| Arc::new(clients));
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|_| RemoteError::Unavailable)?;
@@ -963,6 +1039,7 @@ impl CoordinatorService {
                     continue;
                 };
                 let catalog = catalog.clone();
+                let clients = clients.clone();
                 let jobs = jobs.clone();
                 jobs.expire();
                 handlers.spawn(async move {
@@ -996,6 +1073,13 @@ impl CoordinatorService {
                             }
                         };
                         let bytes = match request {
+                            IncomingRequest::Consistent(_) if clients.is_some() => {
+                                consistency::unsupported(end)
+                            }
+                            IncomingRequest::Job(_) if clients.is_some() => bounded_encode(
+                                &Err::<jobs::Output, _>(QueryFailure::Unsupported),
+                                end,
+                            ),
                             IncomingRequest::Consistent(envelope) => {
                                 consistency::handle(
                                     catalog,
@@ -1005,9 +1089,11 @@ impl CoordinatorService {
                                 )
                                 .await
                             }
-                            IncomingRequest::Query(request) => {
-                                bounded_encode(&execute(&catalog, request, end).await, end)
-                            }
+                            IncomingRequest::Query(request) => bounded_encode(
+                                &execute_transport(&catalog, request, end, clients.as_deref())
+                                    .await,
+                                end,
+                            ),
                             IncomingRequest::Job(envelope) => bounded_encode(
                                 &jobs.handle(catalog, envelope.hierarchy_job, end).await,
                                 end,

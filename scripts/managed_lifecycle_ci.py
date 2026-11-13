@@ -519,8 +519,16 @@ def validate_handoff_artifact(artifact, build_root):
             and integer(artifact['profile'].get('debuginfo'), 0, 0)
             and artifact['profile'].get('overflow_checks') is False, 'wrong exact release profile/features')
     executable = pathlib.Path(artifact['executable'])
-    require(executable.parent == build_root / 'target/release/deps'
-            and re.fullmatch('managed_process-[0-9a-f]+', executable.name)
+    name = re.fullmatch(r'managed_process-([0-9a-f]+)', executable.name)
+    # Cargo's compiler-artifact record is authoritative for the executable, but
+    # only these two exact release layouts belong to this handoff. Cargo 1.100's
+    # per-unit layout binds the directory fingerprint to the executable suffix.
+    legacy = executable.parent == build_root / 'target/release/deps'
+    per_unit = (name is not None and len(name[1]) == 16
+                and executable.parent == build_root / 'target/release/build/replicated-graph'
+                / name[1] / 'out')
+    require(name is not None and (legacy or per_unit)
+            and artifact['executable'] == str(executable)
             and artifact.get('filenames') == [str(executable)], 'wrong release executable path/closure')
 
 

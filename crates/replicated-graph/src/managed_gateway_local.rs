@@ -339,14 +339,14 @@ impl State {
                 if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
                     return Err(Error::Capacity);
                 }
-                let opened = fixed::open(
-                    route.endpoint,
-                    route.identity,
-                    make_open(target.clone(), remaining),
-                    acquire_end.saturating_duration_since(Instant::now()),
-                )
-                .await
-                .map_err(remote_error)?;
+                let transport = self.config.local_transport(route)?;
+                let opened = transport
+                    .open(
+                        make_open(target.clone(), remaining),
+                        acquire_end.saturating_duration_since(Instant::now()),
+                    )
+                    .await
+                    .map_err(remote_error)?;
                 let descriptor = &opened.descriptor;
                 if descriptor.authority != *cut.authority()
                     || descriptor.cohort != *cut.cohort()
@@ -376,7 +376,8 @@ impl State {
                         opened.descriptor.clone(),
                         opened.capture_cost.bytes,
                         opened.capture_cost.rows,
-                    ),
+                    )
+                    .with_transport(transport),
                 );
                 // Compare the complete retained certificate, not a boolean or V.
                 if opened.descriptor.profile != profile || opened.retained_proof != *cut.proof() {

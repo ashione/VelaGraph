@@ -20,7 +20,7 @@ use std::{net::SocketAddr, time::Duration};
 
 #[derive(Debug)]
 enum Command {
-    Serve { catalog: String },
+    Serve { catalog: String, grpc: bool },
     Query { partition: u32, text: String },
     Job(Request),
 }
@@ -33,7 +33,7 @@ struct Options {
 }
 
 const COMMANDS: &str =
-    "expected serve, query, hierarchy-start, hierarchy-rows-start, hierarchy-read, hierarchy-advance, or hierarchy-cancel";
+    "expected serve, serve-grpc, query, hierarchy-start, hierarchy-rows-start, hierarchy-read, hierarchy-advance, or hierarchy-cancel";
 
 fn parse_token(value: &str) -> anyhow::Result<[u8; 16]> {
     anyhow::ensure!(
@@ -125,13 +125,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options>
     );
     let endpoint = endpoint.context("--endpoint is required")?;
     let command = match command.as_str() {
-        "serve" => {
+        "serve" | "serve-grpc" => {
             anyhow::ensure!(
                 partition.is_none() && text.is_none() && token.is_none() && sequence.is_none(),
                 "query and job flags are not accepted by serve"
             );
             Command::Serve {
                 catalog: catalog.context("--catalog is required")?,
+                grpc: command == "serve-grpc",
             }
         }
         "query" | "hierarchy-start" | "hierarchy-rows-start" => {
@@ -202,14 +203,18 @@ async fn main() -> anyhow::Result<()> {
     } = parse_args(std::env::args().skip(1))?;
     let timeout = Duration::from_millis(timeout_ms);
     match command {
-        Command::Serve { catalog } => {
+        Command::Serve { catalog, grpc } => {
             let file = std::fs::File::open(catalog)?;
             anyhow::ensure!(
                 file.metadata()?.len() <= 64 * 1024,
                 "catalog configuration exceeds 64 KiB"
             );
             let catalog: StaticCatalog = serde_json::from_reader(file)?;
-            let service = CoordinatorService::start(endpoint, catalog, timeout).await?;
+            let service = if grpc {
+                CoordinatorService::start_grpc(endpoint, catalog, timeout).await?
+            } else {
+                CoordinatorService::start(endpoint, catalog, timeout).await?
+            };
             println!("coordinator={}", service.local_addr());
             tokio::signal::ctrl_c().await?;
             service.shutdown().await;
@@ -341,6 +346,21 @@ mod tests {
         )
         .is_err());
         assert!(parse("bogus", &[]).is_err());
+    }
+
+    #[test]
+    fn grpc_backend_requires_explicit_server_command() {
+        assert!(matches!(
+            parse("serve-grpc", &["--catalog", "grpc.json"])
+                .unwrap()
+                .command,
+            Command::Serve { grpc: true, .. }
+        ));
+        assert!(matches!(
+            parse("serve", &["--catalog", "tcp.json"]).unwrap().command,
+            Command::Serve { grpc: false, .. }
+        ));
+        assert!(parse("serve-grpc", &["--catalog", "x", "--query", "g.V()"]).is_err());
     }
 
     #[test]
