@@ -1,0 +1,126 @@
+syntax = "proto3";
+package velagraph.internal.managed.v1;
+// Internal only. Original canonical command/proof identities are unchanged.
+service ManagedService { rpc Call(Request) returns (Reply); }
+message Empty {}
+enum CapacityProfile { CAPACITY_PROFILE_UNSPECIFIED = 0; LEGACY_COUNT_V1 = 1; BYTE_BOUND16_MIB_V1 = 2; }
+enum TerminalDecision { TERMINAL_DECISION_UNSPECIFIED = 0; COMMIT = 1; ABORT = 2; }
+message Target { uint64 shard = 1; uint64 epoch = 2; bytes mode = 3; }
+message Authority { uint64 shard = 1; bytes mode = 2; }
+message Member { uint64 shard = 1; uint64 epoch = 2; bytes mode = 3; }
+message Cohort { uint64 coordinator_shard = 1; uint64 coordinator_epoch = 2; repeated Member members = 3; CapacityProfile profile = 4; }
+message Participant { uint64 shard = 1; uint64 epoch = 2; bytes mode = 3; bytes intent = 4; }
+message TerminalRecord { bytes id = 1; uint64 ordinal = 2; repeated Participant participants = 3; repeated bool prepared = 4; TerminalDecision decision = 5; }
+message TerminalSegment { repeated TerminalRecord records = 1; }
+message TerminalPrefix { uint32 format_version = 1; bytes authority = 2; Cohort cohort = 3; uint64 through = 4; repeated TerminalSegment segments = 5; }
+message ReadLimit { uint64 rows = 1; uint64 bytes = 2; uint64 operations = 3; }
+message ErrorPair { uint64 first = 1; uint64 current = 2; }
+enum CoordinatorError { COORDINATOR_ERROR_UNSPECIFIED = 0;
+ COORDINATOR_INVALID_IDENTITY = 1;
+ COORDINATOR_INVALID_PARTICIPANTS = 2;
+ COORDINATOR_IDENTITY_CONFLICT = 3;
+ COORDINATOR_UNKNOWN_TRANSACTION = 4;
+ COORDINATOR_UNKNOWN_PARTICIPANT = 5;
+ COORDINATOR_NOT_PREPARED = 6;
+ COORDINATOR_ALREADY_DECIDED = 7;
+ COORDINATOR_CAPACITY = 8;
+ COORDINATOR_CAPACITY_NOT_CONFIRMED = 9;
+ COORDINATOR_INVALID_JOURNAL = 10;
+ COORDINATOR_INCOMPATIBLE_HISTORY = 11;
+}
+message ApplicationError { oneof kind {
+ Empty not_activated = 1;
+ ErrorPair wrong_shard = 2;
+ ErrorPair fenced = 3;
+ ErrorPair conflict = 4;
+ Empty idempotency_conflict = 5;
+ Empty empty_batch = 6;
+ Empty batch_too_large = 7;
+ Empty sequence_overflow = 8;
+ Empty dedup_capacity = 9;
+ Empty invalid_dedup_capacity = 10;
+ ErrorPair capacity_conflict = 11;
+ Empty legacy_data_present = 12;
+ Empty legacy_write_disabled = 13;
+ Empty invalid_epoch = 14;
+ Empty managed_write_required = 15;
+ Empty managed_writes_not_enabled = 16;
+ Empty invalid_managed_mode = 17;
+ Empty managed_mode_conflict = 18;
+ Empty unverified_write_history = 19;
+ Empty visibility_not_enabled = 20;
+ Empty visibility_required = 21;
+ Empty visibility_history = 22;
+ Empty visibility_gap = 23;
+ Empty visibility_unresolved = 24;
+ Empty visibility_not_applied = 25;
+ Empty visibility_read_limit = 26;
+ Empty participant_only = 27;
+ Empty participant_not_enabled = 28;
+ Empty participant_authority = 29;
+ Empty participant_identity = 30;
+ Empty participant_busy = 31;
+ Empty participant_capacity = 32;
+ Empty participant_unknown = 33;
+ Empty participant_decision_conflict = 34;
+ Empty coordinator_only = 35;
+ Empty coordinator_not_enabled = 36;
+ Empty coordinator_requires_empty_shard = 37;
+ Empty decision_index_history = 38;
+ Empty decision_index_unavailable = 39;
+ Empty event_ledger_history = 40;
+ Empty event_ledger_unavailable = 41;
+ Empty request_index_history = 42;
+ Empty request_index_unavailable = 43;
+ CoordinatorError coordinator_rejected = 44;
+} }
+enum Role { ROLE_UNSPECIFIED = 0; COORDINATOR = 1; PARTICIPANT = 2; }
+message Identity { uint64 group = 1; uint64 node = 2; Target target = 3; Role role = 4; Authority authority = 5; Cohort cohort = 6; }
+message Request { uint32 version = 1; Identity identity = 2; uint64 nonce = 3; Operation operation = 4; uint64 timeout_millis = 5; }
+message Reply { uint32 version = 1; uint32 operation = 2; Identity identity = 3; uint64 nonce = 4; oneof result { Value value = 5; RpcError error = 6; } }
+message RpcError { oneof kind { ApplicationError application = 1; Empty identity = 2; Empty capacity = 3; Empty unavailable = 4; Empty protocol = 5; } }
+message LogId { uint64 term = 1; uint64 node = 2; uint64 index = 3; }
+message CapacityActivation { bytes nonce = 1; LogId log_id = 2; }
+message MemberCapacityGrant { Member member = 1; CapacityActivation activation = 2; }
+message HistoryCursor { uint32 version = 1; Authority authority = 2; Cohort cohort = 3; uint64 event_count = 4; bytes root = 5; }
+message HistoryPage { uint32 version = 1; HistoryCursor base = 2; HistoryCursor end = 3; HistoryCursor cut = 4; repeated Command events = 5; }
+message Put { bytes key = 1; bytes value = 2; }
+message WriteOp { oneof kind { Put put = 1; bytes delete = 2; } }
+message D1WriteRequest { uint64 shard = 1; uint64 epoch = 2; bytes request_id = 3; optional uint64 expected_sequence = 4; repeated WriteOp operations = 5; }
+message RetainedPrepare { uint32 version = 1; Authority authority = 2; Participant participant = 3; D1WriteRequest request = 4; HistoryCursor cut = 5; }
+message AdmitRequest { bytes id = 1; bytes request = 2; bytes payload = 3; bytes transaction_id = 4; repeated Participant participants = 5; }
+message ConfirmCohortCapacity { Cohort cohort = 1; repeated MemberCapacityGrant grants = 2; }
+message Begin { bytes id = 1; repeated Participant participants = 2; }
+message Prepared { bytes id = 1; Participant participant = 2; }
+message Decide { bytes id = 1; TerminalDecision decision = 2; }
+message Command { oneof kind { AdmitRequest admit_request = 1; Cohort bind_cohort = 2; ConfirmCohortCapacity confirm_cohort_capacity = 3; Begin begin = 4; Prepared prepared = 5; Decide decide = 6; } }
+message Journal { bytes authority = 1; repeated Command events = 2; }
+message RequestRecord { bytes id = 1; bytes request = 2; bytes payload = 3; bytes transaction_id = 4; }
+message Transaction { bytes id = 1; uint64 ordinal = 2; repeated Participant participants = 3; repeated bool prepared = 4; optional TerminalDecision decision = 5; }
+message TargetRecord { Transaction transaction = 1; RequestRecord request = 2; }
+message TargetEvidence { uint32 version = 1; HistoryCursor cut = 2; uint64 resolved_prefix = 3; bytes id = 4; TargetRecord record = 5; }
+message RecoveredRequest { RequestRecord record = 1; Transaction transaction = 2; }
+message RequestLookup { Authority authority = 1; Cohort cohort = 2; uint64 resolved_prefix = 3; bytes id = 4; RecoveredRequest record = 5; }
+message HistoryStatus { HistoryCursor cursor = 1; uint64 applied_prefix = 2; }
+message CoordinatorSummary { Authority authority = 1; Cohort cohort = 2; uint64 resolved_prefix = 3; }
+message VisibilityInfo { Authority authority = 1; uint64 baseline_sequence = 2; Cohort cohort = 3; uint64 applied_prefix = 4; }
+message CapacityGrantStatus { Authority authority = 1; Cohort cohort = 2; MemberCapacityGrant grant = 3; }
+message CohortCapacity { Authority authority = 1; Cohort cohort = 2; repeated MemberCapacityGrant grants = 3; }
+message Status { oneof kind { Empty unknown = 1; Empty prepared = 2; uint64 committed_sequence = 3; Empty aborted = 4; } }
+message Entry { bytes key = 1; bytes value = 2; }
+message Snapshot { uint64 shard = 1; uint64 epoch = 2; Authority authority = 3; uint64 version = 4; uint64 baseline_sequence = 5; Cohort cohort = 6; uint64 applied_prefix = 7; uint64 local_sequence = 8; uint64 replay_operations = 9; repeated Entry entries = 10; }
+message SnapshotWithProof { Snapshot snapshot = 1; TerminalPrefix proof = 2; }
+message Value { oneof kind { TargetEvidence target = 1; CapacityGrantStatus grant = 2; CohortCapacity capacity = 3; HistoryStatus history_status = 4; HistoryPage history_page = 5; HistoryStatus history_synced = 6; uint64 retained_prefix = 7; RequestLookup request = 8; Journal journal = 9; Empty unit = 10; VisibilityInfo visibility = 11; Status status = 12; uint64 prefix = 13; CoordinatorSummary summary = 14; TerminalPrefix evidence = 15; SnapshotWithProof snapshot = 16; } }
+message Lookup { Authority authority = 1; uint64 epoch = 2; bytes id = 3; }
+message AuthorityEpoch { Authority authority = 1; uint64 epoch = 2; }
+message BoundTarget { Authority authority = 1; Target target = 2; Cohort cohort = 3; }
+message HistoryPageRequest { Authority authority = 1; uint64 epoch = 2; HistoryCursor base = 3; HistoryCursor cut = 4; }
+message SyncHistory { Authority authority = 1; Target target = 2; HistoryPage page = 3; }
+message AdvanceRetained { Authority authority = 1; Target target = 2; uint64 ordinal = 3; HistoryCursor cut = 4; }
+message TerminalRequest { Authority authority = 1; uint64 epoch = 2; uint64 version = 3; }
+message CommandRequest { Authority authority = 1; uint64 epoch = 2; Command command = 3; }
+message Prepare { Authority authority = 1; Participant participant = 2; D1WriteRequest request = 3; Journal journal = 4; }
+message Advance { Authority authority = 1; Target target = 2; uint64 ordinal = 3; Journal journal = 4; }
+message Prefix { Target target = 1; TerminalPrefix proof = 2; }
+message Read { Target target = 1; ReadLimit limit = 2; TerminalPrefix proof = 3; }
+message Operation { oneof kind { Lookup lookup_target = 1; RetainedPrepare prepare_retained = 2; BoundTarget grant_status = 3; AuthorityEpoch confirm_capacity = 4; BoundTarget history_status = 5; HistoryPageRequest history_page = 6; SyncHistory sync_history = 7; AdvanceRetained advance_retained = 8; Lookup lookup_request = 9; AuthorityEpoch summary = 10; TerminalRequest terminal = 11; AuthorityEpoch journal = 12; CommandRequest command = 13; Target visibility = 14; Prepare prepare = 15; Advance advance = 16; Prefix prefix = 17; Read read = 18; } }

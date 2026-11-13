@@ -25,6 +25,11 @@
   用版本化 Protobuf 和 gRPC adapter 复用原执行器；按已验证 peer 身份复用 channel，
   保留固定视图、顺序、错误与累计预算。真实多进程差分测试后清理替代的 JSON 路径，
   不长期维护两套业务实现，不把 JSON 装进 bytes 就当完成协议迁移。
+- **managed control/write 切片**：[#235](https://github.com/ashione/VelaGraph/issues/235)
+  将现有 18 项 coordinator/member 操作映射到 typed gRPC，复用原状态机、身份、
+  幂等与历史证明；详见 [内部 managed RPC](INTERNAL_GRPC_MANAGED.md)。显式
+  `--internal-grpc` 接通服务的 managed 与 graph 路由，仅用于过渡差分验证；
+  最终需移除替代后的 TCP 路径，不能将可选双协议当作统一通信已完成。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、

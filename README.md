@@ -141,8 +141,12 @@ legacy TCP snapshot/session budgets. The same endpoint hosts the separate
 [typed observed query-fragment service](docs/INTERNAL_GRPC_QUERIES.md), selected
 explicitly with `graph-coordinator serve-grpc`. A separate
 [typed fixed-version session service](docs/INTERNAL_GRPC_FIXED_QUERIES.md) is selected
-by the managed gateway's explicit gRPC graph-route constructor. Managed control,
-observed hierarchy jobs and Raft have **not** migrated; this is not the external API.
+by the managed gateway's explicit gRPC graph-route constructor.
+[Typed managed control/write RPC](docs/INTERNAL_GRPC_MANAGED.md) adds explicit
+coordinator/member gRPC clients and listeners; `graph-service --internal-grpc`
+selects these plus gRPC graph routes without fallback. Observed hierarchy jobs,
+Raft and removal of the remaining legacy transports are separate migration work;
+these internal endpoints are not the public API.
 
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;

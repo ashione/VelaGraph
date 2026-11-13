@@ -99,6 +99,7 @@ struct NodeReady {
 async fn public_service_node_child() -> anyhow::Result<()> {
     let directory = PathBuf::from(std::env::var_os(CHILD_ENV).context("node directory")?);
     let shard: u64 = std::env::var("VELAGRAPH_PUBLIC_SERVICE_NODE_SHARD")?.parse()?;
+    let internal_grpc = std::env::var("VELAGRAPH_PUBLIC_SERVICE_INTERNAL_GRPC")? == "1";
     let cluster = Cluster::new().in_group(shard);
     let node = Arc::new(cluster.start_durable(1, directory.join("data")).await?);
     node.raft
@@ -167,13 +168,41 @@ async fn public_service_node_child() -> anyhow::Result<()> {
         )
         .await?;
     }
-    let server = Server::bind(
-        node.clone(),
-        identity(shard),
-        "127.0.0.1:0".parse()?,
-        BUDGET,
-    )
-    .await?;
+    let (tcp, grpc) = if internal_grpc {
+        (
+            None,
+            Some(
+                d2_raft::managed_rpc::grpc::Server::bind(
+                    node.clone(),
+                    identity(shard),
+                    "127.0.0.1:0".parse()?,
+                    BUDGET,
+                )
+                .await?,
+            ),
+        )
+    } else {
+        (
+            Some(
+                Server::bind(
+                    node.clone(),
+                    identity(shard),
+                    "127.0.0.1:0".parse()?,
+                    BUDGET,
+                )
+                .await?,
+            ),
+            None,
+        )
+    };
+    let control = tcp
+        .as_ref()
+        .map(Server::local_addr)
+        .or_else(|| {
+            grpc.as_ref()
+                .map(d2_raft::managed_rpc::grpc::Server::local_addr)
+        })
+        .context("selected managed listener")?;
     let graph = if shard != 9 {
         Some(
             GraphService::start_managed(&node, "127.0.0.1:0".parse()?, shard, shard, BUDGET)
@@ -182,12 +211,34 @@ async fn public_service_node_child() -> anyhow::Result<()> {
     } else {
         None
     };
+    let graph_grpc = if internal_grpc {
+        if let Some(graph) = graph.as_ref() {
+            Some(
+                replicated_graph::remote::grpc::GrpcSnapshotService::start(
+                    graph,
+                    "127.0.0.1:0".parse()?,
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let graph_address = if internal_grpc {
+        graph_grpc
+            .as_ref()
+            .map(replicated_graph::remote::grpc::GrpcSnapshotService::local_addr)
+    } else {
+        graph.as_ref().map(GraphService::local_addr)
+    };
     fs::write(
         directory.join("ready.tmp"),
         serde_json::to_vec(&NodeReady {
             pid: std::process::id(),
-            control: server.local_addr(),
-            graph: graph.as_ref().map(GraphService::local_addr),
+            control,
+            graph: graph_address,
         })?,
     )?;
     fs::rename(directory.join("ready.tmp"), directory.join("ready.json"))?;
@@ -200,7 +251,7 @@ struct NodeProcess {
     ready: NodeReady,
 }
 impl NodeProcess {
-    async fn start(shard: u64) -> anyhow::Result<Self> {
+    async fn start(shard: u64, internal_grpc: bool) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir()?;
         let mut child = Command::new(std::env::current_exe()?)
             .args([
@@ -211,6 +262,10 @@ impl NodeProcess {
             ])
             .env(CHILD_ENV, directory.path())
             .env("VELAGRAPH_PUBLIC_SERVICE_NODE_SHARD", shard.to_string())
+            .env(
+                "VELAGRAPH_PUBLIC_SERVICE_INTERNAL_GRPC",
+                if internal_grpc { "1" } else { "0" },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -258,19 +313,23 @@ struct ServiceProcess {
     _output: PathBuf,
 }
 impl ServiceProcess {
-    async fn start(config: &Path, output: PathBuf) -> anyhow::Result<Self> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_graph-service"))
-            .args([
-                "--config",
-                config.to_str().context("config path")?,
-                "--http",
-                "127.0.0.1:0",
-                "--grpc",
-                "127.0.0.1:0",
-                "--allow-insecure-development",
-                "--timeout-ms",
-                "15000",
-            ])
+    async fn start(config: &Path, output: PathBuf, internal_grpc: bool) -> anyhow::Result<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
+        command.args([
+            "--config",
+            config.to_str().context("config path")?,
+            "--http",
+            "127.0.0.1:0",
+            "--grpc",
+            "127.0.0.1:0",
+            "--allow-insecure-development",
+            "--timeout-ms",
+            "15000",
+        ]);
+        if internal_grpc {
+            command.arg("--internal-grpc");
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(fs::File::create(&output)?))
             .stderr(Stdio::inherit())
@@ -438,17 +497,28 @@ async fn grpc_channel(address: SocketAddr) -> anyhow::Result<tonic::transport::C
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn four_process_public_http_grpc_consistency_and_restart() -> anyhow::Result<()> {
+    public_scenario(false).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_process_public_service_with_internal_grpc() -> anyhow::Result<()> {
+    public_scenario(true).await
+}
+async fn public_scenario(internal_grpc: bool) -> anyhow::Result<()> {
     let (coordinator, a, b) = tokio::try_join!(
-        NodeProcess::start(9),
-        NodeProcess::start(7),
-        NodeProcess::start(8)
+        NodeProcess::start(9, internal_grpc),
+        NodeProcess::start(7, internal_grpc),
+        NodeProcess::start(8, internal_grpc)
     )?;
     let directory = tempfile::tempdir()?;
     let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
     let config_path = directory.path().join("service.json");
     fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    let mut service =
-        ServiceProcess::start(&config_path, directory.path().join("service1.stdout")).await?;
+    let mut service = ServiceProcess::start(
+        &config_path,
+        directory.path().join("service1.stdout"),
+        internal_grpc,
+    )
+    .await?;
     let pids = [
         std::process::id(),
         service.child.id(),
@@ -588,8 +658,12 @@ async fn four_process_public_http_grpc_consistency_and_restart() -> anyhow::Resu
     drop(grpc_writes);
     drop(grpc_queries);
     service.graceful_stop().await?;
-    let mut service =
-        ServiceProcess::start(&config_path, directory.path().join("service2.stdout")).await?;
+    let mut service = ServiceProcess::start(
+        &config_path,
+        directory.path().join("service2.stdout"),
+        internal_grpc,
+    )
+    .await?;
     let (status, stale) = post(service.address, "/preview1/queries:fetch", fetch).await?;
     assert_eq!(status, 410, "{stale}");
     let channel = grpc_channel(service.grpc).await?;
@@ -628,7 +702,11 @@ async fn four_process_public_http_grpc_consistency_and_restart() -> anyhow::Resu
     invalid["binding"]["cohort"]["coordinator_epoch"] = json!(2);
     let bad_path = directory.path().join("bad.json");
     fs::write(&bad_path, serde_json::to_vec(&invalid)?)?;
-    let failure = Command::new(env!("CARGO_BIN_EXE_graph-service"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
+    if internal_grpc {
+        command.arg("--internal-grpc");
+    }
+    let failure = command
         .args([
             "--allow-insecure-development",
             "--config",
@@ -644,7 +722,11 @@ async fn four_process_public_http_grpc_consistency_and_restart() -> anyhow::Resu
     // The HTTP listener must not be announced if the optional second bind fails.
     let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
     let grpc_address = occupied.local_addr()?.to_string();
-    let failure = Command::new(env!("CARGO_BIN_EXE_graph-service"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
+    if internal_grpc {
+        command.arg("--internal-grpc");
+    }
+    let failure = command
         .args([
             "--allow-insecure-development",
             "--config",

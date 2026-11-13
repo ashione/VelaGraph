@@ -20,8 +20,15 @@ getrandom = "=0.3.4"
 anyhow = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
+# Existing locked MIT-licensed HTTP/2 + typed protobuf stack, shared with graph RPC.
+tonic = "0.14"
+prost = "0.14"
+http-body = "1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
+h2 = "0.4"
 checkpoint-object-store = { path = "../checkpoint-object-store" }
 object_store = { version = "=0.14.2", features = ["aws"] }
 tempfile = "3"
