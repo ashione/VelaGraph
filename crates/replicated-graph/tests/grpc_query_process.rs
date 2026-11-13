@@ -303,7 +303,7 @@ async fn scenario() -> anyhow::Result<()> {
     let grpc = CoordinatorService::start_grpc(
         "127.0.0.1:0".parse()?,
         StaticCatalog {
-            partitions: vec![br, ar],
+            partitions: vec![br.clone(), ar.clone()],
         },
         BUDGET,
     )
@@ -375,17 +375,22 @@ async fn scenario() -> anyhow::Result<()> {
         "g.V(1).repeat(__.out('knows')).emit().times(2).dedup().count()",
     ] {
         assert_eq!(
-            hierarchy_count(tcp.local_addr(), text).await?,
-            hierarchy_count(grpc.local_addr(), text).await?
+            hierarchy_count(tcp.local_addr(), false, text).await?,
+            hierarchy_count(grpc.local_addr(), false, text).await?
         );
     }
     assert_eq!(
-        hierarchy_rows(tcp.local_addr()).await?,
-        hierarchy_rows(grpc.local_addr()).await?
+        hierarchy_rows(tcp.local_addr(), false).await?,
+        hierarchy_rows(grpc.local_addr(), false).await?
     );
-    hierarchy_cancel(tcp.local_addr()).await?;
-    hierarchy_cancel(grpc.local_addr()).await?;
+    hierarchy_cancel(tcp.local_addr(), false).await?;
+    hierarchy_cancel(grpc.local_addr(), false).await?;
     session_checks(&a).await?;
+    // Teardown releases local job admission immediately; remote read leases
+    // may remain until their bounded TTL, so run exact shard-slot checks first.
+    coordinator_ingress_checks(&[br, ar], tcp.local_addr())
+        .await
+        .context("coordinator ingress checks")?;
     a._process.0.kill()?;
     a._process.0.wait()?;
     for endpoint in [tcp.local_addr(), grpc.local_addr()] {
@@ -833,17 +838,18 @@ impl Proxy {
     }
 }
 
-async fn hierarchy_count(endpoint: SocketAddr, text: &str) -> anyhow::Result<u64> {
-    use distributed::jobs::{self, Output, Request};
-    let mut output = jobs::request(
-        endpoint,
-        Request::Start {
-            start_partition: 0,
-            text: text.into(),
-        },
-        BUDGET,
-    )
-    .await??;
+async fn hierarchy_count(endpoint: SocketAddr, grpc: bool, text: &str) -> anyhow::Result<u64> {
+    use distributed::jobs::{Output, Request};
+    let client = JobClient::connect(endpoint, grpc).await?;
+    let mut output = client
+        .request(
+            Request::Start {
+                start_partition: 0,
+                text: text.into(),
+            },
+            BUDGET,
+        )
+        .await??;
     for _ in 0..100 {
         let Output::Progress {
             token,
@@ -859,30 +865,30 @@ async fn hierarchy_count(endpoint: SocketAddr, text: &str) -> anyhow::Result<u64
         assert_eq!(completeness, QueryCompleteness::Unverified);
         if complete {
             assert!(matches!(
-                jobs::request(endpoint, Request::Cancel { token }, BUDGET).await??,
+                client.request(Request::Cancel { token }, BUDGET).await??,
                 Output::Cancelled
             ));
             return count.context("missing count");
         }
         assert!(count.is_none());
-        output = jobs::request(
-            endpoint,
-            Request::Advance {
-                token,
-                sequence: next_sequence,
-            },
-            BUDGET,
-        )
-        .await??;
-        let replay = jobs::request(
-            endpoint,
-            Request::Advance {
-                token,
-                sequence: next_sequence,
-            },
-            BUDGET,
-        )
-        .await??;
+        output = client
+            .request(
+                Request::Advance {
+                    token,
+                    sequence: next_sequence,
+                },
+                BUDGET,
+            )
+            .await??;
+        let replay = client
+            .request(
+                Request::Advance {
+                    token,
+                    sequence: next_sequence,
+                },
+                BUDGET,
+            )
+            .await??;
         assert_eq!(
             serde_json::to_value(&output)?,
             serde_json::to_value(replay)?
@@ -898,23 +904,26 @@ async fn hierarchy_count(endpoint: SocketAddr, text: &str) -> anyhow::Result<u64
     anyhow::bail!("job did not terminate")
 }
 
-async fn hierarchy_rows(endpoint: SocketAddr) -> anyhow::Result<Vec<QualifiedElement>> {
-    use distributed::jobs::{self, Output, Request};
-    let mut output = jobs::request(
-        endpoint,
-        Request::StartRows {
-            start_partition: 0,
-            text: "g.V(1).repeat(__.out('knows')).emit().times(2)".into(),
-            page_size: 1,
-        },
-        BUDGET,
-    )
-    .await??;
+async fn hierarchy_rows(endpoint: SocketAddr, grpc: bool) -> anyhow::Result<Vec<QualifiedElement>> {
+    use distributed::jobs::{Output, Request};
+    let client = JobClient::connect(endpoint, grpc).await?;
+    let mut output = client
+        .request(
+            Request::StartRows {
+                start_partition: 0,
+                text: "g.V(1).repeat(__.out('knows')).emit().times(2)".into(),
+                page_size: 1,
+            },
+            BUDGET,
+        )
+        .await??;
     let Output::Preparing { token, .. } = output else {
         anyhow::bail!("not preparing");
     };
     assert!(matches!(
-        jobs::request(endpoint, Request::Read { token, cursor: 0 }, BUDGET).await?,
+        client
+            .request(Request::Read { token, cursor: 0 }, BUDGET)
+            .await?,
         Err(QueryFailure::InvalidArgument)
     ));
     for _ in 0..100 {
@@ -929,22 +938,26 @@ async fn hierarchy_rows(endpoint: SocketAddr) -> anyhow::Result<Vec<QualifiedEle
         if ready {
             break;
         }
-        output = jobs::request(
-            endpoint,
-            Request::Advance {
-                token,
-                sequence: next_sequence,
-            },
-            BUDGET,
-        )
-        .await??;
+        output = client
+            .request(
+                Request::Advance {
+                    token,
+                    sequence: next_sequence,
+                },
+                BUDGET,
+            )
+            .await??;
     }
     assert!(matches!(output, Output::Preparing { ready: true, .. }));
     let mut cursor = 0;
     let mut rows = Vec::new();
     loop {
-        let page = jobs::request(endpoint, Request::Read { token, cursor }, BUDGET).await??;
-        let replay = jobs::request(endpoint, Request::Read { token, cursor }, BUDGET).await??;
+        let page = client
+            .request(Request::Read { token, cursor }, BUDGET)
+            .await??;
+        let replay = client
+            .request(Request::Read { token, cursor }, BUDGET)
+            .await??;
         assert_eq!(serde_json::to_value(&page)?, serde_json::to_value(replay)?);
         let Output::Page {
             rows: next_rows,
@@ -965,27 +978,30 @@ async fn hierarchy_rows(endpoint: SocketAddr) -> anyhow::Result<Vec<QualifiedEle
         cursor = next_cursor.context("missing cursor")?;
     }
     assert!(matches!(
-        jobs::request(endpoint, Request::Cancel { token }, BUDGET).await??,
+        client.request(Request::Cancel { token }, BUDGET).await??,
         Output::Cancelled
     ));
     assert!(matches!(
-        jobs::request(endpoint, Request::Read { token, cursor: 0 }, BUDGET).await?,
+        client
+            .request(Request::Read { token, cursor: 0 }, BUDGET)
+            .await?,
         Err(QueryFailure::Unavailable)
     ));
     Ok(rows)
 }
 
-async fn hierarchy_cancel(endpoint: SocketAddr) -> anyhow::Result<()> {
-    use distributed::jobs::{self, Output, Request};
-    let output = jobs::request(
-        endpoint,
-        Request::Start {
-            start_partition: 0,
-            text: "g.V(1).repeat(__.out('knows')).times(1).count()".into(),
-        },
-        BUDGET,
-    )
-    .await??;
+async fn hierarchy_cancel(endpoint: SocketAddr, grpc: bool) -> anyhow::Result<()> {
+    use distributed::jobs::{Output, Request};
+    let client = JobClient::connect(endpoint, grpc).await?;
+    let output = client
+        .request(
+            Request::Start {
+                start_partition: 0,
+                text: "g.V(1).repeat(__.out('knows')).times(1).count()".into(),
+            },
+            BUDGET,
+        )
+        .await??;
     let Output::Progress {
         token,
         next_sequence,
@@ -997,20 +1013,313 @@ async fn hierarchy_cancel(endpoint: SocketAddr) -> anyhow::Result<()> {
         anyhow::bail!("expected unadvanced job");
     };
     assert!(matches!(
-        jobs::request(endpoint, Request::Cancel { token }, BUDGET).await??,
+        client.request(Request::Cancel { token }, BUDGET).await??,
         Output::Cancelled
     ));
     assert!(matches!(
-        jobs::request(
-            endpoint,
-            Request::Advance {
-                token,
-                sequence: next_sequence
-            },
-            BUDGET
-        )
-        .await?,
+        client
+            .request(
+                Request::Advance {
+                    token,
+                    sequence: next_sequence
+                },
+                BUDGET
+            )
+            .await?,
         Err(QueryFailure::Unavailable)
     ));
     Ok(())
+}
+
+enum JobClient {
+    Legacy(SocketAddr),
+    Grpc(distributed::grpc::CoordinatorClient),
+}
+impl JobClient {
+    async fn connect(endpoint: SocketAddr, grpc: bool) -> anyhow::Result<Self> {
+        Ok(if grpc {
+            Self::Grpc(distributed::grpc::CoordinatorClient::connect(endpoint, BUDGET).await?)
+        } else {
+            Self::Legacy(endpoint)
+        })
+    }
+    async fn request(
+        &self,
+        request: distributed::jobs::Request,
+        deadline: Duration,
+    ) -> Result<distributed::jobs::Response, remote::RemoteError> {
+        match self {
+            Self::Grpc(client) => client.job(request, deadline).await,
+            Self::Legacy(endpoint) => {
+                distributed::jobs::request(*endpoint, request, deadline).await
+            }
+        }
+    }
+}
+
+async fn coordinator_ingress_checks(
+    routes: &[PartitionRoute],
+    legacy: SocketAddr,
+) -> anyhow::Result<()> {
+    use distributed::grpc::{wire as w, CoordinatorClient, GrpcCoordinatorService};
+    let directory = tempfile::tempdir()?;
+    let catalog = StaticCatalog {
+        partitions: routes.to_vec(),
+    };
+    let catalog_path = directory.path().join("catalog.json");
+    std::fs::write(&catalog_path, serde_json::to_vec(&catalog)?)?;
+    let reserve = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = reserve.local_addr()?;
+    drop(reserve);
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_graph-coordinator"))
+            .env("TOKIO_WORKER_THREADS", "2")
+            .args([
+                "serve-grpc",
+                "--endpoint",
+                &endpoint.to_string(),
+                "--catalog",
+                catalog_path.to_str().unwrap(),
+                "--allow-insecure-development",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+    let client = timeout(BUDGET, async {
+        loop {
+            anyhow::ensure!(
+                process.0.try_wait()?.is_none(),
+                "coordinator exited before readiness"
+            );
+            if let Ok(client) =
+                CoordinatorClient::connect(endpoint, Duration::from_millis(300)).await
+            {
+                if client
+                    .query(request("g.V(1).count()"), Duration::from_millis(500))
+                    .await
+                    .is_ok()
+                {
+                    return Ok::<_, anyhow::Error>(client);
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    for text in [
+        "g.V(1).out('knows')",
+        "g.V(1).out('knows').in('knows').path()",
+        "g.V(1).values('nullable')",
+        "g.V(1).values('signed')",
+        "g.V(1).values('real')",
+        "g.V(1).values('enabled')",
+        "g.V(1).out('knows').valueMap('nullable','name','signed','real','enabled')",
+        "g.V().count()",
+        "g.V(",
+        "g.V(139).out('missing')",
+    ] {
+        assert_eq!(
+            client
+                .query(request(text), BUDGET)
+                .await
+                .with_context(|| format!("typed query {text}"))?,
+            distributed::query(legacy, request(text), BUDGET).await?,
+            "coordinator ingress parity: {text}"
+        );
+    }
+    let text = "g.V(1,1).repeat(__.out('knows')).emit().times(2).count()";
+    assert_eq!(
+        hierarchy_count(endpoint, true, text)
+            .await
+            .context("typed count job")?,
+        hierarchy_count(legacy, false, text).await?
+    );
+    assert_eq!(
+        hierarchy_rows(endpoint, true)
+            .await
+            .context("typed rows job")?,
+        hierarchy_rows(legacy, false).await?
+    );
+    assert_eq!(
+        projected_rows(endpoint, true)
+            .await
+            .context("typed projected job")?,
+        projected_rows(legacy, false).await?
+    );
+    hierarchy_cancel(endpoint, true)
+        .await
+        .context("typed cancel")?;
+    // Malformed typed envelopes fail before a job or query is created.
+    let mut raw = w::coordinator_service_client::CoordinatorServiceClient::connect(format!(
+        "http://{endpoint}"
+    ))
+    .await?;
+    for (version, millis) in [(99, 5000), (1, 0), (1, 5001)] {
+        assert!(raw
+            .query(w::CoordinatorQueryRequest {
+                version,
+                timeout_millis: millis,
+                start_partition: 0,
+                text: "g.V(1).count()".into(),
+            })
+            .await
+            .is_err());
+    }
+    assert!(raw
+        .job(w::CoordinatorJobRequest {
+            version: 1,
+            timeout_millis: 5000,
+            request: None,
+        })
+        .await
+        .is_err());
+    assert!(raw
+        .job(w::CoordinatorJobRequest {
+            version: 1,
+            timeout_millis: 5000,
+            request: Some(w::coordinator_job_request::Request::Cancel(w::JobCancel {
+                token: vec![0; 15]
+            })),
+        })
+        .await
+        .is_err());
+    // Wrong transport must fail, rather than silently probing/falling back.
+    assert!(distributed::query(
+        endpoint,
+        request("g.V(1).count()"),
+        Duration::from_millis(300)
+    )
+    .await
+    .is_err());
+    if let Ok(wrong) = CoordinatorClient::connect(legacy, Duration::from_millis(300)).await {
+        assert!(wrong
+            .query(request("g.V(1).count()"), Duration::from_millis(300))
+            .await
+            .is_err());
+    }
+    assert!(client
+        .query(request("g.V(1).count()"), BUDGET)
+        .await?
+        .is_ok());
+    process.0.kill()?;
+    process.0.wait()?;
+    assert!(client
+        .query(request("g.V(1).count()"), Duration::from_millis(500))
+        .await
+        .is_err());
+    // Exercise library lifecycle independently of killing the CLI process.
+    for graceful in [true, false] {
+        let service =
+            GrpcCoordinatorService::start("127.0.0.1:0".parse()?, catalog.clone(), BUDGET).await?;
+        let address = service.local_addr();
+        let held = CoordinatorClient::connect(address, BUDGET).await?;
+        hierarchy_cancel(address, true).await?;
+        // Leave an admitted unfinished job behind. More than the two job slots
+        // across restarts must succeed only if shutdown/drop releases them.
+        let retained = held
+            .job(
+                distributed::jobs::Request::Start {
+                    start_partition: 0,
+                    text: "g.V(1).repeat(__.out('knows')).times(1).count()".into(),
+                },
+                BUDGET,
+            )
+            .await??;
+        assert!(matches!(
+            retained,
+            distributed::jobs::Output::Progress {
+                complete: false,
+                ..
+            }
+        ));
+        if graceful {
+            service.shutdown().await;
+        } else {
+            drop(service);
+        }
+        timeout(Duration::from_secs(2), async {
+            while TcpStream::connect(address).await.is_ok() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        assert!(held
+            .query(request("g.V(1).count()"), Duration::from_millis(300))
+            .await
+            .is_err());
+    }
+    Ok(())
+}
+
+async fn projected_rows(
+    endpoint: SocketAddr,
+    grpc: bool,
+) -> anyhow::Result<Vec<distributed::jobs::ProjectedRow>> {
+    use distributed::jobs::{Output, Request};
+    let client = JobClient::connect(endpoint, grpc).await?;
+    let mut output = client.request( Request::StartRows {
+        start_partition: 0,
+        text: "g.V(1).repeat(__.out('knows')).emit().times(2).valueMap('nullable','name','signed','real','enabled')".into(),
+        page_size: 1,
+    }, BUDGET).await??;
+    let Output::Preparing { token, .. } = output else {
+        anyhow::bail!("not preparing");
+    };
+    for _ in 0..100 {
+        let Output::Preparing {
+            ready,
+            next_sequence,
+            ..
+        } = output
+        else {
+            anyhow::bail!("not preparing");
+        };
+        if ready {
+            break;
+        }
+        output = client
+            .request(
+                Request::Advance {
+                    token,
+                    sequence: next_sequence,
+                },
+                BUDGET,
+            )
+            .await??;
+    }
+    assert!(matches!(output, Output::Preparing { ready: true, .. }));
+    let mut cursor = 0;
+    let mut all = Vec::new();
+    loop {
+        let page = client
+            .request(Request::Read { token, cursor }, BUDGET)
+            .await??;
+        let replay = client
+            .request(Request::Read { token, cursor }, BUDGET)
+            .await??;
+        assert_eq!(serde_json::to_value(&page)?, serde_json::to_value(replay)?);
+        let Output::ProjectedPage {
+            rows,
+            next_cursor,
+            done,
+            completeness,
+            ..
+        } = page
+        else {
+            anyhow::bail!("not projected page");
+        };
+        assert_eq!(completeness, QueryCompleteness::Unverified);
+        assert_eq!(rows.len(), 1);
+        all.extend(rows);
+        if done {
+            break;
+        }
+        cursor = next_cursor.context("missing cursor")?;
+    }
+    assert!(matches!(
+        client.request(Request::Cancel { token }, BUDGET).await??,
+        Output::Cancelled
+    ));
+    Ok(all)
 }

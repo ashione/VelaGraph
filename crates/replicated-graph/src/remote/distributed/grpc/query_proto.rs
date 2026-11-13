@@ -768,6 +768,288 @@ pub mod application_error {
     }
 }
 #[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CoordinatorQueryRequest {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(uint64, tag = "2")]
+    pub timeout_millis: u64,
+    #[prost(uint32, tag = "3")]
+    pub start_partition: u32,
+    #[prost(string, tag = "4")]
+    pub text: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct QualifiedElement {
+    #[prost(oneof = "qualified_element::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<qualified_element::Kind>,
+}
+/// Nested message and enum types in `QualifiedElement`.
+pub mod qualified_element {
+    #[allow(clippy::all)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Vertex(super::VertexId),
+        #[prost(message, tag = "2")]
+        Edge(super::VertexId),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryPath {
+    #[prost(message, repeated, tag = "1")]
+    pub elements: ::prost::alloc::vec::Vec<QualifiedElement>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PropertyValues {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<Value>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PropertyMap {
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<QualifiedElement>,
+    #[prost(message, repeated, tag = "2")]
+    pub properties: ::prost::alloc::vec::Vec<PropertyValues>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarValue {
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<QualifiedElement>,
+    #[prost(message, optional, tag = "2")]
+    pub value: ::core::option::Option<Value>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryRow {
+    #[prost(oneof = "query_row::Kind", tags = "1, 2, 3, 4, 5")]
+    pub kind: ::core::option::Option<query_row::Kind>,
+}
+/// Nested message and enum types in `QueryRow`.
+pub mod query_row {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Element(super::QualifiedElement),
+        #[prost(message, tag = "2")]
+        Path(super::QueryPath),
+        #[prost(uint64, tag = "3")]
+        Count(u64),
+        #[prost(message, tag = "4")]
+        PropertyMap(super::PropertyMap),
+        #[prost(message, tag = "5")]
+        Value(super::ScalarValue),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CoordinatorQueryOutput {
+    #[prost(enumeration = "Completeness", tag = "1")]
+    pub completeness: i32,
+    #[prost(message, repeated, tag = "2")]
+    pub snapshots: ::prost::alloc::vec::Vec<QueryStamp>,
+    #[prost(message, repeated, tag = "3")]
+    pub rows: ::prost::alloc::vec::Vec<QueryRow>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CoordinatorQueryResponse {
+    #[prost(oneof = "coordinator_query_response::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<coordinator_query_response::Result>,
+}
+/// Nested message and enum types in `CoordinatorQueryResponse`.
+pub mod coordinator_query_response {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Output(super::CoordinatorQueryOutput),
+        #[prost(enumeration = "super::QueryFailure", tag = "2")]
+        Failure(i32),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStart {
+    #[prost(uint32, tag = "1")]
+    pub start_partition: u32,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStartRows {
+    #[prost(uint32, tag = "1")]
+    pub start_partition: u32,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub page_size: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobRead {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub cursor: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobAdvance {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobCancel {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CoordinatorJobRequest {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(uint64, tag = "2")]
+    pub timeout_millis: u64,
+    #[prost(oneof = "coordinator_job_request::Request", tags = "3, 4, 5, 6, 7")]
+    pub request: ::core::option::Option<coordinator_job_request::Request>,
+}
+/// Nested message and enum types in `CoordinatorJobRequest`.
+pub mod coordinator_job_request {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Request {
+        #[prost(message, tag = "3")]
+        Start(super::JobStart),
+        #[prost(message, tag = "4")]
+        StartRows(super::JobStartRows),
+        #[prost(message, tag = "5")]
+        Read(super::JobRead),
+        #[prost(message, tag = "6")]
+        Advance(super::JobAdvance),
+        #[prost(message, tag = "7")]
+        Cancel(super::JobCancel),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobProjectedPage {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub cursor: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub next_cursor: ::core::option::Option<u64>,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(message, repeated, tag = "5")]
+    pub rows: ::prost::alloc::vec::Vec<PropertyMap>,
+    #[prost(enumeration = "Completeness", tag = "6")]
+    pub completeness: i32,
+    #[prost(message, repeated, tag = "7")]
+    pub snapshots: ::prost::alloc::vec::Vec<QueryStamp>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobPreparing {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub next_sequence: u64,
+    #[prost(bool, tag = "3")]
+    pub ready: bool,
+    #[prost(enumeration = "Completeness", tag = "4")]
+    pub completeness: i32,
+    #[prost(message, repeated, tag = "5")]
+    pub snapshots: ::prost::alloc::vec::Vec<QueryStamp>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobPage {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub cursor: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub next_cursor: ::core::option::Option<u64>,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(message, repeated, tag = "5")]
+    pub rows: ::prost::alloc::vec::Vec<QualifiedElement>,
+    #[prost(enumeration = "Completeness", tag = "6")]
+    pub completeness: i32,
+    #[prost(message, repeated, tag = "7")]
+    pub snapshots: ::prost::alloc::vec::Vec<QueryStamp>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobProgress {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub next_sequence: u64,
+    #[prost(bool, tag = "3")]
+    pub complete: bool,
+    #[prost(uint64, optional, tag = "4")]
+    pub count: ::core::option::Option<u64>,
+    #[prost(enumeration = "Completeness", tag = "5")]
+    pub completeness: i32,
+    #[prost(message, repeated, tag = "6")]
+    pub snapshots: ::prost::alloc::vec::Vec<QueryStamp>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CoordinatorJobOutput {
+    #[prost(oneof = "coordinator_job_output::Kind", tags = "1, 2, 3, 4, 5")]
+    pub kind: ::core::option::Option<coordinator_job_output::Kind>,
+}
+/// Nested message and enum types in `CoordinatorJobOutput`.
+pub mod coordinator_job_output {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        ProjectedPage(super::JobProjectedPage),
+        #[prost(message, tag = "2")]
+        Preparing(super::JobPreparing),
+        #[prost(message, tag = "3")]
+        Page(super::JobPage),
+        #[prost(message, tag = "4")]
+        Progress(super::JobProgress),
+        #[prost(message, tag = "5")]
+        Cancelled(super::Empty),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CoordinatorJobResponse {
+    #[prost(oneof = "coordinator_job_response::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<coordinator_job_response::Result>,
+}
+/// Nested message and enum types in `CoordinatorJobResponse`.
+pub mod coordinator_job_response {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Output(super::CoordinatorJobOutput),
+        #[prost(enumeration = "super::QueryFailure", tag = "2")]
+        Failure(i32),
+    }
+}
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum QueryFailure {
@@ -958,6 +1240,36 @@ impl CoordinatorError {
             "COORDINATOR_CAPACITY_NOT_CONFIRMED" => Some(Self::CoordinatorCapacityNotConfirmed),
             "COORDINATOR_INVALID_JOURNAL" => Some(Self::CoordinatorInvalidJournal),
             "COORDINATOR_INCOMPATIBLE_HISTORY" => Some(Self::CoordinatorIncompatibleHistory),
+            _ => None,
+        }
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Completeness {
+    Unspecified = 0,
+    SinglePartition = 1,
+    Unverified = 2,
+}
+impl Completeness {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPLETENESS_UNSPECIFIED",
+            Self::SinglePartition => "SINGLE_PARTITION",
+            Self::Unverified => "UNVERIFIED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPLETENESS_UNSPECIFIED" => Some(Self::Unspecified),
+            "SINGLE_PARTITION" => Some(Self::SinglePartition),
+            "UNVERIFIED" => Some(Self::Unverified),
             _ => None,
         }
     }
@@ -1961,6 +2273,354 @@ pub mod fixed_query_service_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "velagraph.internal.query.v1.FixedQueryService";
     impl<T> tonic::server::NamedService for FixedQueryServiceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod coordinator_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value
+    )]
+    use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
+    /// Observed coordinator ingress. Shares executor/job state, not a new query engine.
+    #[derive(Debug, Clone)]
+    pub struct CoordinatorServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl CoordinatorServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> CoordinatorServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> CoordinatorServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            CoordinatorServiceClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn query(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CoordinatorQueryRequest>,
+        ) -> std::result::Result<tonic::Response<super::CoordinatorQueryResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::remote::distributed::grpc::bounded_codec::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.internal.query.v1.CoordinatorService/Query",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.internal.query.v1.CoordinatorService",
+                "Query",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn job(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CoordinatorJobRequest>,
+        ) -> std::result::Result<tonic::Response<super::CoordinatorJobResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::remote::distributed::grpc::bounded_codec::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.internal.query.v1.CoordinatorService/Job",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.internal.query.v1.CoordinatorService",
+                "Job",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod coordinator_service_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with CoordinatorServiceServer.
+    #[async_trait]
+    pub trait CoordinatorService: std::marker::Send + std::marker::Sync + 'static {
+        async fn query(
+            &self,
+            request: tonic::Request<super::CoordinatorQueryRequest>,
+        ) -> std::result::Result<tonic::Response<super::CoordinatorQueryResponse>, tonic::Status>;
+        async fn job(
+            &self,
+            request: tonic::Request<super::CoordinatorJobRequest>,
+        ) -> std::result::Result<tonic::Response<super::CoordinatorJobResponse>, tonic::Status>;
+    }
+    /// Observed coordinator ingress. Shares executor/job state, not a new query engine.
+    #[derive(Debug)]
+    pub struct CoordinatorServiceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> CoordinatorServiceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for CoordinatorServiceServer<T>
+    where
+        T: CoordinatorService,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/velagraph.internal.query.v1.CoordinatorService/Query" => {
+                    #[allow(non_camel_case_types)]
+                    struct QuerySvc<T: CoordinatorService>(pub Arc<T>);
+                    impl<T: CoordinatorService>
+                        tonic::server::UnaryService<super::CoordinatorQueryRequest>
+                        for QuerySvc<T>
+                    {
+                        type Response = super::CoordinatorQueryResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CoordinatorQueryRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CoordinatorService>::query(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = QuerySvc(inner);
+                        let codec =
+                            crate::remote::distributed::grpc::bounded_codec::BoundedCodec::default(
+                            );
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/velagraph.internal.query.v1.CoordinatorService/Job" => {
+                    #[allow(non_camel_case_types)]
+                    struct JobSvc<T: CoordinatorService>(pub Arc<T>);
+                    impl<T: CoordinatorService>
+                        tonic::server::UnaryService<super::CoordinatorJobRequest> for JobSvc<T>
+                    {
+                        type Response = super::CoordinatorJobResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CoordinatorJobRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CoordinatorService>::job(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = JobSvc(inner);
+                        let codec =
+                            crate::remote::distributed::grpc::bounded_codec::BoundedCodec::default(
+                            );
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
+            }
+        }
+    }
+    impl<T> Clone for CoordinatorServiceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "velagraph.internal.query.v1.CoordinatorService";
+    impl<T> tonic::server::NamedService for CoordinatorServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

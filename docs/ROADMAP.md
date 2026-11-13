@@ -21,7 +21,9 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   observed data-local query fragments 的 Open → Fragment → Close 由 [#227](https://github.com/ashione/VelaGraph/issues/227)
   跟踪，复用真实 query sessions/admission，显式选择 gRPC coordinator backend。
   详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；observed hierarchy jobs 的 shard
-  OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径，但 coordinator job 入口仍是旧协议。不能将这些已交付切片当作旧入口和兼容路径已全部删除。
+  OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径；[#248](https://github.com/ashione/VelaGraph/issues/248)
+  增加 coordinator observed Query/Job typed gRPC 入口，serve-grpc 与 --grpc 客户端复用原执行器、
+  Jobs 状态机及累计预算。旧 coordinator TCP/control/兼容入口仍待退役，不能视作全部删除。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
   managed control 与对外 gateway 协议仍不在该切片内。

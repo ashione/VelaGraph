@@ -55,6 +55,18 @@ fn decode_checked<U: Message + Default + BoundedMessage, B: Buf>(buf: &mut B) ->
     {
         return Err(limit());
     }
+    let ingress_limit = match schema {
+        Schema::CoordinatorQueryRequest | Schema::CoordinatorJobRequest => {
+            Some(crate::remote::query::MAX_QUERY_TEXT_BYTES + 1024)
+        }
+        Schema::CoordinatorQueryResponse | Schema::CoordinatorJobResponse => {
+            Some(super::super::MAX_WIRE)
+        }
+        _ => None,
+    };
+    if ingress_limit.is_some_and(|max| buf.remaining() > max) {
+        return Err(limit());
+    }
     scan(schema, buf.chunk(), 0, 0)?;
     #[cfg(test)]
     PROST_DECODES.with(|n| n.set(n.get() + 1));
@@ -68,6 +80,29 @@ fn limit() -> Status {
 }
 #[derive(Clone, Copy)]
 pub enum Schema {
+    CoordinatorValue,
+    CoordinatorQueryRequest,
+    QualifiedElement,
+    QueryPath,
+    PropertyValues,
+    PropertyMap,
+    ScalarValue,
+    QueryRow,
+    CoordinatorQueryOutput,
+    CoordinatorQueryResponse,
+    JobStart,
+    JobStartRows,
+    JobRead,
+    JobAdvance,
+    JobCancel,
+    CoordinatorJobRequest,
+    JobProjectedPage,
+    JobPreparing,
+    JobPage,
+    JobProgress,
+    CoordinatorJobOutput,
+    CoordinatorJobResponse,
+
     Empty,
     Identity,
     Context,
@@ -144,6 +179,28 @@ const MAX_TERMINAL_SEGMENTS: usize =
 #[rustfmt::skip]
 fn fields(s: Schema) -> &'static [Field] {
  match s {
+ Schema::CoordinatorQueryRequest => &[Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Bytes(None), max: 1, repeated: false }],
+ Schema::QualifiedElement => &[Field { tag: 1, kind: Kind::Child(Schema::VertexId), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::VertexId), max: 1, repeated: false }],
+ Schema::QueryPath => &[Field { tag: 1, kind: Kind::Child(Schema::QualifiedElement), max: super::super::MAX_WIRE, repeated: true }],
+ Schema::PropertyValues => &[Field { tag: 1, kind: Kind::Bytes(None), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::CoordinatorValue), max: 1, repeated: true }],
+ Schema::PropertyMap => &[Field { tag: 1, kind: Kind::Child(Schema::QualifiedElement), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::PropertyValues), max: 8, repeated: true }],
+ Schema::ScalarValue => &[Field { tag: 1, kind: Kind::Child(Schema::QualifiedElement), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::CoordinatorValue), max: 1, repeated: false }],
+ Schema::QueryRow => &[Field { tag: 1, kind: Kind::Child(Schema::QualifiedElement), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::QueryPath), max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Child(Schema::PropertyMap), max: 1, repeated: false }, Field { tag: 5, kind: Kind::Child(Schema::ScalarValue), max: 1, repeated: false }],
+ Schema::CoordinatorQueryOutput => &[Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::QueryStamp), max: 8, repeated: true }, Field { tag: 3, kind: Kind::Child(Schema::QueryRow), max: super::super::MAX_ROWS, repeated: true }],
+ Schema::CoordinatorQueryResponse => &[Field { tag: 1, kind: Kind::Child(Schema::CoordinatorQueryOutput), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }],
+ Schema::JobStart => &[Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 2, kind: Kind::Bytes(None), max: 1, repeated: false }],
+ Schema::JobStartRows => &[Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 2, kind: Kind::Bytes(None), max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }],
+ Schema::JobRead => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }],
+ Schema::JobAdvance => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }],
+ Schema::JobCancel => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }],
+ Schema::CoordinatorJobRequest => &[Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Child(Schema::JobStart), max: 1, repeated: false }, Field { tag: 4, kind: Kind::Child(Schema::JobStartRows), max: 1, repeated: false }, Field { tag: 5, kind: Kind::Child(Schema::JobRead), max: 1, repeated: false }, Field { tag: 6, kind: Kind::Child(Schema::JobAdvance), max: 1, repeated: false }, Field { tag: 7, kind: Kind::Child(Schema::JobCancel), max: 1, repeated: false }],
+ Schema::JobProjectedPage => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 5, kind: Kind::Child(Schema::PropertyMap), max: 128, repeated: true }, Field { tag: 6, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 7, kind: Kind::Child(Schema::QueryStamp), max: 8, repeated: true }],
+ Schema::JobPreparing => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 5, kind: Kind::Child(Schema::QueryStamp), max: 8, repeated: true }],
+ Schema::JobPage => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 5, kind: Kind::Child(Schema::QualifiedElement), max: 1000, repeated: true }, Field { tag: 6, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 7, kind: Kind::Child(Schema::QueryStamp), max: 8, repeated: true }],
+ Schema::JobProgress => &[Field { tag: 1, kind: Kind::Bytes(Some(16)), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 4, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 5, kind: Kind::Varint, max: 1, repeated: false }, Field { tag: 6, kind: Kind::Child(Schema::QueryStamp), max: 8, repeated: true }],
+ Schema::CoordinatorJobOutput => &[Field { tag: 1, kind: Kind::Child(Schema::JobProjectedPage), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Child(Schema::JobPreparing), max: 1, repeated: false }, Field { tag: 3, kind: Kind::Child(Schema::JobPage), max: 1, repeated: false }, Field { tag: 4, kind: Kind::Child(Schema::JobProgress), max: 1, repeated: false }, Field { tag: 5, kind: Kind::Child(Schema::Empty), max: 1, repeated: false }],
+ Schema::CoordinatorJobResponse => &[Field { tag: 1, kind: Kind::Child(Schema::CoordinatorJobOutput), max: 1, repeated: false }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false }],
+
  Schema::Empty => &[],
  Schema::Identity => &[ Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false, }, ],
  Schema::Context => &[ Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Child(Schema::Identity), max: 1, repeated: false, }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false, }, ],
@@ -152,7 +209,7 @@ fn fields(s: Schema) -> &'static [Field] {
  Schema::VertexId => &[ Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false, }, ],
  Schema::EdgeHop => &[ Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Child(Schema::VertexId), max: 1, repeated: false, }, Field { tag: 3, kind: Kind::Child(Schema::VertexId), max: 1, repeated: false, }, Field { tag: 4, kind: Kind::Bytes(None), max: 1, repeated: false, }, ],
  Schema::IncomingEdge => &[ Field { tag: 1, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 3, kind: Kind::Bytes(None), max: 1, repeated: false, }, ],
- Schema::Value => &[ Field { tag: 1, kind: Kind::Child(Schema::Empty), max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 3, kind: Kind::Fixed64, max: 1, repeated: false, }, Field { tag: 4, kind: Kind::Bytes(None), max: 1, repeated: false, }, Field { tag: 5, kind: Kind::Varint, max: 1, repeated: false, }, ],
+ Schema::Value | Schema::CoordinatorValue => &[ Field { tag: 1, kind: Kind::Child(Schema::Empty), max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Varint, max: 1, repeated: false, }, Field { tag: 3, kind: Kind::Fixed64, max: 1, repeated: false, }, Field { tag: 4, kind: Kind::Bytes(None), max: 1, repeated: false, }, Field { tag: 5, kind: Kind::Varint, max: 1, repeated: false, }, ],
  Schema::Filter => &[ Field { tag: 1, kind: Kind::Bytes(None), max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Child(Schema::Value), max: 1, repeated: false, }, ],
  Schema::Labels => &[Field { tag: 1, kind: Kind::Bytes(None), max: crate::remote::MAX_FRAME_BYTES, repeated: true, }],
  Schema::ScanStep => &[ Field { tag: 1, kind: Kind::Child(Schema::Filter), max: 1, repeated: false, }, Field { tag: 2, kind: Kind::Child(Schema::Labels), max: 1, repeated: false, }, Field { tag: 3, kind: Kind::Varint, max: 1, repeated: false, }, ],
@@ -360,6 +417,19 @@ fn scan(schema: Schema, mut data: &[u8], depth: usize, batches: usize) -> Result
             return Err(limit());
         }
     }
+    let oneof_count = match schema {
+        Schema::CoordinatorValue
+        | Schema::QualifiedElement
+        | Schema::QueryRow
+        | Schema::CoordinatorQueryResponse
+        | Schema::CoordinatorJobOutput
+        | Schema::CoordinatorJobResponse => Some(counts.iter().sum::<usize>()),
+        Schema::CoordinatorJobRequest => Some(counts[2..].iter().sum::<usize>()),
+        _ => None,
+    };
+    if oneof_count.is_some_and(|n| n != 1) {
+        return Err(bad());
+    }
     // Missing byte arrays would default to empty vectors. Reject before allocating
     // enclosing records. Zero scalar fields are legal protobuf defaults and count
     // as a one-digit JSON number even when omitted from the frame.
@@ -442,6 +512,26 @@ impl BoundedMessage for wire::Empty {
     }
 }
 
+impl BoundedMessage for wire::CoordinatorQueryRequest {
+    fn schema() -> Schema {
+        Schema::CoordinatorQueryRequest
+    }
+}
+impl BoundedMessage for wire::CoordinatorQueryResponse {
+    fn schema() -> Schema {
+        Schema::CoordinatorQueryResponse
+    }
+}
+impl BoundedMessage for wire::CoordinatorJobRequest {
+    fn schema() -> Schema {
+        Schema::CoordinatorJobRequest
+    }
+}
+impl BoundedMessage for wire::CoordinatorJobResponse {
+    fn schema() -> Schema {
+        Schema::CoordinatorJobResponse
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +698,86 @@ mod tests {
             tonic::Code::ResourceExhausted
         );
         PROST_DECODES.with(|n| assert_eq!(n.get(), 0));
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use super::*;
+    fn reject<U: Message + Default + BoundedMessage>(bytes: Vec<u8>) {
+        PROST_DECODES.with(|n| n.set(0));
+        assert!(decode_checked::<U, _>(&mut bytes.as_slice()).is_err());
+        PROST_DECODES.with(|n| assert_eq!(n.get(), 0));
+    }
+    #[test]
+    fn coordinator_prescan_rejects_bad_oneofs_tokens_and_collections_before_allocation() {
+        reject::<wire::CoordinatorJobRequest>(vec![8, 1, 16, 1]); // no request
+        reject::<wire::CoordinatorQueryResponse>(vec![0x0a, 0, 0x10, 1]); // both results
+        let mut job = wire::CoordinatorJobRequest {
+            version: 1,
+            timeout_millis: 1,
+            request: Some(wire::coordinator_job_request::Request::Cancel(
+                wire::JobCancel { token: vec![1; 15] },
+            )),
+        };
+        reject::<wire::CoordinatorJobRequest>(job.encode_to_vec());
+        job.request = Some(wire::coordinator_job_request::Request::Cancel(
+            wire::JobCancel { token: vec![1; 16] },
+        ));
+        let mut duplicate = job.encode_to_vec();
+        duplicate.extend([8, 1]);
+        reject::<wire::CoordinatorJobRequest>(duplicate);
+        let output = wire::CoordinatorQueryOutput {
+            completeness: 2,
+            snapshots: vec![wire::QueryStamp::default(); 9],
+            rows: vec![],
+        };
+        reject::<wire::CoordinatorQueryResponse>(
+            wire::CoordinatorQueryResponse {
+                result: Some(wire::coordinator_query_response::Result::Output(output)),
+            }
+            .encode_to_vec(),
+        );
+        let output = wire::CoordinatorQueryOutput {
+            completeness: 2,
+            snapshots: vec![],
+            rows: vec![
+                wire::QueryRow {
+                    kind: Some(wire::query_row::Kind::Count(0))
+                };
+                super::super::super::MAX_ROWS + 1
+            ],
+        };
+        reject::<wire::CoordinatorQueryResponse>(
+            wire::CoordinatorQueryResponse {
+                result: Some(wire::coordinator_query_response::Result::Output(output)),
+            }
+            .encode_to_vec(),
+        );
+    }
+    #[test]
+    fn coordinator_prescan_accepts_valid_typed_failures_and_cancel() {
+        let response = wire::CoordinatorQueryResponse {
+            result: Some(wire::coordinator_query_response::Result::Failure(
+                wire::QueryFailure::Unavailable as i32,
+            )),
+        };
+        let bytes = response.encode_to_vec();
+        assert_eq!(
+            decode_checked::<wire::CoordinatorQueryResponse, _>(&mut bytes.as_slice()).unwrap(),
+            response
+        );
+        let request = wire::CoordinatorJobRequest {
+            version: 1,
+            timeout_millis: 1,
+            request: Some(wire::coordinator_job_request::Request::Cancel(
+                wire::JobCancel { token: vec![1; 16] },
+            )),
+        };
+        let bytes = request.encode_to_vec();
+        assert_eq!(
+            decode_checked::<wire::CoordinatorJobRequest, _>(&mut bytes.as_slice()).unwrap(),
+            request
+        );
     }
 }

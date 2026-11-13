@@ -301,6 +301,9 @@ impl Jobs {
             ..Self::new()
         }
     }
+    pub(super) fn clear(&self) {
+        self.values.lock().unwrap().clear();
+    }
     pub(super) fn expire(&self) {
         self.values.lock().unwrap().retain(|_, entry| {
             if Instant::now() >= entry.expires {

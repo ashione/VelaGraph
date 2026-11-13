@@ -4,6 +4,12 @@ use super::*;
 use crate::remote::paged::grpc::{remote_status, response, status, Handler};
 use tonic::{transport::Channel, Status};
 
+#[path = "grpc/coordinator_codec.rs"]
+mod coordinator_codec;
+#[path = "grpc/coordinator_transport.rs"]
+mod coordinator_transport;
+pub use coordinator_transport::{CoordinatorClient, GrpcCoordinatorService};
+
 pub mod wire {
     include!("grpc/query_proto.rs");
 }
