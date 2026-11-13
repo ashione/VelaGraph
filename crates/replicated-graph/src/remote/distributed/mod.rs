@@ -982,8 +982,8 @@ impl CoordinatorService {
     ) -> Result<Self, RemoteError> {
         Self::start_transport(bind, catalog, deadline, false).await
     }
-    /// Explicit observed-query-only gRPC backend. Catalog endpoints must be gRPC.
-    /// Jobs and fixed/managed consistency are rejected, never sent to legacy TCP.
+    /// Explicit observed query/job shard gRPC backend. Catalog endpoints must be gRPC.
+    /// Fixed/managed consistency is rejected, never sent to legacy TCP.
     pub async fn start_grpc(
         bind: SocketAddr,
         catalog: StaticCatalog,
@@ -1025,7 +1025,7 @@ impl CoordinatorService {
             .map_err(|_| RemoteError::Unavailable)?;
         let (stop, mut stopped) = watch::channel(false);
         let catalog = Arc::new(catalog);
-        let jobs = Arc::new(jobs::Jobs::new());
+        let jobs = Arc::new(jobs::Jobs::with_grpc_clients(clients.clone()));
         let task = tokio::spawn(async move {
             let mut handlers = JoinSet::new();
             let mut cleanup = tokio::time::interval(Duration::from_millis(100));
@@ -1076,10 +1076,6 @@ impl CoordinatorService {
                             IncomingRequest::Consistent(_) if clients.is_some() => {
                                 consistency::unsupported(end)
                             }
-                            IncomingRequest::Job(_) if clients.is_some() => bounded_encode(
-                                &Err::<jobs::Output, _>(QueryFailure::Unsupported),
-                                end,
-                            ),
                             IncomingRequest::Consistent(envelope) => {
                                 consistency::handle(
                                     catalog,

@@ -25,6 +25,9 @@ The tonic channel may reconnect a transport connection; this is not application
 replay or reopening a lost query session. A wrong port or
 identity fails. One channel per unique shard is established during startup and
 reused across query Open/Fragment/Close calls, rather than connecting per fragment.
+Hierarchy jobs use typed OpenHierarchy (including the conservative stored-row byte
+bound), followed by the same typed Fragment/Close calls. Each job retains its
+selected clients; it never falls back to the old shard transport.
 
 ## Preserved semantics
 
@@ -52,19 +55,18 @@ reused across query Open/Fragment/Close calls, rather than connecting per fragme
 
 ## Deliberate exclusions and removal plan
 
-The gRPC-backed coordinator rejects hierarchy job and explicit consistency
-requests with typed `Unsupported`. Fixed/renewable query sessions have a separate
-[managed-gateway gRPC entrypoint](INTERNAL_GRPC_FIXED_QUERIES.md); that does not
-change this observed coordinator's admitted request types. Fixed/renewable managed sessions are not selected through this coordinator. Query
-jobs, managed control, public write/query gRPC+HTTP and Raft are **not migrated here**.
-Do not point those existing clients at the gRPC ports or interpret this slice as
-completion of the protocol-unification roadmap.
+The gRPC-backed coordinator supports observed hierarchy count/row jobs but still
+rejects explicit consistency requests with typed `Unsupported`. Fixed/renewable
+query sessions have a separate [managed-gateway gRPC entrypoint](INTERNAL_GRPC_FIXED_QUERIES.md).
+The coordinator's **client-facing query/job envelope is still legacy TCP/JSON**;
+this slice migrates only coordinator-to-shard job sessions. Managed control and
+Raft also remain separate migrations. Do not interpret this slice as completion
+of the protocol-unification roadmap.
 
-Next migrate fixed/renewable and long-running job fragment sessions using the
-same registry/admission model; then switch the respective callers after their
-semantic and resource gates pass. Remove replaced legacy dispatch only after its
-remaining callers migrate. This is a bounded migration, not two permanent query
-engines. Storage record encoding and consensus are unchanged.
+The original job state machine retains cumulative budgets, shard parallelism,
+immutable page/replay behavior, cancellation and leases. Explicit TCP selection
+is retained for differential tests until all callers migrate; it is not a second
+query engine. Storage record encoding and consensus are unchanged.
 
 The endpoint remains plaintext and unauthenticated for trusted development
 networks. Matching a configured identity is not authentication. Session tokens
@@ -75,7 +77,8 @@ regenerate with `scripts/generate-internal-query-proto.sh`.
 ## Verification
 
 `grpc_query_process` exercises actual graph-node processes with TCP/gRPC
-coordinators against the same data and compares ordered results and failures.
+coordinators against the same data and compares ordered results and failures,
+including hierarchy count jobs, snapshot stamps and repeated Advance replay.
 Codec tests cover typed shapes and malformed messages. Existing snapshot and
 legacy query suites remain regression gates. Successful tests establish semantic
 compatibility for this slice, not a throughput improvement or production readiness.

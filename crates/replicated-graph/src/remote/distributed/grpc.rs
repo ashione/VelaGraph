@@ -1,5 +1,5 @@
 //! Typed observed data-local query fragments. No snapshot download or JSON payload.
-//! Fixed/renewable sessions and hierarchy job orchestration are not migrated here.
+//! Includes hierarchy job shard sessions; coordinator ingress is separate.
 use super::*;
 use crate::remote::paged::grpc::{remote_status, response, status, Handler};
 use tonic::{transport::Channel, Status};
@@ -63,6 +63,36 @@ impl QueryService for Handler {
             .await?
         {
             (Reply::OpenQuery(descriptor), end) => Ok(response(descriptor.into(), end)),
+            _ => Err(status(RemoteError::Protocol)),
+        }
+    }
+    async fn open_hierarchy(
+        &self,
+        request: tonic::Request<wire::OpenRequest>,
+    ) -> Result<tonic::Response<wire::HierarchyDescriptor>, Status> {
+        let request = request.into_inner();
+        match self
+            .execute(
+                Some(context(request.context)?),
+                Operation::OpenHierarchyQuery {
+                    shard: request.shard,
+                },
+            )
+            .await?
+        {
+            (
+                Reply::OpenHierarchyQuery {
+                    descriptor,
+                    max_row_bytes,
+                },
+                end,
+            ) => Ok(response(
+                wire::HierarchyDescriptor {
+                    descriptor: Some(descriptor.into()),
+                    max_row_bytes: max_row_bytes as u64,
+                },
+                end,
+            )),
             _ => Err(status(RemoteError::Protocol)),
         }
     }
@@ -194,6 +224,39 @@ impl QueryClient {
             return Err(RemoteError::Protocol);
         }
         Ok(descriptor)
+    }
+    pub(super) async fn open_hierarchy(
+        &self,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<(Descriptor, usize), RemoteError> {
+        let end = checked_deadline(deadline, None)?;
+        let _permit = CLIENT_ADMISSION
+            .try_acquire()
+            .map_err(|_| RemoteError::ResourceExhausted)?;
+        let request = Self::request(
+            wire::OpenRequest {
+                context: Some(self.context(end)?),
+                shard,
+            },
+            end,
+        );
+        let result = tokio::time::timeout_at(end, self.client.clone().open_hierarchy(request))
+            .await
+            .map_err(|_| RemoteError::Timeout { request_id: None })?
+            .map_err(remote_status)?
+            .into_inner();
+        let descriptor: Descriptor = result
+            .descriptor
+            .ok_or(RemoteError::Protocol)?
+            .try_into()
+            .map_err(|_| RemoteError::Protocol)?;
+        if descriptor.stamp.identity != self.identity || descriptor.stamp.shard != shard {
+            return Err(RemoteError::Protocol);
+        }
+        let max_row_bytes =
+            usize::try_from(result.max_row_bytes).map_err(|_| RemoteError::Protocol)?;
+        Ok((descriptor, max_row_bytes))
     }
     pub(super) async fn fragment(
         &self,

@@ -3,6 +3,7 @@ package velagraph.internal.query.v1;
 // Internal observed data-local query fragments. No JSON or public query text.
 service QueryService {
  rpc Open(OpenRequest) returns (Descriptor);
+ rpc OpenHierarchy(OpenRequest) returns (HierarchyDescriptor);
  rpc Fragment(FragmentRequest) returns (FragmentResponse);
  rpc Close(CloseRequest) returns (Empty);
 }
@@ -11,6 +12,7 @@ message Identity { uint64 group = 1; uint64 node = 2; }
 message Context { uint32 version = 1; Identity identity = 2; uint64 timeout_millis = 3; }
 message QueryStamp { Identity identity = 1; uint64 shard = 2; uint64 epoch = 3; uint64 sequence = 4; }
 message Descriptor { QueryStamp stamp = 1; bytes incarnation = 2; bytes token = 3; }
+message HierarchyDescriptor { Descriptor descriptor = 1; uint64 max_row_bytes = 2; }
 message OpenRequest { Context context = 1; uint64 shard = 2; }
 message CloseRequest { Context context = 1; Descriptor descriptor = 2; }
 message Cost { uint64 bytes = 1; uint64 work = 2; }

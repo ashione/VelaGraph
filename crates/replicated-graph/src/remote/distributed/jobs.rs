@@ -254,6 +254,7 @@ impl Compact {
     }
 }
 struct Job {
+    grpc_clients: Option<Arc<BTreeMap<u64, grpc::QueryClient>>>,
     catalog: Arc<StaticCatalog>,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     row_bounds: BTreeMap<u64, usize>,
@@ -282,12 +283,22 @@ struct Entry {
     job: Arc<tokio::sync::Mutex<Job>>,
 }
 pub(super) struct Jobs {
+    grpc_clients: Option<Arc<BTreeMap<u64, grpc::QueryClient>>>,
     values: Mutex<BTreeMap<[u8; 16], Entry>>,
 }
 impl Jobs {
     pub(super) fn new() -> Self {
         Self {
+            grpc_clients: None,
             values: Mutex::new(BTreeMap::new()),
+        }
+    }
+    pub(super) fn with_grpc_clients(
+        clients: Option<Arc<BTreeMap<u64, grpc::QueryClient>>>,
+    ) -> Self {
+        Self {
+            grpc_clients: clients,
+            ..Self::new()
         }
     }
     pub(super) fn expire(&self) {
@@ -345,10 +356,11 @@ impl Jobs {
                 getrandom::fill(&mut token).map_err(|_| QueryFailure::Unavailable)?;
                 let expires = Instant::now() + Duration::from_millis(LEASE_MILLIS);
                 let mut job = Job {
+                    grpc_clients: self.grpc_clients.clone(),
                     catalog,
                     sessions: BTreeMap::new(),
                     row_bounds: BTreeMap::new(),
-                    connections: Some(BTreeMap::new()),
+                    connections: self.grpc_clients.is_none().then(BTreeMap::new),
                     rows: row_state,
                     expires,
                     cost: Cost::default(),
@@ -592,21 +604,31 @@ impl Job {
             }
             check(end)?;
             self.charge(1024, 1)?;
-            let reply = rpc(
-                route.endpoint,
-                Some(route.identity),
-                Operation::OpenHierarchyQuery { shard: route.shard },
-                end.saturating_duration_since(Instant::now()),
-                None,
-            )
-            .await
-            .map_err(remote_failure)?;
-            let Reply::OpenHierarchyQuery {
-                descriptor,
-                max_row_bytes,
-            } = reply
-            else {
-                return Err(QueryFailure::IncompleteOrCorrupt);
+            let (descriptor, max_row_bytes) = if let Some(clients) = &self.grpc_clients {
+                clients
+                    .get(&route.shard)
+                    .ok_or(QueryFailure::Unavailable)?
+                    .open_hierarchy(route.shard, end.saturating_duration_since(Instant::now()))
+                    .await
+                    .map_err(remote_failure)?
+            } else {
+                let reply = rpc(
+                    route.endpoint,
+                    Some(route.identity),
+                    Operation::OpenHierarchyQuery { shard: route.shard },
+                    end.saturating_duration_since(Instant::now()),
+                    None,
+                )
+                .await
+                .map_err(remote_failure)?;
+                let Reply::OpenHierarchyQuery {
+                    descriptor,
+                    max_row_bytes,
+                } = reply
+                else {
+                    return Err(QueryFailure::IncompleteOrCorrupt);
+                };
+                (descriptor, max_row_bytes)
             };
             if descriptor.stamp.identity != route.identity
                 || descriptor.stamp.shard != route.shard
@@ -624,7 +646,7 @@ impl Job {
             connections.clear();
         }
         let execution = Execution {
-            grpc_clients: None,
+            grpc_clients: self.grpc_clients.as_deref(),
             fixed_sessions: None,
             control: None,
             fixed_parallelism: 3,
@@ -1378,6 +1400,7 @@ mod tests {
                     };
                     let permit = JOB_SLOTS.acquire().await.unwrap();
                     let mut job = Job {
+                        grpc_clients: None,
                         catalog: Arc::new(StaticCatalog { partitions: vec![] }),
                         sessions: BTreeMap::new(),
                         row_bounds: BTreeMap::new(),
@@ -1519,6 +1542,7 @@ mod tests {
         let retained = RETAINED_SLOTS.acquire().await.unwrap();
         let expires = Instant::now() + Duration::from_secs(5);
         let job = Job {
+            grpc_clients: None,
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
@@ -1827,6 +1851,7 @@ mod tests {
         });
         let expires = Instant::now() + Duration::from_secs(5);
         let job = Job {
+            grpc_clients: None,
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
