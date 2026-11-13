@@ -54,6 +54,10 @@ legacy library coordinator/gateway 和兼容 listener 尚未全部清理；详�
   使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
   场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/
   资源饱和及原复杂用例共同验收，见 [Metadata stream](METADATA_STREAM.md)。
+- **固定快照公共 RPC**：[#266](https://github.com/ashione/VelaGraph/issues/266) 为原 materialized
+  OpenSession/Read/Traverse/TraversePage/Close 增加独立 typed `FixedSessionService`，
+  与绑定单次查询结果的 data-local `QueryService` 分开；同端口、同 Invocation/admission，
+  保留固定 V、租约、分页身份及错误，不新增查询引擎。异步 job 与旧 listener 退役仍待验收。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、
