@@ -612,6 +612,7 @@ struct OwnedConfig {
     binding: Binding,
     members: Vec<OwnedNode>,
     local_routes: Option<Vec<LocalGraphRoute>>,
+    local_grpc: Option<BTreeMap<u64, crate::remote::distributed::grpc::FixedClient>>,
     local_query_parallelism: usize,
     member_parallelism: usize,
 }
@@ -619,6 +620,7 @@ impl From<Config> for OwnedConfig {
     fn from(config: Config) -> Self {
         Self {
             local_routes: None,
+            local_grpc: None,
             local_query_parallelism: 3,
             member_parallelism: managed_graph::DEFAULT_MEMBER_PARALLELISM,
             coordinator: OwnedNode::Local(config.coordinator),
@@ -631,6 +633,7 @@ impl From<RemoteConfig> for OwnedConfig {
     fn from(config: RemoteConfig) -> Self {
         Self {
             local_routes: None,
+            local_grpc: None,
             local_query_parallelism: 3,
             member_parallelism: managed_graph::DEFAULT_MEMBER_PARALLELISM,
             coordinator: OwnedNode::Remote(config.coordinator.with_bounded_admission()),
@@ -644,6 +647,32 @@ impl From<RemoteConfig> for OwnedConfig {
     }
 }
 impl OwnedConfig {
+    fn local_transport(
+        &self,
+        route: &LocalGraphRoute,
+    ) -> Result<crate::remote::distributed::fixed::Client> {
+        self.fixed_transport(
+            route.endpoint,
+            route.identity,
+            route.managed_identity.target.shard,
+        )
+    }
+    fn fixed_transport(
+        &self,
+        endpoint: SocketAddr,
+        identity: crate::remote::RemoteIdentity,
+        shard: u64,
+    ) -> Result<crate::remote::distributed::fixed::Client> {
+        use crate::remote::distributed::fixed;
+        match &self.local_grpc {
+            None => Ok(fixed::Client::Tcp { endpoint, identity }),
+            Some(clients) => clients
+                .get(&shard)
+                .cloned()
+                .map(fixed::Client::Grpc)
+                .ok_or(Error::Identity),
+        }
+    }
     fn endpoints(&self) -> Vec<(NodeRef<'_>, Target)> {
         self.members
             .iter()
@@ -1131,6 +1160,44 @@ impl Gateway {
         config.member_parallelism = member_parallelism;
         Self::bind_config(config, bind, deadline, None).await
     }
+    /// Use typed gRPC only for fixed/renewable data-local query sessions.
+    /// Managed control endpoints remain the separately supplied Clients.
+    /// Route graph endpoints must name gRPC ports; no protocol fallback occurs.
+    pub async fn bind_remote_local_queries_grpc(
+        config: RemoteConfig,
+        routes: Vec<LocalGraphRoute>,
+        bind: SocketAddr,
+        deadline: Duration,
+        parallelism: usize,
+        member_parallelism: usize,
+    ) -> Result<Self> {
+        check_deadline(deadline)?;
+        if !(1..=MAX_LOCAL_QUERY_PARALLELISM).contains(&parallelism)
+            || !(1..=managed_graph::MAX_MEMBER_PARALLELISM).contains(&member_parallelism)
+        {
+            return Err(Error::Protocol);
+        }
+        local::validate_routes(&config, &routes)?;
+        let end = Instant::now() + deadline;
+        let mut clients = BTreeMap::new();
+        for route in &routes {
+            let client = crate::remote::distributed::grpc::FixedClient::connect(
+                route.endpoint,
+                route.identity,
+                end.saturating_duration_since(Instant::now()),
+            )
+            .await
+            .map_err(local::remote_error)?;
+            clients.insert(route.managed_identity.target.shard, client);
+        }
+        let mut config: OwnedConfig = config.into();
+        config.local_routes = Some(routes);
+        config.local_grpc = Some(clients);
+        config.local_query_parallelism = parallelism;
+        config.member_parallelism = member_parallelism;
+        Self::bind_config(config, bind, deadline, None).await
+    }
+
     /// Opt in to bounded local phase reports; draining/dropping them never gates writes.
     pub async fn bind_with_timing(
         config: Config,

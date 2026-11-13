@@ -3,7 +3,9 @@
 This optional, **plaintext trusted-network** endpoint implements typed Protobuf
 `Open`, `Page`, and `Close` using tonic/HTTP2. It is not a JSON-over-gRPC bridge and
 it is **not** the public graph write/Gremlin query service. It does not migrate
-Raft, managed transactions, data-local query fragments, or hierarchy channels.
+Raft, managed transactions or hierarchy channels. The same endpoint now also hosts
+the separate [observed data-local query service](INTERNAL_GRPC_QUERIES.md); the
+snapshot RPC contract here remains unchanged.
 Those remain on their existing transports. Related tracking: #218.
 
 ## Start and use
@@ -94,8 +96,9 @@ latency improvements. See the PR for exact commands and outcomes.
 
 1. This slice is opt-in and keeps the old snapshot operations for differential
    validation. Do not call the overall internal migration complete.
-2. Next migrate the typed **data-local query Open → fragment/page → Close** chain,
-   preserving fixed-V/cohort identity, resource accounting and query semantics.
+2. The separate observed **data-local query Open → Fragment → Close** slice is
+   described in [INTERNAL_GRPC_QUERIES.md](INTERNAL_GRPC_QUERIES.md). Next migrate
+   fixed-V/cohort and job-session identity without changing accounting/semantics.
 3. Switch snapshot callers to persistent gRPC clients after both-path functional,
    overload, deadline, recovery and performance gates pass. No silent fallback.
 4. Delete old snapshot framing/dispatch only after the callers have moved and
