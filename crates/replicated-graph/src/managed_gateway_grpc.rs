@@ -195,35 +195,55 @@ impl QueryService for Handler {
 
 #[tonic::async_trait]
 impl FixedSessionService for Handler {
-    async fn open(&self, request: tonic::Request<wire::FixedOpenRequest>) -> std::result::Result<tonic::Response<wire::FixedOpenResponse>, Status> {
+    async fn open(
+        &self,
+        request: tonic::Request<wire::FixedOpenRequest>,
+    ) -> std::result::Result<tonic::Response<wire::FixedOpenResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::fixed_open(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_open).await
+        self.run(call, operation, budget, codec::encode_fixed_open)
+            .await
     }
-    async fn read(&self, request: tonic::Request<wire::FixedQueryRequest>) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
+    async fn read(
+        &self,
+        request: tonic::Request<wire::FixedQueryRequest>,
+    ) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::fixed_read(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_query).await
+        self.run(call, operation, budget, codec::encode_fixed_query)
+            .await
     }
-    async fn traverse(&self, request: tonic::Request<wire::FixedQueryRequest>) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
+    async fn traverse(
+        &self,
+        request: tonic::Request<wire::FixedQueryRequest>,
+    ) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::fixed_traverse(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_query).await
+        self.run(call, operation, budget, codec::encode_fixed_query)
+            .await
     }
-    async fn page(&self, request: tonic::Request<wire::FixedPageRequest>) -> std::result::Result<tonic::Response<wire::FixedPageResponse>, Status> {
+    async fn page(
+        &self,
+        request: tonic::Request<wire::FixedPageRequest>,
+    ) -> std::result::Result<tonic::Response<wire::FixedPageResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::fixed_page(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_page).await
+        self.run(call, operation, budget, codec::encode_fixed_page)
+            .await
     }
-    async fn close(&self, request: tonic::Request<wire::FixedCloseRequest>) -> std::result::Result<tonic::Response<wire::FixedCloseResponse>, Status> {
+    async fn close(
+        &self,
+        request: tonic::Request<wire::FixedCloseRequest>,
+    ) -> std::result::Result<tonic::Response<wire::FixedCloseResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::fixed_close(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_close).await
+        self.run(call, operation, budget, codec::encode_fixed_close)
+            .await
     }
 }
 #[derive(Clone)]

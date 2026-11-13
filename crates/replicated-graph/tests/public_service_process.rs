@@ -511,7 +511,9 @@ fn assert_reason(status: &tonic::Status, reason: pb::error_detail::Reason) {
     );
 }
 async fn verify_fixed_session_after_delete(
-    client: &mut pb::fixed_session_service_client::FixedSessionServiceClient<tonic::transport::Channel>,
+    client: &mut pb::fixed_session_service_client::FixedSessionServiceClient<
+        tonic::transport::Channel,
+    >,
     session: &pb::FixedSession,
 ) -> anyhow::Result<()> {
     use pb::error_detail::Reason;
@@ -524,7 +526,11 @@ async fn verify_fixed_session_after_delete(
     };
     let expected = pb::Row {
         kind: Some(pb::row::Kind::Path(pb::Path {
-            elements: vec![element(7, 1, false), element(7, 10, true), element(8, 2, false)],
+            elements: vec![
+                element(7, 1, false),
+                element(7, 10, true),
+                element(8, 2, false),
+            ],
         })),
     };
     let old = client
@@ -581,7 +587,10 @@ async fn verify_fixed_session_after_delete(
     let page = first.page.as_ref().unwrap();
     assert_eq!((page.offset, page.total), (0, 2));
     assert_eq!(page.rows, vec![expected.clone()]);
-    assert_eq!(client.page(first_request.clone()).await?.into_inner(), first);
+    assert_eq!(
+        client.page(first_request.clone()).await?.into_inner(),
+        first
+    );
     let mut next_request = first_request.clone();
     next_request.cursor = page.next.clone();
     assert!(next_request.cursor.is_some());

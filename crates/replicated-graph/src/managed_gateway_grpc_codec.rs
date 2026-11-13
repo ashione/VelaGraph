@@ -451,17 +451,26 @@ pub(super) fn fixed_open(r: pb::FixedOpenRequest) -> Result<Operation> {
     if r.ttl_millis == 0 || r.ttl_millis > MAX_TTL.as_millis() as u64 {
         return Err(Error::Protocol);
     }
-    Ok(Operation::OpenSession { version: r.version, ttl_millis: r.ttl_millis })
+    Ok(Operation::OpenSession {
+        version: r.version,
+        ttl_millis: r.ttl_millis,
+    })
 }
 pub(super) fn fixed_read(r: pb::FixedQueryRequest) -> Result<Operation> {
     request_size(&r)?;
     context(&r.context)?;
-    Ok(Operation::Read { session: fixed_session(required(r.session)?)?, query: query(required(r.query)?)? })
+    Ok(Operation::Read {
+        session: fixed_session(required(r.session)?)?,
+        query: query(required(r.query)?)?,
+    })
 }
 pub(super) fn fixed_traverse(r: pb::FixedQueryRequest) -> Result<Operation> {
     request_size(&r)?;
     context(&r.context)?;
-    Ok(Operation::Traverse { session: fixed_session(required(r.session)?)?, query: query(required(r.query)?)? })
+    Ok(Operation::Traverse {
+        session: fixed_session(required(r.session)?)?,
+        query: query(required(r.query)?)?,
+    })
 }
 pub(super) fn fixed_page(r: pb::FixedPageRequest) -> Result<Operation> {
     request_size(&r)?;
@@ -469,44 +478,91 @@ pub(super) fn fixed_page(r: pb::FixedPageRequest) -> Result<Operation> {
     Ok(Operation::TraversePage {
         session: fixed_session(required(r.session)?)?,
         query: query(required(r.query)?)?,
-        cursor: r.cursor.map(|c| Ok::<_, Error>(PageCursor { token: token(c.token)? })).transpose()?,
+        cursor: r
+            .cursor
+            .map(|c| {
+                Ok::<_, Error>(PageCursor {
+                    token: token(c.token)?,
+                })
+            })
+            .transpose()?,
         page_size: size(r.page_size)?,
     })
 }
 pub(super) fn fixed_close(r: pb::FixedCloseRequest) -> Result<Operation> {
     request_size(&r)?;
     context(&r.context)?;
-    Ok(Operation::Close { session: fixed_session(required(r.session)?)? })
+    Ok(Operation::Close {
+        session: fixed_session(required(r.session)?)?,
+    })
 }
 fn out_fixed_session(s: &Session) -> pb::FixedSession {
-    pb::FixedSession { incarnation: s.incarnation.to_vec(), token: s.token.to_vec(), version: s.version }
+    pb::FixedSession {
+        incarnation: s.incarnation.to_vec(),
+        token: s.token.to_vec(),
+        version: s.version,
+    }
 }
 pub(super) fn encode_fixed_open(r: &Reply) -> Result<pb::FixedOpenResponse> {
-    let Reply::OpenSession(session) = r else { return Err(Error::Protocol); };
-    response_size(pb::FixedOpenResponse { session: Some(out_fixed_session(session)) })
+    let Reply::OpenSession(session) = r else {
+        return Err(Error::Protocol);
+    };
+    response_size(pb::FixedOpenResponse {
+        session: Some(out_fixed_session(session)),
+    })
 }
 pub(super) fn encode_fixed_query(r: &Reply) -> Result<pb::FixedQueryResponse> {
     let (session, query, data) = match r {
-        Reply::Read { session, query, data } | Reply::Traverse { session, query, data } => (session, query, data),
+        Reply::Read {
+            session,
+            query,
+            data,
+        }
+        | Reply::Traverse {
+            session,
+            query,
+            data,
+        } => (session, query, data),
         _ => return Err(Error::Protocol),
     };
     response_size(pb::FixedQueryResponse {
-        session: Some(out_fixed_session(session)), query: Some(out_query(query)),
-        data: Some(pb::QueryData { rows: data.rows.iter().map(out_row).collect::<Result<_>>()?, completeness: match data.completeness {
-            QueryCompleteness::SinglePartition => pb::Completeness::SinglePartition as i32,
-            QueryCompleteness::Unverified => pb::Completeness::Unverified as i32,
-        } }),
+        session: Some(out_fixed_session(session)),
+        query: Some(out_query(query)),
+        data: Some(pb::QueryData {
+            rows: data.rows.iter().map(out_row).collect::<Result<_>>()?,
+            completeness: match data.completeness {
+                QueryCompleteness::SinglePartition => pb::Completeness::SinglePartition as i32,
+                QueryCompleteness::Unverified => pb::Completeness::Unverified as i32,
+            },
+        }),
     })
 }
 pub(super) fn encode_fixed_page(r: &Reply) -> Result<pb::FixedPageResponse> {
-    let Reply::TraversePage { session, query, cursor, page_size, page } = r else { return Err(Error::Protocol); };
+    let Reply::TraversePage {
+        session,
+        query,
+        cursor,
+        page_size,
+        page,
+    } = r
+    else {
+        return Err(Error::Protocol);
+    };
     response_size(pb::FixedPageResponse {
-        session: Some(out_fixed_session(session)), query: Some(out_query(query)), cursor: cursor.as_ref().map(out_cursor), page_size: u32::from(*page_size), page: Some(out_page(page)?),
+        session: Some(out_fixed_session(session)),
+        query: Some(out_query(query)),
+        cursor: cursor.as_ref().map(out_cursor),
+        page_size: u32::from(*page_size),
+        page: Some(out_page(page)?),
     })
 }
 pub(super) fn encode_fixed_close(r: &Reply) -> Result<pb::FixedCloseResponse> {
-    let Reply::Close(session) = r else { return Err(Error::Protocol); };
-    response_size(pb::FixedCloseResponse { session: Some(out_fixed_session(session)) })
+    let Reply::Close(session) = r else {
+        return Err(Error::Protocol);
+    };
+    response_size(pb::FixedCloseResponse {
+        session: Some(out_fixed_session(session)),
+    })
 }
 
 #[cfg(test)]
@@ -514,45 +570,180 @@ mod tests {
     use super::*;
     #[test]
     fn fixed_session_requests_preserve_exact_zero_and_reject_invalid_identity() {
-        let request = pb::FixedOpenRequest { context: ctx(), version: Some(0), ttl_millis: 500 };
-        assert_eq!(fixed_open(request.clone()).unwrap(), Operation::OpenSession { version: Some(0), ttl_millis: 500 });
-        assert_eq!(fixed_open(pb::FixedOpenRequest { version: None, ..request.clone() }).unwrap(), Operation::OpenSession { version: None, ttl_millis: 500 });
-        assert!(fixed_open(pb::FixedOpenRequest { context: None, ..request.clone() }).is_err());
-        assert!(fixed_open(pb::FixedOpenRequest { ttl_millis: 0, ..request.clone() }).is_err());
-        assert!(fixed_open(pb::FixedOpenRequest { ttl_millis: MAX_TTL.as_millis() as u64 + 1, ..request }).is_err());
-        let session = pb::FixedSession { incarnation: vec![1; 16], token: vec![2; 32], version: 7 };
-        let query = pb::Query { partition: 7, text: "g.V(1)".into() };
-        let request = pb::FixedQueryRequest { context: ctx(), session: Some(session.clone()), query: Some(query.clone()) };
-        let expected_session = Session { incarnation: [1; 16], token: [2; 32], version: 7 };
-        let expected_query = Query { partition: 7, text: "g.V(1)".into() };
-        assert_eq!(fixed_read(request.clone()).unwrap(), Operation::Read { session: expected_session.clone(), query: expected_query.clone() });
-        assert_eq!(fixed_traverse(request.clone()).unwrap(), Operation::Traverse { session: expected_session, query: expected_query });
-        assert!(fixed_read(pb::FixedQueryRequest { session: None, ..request.clone() }).is_err());
-        assert!(fixed_traverse(pb::FixedQueryRequest { query: None, ..request.clone() }).is_err());
+        let request = pb::FixedOpenRequest {
+            context: ctx(),
+            version: Some(0),
+            ttl_millis: 500,
+        };
+        assert_eq!(
+            fixed_open(request.clone()).unwrap(),
+            Operation::OpenSession {
+                version: Some(0),
+                ttl_millis: 500
+            }
+        );
+        assert_eq!(
+            fixed_open(pb::FixedOpenRequest {
+                version: None,
+                ..request.clone()
+            })
+            .unwrap(),
+            Operation::OpenSession {
+                version: None,
+                ttl_millis: 500
+            }
+        );
+        assert!(fixed_open(pb::FixedOpenRequest {
+            context: None,
+            ..request.clone()
+        })
+        .is_err());
+        assert!(fixed_open(pb::FixedOpenRequest {
+            ttl_millis: 0,
+            ..request.clone()
+        })
+        .is_err());
+        assert!(fixed_open(pb::FixedOpenRequest {
+            ttl_millis: MAX_TTL.as_millis() as u64 + 1,
+            ..request
+        })
+        .is_err());
+        let session = pb::FixedSession {
+            incarnation: vec![1; 16],
+            token: vec![2; 32],
+            version: 7,
+        };
+        let query = pb::Query {
+            partition: 7,
+            text: "g.V(1)".into(),
+        };
+        let request = pb::FixedQueryRequest {
+            context: ctx(),
+            session: Some(session.clone()),
+            query: Some(query.clone()),
+        };
+        let expected_session = Session {
+            incarnation: [1; 16],
+            token: [2; 32],
+            version: 7,
+        };
+        let expected_query = Query {
+            partition: 7,
+            text: "g.V(1)".into(),
+        };
+        assert_eq!(
+            fixed_read(request.clone()).unwrap(),
+            Operation::Read {
+                session: expected_session.clone(),
+                query: expected_query.clone()
+            }
+        );
+        assert_eq!(
+            fixed_traverse(request.clone()).unwrap(),
+            Operation::Traverse {
+                session: expected_session,
+                query: expected_query
+            }
+        );
+        assert!(fixed_read(pb::FixedQueryRequest {
+            session: None,
+            ..request.clone()
+        })
+        .is_err());
+        assert!(fixed_traverse(pb::FixedQueryRequest {
+            query: None,
+            ..request.clone()
+        })
+        .is_err());
         for n in [0, 15, 17] {
-            assert!(fixed_traverse(pb::FixedQueryRequest { session: Some(pb::FixedSession { incarnation: vec![1; n], ..session.clone() }), ..request.clone() }).is_err());
+            assert!(fixed_traverse(pb::FixedQueryRequest {
+                session: Some(pb::FixedSession {
+                    incarnation: vec![1; n],
+                    ..session.clone()
+                }),
+                ..request.clone()
+            })
+            .is_err());
         }
         for n in [0, 31, 33] {
-            assert!(fixed_read(pb::FixedQueryRequest { session: Some(pb::FixedSession { token: vec![2; n], ..session.clone() }), ..request.clone() }).is_err());
+            assert!(fixed_read(pb::FixedQueryRequest {
+                session: Some(pb::FixedSession {
+                    token: vec![2; n],
+                    ..session.clone()
+                }),
+                ..request.clone()
+            })
+            .is_err());
         }
         for n in [0, u32::from(MAX_PAGE_SIZE) + 1, u32::MAX] {
-            assert!(fixed_page(pb::FixedPageRequest { context: ctx(), session: Some(session.clone()), query: Some(query.clone()), cursor: None, page_size: n }).is_err());
+            assert!(fixed_page(pb::FixedPageRequest {
+                context: ctx(),
+                session: Some(session.clone()),
+                query: Some(query.clone()),
+                cursor: None,
+                page_size: n
+            })
+            .is_err());
         }
-        assert!(fixed_page(pb::FixedPageRequest { context: ctx(), session: Some(session.clone()), query: Some(query), cursor: Some(pb::Cursor { token: vec![1; 31] }), page_size: 1 }).is_err());
-        assert_eq!(fixed_close(pb::FixedCloseRequest { context: ctx(), session: Some(session) }).unwrap(), Operation::Close { session: Session { incarnation: [1; 16], token: [2; 32], version: 7 } });
+        assert!(fixed_page(pb::FixedPageRequest {
+            context: ctx(),
+            session: Some(session.clone()),
+            query: Some(query),
+            cursor: Some(pb::Cursor { token: vec![1; 31] }),
+            page_size: 1
+        })
+        .is_err());
+        assert_eq!(
+            fixed_close(pb::FixedCloseRequest {
+                context: ctx(),
+                session: Some(session)
+            })
+            .unwrap(),
+            Operation::Close {
+                session: Session {
+                    incarnation: [1; 16],
+                    token: [2; 32],
+                    version: 7
+                }
+            }
+        );
     }
     #[test]
     fn fixed_response_preserves_rows_and_rejects_wrong_reply() {
-        let session = Session { incarnation: [1; 16], token: [2; 32], version: 0 };
+        let session = Session {
+            incarnation: [1; 16],
+            token: [2; 32],
+            version: 0,
+        };
         let opened = encode_fixed_open(&Reply::OpenSession(session.clone())).unwrap();
         assert_eq!(opened.session.unwrap().version, 0);
-        let query = Query { partition: 7, text: "g.V().count()".into() };
-        let reply = Reply::Traverse { session: session.clone(), query: query.clone(), data: QueryData { rows: vec![QueryRow::Count(u64::MAX)], completeness: QueryCompleteness::Unverified } };
+        let query = Query {
+            partition: 7,
+            text: "g.V().count()".into(),
+        };
+        let reply = Reply::Traverse {
+            session: session.clone(),
+            query: query.clone(),
+            data: QueryData {
+                rows: vec![QueryRow::Count(u64::MAX)],
+                completeness: QueryCompleteness::Unverified,
+            },
+        };
         let encoded = encode_fixed_query(&reply).unwrap();
-        assert_eq!(encoded.data.unwrap().rows[0].kind, Some(pb::row::Kind::Count(u64::MAX)));
+        assert_eq!(
+            encoded.data.unwrap().rows[0].kind,
+            Some(pb::row::Kind::Count(u64::MAX))
+        );
         assert!(encode_fixed_open(&reply).is_err());
         assert!(encode_fixed_page(&reply).is_err());
-        assert_eq!(encode_fixed_close(&Reply::Close(session)).unwrap().session.unwrap().version, 0);
+        assert_eq!(
+            encode_fixed_close(&Reply::Close(session))
+                .unwrap()
+                .session
+                .unwrap()
+                .version,
+            0
+        );
     }
     fn ctx() -> Option<pb::Context> {
         Some(pb::Context {

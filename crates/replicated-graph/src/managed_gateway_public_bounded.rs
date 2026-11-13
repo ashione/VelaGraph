@@ -223,16 +223,28 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         (S::OpenResponse, 3) | (S::FetchResponse, 4) => (K::Var(u32::MAX.into()), false, false),
         (S::OpenResponse, 4) | (S::FetchResponse, 5) => (K::Message(S::Page), false, false),
         (S::FetchResponse, 3) => (K::Message(S::Cursor), false, false),
-        (S::FixedOpenRequest, 1) | (S::FixedQueryRequest, 1)
-        | (S::FixedPageRequest, 1) | (S::FixedCloseRequest, 1) => (K::Message(S::Context), false, false),
+        (S::FixedOpenRequest, 1)
+        | (S::FixedQueryRequest, 1)
+        | (S::FixedPageRequest, 1)
+        | (S::FixedCloseRequest, 1) => (K::Message(S::Context), false, false),
         (S::FixedOpenRequest, 2 | 3) => (K::Var(u64::MAX), false, false),
-        (S::FixedQueryRequest, 2) | (S::FixedPageRequest, 2) | (S::FixedCloseRequest, 2)
-        | (S::FixedOpenResponse, 1) | (S::FixedQueryResponse, 1)
-        | (S::FixedPageResponse, 1) | (S::FixedCloseResponse, 1) => (K::Message(S::Session), false, false),
-        (S::FixedQueryRequest, 3) | (S::FixedPageRequest, 3)
-        | (S::FixedQueryResponse, 2) | (S::FixedPageResponse, 2) => (K::Message(S::Query), false, false),
-        (S::FixedPageRequest, 4) | (S::FixedPageResponse, 3) => (K::Message(S::Cursor), false, false),
-        (S::FixedPageRequest, 5) | (S::FixedPageResponse, 4) => (K::Var(u32::MAX.into()), false, false),
+        (S::FixedQueryRequest, 2)
+        | (S::FixedPageRequest, 2)
+        | (S::FixedCloseRequest, 2)
+        | (S::FixedOpenResponse, 1)
+        | (S::FixedQueryResponse, 1)
+        | (S::FixedPageResponse, 1)
+        | (S::FixedCloseResponse, 1) => (K::Message(S::Session), false, false),
+        (S::FixedQueryRequest, 3)
+        | (S::FixedPageRequest, 3)
+        | (S::FixedQueryResponse, 2)
+        | (S::FixedPageResponse, 2) => (K::Message(S::Query), false, false),
+        (S::FixedPageRequest, 4) | (S::FixedPageResponse, 3) => {
+            (K::Message(S::Cursor), false, false)
+        }
+        (S::FixedPageRequest, 5) | (S::FixedPageResponse, 4) => {
+            (K::Var(u32::MAX.into()), false, false)
+        }
         (S::FixedPageResponse, 5) => (K::Message(S::Page), false, false),
         (S::FixedQueryResponse, 3) => (K::Message(S::QueryData), false, false),
         (S::QueryData, 1) => (K::Message(S::Row), true, false),
@@ -378,9 +390,19 @@ mod tests {
             assert_eq!(DECODES.with(|n| n.get()), before);
         }
         for version in [None, Some(0), Some(u64::MAX)] {
-            let r = pb::FixedOpenRequest { context: Some(pb::Context { version: 1, timeout_millis: 50 }), version, ttl_millis: 500 };
+            let r = pb::FixedOpenRequest {
+                context: Some(pb::Context {
+                    version: 1,
+                    timeout_millis: 50,
+                }),
+                version,
+                ttl_millis: 500,
+            };
             let bytes = r.encode_to_vec();
-            assert_eq!(decode_checked::<pb::FixedOpenRequest, _>(&mut bytes.as_slice()).unwrap(), r);
+            assert_eq!(
+                decode_checked::<pb::FixedOpenRequest, _>(&mut bytes.as_slice()).unwrap(),
+                r
+            );
         }
         let bytes = [18, 4, 10, 0, 10, 0]; // duplicate incarnation inside fixed session
         let before = DECODES.with(|n| n.get());
