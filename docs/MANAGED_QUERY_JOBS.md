@@ -185,7 +185,7 @@ Use the same typed Query/Page/Context vocabulary, but a distinct JobHandle with
 
 | Proposed RPC | Existing operation | Request and response contract |
 | --- | --- | --- |
-| Start | StartLocalQueryJob | Nonzero 16-byte operation ID, optional exact version (absence means latest admission; explicit zero remains exact zero), Query, page size, required JobPolicy. Return operation ID and handle only. |
+| Start | StartLocalQueryJob | Nonzero 16-byte operation ID, optional exact version (absence means latest at the worker's read-cut admission, not at Start RPC or job-slot admission; explicit zero remains exact zero), Query, page size, required JobPolicy. Return operation ID and handle only. |
 | Get | GetLocalQueryJob | Exact handle; return handle and phase/status. No partial rows, implicit renewal or mutation of selected V. |
 | Renew | RenewLocalQueryJob | Exact handle and expected generation; return handle, generation and remaining milliseconds. Remaining time is anchored at this call's send time, not its receive time. |
 | Fetch | FetchLocalQueryJob | Handle, original Query/page size and optional cursor. Return those bindings, fixed V and complete immutable page. Absent cursor is first page; malformed present cursor is not absence. |
@@ -234,7 +234,7 @@ existing public RPC status mapper combines some error categories.
 | Gate | Evidence needed on the implementation candidate |
 | --- | --- |
 | Typed conversion | Round trips for every phase, exact zero versus absent V, empty versus absent cursor, all failure variants, uint64 generation limits; malformed/duplicate/unknown fields rejected. |
-| Admission and replay | Same-ID/same-arguments Start returns same handle; changed query, page size, policy or V returns Identity; unsupported grammar and full shared pool fail without creating work. |
+| Admission and replay | Same-ID/same-arguments Start returns same handle; changed valid query, page size, policy or V returns Identity; invalid inputs retain validation-first errors; unsupported grammar and full shared pool fail without creating work. |
 | Lost delivery | Drop Start response, replay original request and observe one job. Disconnect Get/Fetch without cancelling the job. Disconnect Renew cannot strand a pending round. |
 | Fixed result | Independent small non-HR oracle with qualified IDs, parallel edges and ordered bags; later writes/deletes do not alter V or page replay; no rows before complete sealing. |
 | Renewal races | Capturing Busy; committed replay does not extend expiry; concurrent pending renewal, wrong generation, node-grant failure, last-read transition, expiry and cancellation use original linearization. |
