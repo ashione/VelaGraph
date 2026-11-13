@@ -207,6 +207,8 @@ pub(crate) fn incoming(
         match accepted {
             Err(e) => Some(Err(e)),
             Ok(socket) => connections.clone().try_acquire_owned().ok().map(|permit| {
+                // Tonic does not configure sockets supplied via custom incoming.
+                socket.set_nodelay(true)?;
                 let token = stop.child_token();
                 Ok(LimitedIo {
                     socket,
@@ -290,6 +292,10 @@ impl tokio_stream::Stream for BudgetIncoming {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             Poll::Ready(Ok((socket, _))) => {
+                if let Err(error) = socket.set_nodelay(true) {
+                    self.permit.take();
+                    return Poll::Ready(Some(Err(error)));
+                }
                 let token = self.stop.child_token();
                 let end = Instant::now() + self.lifetime;
                 let stop = ConnectionStop(token.clone(), Some(end));
@@ -309,6 +315,35 @@ impl tokio_stream::Stream for BudgetIncoming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn custom_raft_incoming_sets_nodelay_on_the_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut incoming = incoming(listener, CancellationToken::new());
+        let client = TcpStream::connect(address).await.unwrap();
+        let accepted = incoming.next().await.unwrap().unwrap();
+        assert!(accepted.socket.nodelay().unwrap());
+        drop(client);
+    }
+    #[tokio::test]
+    async fn custom_control_incoming_sets_nodelay_on_the_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut incoming = incoming_with_limits(
+            listener,
+            CancellationToken::new(),
+            1,
+            Duration::from_secs(3),
+        );
+        let client = TcpStream::connect(address).await.unwrap();
+        let accepted = incoming.next().await.unwrap().unwrap();
+        assert!(accepted.socket.nodelay().unwrap());
+        assert_eq!(incoming.permits.available_permits(), 0);
+        drop(accepted);
+        assert_eq!(incoming.permits.available_permits(), 1);
+        drop(client);
+    }
     #[tokio::test]
     async fn unpolled_response_budget_expires_and_completed_call_keeps_channel() {
         let token = CancellationToken::new();

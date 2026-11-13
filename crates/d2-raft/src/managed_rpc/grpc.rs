@@ -507,6 +507,8 @@ impl Server {
                 move |accepted| match accepted {
                     Err(error) => Some(Err(error)),
                     Ok(socket) => connections.clone().try_acquire_owned().ok().map(|permit| {
+                        // Custom incoming bypasses Tonic's TCP_NODELAY default.
+                        socket.set_nodelay(true)?;
                         let token = connections_stop.child_token();
                         Ok(LimitedIo {
                             socket,

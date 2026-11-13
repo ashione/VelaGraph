@@ -139,6 +139,8 @@ impl GrpcCoordinatorService {
                 move |accepted| match accepted {
                     Err(error) => Some(Err(error)),
                     Ok(socket) => connections.clone().try_acquire_owned().ok().map(|permit| {
+                        // Custom incoming bypasses Tonic's TCP_NODELAY default.
+                        socket.set_nodelay(true)?;
                         Ok(LimitedIo {
                             socket,
                             _permit: permit,

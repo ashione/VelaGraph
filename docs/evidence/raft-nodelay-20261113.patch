@@ -1,0 +1,35 @@
+diff --git a/crates/d2-raft/src/raft_grpc/admission.rs b/crates/d2-raft/src/raft_grpc/admission.rs
+index 8a00ab1..59488b7 100644
+--- a/crates/d2-raft/src/raft_grpc/admission.rs
++++ b/crates/d2-raft/src/raft_grpc/admission.rs
+@@ -189,6 +189,7 @@ pub(super) fn incoming(
+         match accepted {
+             Err(e) => Some(Err(e)),
+             Ok(socket) => connections.clone().try_acquire_owned().ok().map(|permit| {
++                socket.set_nodelay(std::env::var("VELAGRAPH_EXPERIMENT_NODELAY").as_deref() == Ok("1"))?;
+                 let token = stop.child_token();
+                 Ok(LimitedIo {
+                     socket,
+diff --git a/crates/replicated-graph/tests/grpc_snapshot_process.rs b/crates/replicated-graph/tests/grpc_snapshot_process.rs
+index e65eb11..9c8493c 100644
+--- a/crates/replicated-graph/tests/grpc_snapshot_process.rs
++++ b/crates/replicated-graph/tests/grpc_snapshot_process.rs
+@@ -574,3 +574,18 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
+     })
+     .await?
+ }
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore = "controlled original-tree nodelay experiment"]
++async fn investigate_fresh_quorum_latency() -> anyhow::Result<()> {
++    let cluster = Cluster::start().await?;
++    let mut samples = Vec::new();
++    for _ in 0..100 {
++        let started = std::time::Instant::now();
++        let d = remote::open_snapshot(cluster.tcp(), Some(cluster.identity()), SHARD, BUDGET).await?;
++        samples.push(started.elapsed().as_micros());
++        remote::close_snapshot(cluster.tcp(), Some(cluster.identity()), d, BUDGET).await?;
++    }
++    eprintln!("QUORUM_LATENCY_US={samples:?}");
++    Ok(())
++}
