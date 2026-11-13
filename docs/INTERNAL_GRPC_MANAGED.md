@@ -100,8 +100,10 @@ managed state without opening a compatibility TCP listener. HTTP and gRPC adapte
 share its session/job cleanup and stop signal. Expiry runs even when no requests
 arrive; shutdown/drop stops both adapters and cancels retained jobs/sessions, but
 does not undo a durable write or resolve an unknown outcome. The legacy `Gateway`
-wrapper still provides explicitly selected TCP library entrypoints. Removing that
-wrapper and other legacy library TCP ingress paths remains #218 work.
+wrapper still provides explicitly selected TCP library entrypoints, including
+fixed-session traversal and asynchronous local-query jobs not all exposed by the
+public gRPC adapter. Removing that wrapper requires replacement coverage first;
+changing defaults must not silently remove these semantics. Retiring that wrapper and other legacy library TCP ingress paths remains #218 work.
 
 Validation includes actual-process owned socket-inode checks on Linux: only the
 announced public ports listen. Lifecycle tests keep adapter handles alive while

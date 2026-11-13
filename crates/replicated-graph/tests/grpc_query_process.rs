@@ -304,7 +304,7 @@ async fn scenario() -> anyhow::Result<()> {
     ar.endpoint = a.grpc;
     let mut br = b.route.clone();
     br.endpoint = b.grpc;
-    let grpc = CoordinatorService::start_grpc(
+    let grpc = distributed::grpc::GrpcCoordinatorService::start(
         "127.0.0.1:0".parse()?,
         StaticCatalog {
             partitions: vec![br.clone(), ar.clone()],
@@ -312,6 +312,7 @@ async fn scenario() -> anyhow::Result<()> {
         BUDGET,
     )
     .await?;
+    let client = distributed::grpc::CoordinatorClient::connect(grpc.local_addr(), BUDGET).await?;
     for text in [
         "g.V(3,1,3).values('name')",
         "g.V(1).out('knows')",
@@ -332,11 +333,12 @@ async fn scenario() -> anyhow::Result<()> {
         "g.V(1).repeat(out('knows')).times(2).path()",
     ] {
         let expected = distributed::query(tcp.local_addr(), request(text), BUDGET).await??;
-        let actual = distributed::query(grpc.local_addr(), request(text), BUDGET).await??;
+        let actual = client.query(request(text), BUDGET).await??;
         assert_eq!(actual, expected, "ordered TCP/gRPC differential: {text}");
         assert_eq!(actual.completeness, QueryCompleteness::Unverified);
     }
-    let rows = distributed::query(grpc.local_addr(), request("g.V(1).out('knows')"), BUDGET)
+    let rows = client
+        .query(request("g.V(1).out('knows')"), BUDGET)
         .await??
         .rows;
     assert_eq!(
@@ -346,7 +348,7 @@ async fn scenario() -> anyhow::Result<()> {
     );
     for text in ["g.V(", "g.V(139).out('missing')", "g.V(1).unsupported()"] {
         let expected = distributed::query(tcp.local_addr(), request(text), BUDGET).await?;
-        let actual = distributed::query(grpc.local_addr(), request(text), BUDGET).await?;
+        let actual = client.query(request(text), BUDGET).await?;
         assert!(
             expected.is_err(),
             "invalid query unexpectedly succeeded: {text}"
@@ -354,23 +356,24 @@ async fn scenario() -> anyhow::Result<()> {
         assert_eq!(actual, expected, "typed failure differential: {text}");
     }
     assert_eq!(
-        distributed::query(grpc.local_addr(), request("g.V("), BUDGET).await?,
+        client.query(request("g.V("), BUDGET).await?,
         Err(QueryFailure::Parse)
     );
-    // Explicit consistency negotiation remains unsupported for this observed path.
+    // Removed JSON consistency envelopes cannot reach the typed ingress.
+    // The typed observed API does not advertise fixed/global consistency.
     for required in [
         distributed::consistency::ReadConsistency::IndependentShardSnapshots,
         distributed::consistency::ReadConsistency::GlobalCommittedSnapshot,
     ] {
-        assert_eq!(
+        assert!(
             distributed::consistency::query_with_consistency(
                 grpc.local_addr(),
                 request("g.V(1).count()"),
                 required,
                 BUDGET
             )
-            .await?,
-            Err(QueryFailure::Unsupported)
+            .await
+            .is_err()
         );
     }
     for text in [
@@ -380,15 +383,15 @@ async fn scenario() -> anyhow::Result<()> {
     ] {
         assert_eq!(
             hierarchy_count(tcp.local_addr(), false, text).await?,
-            hierarchy_count(grpc.local_addr(), false, text).await?
+            hierarchy_count(grpc.local_addr(), true, text).await?
         );
     }
     assert_eq!(
         hierarchy_rows(tcp.local_addr(), false).await?,
-        hierarchy_rows(grpc.local_addr(), false).await?
+        hierarchy_rows(grpc.local_addr(), true).await?
     );
     hierarchy_cancel(tcp.local_addr(), false).await?;
-    hierarchy_cancel(grpc.local_addr(), false).await?;
+    hierarchy_cancel(grpc.local_addr(), true).await?;
     session_checks(&a).await?;
     // Teardown releases local job admission immediately; remote read leases
     // may remain until their bounded TTL, so run exact shard-slot checks first.
@@ -397,17 +400,18 @@ async fn scenario() -> anyhow::Result<()> {
         .context("coordinator ingress checks")?;
     a._process.0.kill()?;
     a._process.0.wait()?;
-    for endpoint in [tcp.local_addr(), grpc.local_addr()] {
+    for (endpoint, typed) in [(tcp.local_addr(), false), (grpc.local_addr(), true)] {
+        let client = JobClient::connect(endpoint, typed).await?;
         assert!(matches!(
-            distributed::jobs::request(
-                endpoint,
-                distributed::jobs::Request::Start {
-                    start_partition: 0,
-                    text: "g.V(1).repeat(__.out('knows')).times(1).count()".into()
-                },
-                BUDGET
-            )
-            .await?,
+            client
+                .request(
+                    distributed::jobs::Request::Start {
+                        start_partition: 0,
+                        text: "g.V(1).repeat(__.out('knows')).times(1).count()".into()
+                    },
+                    BUDGET
+                )
+                .await?,
             Err(QueryFailure::Unavailable)
         ));
     }

@@ -1,8 +1,10 @@
 # Current capability and work index
 
 Reviewed on **2026-11-13** with main baseline
-[`045debf`](https://github.com/ashione/VelaGraph/commit/045debfbd5ccce8ae7331fdac02fd886e251037d)
-and the #256/#258 default-storage RPC migration in this change.
+[`046488bf`](https://github.com/ashione/VelaGraph/commit/046488bfb7ffd603b4eb66d109ec53cf8d8fcaf0)
+and the #264 hybrid-coordinator retirement in this change. #259 default-storage
+RPC, #261 default coordinator CLI RPC and #263 Unix read gateway retirement are
+merged. Remaining legacy library APIs are not all retired.
 This is an API and implementation index, not a new benchmark or an assertion that
 all milestone exit criteria have passed. Linked PRs/issues show later changes;
 the remaining outcomes below must not be inferred from a merged dependency slice.

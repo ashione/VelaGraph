@@ -28,11 +28,14 @@ graph-coordinator query --endpoint 127.0.0.1:9400 \
 and `CoordinatorClient` are the corresponding library APIs. Existing deployments
 must migrate both ends together: `serve` no longer accepts the old TCP wire, and
 unflagged clients no longer speak it. Catalog endpoints must name typed shard ports.
-The legacy library `CoordinatorService::start_grpc` still means TCP ingress with
-gRPC shard backends for differential tests; `CoordinatorService::start` and
-`jobs::request` retain explicit legacy library behavior. These are not CLI modes
-and remain retirement work under #218. There is no protocol probing, fallback,
-application-request retry, or leader-following.
+The hybrid library `CoordinatorService::start_grpc` (TCP ingress with gRPC
+shard backends) is removed under #264. Use `GrpcCoordinatorService` and
+`CoordinatorClient` together instead; the full ordered-row/error/job differential
+suite now crosses typed ingress as well as typed shard transport.
+`CoordinatorService::start`, `distributed::query`, consistency negotiation and
+`jobs::request` retain explicit legacy library behavior pending their own semantic
+replacement/retirement. They are not CLI modes. There is no protocol probing,
+fallback, application-request retry, or leader-following.
 The tonic channel may reconnect a transport connection; this is not application
 replay or reopening a lost query session. A wrong port or
 identity fails. One channel per unique shard is established during startup and
