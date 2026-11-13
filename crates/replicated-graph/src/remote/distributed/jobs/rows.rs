@@ -540,6 +540,7 @@ mod projection_phase_tests {
         let mut rows = Rows::new(&plan, 0, 128).unwrap();
         rows.traversal_finished = true;
         let job = Job {
+            grpc_clients: None,
             catalog: Arc::new(StaticCatalog { partitions: vec![] }),
             sessions: BTreeMap::new(),
             row_bounds: BTreeMap::new(),

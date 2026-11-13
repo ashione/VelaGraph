@@ -43,6 +43,14 @@ pub struct Descriptor {
     pub token: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HierarchyDescriptor {
+    #[prost(message, optional, tag = "1")]
+    pub descriptor: ::core::option::Option<Descriptor>,
+    #[prost(uint64, tag = "2")]
+    pub max_row_bytes: u64,
+}
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OpenRequest {
     #[prost(message, optional, tag = "1")]
@@ -1063,6 +1071,25 @@ pub mod query_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn open_hierarchy(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenRequest>,
+        ) -> std::result::Result<tonic::Response<super::HierarchyDescriptor>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.internal.query.v1.QueryService/OpenHierarchy",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.internal.query.v1.QueryService",
+                "OpenHierarchy",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn fragment(
             &mut self,
             request: impl tonic::IntoRequest<super::FragmentRequest>,
@@ -1118,6 +1145,10 @@ pub mod query_service_server {
             &self,
             request: tonic::Request<super::OpenRequest>,
         ) -> std::result::Result<tonic::Response<super::Descriptor>, tonic::Status>;
+        async fn open_hierarchy(
+            &self,
+            request: tonic::Request<super::OpenRequest>,
+        ) -> std::result::Result<tonic::Response<super::HierarchyDescriptor>, tonic::Status>;
         async fn fragment(
             &self,
             request: tonic::Request<super::FragmentRequest>,
@@ -1224,6 +1255,45 @@ pub mod query_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = OpenSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/velagraph.internal.query.v1.QueryService/OpenHierarchy" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenHierarchySvc<T: QueryService>(pub Arc<T>);
+                    impl<T: QueryService> tonic::server::UnaryService<super::OpenRequest> for OpenHierarchySvc<T> {
+                        type Response = super::HierarchyDescriptor;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as QueryService>::open_hierarchy(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenHierarchySvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

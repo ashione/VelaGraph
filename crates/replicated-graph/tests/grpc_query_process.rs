@@ -283,7 +283,7 @@ async fn typed_fragments_match_tcp_across_real_shards() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), scenario()).await?
 }
 async fn scenario() -> anyhow::Result<()> {
-    let a = Group::start(0, 120).await?;
+    let mut a = Group::start(0, 120).await?;
     let b = Group::start(1, 130).await?;
     let (ad, bd) = run_blocking(fixture).await??;
     a.seed(ad).await?;
@@ -353,8 +353,7 @@ async fn scenario() -> anyhow::Result<()> {
         distributed::query(grpc.local_addr(), request("g.V("), BUDGET).await?,
         Err(QueryFailure::Parse)
     );
-    // This migration is observed-query-only. Explicit negotiation and job
-    // envelopes must be rejected, not silently routed down the old TCP path.
+    // Explicit consistency negotiation remains unsupported for this observed path.
     for required in [
         distributed::consistency::ReadConsistency::IndependentShardSnapshots,
         distributed::consistency::ReadConsistency::GlobalCommittedSnapshot,
@@ -370,19 +369,39 @@ async fn scenario() -> anyhow::Result<()> {
             Err(QueryFailure::Unsupported)
         );
     }
-    assert!(matches!(
-        distributed::jobs::request(
-            grpc.local_addr(),
-            distributed::jobs::Request::Start {
-                start_partition: 0,
-                text: "g.V(1).count()".into()
-            },
-            BUDGET
-        )
-        .await?,
-        Err(QueryFailure::Unsupported)
-    ));
+    for text in [
+        "g.V(1).repeat(__.out('knows')).times(1).count()",
+        "g.V(1,1).repeat(__.out('knows')).emit().times(2).count()",
+        "g.V(1).repeat(__.out('knows')).emit().times(2).dedup().count()",
+    ] {
+        assert_eq!(
+            hierarchy_count(tcp.local_addr(), text).await?,
+            hierarchy_count(grpc.local_addr(), text).await?
+        );
+    }
+    assert_eq!(
+        hierarchy_rows(tcp.local_addr()).await?,
+        hierarchy_rows(grpc.local_addr()).await?
+    );
+    hierarchy_cancel(tcp.local_addr()).await?;
+    hierarchy_cancel(grpc.local_addr()).await?;
     session_checks(&a).await?;
+    a._process.0.kill()?;
+    a._process.0.wait()?;
+    for endpoint in [tcp.local_addr(), grpc.local_addr()] {
+        assert!(matches!(
+            distributed::jobs::request(
+                endpoint,
+                distributed::jobs::Request::Start {
+                    start_partition: 0,
+                    text: "g.V(1).repeat(__.out('knows')).times(1).count()".into()
+                },
+                BUDGET
+            )
+            .await?,
+            Err(QueryFailure::Unavailable)
+        ));
+    }
     grpc.shutdown().await;
     tcp.shutdown().await;
     Ok(())
@@ -569,6 +588,17 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
         assert_eq!(
             client
                 .open(w::OpenRequest {
+                    context: Some(c),
+                    shard: 120
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        assert_eq!(
+            client
+                .open_hierarchy(w::OpenRequest {
                     context: Some(c),
                     shard: 120
                 })
@@ -801,4 +831,186 @@ impl Proxy {
             task,
         })
     }
+}
+
+async fn hierarchy_count(endpoint: SocketAddr, text: &str) -> anyhow::Result<u64> {
+    use distributed::jobs::{self, Output, Request};
+    let mut output = jobs::request(
+        endpoint,
+        Request::Start {
+            start_partition: 0,
+            text: text.into(),
+        },
+        BUDGET,
+    )
+    .await??;
+    for _ in 0..100 {
+        let Output::Progress {
+            token,
+            next_sequence,
+            complete,
+            count,
+            completeness,
+            snapshots,
+        } = output
+        else {
+            anyhow::bail!("not progress");
+        };
+        assert_eq!(completeness, QueryCompleteness::Unverified);
+        if complete {
+            assert!(matches!(
+                jobs::request(endpoint, Request::Cancel { token }, BUDGET).await??,
+                Output::Cancelled
+            ));
+            return count.context("missing count");
+        }
+        assert!(count.is_none());
+        output = jobs::request(
+            endpoint,
+            Request::Advance {
+                token,
+                sequence: next_sequence,
+            },
+            BUDGET,
+        )
+        .await??;
+        let replay = jobs::request(
+            endpoint,
+            Request::Advance {
+                token,
+                sequence: next_sequence,
+            },
+            BUDGET,
+        )
+        .await??;
+        assert_eq!(
+            serde_json::to_value(&output)?,
+            serde_json::to_value(replay)?
+        );
+        let Output::Progress {
+            snapshots: actual, ..
+        } = &output
+        else {
+            anyhow::bail!("not progress");
+        };
+        assert_eq!(*actual, snapshots);
+    }
+    anyhow::bail!("job did not terminate")
+}
+
+async fn hierarchy_rows(endpoint: SocketAddr) -> anyhow::Result<Vec<QualifiedElement>> {
+    use distributed::jobs::{self, Output, Request};
+    let mut output = jobs::request(
+        endpoint,
+        Request::StartRows {
+            start_partition: 0,
+            text: "g.V(1).repeat(__.out('knows')).emit().times(2)".into(),
+            page_size: 1,
+        },
+        BUDGET,
+    )
+    .await??;
+    let Output::Preparing { token, .. } = output else {
+        anyhow::bail!("not preparing");
+    };
+    assert!(matches!(
+        jobs::request(endpoint, Request::Read { token, cursor: 0 }, BUDGET).await?,
+        Err(QueryFailure::InvalidArgument)
+    ));
+    for _ in 0..100 {
+        let Output::Preparing {
+            ready,
+            next_sequence,
+            ..
+        } = output
+        else {
+            anyhow::bail!("not preparing");
+        };
+        if ready {
+            break;
+        }
+        output = jobs::request(
+            endpoint,
+            Request::Advance {
+                token,
+                sequence: next_sequence,
+            },
+            BUDGET,
+        )
+        .await??;
+    }
+    assert!(matches!(output, Output::Preparing { ready: true, .. }));
+    let mut cursor = 0;
+    let mut rows = Vec::new();
+    loop {
+        let page = jobs::request(endpoint, Request::Read { token, cursor }, BUDGET).await??;
+        let replay = jobs::request(endpoint, Request::Read { token, cursor }, BUDGET).await??;
+        assert_eq!(serde_json::to_value(&page)?, serde_json::to_value(replay)?);
+        let Output::Page {
+            rows: next_rows,
+            next_cursor,
+            done,
+            completeness,
+            ..
+        } = page
+        else {
+            anyhow::bail!("not page");
+        };
+        assert_eq!(completeness, QueryCompleteness::Unverified);
+        assert!(next_rows.len() <= 1);
+        rows.extend(next_rows);
+        if done {
+            break;
+        }
+        cursor = next_cursor.context("missing cursor")?;
+    }
+    assert!(matches!(
+        jobs::request(endpoint, Request::Cancel { token }, BUDGET).await??,
+        Output::Cancelled
+    ));
+    assert!(matches!(
+        jobs::request(endpoint, Request::Read { token, cursor: 0 }, BUDGET).await?,
+        Err(QueryFailure::Unavailable)
+    ));
+    Ok(rows)
+}
+
+async fn hierarchy_cancel(endpoint: SocketAddr) -> anyhow::Result<()> {
+    use distributed::jobs::{self, Output, Request};
+    let output = jobs::request(
+        endpoint,
+        Request::Start {
+            start_partition: 0,
+            text: "g.V(1).repeat(__.out('knows')).times(1).count()".into(),
+        },
+        BUDGET,
+    )
+    .await??;
+    let Output::Progress {
+        token,
+        next_sequence,
+        complete: false,
+        count: None,
+        ..
+    } = output
+    else {
+        anyhow::bail!("expected unadvanced job");
+    };
+    assert!(matches!(
+        jobs::request(endpoint, Request::Cancel { token }, BUDGET).await??,
+        Output::Cancelled
+    ));
+    assert!(matches!(
+        jobs::request(
+            endpoint,
+            Request::Advance {
+                token,
+                sequence: next_sequence
+            },
+            BUDGET
+        )
+        .await?,
+        Err(QueryFailure::Unavailable)
+    ));
+    Ok(())
 }

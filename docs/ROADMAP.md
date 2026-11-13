@@ -17,7 +17,8 @@
 - **已交付基础切片**：remote snapshot 的 typed gRPC OpenSnapshot → Page → Close（#226）。
   observed data-local query fragments 的 Open → Fragment → Close 由 [#227](https://github.com/ashione/VelaGraph/issues/227)
   跟踪，复用真实 query sessions/admission，显式选择 gRPC coordinator backend。
-  详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；fixed/renewable、jobs、managed
+  详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；observed hierarchy jobs 的 shard
+  OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径，但 coordinator job 入口仍是旧协议。fixed/renewable、managed
   和 Raft 尚未全部迁移，不能将 observed 切片当完整查询协议统一。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；

@@ -200,10 +200,11 @@ pub(super) async fn run(
                 .as_mut()
                 .and_then(|connections| connections.remove(&batch.shard));
             let catalog = &job.catalog;
+            let grpc_clients = job.grpc_clients.as_deref();
             let sessions = job.sessions.clone();
             futures.push(Box::pin(async move {
                 let mut execution = Execution {
-                    grpc_clients: None,
+                    grpc_clients,
                     fixed_sessions: None,
                     control: None,
                     fixed_parallelism: 3,
@@ -331,6 +332,7 @@ mod tests {
             listeners.push(listener);
         }
         let job = Job {
+            grpc_clients: None,
             catalog: Arc::new(StaticCatalog { partitions: routes }),
             sessions,
             row_bounds: BTreeMap::from([(1, 256), (2, 256), (3, 256)]),
