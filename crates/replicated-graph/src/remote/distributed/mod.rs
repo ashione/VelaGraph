@@ -999,43 +999,8 @@ impl CoordinatorService {
         catalog: StaticCatalog,
         deadline: Duration,
     ) -> Result<Self, RemoteError> {
-        Self::start_transport(bind, catalog, deadline, false).await
-    }
-    /// Explicit observed query/job shard gRPC backend. Catalog endpoints must be gRPC.
-    /// Fixed/managed consistency is rejected, never sent to legacy TCP.
-    pub async fn start_grpc(
-        bind: SocketAddr,
-        catalog: StaticCatalog,
-        deadline: Duration,
-    ) -> Result<Self, RemoteError> {
-        Self::start_transport(bind, catalog, deadline, true).await
-    }
-    async fn start_transport(
-        bind: SocketAddr,
-        catalog: StaticCatalog,
-        deadline: Duration,
-        grpc: bool,
-    ) -> Result<Self, RemoteError> {
         catalog.validate()?;
-        let setup_end = checked_deadline(deadline, None)?;
-        let mut clients = BTreeMap::new();
-        if grpc {
-            for route in &catalog.partitions {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    clients.entry(route.shard)
-                {
-                    entry.insert(
-                        grpc::QueryClient::connect(
-                            route.endpoint,
-                            route.identity,
-                            setup_end.saturating_duration_since(Instant::now()),
-                        )
-                        .await?,
-                    );
-                }
-            }
-        }
-        let clients = grpc.then(|| Arc::new(clients));
+        checked_deadline(deadline, None)?;
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|_| RemoteError::Unavailable)?;
@@ -1044,7 +1009,7 @@ impl CoordinatorService {
             .map_err(|_| RemoteError::Unavailable)?;
         let (stop, mut stopped) = watch::channel(false);
         let catalog = Arc::new(catalog);
-        let jobs = Arc::new(jobs::Jobs::with_grpc_clients(clients.clone()));
+        let jobs = Arc::new(jobs::Jobs::new());
         let task = tokio::spawn(async move {
             let mut handlers = JoinSet::new();
             let mut cleanup = tokio::time::interval(Duration::from_millis(100));
@@ -1058,7 +1023,6 @@ impl CoordinatorService {
                     continue;
                 };
                 let catalog = catalog.clone();
-                let clients = clients.clone();
                 let jobs = jobs.clone();
                 jobs.expire();
                 handlers.spawn(async move {
@@ -1092,9 +1056,6 @@ impl CoordinatorService {
                             }
                         };
                         let bytes = match request {
-                            IncomingRequest::Consistent(_) if clients.is_some() => {
-                                consistency::unsupported(end)
-                            }
                             IncomingRequest::Consistent(envelope) => {
                                 consistency::handle(
                                     catalog,
@@ -1105,8 +1066,7 @@ impl CoordinatorService {
                                 .await
                             }
                             IncomingRequest::Query(request) => bounded_encode(
-                                &execute_transport(&catalog, request, end, clients.as_deref())
-                                    .await,
+                                &execute_transport(&catalog, request, end, None).await,
                                 end,
                             ),
                             IncomingRequest::Job(envelope) => bounded_encode(

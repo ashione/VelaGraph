@@ -10,10 +10,10 @@
 **gRPC + HTTP 写入/查询服务**。按 2026-11-12 的方向提高优先级，与时态和
 分布式功能并行推进，不等最终 UI/平台产品化；以下区分已交付切片与剩余验收，不将协议切片等同于完整发布。
 
-截至 main `fa202c51`（2026-11-13），Raft peer、managed control/write、snapshot、
+截至 main `046488bf`（2026-11-13），Raft peer、managed control/write、snapshot、
 observed fragments/hierarchy shard jobs、fixed/renewable sessions 已有 typed gRPC。
-`graph-service` 内部 managed 与 graph routes 已强制 gRPC。旧 driver/control、
-coordinator job 入口和兼容 listener 尚未全部清理；详见
+`graph-service` 内部 managed 与 graph routes 已强制 gRPC。driver/control 和 coordinator CLI 入口已使用 typed RPC，Unix read gateway 已删除；
+legacy library coordinator/gateway 和兼容 listener 尚未全部清理；详见
 [通信清单](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory)。
 存储 record proto 与 RPC service schema 分离；迁移不修改持久化记录、共识或 Gremlin 语义。
 
@@ -23,7 +23,8 @@ coordinator job 入口和兼容 listener 尚未全部清理；详见
   详见 [typed query transport](INTERNAL_GRPC_QUERIES.md)；observed hierarchy jobs 的 shard
   OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径；[#248](https://github.com/ashione/VelaGraph/issues/248)
   增加 coordinator observed Query/Job typed gRPC 入口；#260 将 serve/query/jobs 默认统一为 typed RPC，
-  退役 serve-grpc 与 --grpc CLI 选择，保留明确的 legacy library 差分测试；复用原执行器、
+  退役 serve-grpc 与 --grpc CLI 选择；#264 删除对外 JSON/内部 gRPC 的混合
+  library 入口，差分测试改走真正 typed ingress，保留尚未替代的纯 legacy 语义；复用原执行器、
   Jobs 状态机及累计预算。旧 coordinator/gateway library TCP 兼容入口仍待退役，不能视作全部删除。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
