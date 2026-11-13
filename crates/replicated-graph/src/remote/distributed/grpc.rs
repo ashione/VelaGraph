@@ -7,8 +7,16 @@ use tonic::{transport::Channel, Status};
 pub mod wire {
     include!("grpc/query_proto.rs");
 }
+#[path = "grpc/bounded_codec.rs"]
+pub(crate) mod bounded_codec;
 #[path = "grpc/codec.rs"]
 mod codec;
+#[path = "grpc/fixed_codec.rs"]
+mod fixed_codec;
+#[path = "grpc/fixed_transport.rs"]
+mod fixed_transport;
+pub(in crate::remote) use fixed_transport::service as fixed_service;
+pub(crate) use fixed_transport::FixedClient;
 use wire::query_service_client::QueryServiceClient;
 use wire::query_service_server::{QueryService, QueryServiceServer};
 

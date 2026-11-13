@@ -53,8 +53,10 @@ reused across query Open/Fragment/Close calls, rather than connecting per fragme
 ## Deliberate exclusions and removal plan
 
 The gRPC-backed coordinator rejects hierarchy job and explicit consistency
-requests with typed `Unsupported`. Fixed/renewable managed sessions, query jobs,
-managed control, public write/query gRPC+HTTP and Raft are **not migrated here**.
+requests with typed `Unsupported`. Fixed/renewable query sessions have a separate
+[managed-gateway gRPC entrypoint](INTERNAL_GRPC_FIXED_QUERIES.md); that does not
+change this observed coordinator's admitted request types. Fixed/renewable managed sessions are not selected through this coordinator. Query
+jobs, managed control, public write/query gRPC+HTTP and Raft are **not migrated here**.
 Do not point those existing clients at the gRPC ports or interpret this slice as
 completion of the protocol-unification roadmap.
 

@@ -46,6 +46,7 @@ impl ExecutionControl {
 
 pub(crate) struct NodeSession {
     pub route: PartitionRoute,
+    pub(crate) transport: fixed::Client,
     pub descriptor: FixedDescriptor,
     pub(super) sequence: u64,
     pub(super) capture_bytes: usize,
@@ -59,12 +60,20 @@ impl NodeSession {
         capture_rows: usize,
     ) -> Self {
         Self {
+            transport: fixed::Client::Tcp {
+                endpoint: route.endpoint,
+                identity: route.identity,
+            },
             route,
             descriptor,
             sequence: 0,
             capture_bytes,
             capture_rows,
         }
+    }
+    pub(crate) fn with_transport(mut self, transport: fixed::Client) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
@@ -103,7 +112,7 @@ fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     Ok(query)
 }
 pub(super) struct Prepared {
-    route: PartitionRoute,
+    transport: fixed::Client,
     request: FixedFragmentRequest,
     pub(super) cost: Cost,
 }
@@ -135,7 +144,7 @@ pub(super) fn prepare(
         .checked_add(1)
         .ok_or(QueryFailure::ResourceExhausted)?;
     Ok(Prepared {
-        route: node.route.clone(),
+        transport: node.transport.clone(),
         request,
         cost,
     })
@@ -157,14 +166,14 @@ pub(super) async fn invoke(
     let expected = prepared.request.descriptor.clone();
     let sequence = prepared.request.request_sequence;
     let remaining = prepared.request.remaining;
-    let output = fixed::fragment(
-        prepared.route.endpoint,
-        prepared.route.identity,
-        prepared.request,
-        rpc_end.saturating_duration_since(Instant::now()),
-    )
-    .await
-    .map_err(remote_failure)??;
+    let output = prepared
+        .transport
+        .fragment(
+            prepared.request,
+            rpc_end.saturating_duration_since(Instant::now()),
+        )
+        .await
+        .map_err(remote_failure)??;
     check(rpc_end)?;
     if let Some(control) = control {
         control.check()?;
@@ -267,14 +276,14 @@ pub(crate) async fn close(sessions: &BTreeMap<u64, NodeSession>, end: Instant) {
         if Instant::now() >= end {
             break;
         }
-        let _ = fixed::close(
-            node.route.endpoint,
-            node.route.identity,
-            node.descriptor.clone(),
-            end.saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(20)),
-        )
-        .await;
+        let _ = node
+            .transport
+            .close(
+                node.descriptor.clone(),
+                end.saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(20)),
+            )
+            .await;
     }
 }
 

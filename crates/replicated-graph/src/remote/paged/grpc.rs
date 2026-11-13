@@ -214,15 +214,20 @@ impl Handler {
         context: Option<wire::Context>,
         operation: Operation,
     ) -> Result<(Reply, Instant), Status> {
-        let context = context.ok_or_else(|| status(RemoteError::InvalidArgument))?;
-        let identity = context
-            .identity
-            .ok_or_else(|| status(RemoteError::InvalidArgument))?;
+        self.execute_raw(context, operation).await.map_err(status)
+    }
+    pub(in crate::remote) async fn execute_raw(
+        &self,
+        context: Option<wire::Context>,
+        operation: Operation,
+    ) -> Result<(Reply, Instant), RemoteError> {
+        let context = context.ok_or(RemoteError::InvalidArgument)?;
+        let identity = context.identity.ok_or(RemoteError::InvalidArgument)?;
         if context.version != VERSION {
-            return Err(status(RemoteError::Protocol));
+            return Err(RemoteError::Protocol);
         }
         if context.timeout_millis == 0 || context.timeout_millis > 60_000 {
-            return Err(status(RemoteError::InvalidArgument));
+            return Err(RemoteError::InvalidArgument);
         }
         let end = Instant::now()
             + self
@@ -245,9 +250,8 @@ impl Handler {
             ),
         )
         .await
-        .map_err(|_| status(RemoteError::Timeout { request_id: None }))?
+        .map_err(|_| RemoteError::Timeout { request_id: None })?
         .map(|reply| (reply, end))
-        .map_err(status)
     }
 }
 #[derive(Clone, Copy)]
@@ -536,6 +540,7 @@ impl GrpcSnapshotService {
                     }),
                 },
             );
+            let fixed_service = distributed::grpc::fixed_service(handler.clone());
             let query_service = distributed::grpc::service(handler.clone());
             let service = SnapshotServiceServer::new(handler)
                 .max_decoding_message_size(REQUEST_LIMIT)
@@ -550,6 +555,11 @@ impl GrpcSnapshotService {
                 })
                 .add_service(AdmittedService {
                     inner: query_service,
+                    admission: admission.clone(),
+                    deadline,
+                })
+                .add_service(AdmittedService {
+                    inner: fixed_service,
                     admission,
                     deadline,
                 })
