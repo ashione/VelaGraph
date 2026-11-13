@@ -281,6 +281,15 @@ async fn failover_keeps_retained_pages_and_queries_historical_then_fences_epoch(
         commit(&f.resolver, &p, BUDGET).await?;
         let fresh = read(&f.resolver, 1).await?;
         assert_eq!(fresh.sequence(), 3);
+        run_blocking(move || {
+            assert_eq!(
+                fresh.execute_gremlin("g.V().count()")?.rows,
+                vec![GremlinRow::Count(3)]
+            );
+            assert!(fresh.execute_gremlin("g.addV('forbidden')").is_err());
+            Ok::<_, RouteError>(())
+        })
+        .await??;
         let v = retained.clone();
         run_blocking(move || {
             assert_eq!(v.sequence(), 2);

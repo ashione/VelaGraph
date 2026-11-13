@@ -14,8 +14,8 @@ alternate production wire. Its logical byte accounting and conservative control
 write allowance are preserved where documented; they are not JSON-in-protobuf.
 Typed messages add bounded pre-decode allocation checks and reuse tracked
 admission/deadline/connection shutdown. Stored JSON log/snapshot formats are
-independent and unchanged. These limits do not apply to the separate same-host
-UDS gateway or establish a whole-process RSS cap.
+independent and unchanged. These limits do not establish a whole-process RSS cap.
+The separate same-host UDS gateway has been retired (#262).
 
 ## Shared operational boundary
 

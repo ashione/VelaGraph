@@ -127,7 +127,8 @@ Per-read Metadata uses a [bounded stream](METADATA_STREAM.md), retaining every
 applied-epoch check; Probe/Write stay unary. Original default-debug regressions
 and resource/freshness evidence remain the #258 acceptance gate, not a changed
 test profile or a loopback p50 improvement alone.
-Explicit library legacy fixtures and coordinator/gateway/Unix entrypoints remain
+The old Linux UDS read gateway is [retired](GRAPH_UDS_GATEWAY.md).
+Explicit library legacy fixtures and coordinator/gateway TCP entrypoints remain
 separate retirement work; this does not complete the all-RPC inventory.
 
 
@@ -138,7 +139,7 @@ gRPC, HTTP preview and durable formats are separate version namespaces. See
 [Raft gRPC](RAFT_GRPC.md) and [public gRPC](PUBLIC_GRPC_SERVICE.md).
 Raft peer traffic is now typed gRPC (no mixed old/new Raft wire cluster support);
 driver/control is now a separate [typed gRPC service](CONTROL_GRPC.md); remaining
-legacy/Unix compatibility paths remain in the
+legacy library TCP compatibility paths remain in the
 [communication inventory](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory). Bound durable
 coordinator/member metadata is **v16/v17**. Historical v5/v8/v9/v10/v11–v15
 references in foundational documents describe actual legacy modes/migration

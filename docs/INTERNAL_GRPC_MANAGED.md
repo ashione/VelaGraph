@@ -72,7 +72,8 @@ inter-node graph transports and are not replaced by this service migration.
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), legacy TCP ingress retained for retirement |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
 | Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Explicit library legacy fixtures remain separately retained |
-| Legacy library gateway/coordinator and Unix read gateway | Still need separate retirement/migration; graph-service no longer starts the hidden legacy listener |
+| Legacy library gateway/coordinator | Still need separate retirement/migration; graph-service no longer starts the hidden legacy listener |
+| Unix read gateway | Removed under #262; [migration and retained semantic coverage](GRAPH_UDS_GATEWAY.md). No replacement Unix listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
 framing/client/server paths after independent differential review, and test that

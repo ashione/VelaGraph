@@ -204,9 +204,9 @@ K3 write-overlay transactions still belong to `GraphEngine`. Separate
 [server query](REMOTE_QUERY.md) and [distributed observed query](DISTRIBUTED_QUERY.md)
 APIs now exist, with their own scopes; they do not change this adapter contract.
 Automatic remote replica routing and production availability remain unfinished.
-A Linux-only same-host read gateway is
-separately documented in
-[GRAPH_UDS_GATEWAY.md](GRAPH_UDS_GATEWAY.md).
+The former Linux-only same-host UDS read gateway is removed; its
+[migration note](GRAPH_UDS_GATEWAY.md) distinguishes retained in-process routing
+from the supported typed service contracts.
 The optional static in-process resolver is documented in D3_STATIC_CATALOG.md.
 
 ## Development-only remote graph adapter

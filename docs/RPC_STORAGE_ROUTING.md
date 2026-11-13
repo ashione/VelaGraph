@@ -40,7 +40,8 @@ new interpreter, global query plan or consistency claim.
 
 `GraphService` remains an explicit legacy library wrapper for old wire-specific
 callers/parity fixtures; it is not constructed by graph-node. Legacy coordinator,
-gateway and Unix entrypoints remain separately inventoried under #218.
+gateway entrypoints remain separately inventoried under #218. The separate
+[Unix read gateway is retired](GRAPH_UDS_GATEWAY.md).
 
 Existing JSON fragmentation/malformed-frame/proxy assertions are not deleted or
 pretended to test HTTP/2. Their integration suites launch an ignored test-only
