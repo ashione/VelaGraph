@@ -1644,7 +1644,7 @@ mod versioned_query_tests {
             context: context.clone(),
             session: Some(pb::FixedSession {
                 incarnation: vec![4; 16],
-                token: vec![5; 16],
+                token: vec![5; 32],
                 version: 0,
             }),
             query: query.clone(),
@@ -1664,7 +1664,7 @@ mod versioned_query_tests {
                 context: context.clone(),
                 session: Some(pb::Session {
                     incarnation: vec![4; 16],
-                    token: vec![5; 16],
+                    token: vec![5; 32],
                     version: 0,
                 }),
                 query: query.clone(),
@@ -1696,7 +1696,7 @@ mod versioned_query_tests {
                 context,
                 job: Some(pb::JobHandle {
                     incarnation: vec![4; 16],
-                    token: vec![5; 16],
+                    token: vec![5; 32],
                 }),
                 query,
                 cursor: None,
