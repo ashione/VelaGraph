@@ -769,14 +769,22 @@ mod tests {
         async fn renew(
             &self,
             request: tonic::Request<fixed_wire::FixedRenewEnvelope>,
-        ) -> std::result::Result<tonic::Response<fixed_wire::FixedLeaseGrant>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<fixed_wire::FixedLeaseGrant>, tonic::Status>
+        {
             let message = request.into_inner();
             let context = message.context.expect("typed context");
             assert_eq!(context.version, 1);
             assert_eq!(context.identity.expect("peer identity").group, self.shard);
             let renew = message.request.expect("typed renewal request");
             assert_eq!(
-                renew.descriptor.as_ref().unwrap().stamp.as_ref().unwrap().shard,
+                renew
+                    .descriptor
+                    .as_ref()
+                    .unwrap()
+                    .stamp
+                    .as_ref()
+                    .unwrap()
+                    .shard,
                 self.shard
             );
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -797,13 +805,15 @@ mod tests {
         async fn open_renewable(
             &self,
             _: tonic::Request<fixed_wire::RenewableOpenEnvelope>,
-        ) -> std::result::Result<tonic::Response<fixed_wire::RenewableFixedOpened>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<fixed_wire::RenewableFixedOpened>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("renewal-only test peer"))
         }
         async fn fragment_fixed(
             &self,
             _: tonic::Request<fixed_wire::FixedFragmentEnvelope>,
-        ) -> std::result::Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("renewal-only test peer"))
         }
         async fn close_fixed(

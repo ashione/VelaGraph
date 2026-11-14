@@ -809,14 +809,22 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
         routes[0].endpoint = listener.local_addr().unwrap();
         let proxy = tokio::spawn(run_fixed_script(listener, move |mut events| async move {
             let event = events.recv().await.unwrap();
-            let FixedRpc::Open(mut open) = event.request else { panic!("expected OpenFixed") };
+            let FixedRpc::Open(mut open) = event.request else {
+                panic!("expected OpenFixed")
+            };
             if downgrade_profile {
                 let request = open.request.as_mut().unwrap();
-                assert_eq!(request.profile, fixed_wire::LocalReadProfile::LocalRead8MibV1 as i32);
+                assert_eq!(
+                    request.profile,
+                    fixed_wire::LocalReadProfile::LocalRead8MibV1 as i32
+                );
                 request.profile = fixed_wire::LocalReadProfile::Parity2MibV1 as i32;
                 request.capture_limit.as_mut().unwrap().bytes = 2 * 1024 * 1024;
             }
-            let FixedRpcReply::Open(mut opened) = forward_fixed(real, FixedRpc::Open(open)).await else { panic!() };
+            let FixedRpcReply::Open(mut opened) = forward_fixed(real, FixedRpc::Open(open)).await
+            else {
+                panic!()
+            };
             let descriptor = opened.descriptor.clone().unwrap();
             let proof = opened.retained_proof.as_mut().unwrap();
             assert_eq!(proof.through, 0);
@@ -824,12 +832,17 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
                 // Independently valid V0 evidence, but from another authority.
                 proof.authority = vec![66; 16];
             } else {
-                assert_eq!(descriptor.profile, fixed_wire::LocalReadProfile::Parity2MibV1 as i32);
+                assert_eq!(
+                    descriptor.profile,
+                    fixed_wire::LocalReadProfile::Parity2MibV1 as i32
+                );
             }
             assert!(event.reply.send(Ok(FixedRpcReply::Open(opened))).is_ok());
             // Proof/profile rejection still closes the known safe descriptor.
             let event = events.recv().await.unwrap();
-            let FixedRpc::Close(close) = &event.request else { panic!("expected CloseFixed") };
+            let FixedRpc::Close(close) = &event.request else {
+                panic!("expected CloseFixed")
+            };
             assert_eq!(close.descriptor.as_ref(), Some(&descriptor));
             let reply = forward_fixed(real, event.request).await;
             assert!(event.reply.send(Ok(reply)).is_ok());
@@ -899,9 +912,14 @@ enum FixedRpc {
 }
 impl FixedRpc {
     fn fragment(&self) -> Option<&fixed_wire::FixedFragmentRequest> {
-        match self { Self::Fragment(v) => v.request.as_ref(), _ => None }
+        match self {
+            Self::Fragment(v) => v.request.as_ref(),
+            _ => None,
+        }
     }
-    fn is_close(&self) -> bool { matches!(self, Self::Close(_)) }
+    fn is_close(&self) -> bool {
+        matches!(self, Self::Close(_))
+    }
 }
 enum FixedRpcReply {
     Open(fixed_wire::FixedOpened),
@@ -910,50 +928,86 @@ enum FixedRpcReply {
 }
 struct FixedEvent {
     request: FixedRpc,
-    reply: tokio::sync::oneshot::Sender<Result<FixedRpcReply, tonic::Status>>,
+    reply: tokio::sync::oneshot::Sender<std::result::Result<FixedRpcReply, tonic::Status>>,
 }
 #[derive(Clone)]
 struct FixedScript(tokio::sync::mpsc::Sender<FixedEvent>);
 impl FixedScript {
-    async fn dispatch(&self, request: FixedRpc) -> Result<FixedRpcReply, tonic::Status> {
+    async fn dispatch(
+        &self,
+        request: FixedRpc,
+    ) -> std::result::Result<FixedRpcReply, tonic::Status> {
         let (reply, response) = tokio::sync::oneshot::channel();
-        self.0.send(FixedEvent { request, reply }).await
+        self.0
+            .send(FixedEvent { request, reply })
+            .await
             .map_err(|_| tonic::Status::unavailable("fault script finished"))?;
-        response.await.map_err(|_| tonic::Status::unavailable("fault script dropped response"))?
+        response
+            .await
+            .map_err(|_| tonic::Status::unavailable("fault script dropped response"))?
     }
 }
 #[tonic::async_trait]
 impl fixed_wire::fixed_query_service_server::FixedQueryService for FixedScript {
-    async fn open_fixed(&self, request: tonic::Request<fixed_wire::FixedOpenEnvelope>) -> Result<tonic::Response<fixed_wire::FixedOpened>, tonic::Status> {
+    async fn open_fixed(
+        &self,
+        request: tonic::Request<fixed_wire::FixedOpenEnvelope>,
+    ) -> std::result::Result<tonic::Response<fixed_wire::FixedOpened>, tonic::Status> {
         match self.dispatch(FixedRpc::Open(request.into_inner())).await? {
-            FixedRpcReply::Open(v) => Ok(tonic::Response::new(v)), _ => panic!("wrong scripted reply"),
+            FixedRpcReply::Open(v) => Ok(tonic::Response::new(v)),
+            _ => panic!("wrong scripted reply"),
         }
     }
-    async fn fragment_fixed(&self, request: tonic::Request<fixed_wire::FixedFragmentEnvelope>) -> Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status> {
-        match self.dispatch(FixedRpc::Fragment(request.into_inner())).await? {
-            FixedRpcReply::Fragment(v) => Ok(tonic::Response::new(v)), _ => panic!("wrong scripted reply"),
+    async fn fragment_fixed(
+        &self,
+        request: tonic::Request<fixed_wire::FixedFragmentEnvelope>,
+    ) -> std::result::Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status> {
+        match self
+            .dispatch(FixedRpc::Fragment(request.into_inner()))
+            .await?
+        {
+            FixedRpcReply::Fragment(v) => Ok(tonic::Response::new(v)),
+            _ => panic!("wrong scripted reply"),
         }
     }
-    async fn close_fixed(&self, request: tonic::Request<fixed_wire::FixedCloseEnvelope>) -> Result<tonic::Response<fixed_wire::Empty>, tonic::Status> {
+    async fn close_fixed(
+        &self,
+        request: tonic::Request<fixed_wire::FixedCloseEnvelope>,
+    ) -> std::result::Result<tonic::Response<fixed_wire::Empty>, tonic::Status> {
         match self.dispatch(FixedRpc::Close(request.into_inner())).await? {
-            FixedRpcReply::Close(v) => Ok(tonic::Response::new(v)), _ => panic!("wrong scripted reply"),
+            FixedRpcReply::Close(v) => Ok(tonic::Response::new(v)),
+            _ => panic!("wrong scripted reply"),
         }
     }
-    async fn open_renewable(&self, _: tonic::Request<fixed_wire::RenewableOpenEnvelope>) -> Result<tonic::Response<fixed_wire::RenewableFixedOpened>, tonic::Status> {
+    async fn open_renewable(
+        &self,
+        _: tonic::Request<fixed_wire::RenewableOpenEnvelope>,
+    ) -> std::result::Result<tonic::Response<fixed_wire::RenewableFixedOpened>, tonic::Status> {
         panic!("fixed fixture must not open a renewable session")
     }
-    async fn renew(&self, _: tonic::Request<fixed_wire::FixedRenewEnvelope>) -> Result<tonic::Response<fixed_wire::FixedLeaseGrant>, tonic::Status> {
+    async fn renew(
+        &self,
+        _: tonic::Request<fixed_wire::FixedRenewEnvelope>,
+    ) -> std::result::Result<tonic::Response<fixed_wire::FixedLeaseGrant>, tonic::Status> {
         panic!("fixed fixture must not renew or refresh its view")
     }
 }
 async fn forward_fixed(real: SocketAddr, request: FixedRpc) -> FixedRpcReply {
-    let mut client = fixed_wire::fixed_query_service_client::FixedQueryServiceClient::connect(format!("http://{real}")).await.unwrap()
-        .max_decoding_message_size(crate::remote::MAX_FRAME_BYTES)
-        .max_encoding_message_size(crate::remote::MAX_FRAME_BYTES);
+    let mut client = fixed_wire::fixed_query_service_client::FixedQueryServiceClient::connect(
+        format!("http://{real}"),
+    )
+    .await
+    .unwrap()
+    .max_decoding_message_size(crate::remote::MAX_FRAME_BYTES)
+    .max_encoding_message_size(crate::remote::MAX_FRAME_BYTES);
     match request {
         FixedRpc::Open(v) => FixedRpcReply::Open(client.open_fixed(v).await.unwrap().into_inner()),
-        FixedRpc::Fragment(v) => FixedRpcReply::Fragment(client.fragment_fixed(v).await.unwrap().into_inner()),
-        FixedRpc::Close(v) => FixedRpcReply::Close(client.close_fixed(v).await.unwrap().into_inner()),
+        FixedRpc::Fragment(v) => {
+            FixedRpcReply::Fragment(client.fragment_fixed(v).await.unwrap().into_inner())
+        }
+        FixedRpc::Close(v) => {
+            FixedRpcReply::Close(client.close_fixed(v).await.unwrap().into_inner())
+        }
     }
 }
 async fn run_fixed_script<F, Fut, T>(listener: TcpListener, script: F) -> T
@@ -967,11 +1021,19 @@ where
     tasks.spawn(async move {
         tonic::transport::Server::builder()
             .timeout(Duration::from_secs(15))
-            .add_service(fixed_wire::fixed_query_service_server::FixedQueryServiceServer::new(FixedScript(events))
+            .add_service(
+                fixed_wire::fixed_query_service_server::FixedQueryServiceServer::new(FixedScript(
+                    events,
+                ))
                 .max_decoding_message_size(crate::remote::MAX_FRAME_BYTES)
-                .max_encoding_message_size(crate::remote::MAX_FRAME_BYTES))
-            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), stopped.closed())
-            .await.unwrap();
+                .max_encoding_message_size(crate::remote::MAX_FRAME_BYTES),
+            )
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stopped.closed(),
+            )
+            .await
+            .unwrap();
     });
     let result = script(receiver).await;
     // Dropping the receiver starts graceful shutdown, flushing the last response.
@@ -1089,11 +1151,18 @@ async fn fixed_local_concurrent_write_never_refreshes_descriptor_or_recaptures()
             let reply = forward_fixed(real, event.request).await;
             if index == 1 {
                 // Commit after first Exists at V1 but before the second.
-                super::request(write_address, bound(), Operation::Submit(create(2, 7, 2)), Duration::from_secs(15)).await.unwrap();
+                super::request(
+                    write_address,
+                    bound(),
+                    Operation::Submit(create(2, 7, 2)),
+                    Duration::from_secs(15),
+                )
+                .await
+                .unwrap();
             }
             assert!(event.reply.send(Ok(reply)).is_ok());
         }
-        }));
+    }));
     let tested = Gateway::bind_remote_local_queries(
         remote_config(&g),
         routes,
@@ -1207,12 +1276,21 @@ async fn fixed_local_replacement_keeps_captured_paths_and_matches_lazy_traverse(
                     descriptor = fragment.descriptor.clone();
                     assert!(descriptor.is_some());
                 }
-            } else { assert!(close); }
+            } else {
+                assert!(close);
+            }
             let reply = forward_fixed(real, event.request).await;
             if is_fragment && new_v.is_none() {
                 // Both captures preceded this required read. Replace the actual
                 // edge while its old-view response is withheld.
-                let result = super::request(write_address, bound(), Operation::Submit(replacement.clone()), Duration::from_secs(15)).await.unwrap();
+                let result = super::request(
+                    write_address,
+                    bound(),
+                    Operation::Submit(replacement.clone()),
+                    Duration::from_secs(15),
+                )
+                .await
+                .unwrap();
                 new_v = Some(committed(&result).1);
             }
             assert!(event.reply.send(Ok(reply)).is_ok());
@@ -1222,7 +1300,7 @@ async fn fixed_local_replacement_keeps_captured_paths_and_matches_lazy_traverse(
                 return new_v.unwrap();
             }
         }
-        }));
+    }));
     let tested = Gateway::bind_remote_local_queries(
         remote_config(&g),
         routes,
@@ -1476,44 +1554,70 @@ async fn fixed_local_parallel_validation_uses_real_views_and_never_hides_filtere
             route.endpoint = listener.local_addr().unwrap();
             let barrier = barrier.clone();
             let shard = route.identity.group;
-            proxies.push(tokio::spawn(run_fixed_script(listener, move |mut events| async move {
-                let mut sequence = 0;
-                let mut outgoing = 0;
-                let mut descriptor = None;
-                loop {
-                    let event = events.recv().await.unwrap();
-                    let leaf = event.request.fragment();
-                    let kind = leaf.and_then(|v| v.fragment.as_ref()).and_then(|v| v.kind.as_ref());
-                    let verify = matches!(kind, Some(fixed_wire::fragment::Kind::VerifyReverse(_)));
-                    let out = matches!(kind, Some(fixed_wire::fragment::Kind::Out(_)));
-                    if let Some(leaf) = leaf {
-                        assert_eq!(leaf.request_sequence, sequence);
-                        sequence += 1;
-                        assert_eq!(leaf.descriptor.as_ref().unwrap().version, 4);
-                        if let Some(original) = &descriptor {
-                            assert_eq!(leaf.descriptor.as_ref(), Some(original));
-                        } else { descriptor = leaf.descriptor.clone(); }
+            proxies.push(tokio::spawn(run_fixed_script(
+                listener,
+                move |mut events| async move {
+                    let mut sequence = 0;
+                    let mut outgoing = 0;
+                    let mut descriptor = None;
+                    loop {
+                        let event = events.recv().await.unwrap();
+                        let leaf = event.request.fragment();
+                        let kind = leaf
+                            .and_then(|v| v.fragment.as_ref())
+                            .and_then(|v| v.kind.as_ref());
+                        let verify =
+                            matches!(kind, Some(fixed_wire::fragment::Kind::VerifyReverse(_)));
+                        let out = matches!(kind, Some(fixed_wire::fragment::Kind::Out(_)));
+                        if let Some(leaf) = leaf {
+                            assert_eq!(leaf.request_sequence, sequence);
+                            sequence += 1;
+                            assert_eq!(leaf.descriptor.as_ref().unwrap().version, 4);
+                            if let Some(original) = &descriptor {
+                                assert_eq!(leaf.descriptor.as_ref(), Some(original));
+                            } else {
+                                descriptor = leaf.descriptor.clone();
+                            }
+                        }
+                        if out {
+                            outgoing += 1;
+                        }
+                        // Real retained lanes must reach this barrier together.
+                        let parallel_out = !corrupt && out && (shard == 8 || outgoing > 1);
+                        if verify || parallel_out {
+                            tokio::time::timeout(Duration::from_secs(4), barrier.wait())
+                                .await
+                                .unwrap();
+                        }
+                        let close = event.request.is_close();
+                        let mut reply = forward_fixed(real, event.request).await;
+                        if corrupt && verify && shard == 8 {
+                            let FixedRpcReply::Fragment(response) = &mut reply else {
+                                panic!()
+                            };
+                            let Some(fixed_wire::fixed_fragment_response::Result::Output(output)) =
+                                response.result.as_mut()
+                            else {
+                                panic!("expected real successful verification")
+                            };
+                            assert!(matches!(
+                                output.value.as_ref().and_then(|v| v.kind.as_ref()),
+                                Some(fixed_wire::fragment_value::Kind::Boolean(_))
+                            ));
+                            output.value.as_mut().unwrap().kind =
+                                Some(fixed_wire::fragment_value::Kind::Boolean(false));
+                        }
+                        let sent = event.reply.send(Ok(reply));
+                        // Corrupt peer may cancel the healthy lane's response.
+                        if !(corrupt && verify && shard == 7) {
+                            assert!(sent.is_ok());
+                        }
+                        if close {
+                            break;
+                        }
                     }
-                    if out { outgoing += 1; }
-                    // Real retained lanes must reach this barrier together.
-                    let parallel_out = !corrupt && out && (shard == 8 || outgoing > 1);
-                    if verify || parallel_out {
-                        tokio::time::timeout(Duration::from_secs(4), barrier.wait()).await.unwrap();
-                    }
-                    let close = event.request.is_close();
-                    let mut reply = forward_fixed(real, event.request).await;
-                    if corrupt && verify && shard == 8 {
-                        let FixedRpcReply::Fragment(response) = &mut reply else { panic!() };
-                        let Some(fixed_wire::fixed_fragment_response::Result::Output(output)) = response.result.as_mut() else { panic!("expected real successful verification") };
-                        assert!(matches!(output.value.as_ref().and_then(|v| v.kind.as_ref()), Some(fixed_wire::fragment_value::Kind::Boolean(_))));
-                        output.value.as_mut().unwrap().kind = Some(fixed_wire::fragment_value::Kind::Boolean(false));
-                    }
-                    let sent = event.reply.send(Ok(reply));
-                    // Corrupt peer may cancel the healthy lane's response.
-                    if !(corrupt && verify && shard == 7) { assert!(sent.is_ok()); }
-                    if close { break; }
-                }
-            })));
+                },
+            )));
         }
         let tested = Gateway::bind_remote_local_queries(
             remote_config(&g),
