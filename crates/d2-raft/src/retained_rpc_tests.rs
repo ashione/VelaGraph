@@ -5,30 +5,12 @@ fn retained_target_fixture() -> TargetEvidence {
     TargetEvidence::from_journal(&journal, [2; 16]).unwrap()
 }
 async fn fake_target_json(value: serde_json::Value) -> (Client, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = Client::new(
-        listener.local_addr().unwrap(),
-        identity(),
-        Duration::from_secs(2),
-    )
-    .unwrap();
-    let peer = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request: Request = receive(&mut stream).await.unwrap();
-        assert!(matches!(
-            request.operation,
-            Operation::LookupTarget { id: [2, ..], .. }
-        ));
-        let reply = serde_json::json!({
-            "version": PROTOCOL_VERSION, "operation": request.operation.tag(),
-            "identity": request.identity, "nonce": request.nonce,
-            "result": {"Ok": {"Target": value}},
-        });
-        send(&mut stream, &encode(reply).await.unwrap())
-            .await
-            .unwrap();
-    });
-    (client, peer)
+    let result = serde_json::from_value(value).map(Value::Target).map_err(|_| Error::Protocol);
+    typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
+        assert!(matches!(request.operation, Operation::LookupTarget { id: [2, ..], .. }));
+        let result = result.clone();
+        Box::pin(async move { wire_reply(request, result) })
+    }).await
 }
 
 #[tokio::test]

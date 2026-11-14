@@ -8,6 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -874,4 +875,17 @@ mod tests {
             task.await.unwrap();
         }
     }
+}
+
+/// Local fixture translation for process tests; never a network JSON envelope.
+#[cfg(feature = "test-hooks")]
+pub fn test_request_json(value: wire::Request) -> Result<serde_json::Value, Error> {
+    let (request, _) = codec::request_from_wire(value)?;
+    serde_json::to_value(request).map_err(|_| Error::Protocol)
+}
+/// Local fixture translation for process tests; the service sends typed protobuf.
+#[cfg(feature = "test-hooks")]
+pub fn test_reply_from_json(value: serde_json::Value) -> Result<wire::Reply, Error> {
+    let reply = serde_json::from_value(value).map_err(|_| Error::Protocol)?;
+    codec::reply_to_wire(reply)
 }

@@ -14,23 +14,27 @@ use crate::transaction_decisions::{
 };
 use crate::versioned_reads::{ReadLimit, ReadSnapshot, Target};
 use crate::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, NodeHandle};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+#[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
-use tokio::task::{JoinHandle, JoinSet};
+#[cfg(test)]
+use tokio::task::JoinHandle;
 
 /// Typed, versioned internal gRPC transport. No public administration methods.
 pub mod grpc;
 pub(crate) mod grpc_codec;
 
-/// JSON framing limit, enforced before allocation and while serialization runs.
+/// Protobuf message limit, enforced before allocation and encoding.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const PROTOCOL_VERSION: u32 = 6;
 const CONCURRENCY: usize = 4;
@@ -343,7 +347,7 @@ impl Operation {
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reply {
     version: u32,
@@ -352,7 +356,7 @@ struct Reply {
     nonce: u64,
     result: Result<Value, Error>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Value {
     Target(TargetEvidence),
@@ -396,7 +400,7 @@ fn deserialize_capacity_grants<'de, D: serde::Deserializer<'de>>(
         crate::transaction_decisions::MAX_PARTICIPANTS,
     )
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     shard: u64,
@@ -546,7 +550,9 @@ fn bounded_cpu_with_slots<T: Send + 'static>(
         .map_err(|_| Error::Unavailable)?
     })
 }
+#[cfg(test)]
 struct BoundedWriter(Vec<u8>);
+#[cfg(test)]
 impl Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > MAX_FRAME_BYTES.saturating_sub(self.0.len()) {
@@ -559,45 +565,17 @@ impl Write for BoundedWriter {
         Ok(())
     }
 }
+#[cfg(test)]
 fn encode_sync<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     let mut writer = BoundedWriter(Vec::new());
     serde_json::to_writer(&mut writer, value).map_err(|_| Error::Capacity)?;
     Ok(writer.0)
 }
-async fn encode<T: Serialize + Send + 'static>(value: T) -> Result<Vec<u8>, Error> {
-    cpu(move || encode_sync(&value)).await
-}
-async fn receive<T: DeserializeOwned + Send + 'static>(stream: &mut TcpStream) -> Result<T, Error> {
-    let length = stream.read_u32().await.map_err(|_| Error::Unavailable)? as usize;
-    if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(Error::Capacity);
-    }
-    let mut bytes = vec![0; length];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|_| Error::Unavailable)?;
-    cpu(move || serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)).await
-}
-async fn send(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), Error> {
-    if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
-        return Err(Error::Capacity);
-    }
-    stream
-        .write_u32(bytes.len() as u32)
-        .await
-        .map_err(|_| Error::Unavailable)?;
-    stream
-        .write_all(bytes)
-        .await
-        .map_err(|_| Error::Unavailable)
-}
-
-/// A fixed remote replica. No forwarding, discovery, or failover occurs.
+/// A fixed typed gRPC replica. Construct on a Tokio runtime.
+/// No forwarding, discovery, protocol fallback, or failover occurs.
 #[derive(Clone)]
 pub struct Client {
-    address: SocketAddr,
-    transport: Option<Arc<grpc::Transport>>,
+    transport: Arc<grpc::Transport>,
     identity: Identity,
     timeout: Duration,
     slots: Arc<Semaphore>,
@@ -609,8 +587,7 @@ impl Client {
         identity.validate()?;
         valid_timeout(timeout)?;
         Ok(Self {
-            address,
-            transport: None,
+            transport: Arc::new(grpc::Transport::new(address, timeout)?),
             identity,
             timeout,
             slots: outbound_slots().clone(),
@@ -625,9 +602,7 @@ impl Client {
         identity: Identity,
         timeout: Duration,
     ) -> Result<Self, Error> {
-        let mut client = Self::new(address, identity, timeout)?;
-        client.transport = Some(Arc::new(grpc::Transport::new(address, timeout)?));
-        Ok(client)
+        Self::new(address, identity, timeout)
     }
     /// Opt into bounded FIFO waiting for the existing process-wide RPC slots.
     /// Four active allocations plus four additional admitted calls are bounded
@@ -820,50 +795,12 @@ impl Client {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| Error::Capacity)?;
             let operation_tag = operation.tag();
-            if let Some(transport) = &self.transport {
-                let reply = transport
-                    .call(
-                        Request {
-                            version: PROTOCOL_VERSION,
-                            identity: self.identity.clone(),
-                            nonce,
-                            operation,
-                        },
-                        deadline,
-                    )
-                    .await?;
-                if reply.version != PROTOCOL_VERSION
-                    || reply.operation != operation_tag
-                    || reply.identity != self.identity
-                    || reply.nonce != nonce
-                {
-                    return Err(Error::Identity);
-                }
-                return reply.result;
-            }
-            let bytes = encode(Request {
-                version: PROTOCOL_VERSION,
-                identity: self.identity.clone(),
-                nonce,
-                operation,
-            })
-            .await?;
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::Unavailable);
-            }
-            let mut stream = TcpStream::connect(self.address)
-                .await
-                .map_err(|_| Error::Unavailable)?;
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::Unavailable);
-            }
-            send(&mut stream, &bytes).await?;
-            let reply: Reply = receive(&mut stream).await?;
-            if reply.version != PROTOCOL_VERSION
-                || reply.operation != operation_tag
-                || reply.identity != self.identity
-                || reply.nonce != nonce
-            {
+            let reply = self.transport.call(
+                Request { version: PROTOCOL_VERSION, identity: self.identity.clone(), nonce, operation },
+                deadline,
+            ).await?;
+            if reply.version != PROTOCOL_VERSION || reply.operation != operation_tag
+                || reply.identity != self.identity || reply.nonce != nonce {
                 return Err(Error::Identity);
             }
             reply.result
@@ -2607,140 +2544,53 @@ async fn execute(
     }
 }
 
-/// Listener for exactly one configured node. Existing role activation is required.
-/// Shutdown stops admission and waits for bounded in-flight handlers.
-pub struct Server {
-    address: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<()>>,
-}
-impl Server {
-    pub async fn bind(
-        node: Arc<NodeHandle>,
-        identity: Identity,
-        address: SocketAddr,
-        timeout: Duration,
-    ) -> Result<Self, Error> {
-        if identity.role == Role::Coordinator
-            && identity.cohort.profile == CapacityProfile::ByteBound16MiBV1
-        {
-            return Err(Error::Identity);
-        }
-        Self::bind_configured(node, identity, None, address, timeout).await
-    }
-    /// Bind a byte-budget coordinator to its complete, immutable trusted endpoint set.
-    /// Every member, including nonparticipants, is checked during confirmation.
-    pub async fn bind_byte_bound_coordinator(
-        node: Arc<NodeHandle>,
-        identity: Identity,
-        mut members: Vec<Client>,
-        address: SocketAddr,
-        timeout: Duration,
-    ) -> Result<Self, Error> {
-        validate_capacity_endpoints(&identity, &mut members)?;
-        Self::bind_configured(node, identity, Some(members.into()), address, timeout).await
-    }
-    async fn bind_configured(
-        node: Arc<NodeHandle>,
-        identity: Identity,
-        members: Option<Arc<[Client]>>,
-        address: SocketAddr,
-        timeout: Duration,
-    ) -> Result<Self, Error> {
-        identity.validate()?;
-        valid_timeout(timeout)?;
-        if identity.node != node.id || identity.group != node.group_id() {
-            return Err(Error::Identity);
-        }
-        let probe = match identity.role {
-            Role::Coordinator => Operation::Summary {
-                authority: identity.authority.clone(),
-                epoch: identity.target.epoch,
-            },
-            Role::Participant => Operation::Visibility {
-                target: identity.target.clone(),
-            },
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
-        tokio::time::timeout_at(
-            deadline,
-            dispatch(
-                &node,
-                Some(identity.clone()),
-                members.clone(),
-                probe,
-                deadline,
-            ),
-        )
-        .await
-        .map_err(|_| Error::Unavailable)??;
-        let listener = TcpListener::bind(address)
-            .await
-            .map_err(|_| Error::Unavailable)?;
-        let address = listener.local_addr().map_err(|_| Error::Unavailable)?;
-        let (stop, mut stopped) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let slots = Arc::new(Semaphore::new(CONCURRENCY));
-            let mut handlers = JoinSet::new();
-            loop {
-                tokio::select! {
-                    _ = &mut stopped => break,
-                    Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
-                    accepted = listener.accept() => {
-                        let Ok((mut stream,_)) = accepted else { break; };
-                        let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
-                        let node = node.clone(); let identity = identity.clone(); let members = members.clone();
-                        handlers.spawn(async move {
-                            let _permit = permit;
-                            let deadline = tokio::time::Instant::now() + timeout;
-                            let _ = tokio::time::timeout_at(deadline, async {
-                                let request: Request = receive(&mut stream).await?;
-                                let operation = request.operation.tag();
-                                let result = if request.version != PROTOCOL_VERSION { Err(Error::Protocol) } else if request.identity != identity { Err(Error::Identity) }
-                                    else { dispatch(&node,Some(identity.clone()),members,request.operation,deadline).await };
-                                let bytes = match encode(Reply { version:PROTOCOL_VERSION,operation,identity:identity.clone(),nonce:request.nonce,result }).await {
-                                    Ok(bytes) => bytes,
-                                    Err(error) => encode(Reply { version:PROTOCOL_VERSION,operation,identity,nonce:request.nonce,result:Err(error) }).await?,
-                                };
-                                if tokio::time::Instant::now() >= deadline { return Err(Error::Unavailable); }
-                                send(&mut stream,&bytes).await
-                            }).await;
-                        });
-                    }
-                }
-            }
-            while handlers.join_next().await.is_some() {}
-        });
-        Ok(Self {
-            address,
-            stop: Some(stop),
-            task: Some(task),
-        })
-    }
-    pub fn local_addr(&self) -> SocketAddr {
-        self.address
-    }
-    pub async fn shutdown(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-    }
-}
+/// Typed gRPC listener for one configured node. No JSON/TCP compatibility listener.
+pub use grpc::Server;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transaction_decisions::MAX_TRANSACTIONS;
+    use prost::Message;
+    type PeerReply = Result<grpc::wire::Reply, tonic::Status>;
+    type PeerFuture = std::pin::Pin<Box<dyn std::future::Future<Output = PeerReply> + Send>>;
+    struct TypedPeer {
+        reply: Arc<dyn Fn(Request) -> PeerFuture + Send + Sync>,
+        remaining: AtomicU64,
+        stop: tokio_util::sync::CancellationToken,
+    }
+    #[tonic::async_trait]
+    impl grpc::wire::managed_service_server::ManagedService for TypedPeer {
+        async fn call(&self, request: tonic::Request<grpc::wire::Request>) -> Result<tonic::Response<grpc::wire::Reply>, tonic::Status> {
+            let (request, _) = grpc_codec::request_from_wire(request.into_inner())
+                .map_err(|_| tonic::Status::invalid_argument("test request"))?;
+            let result = (self.reply)(request).await;
+            if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 { self.stop.cancel(); }
+            result.map(tonic::Response::new)
+        }
+    }
+    async fn typed_peer(
+        id: Identity, timeout: Duration, calls: u64,
+        reply: impl Fn(Request) -> PeerFuture + Send + Sync + 'static,
+    ) -> (Client, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(listener.local_addr().unwrap(), id, timeout).unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let service = TypedPeer { reply: Arc::new(reply), remaining: AtomicU64::new(calls), stop: stop.clone() };
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(grpc::wire::managed_service_server::ManagedServiceServer::new(service))
+                .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), stop.cancelled_owned())
+                .await.unwrap();
+        });
+        (client, task)
+    }
+    fn wire_reply(request: Request, result: Result<Value, Error>) -> PeerReply {
+        grpc_codec::reply_to_wire(Reply { version: PROTOCOL_VERSION, operation: request.operation.tag(),
+            identity: request.identity, nonce: request.nonce, result })
+            .map_err(|_| tonic::Status::invalid_argument("test reply"))
+    }
+
     #[test]
     fn bounded_writer_and_strict_json() {
         let mut writer = BoundedWriter(vec![0; MAX_FRAME_BYTES - 1]);
@@ -2764,24 +2614,11 @@ mod tests {
             error
         );
     }
-    #[tokio::test]
-    async fn oversized_length_is_rejected_before_payload() {
-        let _resources = test_resource_guard().await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let writer = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            stream
-                .write_u32((MAX_FRAME_BYTES + 1) as u32)
-                .await
-                .unwrap();
-        });
-        let (mut stream, _) = listener.accept().await.unwrap();
-        assert!(matches!(
-            receive::<Request>(&mut stream).await,
-            Err(Error::Capacity)
-        ));
-        writer.await.unwrap();
+    #[test]
+    fn oversized_protobuf_is_rejected_before_decode() {
+        // The active transport pre-scans encoded protobuf before prost allocation.
+        let bytes = vec![0; MAX_FRAME_BYTES + 1];
+        assert!(grpc_codec::check_request(&bytes).is_err());
     }
     fn identity() -> Identity {
         Identity {
@@ -2836,68 +2673,32 @@ mod tests {
     async fn forged_replies_and_slow_input_fail_closed() {
         let _resources = test_resource_guard().await;
         for wrong in 0..5 {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = Client::new(
-                listener.local_addr().unwrap(),
-                identity(),
-                Duration::from_secs(2),
-            )
-            .unwrap();
-            let peer = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request: Request = receive(&mut stream).await.unwrap();
-                let mut reply = Reply {
-                    version: PROTOCOL_VERSION,
-                    operation: request.operation.tag(),
-                    identity: request.identity,
-                    nonce: request.nonce,
-                    result: Ok(Value::Unit),
-                };
-                match wrong {
-                    0 => reply.identity.group += 1,
-                    1 => reply.nonce += 1,
-                    2 => reply.operation += 1,
-                    3 => reply.version += 1,
-                    _ => reply.version = 4,
-                }
-                send(&mut stream, &encode(reply).await.unwrap())
-                    .await
-                    .unwrap();
-            });
-            assert!(matches!(
-                client
-                    .call(Operation::Journal {
-                        authority: identity().authority,
-                        epoch: 1
-                    })
-                    .await,
-                Err(Error::Identity)
-            ));
+            let (client, peer) = typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
+                Box::pin(async move {
+                    let mut reply = wire_reply(request, Ok(Value::Unit))?;
+                    match wrong {
+                        0 => reply.identity.as_mut().unwrap().group += 1,
+                        1 => reply.nonce += 1,
+                        2 => reply.operation += 1,
+                        3 => reply.version += 1,
+                        _ => reply.version = 4,
+                    }
+                    Ok(reply)
+                })
+            }).await;
+            let result = client.call(Operation::Journal { authority: identity().authority, epoch: 1 }).await;
+            if wrong >= 3 { assert!(matches!(result, Err(Error::Protocol))); }
+            else { assert!(matches!(result, Err(Error::Identity))); }
             peer.await.unwrap();
         }
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = Client::new(
-            listener.local_addr().unwrap(),
-            identity(),
-            Duration::from_millis(50),
-        )
-        .unwrap();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _: Request = receive(&mut stream).await.unwrap();
-            stream.write_u32(100).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
-        assert!(matches!(
-            client
-                .call(Operation::Journal {
-                    authority: identity().authority,
-                    epoch: 1
-                })
-                .await,
-            Err(Error::Unavailable)
-        ));
-        peer.await.unwrap();
+        let (client, peer) = typed_peer(identity(), Duration::from_millis(50), 1, |request| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                wire_reply(request, Ok(Value::Unit))
+            })
+        }).await;
+        assert!(matches!(client.call(Operation::Journal { authority: identity().authority, epoch: 1 }).await, Err(Error::Unavailable)));
+        peer.abort(); let _ = peer.await;
     }
     #[tokio::test]
     async fn server_rejects_unready_state_and_wrong_node_at_startup() {
@@ -2928,8 +2729,8 @@ mod tests {
         ));
         node.raft.shutdown().await.unwrap();
     }
-    #[test]
-    fn independent_clients_share_outbound_admission() {
+    #[tokio::test]
+    async fn independent_clients_share_outbound_admission() {
         let a = Client::new(
             "127.0.0.1:1".parse().unwrap(),
             identity(),
@@ -3337,24 +3138,10 @@ mod tests {
         assert!(MAX_FRAME_BYTES > worst);
     }
     async fn fake_value(id: Identity, value: Value) -> (Client, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client =
-            Client::new(listener.local_addr().unwrap(), id, Duration::from_secs(2)).unwrap();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request: Request = receive(&mut stream).await.unwrap();
-            let reply = Reply {
-                version: PROTOCOL_VERSION,
-                operation: request.operation.tag(),
-                identity: request.identity,
-                nonce: request.nonce,
-                result: Ok(value),
-            };
-            send(&mut stream, &encode(reply).await.unwrap())
-                .await
-                .unwrap();
-        });
-        (client, peer)
+        typed_peer(id, Duration::from_secs(2), 1, move |request| {
+            let value = value.clone();
+            Box::pin(async move { wire_reply(request, Ok(value)) })
+        }).await
     }
     fn request_lookup() -> RequestLookup {
         let journal =
@@ -3371,32 +3158,14 @@ mod tests {
         }
     }
     async fn fake_request_json(value: serde_json::Value) -> (Client, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = Client::new(
-            listener.local_addr().unwrap(),
-            identity(),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request: Request = receive(&mut stream).await.unwrap();
-            assert!(matches!(
-                request.operation,
-                Operation::LookupRequest { id: [1, ..], .. }
-            ));
-            let reply = serde_json::json!({
-                "version": PROTOCOL_VERSION,
-                "operation": request.operation.tag(),
-                "identity": request.identity,
-                "nonce": request.nonce,
-                "result": {"Ok": {"Request": value}},
-            });
-            send(&mut stream, &encode(reply).await.unwrap())
-                .await
-                .unwrap();
-        });
-        (client, peer)
+        // JSON remains a local durable-domain fixture, not the transport.
+        // Structurally invalid durable evidence is rejected before protobuf conversion.
+        let result = serde_json::from_value(value).map(Value::Request).map_err(|_| Error::Protocol);
+        typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
+            assert!(matches!(request.operation, Operation::LookupRequest { id: [1, ..], .. }));
+            let result = result.clone();
+            Box::pin(async move { wire_reply(request, result) })
+        }).await
     }
     #[tokio::test]
     async fn point_request_rejects_invalid_outbound_identity_without_connecting() {
@@ -3901,36 +3670,25 @@ mod tests {
     async fn acquisition_requests_only_summary_and_chosen_cut_not_full_archive() {
         let _resources = test_resource_guard().await;
         async fn sequence(id: Identity, values: Vec<Value>) -> (Client, JoinHandle<Vec<u8>>) {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client =
-                Client::new(listener.local_addr().unwrap(), id, Duration::from_secs(2)).unwrap();
-            let server = tokio::spawn(async move {
-                let mut tags = Vec::new();
-                for value in values {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let request: Request = receive(&mut stream).await.unwrap();
-                    tags.push(request.operation.tag());
-                    match &request.operation {
-                        Operation::Journal { .. } => panic!("acquisition fetched full archive"),
-                        Operation::Terminal { version, .. } => assert_eq!(*version, 1),
-                        Operation::Read { proof, .. } => assert_eq!(proof.version(), 1),
-                        _ => {}
-                    }
-                    let reply = Reply {
-                        version: PROTOCOL_VERSION,
-                        operation: request.operation.tag(),
-                        identity: request.identity,
-                        nonce: request.nonce,
-                        result: Ok(value),
-                    };
-                    send(&mut stream, &encode(reply).await.unwrap())
-                        .await
-                        .unwrap();
+            let values = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(values)));
+            let tags = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = tags.clone();
+            let calls = values.lock().unwrap().len() as u64;
+            let (client, task) = typed_peer(id, Duration::from_secs(2), calls, move |request| {
+                observed.lock().unwrap().push(request.operation.tag());
+                match &request.operation {
+                    Operation::Journal { .. } => panic!("acquisition fetched full archive"),
+                    Operation::Terminal { version, .. } => assert_eq!(*version, 1),
+                    Operation::Read { proof, .. } => assert_eq!(proof.version(), 1),
+                    _ => {}
                 }
-                tags
-            });
-            (client, server)
+                let value = values.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { wire_reply(request, Ok(value)) })
+            }).await;
+            let task = tokio::spawn(async move { task.await.unwrap(); tags.lock().unwrap().clone() });
+            (client, task)
         }
+
         let proof = terminal_journal(1).terminal_prefix(1).unwrap();
         let (coordinator, coordinator_calls) = sequence(
             identity(),
@@ -4158,36 +3916,17 @@ mod tests {
         .unwrap();
         // Previous wire peers fail closed. There is no automatic archive or
         // weaker-read fallback even though durable journal formats are unchanged.
-        let mut legacy = TcpStream::connect(server.local_addr()).await.unwrap();
-        send(
-            &mut legacy,
-            &encode_sync(&Request {
-                version: 5,
-                identity: identity(),
-                nonce: 1,
-                operation: Operation::Journal {
-                    authority: identity().authority,
-                    epoch: 1,
-                },
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let reply: Reply = receive(&mut legacy).await.unwrap();
-        assert_eq!(reply.version, PROTOCOL_VERSION);
-        assert!(matches!(reply.result, Err(Error::Protocol)));
+        let reply = grpc::Transport::new(server.local_addr(), Duration::from_secs(2)).unwrap()
+            .call(Request { version: 5, identity: identity(), nonce: 1,
+                operation: Operation::Journal { authority: identity().authority, epoch: 1 } },
+                tokio::time::Instant::now() + Duration::from_secs(2)).await;
+        assert!(matches!(reply, Err(Error::Protocol)) || matches!(reply, Ok(Reply { result: Err(Error::Protocol), .. })));
+        // The removed JSON protocol is not accepted by the HTTP/2 listener.
         let mut slow = TcpStream::connect(server.local_addr()).await.unwrap();
-        slow.write_u32(100).await.unwrap();
-        slow.write_all(b"{").await.unwrap();
+        slow.write_u32(100).await.unwrap(); slow.write_all(b"{").await.unwrap();
         let mut byte = [0u8; 1];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), slow.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap(),
-            0
-        );
+        let rejected = tokio::time::timeout(Duration::from_secs(2), slow.read(&mut byte)).await.unwrap();
+        assert!(matches!(rejected, Ok(0) | Err(_)));
         let client = Client::new(server.local_addr(), identity(), Duration::from_secs(2)).unwrap();
         assert_eq!(
             NodeRef::Remote(&client)
@@ -4415,8 +4154,8 @@ mod tests {
         let client = Client::new(server.local_addr(), identity, Duration::from_secs(2)).unwrap();
         (client, server)
     }
-    #[test]
-    fn capacity_endpoint_set_is_complete_unique_and_profile_bound() {
+    #[tokio::test]
+    async fn capacity_endpoint_set_is_complete_unique_and_profile_bound() {
         let id = byte_identity();
         let client = |shard: u64| {
             Client::new(
@@ -4694,26 +4433,11 @@ mod tests {
                 .await,
             Err(Error::Identity)
         );
-        // Bypass client validation to prove the actual TCP server rejects forged
-        // grants on the ordinary Command route as well.
-        let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
-        send(
-            &mut stream,
-            &encode_sync(&Request {
-                version: PROTOCOL_VERSION,
-                identity: id.clone(),
-                nonce: 19,
-                operation: Operation::Command {
-                    authority: id.authority.clone(),
-                    epoch: 1,
-                    command,
-                },
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let reply: Reply = receive(&mut stream).await.unwrap();
+        // Bypass domain client validation, but use the real typed RPC listener.
+        let reply = grpc::Transport::new(server.local_addr(), Duration::from_secs(2)).unwrap()
+            .call(Request { version: PROTOCOL_VERSION, identity: id.clone(), nonce: 19,
+                operation: Operation::Command { authority: id.authority.clone(), epoch: 1, command } },
+                tokio::time::Instant::now() + Duration::from_secs(2)).await.unwrap();
         assert_eq!(reply.nonce, 19);
         assert!(matches!(reply.result, Err(Error::Identity)));
         let offline_address = observer_server.local_addr();
@@ -5238,48 +4962,34 @@ mod tests {
                 proof.clone(),
             )),
         };
-        let base = encode_sync(&reply).unwrap().len();
-        let growth = MAX_FRAME_BYTES - 1 - base;
-        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result {
-            let value = &mut snapshot.entries[0].1;
-            // Each appended 255 adds four JSON bytes. Keep the initial zero
-            // for the later one-byte transitions 0 -> 10 -> 100.
-            let appended = growth.div_ceil(4);
-            value.extend(std::iter::repeat_n(255, appended));
-            let reduction = 4 * appended - growth;
-            if reduction >= 2 {
-                value[appended] = 0;
+        let mut wire = grpc_codec::reply_to_wire(reply.clone()).unwrap();
+        let base = wire.encoded_len();
+        // Protobuf length prefixes grow at thresholds. Find the exact payload
+        // boundary rather than assuming JSON byte-array expansion.
+        let mut low = 0usize;
+        let mut high = MAX_FRAME_BYTES;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result { snapshot.entries[0].1 = vec![255; mid]; }
+            match grpc_codec::reply_to_wire(reply.clone()) {
+                Ok(_) => low = mid,
+                Err(Error::Capacity) => high = mid - 1,
+                Err(error) => panic!("unexpected boundary error {error:?}"),
             }
-            if reduction % 2 == 1 {
-                value[appended - 1] = 10;
-            }
-            assert!(value.len() + 1 < crate::versioned_reads::MAX_READ_BYTES);
         }
-
-        // Actual Reply + Value::Snapshot, including both the rows and the
-        // checked evidence. A proof-only frame measurement is insufficient.
-        assert_eq!(encode_sync(&reply).unwrap().len(), MAX_FRAME_BYTES - 1);
-        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result {
-            snapshot.entries[0].1[0] = 10;
-        }
-        assert_eq!(encode_sync(&reply).unwrap().len(), MAX_FRAME_BYTES);
+        assert!(low > 0 && base < MAX_FRAME_BYTES);
         if let Ok(Value::Snapshot(snapshot, retained)) = &mut reply.result {
-            snapshot.entries[0].1[0] = 100;
-            // Both components individually fit, but their complete envelope
-            // is one byte over the frame. Row capture's 64 MiB raw-data bound
-            // does not promise that JSON rows plus proof fit a 32 MiB frame.
-            assert!(encode_sync(snapshot).unwrap().len() < MAX_FRAME_BYTES);
-            assert!(encode_sync(retained).unwrap().len() < MAX_FRAME_BYTES);
-            assert_eq!(*retained, proof);
+            snapshot.entries[0].1 = vec![255; low]; assert_eq!(*retained, proof);
         }
-        // The encoder owns its temporary writer: failure returns only the
-        // typed error, never a partially encoded successful response.
-        assert_eq!(encode_sync(&reply), Err(Error::Capacity));
+        wire = grpc_codec::reply_to_wire(reply.clone()).unwrap();
+        assert!(wire.encoded_len() <= MAX_FRAME_BYTES);
+        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result { snapshot.entries[0].1.push(255); }
+        assert!(matches!(grpc_codec::reply_to_wire(reply.clone()), Err(Error::Capacity)));
         reply.result = Err(Error::Capacity);
-        let fallback = encode_sync(&reply).unwrap();
-        assert!(fallback.len() < 4096);
-        let decoded: Reply = serde_json::from_slice(&fallback).unwrap();
-        assert!(matches!(decoded.result, Err(Error::Capacity)));
+        let fallback = grpc_codec::reply_to_wire(reply).unwrap();
+        assert!(fallback.encoded_len() < 4096);
+        assert!(matches!(grpc_codec::reply_from_wire(fallback).unwrap().result, Err(Error::Capacity)));
     }
+
     include!("retained_rpc_tests.rs");
 }

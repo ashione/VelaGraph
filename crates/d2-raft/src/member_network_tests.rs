@@ -1,4 +1,4 @@
-//! Real managed v5 TCP member operations over durable Raft, with the member's
+//! Real typed managed gRPC member operations over durable Raft, with the member's
 //! actual server/apply workers forbidding local full-Journal materialization.
 use super::*;
 use crate::managed_rpc::{Client, Error, Identity, NodeRef, Role, Server};
@@ -11,7 +11,7 @@ use crate::versioned_reads::Target;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn actual_tcp_byte_member_uses_compact_history_and_original_plan() {
+async fn actual_grpc_byte_member_uses_compact_history_and_original_plan() {
     let _resources = crate::managed_rpc::test_resource_guard().await;
     let authority = Authority {
         shard: 9,
@@ -155,38 +155,41 @@ async fn actual_tcp_byte_member_uses_compact_history_and_original_plan() {
     // Send malformed requests directly, bypassing client preflight. A correct
     // reply envelope cannot authorize another target/role/authority/cohort.
     for fault in 0..4 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::managed_rpc::grpc::wire;
         tokio::time::timeout(Duration::from_secs(5), async {
-            let mut request = serde_json::json!({
-                "version": 6, "identity": identity, "nonce": 100 + fault,
-                "operation": {"HistoryStatus": {"authority": authority, "target": target, "cohort": cohort}}
-            });
+            let mut bound = wire::BoundTarget {
+                authority: Some(authority.clone().into()),
+                target: Some(target.clone().into()),
+                cohort: Some(cohort.clone().into()),
+            };
+            let mut wire_identity: wire::Identity = identity.clone().into();
             match fault {
-                0 => request["identity"]["role"] = serde_json::json!("Coordinator"),
-                1 => request["operation"]["HistoryStatus"]["target"]["shard"] = serde_json::json!(8),
-                2 => {
-                    request["operation"]["HistoryStatus"]["authority"]["shard"] = serde_json::json!(10)
-                }
-                _ => {
-                    request["operation"]["HistoryStatus"]["cohort"]["coordinator_epoch"] =
-                        serde_json::json!(2)
-                }
+                0 => wire_identity.role = wire::Role::Coordinator as i32,
+                1 => bound.target.as_mut().unwrap().shard = 8,
+                2 => bound.authority.as_mut().unwrap().shard = 10,
+                _ => bound.cohort.as_mut().unwrap().coordinator_epoch = 2,
             }
-            let bytes = serde_json::to_vec(&request).unwrap();
-            let mut socket = tokio::net::TcpStream::connect(server.local_addr())
-                .await
-                .unwrap();
-            socket.write_u32(bytes.len() as u32).await.unwrap();
-            socket.write_all(&bytes).await.unwrap();
-            let length = socket.read_u32().await.unwrap() as usize;
-            assert!(length <= 1024 * 1024);
-            let mut reply = vec![0; length];
-            socket.read_exact(&mut reply).await.unwrap();
-            let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
-            assert_eq!(reply["result"], serde_json::json!({"Err": "Identity"}));
-        })
-        .await
-        .expect("malformed-request exchange must terminate");
+            let request = wire::Request {
+                version: 6, identity: Some(wire_identity), nonce: 100 + fault,
+                operation: Some(wire::Operation { kind: Some(wire::operation::Kind::HistoryStatus(bound)) }),
+                timeout_millis: 5_000,
+            };
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", server.local_addr()))
+                .unwrap().connect().await.unwrap();
+            let mut client = wire::managed_service_client::ManagedServiceClient::new(channel);
+            let result = client.call(request).await;
+            if fault == 0 {
+                // This role is structurally inconsistent with the identity's cohort.
+                // Protobuf domain decoding rejects it before dispatch.
+                assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+            } else {
+                let reply = result.unwrap().into_inner();
+                assert!(matches!(reply.result,
+                    Some(wire::reply::Result::Error(wire::RpcError {
+                        kind: Some(wire::rpc_error::Kind::Identity(_))
+                    }))));
+            }
+        }).await.expect("malformed-request exchange must terminate");
     }
 
     let participant = Participant {

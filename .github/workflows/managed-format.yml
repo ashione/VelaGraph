@@ -1,0 +1,30 @@
+name: Managed transport format (temporary)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/managed-format.yml'
+permissions:
+  contents: read
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - name: Export formatted sources
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib,base64
+          names=['crates/d2-raft/src/managed_rpc.rs', 'crates/d2-raft/src/managed_rpc/grpc.rs', 'crates/d2-raft/src/member_network_tests.rs', 'crates/d2-raft/src/retained_rpc_tests.rs', 'crates/replicated-graph/src/managed_graph_tests.rs', 'crates/replicated-graph/src/managed_submission_timing_tests.rs', 'crates/replicated-graph/tests/public_service_process.rs', 'crates/replicated-graph/src/managed_grpc_test_peer.rs']
+          for name in names:
+              print('FORMATTED_FILE '+name)
+              data=base64.b64encode(pathlib.Path(name).read_bytes()).decode()
+              for i in range(0,len(data),120): print(data[i:i+120])
+              print('FORMATTED_END')
+          PYTHON

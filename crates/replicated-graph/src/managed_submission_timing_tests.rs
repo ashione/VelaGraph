@@ -135,46 +135,35 @@ async fn remote_submission_timing_preserves_success_and_original_id_retry() {
     assert_eq!(observed[0], (1, vec![], vec![v(7, 1)], 1));
 }
 
-// Forward the actual bounded managed frames to the real durable coordinator.
-// Only the first LookupTarget is held: admission and its recovery lookup have
-// already returned, but no preparation or decision command can be sent.
-// The finite test request sequence ends with an explicit stop signal.
+#[path = "managed_grpc_test_peer.rs"]
+mod rpc_peer;
+
+// Hold the first typed LookupTarget before forwarding. Admission and recovery
+// lookup have already completed; cancellation cannot dispatch the held read.
 async fn hold_first_target(
     upstream: SocketAddr,
     reached: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
-    mut stop: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio::sync::oneshot::Receiver<()>,
     listener: TcpListener,
 ) {
-    let mut gate = Some((reached, release));
-    loop {
-        let (mut incoming, _) = tokio::select! {
-            _ = &mut stop => break,
-            accepted = listener.accept() => accepted.unwrap(),
-        };
-        let length = incoming.read_u32().await.unwrap() as usize;
-        assert!(length <= managed_rpc::MAX_FRAME_BYTES);
-        let mut bytes = vec![0; length];
-        incoming.read_exact(&mut bytes).await.unwrap();
-        let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        if request["operation"].get("LookupTarget").is_some() {
-            if let Some((reached, release)) = gate.take() {
+    let gate = Arc::new(std::sync::Mutex::new(Some((reached, release))));
+    let peer = rpc_peer::spawn(listener, move |wire| {
+        let held = if matches!(wire.operation.as_ref().and_then(|v| v.kind.as_ref()),
+            Some(managed_rpc::grpc::wire::operation::Kind::LookupTarget(_))) {
+            gate.lock().unwrap().take()
+        } else { None };
+        async move {
+            if let Some((reached, release)) = held {
                 reached.send(()).unwrap();
                 release.await.unwrap();
-                // The test has canceled its handler; discard this held read.
-                continue;
+                return Err(tonic::Status::cancelled("held read discarded"));
             }
+            rpc_peer::forward(upstream, wire).await
         }
-        let mut outgoing = TcpStream::connect(upstream).await.unwrap();
-        outgoing.write_u32(length as u32).await.unwrap();
-        outgoing.write_all(&bytes).await.unwrap();
-        let length = outgoing.read_u32().await.unwrap() as usize;
-        assert!(length <= managed_rpc::MAX_FRAME_BYTES);
-        let mut bytes = vec![0; length];
-        outgoing.read_exact(&mut bytes).await.unwrap();
-        incoming.write_u32(length as u32).await.unwrap();
-        incoming.write_all(&bytes).await.unwrap();
-    }
+    });
+    let _ = stop.await;
+    peer.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -296,7 +285,9 @@ async fn submission_timing_cancellation_after_durable_admit_preserves_original_p
             .unwrap(),
         original
     );
-    release.send(()).unwrap();
+    // HTTP/2 may have already canceled and dropped the held handler. Either
+    // way the held read is never forwarded; recovery checks below are unchanged.
+    let _ = release.send(());
     assert!(
         matches!(call(&g, Operation::Status(write.clone())).await.unwrap(),
         Reply::Write { transaction_id: Some(id), status: WriteStatus::Pending, .. } if id == original.id())

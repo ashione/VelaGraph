@@ -7,7 +7,7 @@ It is not completion of the all-RPC migration.
 
 ## Contract and deployment
 
-`d2_raft::managed_rpc::grpc::Server` and `Client::new_grpc` use the versioned
+`d2_raft::managed_rpc::Server` (the typed server) and `Client::new` use the versioned
 `velagraph.internal.managed.v1.ManagedService` schema in
 `crates/d2-raft/proto/internal_managed.proto`. All 18 original internal operations
 have typed protobuf payloads and replies: coordinator commands/summary/terminal
@@ -23,7 +23,7 @@ API. Do not expose it via the public graph listener. Public writes/queries stay
 on the separate public HTTP/gRPC services. It cannot activate a new cohort,
 restore a graph, or override readiness. Startup runs the original leader-observed
 role/cohort readiness probe. Capacity confirmation uses the explicitly configured
-member clients; selecting gRPC requires gRPC clients for those members too.
+member clients; every member endpoint must speak this same typed protocol.
 
 Clients cache one HTTP/2 channel per explicitly constructed endpoint/identity;
 clones share the channel. Full identity, operation tag and nonce are checked in
@@ -33,7 +33,7 @@ outcome: retain the original external ID and canonical command and use the
 existing status/recovery protocol. Reconnecting a channel is not rollback.
 
 The shared managed client admission remains four active calls and four bounded
-additional waiters, including legacy clients; CPU work retains the existing
+additional waiters; CPU work retains the existing
 process-wide slots through actual completion. The gRPC listener admits at most
 four active calls through request decode, execution and response delivery, with
 eight bounded connections. Pre-prost scanning bounds each collection and total
@@ -55,7 +55,11 @@ Legacy managed endpoints fail the startup identity probe. A graph channel
 connection is not typed-service readiness: incompatible graph endpoints fail
 the first graph operation, without fallback. This completes
 [#242](https://github.com/ashione/VelaGraph/issues/242), not the entire RPC inventory.
-Library-level old transports remain only until their own replacement/removal gates.
+The managed member library now also uses gRPC exclusively: its former JSON
+framing/client/listener is removed. `Client::new_grpc` names the same typed
+constructor and is not a compatibility transport or fallback. Both constructors
+require a running Tokio runtime; clones share a channel. Other graph/gateway
+legacy APIs remain subject to their separate removal gates.
 
 The public HTTP adapter remains supported by design. In-process Rust calls,
 RocksDB filesystem I/O, and S3-compatible object-store HTTP are not custom
@@ -67,7 +71,7 @@ inter-node graph transports and are not replaced by this service migration.
 | --- | --- |
 | Public managed HTTP and typed gRPC | Shared domain handlers; loopback preview |
 | Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC available; old TCP retained for migration parity |
-| Managed coordinator/member control and writes | This typed gRPC slice; explicit client/server selection |
+| Managed coordinator/member control and writes | Typed gRPC only, including library Client/Server; old JSON/TCP wire removed |
 | Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control is typed gRPC (#251) |
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), default CLI transport (#260); legacy library TCP ingress retained for retirement |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
@@ -112,3 +116,21 @@ announced public ports listen. Lifecycle tests keep adapter handles alive while
 dropping/shutting down Service, check listeners close, and verify expired/retained
 session reservations are released. These tests are not multi-host recovery proof.
 
+
+## Managed library transport retirement
+
+The client nonce/identity/operation checks, original IDs and status recovery,
+member-capacity configuration, shared admission, and decreasing deadlines are
+unchanged. The listener is now the same typed implementation used by production
+services. There is no wire detection and no request retry. A former JSON port is
+not usable after this change. Public HTTP remains intentional and unrelated.
+
+Adversarial fixtures use real protobuf services. Some fixtures describe durable
+records with local JSON values before conversion; no JSON envelope crosses the
+network. Strict durable-record parsing still rejects malformed records, whereas
+protobuf collection/field/envelope checks protect the live RPC boundary. Tests
+for foreign identities/nonces, unavailable outcomes, capacity, history, retained
+reads and end-to-end process behavior must pass on the final commit. This change
+does not retire `managed_gateway::Gateway`, `remote::GraphService` or the old
+library observed coordinator. These remain #218 work and must not be described
+as complete merely because managed member traffic is now typed-only.
