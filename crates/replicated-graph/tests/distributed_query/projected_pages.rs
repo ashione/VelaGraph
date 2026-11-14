@@ -196,7 +196,7 @@ pub(super) async fn fixed_snapshot(endpoint: SocketAddr, group: &Group) -> anyho
         Ok(node.admin().export()?)
     })
     .await??;
-    remote::write_identified(
+    typed_write(
         group.route.endpoint,
         group.route.identity,
         d2_raft::D1WriteRequest {

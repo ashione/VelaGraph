@@ -10,10 +10,10 @@
 **gRPC + HTTP 写入/查询服务**。按 2026-11-12 的方向提高优先级，与时态和
 分布式功能并行推进，不等最终 UI/平台产品化；以下区分已交付切片与剩余验收，不将协议切片等同于完整发布。
 
-截至 main `046488bf`（2026-11-13），Raft peer、managed control/write、snapshot、
+当前实现（切片验收以关联 PR 的精确版本证据为准），Raft peer、managed control/write、snapshot、
 observed fragments/hierarchy shard jobs、fixed/renewable sessions 已有 typed gRPC。
 `graph-service` 内部 managed 与 graph routes 已强制 gRPC。driver/control 和 coordinator CLI 入口已使用 typed RPC，Unix read gateway 已删除；
-legacy library coordinator/gateway 和兼容 listener 尚未全部清理；详见
+legacy GraphService/Gateway 和兼容 listener 尚未全部清理；详见
 [通信清单](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory)。
 存储 record proto 与 RPC service schema 分离；迁移不修改持久化记录、共识或 Gremlin 语义。
 
@@ -25,7 +25,8 @@ legacy library coordinator/gateway 和兼容 listener 尚未全部清理；详�
   增加 coordinator observed Query/Job typed gRPC 入口；#260 将 serve/query/jobs 默认统一为 typed RPC，
   退役 serve-grpc 与 --grpc CLI 选择；#264 删除对外 JSON/内部 gRPC 的混合
   library 入口，差分测试改走真正 typed ingress，保留尚未替代的纯 legacy 语义；复用原执行器、
-  Jobs 状态机及累计预算。旧 coordinator/gateway library TCP 兼容入口仍待退役，不能视作全部删除。
+  Jobs 状态机及累计预算。[#274](https://github.com/ashione/VelaGraph/issues/274) 将 coordinator library query/job/consistency
+  全部迁到 typed gRPC，保留显式一致性协商和旧peer拒绝；graph/Gateway旧入口仍待退役。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
   managed control 与对外 gateway 协议仍不在该切片内。
@@ -49,7 +50,7 @@ legacy library coordinator/gateway 和兼容 listener 尚未全部清理；详�
 - **默认存储链与listener退役**：[#256](https://github.com/ashione/VelaGraph/issues/256) 将
   RemoteStorageNode/catalog/routing默认链、单分片server-query切到typed RPC；graph-node仅
   --graph一个typed入口，拒绝旧--grpc-snapshot双端口选项。旧wire专项测试使用test-only子进程
-  fixture保留断言，不恢复产品legacy listener。其余library/coordinator/gateway退役仍待验收。
+  fixture保留断言，不恢复产品legacy listener。其余GraphService/Gateway退役仍待验收。
 - **通用Metadata RPC成本**：[#258](https://github.com/ashione/VelaGraph/issues/258) 是 #256 的性能验收前置项。
   使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
   场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/

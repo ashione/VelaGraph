@@ -93,11 +93,6 @@ pub struct ProjectedRow {
     pub properties: BTreeMap<String, Vec<Value>>,
 }
 pub type Response = Result<Output, QueryFailure>;
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Envelope {
-    pub hierarchy_job: Request,
-}
 
 struct Plan {
     ids: Vec<u64>,
@@ -942,30 +937,19 @@ pub async fn request(
         return Err(RemoteError::ResourceExhausted);
     }
     let end = checked_deadline(deadline.min(Duration::from_millis(MAX_TIMEOUT)), None)?;
-    let _permit = CLIENT_ADMISSION
-        .try_acquire()
-        .map_err(|_| RemoteError::ResourceExhausted)?;
     tokio::time::timeout_at(end, async {
-        let mut socket = TcpStream::connect(endpoint)
+        let client = grpc::CoordinatorClient::connect_lazy(
+            endpoint,
+            end.saturating_duration_since(Instant::now()),
+        )?;
+        client
+            .job(request, end.saturating_duration_since(Instant::now()))
             .await
-            .map_err(|_| RemoteError::Unavailable)?;
-        write_frame(
-            &mut socket,
-            &Envelope {
-                hierarchy_job: request.clone(),
-            },
-            end,
-        )
-        .await?;
-        let response: Response = read_frame_limited(&mut socket, end, MAX_WIRE).await?;
-        if let Ok(output) = &response {
-            validate_output(output, &request)?;
-        }
-        Ok(response)
     })
     .await
     .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }
+
 fn validate_stamps(
     completeness: QueryCompleteness,
     snapshots: &[QueryStamp],
