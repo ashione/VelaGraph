@@ -1,5 +1,12 @@
 # Internal gRPC snapshot transport
 
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
 `graph-node --graph ADDRESS` hosts typed snapshot, fragment/session, single-shard
 operation and query RPC services on one graph endpoint. Raft and driver/control
 use their separate RPC ports. This is plaintext trusted-network development
@@ -28,8 +35,8 @@ a page cursor or renew the session.
 ## Shared semantics and limits
 
 Listener-free `GraphState` owns the shared Raft/state handles and snapshot
-session pool. Explicit library legacy fixtures can share it with gRPC, but
-the product graph-node does not start a TCP listener. Open uses the existing leader read barrier and atomic capture.
+session pool. Multiple typed library listeners can share that state;
+neither GraphService nor product graph-node starts a legacy listener. Open uses the existing leader read barrier and atomic capture.
 Page uses the existing descriptor/cursor/epoch validation and frozen entries;
 Close releases the same session. A token opened by either protocol can be used or
 closed through the other in explicit library/parity fixtures. Cross-protocol calls cannot exceed
@@ -40,7 +47,7 @@ the shared four sessions / 128 MiB retained-byte budget. Tokens remain random
 - Pages retain the 2 MiB raw key/value and 4,096-row limits; no partial-success
   truncation. The protobuf response wire cap includes bounded entry overhead.
 - Fixed 60-second session lifetime; pages never extend it.
-- Existing 16-operation service admission is shared with TCP, from decode through
+- Existing 16-operation service admission is shared by typed adapters, from decode through
   response-body EOF/drop, not only handler execution. Client calls use
   the existing process-wide 16-operation admission. Overload fails explicitly.
 - The typed graph listener accepts at most 32 live connections (including the
