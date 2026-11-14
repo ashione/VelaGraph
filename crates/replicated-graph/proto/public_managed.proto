@@ -126,3 +126,34 @@ message FixedPageRequest { Context context = 1; FixedSession session = 2; Query 
 message FixedPageResponse { FixedSession session = 1; Query query = 2; Cursor cursor = 3; uint32 page_size = 4; Page page = 5; }
 message FixedCloseRequest { Context context = 1; FixedSession session = 2; }
 message FixedCloseResponse { FixedSession session = 1; }
+
+// Process-local bounded jobs on the same public listener. No durable resume.
+service ManagedQueryJobService {
+  rpc Start(JobStartRequest) returns (JobStartResponse);
+  rpc Get(JobGetRequest) returns (JobStatusResponse);
+  rpc Renew(JobRenewRequest) returns (JobRenewResponse);
+  rpc Fetch(JobFetchRequest) returns (JobFetchResponse);
+  rpc Cancel(JobCancelRequest) returns (JobStatusResponse);
+}
+message JobHandle { bytes incarnation = 1; bytes token = 2; }
+message JobPolicy { uint64 idle_millis = 1; uint64 execution_millis = 2; uint64 lifetime_millis = 3; }
+enum JobPhase { JOB_PHASE_UNSPECIFIED = 0; CAPTURING = 1; RUNNING = 2; SEALING = 3; READY = 4; CANCELLED = 5; EXPIRED = 6; FAILED = 7; }
+// Unlike RPC status details, retained failure preserves every domain distinction.
+enum JobFailure {
+  JOB_FAILURE_UNSPECIFIED = 0;
+  PROTOCOL = 1; BUSY = 2; IDENTITY = 3; CAPACITY = 4; REJECTED = 5;
+  PRECONDITION_FAILED = 6; UNKNOWN = 7; SESSION_UNAVAILABLE = 8;
+  QUERY_PARSE = 9; QUERY_UNSUPPORTED = 10; QUERY_INVALID_ARGUMENT = 11;
+  QUERY_RESOURCE_EXHAUSTED = 12; QUERY_TIMEOUT = 13;
+  QUERY_UNSUPPORTED_SCOPE = 14; QUERY_INCOMPLETE_OR_CORRUPT = 15; QUERY_UNAVAILABLE = 16;
+}
+message JobStatus { JobPhase phase = 1; optional uint64 version = 2; optional uint32 total = 3; optional JobFailure failure = 4; }
+message JobStartRequest { Context context = 1; bytes operation_id = 2; optional uint64 version = 3; Query query = 4; uint32 page_size = 5; JobPolicy policy = 6; }
+message JobStartResponse { bytes operation_id = 1; JobHandle job = 2; }
+message JobGetRequest { Context context = 1; JobHandle job = 2; }
+message JobCancelRequest { Context context = 1; JobHandle job = 2; }
+message JobStatusResponse { JobHandle job = 1; JobStatus status = 2; }
+message JobRenewRequest { Context context = 1; JobHandle job = 2; uint64 expected_generation = 3; }
+message JobRenewResponse { JobHandle job = 1; uint64 generation = 2; uint64 remaining_millis = 3; }
+message JobFetchRequest { Context context = 1; JobHandle job = 2; Query query = 3; Cursor cursor = 4; uint32 page_size = 5; }
+message JobFetchResponse { JobHandle job = 1; Query query = 2; Cursor cursor = 3; uint32 page_size = 4; uint64 version = 5; Page page = 6; }

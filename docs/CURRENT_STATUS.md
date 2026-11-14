@@ -86,7 +86,9 @@ The [graph-service CLI](PUBLIC_SERVICE_CLI.md) hosts HTTP `/preview1` and typed
 public gRPC over shared handlers/budgets. Its internal managed and graph routes
 are gRPC-only. Its `FixedSessionService` exposes the original bounded materialized
 snapshot session (Open/Read/Traverse/Page/Close), separately from the data-local
-`QueryService`; old async-job library transport still needs migration (#218).
+`QueryService`. The typed `ManagedQueryJobService` candidate adds the existing
+renewable job lifecycle on the same endpoint; legacy entrypoint retirement still
+requires separate #218 acceptance.
 This is a loopback development preview requiring an already
 activated fixed cohort, not cluster bootstrap, production serving or global
 restore. Graph channel connection is not typed-service readiness; an incompatible

@@ -545,17 +545,18 @@ impl State {
             }
             for offset in (0..result.data.rows.len().max(1)).step_by(usize::from(result.size)) {
                 worker.deadline()?;
-                local::preflight(
-                    &binding,
-                    Reply::FetchLocalQueryJob {
-                        job: worker.handle.clone(),
-                        query: result.query.clone(),
-                        cursor: result.cursors.get(&offset).cloned(),
-                        page_size: result.size,
-                        version,
-                        page: result.page(offset),
-                    },
-                )?;
+                let reply = Reply::FetchLocalQueryJob {
+                    job: worker.handle.clone(),
+                    query: result.query.clone(),
+                    cursor: result.cursors.get(&offset).cloned(),
+                    page_size: result.size,
+                    version,
+                    page: result.page(offset),
+                };
+                // Ready is transport-independent: retain the logical envelope
+                // check and also preflight every typed page before publication.
+                local::preflight(&binding, reply.clone())?;
+                grpc_codec::encode_job_fetch(&reply)?;
             }
             worker.deadline()?;
             Ok(Arc::new(result))
