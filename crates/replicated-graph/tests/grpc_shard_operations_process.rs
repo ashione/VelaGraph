@@ -333,7 +333,10 @@ async fn scenario() -> anyhow::Result<()> {
         client.write(expanded).await,
         Err(RemoteError::ResourceExhausted)
     ));
-    assert_eq!(client.metadata(SHARD).await.context("leader metadata")?, committed);
+    assert_eq!(
+        client.metadata(SHARD).await.context("leader metadata")?,
+        committed
+    );
     malformed(endpoint, identity)
         .await
         .context("malformed requests")?;
@@ -358,14 +361,17 @@ async fn scenario() -> anyhow::Result<()> {
             .await
             .is_err()
     );
-    assert_eq!(client.metadata(SHARD).await.context("leader metadata")?, committed);
+    assert_eq!(
+        client.metadata(SHARD).await.context("leader metadata")?,
+        committed
+    );
     cli_checks(endpoint, cluster.tcp(cluster.leader), identity, committed.2).await?;
     unknown_outcome(endpoint, identity)
         .await
         .context("unknown outcome")?;
     cached_adapter_unknown_outcome(endpoint, identity)
         .await
-        .context("unknown outcome")?;
+        .context("cached adapter outcome")?;
     server_query_cli(endpoint, identity)
         .await
         .context("server query CLI")?;
