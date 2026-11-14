@@ -185,17 +185,6 @@ impl Invocation {
         }
         self.live()
     }
-    pub(super) fn encode_tcp(mut self) -> Result<(Vec<u8>, Self)> {
-        let encoded = match encode(&self.response, MAX_RESPONSE_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.response.result = Err(Error::Capacity);
-                encode(&self.response, MAX_RESPONSE_BYTES)?
-            }
-        };
-        self.live()?;
-        Ok((encoded, self))
-    }
     pub(super) fn delivered(&mut self) {
         if self.response.result.is_ok() {
             self.delivery.token = None;

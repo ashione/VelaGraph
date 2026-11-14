@@ -78,11 +78,22 @@ fn admitted<T>(request: &tonic::Request<T>) -> std::result::Result<Call, Status>
         .ok_or_else(|| Status::internal("missing admission"))
 }
 impl Handler {
-    async fn run<T: Message + 'static>(
+    fn prepare(&self, context: &Option<wire::Context>) -> std::result::Result<(Duration, Option<wire::CallIdentity>), Status> {
+        let budget = codec::context(context).map_err(codec::error)?;
+        let Some(identity) = context.as_ref().and_then(|c| c.identity.as_ref()) else { return Ok((budget, None)); };
+        let request_id = codec::token::<16>(identity.request_id.clone()).map_err(codec::error)?;
+        let response_identity = Some(wire::CallIdentity { request_id: request_id.to_vec(), binding: Some(codec::encode_binding(&self.state.config.binding)) });
+        let binding = identity.binding.clone().ok_or_else(|| codec::identified_error(Error::Protocol, response_identity.clone()))?;
+        let binding = codec::decode_binding(binding).map_err(|e| codec::identified_error(e, response_identity.clone()))?;
+        if binding != self.state.config.binding { return Err(codec::identified_error(Error::Identity, response_identity)); }
+        Ok((budget, response_identity))
+    }
+    async fn run<T: codec::Identified + 'static>(
         &self,
         call: Call,
         operation: Operation,
         budget: Duration,
+        identity: Option<wire::CallIdentity>,
         encode: fn(&Reply) -> Result<T>,
     ) -> std::result::Result<tonic::Response<T>, Status> {
         if self
@@ -90,13 +101,13 @@ impl Handler {
             .jobs_stopping
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(codec::error(Error::Rejected));
+            return Err(codec::identified_error(Error::Rejected, identity));
         }
         let end = invocation::operation_end(&operation, call.end.min(call.started + budget));
         call.budget.send_replace(end);
         let request = Request {
             version: VERSION,
-            request_id: random().map_err(codec::error)?,
+            request_id: match &identity { Some(value) => codec::token(value.request_id.clone()).map_err(codec::error)?, None => random().map_err(codec::error)? },
             binding: self.state.config.binding.clone(),
             operation,
         };
@@ -106,10 +117,13 @@ impl Handler {
                     .await?;
             // The decoder/executor and response encoding use the same admission.
             // A cancelled blocking encoder retains its work and delivery guard.
+            let response_identity = identity.clone();
             let (message, invocation) = tokio::task::spawn_blocking(move || {
                 invocation.preflight_grpc()?;
                 let reply = invocation.response.result.as_ref().map_err(Clone::clone)?;
-                let message = encode(reply)?;
+                let mut message = encode(reply)?;
+                *message.identity_mut() = response_identity;
+                codec::bounded::validate_bytes::<T>(&message.encode_to_vec()).map_err(|_| Error::Capacity)?;
                 if message.encoded_len() > MAX_RESPONSE_BYTES {
                     return Err(Error::Capacity);
                 }
@@ -128,8 +142,8 @@ impl Handler {
         })
         .await;
         match result {
-            Ok(result) => result.map_err(codec::error),
-            Err(_) => Err(codec::error(Error::Unknown)),
+            Ok(result) => result.map_err(|e| codec::identified_error(e, identity.clone())),
+            Err(_) => Err(codec::identified_error(Error::Unknown, identity)),
         }
     }
 }
@@ -140,27 +154,27 @@ impl WriteService for Handler {
         request: tonic::Request<wire::WriteRequest>,
     ) -> std::result::Result<tonic::Response<wire::WriteResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::submit(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_write).await
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::submit(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_write).await
     }
     async fn status(
         &self,
         request: tonic::Request<wire::WriteRequest>,
     ) -> std::result::Result<tonic::Response<wire::WriteResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::status(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_write).await
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::status(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_write).await
     }
     async fn abort(
         &self,
         request: tonic::Request<wire::WriteRequest>,
     ) -> std::result::Result<tonic::Response<wire::WriteResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::abort(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_write).await
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::abort(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_write).await
     }
 }
 #[tonic::async_trait]
@@ -170,27 +184,27 @@ impl QueryService for Handler {
         request: tonic::Request<wire::OpenRequest>,
     ) -> std::result::Result<tonic::Response<wire::OpenResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::open(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_open).await
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::open(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_open).await
     }
     async fn fetch(
         &self,
         request: tonic::Request<wire::FetchRequest>,
     ) -> std::result::Result<tonic::Response<wire::FetchResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::fetch(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fetch).await
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::fetch(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_fetch).await
     }
     async fn close(
         &self,
         request: tonic::Request<wire::CloseRequest>,
     ) -> std::result::Result<tonic::Response<wire::CloseResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::close(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_close).await
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::close(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_close).await
     }
 }
 
@@ -201,9 +215,9 @@ impl FixedSessionService for Handler {
         request: tonic::Request<wire::FixedOpenRequest>,
     ) -> std::result::Result<tonic::Response<wire::FixedOpenResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::fixed_open(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_open)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::fixed_open(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_fixed_open)
             .await
     }
     async fn read(
@@ -211,9 +225,9 @@ impl FixedSessionService for Handler {
         request: tonic::Request<wire::FixedQueryRequest>,
     ) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::fixed_read(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_query)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::fixed_read(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_fixed_query)
             .await
     }
     async fn traverse(
@@ -221,9 +235,9 @@ impl FixedSessionService for Handler {
         request: tonic::Request<wire::FixedQueryRequest>,
     ) -> std::result::Result<tonic::Response<wire::FixedQueryResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::fixed_traverse(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_query)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::fixed_traverse(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_fixed_query)
             .await
     }
     async fn page(
@@ -231,9 +245,9 @@ impl FixedSessionService for Handler {
         request: tonic::Request<wire::FixedPageRequest>,
     ) -> std::result::Result<tonic::Response<wire::FixedPageResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::fixed_page(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_page)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::fixed_page(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_fixed_page)
             .await
     }
     async fn close(
@@ -241,9 +255,9 @@ impl FixedSessionService for Handler {
         request: tonic::Request<wire::FixedCloseRequest>,
     ) -> std::result::Result<tonic::Response<wire::FixedCloseResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::fixed_close(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_fixed_close)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::fixed_close(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_fixed_close)
             .await
     }
 }
@@ -572,9 +586,9 @@ impl ManagedQueryJobService for Handler {
         request: tonic::Request<wire::JobStartRequest>,
     ) -> std::result::Result<tonic::Response<wire::JobStartResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::job_start(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_start)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::job_start(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_job_start)
             .await
     }
     async fn get(
@@ -582,9 +596,9 @@ impl ManagedQueryJobService for Handler {
         request: tonic::Request<wire::JobGetRequest>,
     ) -> std::result::Result<tonic::Response<wire::JobStatusResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::job_get(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_status)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::job_get(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_job_status)
             .await
     }
     async fn renew(
@@ -592,9 +606,9 @@ impl ManagedQueryJobService for Handler {
         request: tonic::Request<wire::JobRenewRequest>,
     ) -> std::result::Result<tonic::Response<wire::JobRenewResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::job_renew(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_renew)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::job_renew(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_job_renew)
             .await
     }
     async fn fetch(
@@ -602,9 +616,9 @@ impl ManagedQueryJobService for Handler {
         request: tonic::Request<wire::JobFetchRequest>,
     ) -> std::result::Result<tonic::Response<wire::JobFetchResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::job_fetch(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_fetch)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::job_fetch(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_job_fetch)
             .await
     }
     async fn cancel(
@@ -612,9 +626,9 @@ impl ManagedQueryJobService for Handler {
         request: tonic::Request<wire::JobCancelRequest>,
     ) -> std::result::Result<tonic::Response<wire::JobStatusResponse>, Status> {
         let call = admitted(&request)?;
-        let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
-        let operation = codec::job_cancel(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_status)
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        let operation = codec::job_cancel(request.into_inner()).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        self.run(call, operation, budget, identity, codec::encode_job_status)
             .await
     }
 }

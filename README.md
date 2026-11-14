@@ -162,7 +162,7 @@ hierarchy shard jobs and [Raft peers](docs/RAFT_GRPC.md) also have typed gRPC pa
 Observed coordinator query/job ingress now has a typed gRPC service: use
 `graph-coordinator serve` and unflagged query/hierarchy client commands. The old
 `serve-grpc` command and `--grpc` flag are rejected. The observed coordinator library now also uses typed RPC, including explicit
-consistency negotiation. Remaining graph/Gateway library TCP listeners need retirement;
+consistency negotiation. Remaining graph library TCP listeners need retirement;
 [process-node driver/control](docs/CONTROL_GRPC.md) now uses typed gRPC too;
 these internal observed endpoints are not the public managed API.
 
@@ -170,7 +170,7 @@ Single-shard Probe/Metadata/Write also have an explicit
 [typed RPC service and CLI](docs/SHARD_OPERATIONS_GRPC.md). Catalog/routing adapters now use typed snapshots/operations by default;
 graph-node --graph is a single typed listener and --grpc-snapshot is removed.
 The old Linux UDS read gateway is [retired](docs/GRAPH_UDS_GATEWAY.md).
-Explicit graph library legacy fixtures and Gateway TCP entrypoints remain
+Explicit graph library legacy fixtures remain
 separate retirement work; this does not complete the all-RPC inventory.
 
 

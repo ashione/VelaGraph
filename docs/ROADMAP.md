@@ -841,3 +841,11 @@ reuses fixed-V workers and shared admission rather than introducing an executor.
 The exact contract, evidence matrix and non-goals remain in
 [MANAGED_QUERY_JOBS.md](MANAGED_QUERY_JOBS.md). Acceptance requires final-head
 CI and independent review; this is not completion of all #218 legacy retirement.
+
+### #276 — managed Gateway library transport retirement
+
+- Preserve all domain operations, fixed binding/nonce verification and explicit
+  bounded capture profiles through typed public RPC, not a JSON envelope.
+- Remove the replaced Gateway listener/client; retain intentional public HTTP.
+- Keep fault, cancellation, unknown-write, session/job and retained-history gates.
+- GraphService retirement remains separate; this slice does not complete #218.

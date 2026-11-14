@@ -1,4 +1,4 @@
-//! Experimental plaintext TCP over trusted, pinned local or remote Raft nodes.
+//! Experimental typed gRPC over trusted, pinned local or remote Raft nodes.
 //! Standard Gremlin text reads and typed managed writes do not enable the older
 //! remote Global Gremlin API, authenticated access, multi-host Raft placement,
 //! discovery, or a durable read lease.
@@ -14,7 +14,9 @@ use d2_raft::{
     versioned_reads::{ReadLimit, Target},
     NodeHandle,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde::de::DeserializeOwned;
 use velagraph::{
     experimental_graph::{CrossEdge, EdgePropertyPatch, EdgeRef, VertexPropertyPatch, VertexRef},
     Value, Vertex,
@@ -34,6 +36,8 @@ mod grpc_codec;
 #[path = "managed_gateway_public_proto.rs"]
 pub mod public_proto;
 pub use grpc::GrpcService;
+#[path = "managed_gateway_grpc_client.rs"]
+mod grpc_client;
 #[path = "managed_gateway_jobs.rs"]
 mod jobs;
 #[path = "managed_gateway_local.rs"]
@@ -55,8 +59,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{watch, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
@@ -1091,7 +1096,7 @@ impl State {
 /// Separate bounded listener. Dropping/shutdown loses sessions, never aborts a
 /// durable request. A lost/late response always leaves the write outcome unknown.
 pub struct Gateway {
-    address: SocketAddr,
+    adapter: GrpcService,
     service: Service,
 }
 /// Managed state and cleanup lifecycle, independent of any legacy TCP listener.
@@ -1238,17 +1243,21 @@ impl Gateway {
         deadline: Duration,
         timing: Option<timing::Sender>,
     ) -> Result<Self> {
-        let (service, address) = Service::start(config, Some(bind), deadline, timing).await?;
-        Ok(Self {
-            service,
-            address: address.ok_or(Error::Unknown)?,
-        })
+        // Preserve the public adapter's loopback-only boundary. Reject before
+        // baseline probes rather than widening exposure for old TCP callers.
+        if !bind.ip().is_loopback() {
+            return Err(Error::Protocol);
+        }
+        let service = Service::start(config, deadline, timing).await?;
+        let adapter = service.bind_grpc(bind, deadline).await?;
+        Ok(Self { service, adapter })
     }
     pub fn local_addr(&self) -> SocketAddr {
-        self.address
+        self.adapter.local_addr()
     }
     pub async fn shutdown(self) {
         self.service.shutdown().await;
+        self.adapter.shutdown().await;
     }
 }
 impl std::ops::Deref for Gateway {
@@ -1269,15 +1278,13 @@ impl Service {
     ) -> Result<Self> {
         let config =
             grpc_local_config(config, routes, deadline, parallelism, member_parallelism).await?;
-        let (service, _) = Self::start(config, None, deadline, None).await?;
-        Ok(service)
+        Self::start(config, deadline, None).await
     }
     async fn start(
         config: OwnedConfig,
-        bind: Option<SocketAddr>,
         deadline: Duration,
         timing: Option<timing::Sender>,
-    ) -> Result<(Self, Option<SocketAddr>)> {
+    ) -> Result<Self> {
         check_deadline(deadline)?;
         config.validate()?;
         let state = Arc::new(State {
@@ -1309,68 +1316,28 @@ impl Service {
         )
         .await
         .map_err(|_| Error::Unknown)??;
-        let listener = match bind {
-            Some(bind) => Some(TcpListener::bind(bind).await.map_err(|_| Error::Unknown)?),
-            None => None,
-        };
-        let address = listener
-            .as_ref()
-            .map(TcpListener::local_addr)
-            .transpose()
-            .map_err(|_| Error::Unknown)?;
         let (stop, mut stopped) = watch::channel(false);
         let worker = state.clone();
         let task = tokio::spawn(async move {
-            let mut handlers = JoinSet::new();
             let mut cleanup = tokio::time::interval(Duration::from_millis(50));
             loop {
-                let accepted = tokio::select! {
+                tokio::select! {
                     _ = stopped.changed() => break,
-                    _ = cleanup.tick() => { worker.expire(); continue; },
-                    _ = handlers.join_next(), if !handlers.is_empty() => continue,
-                    accepted = async {
-                        match &listener {
-                            Some(listener) => listener.accept().await,
-                            None => std::future::pending().await,
-                        }
-                    } => accepted,
-                };
-                let Ok((socket, _)) = accepted else {
-                    break;
-                };
-                let Ok(permit) = worker.connections.clone().try_acquire_owned() else {
-                    continue;
-                };
-                let state = worker.clone();
-                let end = Instant::now() + deadline;
-                handlers.spawn(async move {
-                    let work = Arc::new(permit);
-                    if Instant::now() < end {
-                        let _ = tokio::time::timeout_at(
-                            tokio::time::Instant::from_std(end),
-                            serve(socket, state, work.clone(), end),
-                        )
-                        .await;
-                    }
-                });
+                    _ = cleanup.tick() => worker.expire(),
+                }
             }
             worker.cancel_jobs();
-            handlers.abort_all();
-            while handlers.join_next().await.is_some() {}
             let mut jobs = std::mem::take(&mut *worker.job_tasks.lock().unwrap());
             while jobs.join_next().await.is_some() {}
             worker.jobs.lock().unwrap().clear();
             worker.sessions.lock().unwrap().clear();
             worker.local_sessions.lock().unwrap().clear();
         });
-        Ok((
-            Self {
-                state,
-                stop,
-                task: Some(task),
-            },
-            address,
-        ))
+        Ok(Self {
+            state,
+            stop,
+            task: Some(task),
+        })
     }
     /// Bind the bounded development-only public HTTP adapter to this already
     /// validated live managed gateway. Offline restored nodes cannot create this
@@ -1400,66 +1367,15 @@ impl Drop for Service {
         let _ = self.stop.send(true);
     }
 }
-async fn serve(
-    mut socket: TcpStream,
-    state: Arc<State>,
-    work: Arc<OwnedSemaphorePermit>,
-    end: Instant,
-) -> Result<()> {
-    let request: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await?;
-    let invocation = invocation::Invocation::begin(state, request, work, end).await?;
-    let (bytes, mut invocation) = tokio::task::spawn_blocking(move || invocation.encode_tcp())
-        .await
-        .map_err(|_| Error::Unknown)??;
-    invocation.live()?;
-    let sent = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(invocation.delivery_end()?),
-        write_bytes(&mut socket, &bytes),
-    )
-    .await
-    .map_err(|_| invocation.live().err().unwrap_or(Error::Unknown))?;
-    if sent.is_ok() {
-        invocation.delivered();
-    }
-    sent
-}
-/// Performs no automatic retry. Reuse `Write.external_id` and exact mutation after
-/// Unknown. Every accepted reply is checked against the request and fixed binding.
+/// Performs no automatic retry. Reuse the exact original external ID and
+/// mutation after Unknown. The typed server confirms binding and request identity.
 pub async fn request(
     address: SocketAddr,
     binding: Binding,
     operation: Operation,
     deadline: Duration,
 ) -> Result<Reply> {
-    check_deadline(deadline)?;
-    let _permit = CLIENT_ADMISSION
-        .try_acquire()
-        .map_err(|_| Error::Capacity)?;
-    let request = Request {
-        version: VERSION,
-        request_id: random()?,
-        binding,
-        operation,
-    };
-    let end = Instant::now() + deadline;
-    tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
-        let bytes = encode(&request, MAX_REQUEST_BYTES)?;
-        if Instant::now() >= end {
-            return Err(Error::Unknown);
-        }
-        let mut socket = TcpStream::connect(address)
-            .await
-            .map_err(|_| Error::Unknown)?;
-        write_bytes(&mut socket, &bytes).await?;
-        let response: Response = read_frame(&mut socket, MAX_RESPONSE_BYTES).await?;
-        let result = validate_reply(&request, response);
-        if Instant::now() >= end {
-            return Err(Error::Unknown);
-        }
-        result
-    })
-    .await
-    .map_err(|_| Error::Unknown)?
+    grpc_client::request(address, binding, operation, deadline).await
 }
 fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
     if response.version != VERSION
@@ -1735,6 +1651,7 @@ fn encode<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>> {
     serde_json::to_writer(&mut writer, value).map_err(|_| Error::Capacity)?;
     Ok(writer.bytes)
 }
+#[cfg(test)]
 async fn read_frame<T: DeserializeOwned>(socket: &mut TcpStream, limit: usize) -> Result<T> {
     let len = socket.read_u32().await.map_err(|_| Error::Unknown)? as usize;
     if len == 0 || len > limit {
@@ -1747,6 +1664,7 @@ async fn read_frame<T: DeserializeOwned>(socket: &mut TcpStream, limit: usize) -
         .map_err(|_| Error::Unknown)?;
     serde_json::from_slice(&body).map_err(|_| Error::Protocol)
 }
+#[cfg(test)]
 async fn write_bytes(socket: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     socket
         .write_u32(u32::try_from(bytes.len()).map_err(|_| Error::Capacity)?)

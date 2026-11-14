@@ -8,22 +8,22 @@ pub(crate) mod bounded;
 
 pub(super) fn context(c: &Option<pb::Context>) -> Result<Duration> {
     let c = c.as_ref().ok_or(Error::Protocol)?;
-    if c.version != 1 || c.timeout_millis == 0 || c.timeout_millis > 60_000 {
+    if !matches!(c.version, 1 | 2) || (c.version == 2) != c.identity.is_some() || c.timeout_millis == 0 || c.timeout_millis > 60_000 {
         return Err(Error::Protocol);
     }
     Ok(Duration::from_millis(c.timeout_millis))
 }
-fn required<T>(x: Option<T>) -> Result<T> {
+pub(super) fn required<T>(x: Option<T>) -> Result<T> {
     x.ok_or(Error::Protocol)
 }
-fn token<const N: usize>(x: Vec<u8>) -> Result<[u8; N]> {
+pub(super) fn token<const N: usize>(x: Vec<u8>) -> Result<[u8; N]> {
     let x: [u8; N] = x.try_into().map_err(|_| Error::Identity)?;
     if x == [0; N] {
         return Err(Error::Identity);
     }
     Ok(x)
 }
-fn scalar(s: pb::Scalar) -> Result<Value> {
+pub(super) fn scalar(s: pb::Scalar) -> Result<Value> {
     use pb::scalar::Kind;
     Ok(match required(s.kind)? {
         Kind::Null(_) => Value::Null,
@@ -150,7 +150,7 @@ pub(super) fn status(r: pb::WriteRequest) -> Result<Operation> {
 pub(super) fn abort(r: pb::WriteRequest) -> Result<Operation> {
     Ok(Operation::Abort(write(r)?))
 }
-fn query(q: pb::Query) -> Result<Query> {
+pub(super) fn query(q: pb::Query) -> Result<Query> {
     if q.text.len() > crate::remote::query::MAX_QUERY_TEXT_BYTES {
         return Err(Error::Capacity);
     }
@@ -159,14 +159,14 @@ fn query(q: pb::Query) -> Result<Query> {
         text: q.text,
     })
 }
-fn size(x: u32) -> Result<u16> {
+pub(super) fn size(x: u32) -> Result<u16> {
     let size = u16::try_from(x).map_err(|_| Error::Protocol)?;
     if !(1..=MAX_PAGE_SIZE).contains(&size) {
         return Err(Error::Protocol);
     }
     Ok(size)
 }
-fn session(s: pb::Session) -> Result<LocalSession> {
+pub(super) fn session(s: pb::Session) -> Result<LocalSession> {
     Ok(LocalSession {
         incarnation: token(s.incarnation)?,
         token: token(s.token)?,
@@ -181,6 +181,15 @@ pub(super) fn open(r: pb::OpenRequest) -> Result<Operation> {
     }
     let query = query(required(r.query)?)?;
     let page_size = size(r.page_size)?;
+    if let Some(profile) = r.profile {
+        let profile = decode_profile(profile)?;
+        let version = match required(required(r.read)?.kind)? {
+            pb::read_selector::Kind::Latest(_) => None,
+            pb::read_selector::Kind::Exact(v) => Some(v),
+            pb::read_selector::Kind::Minimum(_) => return Err(Error::Protocol),
+        };
+        return Ok(Operation::OpenLocalQueryWithProfile { profile, version, ttl_millis: r.ttl_millis, query, page_size });
+    }
     Ok(match required(required(r.read)?.kind)? {
         pb::read_selector::Kind::Latest(_) => Operation::OpenLocalQuery {
             version: None,
@@ -226,7 +235,7 @@ pub(super) fn close(r: pb::CloseRequest) -> Result<Operation> {
         session: session(required(r.session)?)?,
     })
 }
-fn out_scalar(s: &Value) -> Result<pb::Scalar> {
+pub(super) fn out_scalar(s: &Value) -> Result<pb::Scalar> {
     use pb::scalar::Kind;
     Ok(pb::Scalar {
         kind: Some(match s {
@@ -283,20 +292,20 @@ fn out_row(r: &QueryRow) -> Result<pb::Row> {
         }),
     })
 }
-fn out_session(s: &LocalSession) -> pb::Session {
+pub(super) fn out_session(s: &LocalSession) -> pb::Session {
     pb::Session {
         incarnation: s.incarnation.to_vec(),
         token: s.token.to_vec(),
         version: s.version,
     }
 }
-fn out_query(q: &Query) -> pb::Query {
+pub(super) fn out_query(q: &Query) -> pb::Query {
     pb::Query {
         partition: q.partition,
         text: q.text.clone(),
     }
 }
-fn out_cursor(c: &PageCursor) -> pb::Cursor {
+pub(super) fn out_cursor(c: &PageCursor) -> pb::Cursor {
     pb::Cursor {
         token: c.token.to_vec(),
     }
@@ -339,6 +348,7 @@ pub(super) fn encode_write(r: &Reply) -> Result<pb::WriteResponse> {
     };
     use pb::write_response::Status;
     response_size(pb::WriteResponse {
+        identity: None,
         external_id: external_id.to_vec(),
         transaction_id: transaction_id.as_ref().map(|x| x.to_vec()),
         status: Some(match status {
@@ -358,16 +368,14 @@ pub(super) fn encode_write(r: &Reply) -> Result<pb::WriteResponse> {
     })
 }
 pub(super) fn encode_open(r: &Reply) -> Result<pb::OpenResponse> {
-    let Reply::OpenLocalQuery {
-        session,
-        query,
-        page_size,
-        page,
-    } = r
-    else {
-        return Err(Error::Protocol);
+    let (profile, session, query, page_size, page) = match r {
+        Reply::OpenLocalQuery { session, query, page_size, page } => (None, session, query, page_size, page),
+        Reply::OpenLocalQueryWithProfile { profile, session, query, page_size, page } => (Some(encode_profile(*profile)), session, query, page_size, page),
+        _ => return Err(Error::Protocol),
     };
     response_size(pb::OpenResponse {
+        identity: None,
+        profile,
         session: Some(out_session(session)),
         query: Some(out_query(query)),
         page_size: u32::from(*page_size),
@@ -386,6 +394,7 @@ pub(super) fn encode_fetch(r: &Reply) -> Result<pb::FetchResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::FetchResponse {
+        identity: None,
         session: Some(out_session(session)),
         query: Some(out_query(query)),
         cursor: cursor.as_ref().map(out_cursor),
@@ -398,6 +407,7 @@ pub(super) fn encode_close(r: &Reply) -> Result<pb::CloseResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::CloseResponse {
+        identity: None,
         session: Some(out_session(session)),
     })
 }
@@ -415,9 +425,8 @@ pub(super) fn error(e: Error) -> tonic::Status {
         Error::JobBusy => (C::FailedPrecondition, R::JobBusy),
         Error::Query(q) => match q {
             QueryFailure::Parse => (C::InvalidArgument, R::QuerySyntax),
-            QueryFailure::Unsupported | QueryFailure::UnsupportedScope => {
-                (C::Unimplemented, R::QueryUnsupported)
-            }
+            QueryFailure::Unsupported => (C::Unimplemented, R::QueryUnsupported),
+            QueryFailure::UnsupportedScope => (C::Unimplemented, R::QueryUnsupportedScope),
             QueryFailure::InvalidArgument => (C::InvalidArgument, R::QueryInvalidArgument),
             QueryFailure::ResourceExhausted => (C::ResourceExhausted, R::QueryResourceExhausted),
             QueryFailure::Timeout => (C::DeadlineExceeded, R::QueryDeadline),
@@ -429,6 +438,7 @@ pub(super) fn error(e: Error) -> tonic::Status {
         code,
         reason.as_str_name(),
         pb::ErrorDetail {
+            identity: None,
             reason: reason as i32,
         }
         .encode_to_vec()
@@ -438,7 +448,7 @@ pub(super) fn error(e: Error) -> tonic::Status {
 
 // Fixed snapshot sessions deliberately use a distinct public DTO from local
 // query sessions. Both are checked by their original state registry.
-fn fixed_session(s: pb::FixedSession) -> Result<Session> {
+pub(super) fn fixed_session(s: pb::FixedSession) -> Result<Session> {
     Ok(Session {
         incarnation: token(s.incarnation)?,
         token: token(s.token)?,
@@ -496,7 +506,7 @@ pub(super) fn fixed_close(r: pb::FixedCloseRequest) -> Result<Operation> {
         session: fixed_session(required(r.session)?)?,
     })
 }
-fn out_fixed_session(s: &Session) -> pb::FixedSession {
+pub(super) fn out_fixed_session(s: &Session) -> pb::FixedSession {
     pb::FixedSession {
         incarnation: s.incarnation.to_vec(),
         token: s.token.to_vec(),
@@ -508,6 +518,7 @@ pub(super) fn encode_fixed_open(r: &Reply) -> Result<pb::FixedOpenResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::FixedOpenResponse {
+        identity: None,
         session: Some(out_fixed_session(session)),
     })
 }
@@ -526,6 +537,7 @@ pub(super) fn encode_fixed_query(r: &Reply) -> Result<pb::FixedQueryResponse> {
         _ => return Err(Error::Protocol),
     };
     response_size(pb::FixedQueryResponse {
+        identity: None,
         session: Some(out_fixed_session(session)),
         query: Some(out_query(query)),
         data: Some(pb::QueryData {
@@ -549,6 +561,7 @@ pub(super) fn encode_fixed_page(r: &Reply) -> Result<pb::FixedPageResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::FixedPageResponse {
+        identity: None,
         session: Some(out_fixed_session(session)),
         query: Some(out_query(query)),
         cursor: cursor.as_ref().map(out_cursor),
@@ -561,6 +574,7 @@ pub(super) fn encode_fixed_close(r: &Reply) -> Result<pb::FixedCloseResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::FixedCloseResponse {
+        identity: None,
         session: Some(out_fixed_session(session)),
     })
 }
@@ -747,6 +761,7 @@ mod tests {
     }
     fn ctx() -> Option<pb::Context> {
         Some(pb::Context {
+            identity: None,
             version: 1,
             timeout_millis: 500,
         })
@@ -884,6 +899,7 @@ mod tests {
     #[test]
     fn read_selector_and_context_never_silently_default() {
         let req = pb::OpenRequest {
+            profile: None,
             context: ctx(),
             read: Some(pb::ReadSelector {
                 kind: Some(pb::read_selector::Kind::Exact(0)),
@@ -987,7 +1003,7 @@ mod tests {
     }
 }
 
-fn job(h: pb::JobHandle) -> Result<JobHandle> {
+pub(super) fn job(h: pb::JobHandle) -> Result<JobHandle> {
     Ok(JobHandle {
         incarnation: token(h.incarnation)?,
         token: token(h.token)?,
@@ -1048,7 +1064,7 @@ pub(super) fn job_fetch(r: pb::JobFetchRequest) -> Result<Operation> {
         page_size: size(r.page_size)?,
     })
 }
-fn out_job(j: &JobHandle) -> pb::JobHandle {
+pub(super) fn out_job(j: &JobHandle) -> pb::JobHandle {
     pb::JobHandle {
         incarnation: j.incarnation.to_vec(),
         token: j.token.to_vec(),
@@ -1102,6 +1118,7 @@ pub(super) fn encode_job_start(r: &Reply) -> Result<pb::JobStartResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::JobStartResponse {
+        identity: None,
         operation_id: operation_id.to_vec(),
         job: Some(out_job(job)),
     })
@@ -1114,6 +1131,7 @@ pub(super) fn encode_job_status(r: &Reply) -> Result<pb::JobStatusResponse> {
         _ => return Err(Error::Protocol),
     };
     response_size(pb::JobStatusResponse {
+        identity: None,
         job: Some(out_job(job)),
         status: Some(out_job_status(status)?),
     })
@@ -1123,6 +1141,7 @@ pub(super) fn encode_job_renew(r: &Reply) -> Result<pb::JobRenewResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::JobRenewResponse {
+        identity: None,
         job: Some(out_job(job)),
         generation: grant.generation,
         remaining_millis: grant.remaining_millis,
@@ -1141,6 +1160,7 @@ pub(super) fn encode_job_fetch(r: &Reply) -> Result<pb::JobFetchResponse> {
         return Err(Error::Protocol);
     };
     response_size(pb::JobFetchResponse {
+        identity: None,
         job: Some(out_job(job)),
         query: Some(out_query(query)),
         cursor: cursor.as_ref().map(out_cursor),
@@ -1164,6 +1184,7 @@ mod job_tests {
     fn start() -> pb::JobStartRequest {
         pb::JobStartRequest {
             context: Some(pb::Context {
+            identity: None,
                 version: 1,
                 timeout_millis: 100,
             }),
@@ -1415,4 +1436,59 @@ mod job_tests {
         assert_eq!(grant.generation, u64::MAX);
         assert_eq!(grant.remaining_millis, 1);
     }
+}
+
+// Typed identity is placement/correlation, never an authentication token.
+pub(super) fn encode_binding(binding: &Binding) -> pb::Binding {
+    use d2_raft::transaction_decisions::CapacityProfile;
+    pb::Binding {
+        authority_shard: binding.authority.shard,
+        authority_mode: binding.authority.mode.to_vec(),
+        coordinator_shard: binding.cohort.coordinator_shard,
+        coordinator_epoch: binding.cohort.coordinator_epoch,
+        members: binding.cohort.members.iter().map(|m| pb::BindingMember { shard: m.shard, epoch: m.epoch, mode: m.mode.to_vec() }).collect(),
+        capacity_profile: (match binding.cohort.profile { CapacityProfile::LegacyCountV1 => pb::CapacityProfile::LegacyCountV1, CapacityProfile::ByteBound16MiBV1 => pb::CapacityProfile::ByteBound16MibV1 }) as i32,
+        mapping: pb::Mapping::PartitionEqualsShardV1 as i32,
+    }
+}
+pub(super) fn decode_binding(binding: pb::Binding) -> Result<Binding> {
+    use d2_raft::transaction_decisions::{CapacityProfile, Member};
+    if binding.mapping != pb::Mapping::PartitionEqualsShardV1 as i32 { return Err(Error::Identity); }
+    let cohort = Cohort {
+        coordinator_shard: binding.coordinator_shard,
+        coordinator_epoch: binding.coordinator_epoch,
+        members: binding.members.into_iter().map(|m| Ok(Member { shard: m.shard, epoch: m.epoch, mode: token(m.mode)? })).collect::<Result<_>>()?,
+        profile: match pb::CapacityProfile::try_from(binding.capacity_profile).map_err(|_| Error::Protocol)? {
+            pb::CapacityProfile::LegacyCountV1 => CapacityProfile::LegacyCountV1,
+            pb::CapacityProfile::ByteBound16MibV1 => CapacityProfile::ByteBound16MiBV1,
+            _ => return Err(Error::Protocol),
+        },
+    };
+    cohort.validate().map_err(|_| Error::Protocol)?;
+    Ok(Binding { authority: Authority { shard: binding.authority_shard, mode: token(binding.authority_mode)? }, cohort, mapping: Mapping::PartitionEqualsShardV1 })
+}
+pub(super) fn decode_profile(value: i32) -> Result<LocalReadProfile> {
+    match pb::LocalReadProfile::try_from(value).map_err(|_| Error::Protocol)? {
+        pb::LocalReadProfile::Parity2MibV1 => Ok(LocalReadProfile::Parity2MiBV1),
+        pb::LocalReadProfile::LocalRead8MibV1 => Ok(LocalReadProfile::LocalRead8MiBV1),
+        _ => Err(Error::Protocol),
+    }
+}
+pub(super) fn encode_profile(value: LocalReadProfile) -> i32 {
+    (match value { LocalReadProfile::Parity2MiBV1 => pb::LocalReadProfile::Parity2MibV1, LocalReadProfile::LocalRead8MiBV1 => pb::LocalReadProfile::LocalRead8MibV1 }) as i32
+}
+pub(super) trait Identified: Message + bounded::BoundedMessage {
+    fn identity_mut(&mut self) -> &mut Option<pb::CallIdentity>;
+}
+macro_rules! identities {
+    ($($name:ident),*) => {$(impl Identified for pb::$name {
+        fn identity_mut(&mut self) -> &mut Option<pb::CallIdentity> { &mut self.identity }
+    })*};
+}
+identities!(WriteResponse,OpenResponse,FetchResponse,CloseResponse,FixedOpenResponse,FixedQueryResponse,FixedPageResponse,FixedCloseResponse,JobStartResponse,JobStatusResponse,JobRenewResponse,JobFetchResponse);
+pub(super) fn identified_error(error: Error, identity: Option<pb::CallIdentity>) -> tonic::Status {
+    let status = self::error(error);
+    let mut detail = pb::ErrorDetail::decode(status.details()).expect("own error encoding");
+    detail.identity = identity;
+    tonic::Status::with_details(status.code(), status.message(), detail.encode_to_vec().into())
 }

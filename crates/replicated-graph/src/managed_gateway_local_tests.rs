@@ -1985,7 +1985,9 @@ async fn public_grpc_zero_window_deadlines_release_shared_work_and_new_open() {
             .unwrap();
         let (response, mut send) = sender.send_request(request, false).unwrap();
         let payload = pb::OpenRequest {
+            profile: None,
             context: Some(pb::Context {
+            identity: None,
                 version: 1,
                 timeout_millis: rpc_ms,
             }),

@@ -14,6 +14,7 @@ jobs:
         with:
           components: rustfmt
       - run: bash scripts/generate-public-managed-proto.sh
+      - run: cargo fmt --all
       - run: git diff --binary > gateway-codegen.patch
       - uses: actions/upload-artifact@v4
         with:

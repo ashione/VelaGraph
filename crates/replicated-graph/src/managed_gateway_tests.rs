@@ -7,6 +7,86 @@ use d2_raft::transaction_decisions::{Command, Decision, Journal, Member};
 use d2_raft::{
     participant_driver, versioned_reads, Cluster, D1Command, D1Error, D1Result, LogCommand,
 };
+// Real HTTP/2 frames, including explicit reset/half-frame injection. These
+// helpers deliberately bypass the normal client only for transport failures.
+struct RpcDriver(tokio::task::JoinHandle<()>);
+impl Drop for RpcDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+fn public_context() -> Option<public_proto::Context> {
+    Some(public_proto::Context {
+        version: 1,
+        timeout_millis: 15_000,
+        ..Default::default()
+    })
+}
+fn grpc_frame(message: &impl prost::Message) -> Vec<u8> {
+    let encoded = message.encode_to_vec();
+    let mut bytes = Vec::with_capacity(encoded.len() + 5);
+    bytes.push(0);
+    bytes.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    bytes.extend(encoded);
+    bytes
+}
+async fn raw_rpc(
+    address: SocketAddr,
+    method: &str,
+    bytes: Vec<u8>,
+    end_stream: bool,
+) -> (h2::client::ResponseFuture, h2::SendStream<tonic::codegen::Bytes>, RpcDriver) {
+    let socket = TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) = h2::client::handshake(socket).await.unwrap();
+    let driver = RpcDriver(tokio::spawn(async move { let _ = connection.await; }));
+    let request = tonic::codegen::http::Request::builder()
+        .method("POST")
+        .uri(format!("http://{address}/{method}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .header("grpc-timeout", "15000m")
+        .body(())
+        .unwrap();
+    let (response, mut body) = sender.send_request(request, false).unwrap();
+    body.send_data(bytes.into(), end_stream).unwrap();
+    (response, body, driver)
+}
+async fn rejected_rpc(response: h2::client::ResponseFuture) {
+    // Transport resets and non-OK gRPC statuses both reject the malformed call.
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let response = response.await?;
+        let initial = response.headers().get("grpc-status").cloned();
+        let mut body = response.into_body();
+        while let Some(data) = body.data().await {
+            let data = data?;
+            body.flow_control().release_capacity(data.len())?;
+        }
+        let trailers = body.trailers().await?;
+        let status = trailers.as_ref().and_then(|h| h.get("grpc-status")).cloned().or(initial);
+        Ok::<_, h2::Error>(status)
+    }).await.expect("rejected RPC must terminate within deadline");
+    if let Ok(status) = result {
+        assert!(status.is_some_and(|status| status != "0"));
+    }
+}
+async fn send_write_lost_ack(g: &Gateway, f: &Fixture, write: &Write) {
+    let message = grpc_client::encode_write(public_context(), write).unwrap();
+    let (response, mut body, driver) = raw_rpc(
+        g.local_addr(), "velagraph.public.managed.v1.WriteService/Submit",
+        grpc_frame(&message), true,
+    ).await;
+    // Wait for durable admission, not an arbitrary sleep or socket write. No
+    // response is observed, so recovery must preserve this exact external ID.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if journal(f).await.request(write.external_id).is_some() { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    body.send_reset(h2::Reason::CANCEL);
+    drop(response);
+    drop(driver);
+}
 fn authority() -> Authority {
     Authority {
         shard: 9,
@@ -303,7 +383,71 @@ async fn journal(f: &Fixture) -> Journal {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tcp_mutations_fixed_versions_concurrent_identity_and_disconnect() {
+async fn wrong_typed_binding_and_nonce_reject_before_write_admission() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    let g = f.gateway().await;
+    for case in 0..3 {
+        let mut wrong = bound();
+        match case {
+            0 => wrong.authority.mode[0] ^= 1,
+            1 => wrong.cohort.members[0].epoch += 1,
+            _ => wrong.cohort.coordinator_epoch += 1,
+        }
+        let write = create(90 + case, 7, 90 + u64::from(case));
+        assert_eq!(
+            request(g.local_addr(), wrong, Operation::Submit(write.clone()), Duration::from_secs(2)).await,
+            Err(Error::Identity)
+        );
+        assert!(journal(&f).await.request(write.external_id).is_none());
+        assert!(matches!(call(&g, Operation::Status(write)).await.unwrap(), Reply::Write { status: WriteStatus::Absent, .. }));
+    }
+    let write = create(99, 7, 99);
+    let context = Some(public_proto::Context {
+        version: 2,
+        timeout_millis: 2000,
+        identity: Some(public_proto::CallIdentity {
+            request_id: vec![1; 15],
+            binding: Some(grpc_client::encode_binding(&bound())),
+        }),
+    });
+    let mut client = public_proto::write_service_client::WriteServiceClient::connect(format!("http://{}", g.local_addr())).await.unwrap();
+    let error = client.submit(grpc_client::encode_write(context, &write).unwrap()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(journal(&f).await.request(write.external_id).is_none());
+    assert!(matches!(call(&g, Operation::Status(write)).await.unwrap(), Reply::Write { status: WriteStatus::Absent, .. }));
+    assert_eq!(journal(&f).await.resolved_prefix(), 0);
+    g.shutdown().await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn typed_client_admission_precedes_connection() {
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reserved = CLIENT_ADMISSION.acquire_many(MAX_CONNECTIONS as u32).await.unwrap();
+    assert_eq!(
+        request(listener.local_addr().unwrap(), bound(), Operation::Status(create(1, 7, 1)), Duration::from_secs(1)).await,
+        Err(Error::Capacity)
+    );
+    assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+    drop(reserved);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_rejects_non_loopback_before_binding() {
+    let _test = TEST_GATE.lock().await;
+    let f = Fixture::new().await;
+    // No external listener is opened: this address must fail the public
+    // adapter's policy check, not reach socket bind or graph acquisition.
+    let result = Gateway::bind(f.config(), "0.0.0.0:0".parse().unwrap(), Duration::from_secs(2)).await;
+    assert!(matches!(result, Err(Error::Protocol)));
+    assert_eq!(journal(&f).await.resolved_prefix(), 0);
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_mutations_fixed_versions_concurrent_identity_and_disconnect() {
     let _test = TEST_GATE.lock().await;
     let f = Fixture::new().await;
     let g = f.gateway().await;
@@ -389,18 +533,7 @@ async fn tcp_mutations_fixed_versions_concurrent_identity_and_disconnect() {
             edge: entity(7, 10),
         },
     };
-    // Real socket delivers the full command, then discards the final reply.
-    let request = Request {
-        version: VERSION,
-        request_id: [7; 16],
-        binding: bound(),
-        operation: Operation::Submit(deletion.clone()),
-    };
-    let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-    write_bytes(&mut socket, &encode(&request, MAX_REQUEST_BYTES).unwrap())
-        .await
-        .unwrap();
-    drop(socket);
+    send_write_lost_ack(&g, &f, &deletion).await;
     let deleted = call(&g, Operation::Submit(deletion.clone())).await.unwrap();
     let (_, ordinal) = committed(&deleted);
     assert_eq!(ordinal, 6);
@@ -612,40 +745,28 @@ async fn session_budgets_expiry_malformed_fields_and_oversized_frames() {
         .await,
         Err(Error::Identity)
     );
-    let req = Request {
-        version: VERSION,
-        request_id: [1; 16],
-        binding: bound(),
-        operation: Operation::Read {
-            session: sessions[0].clone(),
-            query: query(7, "g.V(1)"),
-        },
+    let req = public_proto::FixedQueryRequest {
+        context: public_context(),
+        session: Some(public_proto::FixedSession {
+            incarnation: sessions[0].incarnation.to_vec(),
+            token: sessions[0].token.to_vec(),
+            version: sessions[0].version,
+        }),
+        query: Some(public_proto::Query { partition: 7, text: "g.V(1)".into() }),
+        ..Default::default()
     };
-    let mut value = serde_json::to_value(req).unwrap();
-    value["operation"]["Read"]["cursor"] = serde_json::json!(1);
-    let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-    write_bytes(&mut socket, &serde_json::to_vec(&value).unwrap())
-        .await
-        .unwrap();
-    assert!(tokio::time::timeout(
-        Duration::from_secs(2),
-        read_frame::<Response>(&mut socket, MAX_RESPONSE_BYTES)
-    )
-    .await
-    .unwrap()
-    .is_err());
-    let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-    socket
-        .write_u32(MAX_REQUEST_BYTES as u32 + 1)
-        .await
-        .unwrap();
-    assert!(tokio::time::timeout(
-        Duration::from_secs(2),
-        read_frame::<Response>(&mut socket, MAX_RESPONSE_BYTES)
-    )
-    .await
-    .unwrap()
-    .is_err());
+    let mut payload = prost::Message::encode_to_vec(&req);
+    // Unknown field 127 must fail the strict protobuf prescan.
+    payload.extend_from_slice(&[0xf8, 0x07, 0x01]);
+    let mut frame = vec![0];
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend(payload);
+    let (response, _body, _driver) = raw_rpc(g.local_addr(), "velagraph.public.managed.v1.FixedSessionService/Read", frame, true).await;
+    rejected_rpc(response).await;
+    let mut oversized = vec![0];
+    oversized.extend_from_slice(&(MAX_REQUEST_BYTES as u32 + 1).to_be_bytes());
+    let (response, _body, _driver) = raw_rpc(g.local_addr(), "velagraph.public.managed.v1.FixedSessionService/Read", oversized, true).await;
+    rejected_rpc(response).await;
     for session in sessions {
         close(&g, session).await;
     }
@@ -969,25 +1090,14 @@ async fn connection_admission_and_total_deadline_leave_no_implicit_write() {
         .acquire_many_owned(MAX_CONNECTIONS as u32)
         .await
         .unwrap();
-    let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-    assert!(tokio::time::timeout(
-        Duration::from_secs(2),
-        read_frame::<Response>(&mut socket, MAX_RESPONSE_BYTES)
-    )
-    .await
-    .unwrap()
-    .is_err());
+    assert!(call(&g, Operation::Status(create(99, 7, 99))).await.is_err());
     drop(reserved);
-    let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-    socket.write_u32(100).await.unwrap();
-    socket.write_all(b"{").await.unwrap();
-    assert!(tokio::time::timeout(
-        Duration::from_secs(2),
-        read_frame::<Response>(&mut socket, MAX_RESPONSE_BYTES)
-    )
-    .await
-    .unwrap()
-    .is_err());
+    // Incomplete protobuf body must expire without admitting any write.
+    let (response, _body, _driver) = raw_rpc(
+        g.local_addr(), "velagraph.public.managed.v1.WriteService/Submit",
+        vec![0, 0, 0, 0, 100, 0x0a], false,
+    ).await;
+    rejected_rpc(response).await;
     let serial = g.state.submit.lock().await;
     let submitted = request(
         g.local_addr(),
@@ -1012,41 +1122,79 @@ async fn connection_admission_and_total_deadline_leave_no_implicit_write() {
     f.stop().await;
 }
 
+#[derive(Clone)]
+struct FakeFixedPeer {
+    case: usize,
+    rows: bool,
+}
+#[tonic::async_trait]
+impl public_proto::fixed_session_service_server::FixedSessionService for FakeFixedPeer {
+    async fn open(&self, request: tonic::Request<public_proto::FixedOpenRequest>) -> std::result::Result<tonic::Response<public_proto::FixedOpenResponse>, tonic::Status> {
+        let mut identity = request.into_inner().context.and_then(|c| c.identity);
+        match self.case {
+            0 => identity.as_mut().unwrap().request_id[0] ^= 1,
+            1 => identity.as_mut().unwrap().binding.as_mut().unwrap().authority_mode[0] ^= 1,
+            4 => identity = None,
+            5 => { identity.as_mut().unwrap().request_id.pop(); },
+            6 => identity.as_mut().unwrap().binding.as_mut().unwrap().members[0].epoch += 1,
+            _ => {}
+        }
+        Ok(tonic::Response::new(public_proto::FixedOpenResponse {
+            session: Some(public_proto::FixedSession {
+                incarnation: vec![1; 16],
+                token: if self.case == 3 { vec![2; MAX_RESPONSE_BYTES + 1] } else { vec![2; 32] },
+                version: if self.case == 2 { 5 } else { 4 },
+            }),
+            identity,
+        }))
+    }
+    async fn read(&self, request: tonic::Request<public_proto::FixedQueryRequest>) -> std::result::Result<tonic::Response<public_proto::FixedQueryResponse>, tonic::Status> {
+        use crate::remote::query::QualifiedElement as Q;
+        assert!(self.rows);
+        let request = request.into_inner();
+        let identity = request.context.as_ref().and_then(|c| c.identity.clone());
+        let operation = grpc_codec::fixed_read(request).unwrap();
+        let Operation::Read { session, query } = operation else { unreachable!() };
+        let rows = match self.case {
+            0 => vec![v(7, 2)],
+            1 | 2 => vec![e(8, 10)],
+            3 => vec![e(10, 10)],
+            4 | 5 => vec![],
+            6 => vec![value(Q::Edge { partition: 7, id: 10 }, Value::Integer(11))],
+            _ => vec![value(Q::Vertex { partition: 7, id: 2 }, Value::Null)],
+        };
+        let mut reply = grpc_codec::encode_fixed_query(&Reply::Read {
+            session, query, data: QueryData { rows, completeness: QueryCompleteness::Unverified },
+        }).unwrap();
+        reply.identity = identity;
+        Ok(tonic::Response::new(reply))
+    }
+    async fn traverse(&self, _: tonic::Request<public_proto::FixedQueryRequest>) -> std::result::Result<tonic::Response<public_proto::FixedQueryResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a fixture operation"))
+    }
+    async fn page(&self, _: tonic::Request<public_proto::FixedPageRequest>) -> std::result::Result<tonic::Response<public_proto::FixedPageResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a fixture operation"))
+    }
+    async fn close(&self, _: tonic::Request<public_proto::FixedCloseRequest>) -> std::result::Result<tonic::Response<public_proto::FixedCloseResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not a fixture operation"))
+    }
+}
+async fn fake_fixed_peer(case: usize, rows: bool) -> (SocketAddr, RpcDriver) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = public_proto::fixed_session_service_server::FixedSessionServiceServer::new(FakeFixedPeer { case, rows })
+        .max_encoding_message_size(MAX_RESPONSE_BYTES * 2);
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder().add_service(service)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)).await.unwrap();
+    });
+    (address, RpcDriver(task))
+}
 #[tokio::test]
 async fn fake_peer_mismatches_and_response_cap_fail_closed() {
     let _test = TEST_GATE.lock().await;
-    for test in 0..4 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let req: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await.unwrap();
-            if test == 3 {
-                socket
-                    .write_u32(MAX_RESPONSE_BYTES as u32 + 1)
-                    .await
-                    .unwrap();
-                return;
-            }
-            let mut response = Response {
-                version: VERSION,
-                request_id: req.request_id,
-                binding: req.binding,
-                result: Ok(Reply::OpenSession(Session {
-                    incarnation: [1; 16],
-                    token: [2; 32],
-                    version: 5,
-                })),
-            };
-            match test {
-                0 => response.request_id[0] ^= 1,
-                1 => response.binding.authority.mode[0] ^= 1,
-                _ => {}
-            }
-            write_bytes(&mut socket, &encode(&response, MAX_RESPONSE_BYTES).unwrap())
-                .await
-                .unwrap();
-        });
+    for test in 0..7 {
+        let (addr, _server) = fake_fixed_peer(test, false).await;
         let result = request(
             addr,
             bound(),
@@ -1065,7 +1213,6 @@ async fn fake_peer_mismatches_and_response_cap_fail_closed() {
                 Error::Identity
             })
         );
-        server.await.unwrap();
     }
 }
 
@@ -1176,10 +1323,8 @@ async fn undelivered_open_guard_reclaims_on_cancellation() {
 #[tokio::test]
 async fn fake_peer_point_and_adjacency_entities_must_match_request() {
     let _test = TEST_GATE.lock().await;
-    use crate::remote::query::QualifiedElement as Q;
     for test in 0..8 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (addr, _server) = fake_fixed_peer(test, true).await;
         let session = Session {
             incarnation: [1; 16],
             token: [2; 32],
@@ -1199,78 +1344,32 @@ async fn fake_peer_point_and_adjacency_entities_must_match_request() {
             session: session.clone(),
             query: query.clone(),
         };
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let req: Request = read_frame(&mut socket, MAX_REQUEST_BYTES).await.unwrap();
-            let rows = match test {
-                0 => vec![v(7, 2)],
-                1 => vec![e(8, 10)],
-                2 => vec![e(8, 10)],
-                3 => vec![e(10, 10)],
-                4 | 5 => vec![],
-                6 => vec![value(
-                    Q::Edge {
-                        partition: 7,
-                        id: 10,
-                    },
-                    Value::Integer(11),
-                )],
-                _ => vec![value(
-                    Q::Vertex {
-                        partition: 7,
-                        id: 2,
-                    },
-                    Value::Null,
-                )],
-            };
-            let response = Response {
-                version: VERSION,
-                request_id: req.request_id,
-                binding: req.binding,
-                result: Ok(Reply::Read {
-                    session,
-                    query,
-                    data: QueryData {
-                        rows,
-                        completeness: QueryCompleteness::Unverified,
-                    },
-                }),
-            };
-            write_bytes(&mut socket, &encode(&response, MAX_RESPONSE_BYTES).unwrap())
-                .await
-                .unwrap();
-        });
         assert_eq!(
             request(addr, bound(), operation, Duration::from_secs(2)).await,
             Err(Error::Identity)
         );
-        server.await.unwrap();
     }
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reset_open_connection_releases_undelivered_session_over_real_tcp() {
+async fn reset_open_rpc_releases_undelivered_session_over_real_http2() {
     let _test = TEST_GATE.lock().await;
     let f = Fixture::new().await;
     let g = f.gateway().await;
-    for nonce in 1..=MAX_SESSIONS + 1 {
+    for _ in 1..=MAX_SESSIONS + 1 {
         // Ensure the frame has reached capture before resetting the socket,
         // while preventing a reply until the peer has definitely sent RST.
         let paused = f.nodes[0].state_machine.pause_state().await;
-        let request = Request {
-            version: VERSION,
-            request_id: [nonce as u8; 16],
-            binding: bound(),
-            operation: Operation::OpenSession {
-                version: None,
-                ttl_millis: 60000,
-            },
+        let request = public_proto::FixedOpenRequest {
+            context: public_context(),
+            version: None,
+            ttl_millis: 60000,
+            ..Default::default()
         };
-        let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-        write_bytes(&mut socket, &encode(&request, MAX_REQUEST_BYTES).unwrap())
-            .await
-            .unwrap();
+        let (response, mut body, driver) = raw_rpc(
+            g.local_addr(), "velagraph.public.managed.v1.FixedSessionService/Open",
+            grpc_frame(&request), true,
+        ).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while g.retained_payload_charge() != SESSION_CHARGE {
                 tokio::task::yield_now().await;
@@ -1278,9 +1377,8 @@ async fn reset_open_connection_releases_undelivered_session_over_real_tcp() {
         })
         .await
         .unwrap();
-        let socket = socket.into_std().unwrap();
-        rustix::net::sockopt::set_socket_linger(&socket, Some(Duration::ZERO)).unwrap();
-        drop(socket);
+        body.send_reset(h2::Reason::CANCEL);
+        drop(response);
         drop(paused);
         tokio::time::timeout(Duration::from_secs(2), async {
             while g.state.connections.available_permits() != MAX_CONNECTIONS {
@@ -1291,6 +1389,7 @@ async fn reset_open_connection_releases_undelivered_session_over_real_tcp() {
         .unwrap();
         assert_eq!(g.retained_payload_charge(), 0);
         assert!(g.state.sessions.lock().unwrap().is_empty());
+        drop(driver);
     }
     let session = open(&g, None).await;
     close(&g, session).await;
@@ -1840,10 +1939,12 @@ async fn shared_invocation_drop_cleans_new_session_and_holds_admission() {
         Ok(Reply::OpenSession(session)) => session.clone(),
         other => panic!("{other:?}"),
     };
-    let (bytes, invocation) = tokio::task::spawn_blocking(move || invocation.encode_tcp())
-        .await
-        .unwrap()
-        .unwrap();
+    let (bytes, invocation) = tokio::task::spawn_blocking(move || {
+        invocation.preflight_grpc().unwrap();
+        let reply = invocation.response.result.as_ref().unwrap();
+        let bytes = prost::Message::encode_to_vec(&grpc_codec::encode_fixed_open(reply).unwrap());
+        (bytes, invocation)
+    }).await.unwrap();
     assert!(!bytes.is_empty());
     assert_eq!(g.state.connections.available_permits(), MAX_CONNECTIONS - 1);
     drop(invocation); // cancelled or undelivered response: never call delivered
@@ -1858,7 +1959,7 @@ async fn shared_invocation_drop_cleans_new_session_and_holds_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http_idle_and_incomplete_body_share_tcp_admission_and_deadline() {
+async fn http_idle_and_incomplete_body_share_grpc_admission_and_deadline() {
     let _test = TEST_GATE.lock().await;
     let f = Fixture::new().await;
     let g = f.gateway().await;
