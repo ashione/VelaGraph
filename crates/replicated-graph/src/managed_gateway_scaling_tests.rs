@@ -405,71 +405,52 @@ async fn fixed_local_scaling_four_real_retained_views_overlap_during_managed_wri
         route.endpoint = listener.local_addr().unwrap();
         let barrier = barrier.clone();
         let address = writer.local_addr();
-        proxies.push(tokio::spawn(async move {
+        proxies.push(tokio::spawn(run_fixed_script(listener, move |mut events| async move {
             let mut sequence = 0;
             let mut descriptor = None;
             let mut outs = 0;
             let mut overlaps = 0;
             loop {
-                let (mut client, _) = listener.accept().await.unwrap();
-                let body = wire_read(&mut client).await;
-                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let operation = &value["operation"];
-                let fragment = &operation["FixedQueryFragment"];
-                if fragment.is_object() {
-                    assert_eq!(fragment["request_sequence"], sequence);
+                let event = events.recv().await.unwrap();
+                let fragment = event.request.fragment();
+                if let Some(fragment) = fragment {
+                    assert_eq!(fragment.request_sequence, sequence);
                     sequence += 1;
-                    assert_eq!(fragment["descriptor"]["version"], old_v);
+                    assert_eq!(fragment.descriptor.as_ref().unwrap().version, old_v);
                     if let Some(original) = &descriptor {
-                        assert_eq!(&fragment["descriptor"], original);
-                    } else {
-                        descriptor = Some(fragment["descriptor"].clone());
-                    }
+                        assert_eq!(fragment.descriptor.as_ref(), Some(original));
+                    } else { descriptor = fragment.descriptor.clone(); }
                 }
-                if fragment["fragment"]["Out"].is_object() {
-                    outs += 1;
-                }
-                let overlap = fragment["fragment"]["Out"].is_object() && (shard != 20 || outs == 2);
-                let mut upstream = TcpStream::connect(real).await.unwrap();
-                wire_write(&mut upstream, &body).await;
-                let reply = wire_read(&mut upstream).await;
+                let out = matches!(fragment.and_then(|v| v.fragment.as_ref()).and_then(|v| v.kind.as_ref()), Some(fixed_wire::fragment::Kind::Out(_)));
+                if out { outs += 1; }
+                let overlap = out && (shard != 20 || outs == 2);
+                let close = event.request.is_close();
+                let reply = forward_fixed(real, event.request).await;
                 if overlap {
                     overlaps += 1;
-                    // Responses from all four actual retained views are held
-                    // concurrently. A serial implementation cannot pass this
-                    // barrier; no injected delay is used as timing evidence.
-                    let leader = tokio::time::timeout(DEADLINE, barrier.wait())
-                        .await
-                        .unwrap()
-                        .is_leader();
+                    // Four complete responses from actual retained views are
+                    // withheld concurrently; serial execution cannot pass.
+                    let leader = tokio::time::timeout(DEADLINE, barrier.wait()).await.unwrap().is_leader();
                     if leader {
                         let result = request(
-                            address,
-                            scaling_binding(),
+                            address, scaling_binding(),
                             Operation::Submit(Write {
                                 external_id: [101; 16],
-                                mutation: Mutation::DeleteEdge {
-                                    edge: entity(23, 223),
-                                },
-                            }),
-                            DEADLINE,
-                        )
-                        .await
-                        .unwrap();
+                                mutation: Mutation::DeleteEdge { edge: entity(23, 223) },
+                            }), DEADLINE,
+                        ).await.unwrap();
                         assert!(committed(&result).1 > old_v);
                     }
-                    tokio::time::timeout(DEADLINE, barrier.wait())
-                        .await
-                        .unwrap();
+                    tokio::time::timeout(DEADLINE, barrier.wait()).await.unwrap();
                 }
-                wire_write(&mut client, &reply).await;
-                if operation["CloseFixedQuery"].is_object() {
+                assert!(event.reply.send(Ok(reply)).is_ok());
+                if close {
                     assert_eq!(overlaps, 1);
                     assert!(descriptor.is_some());
                     break;
                 }
             }
-        }));
+        })));
     }
     let tested = f.gateway_with_routes(4, routes).await;
     assert_eq!(

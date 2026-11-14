@@ -807,64 +807,33 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
         let real = routes[0].endpoint;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         routes[0].endpoint = listener.local_addr().unwrap();
-        let proxy = tokio::spawn(async move {
-            let (mut client, _) = listener.accept().await.unwrap();
-            let mut length = client.read_u32().await.unwrap();
-            assert!(length as usize <= crate::remote::MAX_FRAME_BYTES);
-            let mut body = vec![0; length as usize];
-            client.read_exact(&mut body).await.unwrap();
+        let proxy = tokio::spawn(run_fixed_script(listener, move |mut events| async move {
+            let event = events.recv().await.unwrap();
+            let FixedRpc::Open(mut open) = event.request else { panic!("expected OpenFixed") };
             if downgrade_profile {
-                let mut request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let open = &mut request["operation"]["OpenFixedQuery"];
-                assert_eq!(open["profile"], "LocalRead8MiBV1");
-                open["profile"] = serde_json::json!("Parity2MiBV1");
-                open["capture_limit"]["bytes"] = serde_json::json!(2 * 1024 * 1024);
-                body = serde_json::to_vec(&request).unwrap();
-                length = body.len() as u32;
+                let request = open.request.as_mut().unwrap();
+                assert_eq!(request.profile, fixed_wire::LocalReadProfile::LocalRead8MibV1 as i32);
+                request.profile = fixed_wire::LocalReadProfile::Parity2MibV1 as i32;
+                request.capture_limit.as_mut().unwrap().bytes = 2 * 1024 * 1024;
             }
-            let mut upstream = TcpStream::connect(real).await.unwrap();
-            upstream.write_u32(length).await.unwrap();
-            upstream.write_all(&body).await.unwrap();
-            let length = upstream.read_u32().await.unwrap();
-            assert!(length as usize <= crate::remote::MAX_FRAME_BYTES);
-            let mut body = vec![0; length as usize];
-            upstream.read_exact(&mut body).await.unwrap();
-            let mut reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let descriptor = reply["result"]["Ok"]["OpenFixedQuery"]["descriptor"].clone();
-            let proof = &mut reply["result"]["Ok"]["OpenFixedQuery"]["retained_proof"];
-            assert_eq!(proof["through"], 0);
-            // Independently valid exact V0 evidence, but from a different authority.
+            let FixedRpcReply::Open(mut opened) = forward_fixed(real, FixedRpc::Open(open)).await else { panic!() };
+            let descriptor = opened.descriptor.clone().unwrap();
+            let proof = opened.retained_proof.as_mut().unwrap();
+            assert_eq!(proof.through, 0);
             if !downgrade_profile {
-                proof["authority"] = serde_json::to_value([66u8; 16]).unwrap();
+                // Independently valid V0 evidence, but from another authority.
+                proof.authority = vec![66; 16];
             } else {
-                assert!(descriptor.get("profile").is_none());
+                assert_eq!(descriptor.profile, fixed_wire::LocalReadProfile::Parity2MibV1 as i32);
             }
-            let body = serde_json::to_vec(&reply).unwrap();
-            client.write_u32(body.len() as u32).await.unwrap();
-            client.write_all(&body).await.unwrap();
-            // A known identity-safe descriptor is closed even though its proof
-            // failed validation, instead of consuming the shared pool until TTL.
-            let (mut client, _) = listener.accept().await.unwrap();
-            let length = client.read_u32().await.unwrap();
-            let mut body = vec![0; length as usize];
-            client.read_exact(&mut body).await.unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert!(request["operation"]["CloseFixedQuery"].is_object());
-            assert_eq!(
-                request["operation"]["CloseFixedQuery"]["descriptor"],
-                descriptor
-            );
-            let mut upstream = TcpStream::connect(real).await.unwrap();
-            upstream.write_u32(length).await.unwrap();
-            upstream.write_all(&body).await.unwrap();
-            let length = upstream.read_u32().await.unwrap();
-            let mut body = vec![0; length as usize];
-            upstream.read_exact(&mut body).await.unwrap();
-            let closed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(closed["result"]["Ok"], "CloseFixedQuery");
-            client.write_u32(length).await.unwrap();
-            client.write_all(&body).await.unwrap();
-        });
+            assert!(event.reply.send(Ok(FixedRpcReply::Open(opened))).is_ok());
+            // Proof/profile rejection still closes the known safe descriptor.
+            let event = events.recv().await.unwrap();
+            let FixedRpc::Close(close) = &event.request else { panic!("expected CloseFixed") };
+            assert_eq!(close.descriptor.as_ref(), Some(&descriptor));
+            let reply = forward_fixed(real, event.request).await;
+            assert!(event.reply.send(Ok(reply)).is_ok());
+        }));
         let client = |node: &OwnedNode| match node {
             OwnedNode::Remote(c) => c.clone(),
             _ => panic!(),
@@ -919,17 +888,98 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
     f.stop().await;
 }
 
-async fn wire_read(socket: &mut TcpStream) -> Vec<u8> {
-    let length = socket.read_u32().await.unwrap() as usize;
-    assert!(length <= crate::remote::MAX_FRAME_BYTES);
-    let mut body = vec![0; length];
-    socket.read_exact(&mut body).await.unwrap();
-    body
+// Test-only typed scripts inspect real fixed RPCs and withhold actual upstream
+// responses at deterministic boundaries. No JSON, fake views, or engine changes.
+use crate::remote::distributed::grpc::wire as fixed_wire;
+#[derive(Clone)]
+enum FixedRpc {
+    Open(fixed_wire::FixedOpenEnvelope),
+    Fragment(fixed_wire::FixedFragmentEnvelope),
+    Close(fixed_wire::FixedCloseEnvelope),
 }
-async fn wire_write(socket: &mut TcpStream, body: &[u8]) {
-    socket.write_u32(body.len() as u32).await.unwrap();
-    socket.write_all(body).await.unwrap();
+impl FixedRpc {
+    fn fragment(&self) -> Option<&fixed_wire::FixedFragmentRequest> {
+        match self { Self::Fragment(v) => v.request.as_ref(), _ => None }
+    }
+    fn is_close(&self) -> bool { matches!(self, Self::Close(_)) }
 }
+enum FixedRpcReply {
+    Open(fixed_wire::FixedOpened),
+    Fragment(fixed_wire::FixedFragmentResponse),
+    Close(fixed_wire::Empty),
+}
+struct FixedEvent {
+    request: FixedRpc,
+    reply: tokio::sync::oneshot::Sender<Result<FixedRpcReply, tonic::Status>>,
+}
+#[derive(Clone)]
+struct FixedScript(tokio::sync::mpsc::Sender<FixedEvent>);
+impl FixedScript {
+    async fn dispatch(&self, request: FixedRpc) -> Result<FixedRpcReply, tonic::Status> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.0.send(FixedEvent { request, reply }).await
+            .map_err(|_| tonic::Status::unavailable("fault script finished"))?;
+        response.await.map_err(|_| tonic::Status::unavailable("fault script dropped response"))?
+    }
+}
+#[tonic::async_trait]
+impl fixed_wire::fixed_query_service_server::FixedQueryService for FixedScript {
+    async fn open_fixed(&self, request: tonic::Request<fixed_wire::FixedOpenEnvelope>) -> Result<tonic::Response<fixed_wire::FixedOpened>, tonic::Status> {
+        match self.dispatch(FixedRpc::Open(request.into_inner())).await? {
+            FixedRpcReply::Open(v) => Ok(tonic::Response::new(v)), _ => panic!("wrong scripted reply"),
+        }
+    }
+    async fn fragment_fixed(&self, request: tonic::Request<fixed_wire::FixedFragmentEnvelope>) -> Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status> {
+        match self.dispatch(FixedRpc::Fragment(request.into_inner())).await? {
+            FixedRpcReply::Fragment(v) => Ok(tonic::Response::new(v)), _ => panic!("wrong scripted reply"),
+        }
+    }
+    async fn close_fixed(&self, request: tonic::Request<fixed_wire::FixedCloseEnvelope>) -> Result<tonic::Response<fixed_wire::Empty>, tonic::Status> {
+        match self.dispatch(FixedRpc::Close(request.into_inner())).await? {
+            FixedRpcReply::Close(v) => Ok(tonic::Response::new(v)), _ => panic!("wrong scripted reply"),
+        }
+    }
+    async fn open_renewable(&self, _: tonic::Request<fixed_wire::RenewableOpenEnvelope>) -> Result<tonic::Response<fixed_wire::RenewableFixedOpened>, tonic::Status> {
+        panic!("fixed fixture must not open a renewable session")
+    }
+    async fn renew(&self, _: tonic::Request<fixed_wire::FixedRenewEnvelope>) -> Result<tonic::Response<fixed_wire::FixedLeaseGrant>, tonic::Status> {
+        panic!("fixed fixture must not renew or refresh its view")
+    }
+}
+async fn forward_fixed(real: SocketAddr, request: FixedRpc) -> FixedRpcReply {
+    let mut client = fixed_wire::fixed_query_service_client::FixedQueryServiceClient::connect(format!("http://{real}")).await.unwrap()
+        .max_decoding_message_size(crate::remote::MAX_FRAME_BYTES)
+        .max_encoding_message_size(crate::remote::MAX_FRAME_BYTES);
+    match request {
+        FixedRpc::Open(v) => FixedRpcReply::Open(client.open_fixed(v).await.unwrap().into_inner()),
+        FixedRpc::Fragment(v) => FixedRpcReply::Fragment(client.fragment_fixed(v).await.unwrap().into_inner()),
+        FixedRpc::Close(v) => FixedRpcReply::Close(client.close_fixed(v).await.unwrap().into_inner()),
+    }
+}
+async fn run_fixed_script<F, Fut, T>(listener: TcpListener, script: F) -> T
+where
+    F: FnOnce(tokio::sync::mpsc::Receiver<FixedEvent>) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (events, receiver) = tokio::sync::mpsc::channel(16);
+    let stopped = events.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        tonic::transport::Server::builder()
+            .timeout(Duration::from_secs(15))
+            .add_service(fixed_wire::fixed_query_service_server::FixedQueryServiceServer::new(FixedScript(events))
+                .max_decoding_message_size(crate::remote::MAX_FRAME_BYTES)
+                .max_encoding_message_size(crate::remote::MAX_FRAME_BYTES))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), stopped.closed())
+            .await.unwrap();
+    });
+    let result = script(receiver).await;
+    // Dropping the receiver starts graceful shutdown, flushing the last response.
+    // JoinSet owns the server if an assertion or caller cancellation interrupts us.
+    tasks.join_next().await.unwrap().unwrap();
+    result
+}
+
 fn remote_config(g: &Gateway) -> RemoteConfig {
     let client = |node: &OwnedNode| match node {
         OwnedNode::Remote(c) => c.clone(),
@@ -954,31 +1004,24 @@ async fn fixed_local_fault_timing_respects_last_required_access() {
         let graph = graphs.remove(0);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         routes[0].endpoint = listener.local_addr().unwrap();
-        let proxy = tokio::spawn(async move {
-            let (mut client, _) = listener.accept().await.unwrap();
-            let body = wire_read(&mut client).await;
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert!(request["operation"]["OpenFixedQuery"].is_object());
-            let mut upstream = TcpStream::connect(real).await.unwrap();
-            wire_write(&mut upstream, &body).await;
-            let reply = wire_read(&mut upstream).await;
-            wire_write(&mut client, &reply).await;
-            let (mut client, _) = listener.accept().await.unwrap();
-            let body = wire_read(&mut client).await;
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert!(request["operation"]["FixedQueryFragment"].is_object());
+        let proxy = tokio::spawn(run_fixed_script(listener, move |mut events| async move {
+            let event = events.recv().await.unwrap();
+            assert!(matches!(event.request, FixedRpc::Open(_)));
+            let reply = forward_fixed(real, event.request).await;
+            assert!(event.reply.send(Ok(reply)).is_ok());
+            let event = events.recv().await.unwrap();
+            assert!(matches!(event.request, FixedRpc::Fragment(_)));
             if !after_last_read {
                 graph.shutdown().await;
-                return; // Required Exists response is unknown: never Ready.
+                drop(event); // No required result was obtained: never Ready.
+                return;
             }
-            let mut upstream = TcpStream::connect(real).await.unwrap();
-            wire_write(&mut upstream, &body).await;
-            let reply = wire_read(&mut upstream).await;
-            // The required response is complete, but the gateway cannot have
-            // observed it or sealed Ready until we forward it after shutdown.
+            let reply = forward_fixed(real, event.request).await;
+            // Hold the complete actual result until the participant is gone.
+            // The gateway cannot have observed it or sealed before shutdown.
             graph.shutdown().await;
-            wire_write(&mut client, &reply).await;
-        });
+            assert!(event.reply.send(Ok(reply)).is_ok());
+        }));
         let tested = Gateway::bind_remote_local_queries(
             remote_config(&g),
             routes,
@@ -1025,42 +1068,32 @@ async fn fixed_local_concurrent_write_never_refreshes_descriptor_or_recaptures()
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     routes[0].endpoint = listener.local_addr().unwrap();
     let write_address = g.local_addr();
-    let proxy = tokio::spawn(async move {
+    let proxy = tokio::spawn(run_fixed_script(listener, move |mut events| async move {
         let mut descriptor = None;
         for index in 0..4 {
-            let (mut client, _) = listener.accept().await.unwrap();
-            let body = wire_read(&mut client).await;
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let event = events.recv().await.unwrap();
             if index == 0 {
-                assert!(request["operation"]["OpenFixedQuery"].is_object());
+                assert!(matches!(event.request, FixedRpc::Open(_)));
             } else if index < 3 {
-                let fragment = &request["operation"]["FixedQueryFragment"];
-                assert_eq!(fragment["request_sequence"], index - 1);
+                let fragment = event.request.fragment().expect("expected fragment");
+                assert_eq!(fragment.request_sequence, index - 1);
                 if let Some(original) = &descriptor {
-                    assert_eq!(&fragment["descriptor"], original);
+                    assert_eq!(fragment.descriptor.as_ref(), Some(original));
                 } else {
-                    descriptor = Some(fragment["descriptor"].clone());
+                    descriptor = fragment.descriptor.clone();
+                    assert!(descriptor.is_some());
                 }
             } else {
-                assert!(request["operation"]["CloseFixedQuery"].is_object());
+                assert!(event.request.is_close());
             }
-            let mut upstream = TcpStream::connect(real).await.unwrap();
-            wire_write(&mut upstream, &body).await;
-            let reply = wire_read(&mut upstream).await;
+            let reply = forward_fixed(real, event.request).await;
             if index == 1 {
-                // Commit after the first Exists at V1 but before the second.
-                super::request(
-                    write_address,
-                    bound(),
-                    Operation::Submit(create(2, 7, 2)),
-                    Duration::from_secs(15),
-                )
-                .await
-                .unwrap();
+                // Commit after first Exists at V1 but before the second.
+                super::request(write_address, bound(), Operation::Submit(create(2, 7, 2)), Duration::from_secs(15)).await.unwrap();
             }
-            wire_write(&mut client, &reply).await;
+            assert!(event.reply.send(Ok(reply)).is_ok());
         }
-    });
+        }));
     let tested = Gateway::bind_remote_local_queries(
         remote_config(&g),
         routes,
@@ -1154,55 +1187,42 @@ async fn fixed_local_replacement_keeps_captured_paths_and_matches_lazy_traverse(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     routes[0].endpoint = listener.local_addr().unwrap();
     let write_address = g.local_addr();
-    let proxy = tokio::spawn(async move {
+    let proxy = tokio::spawn(run_fixed_script(listener, move |mut events| async move {
         let mut descriptor = None;
         let (mut opens, mut sequence, mut new_v) = (0, 0u64, None);
         loop {
-            let (mut client, _) = listener.accept().await.unwrap();
-            let body = wire_read(&mut client).await;
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let operation = &request["operation"];
-            let fragment = operation["FixedQueryFragment"].is_object();
-            let close = operation["CloseFixedQuery"].is_object();
-            if operation["OpenFixedQuery"].is_object() {
+            let event = events.recv().await.unwrap();
+            let fragment = event.request.fragment();
+            let is_fragment = fragment.is_some();
+            let close = event.request.is_close();
+            if matches!(event.request, FixedRpc::Open(_)) {
                 opens += 1;
                 assert_eq!(opens, 1);
-            } else if fragment {
-                let fragment = &operation["FixedQueryFragment"];
-                assert_eq!(fragment["request_sequence"], sequence);
+            } else if let Some(fragment) = fragment {
+                assert_eq!(fragment.request_sequence, sequence);
                 sequence += 1;
                 if let Some(original) = &descriptor {
-                    assert_eq!(&fragment["descriptor"], original);
+                    assert_eq!(fragment.descriptor.as_ref(), Some(original));
                 } else {
-                    descriptor = Some(fragment["descriptor"].clone());
+                    descriptor = fragment.descriptor.clone();
+                    assert!(descriptor.is_some());
                 }
-            } else {
-                assert!(close);
+            } else { assert!(close); }
+            let reply = forward_fixed(real, event.request).await;
+            if is_fragment && new_v.is_none() {
+                // Both captures preceded this required read. Replace the actual
+                // edge while its old-view response is withheld.
+                let result = super::request(write_address, bound(), Operation::Submit(replacement.clone()), Duration::from_secs(15)).await.unwrap();
+                new_v = Some(committed(&result).1);
             }
-            let mut upstream = TcpStream::connect(real).await.unwrap();
-            wire_write(&mut upstream, &body).await;
-            let reply = wire_read(&mut upstream).await;
-            if fragment && new_v.is_none() {
-                // Both members were captured before the first required read.
-                // Change source owner, target and label while retaining the edge ID before traversal resumes.
-                let reply = super::request(
-                    write_address,
-                    bound(),
-                    Operation::Submit(replacement.clone()),
-                    Duration::from_secs(15),
-                )
-                .await
-                .unwrap();
-                new_v = Some(committed(&reply).1);
-            }
-            wire_write(&mut client, &reply).await;
+            assert!(event.reply.send(Ok(reply)).is_ok());
             if close {
                 assert_eq!(opens, 1);
                 assert!(sequence > 1);
                 return new_v.unwrap();
             }
         }
-    });
+        }));
     let tested = Gateway::bind_remote_local_queries(
         remote_config(&g),
         routes,
@@ -1456,64 +1476,44 @@ async fn fixed_local_parallel_validation_uses_real_views_and_never_hides_filtere
             route.endpoint = listener.local_addr().unwrap();
             let barrier = barrier.clone();
             let shard = route.identity.group;
-            proxies.push(tokio::spawn(async move {
+            proxies.push(tokio::spawn(run_fixed_script(listener, move |mut events| async move {
                 let mut sequence = 0;
                 let mut outgoing = 0;
                 let mut descriptor = None;
                 loop {
-                    let (mut client, _) = listener.accept().await.unwrap();
-                    let body = wire_read(&mut client).await;
-                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    let leaf = &request["operation"]["FixedQueryFragment"];
-                    let verify = leaf["fragment"]["VerifyReverse"].is_object();
-                    if leaf.is_object() {
-                        assert_eq!(leaf["request_sequence"], sequence);
+                    let event = events.recv().await.unwrap();
+                    let leaf = event.request.fragment();
+                    let kind = leaf.and_then(|v| v.fragment.as_ref()).and_then(|v| v.kind.as_ref());
+                    let verify = matches!(kind, Some(fixed_wire::fragment::Kind::VerifyReverse(_)));
+                    let out = matches!(kind, Some(fixed_wire::fragment::Kind::Out(_)));
+                    if let Some(leaf) = leaf {
+                        assert_eq!(leaf.request_sequence, sequence);
                         sequence += 1;
-                        assert_eq!(leaf["descriptor"]["version"], 4);
+                        assert_eq!(leaf.descriptor.as_ref().unwrap().version, 4);
                         if let Some(original) = &descriptor {
-                            assert_eq!(&leaf["descriptor"], original);
-                        } else {
-                            descriptor = Some(leaf["descriptor"].clone());
-                        }
+                            assert_eq!(leaf.descriptor.as_ref(), Some(original));
+                        } else { descriptor = leaf.descriptor.clone(); }
                     }
-                    let out = leaf["fragment"]["Out"].is_object();
-                    if out {
-                        outgoing += 1;
-                    }
-                    // The initial root exists only on shard 7. Its first Out
-                    // creates the cross-shard frontier. The second hop must
-                    // dispatch Out to both actual retained participant views.
+                    if out { outgoing += 1; }
+                    // Real retained lanes must reach this barrier together.
                     let parallel_out = !corrupt && out && (shard == 8 || outgoing > 1);
                     if verify || parallel_out {
-                        // Both actual participant lanes must be in flight. The
-                        // barrier is synchronization, not a performance claim.
-                        tokio::time::timeout(Duration::from_secs(4), barrier.wait())
-                            .await
-                            .unwrap();
+                        tokio::time::timeout(Duration::from_secs(4), barrier.wait()).await.unwrap();
                     }
-                    let mut upstream = TcpStream::connect(real).await.unwrap();
-                    wire_write(&mut upstream, &body).await;
-                    let mut reply = wire_read(&mut upstream).await;
+                    let close = event.request.is_close();
+                    let mut reply = forward_fixed(real, event.request).await;
                     if corrupt && verify && shard == 8 {
-                        let mut value: serde_json::Value = serde_json::from_slice(&reply).unwrap();
-                        value["result"]["Ok"]["FixedQueryFragment"]["Ok"]["value"]["Bool"] =
-                            false.into();
-                        reply = serde_json::to_vec(&value).unwrap();
+                        let FixedRpcReply::Fragment(response) = &mut reply else { panic!() };
+                        let Some(fixed_wire::fixed_fragment_response::Result::Output(output)) = response.result.as_mut() else { panic!("expected real successful verification") };
+                        assert!(matches!(output.value.as_ref().and_then(|v| v.kind.as_ref()), Some(fixed_wire::fragment_value::Kind::Boolean(_))));
+                        output.value.as_mut().unwrap().kind = Some(fixed_wire::fragment_value::Kind::Boolean(false));
                     }
-                    if corrupt && verify && shard == 7 {
-                        // The failing peer may cancel this healthy lane before
-                        // its response finishes. That is expected cancellation.
-                        if client.write_u32(reply.len() as u32).await.is_ok() {
-                            let _ = client.write_all(&reply).await;
-                        }
-                    } else {
-                        wire_write(&mut client, &reply).await;
-                    }
-                    if request["operation"]["CloseFixedQuery"].is_object() {
-                        break;
-                    }
+                    let sent = event.reply.send(Ok(reply));
+                    // Corrupt peer may cancel the healthy lane's response.
+                    if !(corrupt && verify && shard == 7) { assert!(sent.is_ok()); }
+                    if close { break; }
                 }
-            }));
+            })));
         }
         let tested = Gateway::bind_remote_local_queries(
             remote_config(&g),

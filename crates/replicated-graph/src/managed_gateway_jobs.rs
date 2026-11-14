@@ -757,6 +757,62 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::distributed::grpc::wire as fixed_wire;
+
+    #[derive(Clone)]
+    struct SlowRenewalPeer {
+        shard: u64,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[tonic::async_trait]
+    impl fixed_wire::fixed_query_service_server::FixedQueryService for SlowRenewalPeer {
+        async fn renew(
+            &self,
+            request: tonic::Request<fixed_wire::FixedRenewEnvelope>,
+        ) -> std::result::Result<tonic::Response<fixed_wire::FixedLeaseGrant>, tonic::Status> {
+            let message = request.into_inner();
+            let context = message.context.expect("typed context");
+            assert_eq!(context.version, 1);
+            assert_eq!(context.identity.expect("peer identity").group, self.shard);
+            let renew = message.request.expect("typed renewal request");
+            assert_eq!(
+                renew.descriptor.as_ref().unwrap().stamp.as_ref().unwrap().shard,
+                self.shard
+            );
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Each reply fits five seconds, but the serial round takes 5.2s.
+            tokio::time::sleep(Duration::from_millis(2600)).await;
+            Ok(tonic::Response::new(fixed_wire::FixedLeaseGrant {
+                descriptor: renew.descriptor,
+                generation: renew.generation,
+                granted_millis: renew.lease_millis,
+            }))
+        }
+        async fn open_fixed(
+            &self,
+            _: tonic::Request<fixed_wire::FixedOpenEnvelope>,
+        ) -> std::result::Result<tonic::Response<fixed_wire::FixedOpened>, tonic::Status> {
+            Err(tonic::Status::unimplemented("renewal-only test peer"))
+        }
+        async fn open_renewable(
+            &self,
+            _: tonic::Request<fixed_wire::RenewableOpenEnvelope>,
+        ) -> std::result::Result<tonic::Response<fixed_wire::RenewableFixedOpened>, tonic::Status> {
+            Err(tonic::Status::unimplemented("renewal-only test peer"))
+        }
+        async fn fragment_fixed(
+            &self,
+            _: tonic::Request<fixed_wire::FixedFragmentEnvelope>,
+        ) -> std::result::Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("renewal-only test peer"))
+        }
+        async fn close_fixed(
+            &self,
+            _: tonic::Request<fixed_wire::FixedCloseEnvelope>,
+        ) -> std::result::Result<tonic::Response<fixed_wire::Empty>, tonic::Status> {
+            Err(tonic::Status::unimplemented("renewal-only test peer"))
+        }
+    }
     fn fixture(pool: Arc<Semaphore>, now: Instant) -> Arc<Job> {
         let (stop, _) = watch::channel(false);
         Arc::new(Job {
@@ -1035,21 +1091,25 @@ mod tests {
         for shard in [7, 8] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = listener.local_addr().unwrap();
-            let observed = calls.clone();
-            responders.push(tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let request: serde_json::Value = read_frame(&mut socket, MAX_REQUEST_BYTES).await.unwrap();
-                let renew = &request["operation"]["RenewFixedQuery"];
-                let reply = serde_json::json!({"version":1,"result":{"Ok":{"RenewFixedQuery":{
-                    "descriptor": renew["descriptor"], "generation": renew["generation"], "granted_millis": renew["lease_millis"]
-                }}}});
-                observed.fetch_add(1, Ordering::SeqCst);
-                // Each response is individually inside five seconds. Their
-                // serial total exceeds the entire control operation's budget.
-                tokio::time::sleep(Duration::from_millis(2600)).await;
-                let bytes = serde_json::to_vec(&reply).unwrap();
-                let _ = write_bytes(&mut socket, &bytes).await;
-            }));
+            let stop = tokio_util::sync::CancellationToken::new();
+            let stopped = stop.clone();
+            let peer = SlowRenewalPeer {
+                shard,
+                calls: calls.clone(),
+            };
+            let responder = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(
+                        fixed_wire::fixed_query_service_server::FixedQueryServiceServer::new(peer),
+                    )
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        stopped.cancelled_owned(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            responders.push((stop, responder));
             let identity = RemoteIdentity {
                 group: shard,
                 node: 1,
@@ -1145,7 +1205,8 @@ mod tests {
         .is_err());
         assert!(start.elapsed() < Duration::from_secs(7));
         service.shutdown().await;
-        for responder in responders {
+        for (stop, responder) in responders {
+            stop.cancel();
             responder.await.unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);

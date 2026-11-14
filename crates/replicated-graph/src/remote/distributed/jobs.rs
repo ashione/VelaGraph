@@ -574,7 +574,9 @@ impl Job {
         if self.grpc_clients.is_none() {
             let mut clients = BTreeMap::new();
             for route in &self.catalog.partitions {
-                if let std::collections::btree_map::Entry::Vacant(entry) = clients.entry(route.shard) {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    clients.entry(route.shard)
+                {
                     entry.insert(observed_client(None, route, end)?);
                 }
             }
