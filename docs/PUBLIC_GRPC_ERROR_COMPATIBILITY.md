@@ -114,7 +114,7 @@ new proprietary wrapper. The public generated ErrorDetail remains the payload.
 
 The contract above is normative: exact Any type URL, one detail, matching
 transport/envelope code, matching message/reason, and request-correlated v2
-identity. Parsing occurs under the existing total size and recursive budgets,
+identity when applicable (v1 omits it). Parsing occurs under the existing total size and recursive budgets,
 including the outer envelope, rather than allocating an unbounded wrapper
 first. Malformed or contradictory errors fail closed; absence of a domain
 detail does not prove that a write failed to commit. There is no automatic
