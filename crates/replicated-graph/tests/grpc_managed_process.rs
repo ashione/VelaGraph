@@ -1,5 +1,5 @@
 //! Managed coordinator/member typed gRPC acceptance in independent OS processes.
-//! Both historical capacity profiles are compared with the legacy transport.
+//! Both capacity profiles compare default and explicit typed constructors.
 //! The public gateway test driver remains TCP; all managed control/read/write
 //! hops in the gRPC cohort use explicit gRPC clients, never a TCP fallback.
 #![allow(dead_code)]
@@ -117,16 +117,16 @@ fn vertex_write(external: u8, partition: u32, id: u64) -> Write {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_grpc_matches_tcp_and_retains_identity_after_restart() -> anyhow::Result<()> {
+async fn managed_grpc_constructors_match_and_retain_identity_after_restart() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(180), async {
         for profile in [
             CapacityProfile::LegacyCountV1,
             CapacityProfile::ByteBound16MiBV1,
         ] {
-            let tcp = scenario(profile, false).await?;
+            let default = scenario(profile, false).await?;
             let grpc = scenario(profile, true).await?;
             assert_eq!(
-                grpc, tcp,
+                grpc, default,
                 "complete typed values/results differ for {profile:?}"
             );
         }
@@ -153,18 +153,35 @@ async fn scenario(profile: CapacityProfile, grpc: bool) -> anyhow::Result<Vec<Ve
         members: vec![a_client.clone(), b_client.clone()],
     };
     let g = Gateway::bind_remote(config(), "127.0.0.1:0".parse()?, BUDGET).await?;
-    let wrong_constructor = if grpc { Client::new } else { Client::new_grpc };
-    let wrong_transport = wrong_constructor(
-        c.address,
-        c_client.identity().clone(),
-        Duration::from_millis(200),
-    )?;
-    assert!(
-        NodeRef::Remote(&wrong_transport)
-            .summary(&authority(), 1)
-            .await
-            .is_err(),
-        "transport must not fallback/negotiate"
+    // Both constructors are typed-only now. Probe the removed JSON wire itself,
+    // not the default constructor, and require the server to close the stream.
+    let before = NodeRef::Remote(&c_client).summary(&authority(), 1).await?;
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "version": 6, "identity": c_client.identity(), "nonce": 1,
+        "operation": { "Summary": { "authority": authority(), "epoch": 1 } }
+    }))?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut legacy = tokio::net::TcpStream::connect(c.address).await?;
+    legacy.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    legacy.write_all(&payload).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut received = 0;
+        let mut buffer = [0; 4096];
+        loop {
+            match legacy.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(bytes) => {
+                    received += bytes;
+                    assert!(received <= 64 * 1024, "legacy peer was not rejected");
+                }
+            }
+        }
+    })
+    .await
+    .context("legacy JSON peer must close, even after HTTP/2 SETTINGS")?;
+    assert_eq!(
+        NodeRef::Remote(&c_client).summary(&authority(), 1).await?,
+        before
     );
     let mut wrong_identity = c_client.identity().clone();
     wrong_identity.node += 1;
