@@ -11,6 +11,7 @@ use replicated_graph::remote::{
     RemoteError, RemoteIdentity,
 };
 use std::{
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -33,10 +34,55 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+// Failure-only evidence is emitted before Process kills the child. Each file
+// is read through an independent handle and capped, without dumping graph data.
+struct ObservedProcess {
+    process: Process,
+    log: tempfile::NamedTempFile,
+    node: usize,
+    success: bool,
+}
+fn log_tail(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    const LIMIT: u64 = 16 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+impl Drop for ObservedProcess {
+    fn drop(&mut self) {
+        if !self.success {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "shard_fixture node={} pid={} pre_cleanup_exit={:?}",
+                self.node,
+                self.process.0.id(),
+                self.process.0.try_wait()
+            );
+            match log_tail(self.log.path()) {
+                Ok(bytes) => {
+                    let _ = writeln!(
+                        stderr,
+                        "shard_fixture node={} log_tail_bytes={}\n{}",
+                        self.node,
+                        bytes.len(),
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(stderr, "shard_fixture node={} log_error={error}", self.node);
+                }
+            }
+        }
+    }
+}
 struct Cluster {
     addresses: Vec<SocketAddr>,
     leader: usize,
-    _processes: Vec<Process>,
+    _processes: Vec<ObservedProcess>,
     _dirs: Vec<tempfile::TempDir>,
 }
 impl Cluster {
@@ -82,12 +128,19 @@ impl Cluster {
             if i == 0 {
                 command.args(["--bootstrap", &bootstrap]);
             }
-            processes.push(Process(
-                command
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit())
-                    .spawn()?,
-            ));
+            let log = tempfile::NamedTempFile::new()?;
+            let output = log.reopen()?;
+            let child = command
+                .stdout(Stdio::from(output.try_clone()?))
+                .stderr(Stdio::from(output))
+                .spawn()
+                .with_context(|| format!("spawn shard node {}", i + 1))?;
+            processes.push(ObservedProcess {
+                process: Process(child),
+                log,
+                node: i + 1,
+                success: false,
+            });
         }
         let leader = timeout(Duration::from_secs(35), async {
             loop {
@@ -157,19 +210,21 @@ async fn typed_shard_operations_preserve_real_process_semantics() -> anyhow::Res
     timeout(Duration::from_secs(90), scenario()).await?
 }
 async fn scenario() -> anyhow::Result<()> {
-    let cluster = Cluster::start().await?;
+    let mut cluster = Cluster::start().await.context("start shard cluster")?;
     let endpoint = cluster.grpc(cluster.leader);
     let identity = cluster.identity(cluster.leader);
-    let mut client = Client::connect(endpoint, identity, BUDGET).await?;
-    client.probe(SHARD).await?;
-    let initial = client.metadata(SHARD).await?;
+    let mut client = Client::connect(endpoint, identity, BUDGET)
+        .await
+        .context("connect leader")?;
+    client.probe(SHARD).await.context("leader probe")?;
+    let initial = client.metadata(SHARD).await.context("leader metadata")?;
     assert_eq!(initial, (SHARD, 3, 0));
     let request = write(1, Some(initial.2));
     assert!(
-        matches!(client.write(request.clone()).await?, D1Result::Write { status: D1WriteStatus::Committed, sequence, applied_operations: 1 } if sequence == initial.2+1)
+        matches!(client.write(request.clone()).await.context("initial write")?, D1Result::Write { status: D1WriteStatus::Committed, sequence, applied_operations: 1 } if sequence == initial.2+1)
     );
     assert!(
-        matches!(client.write(request.clone()).await?, D1Result::Write { status: D1WriteStatus::Duplicate, sequence, applied_operations: 1 } if sequence == initial.2+1)
+        matches!(client.write(request.clone()).await.context("duplicate write")?, D1Result::Write { status: D1WriteStatus::Duplicate, sequence, applied_operations: 1 } if sequence == initial.2+1)
     );
     let mut conflict = request.clone();
     conflict.operations = vec![WriteOp::Delete {
@@ -181,21 +236,32 @@ async fn scenario() -> anyhow::Result<()> {
     ));
     assert!(matches!(client.write(write(2, Some(initial.2))).await,
         Err(RemoteError::Application(D1Error::Conflict { expected, current })) if expected == initial.2 && current == initial.2+1));
-    let committed = client.metadata(SHARD).await?;
+    let committed = client.metadata(SHARD).await.context("leader metadata")?;
     assert_eq!(
         committed.2,
         initial.2 + 1,
         "duplicate/rejected writes must not advance graph sequence"
     );
-    let snapshots = SnapshotClient::connect(endpoint, identity, BUDGET).await?;
-    let descriptor = snapshots.open(SHARD, BUDGET).await?;
-    let page = snapshots.page(descriptor.clone(), None, BUDGET).await?;
+    let snapshots = SnapshotClient::connect(endpoint, identity, BUDGET)
+        .await
+        .context("connect leader")?;
+    let descriptor = snapshots
+        .open(SHARD, BUDGET)
+        .await
+        .context("snapshot open")?;
+    let page = snapshots
+        .page(descriptor.clone(), None, BUDGET)
+        .await
+        .context("snapshot page")?;
     assert!(
         page.entries
             .contains(&(vec![b'k', 1, 0, 255], vec![0, 255, 1])),
         "typed write must preserve opaque binary bytes"
     );
-    snapshots.close(descriptor, BUDGET).await?;
+    snapshots
+        .close(descriptor, BUDGET)
+        .await
+        .context("snapshot close")?;
 
     for wrong in [
         RemoteIdentity {
@@ -274,9 +340,16 @@ async fn scenario() -> anyhow::Result<()> {
         client.write(expanded).await,
         Err(RemoteError::ResourceExhausted)
     ));
-    assert_eq!(client.metadata(SHARD).await?, committed);
-    malformed(endpoint, identity).await?;
-    late_body_cannot_commit(endpoint, identity).await?;
+    assert_eq!(
+        client.metadata(SHARD).await.context("leader metadata")?,
+        committed
+    );
+    malformed(endpoint, identity)
+        .await
+        .context("malformed requests")?;
+    late_body_cannot_commit(endpoint, identity)
+        .await
+        .context("late body")?;
     // Wrong protocol never falls back. The retired legacy port must not listen.
     assert!(TcpStream::connect(cluster.tcp(cluster.leader))
         .await
@@ -295,11 +368,23 @@ async fn scenario() -> anyhow::Result<()> {
             .await
             .is_err()
     );
-    assert_eq!(client.metadata(SHARD).await?, committed);
+    assert_eq!(
+        client.metadata(SHARD).await.context("leader metadata")?,
+        committed
+    );
     cli_checks(endpoint, cluster.tcp(cluster.leader), identity, committed.2).await?;
-    unknown_outcome(endpoint, identity).await?;
-    cached_adapter_unknown_outcome(endpoint, identity).await?;
-    server_query_cli(endpoint, identity).await?;
+    unknown_outcome(endpoint, identity)
+        .await
+        .context("unknown outcome")?;
+    cached_adapter_unknown_outcome(endpoint, identity)
+        .await
+        .context("cached adapter outcome")?;
+    server_query_cli(endpoint, identity)
+        .await
+        .context("server query CLI")?;
+    for process in &mut cluster._processes {
+        process.success = true;
+    }
     Ok(())
 }
 
@@ -462,7 +547,9 @@ async fn unknown_outcome(endpoint: SocketAddr, identity: RemoteIdentity) -> anyh
     let proxy = Proxy::start(endpoint).await?;
     let mut slow = Client::connect(proxy.address, identity, Duration::from_millis(500)).await?;
     slow.probe(SHARD).await?;
-    let mut direct = Client::connect(endpoint, identity, BUDGET).await?;
+    let mut direct = Client::connect(endpoint, identity, BUDGET)
+        .await
+        .context("connect leader")?;
     let before = direct.metadata(SHARD).await?.2;
     let request = write(10, Some(before));
     proxy.paused.send(true)?;
@@ -501,7 +588,9 @@ async fn cached_adapter_unknown_outcome(
         SHARD,
         Duration::from_millis(500),
     )?;
-    let mut direct = Client::connect(endpoint, identity, BUDGET).await?;
+    let mut direct = Client::connect(endpoint, identity, BUDGET)
+        .await
+        .context("connect leader")?;
     let epoch = direct.metadata(SHARD).await?.1;
     let request = |id| WriteRequest {
         shard: SHARD,
@@ -550,7 +639,9 @@ async fn late_body_cannot_commit(
     use d2_raft::managed_rpc::grpc::wire as managed;
     use prost::Message;
     use tonic::codegen::http;
-    let mut direct = Client::connect(endpoint, identity, BUDGET).await?;
+    let mut direct = Client::connect(endpoint, identity, BUDGET)
+        .await
+        .context("connect leader")?;
     let before = direct.metadata(SHARD).await?;
     let key = b"late-header-deadline".to_vec();
     let message = w::Request {
@@ -651,9 +742,17 @@ async fn late_body_cannot_commit(
         before,
         "late body must not advance the graph sequence"
     );
-    let snapshots = SnapshotClient::connect(endpoint, identity, BUDGET).await?;
-    let descriptor = snapshots.open(SHARD, BUDGET).await?;
-    let page = snapshots.page(descriptor.clone(), None, BUDGET).await?;
+    let snapshots = SnapshotClient::connect(endpoint, identity, BUDGET)
+        .await
+        .context("connect leader")?;
+    let descriptor = snapshots
+        .open(SHARD, BUDGET)
+        .await
+        .context("snapshot open")?;
+    let page = snapshots
+        .page(descriptor.clone(), None, BUDGET)
+        .await
+        .context("snapshot page")?;
     assert!(
         page.next.is_none(),
         "small fixture must fit one page for exhaustive absence check"
@@ -662,7 +761,10 @@ async fn late_body_cannot_commit(
         page.entries.iter().all(|(actual, _)| actual != &key),
         "expired request wrote its value"
     );
-    snapshots.close(descriptor, BUDGET).await?;
+    snapshots
+        .close(descriptor, BUDGET)
+        .await
+        .context("snapshot close")?;
     Ok(())
 }
 
@@ -753,5 +855,18 @@ async fn server_query_cli(endpoint: SocketAddr, identity: RemoteIdentity) -> any
             serde_json::json!({"Value":{"source":source,"value":{"Text":"rpc-query"}}})
         );
     }
+    Ok(())
+}
+
+#[test]
+fn diagnostic_tail_is_bounded_and_does_not_move_writer_offset() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let mut writer = file.reopen()?;
+    writer.write_all(&vec![b'a'; 20 * 1024])?;
+    assert_eq!(log_tail(file.path())?, vec![b'a'; 16 * 1024]);
+    writer.write_all(b"end")?;
+    let tail = log_tail(file.path())?;
+    assert_eq!(tail.len(), 16 * 1024);
+    assert!(tail.ends_with(b"end"));
     Ok(())
 }
