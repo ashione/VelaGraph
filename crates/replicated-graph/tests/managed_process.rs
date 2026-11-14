@@ -2126,7 +2126,7 @@ async fn verify_retained_lifecycle(
     Ok(())
 }
 
-/// Forward the actual gateway request verbatim, receive its entire bounded
+/// Forward the typed gateway request without changing its semantics, receive its bounded
 /// response, then close without forwarding a byte of the ACK. The caller must
 /// observe Unknown; this is transport ACK loss, not a fabricated status.
 async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
@@ -2228,18 +2228,13 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
             // Keep driving HTTP/2 while reading the request and waiting for the
             // real upstream response. No downstream response headers, data, or
             // fabricated gRPC status are ever sent.
-            loop {
-                tokio::select! {
-                    result = &mut forwarding => {
-                        result?;
-                        break;
-                    }
-                    extra = connection.accept() => {
-                        match extra {
-                            Some(Ok(_)) => anyhow::bail!("unexpected second ACK-loss RPC"),
-                            Some(Err(error)) => return Err(error.into()),
-                            None => anyhow::bail!("caller disconnected before ACK-loss evidence"),
-                        }
+            tokio::select! {
+                result = &mut forwarding => result?,
+                extra = connection.accept() => {
+                    match extra {
+                        Some(Ok(_)) => anyhow::bail!("unexpected second ACK-loss RPC"),
+                        Some(Err(error)) => return Err(error.into()),
+                        None => anyhow::bail!("caller disconnected before ACK-loss evidence"),
                     }
                 }
             }
