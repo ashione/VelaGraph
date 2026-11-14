@@ -1913,8 +1913,8 @@ async fn member_waves_bound_work_and_stop_after_error() {
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn member_parallelism_is_checked_without_contacting_endpoints() {
+#[tokio::test]
+async fn member_parallelism_is_checked_without_contacting_endpoints() {
     let client = managed_rpc::Client::new(
         "127.0.0.1:1".parse().unwrap(),
         history_identity(9),

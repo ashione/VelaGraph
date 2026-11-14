@@ -473,8 +473,8 @@ async fn fixed_local_unsupported_and_shared_gateway_reservations() {
     f.stop().await;
 }
 
-#[test]
-fn fixed_graph_routes_bind_complete_managed_identity() {
+#[tokio::test]
+async fn fixed_graph_routes_bind_complete_managed_identity() {
     let client = |shard| {
         Client::new(
             "127.0.0.1:12345".parse().unwrap(),
@@ -557,8 +557,8 @@ fn fixed_graph_routes_bind_complete_managed_identity() {
     }
 }
 
-#[test]
-fn fixed_graph_protocol_member_limit_is_checked_before_admission() {
+#[tokio::test]
+async fn fixed_graph_protocol_member_limit_is_checked_before_admission() {
     let mut binding = bound();
     binding.cohort.members = (10..74)
         .map(|shard| d2_raft::transaction_decisions::Member {
@@ -1640,8 +1640,8 @@ async fn fixed_local_parallel_query_measurement() {
 #[path = "managed_gateway_scaling_tests.rs"]
 mod scaling;
 
-#[test]
-fn fixed_graph_membership_accepts_protocol_bound_and_checks_late_routes() {
+#[tokio::test]
+async fn fixed_graph_membership_accepts_protocol_bound_and_checks_late_routes() {
     use d2_raft::transaction_decisions::Member;
     for count in [9, 64] {
         let mut cohort = binding();
