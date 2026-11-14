@@ -72,3 +72,18 @@ separate-process typed operations and CLI checks, incompatible-endpoint rejectio
 admission/deadline/shutdown tests, independent review, and exact-head CI/CoreHR.
 The PR records actual passed, failed and not-run stages; protocol selection alone
 is not evidence of correctness or throughput improvement.
+
+### Failure evidence
+
+The real-process shard-operations fixture adds RPC/phase context without replacing
+underlying errors. On failure, panic, startup failure or cancellation it reports
+each started child's PID and exit state before cleanup, plus at most the last
+16 KiB of its combined stdout/stderr. This synthetic fixture does not log request
+payloads or tokens. Successful runs suppress these tails. The normal CI test log
+artifact retains the output under its existing retention policy.
+
+A generic `Unavailable` string does not prove that a write occurred, nor identify
+a read-quorum, transport or process failure. The main failure in run 43519111727
+is recorded in #247 as related evidence, not a proven recurrence of its original
+snapshot-barrier cause. These diagnostics do not replay requests, extend budgets,
+relax assertions or establish a root-cause fix.
