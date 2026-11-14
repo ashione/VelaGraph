@@ -1,6 +1,13 @@
 # Typed fixed-version query sessions over gRPC
 
-This extends the optional internal gRPC endpoint with a distinct
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
+The mandatory typed graph endpoint includes a distinct
 `FixedQueryService`. It transports the existing fixed-version and renewable
 query session operations; it does **not** replace managed transaction control,
 Raft, the public gateway wire protocol, or the observed-query coordinator.
@@ -13,7 +20,7 @@ parallelism, member_parallelism)` to select gRPC graph endpoints. Each
 `RemoteConfig` continues to contain the separate managed-control Clients.
 Identity matching is checked before binding. No port is inferred from another
 port, selected by a query, probed, retried at application level, or silently
-redirected to TCP. Existing constructors explicitly retain their TCP transport.
+redirected to a legacy wire. Existing constructors now use the same typed transport.
 
 The server uses `GrpcSnapshotService::start` with a `GraphService::start_managed`
 source. The source and gRPC service share the real query session registry and
@@ -70,16 +77,15 @@ their original contracts; this transport does not add a new read-consistency mod
 ## Limits and migration sequence
 
 This remains an unauthenticated plaintext trusted-development-network service.
-The external gateway still uses its original protocol. Managed writes, control
-RPC, restore, Raft, public HTTP/gRPC service APIs and observed hierarchy job
-orchestration are separate migrations. No storage format changes are introduced.
+The external Gateway now uses typed public RPC. Managed writes, control RPC,
+Raft and observed hierarchy job orchestration also use typed services. Restore
+and production-readiness work remain separate. No storage format changes are introduced.
 
-Once the remaining callers use the explicit typed services and the equivalent
-semantic/resource tests pass, remove their replaced legacy dispatch. Do not keep
-two independent query engines. This slice deliberately uses the same execution,
-proof validation, lease state and admission implementations.
+The remaining callers and legacy dispatch were migrated in #279, using the same
+execution, proof validation, lease state and admission implementations rather
+than two independent query engines.
 
-Validation uses real managed node processes with separate TCP/gRPC gateways,
+Validation uses real managed node processes and typed gateways,
 fixed-V query/result comparisons and the existing renewal and failure contracts.
 Focused passing tests are not claims of production readiness, multi-host
 performance, authentication or a completed full protocol migration.

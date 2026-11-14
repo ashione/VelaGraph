@@ -1,5 +1,12 @@
 # Trusted remote managed-node transport
 
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
 Status: experimental, fixed-placement internal storage/transaction RPC. The
 managed gateway can use a coordinator and participants in separate OS processes
 through `Gateway::bind_remote(RemoteConfig, ...)`. Its existing local `Config`
@@ -7,8 +14,9 @@ constructor remains supported. This is not production deployment, multi-machine
 validation, authenticated transport, replica failover, or D4/D5 completion.
 
 Current peers require internal managed RPC **v6**
-([S4 retained control](RETAINED_GATEWAY_CONTROL.md)); external gateway framing
-remains v1. The historical A1/A2.1/v4 sections at the end record earlier protocol
+([S4 retained control](RETAINED_GATEWAY_CONTROL.md)); this is the domain protocol
+version, not an old JSON framing mode. The Gateway library uses identified
+version-2 public gRPC contexts; generated public v1 clients remain separately supported. The historical A1/A2.1/v4 sections at the end record earlier protocol
 slices, not the version or ordinary control path to deploy now.
 
 ## Boundaries
@@ -80,10 +88,11 @@ Nonparticipants must consume terminal ordinals too before a new common V exists.
 
 ## Resource and time limits
 
-The transport uses one length-prefixed strict JSON request/reply per connection,
-with an explicit protocol version and operation/correlation identity. Unknown
-fields, malformed frames, duplicate snapshot keys, identity mismatches and
-unexpected reply variants fail closed. Length checks precede receive allocation;
+The transport uses typed gRPC/Protobuf with a shared bounded channel,
+explicit domain protocol version and operation/correlation identity. Well-formed
+unknown protobuf fields are skipped under the bounded scanner; this is not the
+former strict-JSON unknown-field rule. Malformed wire data, duplicate snapshot
+keys, identity mismatches and unexpected reply variants fail closed. Length checks precede receive allocation;
 serialization stops at the encoded frame limit rather than allocating an
 unbounded result first. Journal objects are embedded once, not nested JSON byte
 arrays or escaped strings, so existing 16 MiB journal capacity remains consumable.

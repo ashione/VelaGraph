@@ -58,8 +58,8 @@ the first graph operation, without fallback. This completes
 The managed member library now also uses gRPC exclusively: its former JSON
 framing/client/listener is removed. `Client::new_grpc` names the same typed
 constructor and is not a compatibility transport or fallback. Both constructors
-require a running Tokio runtime; clones share a channel. Other graph/gateway
-legacy APIs remain subject to their separate removal gates.
+require a running Tokio runtime; clones share a channel. Graph, coordinator and Gateway library network paths were subsequently retired
+in #274, #276 and #278; their supported APIs now select typed RPC.
 
 The public HTTP adapter remains supported by design. In-process Rust calls,
 RocksDB filesystem I/O, and S3-compatible object-store HTTP are not custom
@@ -70,19 +70,19 @@ inter-node graph transports and are not replaced by this service migration.
 | Path | State after this slice |
 | --- | --- |
 | Public managed HTTP and typed gRPC | Shared domain handlers; loopback preview |
-| Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC available; old TCP retained for migration parity |
+| Snapshot, observed fragments, fixed/renewable graph sessions | Typed gRPC only, including library constructors and clients (#278) |
 | Managed coordinator/member control and writes | Typed gRPC only, including library Client/Server; old JSON/TCP wire removed |
 | Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control is typed gRPC (#251) |
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), default CLI transport (#260); library query/job/consistency ingress migrated to typed RPC (#274) |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
-| Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Graph library callers/fixtures migrate under [#278](GRAPH_LIBRARY_GRPC.md) |
+| Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Graph library callers/fixtures migrated under [#278](GRAPH_LIBRARY_GRPC.md) |
 | Legacy library graph | [GraphService retirement](GRAPH_LIBRARY_GRPC.md) removes its old wire; Gateway library uses identified typed gRPC (#276), observed coordinator uses typed RPC (#274); graph-service has no hidden legacy listener |
 | Unix read gateway | Removed under #262; [migration and retained semantic coverage](GRAPH_UDS_GATEWAY.md). No replacement Unix listener |
 
-The exit gate is to make supported service paths RPC-only, remove superseded
-framing/client/server paths after independent differential review, and test that
-no hidden fallback remains. #218 stays open until that gate and all other
-communication paths pass. No global recovery or multi-host HA claim follows from
+The supported network-path retirement gate passed in #279. The broader #218
+still requires honest cross-language, HTTP surface, compatibility and resource
+evidence. See [current audit](RPC_MIGRATION_STATUS.md); a green Rust suite does
+not establish Go interoperability or complete service readiness. No global recovery or multi-host HA claim follows from
 same-host independent-process transport tests.
 
 ## Reproduction
