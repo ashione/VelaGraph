@@ -431,15 +431,32 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
     )?;
     // Both shipped constructors now speak typed RPC. Use isolated old-wire
     // peers instead: neither peer can forward a request or mutate a real node.
+    // Each route needs its own address: duplicate endpoints are correctly
+    // rejected by topology validation before any network operation.
     let (old_control_addr, control_attempts, control_peer) = legacy_rejection_peer().await?;
-    let (old_graph_addr, graph_attempts, graph_peer) = legacy_rejection_peer().await?;
+    let (old_control_a, control_a_attempts, control_a_peer) = legacy_rejection_peer().await?;
+    let (old_control_b, control_b_attempts, control_b_peer) = legacy_rejection_peer().await?;
+    let (old_graph_a, graph_a_attempts, graph_a_peer) = legacy_rejection_peer().await?;
+    let (old_graph_b, graph_b_attempts, graph_b_peer) = legacy_rejection_peer().await?;
+    let control_count = || {
+        [&control_attempts, &control_a_attempts, &control_b_attempts]
+            .into_iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .sum::<usize>()
+    };
+    let graph_count = || {
+        [&graph_a_attempts, &graph_b_attempts]
+            .into_iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .sum::<usize>()
+    };
     let directory = tempfile::tempdir()?;
     // Independently reject legacy control, legacy graph, and both. A failure
     // on one path must not conceal fallback on the other.
     for (legacy_control, legacy_graph) in [(true, true), (true, false), (false, true)] {
-        let control_before = control_attempts.load(std::sync::atomic::Ordering::Relaxed);
-        let graph_before = graph_attempts.load(std::sync::atomic::Ordering::Relaxed);
-        let config = json!({"binding":binding(),"coordinator":{"endpoint":if legacy_control { old_control_addr } else { grpc_coordinator.ready.control },"identity":identity(9)},"members":[{"endpoint":if legacy_control { old_control_addr } else { grpc_a.ready.control },"identity":identity(7),"graph_endpoint":if legacy_graph { Some(old_graph_addr) } else { grpc_a.ready.graph }},{"endpoint":if legacy_control { old_control_addr } else { grpc_b.ready.control },"identity":identity(8),"graph_endpoint":if legacy_graph { Some(old_graph_addr) } else { grpc_b.ready.graph }}]});
+        let control_before = control_count();
+        let graph_before = graph_count();
+        let config = json!({"binding":binding(),"coordinator":{"endpoint":if legacy_control { old_control_addr } else { grpc_coordinator.ready.control },"identity":identity(9)},"members":[{"endpoint":if legacy_control { old_control_a } else { grpc_a.ready.control },"identity":identity(7),"graph_endpoint":if legacy_graph { Some(old_graph_a) } else { grpc_a.ready.graph }},{"endpoint":if legacy_control { old_control_b } else { grpc_b.ready.control },"identity":identity(8),"graph_endpoint":if legacy_graph { Some(old_graph_b) } else { grpc_b.ready.graph }}]});
         let path = directory.path().join("legacy.json");
         fs::write(&path, serde_json::to_vec(&config)?)?;
         if !legacy_control {
@@ -457,11 +474,11 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
             );
             drop(service);
             assert!(
-                graph_attempts.load(std::sync::atomic::Ordering::Relaxed) > graph_before,
+                graph_count() > graph_before,
                 "graph-only failure must actually reach the old-wire graph peer"
             );
             assert_eq!(
-                control_attempts.load(std::sync::atomic::Ordering::Relaxed),
+                control_count(),
                 control_before,
                 "healthy control routes must not reach the old-wire control peer"
             );
@@ -504,11 +521,17 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
             "legacy endpoints must never announce serving"
         );
         assert!(
-            control_attempts.load(std::sync::atomic::Ordering::Relaxed) > control_before,
+            control_count() > control_before,
             "control failure must actually reach the old-wire control peer"
         );
     }
-    for peer in [control_peer, graph_peer] {
+    for peer in [
+        control_peer,
+        control_a_peer,
+        control_b_peer,
+        graph_a_peer,
+        graph_b_peer,
+    ] {
         assert!(
             !peer.is_finished(),
             "legacy protocol fixture must observe no fallback"
