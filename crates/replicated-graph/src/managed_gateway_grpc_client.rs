@@ -819,13 +819,17 @@ mod tests {
         let raw = pb::ErrorDetail {
             reason: pb::error_detail::Reason::RejectedOutcomeUncertain as i32,
             identity: Some(identity.clone()),
-        }.encode_to_vec();
+        }
+        .encode_to_vec();
         assert_eq!(
-            remote_error(tonic::Status::with_details(
-                tonic::Code::Unavailable,
-                "REJECTED_OUTCOME_UNCERTAIN",
-                raw.into(),
-            ), &identity),
+            remote_error(
+                tonic::Status::with_details(
+                    tonic::Code::Unavailable,
+                    "REJECTED_OUTCOME_UNCERTAIN",
+                    raw.into(),
+                ),
+                &identity
+            ),
             Error::Protocol
         );
         let mut wrong = identity.clone();

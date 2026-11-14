@@ -32,6 +32,7 @@ type client struct {
 	binding *pb.Binding
 	write   pb.WriteServiceClient
 	query   pb.QueryServiceClient
+	fixed   pb.FixedSessionServiceClient
 }
 
 func (c *client) envelope() *pb.Context {
@@ -106,7 +107,7 @@ func (c *client) create(partition uint32, id uint64) {
 }
 
 func rows(page *pb.Page, partition uint32, first uint64, seen map[uint64]bool) {
-	check(page != nil && page.Completeness == pb.Completeness_SINGLE_PARTITION, "missing/incomplete page")
+	check(page != nil && page.Completeness == pb.Completeness_UNVERIFIED, "missing/incomplete page")
 	for _, r := range page.Rows {
 		m := r.GetPropertyMap()
 		check(m != nil && m.Source != nil && m.Source.GetVertex() != nil, "expected typed vertex property map: %v", r)
@@ -127,37 +128,79 @@ func rows(page *pb.Page, partition uint32, first uint64, seen map[uint64]bool) {
 		}
 	}
 }
+// The bounded data-local QueryService supports explicit vertices/out/in/path/count,
+// not property maps. Materialized FixedSessionService.Traverse owns valueMap.
+func (c *client) propertiesAt(partition uint32, first uint64, version uint64) {
+ req := &pb.FixedOpenRequest{Context:c.envelope(), Version:&version, TtlMillis:10000}
+ opened,err:=c.fixed.Open(c.ctx,req);check(err==nil,"Fixed Open exact V: %v",err)
+ identity(req.Context.Identity,opened.Identity)
+ check(opened.Session!=nil && len(opened.Session.Token)==32 && len(opened.Session.Incarnation)==16 && opened.Session.Version==version,"fixed session shape/version")
+ q:=&pb.Query{Partition:partition,Text:fmt.Sprintf("g.V(%d,%d,%d).valueMap('nil','integer','imax','precise','real','text','boolean','absent')",first,first+1,first+2)}
+ read:=&pb.FixedQueryRequest{Context:c.envelope(),Session:opened.Session,Query:q}
+ result,err:=c.fixed.Traverse(c.ctx,read);check(err==nil,"Fixed Traverse valueMap: %v",err)
+ identity(read.Context.Identity,result.Identity)
+ check(proto.Equal(result.Session,opened.Session) && proto.Equal(result.Query,q) && result.Data!=nil,"fixed traversal correlation")
+ seen:=map[uint64]bool{}
+ rows(&pb.Page{Rows:result.Data.Rows,Completeness:result.Data.Completeness},partition,first,seen)
+ check(len(seen)==2,"fixed property rows missing")
+ closeReq:=&pb.FixedCloseRequest{Context:c.envelope(),Session:opened.Session}
+ closed,err:=c.fixed.Close(c.ctx,closeReq);check(err==nil,"Fixed Close: %v",err)
+ identity(closeReq.Context.Identity,closed.Identity)
+ check(proto.Equal(closed.Session,opened.Session),"fixed Close session")
+}
+func elementRows(page *pb.Page, partition uint32, first uint64, seen map[uint64]bool) {
+ check(page!=nil && page.Completeness==pb.Completeness_UNVERIFIED,"managed completeness contract")
+ for _,r:=range page.Rows {
+  element:=r.GetElement()
+  check(element!=nil && element.GetVertex()!=nil,"expected typed vertex element: %v",r)
+  src:=element.GetVertex()
+  check(src.Partition==partition && (src.Id==first || src.Id==first+1) && !seen[src.Id],"wrong/duplicate retained vertex %v",src)
+  seen[src.Id]=true
+ }
+}
 func (c *client) pages(partition uint32, first uint64) {
-	q := &pb.Query{Partition: partition, Text: fmt.Sprintf("g.V(%d,%d,%d).valueMap('nil','integer','imax','precise','real','text','boolean','absent')", first, first+1, first+2)}
+	q := &pb.Query{Partition: partition, Text: fmt.Sprintf("g.V(%d,%d,%d)", first, first+1, first+2)}
 	req := &pb.OpenRequest{Context: c.envelope(), Read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}, TtlMillis: 10000, Query: q, PageSize: 1}
 	opened, err := c.query.Open(c.ctx, req)
 	check(err == nil, "Open: %v", err)
 	identity(req.Context.Identity, opened.Identity)
-	check(opened.Session != nil && len(opened.Session.Token) == 16 && len(opened.Session.Incarnation) == 16, "session shape")
+	check(opened.Session != nil && len(opened.Session.Token) == 32 && len(opened.Session.Incarnation) == 16, "session shape")
 	check(proto.Equal(opened.Query, q) && opened.PageSize == 1, "Open query/page-size correlation")
 	seen := map[uint64]bool{}
 	page := opened.Page
 	check(page != nil && page.Total == 2 && page.Offset == 0 && len(page.Rows) == 1 && page.Next != nil, "first page not paginated: %v", page)
-	rows(page, partition, first, seen)
+	elementRows(page, partition, first, seen)
 	// Write after capture: the old cursor must stay at V and exclude the new vertex.
 	c.create(partition, first+2)
+	c.propertiesAt(partition,first,opened.Session.Version)
 	fetch := &pb.FetchRequest{Context: c.envelope(), Session: opened.Session, Query: q, Cursor: page.Next, PageSize: 1}
 	next, err := c.query.Fetch(c.ctx, fetch)
 	check(err == nil, "Fetch: %v", err)
 	identity(fetch.Context.Identity, next.Identity)
 	check(proto.Equal(next.Session, opened.Session) && proto.Equal(next.Query, q) && proto.Equal(next.Cursor, fetch.Cursor) && next.PageSize == 1, "Fetch session/version/query/cursor changed")
 	check(next.Page != nil && next.Page.Offset == 1 && next.Page.Total == 2 && next.Page.Next == nil, "last page shape: %v", next.Page)
-	rows(next.Page, partition, first, seen)
+	elementRows(next.Page, partition, first, seen)
 	check(len(seen) == 2, "missing results")
 	freshReq := &pb.OpenRequest{Context: c.envelope(), Read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}, TtlMillis: 10000, Query: q, PageSize: 10}
 	fresh, err := c.query.Open(c.ctx, freshReq)
 	check(err == nil, "fresh Open: %v", err)
 	identity(freshReq.Context.Identity, fresh.Identity)
 	check(fresh.Session != nil && fresh.Session.Version > opened.Session.Version && fresh.Page != nil && fresh.Page.Total == 3, "fresh view failed to observe concurrent write")
+	check(fresh.Page.Completeness==pb.Completeness_UNVERIFIED && len(fresh.Page.Rows)==3 && fresh.Page.Next==nil,"fresh result completeness/shape")
+ freshIDs:=map[uint64]bool{}
+ for _,r:=range fresh.Page.Rows {
+  e:=r.GetElement()
+  check(e!=nil && e.GetVertex()!=nil,"fresh expected vertex: %v",r)
+  v:=e.GetVertex()
+  check(v.Partition==partition && v.Id>=first && v.Id<=first+2 && !freshIDs[v.Id],"fresh wrong/duplicate vertex: %v",v)
+  freshIDs[v.Id]=true
+ }
+ check(len(freshIDs)==3,"fresh IDs missing")
 	freshClose := &pb.CloseRequest{Context: c.envelope(), Session: fresh.Session}
 	freshClosed, err := c.query.Close(c.ctx, freshClose)
 	check(err == nil, "fresh Close: %v", err)
 	identity(freshClose.Context.Identity, freshClosed.Identity)
+	check(proto.Equal(freshClosed.Session,fresh.Session),"fresh Close session")
 	closeReq := &pb.CloseRequest{Context: c.envelope(), Session: opened.Session}
 	closed, err := c.query.Close(c.ctx, closeReq)
 	check(err == nil, "Close: %v", err)
@@ -186,7 +229,7 @@ func run() {
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1<<20), grpc.MaxCallSendMsgSize(1<<20)))
 	check(err == nil, "client: %v", err)
 	defer conn.Close()
-	c := client{ctx: ctx, binding: binding, write: pb.NewWriteServiceClient(conn), query: pb.NewQueryServiceClient(conn)}
+	c := client{ctx: ctx, binding: binding, write: pb.NewWriteServiceClient(conn), query: pb.NewQueryServiceClient(conn), fixed:pb.NewFixedSessionServiceClient(conn)}
 	invalid := &pb.OpenRequest{Context: c.envelope(), Read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}, TtlMillis: 10000, Query: &pb.Query{Partition: uint32(*partition), Text: "g.V("}, PageSize: 1}
 	_, err = c.query.Open(ctx, invalid)
 	expectError(err, codes.InvalidArgument, pb.ErrorDetail_QUERY_SYNTAX)

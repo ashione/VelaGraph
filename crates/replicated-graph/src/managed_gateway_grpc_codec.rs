@@ -1648,7 +1648,11 @@ pub(super) fn identified_error(error: Error, identity: Option<pb::CallIdentity>)
         message: reason.as_str_name().to_owned(),
         detail: Some(RpcAny {
             type_url: ERROR_TYPE_URL.to_owned(),
-            value: pb::ErrorDetail { reason: reason as i32, identity }.encode_to_vec(),
+            value: pb::ErrorDetail {
+                reason: reason as i32,
+                identity,
+            }
+            .encode_to_vec(),
         }),
     };
     tonic::Status::with_details(code, reason.as_str_name(), rich.encode_to_vec().into())

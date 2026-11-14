@@ -8,7 +8,8 @@
 
 [#278](https://github.com/ashione/VelaGraph/issues/278) 覆盖剩余 graph library
 listener、客户端及真实测试迁移，并补齐原 D1 managed-mode 和单次 Snapshot typed
-契约。不得删除原功能来宣称统一；独立审查及精确版本 CI/CoreHR 通过后才验收。
+契约。#279 已在独立审查、精确版本 CI/CoreHR 与 1025 写入恢复验证通过后
+squash 合并为 `40e2b9a`。剩余跨语言/服务契约门禁见 [当前通信审计](RPC_MIGRATION_STATUS.md)。
 详见 [迁移说明](GRAPH_LIBRARY_GRPC.md)。#218 总目标和 #247 根因问题仍单独保持开放。
 
 ## 高优先级：统一 gRPC/Protobuf 与对外服务接口
@@ -33,7 +34,7 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
   退役 serve-grpc 与 --grpc CLI 选择；#264 删除对外 JSON/内部 gRPC 的混合
   library 入口，差分测试改走真正 typed ingress，保留尚未替代的纯 legacy 语义；复用原执行器、
   Jobs 状态机及累计预算。[#274](https://github.com/ashione/VelaGraph/issues/274) 将 coordinator library query/job/consistency
-  全部迁到 typed gRPC，保留显式一致性协商和旧peer拒绝；graph/Gateway旧入口仍待退役。
+  全部迁到 typed gRPC，保留显式一致性协商和旧peer拒绝；graph/Gateway旧入口随后由 #276/#278 退役。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
   session gRPC 路径，checked terminal-prefix DTO 保留完整证明及租约/序号语义；
   managed control 与对外 gateway 协议仍不在该切片内。
@@ -57,7 +58,7 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
 - **默认存储链与listener退役**：[#256](https://github.com/ashione/VelaGraph/issues/256) 将
   RemoteStorageNode/catalog/routing默认链、单分片server-query切到typed RPC；graph-node仅
   --graph一个typed入口，拒绝旧--grpc-snapshot双端口选项。旧wire专项测试使用test-only子进程
-  fixture保留断言，不恢复产品legacy listener。其余GraphService/Gateway退役仍待验收。
+  fixture保留断言，不恢复产品legacy listener。GraphService/Gateway随后由 #276/#278 退役并验收。
 - **通用Metadata RPC成本**：[#258](https://github.com/ashione/VelaGraph/issues/258) 是 #256 的性能验收前置项。
   使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
   场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/
@@ -65,7 +66,7 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
 - **固定快照公共 RPC**：[#266](https://github.com/ashione/VelaGraph/issues/266) 为原 materialized
   OpenSession/Read/Traverse/TraversePage/Close 增加独立 typed `FixedSessionService`，
   与绑定单次查询结果的 data-local `QueryService` 分开；同端口、同 Invocation/admission，
-  保留固定 V、租约、分页身份及错误，不新增查询引擎。异步 job 与旧 listener 退役仍待验收。
+  保留固定 V、租约、分页身份及错误，不新增查询引擎。异步 job 已由 #268 交付，旧 listener 由 #276/#278 退役。
 - **内部边界**：Raft、managed control/member 和 shard execution 分服务迁移。
   分别验证混合版本或明确拒绝、升级窗口和原恢复契约；不捆绑存储格式或 purge 变更。
 - **外部边界**：独立公开 Graph/Write/Query 服务，gRPC 与 HTTP 使用相同 handler、

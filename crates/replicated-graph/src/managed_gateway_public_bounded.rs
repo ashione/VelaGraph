@@ -456,7 +456,8 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                 if exact_width.is_some_and(|width| len != width) {
                     return Err(bad());
                 }
-                if matches!(schema, Schema::RpcAny) && tag == 1
+                if matches!(schema, Schema::RpcAny)
+                    && tag == 1
                     && &bytes[at..end] != super::ERROR_TYPE_URL.as_bytes()
                 {
                     return Err(bad());
@@ -533,8 +534,12 @@ macro_rules! message {
     };
 }
 impl BoundedMessage for super::RpcStatus {
-    fn schema() -> Schema { Schema::RpcStatus }
-    fn request() -> bool { false }
+    fn schema() -> Schema {
+        Schema::RpcStatus
+    }
+    fn request() -> bool {
+        false
+    }
 }
 message!(ErrorDetail, false);
 message!(WriteRequest, true);
