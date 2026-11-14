@@ -38,8 +38,9 @@ Listener-free `GraphState` owns the shared Raft/state handles and snapshot
 session pool. Multiple typed library listeners can share that state;
 neither GraphService nor product graph-node starts a legacy listener. Open uses the existing leader read barrier and atomic capture.
 Page uses the existing descriptor/cursor/epoch validation and frozen entries;
-Close releases the same session. A token opened by either protocol can be used or
-closed through the other in explicit library/parity fixtures. Cross-protocol calls cannot exceed
+Close releases the same session. A token opened through one typed listener can
+be used or closed through another typed adapter sharing that GraphState. These
+shared-state calls cannot exceed
 the shared four sessions / 128 MiB retained-byte budget. Tokens remain random
 16-byte capabilities tied to an incarnation, descriptor and cursor position.
 
@@ -91,7 +92,7 @@ framing, while protobuf gives independently specified typed fields.
 ## Verification and exit path
 
 `cargo test --locked -p replicated-graph --test grpc_snapshot_process` exercises
-three actual graph-node/Raft processes, legacy/gRPC differential pages, frozen
+three actual graph-node/Raft processes, typed listener/shared-state pages, frozen
 views, shared-session capacity, malformed typed requests, identity/follower and
 close errors, cancellation/replay, physical connection reuse, 16 zero-window
 HTTP2 responses exhausting shared admission, and bounded real-process shutdown. The ignored

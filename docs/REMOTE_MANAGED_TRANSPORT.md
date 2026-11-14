@@ -89,9 +89,10 @@ Nonparticipants must consume terminal ordinals too before a new common V exists.
 ## Resource and time limits
 
 The transport uses typed gRPC/Protobuf with a shared bounded channel,
-explicit domain protocol version and operation/correlation identity. Unknown
-fields, malformed frames, duplicate snapshot keys, identity mismatches and
-unexpected reply variants fail closed. Length checks precede receive allocation;
+explicit domain protocol version and operation/correlation identity. Well-formed
+unknown protobuf fields are skipped under the bounded scanner; this is not the
+former strict-JSON unknown-field rule. Malformed wire data, duplicate snapshot
+keys, identity mismatches and unexpected reply variants fail closed. Length checks precede receive allocation;
 serialization stops at the encoded frame limit rather than allocating an
 unbounded result first. Journal objects are embedded once, not nested JSON byte
 arrays or escaped strings, so existing 16 MiB journal capacity remains consumable.
