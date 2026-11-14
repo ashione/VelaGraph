@@ -432,14 +432,14 @@ async fn scenario() -> anyhow::Result<()> {
 }
 
 // A response-only TCP gate is test instrumentation, never a product fallback.
-// It may also gate HTTP/2 control frames, so direct replay below confirms actual
-// admission before the caller is aborted; blocked bytes alone are not an ACK.
+// Only a complete, decoded gRPC DATA response proves business completion.
+// HTTP/2 control frames and response headers are forwarded, not counted as proof.
 async fn interrupted_delivery(
     jobs: &mut Jobs,
     endpoint: SocketAddr,
     version: u64,
 ) -> anyhow::Result<()> {
-    let proxy = ResponseGate::start(endpoint).await?;
+    let mut proxy = ResponseGate::start(endpoint).await?;
     let mut gated = Jobs::new(grpc_channel(proxy.address).await?);
     let unknown = pb::JobHandle {
         incarnation: vec![0; 16],
@@ -451,8 +451,11 @@ async fn interrupted_delivery(
     let mut pending_client = gated.clone();
     let pending_start = start.clone();
     let pending = tokio::spawn(async move { pending_client.start(pending_start).await });
-    tokio::time::timeout(BUDGET, proxy.blocked.notified()).await?;
-    let admitted = jobs.start(start.clone()).await?.into_inner();
+    let response = tokio::time::timeout(BUDGET, proxy.responses.recv())
+        .await?
+        .context("gate closed before Start response DATA")?;
+    let admitted = <pb::JobStartResponse as prost::Message>::decode(response.as_slice())?;
+    assert_eq!(admitted.operation_id, start.operation_id);
     let handle = admitted.job.clone().context("admitted interrupted job")?;
     pending.abort();
     assert!(pending.await.unwrap_err().is_cancelled());
@@ -470,7 +473,7 @@ async fn interrupted_delivery(
         jobs.fetch(fetch_job(&handle, &start)).await?.into_inner(),
         original
     );
-    let proxy = ResponseGate::start(endpoint).await?;
+    let mut proxy = ResponseGate::start(endpoint).await?;
     let mut gated = Jobs::new(grpc_channel(proxy.address).await?);
     gated.get(get_job(&handle)).await?;
     proxy.paused.send(true)?;
@@ -481,7 +484,12 @@ async fn interrupted_delivery(
     };
     let pending_request = renewal.clone();
     let pending = tokio::spawn(async move { gated.renew(pending_request).await });
-    tokio::time::timeout(BUDGET, proxy.blocked.notified()).await?;
+    let response = tokio::time::timeout(BUDGET, proxy.responses.recv())
+        .await?
+        .context("gate closed before Renew response DATA")?;
+    let lost_renewal = <pb::JobRenewResponse as prost::Message>::decode(response.as_slice())?;
+    assert_eq!(lost_renewal.job.as_ref(), Some(&handle));
+    assert_eq!(lost_renewal.generation, 1);
     pending.abort();
     assert!(pending.await.unwrap_err().is_cancelled());
     drop(proxy);
@@ -489,7 +497,8 @@ async fn interrupted_delivery(
     // nor advance the same committed renewal more than once.
     let committed = jobs.renew(renewal.clone()).await?.into_inner();
     let replayed = jobs.renew(renewal).await?.into_inner();
-    assert_eq!(committed.generation, 1);
+    assert_eq!(committed.generation, lost_renewal.generation);
+    assert!(committed.remaining_millis <= lost_renewal.remaining_millis);
     assert_eq!(replayed.generation, committed.generation);
     assert!(replayed.remaining_millis <= committed.remaining_millis);
     Ok(())
@@ -497,7 +506,7 @@ async fn interrupted_delivery(
 struct ResponseGate {
     address: SocketAddr,
     paused: tokio::sync::watch::Sender<bool>,
-    blocked: Arc<tokio::sync::Notify>,
+    responses: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for ResponseGate {
@@ -511,8 +520,7 @@ impl ResponseGate {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let (paused, pause) = tokio::sync::watch::channel(false);
-        let blocked = Arc::new(tokio::sync::Notify::new());
-        let signal = blocked.clone();
+        let (signal, responses) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -527,17 +535,57 @@ impl ResponseGate {
                             let (mut sr, mut sw) = server.into_split();
                             let requests = tokio::io::copy(&mut cr, &mut sw);
                             let responses = async {
-                                let mut buf = vec![0; 16*1024];
+                                // A server HTTP/2 connection begins with frames (no preface).
+                                // Parse framing so SETTINGS/PING/WINDOW_UPDATE cannot be
+                                // mistaken for completion of the pending business RPC.
+                                let mut message = Vec::new();
+                                let mut message_stream = None;
                                 loop {
-                                    let n = sr.read(&mut buf).await?;
-                                    if n == 0 { break; }
-                                    while *pause.borrow_and_update() {
-                                        signal.notify_one();
-                                        if pause.changed().await.is_err() { return Ok::<(), std::io::Error>(()); }
+                                    let mut header = [0u8; 9];
+                                    sr.read_exact(&mut header).await?;
+                                    let length = ((header[0] as usize) << 16)
+                                        | ((header[1] as usize) << 8)
+                                        | header[2] as usize;
+                                    let mut payload = vec![0; length];
+                                    sr.read_exact(&mut payload).await?;
+                                    let stream = u32::from_be_bytes([
+                                        header[5] & 0x7f, header[6], header[7], header[8],
+                                    ]);
+                                    let capturing = *pause.borrow_and_update();
+                                    if header[3] == 0 && stream != 0 && capturing {
+                                        if message_stream.is_some_and(|id| id != stream) {
+                                            return Err::<(), std::io::Error>(std::io::Error::other("unexpected concurrent DATA stream"));
+                                        }
+                                        message_stream = Some(stream);
+                                        let data = if header[4] & 0x08 != 0 {
+                                            let padding = *payload.first().ok_or_else(|| std::io::Error::other("missing DATA padding length"))? as usize;
+                                            if padding + 1 > payload.len() {
+                                                return Err(std::io::Error::other("invalid DATA padding"));
+                                            }
+                                            &payload[1..payload.len() - padding]
+                                        } else {
+                                            payload.as_slice()
+                                        };
+                                        message.extend_from_slice(data);
+                                        if message.len() >= 5 {
+                                            if message[0] != 0 {
+                                                return Err(std::io::Error::other("unexpected compressed gRPC message"));
+                                            }
+                                            let size = u32::from_be_bytes(message[1..5].try_into().unwrap()) as usize;
+                                            if message.len() >= 5 + size {
+                                                // No response DATA has reached the caller. Decode
+                                                // this captured message in the test before aborting.
+                                                let _ = signal.send(message[5..5 + size].to_vec());
+                                                // Intentionally discard all response DATA. This
+                                                // gate is single-use; its owner aborts the proxy.
+                                                std::future::pending::<()>().await;
+                                            }
+                                        }
+                                        continue;
                                     }
-                                    cw.write_all(&buf[..n]).await?;
+                                    cw.write_all(&header).await?;
+                                    cw.write_all(&payload).await?;
                                 }
-                                Ok::<(), std::io::Error>(())
                             };
                             tokio::select! { result = requests => { result?; }, result = responses => { result?; } }
                             Ok::<(), std::io::Error>(())
@@ -550,7 +598,7 @@ impl ResponseGate {
         Ok(Self {
             address,
             paused,
-            blocked,
+            responses,
             task,
         })
     }

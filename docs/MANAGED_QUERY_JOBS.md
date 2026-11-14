@@ -266,7 +266,11 @@ Transport-only performance claims require separate matched measurements.
 service and managed node processes using a fixture-owned qualified-path oracle.
 It covers fixed results across later deletion, Start argument replay, failure
 precedence, immutable pages, lease replay, expiration without implicit renewal,
-shared-slot exhaustion, incarnation fencing and dropped control replies.
+shared-slot exhaustion, incarnation fencing and dropped control replies. The
+response-loss cases capture and decode a complete gRPC response from HTTP/2 DATA
+before discarding it; control frames and headers are not business-completion
+evidence. Replay is issued only after the captured Start/Renew response proves
+the operation completed without delivering that response to its caller.
 The existing deterministic lifecycle tests remain the evidence for running
 renewal races and last-owner resource retention. This candidate must pass
 independent review and exact-head CI before #268 acceptance.

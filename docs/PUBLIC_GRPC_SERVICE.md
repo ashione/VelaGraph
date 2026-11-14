@@ -47,9 +47,9 @@ The read selector is a required oneof: latest certified, exact V (including
 zero), or minimum V. Queries retain one immutable certified V and original
 completeness through all pages. This is not linearizable latest or a certificate
 that arbitrary trusted low-level writers preserved all adjacency. Every
-unsupported Gremlin feature fails explicitly. Query jobs, historical business
-time, custom read profiles and arbitrary graph transactions are not exposed by
-this slice. Limits are unchanged from the existing managed execution path.
+unsupported Gremlin feature fails explicitly. Historical business time, custom
+read profiles and arbitrary graph transactions are not exposed by this slice.
+Limits are unchanged from the existing managed execution path.
 
 All eight currently supported managed mutation forms are typed. Scalar presence
 is mandatory: Null, absent properties, integer/real and finite values remain
@@ -82,9 +82,9 @@ requests never recapture latest automatically.
 All methods share the original Invocation/admission/deadline and response
 ownership machinery. Fixed snapshot acquisition, retained results and individual
 messages keep their existing capacity limits. This is not a data-local scaling
-improvement. HTTP parity for this additional service and the five asynchronous
-managed job operations remain future work. The legacy library Gateway is not
-removed until its remaining semantics have replacements; #218 remains open.
+improvement. HTTP parity for this additional service and for the asynchronous
+managed job service remains future work; typed job RPCs are described below.
+The legacy library Gateway is not removed until its remaining semantics have replacements; #218 remains open.
 
 ## Errors and ownership
 
