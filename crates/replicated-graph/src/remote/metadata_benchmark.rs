@@ -62,7 +62,7 @@ fn emit(lane: &str, round: usize, elapsed: Duration, mut samples: Vec<u64>, expe
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "manual same-node TCP/gRPC/adapter latency diagnostic"]
+#[ignore = "manual same-node typed convenience/gRPC/adapter latency diagnostic"]
 async fn metadata_transport_microbenchmark() {
     let dir = tempfile::tempdir().unwrap();
     let node = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
@@ -103,11 +103,11 @@ async fn metadata_transport_microbenchmark() {
         })))
         .await
         .unwrap();
-    let legacy =
+    let convenience =
         GraphService::start_identified(&node, "127.0.0.1:0".parse().unwrap(), GROUP, 7, BUDGET)
             .await
             .unwrap();
-    let grpc = grpc::GrpcSnapshotService::start(&legacy, "127.0.0.1:0".parse().unwrap())
+    let grpc = grpc::GrpcSnapshotService::start(&convenience, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let id = RemoteIdentity {
@@ -134,7 +134,7 @@ async fn metadata_transport_microbenchmark() {
     .unwrap();
     // Warm every path before timed sampling. Do not include connection/setup in warm RPC latency.
     for _ in 0..100 {
-        metadata_identified(legacy.local_addr(), id, 7, BUDGET)
+        metadata_identified(convenience.local_addr(), id, 7, BUDGET)
             .await
             .unwrap();
         client.metadata(7).await.unwrap();
@@ -164,7 +164,7 @@ async fn metadata_transport_microbenchmark() {
                     for _ in 0..1000 {
                         let t = Instant::now();
                         assert_eq!(
-                            metadata_identified(legacy.local_addr(), id, 7, BUDGET)
+                            metadata_identified(convenience.local_addr(), id, 7, BUDGET)
                                 .await
                                 .unwrap(),
                             (7, 1, 1)
@@ -210,7 +210,7 @@ async fn metadata_transport_microbenchmark() {
             }
             emit(
                 [
-                    "tcp_direct",
+                    "grpc_convenience",
                     "grpc_reused",
                     "grpc_stream",
                     "grpc_adapter_get",
@@ -222,13 +222,13 @@ async fn metadata_transport_microbenchmark() {
             );
         }
     }
-    for lane in ["tcp_snapshot", "grpc_snapshot"] {
+    for lane in ["grpc_convenience_snapshot", "grpc_snapshot"] {
         let t = Instant::now();
         let mut times = vec![];
         for _ in 0..10 {
             let s = Instant::now();
-            let snap = if lane == "tcp_snapshot" {
-                paged_snapshot_identified(legacy.local_addr(), id, 7, BUDGET)
+            let snap = if lane == "grpc_convenience_snapshot" {
+                paged_snapshot_identified(convenience.local_addr(), id, 7, BUDGET)
                     .await
                     .unwrap()
             } else {
@@ -245,6 +245,6 @@ async fn metadata_transport_microbenchmark() {
     drop(stream);
     drop(client);
     grpc.shutdown().await;
-    legacy.shutdown().await;
+    convenience.shutdown().await;
     node.shutdown().await;
 }

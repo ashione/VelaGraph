@@ -31,6 +31,11 @@ specialized for one dataset.
   generic hierarchy and membership queries; it does not introduce HR-specific
   execution rules.
 
+Internal graph, managed, coordinator and Raft transports use typed gRPC. See
+[graph library migration](docs/GRAPH_LIBRARY_GRPC.md) for the remaining retirement
+candidate, explicit-identity API changes and validation boundaries. Public HTTP
+remains supported; old JSON/TCP clients are not a supported fallback.
+
 ## Quick start
 
 ### Try one graph query

@@ -115,37 +115,7 @@ pub async fn query(
     request: QueryRequest,
     deadline: Duration,
 ) -> Result<QueryResponse, RemoteError> {
-    let end = checked_deadline(deadline, None)?;
-    request.validate()?;
-    let expected = (request.shard, request.partition, request.mode);
-    let (repeated_path, map_keys) = admitted_extensions(&request);
-    match rpc(
-        endpoint,
-        identity,
-        Operation::Query(request),
-        end.saturating_duration_since(Instant::now()),
-        None,
-    )
-    .await?
-    {
-        Reply::Query(response) => {
-            if let Ok(output) = &response {
-                validate_output(
-                    output,
-                    expected,
-                    identity,
-                    repeated_path,
-                    map_keys.as_ref(),
-                    end,
-                )?;
-            }
-            if Instant::now() >= end {
-                return Err(RemoteError::Timeout { request_id: None });
-            }
-            Ok(response)
-        }
-        _ => Err(RemoteError::Protocol),
-    }
+    super::single_query_grpc::query(endpoint, identity.ok_or(RemoteError::InvalidArgument)?, request, deadline).await
 }
 
 struct MapShape {
@@ -926,21 +896,10 @@ mod tests {
     }
     #[tokio::test]
     async fn query_response_length_is_rejected_before_body_allocation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let _: Request = read_frame(&mut socket, Instant::now() + MAX_QUERY_DEADLINE)
-                .await
-                .unwrap();
-            socket
-                .write_u32((MAX_QUERY_RESPONSE_BYTES + 1025) as u32)
-                .await
-                .unwrap();
-        });
+        let (endpoint, seen, server) = raw_test_peer::spawn(Some(MAX_QUERY_RESPONSE_BYTES + 1)).await;
         let result = query(
             endpoint,
-            None,
+            Some(RemoteIdentity { group: 10, node: 1 }),
             QueryRequest {
                 shard: 7,
                 partition: 10,
@@ -952,7 +911,8 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
+        server.abort();
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_panic_keeps_unavailable_and_releases_its_permit() {

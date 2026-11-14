@@ -1,5 +1,7 @@
 //! Disjoint, conservative budget reservations for independent shard sessions.
 use super::*;
+// Preserve the existing logical request/response wrapper accounting.
+const TRANSPORT_BYTES: usize = 512;
 use std::{future::Future, task::Poll};
 
 const WIDTH: usize = 3;
@@ -67,7 +69,7 @@ fn reservation(batch: &Batch, row_bytes: usize, descriptor: &Descriptor) -> Opti
     let encoded = serde_json::to_vec(&request).ok()?;
     cost.bytes = cost
         .bytes
-        .checked_add(channel::TRANSPORT_BYTES)?
+        .checked_add(TRANSPORT_BYTES)?
         .checked_add(encoded.len().checked_mul(2)?)?;
     cost.work = cost.work.checked_add(1)?;
     Some(cost)
@@ -194,11 +196,6 @@ pub(super) async fn run(
         wave.reverse();
         let mut futures = Vec::new();
         for (batch, bound) in wave {
-            let enabled = job.connections.is_some();
-            let mut connection = job
-                .connections
-                .as_mut()
-                .and_then(|connections| connections.remove(&batch.shard));
             let catalog = &job.catalog;
             let grpc_clients = job.grpc_clients.as_deref();
             let sessions = job.sessions.clone();
@@ -220,14 +217,12 @@ pub(super) async fn run(
                     _ => unreachable!("job batches are typed"),
                 };
                 let value = execution
-                    .fragment_transport(batch.fragment, enabled.then_some(&mut connection))
+                    .fragment_transport(batch.fragment)
                     .await;
                 (
                     batch.indices,
                     execution.cost,
                     value,
-                    batch.shard,
-                    connection,
                     expected,
                 )
             }));
@@ -256,7 +251,7 @@ pub(super) async fn run(
         drop(futures);
         let mut accepted = Vec::new();
         for reply in replies {
-            let (indices, cost, result, shard, connection, expected) = reply.unwrap();
+            let (indices, cost, result, expected) = reply.unwrap();
             job.charge(cost.bytes, cost.work)?;
             let FragmentValue::HierarchyBatch(values) = result? else {
                 return Err(QueryFailure::IncompleteOrCorrupt);
@@ -265,12 +260,9 @@ pub(super) async fn run(
                 return Err(QueryFailure::IncompleteOrCorrupt);
             }
             validate_leaves(&expected, &values)?;
-            accepted.push((indices, values, shard, connection));
+            accepted.push((indices, values));
         }
-        for (indices, values, shard, connection) in accepted {
-            if let (Some(cache), Some(connection)) = (&mut job.connections, connection) {
-                cache.insert(shard, connection);
-            }
+        for (indices, values) in accepted {
             for (index, value) in indices.into_iter().zip(values) {
                 outputs[index] = Some(value);
             }
@@ -298,6 +290,7 @@ pub(super) fn reservation_for_test(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::typed_test_peer::{Listener as TcpListener, Socket as TcpStream, read_frame, write_frame};
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -336,7 +329,6 @@ mod tests {
             catalog: Arc::new(StaticCatalog { partitions: routes }),
             sessions,
             row_bounds: BTreeMap::from([(1, 256), (2, 256), (3, 256)]),
-            connections: None,
             rows: None,
             expires: Instant::now() + Duration::from_secs(5),
             cost: Cost::default(),
@@ -384,7 +376,7 @@ mod tests {
     async fn reply(socket: &mut TcpStream, request: FragmentRequest, corrupt: bool) {
         write_frame(
             socket,
-            &super::super::super::super::Response {
+            super::super::super::super::Response {
                 version: VERSION,
                 result: Ok(Reply::QueryFragment(Ok(FragmentOutput {
                     descriptor: request.descriptor.clone(),

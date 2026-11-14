@@ -99,7 +99,7 @@ pub(in crate::remote) fn remote_status(error: Status) -> RemoteError {
             RemoteError::SessionUnavailable
         }
         (Code::InvalidArgument, _) => RemoteError::InvalidArgument,
-        (Code::ResourceExhausted, _) => RemoteError::ResourceExhausted,
+        (Code::ResourceExhausted | Code::OutOfRange, _) => RemoteError::ResourceExhausted,
         (Code::DeadlineExceeded | Code::Cancelled, _) => RemoteError::Timeout { request_id: None },
         (Code::DataLoss | Code::Unimplemented | Code::FailedPrecondition | Code::NotFound, _) => {
             RemoteError::Protocol
@@ -683,6 +683,19 @@ impl SnapshotClient {
                 .max_encoding_message_size(REQUEST_LIMIT),
             identity,
         })
+    }
+    /// Build a channel without network activity. Operation admission is acquired
+    /// before the first HTTP/2 handshake; the operation owns the total deadline.
+    pub(crate) fn connect_lazy(address: SocketAddr, identity: RemoteIdentity,
+        deadline: Duration) -> Result<Self, RemoteError> {
+        checked_deadline(deadline, None)?;
+        let channel = Channel::from_shared(format!("http://{address}"))
+            .map_err(|_| RemoteError::InvalidArgument)?
+            .connect_timeout(deadline).buffer_size(MAX_IN_FLIGHT)
+            .concurrency_limit(MAX_IN_FLIGHT).connect_lazy();
+        Ok(Self { client: SnapshotServiceClient::new(channel)
+            .max_decoding_message_size(RESPONSE_LIMIT)
+            .max_encoding_message_size(REQUEST_LIMIT), identity })
     }
     fn context(&self, end: Instant) -> Result<wire::Context, RemoteError> {
         check_time(end)?;

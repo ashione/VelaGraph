@@ -183,18 +183,6 @@ impl Sessions {
         }
         Ok(session)
     }
-    pub(super) fn hierarchy_deadline(
-        &self,
-        identity: RemoteIdentity,
-        shard: u64,
-        descriptor: &Descriptor,
-    ) -> Result<Instant, RemoteError> {
-        let session = self.lookup(identity, shard, descriptor)?;
-        if !session.hierarchy {
-            return Err(RemoteError::InvalidArgument);
-        }
-        Ok(Instant::from_std(session.node.end))
-    }
     pub(in crate::remote) fn close(
         &self,
         identity: RemoteIdentity,
@@ -880,6 +868,12 @@ mod lifetime_tests {
         expected_error: Option<QueryFailure>,
     ) {
         use super::super::{fixed, fixed_execution, fixed_parallel};
+        // Reservation tests also run synchronously; a lazy channel needs a
+        // runtime handle but does not connect or execute any network work.
+        let runtime = tokio::runtime::Handle::try_current().is_err().then(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        });
+        let _entered = runtime.as_ref().map(|runtime| runtime.enter());
         use d2_raft::{
             participant_writes::Authority,
             transaction_decisions::{Cohort, Member},
@@ -924,7 +918,7 @@ mod lifetime_tests {
             descriptor.clone(),
             entries.iter().map(|(k, v)| k.len() + v.len()).sum(),
             entries.len(),
-        );
+        ).unwrap();
         session.sequence = u64::MAX - 1;
         let bound = fixed_parallel::reservation_for_test(&fragment, &session).unwrap();
         let prepared = fixed_execution::prepare(&mut session, fragment.clone(), bound).unwrap();
@@ -1888,261 +1882,106 @@ mod epoch_tests {
 }
 // Exercise real channel framing and session counters without test-only hooks.
 #[cfg(test)]
-mod channel_server_tests {
+mod typed_hierarchy_session_tests {
     use super::*;
     use openraft::{storage::RaftStateMachine, CommittedLeaderId, Entry, EntryPayload, LogId};
-    use serde_json::{json, Value as Json};
-    use tokio::net::TcpListener;
-    use tokio::task::JoinHandle;
+    use super::super::typed_test_peer;
 
     const IDENTITY: RemoteIdentity = RemoteIdentity { group: 2, node: 1 };
     const SHARD: u64 = 7;
     const OPERATION_LIMIT: Duration = Duration::from_secs(5);
 
-    async fn apply(state: &mut Arc<StateMachine>, index: u64, command: D1Command) {
-        state
-            .apply([Entry {
-                log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
-                payload: EntryPayload::Normal(LogCommand::D1V1(command)),
-            }])
-            .await
-            .unwrap()[0]
-            .d1
-            .as_ref()
-            .unwrap()
-            .as_ref()
-            .unwrap();
-    }
     async fn fixture() -> (Arc<StateMachine>, Arc<Sessions>, Descriptor) {
         let mut state = Arc::new(StateMachine::default());
-        apply(
-            &mut state,
-            1,
-            D1Command::Activate {
-                shard: SHARD,
-                epoch: 1,
-            },
-        )
-        .await;
+        state.apply([Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Activate { shard: SHARD, epoch: 1 })),
+        }]).await.unwrap()[0].d1.as_ref().unwrap().as_ref().unwrap();
         let sessions = Arc::new(Sessions::new().unwrap());
-        let (descriptor, _) = sessions
-            .open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT)
-            .await
-            .unwrap();
+        let (descriptor, _) = sessions.open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT).await.unwrap();
         (state, sessions, descriptor)
     }
     fn request(descriptor: &Descriptor) -> FragmentRequest {
         FragmentRequest {
             descriptor: descriptor.clone(),
-            fragment: Fragment::HierarchyBatch {
-                partition: 0,
-                fragments: vec![Fragment::Exists(VertexId {
-                    partition: 0,
-                    id: 1,
-                })],
-            },
+            fragment: Fragment::HierarchyBatch { partition: 0, fragments: vec![Fragment::Exists(VertexId { partition: 0, id: 1 })] },
             remaining: jobs::JOB_CEILING,
         }
     }
-    async fn start(
-        state: Arc<StateMachine>,
-        sessions: Arc<Sessions>,
-        descriptor: &Descriptor,
-    ) -> (TcpStream, JoinHandle<Result<(), RemoteError>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        client.set_nodelay(true).unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let first_end = Instant::now() + OPERATION_LIMIT;
-        let first = request(descriptor);
-        // Match the real dispatcher boundary: it has accepted the socket and
-        // decoded OpenHierarchyChannel's initial FragmentRequest before serve.
-        let handler = tokio::spawn(channel::serve(
-            server,
-            state,
-            sessions,
-            (IDENTITY, SHARD),
-            1,
-            first,
-            (first_end, OPERATION_LIMIT),
-        ));
-        (client, handler)
-    }
-    async fn receive(stream: &mut TcpStream) -> Json {
-        tokio::time::timeout(
-            OPERATION_LIMIT,
-            read_frame::<Json>(stream, Instant::now() + OPERATION_LIMIT),
-        )
-        .await
-        .expect("server answer timed out")
-        .unwrap()
-    }
-    async fn send(stream: &mut TcpStream, sequence: u64, descriptor: &Descriptor) {
-        let frame = json!({
-            "version": 1, "sequence": sequence, "timeout_millis": 5000,
-            "request": request(descriptor),
-        });
-        tokio::time::timeout(
-            OPERATION_LIMIT,
-            write_frame(stream, &frame, Instant::now() + OPERATION_LIMIT),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    }
-    fn success(
-        reply: Json,
-        sequence: u64,
-        descriptor: &Descriptor,
-        retire: bool,
-    ) -> FragmentOutput {
-        assert_eq!(reply["version"], json!(1));
-        assert_eq!(reply["sequence"], json!(sequence));
-        assert_eq!(reply["retire"], json!(retire));
-        // This also rejects accidental Response/Reply envelope nesting.
-        assert_eq!(reply.as_object().unwrap().len(), 4);
-        let output: FragmentOutput = serde_json::from_value(reply["output"]["Ok"].clone()).unwrap();
-        assert_eq!(output.descriptor, *descriptor);
-        match &output.value {
-            FragmentValue::HierarchyBatch(values) => {
-                assert_eq!(values.len(), 1);
-                assert!(matches!(values[0], FragmentValue::Bool(false)));
+    async fn start(state: Arc<StateMachine>, sessions: Arc<Sessions>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = typed_test_peer::Listener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handler = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let end = Instant::now() + OPERATION_LIMIT;
+                let received = typed_test_peer::read_frame(&mut socket, end).await.unwrap();
+                assert_eq!(received.identity, Some(IDENTITY));
+                let Operation::QueryFragment(request) = received.operation else { panic!("typed fragment expected") };
+                let result = sessions.fragment(&state, IDENTITY, SHARD, request, end).await;
+                let _ = typed_test_peer::write_frame(&mut socket, super::super::super::Response { version: VERSION, result }, end).await;
             }
-            _ => panic!("expected real empty-snapshot hierarchy result"),
-        }
-        output
+        });
+        (address, handler)
     }
-    async fn eof(stream: &mut TcpStream) {
-        let mut byte = [0u8];
-        assert_eq!(
-            tokio::time::timeout(OPERATION_LIMIT, stream.read(&mut byte))
-                .await
-                .expect("handler did not close its socket")
-                .unwrap(),
-            0
-        );
+    fn client(address: SocketAddr) -> grpc::QueryClient {
+        grpc::QueryClient::connect_lazy(address, IDENTITY, OPERATION_LIMIT).unwrap()
     }
-
     #[tokio::test]
-    async fn real_channel_retires_at_1024_and_reconnect_preserves_session_and_budget() {
+    async fn typed_reconnection_preserves_session_lease_and_cumulative_budget() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;
-        let (mut client, handler) = start(state.clone(), sessions.clone(), &descriptor).await;
-        let mut summed_cost = Cost::default();
-        for sequence in 0..1024u64 {
-            if sequence != 0 {
-                send(&mut client, sequence, &descriptor).await;
-            }
-            let output = success(
-                receive(&mut client).await,
-                sequence,
-                &descriptor,
-                sequence == 1023,
-            );
-            summed_cost.bytes += output.cost.bytes;
-            summed_cost.work += output.cost.work;
+        let (address, handler) = start(state, sessions.clone()).await;
+        let mut connection = client(address);
+        let mut summed = Cost::default();
+        for sequence in 0..1025 {
+            if sequence == 1024 { connection = client(address); }
+            let output = connection.fragment(request(&descriptor), OPERATION_LIMIT).await.unwrap().unwrap();
+            assert_eq!(output.descriptor, descriptor);
+            assert!(matches!(&output.value, FragmentValue::HierarchyBatch(v) if matches!(v.as_slice(), [FragmentValue::Bool(false)])));
+            summed.bytes += output.cost.bytes; summed.work += output.cost.work;
             let used = session.used.lock().unwrap();
-            assert_eq!(used.bytes, summed_cost.bytes);
-            assert_eq!(used.work, summed_cost.work);
+            assert_eq!(used.bytes, summed.bytes); assert_eq!(used.work, summed.work);
             assert_eq!(session.node.end, lease_end);
         }
-        handler.await.unwrap().unwrap();
-        eof(&mut client).await;
-        let after_retirement = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
-        assert!(Arc::ptr_eq(&session, &after_retirement));
-        drop(after_retirement);
-
-        // New TCP channel, same immutable session, sequence restarted only for
-        // transport. No session-open operation occurs at this reconnect.
-        let (mut client, handler) = start(state.clone(), sessions.clone(), &descriptor).await;
-        let output = success(receive(&mut client).await, 0, &descriptor, false);
-        summed_cost.bytes += output.cost.bytes;
-        summed_cost.work += output.cost.work;
-        {
-            let used = session.used.lock().unwrap();
-            assert_eq!(used.bytes, summed_cost.bytes);
-            assert_eq!(used.work, summed_cost.work);
-        }
-        assert_eq!(session.node.end, lease_end);
-        drop(client);
-        assert!(matches!(
-            handler.await.unwrap(),
-            Err(RemoteError::Unavailable)
-        ));
-
-        // Seed just the cumulative ceiling, as existing epoch_tests do. This
-        // avoids millions of operations while testing the real TCP path and
-        // proves reconnect does not reset server-side resource accounting.
+        assert!(Arc::ptr_eq(&session, &sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap()));
         *session.used.lock().unwrap() = jobs::JOB_CEILING;
-        let (mut client, handler) = start(state, sessions.clone(), &descriptor).await;
-        let reply = receive(&mut client).await;
-        assert_eq!(reply["sequence"], json!(0));
-        assert_eq!(reply["retire"], json!(true));
-        assert_eq!(reply["output"], json!({"Err": "ResourceExhausted"}));
-        handler.await.unwrap().unwrap();
-        eof(&mut client).await;
+        assert!(matches!(client(address).fragment(request(&descriptor), OPERATION_LIMIT).await.unwrap(), Err(QueryFailure::ResourceExhausted)));
         assert_eq!(session.node.end, lease_end);
-        // Failed admission retains its attempted-operation charge as before.
-        assert_eq!(
-            session.used.lock().unwrap().work,
-            jobs::JOB_CEILING.work + 1
-        );
+        assert_eq!(session.used.lock().unwrap().work, jobs::JOB_CEILING.work + 1);
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
+        handler.abort(); let _ = handler.await;
     }
-
     #[tokio::test]
-    async fn server_rejects_switch_to_another_valid_descriptor_without_executing_it() {
+    async fn malformed_descriptor_does_not_charge_another_session() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
-        let (other, _) = sessions
-            .open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT)
-            .await
-            .unwrap();
-        let other_session = sessions.lookup(IDENTITY, SHARD, &other).unwrap();
-        assert_ne!(descriptor, other);
-        let (mut client, handler) = start(state, sessions.clone(), &descriptor).await;
-        success(receive(&mut client).await, 0, &descriptor, false);
-        send(&mut client, 1, &other).await;
-        assert!(matches!(
-            handler.await.unwrap(),
-            Err(RemoteError::InvalidArgument)
-        ));
-        eof(&mut client).await;
-        let used = other_session.used.lock().unwrap();
-        assert_eq!(used.bytes, 0);
-        assert_eq!(used.work, 0);
-        drop(used);
+        let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
+        let (address, handler) = start(state, sessions.clone()).await;
+        let mut forged = descriptor.clone(); forged.incarnation[0] ^= 1;
+        assert!(client(address).fragment(request(&forged), OPERATION_LIMIT).await.is_err());
+        assert_eq!(session.used.lock().unwrap().bytes, 0);
+        assert_eq!(session.used.lock().unwrap().work, 0);
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
-        sessions.close(IDENTITY, SHARD, &other).unwrap();
+        handler.abort(); let _ = handler.await;
     }
-
     #[tokio::test]
-    async fn aborting_real_idle_handler_closes_socket_without_reopening_session() {
+    async fn closing_transport_does_not_reopen_or_extend_session() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;
-        let (mut client, handler) = start(state, sessions.clone(), &descriptor).await;
-        success(receive(&mut client).await, 0, &descriptor, false);
-        let used_before = *session.used.lock().unwrap();
-        // RemoteService shutdown uses abort_all on its handler JoinSet. This
-        // verifies the same cancellation boundary without booting a Raft node.
-        handler.abort();
-        match handler.await {
-            Err(error) => assert!(error.is_cancelled()),
-            Ok(_) => panic!("idle channel handler unexpectedly completed"),
-        }
-        eof(&mut client).await;
+        let (address, handler) = start(state, sessions.clone()).await;
+        client(address).fragment(request(&descriptor), OPERATION_LIMIT).await.unwrap().unwrap();
+        let before = *session.used.lock().unwrap();
+        handler.abort(); assert!(handler.await.unwrap_err().is_cancelled());
         let retained = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         assert!(Arc::ptr_eq(&session, &retained));
         assert_eq!(retained.node.end, lease_end);
-        let used_after = *retained.used.lock().unwrap();
-        assert_eq!(used_before.bytes, used_after.bytes);
-        assert_eq!(used_before.work, used_after.work);
+        let after = *retained.used.lock().unwrap();
+        assert_eq!(before.bytes, after.bytes); assert_eq!(before.work, after.work);
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
     }
 }

@@ -8,11 +8,12 @@ use velagraph::{
     Value,
 };
 mod adjacency;
+#[cfg(test)]
+mod typed_test_peer;
 pub(crate) mod fixed;
 pub(crate) mod fixed_execution;
 mod fixed_parallel;
 use adjacency::Direction;
-pub(in crate::remote) mod channel;
 pub mod consistency;
 pub mod grpc;
 mod hierarchy;
@@ -454,12 +455,11 @@ impl Execution<'_> {
             .ok_or(QueryFailure::UnsupportedScope)
     }
     async fn fragment(&mut self, fragment: Fragment) -> Result<FragmentValue, QueryFailure> {
-        self.fragment_transport(fragment, None).await
+        self.fragment_transport(fragment).await
     }
     async fn fragment_transport(
         &mut self,
         fragment: Fragment,
-        connection: Option<&mut Option<channel::Connection>>,
     ) -> Result<FragmentValue, QueryFailure> {
         self.check()?;
         if let Some(sessions) = &mut self.fixed_sessions {
@@ -505,35 +505,11 @@ impl Execution<'_> {
             },
             ..request
         };
-        let reply = if let Some(clients) = self.grpc_clients {
-            clients
-                .get(&route.shard)
-                .ok_or(QueryFailure::Unavailable)?
-                .fragment(request, self.end.saturating_duration_since(Instant::now()))
-                .await
-                .map(Reply::QueryFragment)
-        } else if let Some(slot) = connection {
-            let (reply, returned) = channel::call(
-                route.endpoint,
-                route.identity,
-                request,
-                self.end,
-                slot.take(),
-            )
-            .await;
-            *slot = returned;
-            reply
-        } else {
-            rpc(
-                route.endpoint,
-                Some(route.identity),
-                Operation::QueryFragment(request),
-                self.end.saturating_duration_since(Instant::now()),
-                None,
-            )
+        let reply = observed_client(self.grpc_clients, &route, self.end)?
+            .fragment(request, self.end.saturating_duration_since(Instant::now()))
             .await
-        }
-        .map_err(remote_failure)?;
+            .map(Reply::QueryFragment)
+            .map_err(remote_failure)?;
         check(self.end)?;
         let Reply::QueryFragment(response) = reply else {
             return Err(QueryFailure::IncompleteOrCorrupt);
@@ -799,32 +775,27 @@ impl Execution<'_> {
             if Instant::now() >= self.end {
                 break;
             }
-            if let Some(clients) = self.grpc_clients {
-                if let Some(client) = clients.get(&route.shard) {
-                    let _ = client
-                        .close(
-                            descriptor.clone(),
-                            self.end
-                                .saturating_duration_since(Instant::now())
-                                .min(Duration::from_millis(20)),
-                        )
-                        .await;
-                }
-                continue;
+            if let Ok(client) = observed_client(self.grpc_clients, route, self.end) {
+                let _ = client.close(
+                    descriptor.clone(),
+                    self.end.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)),
+                ).await;
             }
-            let _ = rpc(
-                route.endpoint,
-                Some(route.identity),
-                Operation::CloseQuery {
-                    descriptor: descriptor.clone(),
-                },
-                self.end
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(20)),
-                None,
-            )
-            .await;
         }
+    }
+}
+
+// A missing cache is a cold typed channel, never a transport fallback.
+fn observed_client(
+    clients: Option<&BTreeMap<u64, grpc::QueryClient>>,
+    route: &PartitionRoute,
+    end: Instant,
+) -> Result<grpc::QueryClient, QueryFailure> {
+    match clients {
+        Some(clients) => clients.get(&route.shard).cloned().ok_or(QueryFailure::Unavailable),
+        None => grpc::QueryClient::connect_lazy(
+            route.endpoint, route.identity, end.saturating_duration_since(Instant::now()),
+        ).map_err(remote_failure),
     }
 }
 
@@ -871,27 +842,11 @@ async fn execute_transport(
                 execution.cost.charge(1024, 1, execution.ceiling)?;
             }
             let remaining = end.saturating_duration_since(Instant::now());
-            let reply = if let Some(clients) = grpc_clients {
-                clients
-                    .get(&route.shard)
-                    .ok_or(QueryFailure::Unavailable)?
-                    .open(route.shard, remaining)
-                    .await
-                    .map(Reply::OpenQuery)
-            } else {
-                rpc(
-                    route.endpoint,
-                    Some(route.identity),
-                    Operation::OpenQuery {
-                        shard: route.shard,
-                        timeout_millis: remaining.as_millis().min(MAX_TIMEOUT as u128) as u64,
-                    },
-                    remaining,
-                    None,
-                )
+            let reply = observed_client(grpc_clients, route, end)?
+                .open(route.shard, remaining)
                 .await
-            }
-            .map_err(remote_failure)?;
+                .map(Reply::OpenQuery)
+                .map_err(remote_failure)?;
             let Reply::OpenQuery(descriptor) = reply else {
                 return Err(QueryFailure::IncompleteOrCorrupt);
             };

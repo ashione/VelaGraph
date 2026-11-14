@@ -253,7 +253,6 @@ struct Job {
     catalog: Arc<StaticCatalog>,
     sessions: BTreeMap<u64, (PartitionRoute, Descriptor)>,
     row_bounds: BTreeMap<u64, usize>,
-    connections: Option<BTreeMap<u64, channel::Connection>>,
     rows: Option<rows::Rows>,
     expires: Instant,
     cost: Cost,
@@ -304,11 +303,6 @@ impl Jobs {
             if Instant::now() >= entry.expires {
                 return false;
             }
-            if let Ok(mut job) = entry.job.try_lock() {
-                if let Some(connections) = &mut job.connections {
-                    connections.retain(|_, c| c.live());
-                }
-            }
             true
         });
     }
@@ -358,7 +352,6 @@ impl Jobs {
                     catalog,
                     sessions: BTreeMap::new(),
                     row_bounds: BTreeMap::new(),
-                    connections: self.grpc_clients.is_none().then(BTreeMap::new),
                     rows: row_state,
                     expires,
                     cost: Cost::default(),
@@ -580,6 +573,15 @@ impl Job {
         }
     }
     async fn open(&mut self, partition: u32, end: Instant) -> Result<(), QueryFailure> {
+        if self.grpc_clients.is_none() {
+            let mut clients = BTreeMap::new();
+            for route in &self.catalog.partitions {
+                if !clients.contains_key(&route.shard) {
+                    clients.insert(route.shard, observed_client(None, route, end)?);
+                }
+            }
+            self.grpc_clients = Some(Arc::new(clients));
+        }
         if !self
             .catalog
             .partitions
@@ -602,32 +604,10 @@ impl Job {
             }
             check(end)?;
             self.charge(1024, 1)?;
-            let (descriptor, max_row_bytes) = if let Some(clients) = &self.grpc_clients {
-                clients
-                    .get(&route.shard)
-                    .ok_or(QueryFailure::Unavailable)?
-                    .open_hierarchy(route.shard, end.saturating_duration_since(Instant::now()))
-                    .await
-                    .map_err(remote_failure)?
-            } else {
-                let reply = rpc(
-                    route.endpoint,
-                    Some(route.identity),
-                    Operation::OpenHierarchyQuery { shard: route.shard },
-                    end.saturating_duration_since(Instant::now()),
-                    None,
-                )
+            let (descriptor, max_row_bytes) = observed_client(self.grpc_clients.as_deref(), &route, end)?
+                .open_hierarchy(route.shard, end.saturating_duration_since(Instant::now()))
                 .await
                 .map_err(remote_failure)?;
-                let Reply::OpenHierarchyQuery {
-                    descriptor,
-                    max_row_bytes,
-                } = reply
-                else {
-                    return Err(QueryFailure::IncompleteOrCorrupt);
-                };
-                (descriptor, max_row_bytes)
-            };
             if descriptor.stamp.identity != route.identity
                 || descriptor.stamp.shard != route.shard
                 || descriptor.stamp.epoch != route.epoch
@@ -640,9 +620,6 @@ impl Job {
         check(end)
     }
     async fn close(&mut self) {
-        if let Some(connections) = &mut self.connections {
-            connections.clear();
-        }
         let execution = Execution {
             grpc_clients: self.grpc_clients.as_deref(),
             fixed_sessions: None,
@@ -1109,6 +1086,7 @@ pub(in crate::remote::distributed) fn hierarchy_reservation_for_test(
 
 #[cfg(test)]
 mod tests {
+    use super::super::typed_test_peer::{Listener as TcpListener, Socket as TcpStream, read_frame, write_frame};
     use super::*;
     fn vertex(id: usize) -> VertexId {
         // Neighboring logical vertices deliberately share the numeric ID.
@@ -1391,7 +1369,6 @@ mod tests {
                         catalog: Arc::new(StaticCatalog { partitions: vec![] }),
                         sessions: BTreeMap::new(),
                         row_bounds: BTreeMap::new(),
-                        connections: None,
                         rows: None,
                         expires: Instant::now() + Duration::from_secs(1),
                         cost: Cost::default(),
@@ -1533,7 +1510,6 @@ mod tests {
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
-            connections: None,
             rows: None,
             expires,
             cost: Cost::default(),
@@ -1622,7 +1598,7 @@ mod tests {
         };
         write_frame(
             socket,
-            &super::super::super::Response {
+            super::super::super::Response {
                 version: VERSION,
                 result: Ok(reply),
             },
@@ -1842,7 +1818,6 @@ mod tests {
             catalog: catalog.clone(),
             sessions: BTreeMap::from([(1, (route, descriptor))]),
             row_bounds: BTreeMap::new(),
-            connections: None,
             rows: None,
             expires,
             cost: Cost::default(),

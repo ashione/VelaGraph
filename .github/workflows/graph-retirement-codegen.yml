@@ -1,0 +1,31 @@
+name: Graph retirement code generation
+on:
+  push:
+    branches: [retire-graph-legacy]
+permissions:
+  contents: read
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Generate typed operations and format
+        run: |
+          bash scripts/generate-internal-operations-proto.sh
+          cargo fmt --all
+          git diff --check
+      - name: Report generated source patch without modifying repository
+        run: |
+          python3 - <<'PY'
+          import base64, subprocess, zlib
+          patch = subprocess.check_output(['git', 'diff', '--binary'])
+          encoded = base64.b64encode(zlib.compress(patch)).decode()
+          print('GENERATED_PATCH_BEGIN')
+          for i in range(0, len(encoded), 4000):
+              print(encoded[i:i+4000])
+          print('GENERATED_PATCH_END')
+          PY

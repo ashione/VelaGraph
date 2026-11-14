@@ -683,7 +683,7 @@ impl State {
                     descriptor.clone(),
                     opened.opened.capture_cost.bytes,
                     opened.opened.capture_cost.rows,
-                )
+                ).map_err(local::remote_error)?
                 .with_transport(transport),
             );
             if descriptor.profile != requested_profile

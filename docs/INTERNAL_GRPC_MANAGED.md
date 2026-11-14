@@ -75,8 +75,8 @@ inter-node graph transports and are not replaced by this service migration.
 | Raft peer replication, votes, snapshot transfer | Typed gRPC peer transport (#239); driver control is typed gRPC (#251) |
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), default CLI transport (#260); library query/job/consistency ingress migrated to typed RPC (#274) |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
-| Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Explicit library legacy fixtures remain separately retained |
-| Legacy library graph | GraphService still needs separate retirement; Gateway library uses identified typed gRPC (#276), observed coordinator uses typed RPC (#274); graph-service has no hidden legacy listener |
+| Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Graph library callers/fixtures migrate under [#278](GRAPH_LIBRARY_GRPC.md) |
+| Legacy library graph | [GraphService retirement](GRAPH_LIBRARY_GRPC.md) removes its old wire; Gateway library uses identified typed gRPC (#276), observed coordinator uses typed RPC (#274); graph-service has no hidden legacy listener |
 | Unix read gateway | Removed under #262; [migration and retained semantic coverage](GRAPH_UDS_GATEWAY.md). No replacement Unix listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
@@ -130,6 +130,6 @@ network. Strict durable-record parsing still rejects malformed records, whereas
 protobuf collection/field/envelope checks protect the live RPC boundary. Tests
 for foreign identities/nonces, unavailable outcomes, capacity, history, retained
 reads and end-to-end process behavior must pass on the final commit. This change
-does not itself retire `remote::GraphService`. Gateway and observed coordinator
-library ingress were separately migrated under #276 and #274; graph ingress remains #218 work and must not be described
-as complete merely because managed member traffic is now typed-only.
+was separate from GraphService retirement (#278). Gateway and observed coordinator
+library ingress migrated under #276 and #274. See [graph library migration](GRAPH_LIBRARY_GRPC.md)
+for the remaining graph adapter and its independent validation gates.

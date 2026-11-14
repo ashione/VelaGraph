@@ -36,21 +36,14 @@ new interpreter, global query plan or consistency claim.
   registries even if another owner keeps GraphState alive. Socket/resource tests
   distinguish listener state from application state.
 
-## Legacy boundary and tests
+## Library boundary and tests
 
-`GraphService` remains an explicit legacy library wrapper for old wire-specific
-callers/parity fixtures; it is not constructed by graph-node. Legacy coordinator,
-gateway entrypoints remain separately inventoried under #218. The separate
-[Unix read gateway is retired](GRAPH_UDS_GATEWAY.md).
-
-Existing JSON fragmentation/malformed-frame/proxy assertions are not deleted or
-pretended to test HTTP/2. Their integration suites launch an ignored test-only
-fixture through their own test executable, preserving independent processes
-without shipping a legacy product binary or adding a product compatibility flag.
-The real graph-node scenarios, catalog/routing tests, CLI demo and typed services
-exercise the new RPC-only default. Both kinds of evidence are required and are
-reported separately. A legacy-fixture success is not evidence that the product
-still offers that wire.
+[Graph library retirement](GRAPH_LIBRARY_GRPC.md) replaces `GraphService` and its
+remaining library callers with typed services. Test-only independent-process
+fixtures now also bind typed graph listeners. Controlled typed peers retain the
+original ordering/identity/cancellation and fault assertions; old JSON frame
+codec tests are not presented as HTTP/2 evidence. The original migration history
+below describes the baseline, not an available product compatibility mode.
 
 ## Validation and claims
 

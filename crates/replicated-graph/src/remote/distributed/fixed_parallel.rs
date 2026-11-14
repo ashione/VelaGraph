@@ -272,6 +272,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::typed_test_peer::{Listener as TcpListener, Socket as TcpStream, read_frame, write_frame};
     use super::*;
     use d2_raft::{
         participant_writes::Authority,
@@ -330,7 +331,7 @@ mod tests {
                 version: 8,
                 mode: [shard as u8; 16],
             };
-            nodes.insert(shard, NodeSession::new(route, descriptor, 256, 10));
+            nodes.insert(shard, NodeSession::new(route, descriptor, 256, 10).unwrap());
             listeners.push(listener);
         }
         (nodes, listeners)
@@ -386,7 +387,7 @@ mod tests {
         }
         write_frame(
             socket,
-            &super::super::super::Response {
+            super::super::super::Response {
                 version: VERSION,
                 result: Ok(Reply::FixedQueryFragment(Ok(output))),
             },

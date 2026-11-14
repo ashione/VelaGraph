@@ -1,7 +1,7 @@
-//! Real three-process TCP/gRPC snapshot differential tests. This is not a
+//! Real three-process typed convenience/direct gRPC snapshot differential tests. This is not a
 //! throughput benchmark, authenticated transport, or a query/Raft migration test.
-#[path = "support/legacy_graph_node.rs"]
-mod legacy_graph_node;
+#[path = "support/typed_graph_node.rs"]
+mod typed_graph_node;
 use anyhow::{ensure, Context};
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{
@@ -62,7 +62,7 @@ impl Cluster {
         drop(reserved);
         let mut processes = Vec::new();
         for i in 0..3 {
-            let mut command = legacy_graph_node::command();
+            let mut command = typed_graph_node::command();
             command.env("TOKIO_WORKER_THREADS", "2").args([
                 "--allow-insecure-development",
                 "--id",
@@ -134,7 +134,7 @@ impl Cluster {
             node: (self.leader + 1) as u64,
         }
     }
-    fn tcp(&self) -> SocketAddr {
+    fn convenience(&self) -> SocketAddr {
         self.addresses[4 * self.leader + 2]
     }
     fn grpc(&self) -> SocketAddr {
@@ -302,18 +302,18 @@ async fn differential() -> anyhow::Result<()> {
     cluster.seed().await?;
     let proxy = Proxy::start(cluster.grpc()).await?;
     let client = SnapshotClient::connect(proxy.address, cluster.identity(), BUDGET).await?;
-    let tcp = remote::open_snapshot(cluster.tcp(), Some(cluster.identity()), SHARD, BUDGET).await?;
+    let convenience = remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD, BUDGET).await?;
     let grpc = client.open(SHARD, BUDGET).await?;
-    same_view(&tcp, &grpc);
+    same_view(&convenience, &grpc);
     ensure!(grpc.bytes > remote::MAX_PAGE_BYTES);
     let (mut tc, mut gc) = (None, None);
     let mut total = 0;
     let mut pages = 0;
     loop {
         let a = remote::snapshot_page(
-            cluster.tcp(),
+            cluster.convenience(),
             Some(cluster.identity()),
-            tcp.clone(),
+            convenience.clone(),
             tc,
             BUDGET,
         )
@@ -347,9 +347,9 @@ async fn differential() -> anyhow::Result<()> {
     run_blocking(move || GraphRecordStore::new(node, SHARD, 0).create_vertex(&Vertex::new(999)))
         .await??;
     let a = remote::snapshot_page(
-        cluster.tcp(),
+        cluster.convenience(),
         Some(cluster.identity()),
-        tcp.clone(),
+        convenience.clone(),
         None,
         BUDGET,
     )
@@ -385,7 +385,7 @@ async fn differential() -> anyhow::Result<()> {
         Err(RemoteError::InvalidArgument)
     ));
     assert!(matches!(
-        remote::open_snapshot(cluster.tcp(), Some(cluster.identity()), SHARD + 1, BUDGET).await,
+        remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD + 1, BUDGET).await,
         Err(RemoteError::InvalidArgument)
     ));
     let wrong = RemoteIdentity {
@@ -398,17 +398,17 @@ async fn differential() -> anyhow::Result<()> {
         Err(RemoteError::InvalidArgument)
     ));
     assert!(matches!(
-        remote::open_snapshot(cluster.tcp(), Some(wrong), SHARD, BUDGET).await,
+        remote::open_snapshot(cluster.convenience(), Some(wrong), SHARD, BUDGET).await,
         Err(RemoteError::InvalidArgument)
     ));
     // Shared server pools allow gradual migration without duplicating budgets.
     assert_eq!(
-        client.page(tcp.clone(), None, BUDGET).await?.entries,
+        client.page(convenience.clone(), None, BUDGET).await?.entries,
         a.entries
     );
     assert_eq!(
         remote::snapshot_page(
-            cluster.tcp(),
+            cluster.convenience(),
             Some(cluster.identity()),
             grpc.clone(),
             None,
@@ -491,9 +491,9 @@ async fn differential() -> anyhow::Result<()> {
         }
         pair => anyhow::bail!("follower error mismatch: {pair:?}"),
     }
-    client.close(tcp.clone(), BUDGET).await?;
+    client.close(convenience.clone(), BUDGET).await?;
     remote::close_snapshot(
-        cluster.tcp(),
+        cluster.convenience(),
         Some(cluster.identity()),
         grpc.clone(),
         BUDGET,
@@ -504,7 +504,7 @@ async fn differential() -> anyhow::Result<()> {
         Err(RemoteError::SessionUnavailable)
     ));
     assert!(matches!(
-        remote::snapshot_page(cluster.tcp(), Some(cluster.identity()), tcp, None, BUDGET).await,
+        remote::snapshot_page(cluster.convenience(), Some(cluster.identity()), convenience, None, BUDGET).await,
         Err(RemoteError::SessionUnavailable)
     ));
     assert!(matches!(
@@ -518,7 +518,7 @@ async fn differential() -> anyhow::Result<()> {
         held.push(if i % 2 == 0 {
             client.open(SHARD, BUDGET).await?
         } else {
-            remote::open_snapshot(cluster.tcp(), Some(cluster.identity()), SHARD, BUDGET).await?
+            remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD, BUDGET).await?
         });
     }
     assert!(matches!(
@@ -618,8 +618,8 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
     timeout(Duration::from_secs(120), async {
         let cluster = Cluster::start().await?;
         let client = SnapshotClient::connect(cluster.grpc(), cluster.identity(), BUDGET).await?;
-        let tcp =
-            remote::open_snapshot(cluster.tcp(), Some(cluster.identity()), SHARD, BUDGET).await?;
+        let convenience =
+            remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD, BUDGET).await?;
         let grpc = client.open(SHARD, BUDGET).await?;
         sleep(remote::SESSION_TTL + Duration::from_millis(250)).await;
         assert!(matches!(
@@ -627,7 +627,7 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
             Err(RemoteError::SessionUnavailable)
         ));
         assert!(matches!(
-            remote::snapshot_page(cluster.tcp(), Some(cluster.identity()), tcp, None, BUDGET).await,
+            remote::snapshot_page(cluster.convenience(), Some(cluster.identity()), convenience, None, BUDGET).await,
             Err(RemoteError::SessionUnavailable)
         ));
         // Expiry is local to the original fixed session. Do not require this

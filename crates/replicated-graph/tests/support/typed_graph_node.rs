@@ -1,7 +1,6 @@
-//! Test-only legacy wire fixture. Never installed as a product binary.
-//! Uses this integration test executable as an ignored child process so legacy
-//! adversarial/parity assertions remain independent-process checks after the
-//! production graph-node retires its TCP listener.
+//! Test-only typed graph RPC fixture, never installed as a product binary.
+//! Uses this integration executable as an ignored child, preserving independent
+//! process assertions and optional second typed listener sharing the same state.
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -24,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let mut epoch = None;
     let mut trusted = false;
     let args: Vec<String> = serde_json::from_str(
-        &std::env::var("VELA_LEGACY_TEST_NODE_ARGS").context("test fixture arguments")?,
+        &std::env::var("VELA_TYPED_TEST_NODE_ARGS").context("test fixture arguments")?,
     )?;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -217,13 +216,13 @@ mod tests {
 }
 
 #[test]
-#[ignore = "subprocess fixture, launched only by legacy wire parity tests"]
+#[ignore = "subprocess fixture, launched only by typed graph RPC tests"]
 fn serve() {
     // A manual --include-ignored run is not a request to start a daemon.
-    if std::env::var_os("VELA_LEGACY_TEST_NODE_ARGS").is_none() {
+    if std::env::var_os("VELA_TYPED_TEST_NODE_ARGS").is_none() {
         return;
     }
-    main().expect("legacy test node failed");
+    main().expect("typed test node failed");
 }
 
 pub struct TestCommand {
@@ -235,7 +234,7 @@ pub fn command() -> TestCommand {
     inner.args([
         "--ignored",
         "--exact",
-        "legacy_graph_node::serve",
+        "typed_graph_node::serve",
         "--nocapture",
     ]);
     TestCommand {
@@ -273,7 +272,7 @@ impl TestCommand {
     }
     pub fn spawn(&mut self) -> std::io::Result<std::process::Child> {
         self.inner.env(
-            "VELA_LEGACY_TEST_NODE_ARGS",
+            "VELA_TYPED_TEST_NODE_ARGS",
             serde_json::to_string(&self.arguments).expect("fixture args"),
         );
         self.inner.spawn()

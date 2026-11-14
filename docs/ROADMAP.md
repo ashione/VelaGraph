@@ -4,6 +4,13 @@
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
+## 当前完整交付：GraphService 旧协议退役
+
+[#278](https://github.com/ashione/VelaGraph/issues/278) 覆盖剩余 graph library
+listener、客户端及真实测试迁移，并补齐原 D1 managed-mode 和单次 Snapshot typed
+契约。不得删除原功能来宣称统一；独立审查及精确版本 CI/CoreHR 通过后才验收。
+详见 [迁移说明](GRAPH_LIBRARY_GRPC.md)。#218 总目标和 #247 根因问题仍单独保持开放。
+
 ## 高优先级：统一 gRPC/Protobuf 与对外服务接口
 
 [#218](https://github.com/ashione/VelaGraph/issues/218) 跟踪内部协议统一及对外
@@ -13,7 +20,7 @@
 当前实现（切片验收以关联 PR 的精确版本证据为准），Raft peer、managed control/write、snapshot、
 observed fragments/hierarchy shard jobs、fixed/renewable sessions 已有 typed gRPC。
 `graph-service` 内部 managed 与 graph routes 已强制 gRPC。driver/control 和 coordinator CLI 入口已使用 typed RPC，Unix read gateway 已删除；
-legacy GraphService/Gateway 和兼容 listener 尚未全部清理；详见
+Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完整迁移；详见
 [通信清单](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory)。
 存储 record proto 与 RPC service schema 分离；迁移不修改持久化记录、共识或 Gremlin 语义。
 

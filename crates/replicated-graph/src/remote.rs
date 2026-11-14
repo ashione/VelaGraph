@@ -1,18 +1,16 @@
-//! Bounded plaintext TCP D1 transport for trusted development networks only.
+//! Bounded typed gRPC D1 transport for trusted development networks only.
 //! No authentication, TLS, forwarding or mutation replay is provided. Only read
 //! quorum confirmation has bounded retry within the original deadline. Managed write activation
 //! is an explicit irreversible protocol transition, not an authorization boundary.
-//! Ordinary connections carry one request/response. Opt-in hierarchy channels
-//! reuse a bounded, sequential connection tied to one fixed query session.
+//! HTTP/2 channels carry typed operations; no legacy protocol detection or fallback.
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use d2_raft::{D1Command, D1Error, D1Result, D1WriteRequest, LogCommand, StateMachine, TypeConfig};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{watch, Semaphore},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
     time::Instant,
 };
 
@@ -131,10 +129,6 @@ enum Operation {
         shard: u64,
     },
     QueryFragment(distributed::FragmentRequest),
-    OpenHierarchyChannel {
-        version: u32,
-        request: distributed::FragmentRequest,
-    },
     CloseQuery {
         descriptor: distributed::Descriptor,
     },
@@ -247,287 +241,37 @@ impl GraphState {
     }
 }
 
-/// Explicit legacy TCP adapter for library/parity callers. Construct GraphState
-/// and a typed gRPC adapter instead for a graph node without a legacy listener.
-/// Shutdown cancels/joins handlers; submitted Raft writes may still commit.
+/// Typed graph RPC convenience adapter. No legacy listener or protocol fallback.
+/// The shared state keeps the same session/admission budgets as explicit adapters.
 pub struct GraphService {
     shared: GraphState,
-    address: SocketAddr,
-    stop: watch::Sender<bool>,
-    task: Option<JoinHandle<()>>,
+    transport: grpc::GrpcSnapshotService,
 }
 impl std::ops::Deref for GraphService {
     type Target = GraphState;
-    fn deref(&self) -> &GraphState {
-        &self.shared
-    }
+    fn deref(&self) -> &GraphState { &self.shared }
 }
 impl GraphService {
-    pub async fn start(
-        node: &d2_raft::tcp::TcpNode,
-        bind: SocketAddr,
-        shard: u64,
-        deadline: Duration,
-    ) -> Result<Self, RemoteError> {
+    pub async fn start(node: &d2_raft::tcp::TcpNode, bind: SocketAddr,
+        shard: u64, deadline: Duration) -> Result<Self, RemoteError> {
         Self::start_identified(node, bind, 0, shard, deadline).await
     }
-
-    /// Bind graph RPC identity. Nonzero groups require identified requests.
-    /// Separate Raft groups must still use independently configured TCP peers.
-    pub async fn start_identified(
-        node: &d2_raft::tcp::TcpNode,
-        bind: SocketAddr,
-        group: u64,
-        shard: u64,
-        deadline: Duration,
-    ) -> Result<Self, RemoteError> {
-        Self::start_parts(
-            node.id,
-            node.raft.clone(),
-            node.state_machine.clone(),
-            bind,
-            group,
-            shard,
-            deadline,
-        )
-        .await
+    pub async fn start_identified(node: &d2_raft::tcp::TcpNode, bind: SocketAddr,
+        group: u64, shard: u64, deadline: Duration) -> Result<Self, RemoteError> {
+        let shared = GraphState::from_tcp(node, group, shard, deadline)?;
+        let transport = grpc::GrpcSnapshotService::start(&shared, bind).await?;
+        Ok(Self { shared, transport })
     }
-
-    /// Serve the exact same Raft/state handle as a managed-RPC endpoint. The
-    /// caller fixes both ports and identities in trusted server configuration.
-    /// This adds neither authentication nor automatic endpoint discovery.
-    pub async fn start_managed(
-        node: &d2_raft::NodeHandle,
-        bind: SocketAddr,
-        group: u64,
-        shard: u64,
-        deadline: Duration,
-    ) -> Result<Self, RemoteError> {
-        if group != node.group_id() {
-            return Err(RemoteError::InvalidArgument);
-        }
-        Self::start_parts(
-            node.id,
-            node.raft.clone(),
-            node.state_machine.clone(),
-            bind,
-            group,
-            shard,
-            deadline,
-        )
-        .await
+    pub async fn start_managed(node: &d2_raft::NodeHandle, bind: SocketAddr,
+        group: u64, shard: u64, deadline: Duration) -> Result<Self, RemoteError> {
+        let shared = GraphState::from_managed(node, group, shard, deadline)?;
+        let transport = grpc::GrpcSnapshotService::start(&shared, bind).await?;
+        Ok(Self { shared, transport })
     }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn start_parts(
-        node: u64,
-        raft: openraft::Raft<TypeConfig>,
-        state: Arc<StateMachine>,
-        bind: SocketAddr,
-        group: u64,
-        shard: u64,
-        deadline: Duration,
-    ) -> Result<Self, RemoteError> {
-        let shared =
-            GraphState::from_parts(node, raft.clone(), state.clone(), group, shard, deadline)?;
-        let identity = shared.identity;
-        let listener = TcpListener::bind(bind)
-            .await
-            .map_err(|_| RemoteError::Unavailable)?;
-        let address = listener
-            .local_addr()
-            .map_err(|_| RemoteError::Unavailable)?;
-        let worker_sessions = shared.sessions.clone();
-        let query_sessions = shared.query_sessions.clone();
-        let (stop, mut stopped) = watch::channel(false);
-        let admission = shared.admission.clone();
-        let task = tokio::spawn(async move {
-            let sessions = worker_sessions;
-            let mut cleanup = tokio::time::interval(Duration::from_millis(100));
-            let mut handlers = JoinSet::new();
-            loop {
-                while let Some(result) = handlers.try_join_next() {
-                    if let Err(error) = result {
-                        diagnostic::failure(format_args!(
-                            "phase=handler_join panic={} cancelled={}",
-                            error.is_panic(),
-                            error.is_cancelled()
-                        ));
-                    }
-                }
-                let accepted = tokio::select! {
-                    _ = stopped.changed() => break,
-                    _ = cleanup.tick() => { sessions.expire(); query_sessions.expire(); continue; },
-                    result = handlers.join_next(), if !handlers.is_empty() => { if let Some(Err(error)) = result { diagnostic::failure(format_args!("phase=handler_join panic={} cancelled={}", error.is_panic(), error.is_cancelled())); } continue; },
-                    result = listener.accept() => result,
-                };
-                let Ok((mut socket, peer)) = accepted else {
-                    break;
-                };
-                let Ok(permit) = admission.clone().try_acquire_owned() else {
-                    diagnostic::failure(format_args!(
-                        "phase=server_admission peer={peer} reason=resource_exhausted"
-                    ));
-                    continue;
-                };
-                let raft = raft.clone();
-                let state = state.clone();
-                let sessions = sessions.clone();
-                let query_sessions = query_sessions.clone();
-                let end = Instant::now() + deadline;
-                handlers.spawn(async move {
-                    let _permit = permit;
-                    let request =
-                        match tokio::time::timeout_at(end, read_frame::<Request>(&mut socket, end))
-                            .await
-                        {
-                            Ok(Ok(request)) => request,
-                            _ => {
-                                diagnostic::failure(format_args!(
-                                    "phase=server_request_read peer={peer} expired={}",
-                                    Instant::now() >= end
-                                ));
-                                return;
-                            }
-                        };
-                    let op = diagnostic::operation(&request.operation);
-                    let request = match request {
-                        Request {
-                            version: VERSION,
-                            identity: Some(expected),
-                            operation: Operation::OpenHierarchyChannel { version, request },
-                        } if expected == identity => {
-                            let _ = distributed::channel::serve(
-                                socket,
-                                state,
-                                query_sessions,
-                                (identity, shard),
-                                version,
-                                request,
-                                (end, deadline),
-                            )
-                            .await;
-                            return;
-                        }
-                        request => request,
-                    };
-                    // A query's shorter budget also governs response encoding and
-                    // sending; it cannot regain the longer connection deadline.
-                    let end = match &request.operation {
-                        Operation::Query(query) if (1..=5000).contains(&query.timeout_millis) => {
-                            end.min(Instant::now() + Duration::from_millis(query.timeout_millis))
-                        }
-                        Operation::OpenQuery { timeout_millis, .. }
-                            if (1..=5000).contains(timeout_millis) =>
-                        {
-                            end.min(Instant::now() + Duration::from_millis(*timeout_millis))
-                        }
-                        Operation::OpenFixedQuery(request)
-                            if (1..=5000).contains(&request.acquire_timeout_millis) =>
-                        {
-                            end.min(
-                                Instant::now()
-                                    + Duration::from_millis(request.acquire_timeout_millis),
-                            )
-                        }
-                        Operation::OpenRenewableFixedQuery(request)
-                            if (1..=5000).contains(&request.open.acquire_timeout_millis) =>
-                        {
-                            end.min(
-                                Instant::now()
-                                    + Duration::from_millis(request.open.acquire_timeout_millis),
-                            )
-                        }
-                        Operation::OpenHierarchyQuery { .. } => {
-                            end.min(Instant::now() + Duration::from_secs(5))
-                        }
-                        _ => end,
-                    };
-                    // Dropping the waiting future at the deadline does not undo
-                    // a command already submitted to Raft.
-                    if Instant::now() >= end {
-                        diagnostic::failure(format_args!(
-                            "phase=server_before_execute op={op} peer={peer} expired=true"
-                        ));
-                        return;
-                    }
-                    let result = match tokio::time::timeout_at(
-                        end,
-                        execute(
-                            raft,
-                            state,
-                            identity,
-                            shard,
-                            request,
-                            (sessions, query_sessions),
-                            end,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            diagnostic::failure(format_args!(
-                                "phase=server_execute op={op} peer={peer} reason=deadline"
-                            ));
-                            return;
-                        }
-                    };
-                    if let Err(error) = &result {
-                        diagnostic::failure(format_args!(
-                            "phase=server_execute op={op} peer={peer} reason={}",
-                            diagnostic::kind(error)
-                        ));
-                    }
-                    let response = Response {
-                        version: VERSION,
-                        result,
-                    };
-                    match tokio::time::timeout_at(end, write_frame(&mut socket, &response, end))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => diagnostic::failure(format_args!(
-                            "phase=server_response op={op} peer={peer} reason={}",
-                            diagnostic::kind(&error)
-                        )),
-                        Err(_) => diagnostic::failure(format_args!(
-                            "phase=server_response op={op} peer={peer} reason=deadline"
-                        )),
-                    }
-                });
-            }
-            handlers.abort_all();
-            while handlers.join_next().await.is_some() {}
-        });
-        Ok(Self {
-            shared,
-            address,
-            stop,
-            task: Some(task),
-        })
-    }
-    /// Local diagnostic counters; not a remote administration endpoint.
-    pub fn snapshot_stats(&self) -> SnapshotStats {
-        self.sessions.stats()
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.address
-    }
-    /// Stop accepting and cancel/join connection handlers. Already submitted
-    /// Raft commands may still commit; retain original write identities.
-    pub async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-impl Drop for GraphService {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
-    }
+    pub fn snapshot_stats(&self) -> SnapshotStats { self.shared.snapshot_stats() }
+    pub fn local_addr(&self) -> SocketAddr { self.transport.local_addr() }
+    /// Submitted Raft commands may still commit after shutdown.
+    pub async fn shutdown(self) { self.transport.shutdown().await; }
 }
 
 async fn execute(
@@ -564,7 +308,6 @@ async fn execute(
         Operation::Managed(request) => managed::handle(raft, state, shard, request)
             .await
             .map(Reply::Managed),
-        Operation::OpenHierarchyChannel { .. } => Err(RemoteError::InvalidArgument),
         Operation::OpenFixedQuery(request) => {
             request.validate(shard)?;
             // Start the node lease before preflight/barrier/capture, never afterwards.
@@ -802,15 +545,9 @@ fn validate_write(request: &D1WriteRequest) -> Result<(), RemoteError> {
 }
 
 /// Fetch a bounded whole-shard snapshot; does not follow leader hints.
-pub async fn snapshot(
-    endpoint: SocketAddr,
-    shard: u64,
-    deadline: Duration,
-) -> Result<RemoteSnapshot, RemoteError> {
-    snapshot_with_identity(endpoint, None, shard, deadline).await
-}
 
-/// Identified variant of [`snapshot`]; validates the configured group and node.
+
+/// Validate the configured group and node for a bounded whole-shard copy.
 pub async fn snapshot_identified(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
@@ -826,7 +563,7 @@ async fn snapshot_with_identity(
     shard: u64,
     deadline: Duration,
 ) -> Result<RemoteSnapshot, RemoteError> {
-    match rpc(
+    match typed_operation(
         endpoint,
         identity,
         Operation::Snapshot { shard },
@@ -855,15 +592,9 @@ async fn snapshot_with_identity(
 }
 /// Check local applied metadata for a pinned view. This is not a leader read
 /// barrier and provides the same local-epoch check as the in-process adapter.
-pub async fn metadata(
-    endpoint: SocketAddr,
-    shard: u64,
-    deadline: Duration,
-) -> Result<(u64, u64, u64), RemoteError> {
-    metadata_with_identity(endpoint, None, shard, deadline).await
-}
 
-/// Identified variant of [`metadata`]; validates the configured group and node.
+
+/// Fetch metadata with the configured group and node.
 pub async fn metadata_identified(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
@@ -879,7 +610,7 @@ async fn metadata_with_identity(
     shard: u64,
     deadline: Duration,
 ) -> Result<(u64, u64, u64), RemoteError> {
-    match rpc(
+    match typed_operation(
         endpoint,
         identity,
         Operation::Metadata { shard },
@@ -896,15 +627,9 @@ async fn metadata_with_identity(
 }
 /// Submit exact immutable D1 bytes/identity once. Preserve a copy before calling:
 /// timeout, disconnect, or unavailable responses may have an unknown outcome.
-pub async fn write(
-    endpoint: SocketAddr,
-    request: D1WriteRequest,
-    deadline: Duration,
-) -> Result<D1Result, RemoteError> {
-    write_with_identity(endpoint, None, request, deadline).await
-}
 
-/// Identified variant of [`write`]; validates the configured group and node.
+
+/// Write with the configured group and node and original request identity.
 pub async fn write_identified(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
@@ -922,7 +647,7 @@ async fn write_with_identity(
 ) -> Result<D1Result, RemoteError> {
     validate_write(&request)?;
     let id = request.request_id;
-    match rpc(
+    match typed_operation(
         endpoint,
         identity,
         Operation::Write(request),
@@ -942,7 +667,7 @@ pub async fn probe_identified(
     shard: u64,
     deadline: Duration,
 ) -> Result<(), RemoteError> {
-    match rpc(
+    match typed_operation(
         endpoint,
         Some(identity),
         Operation::Probe { shard },
@@ -967,7 +692,9 @@ fn checked_deadline(duration: Duration, id: Option<[u8; 16]>) -> Result<Instant,
         .checked_add(duration)
         .ok_or(RemoteError::InvalidArgument)
 }
-async fn rpc(
+/// Single-operation typed client. Lazy connection ensures admission precedes
+/// any handshake; an absolute cap covers construction, transport and decoding.
+async fn typed_operation(
     endpoint: SocketAddr,
     identity: Option<RemoteIdentity>,
     operation: Operation,
@@ -975,87 +702,15 @@ async fn rpc(
     id: Option<[u8; 16]>,
 ) -> Result<Reply, RemoteError> {
     let end = checked_deadline(duration, id)?;
-    let op = diagnostic::operation(&operation);
-    let response_limit = if matches!(
-        &operation,
-        Operation::Query(_)
-            | Operation::OpenQuery { .. }
-            | Operation::OpenHierarchyQuery { .. }
-            | Operation::OpenHierarchyChannel { .. }
-            | Operation::FixedQueryFragment(_)
-            | Operation::CloseFixedQuery { .. }
-            | Operation::QueryFragment(_)
-            | Operation::CloseQuery { .. }
-    ) {
-        query::MAX_QUERY_RESPONSE_BYTES + 1024
-    } else {
-        MAX_FRAME_BYTES
-    };
-    let _permit = CLIENT_ADMISSION
-        .try_acquire()
-        .map_err(|_| RemoteError::ResourceExhausted)?;
-    tokio::time::timeout_at(end, async {
-        let mut stream = TcpStream::connect(endpoint).await.map_err(|e| {
-            diagnostic::failure(format_args!(
-                "phase=connect op={op} peer={endpoint} io_kind={:?} os={:?}",
-                e.kind(),
-                e.raw_os_error()
-            ));
-            RemoteError::Unavailable
-        })?;
-        write_frame(
-            &mut stream,
-            &Request {
-                version: VERSION,
-                identity,
-                operation,
-            },
-            end,
-        )
-        .await?;
-        let response: Response = read_frame_limited(&mut stream, end, response_limit).await?;
-        if response.version != VERSION {
-            return Err(RemoteError::Protocol);
-        }
-        response.result
-    })
-    .await
-    .unwrap_or(Err(RemoteError::Timeout { request_id: id }))
-    .map_err(|error| {
-        diagnostic::failure(format_args!(
-            "phase=client_rpc op={op} peer={endpoint} reason={}",
-            diagnostic::kind(&error)
-        ));
-        match error {
-            RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
-            other => other,
-        }
+    let identity = identity.ok_or(RemoteError::InvalidArgument)?;
+    let mut client = operations_grpc::Client::connect_lazy(endpoint, identity, duration)?
+        .with_deadline(end);
+    Box::pin(client.call(operation)).await.map_err(|error| match error {
+        RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
+        other => other,
     })
 }
 
-struct BoundedWriter(Vec<u8>, Instant);
-impl io::Write for BoundedWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if Instant::now() >= self.1 {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
-        }
-        if bytes.len() > MAX_FRAME_BYTES.saturating_sub(self.0.len()) {
-            return Err(io::Error::other("frame limit"));
-        }
-        let needed = self.0.len() + bytes.len();
-        if needed > self.0.capacity() {
-            let capacity = needed
-                .max(self.0.capacity().saturating_mul(2))
-                .min(MAX_FRAME_BYTES);
-            self.0.reserve_exact(capacity - self.0.len());
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 // Preserve the caller's stack, deadline and permits while allowing the
 // multithread runtime to replace its worker during bounded JSON CPU work.
 fn blocking_json<T>(work: impl FnOnce() -> T) -> T {
@@ -1071,125 +726,11 @@ fn blocking_json<T>(work: impl FnOnce() -> T) -> T {
     }
 }
 
-// Tiny frames have a fixed, conservative CPU-input bound. Avoid handing off a
-// runtime worker for these short parses; larger frames retain the blocking
-// boundary. This is a byte threshold, independent of protocol or graph shape.
-const INLINE_JSON_BYTES: usize = 4096;
-fn decode_frame_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, serde_json::Error> {
-    if bytes.len() <= INLINE_JSON_BYTES {
-        serde_json::from_slice(bytes)
-    } else {
-        blocking_json(|| serde_json::from_slice(bytes))
-    }
-}
-
-async fn write_frame<T: Serialize>(
-    stream: &mut TcpStream,
-    value: &T,
-    end: Instant,
-) -> Result<(), RemoteError> {
-    let mut phase = diagnostic::Phase::new("encode", Some(stream), end);
-    let buffer = blocking_json(|| {
-        let mut buffer = BoundedWriter(Vec::new(), end);
-        {
-            let mut buffered = io::BufWriter::with_capacity(8192, &mut buffer);
-            serde_json::to_writer(&mut buffered, value)
-                .and_then(|()| io::Write::flush(&mut buffered).map_err(serde_json::Error::io))
-                .map_err(|_| {
-                    if Instant::now() >= end {
-                        RemoteError::Timeout { request_id: None }
-                    } else {
-                        RemoteError::ResourceExhausted
-                    }
-                })?;
-        }
-        Ok::<_, RemoteError>(buffer)
-    });
-    if buffer.is_err() {
-        phase.finish(&buffer);
-    }
-    let buffer = buffer?;
-    if Instant::now() >= end {
-        return Err(RemoteError::Timeout { request_id: None });
-    }
-    phase.stage("write_header");
-    stream.write_u32(buffer.0.len() as u32).await.map_err(|e| {
-        phase.io(&e);
-        RemoteError::Unavailable
-    })?;
-    phase.stage("write_body");
-    let result = stream.write_all(&buffer.0).await.map_err(|e| {
-        phase.io(&e);
-        RemoteError::Unavailable
-    });
-    phase.finish(&result);
-    result
-}
-async fn read_frame<T: DeserializeOwned>(
-    stream: &mut TcpStream,
-    end: Instant,
-) -> Result<T, RemoteError> {
-    read_frame_limited(stream, end, MAX_FRAME_BYTES).await
-}
-async fn read_frame_limited<T: DeserializeOwned>(
-    stream: &mut TcpStream,
-    end: Instant,
-    limit: usize,
-) -> Result<T, RemoteError> {
-    let mut phase = diagnostic::Phase::new("read_header", Some(stream), end);
-    let size = stream.read_u32().await.map_err(|e| {
-        phase.io(&e);
-        RemoteError::Unavailable
-    })? as usize;
-    if size == 0 || size > limit {
-        phase.finish(&Err::<(), _>(RemoteError::ResourceExhausted));
-        return Err(RemoteError::ResourceExhausted);
-    }
-    let mut bytes = vec![0; size];
-    phase.stage("read_body");
-    stream.read_exact(&mut bytes).await.map_err(|e| {
-        phase.io(&e);
-        RemoteError::Unavailable
-    })?;
-    if Instant::now() >= end {
-        return Err(RemoteError::Timeout { request_id: None });
-    }
-    phase.stage("decode");
-    let result = decode_frame_json(&bytes).map_err(|_| RemoteError::Protocol);
-    if Instant::now() >= end {
-        return Err(RemoteError::Timeout { request_id: None });
-    }
-    phase.finish(&result);
-    result
-}
-
 #[cfg(test)]
-mod frame_decode_tests;
-#[cfg(test)]
-mod frame_scheduler_probe;
-
+mod raw_test_peer;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bounded_encoding_and_strict_requests() {
-        let mut writer = BoundedWriter(
-            vec![0; MAX_FRAME_BYTES - 1],
-            Instant::now() + Duration::from_secs(5),
-        );
-        assert!(io::Write::write_all(&mut writer, &[1, 2]).is_err());
-        assert_eq!(writer.0.len(), MAX_FRAME_BYTES - 1);
-        assert!(serde_json::from_str::<Request>(
-            r#"{"version":1,"operation":{"Snapshot":{"shard":7,"extra":1}}}"#
-        )
-        .is_err());
-        assert!(serde_json::from_str::<Request>(
-            r#"{"version":1,"operation":{"Activate":{"shard":7,"epoch":1}}}"#
-        )
-        .is_err());
-    }
-
     #[tokio::test]
     async fn every_operation_checks_group_and_node_before_execution() {
         let dir = tempfile::tempdir().unwrap();
@@ -1236,7 +777,7 @@ mod tests {
                 Operation::Write(request.clone()),
             ] {
                 assert!(matches!(
-                    rpc(endpoint, wrong, operation, Duration::from_secs(2), None).await,
+                    typed_operation(endpoint, wrong, operation, Duration::from_secs(2), None).await,
                     Err(RemoteError::InvalidArgument)
                 ));
             }
@@ -1317,355 +858,31 @@ mod tests {
         node.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn oversized_frame_rejected_before_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.write_u32(MAX_FRAME_BYTES as u32 + 1).await.unwrap();
-        });
-        let mut stream = TcpStream::connect(address).await.unwrap();
-        assert!(matches!(
-            read_frame::<Response>(&mut stream, Instant::now() + Duration::from_secs(5)).await,
-            Err(RemoteError::ResourceExhausted)
-        ));
-        task.await.unwrap();
-    }
 
+    #[tokio::test]
+    async fn oversized_response_rejected_before_body() {
+        let (address, seen, task) = raw_test_peer::spawn(Some(MAX_FRAME_BYTES + 1)).await;
+        let result = metadata_identified(address, RemoteIdentity { group: 10, node: 1 }, 7, Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
+        assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
+        task.abort();
+    }
     #[tokio::test]
     async fn stalled_response_keeps_original_write_identity() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let _: Request = read_frame(&mut socket, Instant::now() + Duration::from_secs(5))
-                .await
-                .unwrap();
-            socket.write_all(&[0, 0]).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
-        let request = D1WriteRequest {
-            shard: 7,
-            epoch: 1,
-            request_id: [9; 16],
-            expected_sequence: Some(0),
-            operations: vec![d2_raft::WriteOp::Put {
-                key: vec![1],
-                value: vec![2],
-            }],
-        };
-        assert!(matches!(
-            write(address, request, Duration::from_millis(100)).await,
-            Err(RemoteError::Timeout {
-                request_id: Some([9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9])
-            })
-        ));
+        let (address, seen, task) = raw_test_peer::spawn(None).await;
+        let request = D1WriteRequest { shard: 7, epoch: 1, request_id: [9; 16], expected_sequence: Some(0),
+            operations: vec![d2_raft::WriteOp::Put { key: vec![1], value: vec![2] }] };
+        let result = write_identified(address, RemoteIdentity { group: 10, node: 1 }, request, Duration::from_millis(500)).await;
+        let frame = tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
+        use prost::Message;
+        assert_eq!(frame[0], 0);
+        assert_eq!(u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize, frame.len() - 5);
+        let observed = operations_grpc::wire::Request::decode(&frame[5..]).unwrap();
+        let Some(operations_grpc::wire::request::Operation::Write(observed)) = observed.operation else { panic!("expected typed Write"); };
+        assert_eq!(observed.request_id, vec![9; 16]);
+        assert!(matches!(result, Err(RemoteError::Timeout { request_id: Some(id) }) if id == [9; 16]));
         task.abort();
     }
-    #[tokio::test]
-    async fn service_bounds_stalled_inputs_and_validates_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
-            id: 1,
-            raft_addr: "127.0.0.1:0".into(),
-            control_addr: "127.0.0.1:0".into(),
-            data_dir: dir.path().into(),
-        })
-        .await
-        .unwrap();
-        let service = GraphService::start(
-            &node,
-            "127.0.0.1:0".parse().unwrap(),
-            7,
-            Duration::from_millis(150),
-        )
-        .await
-        .unwrap();
-        let address = service.local_addr();
-        for prefix in [vec![0], vec![0, 0, 0, 100, b'{']] {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            stream.write_all(&prefix).await.unwrap();
-            let mut byte = [0];
-            let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(count, 0);
-        }
-        for (version, shard) in [(2, 7), (1, 8)] {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            write_frame(
-                &mut stream,
-                &Request {
-                    version,
-                    identity: None,
-                    operation: Operation::Snapshot { shard },
-                },
-                Instant::now() + Duration::from_secs(5),
-            )
-            .await
-            .unwrap();
-            let response: Response =
-                read_frame(&mut stream, Instant::now() + Duration::from_secs(5))
-                    .await
-                    .unwrap();
-            assert!(matches!(
-                response.result,
-                Err(RemoteError::Protocol | RemoteError::InvalidArgument)
-            ));
-        }
-        service.shutdown().await;
-        node.shutdown().await;
-    }
 }
-
-#[cfg(test)]
-mod scheduling_regression {
-    use super::*;
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn graph_frame_encoding_keeps_async_worker_available() {
-        struct GatedValue {
-            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        }
-        impl Serialize for GatedValue {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                self.entered
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap();
-                self.release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(2))
-                    .map_err(serde::ser::Error::custom)?;
-                serializer.serialize_u64(42)
-            }
-        }
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (mut server, _) = listener.accept().await.unwrap();
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (release, receiver) = std::sync::mpsc::channel();
-        let writer = tokio::spawn(async move {
-            write_frame(
-                &mut server,
-                &GatedValue {
-                    entered: std::sync::Mutex::new(Some(entered)),
-                    release: std::sync::Mutex::new(receiver),
-                },
-                Instant::now() + Duration::from_secs(5),
-            )
-            .await
-        });
-        let releaser = tokio::spawn(async move {
-            ready.await.unwrap();
-            release.send(()).unwrap();
-        });
-        writer.await.unwrap().unwrap();
-        releaser.await.unwrap();
-        assert_eq!(
-            read_frame::<u64>(&mut client, Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            42
-        );
-    }
-}
-
-#[cfg(test)]
-mod transport_boundary_tests {
-    use super::*;
-    async fn sockets() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        (client, server)
-    }
-    #[test]
-    fn frame_decode_matches_json_across_inline_boundary() {
-        for n in [
-            0,
-            1,
-            INLINE_JSON_BYTES - 3,
-            INLINE_JSON_BYTES - 2,
-            INLINE_JSON_BYTES - 1,
-            INLINE_JSON_BYTES,
-            INLINE_JSON_BYTES + 1,
-            8192,
-        ] {
-            let text = "x".repeat(n);
-            let bytes = serde_json::to_vec(&text).unwrap();
-            assert_eq!(decode_frame_json::<String>(&bytes).unwrap(), text);
-            let mut corrupt = bytes.clone();
-            corrupt.push(b'!');
-            assert!(decode_frame_json::<String>(&corrupt).is_err());
-        }
-        for value in [
-            serde_json::json!({"s":"\u{0000}\n雪🚀".repeat(1024)}),
-            serde_json::json!([null, true, i64::MIN, u64::MAX, 0.125]),
-        ] {
-            let bytes = serde_json::to_vec(&value).unwrap();
-            assert_eq!(
-                decode_frame_json::<serde_json::Value>(&bytes).unwrap(),
-                value
-            );
-        }
-        for invalid in [b"".as_slice(), b"null trailing", b"[", b"\xff"] {
-            assert!(decode_frame_json::<serde_json::Value>(invalid).is_err());
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frame_decode_matches_json_in_multithread_runtime() {
-        frame_decode_matches_json_across_inline_boundary();
-    }
-
-    #[test]
-    fn no_runtime_fallback() {
-        assert_eq!(blocking_json(|| 7), 7);
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn current_thread_compatibility_roundtrip() {
-        let (mut client, mut server) = sockets().await;
-        write_frame(&mut server, &42u64, Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            read_frame::<u64>(&mut client, Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            42
-        );
-    }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn exact_buffered_frame_cap_and_oversize_no_network_prefix() {
-        let (mut client, mut server) = sockets().await;
-        let payload = "x".repeat(MAX_FRAME_BYTES - 2);
-        let write = tokio::spawn(async move {
-            write_frame(
-                &mut server,
-                &payload,
-                Instant::now() + Duration::from_secs(10),
-            )
-            .await
-        });
-        let received = read_frame::<String>(&mut client, Instant::now() + Duration::from_secs(10))
-            .await
-            .unwrap();
-        assert_eq!(received.len(), MAX_FRAME_BYTES - 2);
-        write.await.unwrap().unwrap();
-        let (mut client, mut server) = sockets().await;
-        let result = write_frame(
-            &mut server,
-            &"x".repeat(MAX_FRAME_BYTES - 1),
-            Instant::now() + Duration::from_secs(10),
-        )
-        .await;
-        assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
-        drop(server);
-        let mut byte = [0u8];
-        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
-    }
-    struct LateEncode;
-    impl Serialize for LateEncode {
-        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            std::thread::sleep(Duration::from_millis(30));
-            s.serialize_u64(42)
-        }
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn late_small_buffer_encode_sends_no_prefix() {
-        let (mut client, mut server) = sockets().await;
-        assert!(matches!(
-            write_frame(
-                &mut server,
-                &LateEncode,
-                Instant::now() + Duration::from_millis(5)
-            )
-            .await,
-            Err(RemoteError::Timeout { .. })
-        ));
-        drop(server);
-        let mut byte = [0u8];
-        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
-    }
-    struct LateDecode;
-    impl<'de> serde::Deserialize<'de> for LateDecode {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let _ = <u64 as serde::Deserialize>::deserialize(d)?;
-            std::thread::sleep(Duration::from_millis(30));
-            Ok(Self)
-        }
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn post_decode_deadline_rejects_late_success() {
-        let (mut client, mut server) = sockets().await;
-        write_frame(&mut server, &42u64, Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_frame::<LateDecode>(&mut client, Instant::now() + Duration::from_millis(5)).await,
-            Err(RemoteError::Timeout { .. })
-        ));
-    }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn aborted_encoding_keeps_original_admission_until_work_finishes() {
-        struct Gate {
-            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        }
-        impl Serialize for Gate {
-            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                self.entered
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap();
-                self.release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(3))
-                    .map_err(serde::ser::Error::custom)?;
-                s.serialize_u64(42)
-            }
-        }
-        let (_client, mut server) = sockets().await;
-        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = permits.clone().acquire_owned().await.unwrap();
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (release, rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-            write_frame(
-                &mut server,
-                &Gate {
-                    entered: std::sync::Mutex::new(Some(entered)),
-                    release: std::sync::Mutex::new(rx),
-                },
-                Instant::now() + Duration::from_secs(5),
-            )
-            .await
-        });
-        ready.await.unwrap();
-        task.abort();
-        assert_eq!(permits.available_permits(), 0);
-        assert!(permits.try_acquire().is_err());
-        release.send(()).unwrap();
-        let _ = task.await;
-        assert_eq!(permits.available_permits(), 1);
-    }
-}
-
 #[cfg(test)]
 mod metadata_benchmark;
