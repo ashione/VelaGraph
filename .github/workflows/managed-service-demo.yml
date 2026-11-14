@@ -1,0 +1,63 @@
+name: Managed service clean startup
+on:
+  pull_request:
+    paths:
+      - 'crates/replicated-graph/**'
+      - 'crates/d2-raft/**'
+      - 'src/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'scripts/managed-service-demo.sh'
+      - '.github/workflows/managed-service-demo.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: managed-demo-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
+  RUST_BACKTRACE: "1"
+jobs:
+  clean-startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          test -n "$libclang_path" && test "$libclang_path" != .
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-no-debug-rust
+      - name: Record exact source
+        run: |
+          mkdir -p demo-evidence
+          git rev-parse HEAD HEAD^{tree} > demo-evidence/source.txt
+          rustc -Vv >> demo-evidence/source.txt
+      - name: Build actual demo and service
+        run: cargo build --locked -p replicated-graph --example managed_service_demo --bin graph-service
+      - name: Verify clean process startup and shutdown
+        env:
+          VELAGRAPH_MANAGED_DEMO_BIN: ${{ github.workspace }}/target/debug/examples/managed_service_demo
+          VELAGRAPH_REMOTE_EVIDENCE_DIR: ${{ github.workspace }}/demo-evidence
+        run: |
+          set -o pipefail
+          cargo test --locked -p replicated-graph --test managed_service_demo_process fresh_demo_write_query_reject_existing_and_stop_children -- --ignored --exact --nocapture 2>&1 | tee demo-evidence/test.log
+          grep -q '1 passed; 0 failed' demo-evidence/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: managed-demo-${{ github.run_id }}-${{ github.run_attempt }}
+          path: demo-evidence/
+          if-no-files-found: error
+          retention-days: 7
