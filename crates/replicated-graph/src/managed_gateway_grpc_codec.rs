@@ -166,6 +166,17 @@ pub(super) fn status(r: pb::WriteRequest) -> Result<Operation> {
 pub(super) fn abort(r: pb::WriteRequest) -> Result<Operation> {
     Ok(Operation::Abort(write(r)?))
 }
+// Preserve the public v1 DTO's early limit and error precedence. Only a
+// validated v2 domain request defers text limits to the original Gateway parser.
+fn inbound_query(q: pb::Query, c: &Option<pb::Context>) -> Result<Query> {
+    context(c)?;
+    if c.as_ref().is_some_and(|c| c.version == 1)
+        && q.text.len() > crate::remote::query::MAX_QUERY_TEXT_BYTES
+    {
+        return Err(Error::Capacity);
+    }
+    query(q)
+}
 pub(super) fn query(q: pb::Query) -> Result<Query> {
     // The bounded message envelope limits transport memory. The official
     // Gremlin parser owns its text/depth limits and exact query error taxonomy.
@@ -195,7 +206,7 @@ pub(super) fn open(r: pb::OpenRequest) -> Result<Operation> {
     if r.ttl_millis == 0 || r.ttl_millis > MAX_TTL.as_millis() as u64 {
         return Err(Error::Protocol);
     }
-    let query = query(required(r.query)?)?;
+    let query = inbound_query(required(r.query)?, &r.context)?;
     let page_size = size(r.page_size)?;
     if let Some(profile) = r.profile {
         let profile = decode_profile(profile)?;
@@ -238,7 +249,7 @@ pub(super) fn fetch(r: pb::FetchRequest) -> Result<Operation> {
     context(&r.context)?;
     Ok(Operation::FetchLocalQuery {
         session: session(required(r.session)?)?,
-        query: query(required(r.query)?)?,
+        query: inbound_query(required(r.query)?, &r.context)?,
         cursor: r
             .cursor
             .map(|c| {
@@ -510,7 +521,7 @@ pub(super) fn fixed_read(r: pb::FixedQueryRequest) -> Result<Operation> {
     context(&r.context)?;
     Ok(Operation::Read {
         session: fixed_session(required(r.session)?)?,
-        query: query(required(r.query)?)?,
+        query: inbound_query(required(r.query)?, &r.context)?,
     })
 }
 pub(super) fn fixed_traverse(r: pb::FixedQueryRequest) -> Result<Operation> {
@@ -518,7 +529,7 @@ pub(super) fn fixed_traverse(r: pb::FixedQueryRequest) -> Result<Operation> {
     context(&r.context)?;
     Ok(Operation::Traverse {
         session: fixed_session(required(r.session)?)?,
-        query: query(required(r.query)?)?,
+        query: inbound_query(required(r.query)?, &r.context)?,
     })
 }
 pub(super) fn fixed_page(r: pb::FixedPageRequest) -> Result<Operation> {
@@ -526,7 +537,7 @@ pub(super) fn fixed_page(r: pb::FixedPageRequest) -> Result<Operation> {
     context(&r.context)?;
     Ok(Operation::TraversePage {
         session: fixed_session(required(r.session)?)?,
-        query: query(required(r.query)?)?,
+        query: inbound_query(required(r.query)?, &r.context)?,
         cursor: r
             .cursor
             .map(|c| {
@@ -1055,7 +1066,7 @@ pub(super) fn job_start(r: pb::JobStartRequest) -> Result<Operation> {
     Ok(Operation::StartLocalQueryJob {
         operation_id: token(r.operation_id).map_err(|_| Error::Protocol)?,
         version: r.version,
-        query: query(required(r.query)?)?,
+        query: inbound_query(required(r.query)?, &r.context)?,
         page_size: size(r.page_size)?,
         policy: JobPolicy {
             idle_millis: p.idle_millis,
@@ -1091,7 +1102,7 @@ pub(super) fn job_fetch(r: pb::JobFetchRequest) -> Result<Operation> {
     context(&r.context)?;
     Ok(Operation::FetchLocalQueryJob {
         job: job(required(r.job)?)?,
-        query: query(required(r.query)?)?,
+        query: inbound_query(required(r.query)?, &r.context)?,
         cursor: r
             .cursor
             .map(|c| {
@@ -1595,4 +1606,164 @@ pub(super) fn preflight_identity<M: Identified>(mut message: M, binding: &Bindin
     });
     response_size(message)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod versioned_query_tests {
+    use super::*;
+
+    fn context_for(version: u32) -> Option<pb::Context> {
+        Some(pb::Context {
+            version,
+            timeout_millis: 1000,
+            identity: (version == 2).then(|| pb::CallIdentity {
+                request_id: vec![1; 16],
+                binding: Some(pb::Binding {
+                    authority_shard: 1,
+                    authority_mode: vec![2; 16],
+                    coordinator_shard: 1,
+                    coordinator_epoch: 1,
+                    members: vec![pb::BindingMember {
+                        shard: 2,
+                        epoch: 1,
+                        mode: vec![3; 16],
+                    }],
+                    capacity_profile: pb::CapacityProfile::LegacyCountV1 as i32,
+                    mapping: pb::Mapping::PartitionEqualsShardV1 as i32,
+                }),
+            }),
+        })
+    }
+
+    fn conversions(context: Option<pb::Context>, text: &str) -> [Result<Operation>; 7] {
+        let query = Some(pb::Query {
+            partition: 2,
+            text: text.into(),
+        });
+        let fixed = pb::FixedQueryRequest {
+            context: context.clone(),
+            session: Some(pb::FixedSession {
+                incarnation: vec![4; 16],
+                token: vec![5; 16],
+                version: 0,
+            }),
+            query: query.clone(),
+        };
+        [
+            open(pb::OpenRequest {
+                context: context.clone(),
+                read: Some(pb::ReadSelector {
+                    kind: Some(pb::read_selector::Kind::Latest(pb::Empty {})),
+                }),
+                ttl_millis: 1000,
+                query: query.clone(),
+                page_size: 1,
+                profile: None,
+            }),
+            fetch(pb::FetchRequest {
+                context: context.clone(),
+                session: Some(pb::Session {
+                    incarnation: vec![4; 16],
+                    token: vec![5; 16],
+                    version: 0,
+                }),
+                query: query.clone(),
+                cursor: None,
+                page_size: 1,
+            }),
+            fixed_read(fixed.clone()),
+            fixed_traverse(fixed.clone()),
+            fixed_page(pb::FixedPageRequest {
+                context: context.clone(),
+                session: fixed.session,
+                query: query.clone(),
+                cursor: None,
+                page_size: 1,
+            }),
+            job_start(pb::JobStartRequest {
+                context: context.clone(),
+                operation_id: vec![6; 16],
+                version: Some(0),
+                query: query.clone(),
+                page_size: 1,
+                policy: Some(pb::JobPolicy {
+                    idle_millis: 1000,
+                    execution_millis: 1000,
+                    lifetime_millis: 2000,
+                }),
+            }),
+            job_fetch(pb::JobFetchRequest {
+                context,
+                job: Some(pb::JobHandle {
+                    incarnation: vec![4; 16],
+                    token: vec![5; 16],
+                }),
+                query,
+                cursor: None,
+                page_size: 1,
+            }),
+        ]
+    }
+
+    #[test]
+    fn all_seven_inbound_queries_preserve_versioned_text_policy() {
+        let limit = crate::remote::query::MAX_QUERY_TEXT_BYTES;
+        let oversized = "x".repeat(limit + 1);
+        for (index, result) in conversions(context_for(1), &oversized)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(result, Err(Error::Capacity), "v1 entry {index}");
+        }
+        for (index, result) in conversions(context_for(2), &oversized)
+            .into_iter()
+            .enumerate()
+        {
+            assert!(result.is_ok(), "v2 entry {index}: {result:?}");
+        }
+        for version in [1, 2] {
+            for result in conversions(context_for(version), &"x".repeat(limit)) {
+                assert!(result.is_ok());
+            }
+        }
+        for context in [None, context_for(3)] {
+            for result in conversions(context, &oversized) {
+                assert_eq!(result, Err(Error::Protocol));
+            }
+        }
+        let mut invalid_v2 = context_for(2);
+        invalid_v2.as_mut().unwrap().identity = None;
+        let mut invalid_v1 = context_for(2);
+        invalid_v1.as_mut().unwrap().version = 1;
+        for context in [invalid_v1, invalid_v2] {
+            for result in conversions(context, &oversized) {
+                assert_eq!(result, Err(Error::Protocol));
+            }
+        }
+    }
+
+    #[test]
+    fn v1_text_capacity_still_precedes_later_page_validation() {
+        for version in [1, 2] {
+            let request = pb::OpenRequest {
+                context: context_for(version),
+                read: Some(pb::ReadSelector {
+                    kind: Some(pb::read_selector::Kind::Latest(pb::Empty {})),
+                }),
+                ttl_millis: 1000,
+                query: Some(pb::Query {
+                    partition: 2,
+                    text: "x".repeat(crate::remote::query::MAX_QUERY_TEXT_BYTES + 1),
+                }),
+                page_size: 0,
+                profile: None,
+            };
+            let expected = if version == 1 {
+                Error::Capacity
+            } else {
+                Error::Protocol
+            };
+            assert_eq!(open(request), Err(expected));
+        }
+    }
 }

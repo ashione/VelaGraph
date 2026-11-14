@@ -1343,14 +1343,14 @@ async fn fake_peer_mismatches_and_response_cap_fail_closed() {
             Duration::from_secs(2),
         )
         .await;
-        assert_eq!(
-            result,
-            Err(if test == 3 {
-                Error::Capacity
-            } else {
-                Error::Identity
-            })
-        );
+        // A short nonce is malformed framing, not a valid mismatched identity.
+        // The original JSON fixed-array decoder also classified this as Protocol.
+        let expected = match test {
+            3 => Error::Capacity,
+            5 => Error::Protocol,
+            _ => Error::Identity,
+        };
+        assert_eq!(result, Err(expected), "fake peer case {test}");
     }
 }
 
