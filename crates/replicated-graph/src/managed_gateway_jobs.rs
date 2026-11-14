@@ -556,7 +556,7 @@ impl State {
                 // Ready is transport-independent: retain the logical envelope
                 // check and also preflight every typed page before publication.
                 local::preflight(&binding, reply.clone())?;
-                grpc_codec::encode_job_fetch(&reply)?;
+                grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply)?, &binding)?;
             }
             worker.deadline()?;
             Ok(Arc::new(result))

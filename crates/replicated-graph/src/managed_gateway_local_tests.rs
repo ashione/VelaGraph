@@ -2058,3 +2058,82 @@ async fn public_grpc_zero_window_deadlines_release_shared_work_and_new_open() {
     }
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_profile_large_pages_preserve_v2_identity_and_reject_oversized_open() {
+    use prost::Message;
+    let _test = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    // Seed through the existing domain planner: these legal stored values are
+    // larger than a single public write request, not a larger write-wire budget.
+    let config = OwnedConfig::from(f.config());
+    let graph = config.graph();
+    let payload = "x".repeat(128 * 1024);
+    for id in [1, 2] {
+        let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+        let mut vertex = Vertex::new(id);
+        vertex.properties.insert("payload".into(), Value::Text(payload.clone()));
+        let plan = snapshot.prepare_vertex(7, &vertex).unwrap();
+        graph.execute(&plan).await.unwrap();
+    }
+    let operation = |text: &str| Operation::OpenLocalQueryWithProfile {
+        profile: LocalReadProfile::LocalRead8MiBV1,
+        version: None,
+        ttl_millis: 60_000,
+        query: Query { partition: 7, text: text.into() },
+        page_size: 3,
+    };
+    let first = call(&g, operation("g.V(1,2,1,2,1,2).values('payload')")).await.unwrap();
+    let Reply::OpenLocalQueryWithProfile { profile, session, query, page_size, page } = first.clone() else {
+        panic!("explicit profile reply was erased");
+    };
+    assert_eq!(profile, LocalReadProfile::LocalRead8MiBV1);
+    assert_eq!(page_size, 3);
+    assert_eq!(page.total, 6);
+    assert_eq!(page.offset, 0);
+    let identity = Some(public_proto::CallIdentity {
+        request_id: vec![255; 16],
+        binding: Some(grpc_client::encode_binding(&bound())),
+    });
+    let mut encoded = grpc_codec::encode_open(&first).unwrap();
+    encoded.identity = identity.clone();
+    assert!(encoded.encoded_len() > 384 * 1024);
+    assert!(encoded.encoded_len() <= MAX_RESPONSE_BYTES);
+    assert_eq!(encoded.profile, Some(grpc_codec::encode_profile(profile)));
+    let expected = |ids: &[u64]| ids.iter().map(|id| QueryRow::Value {
+        source: Some(crate::remote::query::QualifiedElement::Vertex { partition: 7, id: *id }),
+        value: Value::Text(payload.clone()),
+    }).collect::<Vec<_>>();
+    assert_eq!(page.data.rows, expected(&[1, 2, 1]));
+    let second = call(&g, Operation::FetchLocalQuery {
+        session: session.clone(), query: query.clone(), cursor: page.next.clone(), page_size: 3,
+    }).await.unwrap();
+    let Reply::FetchLocalQuery { session: returned, page: next, .. } = &second else { panic!("fetch reply"); };
+    assert_eq!(returned, &session);
+    assert_eq!(next.offset, 3);
+    assert_eq!(next.total, 6);
+    assert_eq!(next.next, None);
+    assert_eq!(next.data.rows, expected(&[2, 1, 2]));
+    let mut encoded = grpc_codec::encode_fetch(&second).unwrap();
+    encoded.identity = identity;
+    assert!(encoded.encoded_len() > 384 * 1024);
+    assert!(encoded.encoded_len() <= MAX_RESPONSE_BYTES);
+    call(&g, Operation::CloseLocalQuery { session }).await.unwrap();
+    assert!(g.state.local_sessions.lock().unwrap().is_empty());
+    assert_eq!(g.retained_payload_charge(), 0);
+    // Each individual page still fits. The complete bag exceeds the result
+    // budget, so even the first bounded page must never be published/retained.
+    assert_eq!(
+        call(&g, operation("g.V(1,2,1,2,1,2,1,2,1).values('payload')")).await,
+        Err(Error::Capacity)
+    );
+    assert!(g.state.local_sessions.lock().unwrap().is_empty());
+    assert_eq!(g.retained_payload_charge(), 0);
+    g.shutdown().await;
+    for graph in graphs { graph.shutdown().await; }
+    for server in servers { server.shutdown().await; }
+    drop(config);
+    f.stop().await;
+}

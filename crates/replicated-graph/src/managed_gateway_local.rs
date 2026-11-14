@@ -159,28 +159,32 @@ fn preflight_http_pages(
     }
     before_deadline(end)
 }
+// Prove all pages with the exact fixed-binding v2 identity envelope before any
+// first page is delivered. Even a v1 open may later be fetched by a v2 client.
+fn preflight_grpc_pages(
+    binding: &Binding,
+    session: &LocalSession,
+    result: &pages::Materialized,
+    end: Instant,
+) -> Result<()> {
+    for offset in (0..result.data.rows.len().max(1)).step_by(usize::from(result.size)) {
+        before_deadline(end)?;
+        let message = grpc_codec::encode_fetch(&Reply::FetchLocalQuery {
+            session: session.clone(), query: result.query.clone(),
+            cursor: result.cursors.get(&offset).cloned(), page_size: result.size,
+            page: result.page(offset),
+        })?;
+        grpc_codec::preflight_identity(message, binding)?;
+    }
+    before_deadline(end)
+}
 impl Retained {
-    pub(super) fn preflight_grpc(&self, end: Instant) -> Result<()> {
+    pub(super) fn preflight_grpc(&self, binding: &Binding, end: Instant) -> Result<()> {
         live(self, end)?;
-        if !self
-            .grpc_preflighted
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            for offset in
-                (0..self.result.data.rows.len().max(1)).step_by(usize::from(self.result.size))
-            {
-                before_deadline(end)?;
-                grpc_codec::encode_fetch(&Reply::FetchLocalQuery {
-                    session: self.descriptor.clone(),
-                    query: self.result.query.clone(),
-                    cursor: self.result.cursors.get(&offset).cloned(),
-                    page_size: self.result.size,
-                    page: self.result.page(offset),
-                })?;
-            }
+        if !self.grpc_preflighted.load(std::sync::atomic::Ordering::Acquire) {
+            preflight_grpc_pages(binding, &self.descriptor, &self.result, end)?;
             live(self, end)?;
-            self.grpc_preflighted
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.grpc_preflighted.store(true, std::sync::atomic::Ordering::Release);
         }
         live(self, end)
     }
@@ -788,5 +792,60 @@ mod http_boundary_tests {
             preflight_http_pages(&session, &result, Instant::now() + Duration::from_secs(5)),
             Err(Error::Capacity)
         );
+    }
+}
+
+#[cfg(test)]
+mod grpc_identity_boundary_tests {
+    use super::*;
+    use prost::Message;
+    use d2_raft::transaction_decisions::Member;
+
+    #[test]
+    fn later_page_identity_overhead_is_rejected_before_profile_first_delivery() {
+        // Synthetic encoder boundary, not a claim that query/result logical
+        // budgets admit this fixture. It isolates the protobuf envelope proof.
+        let binding = Binding {
+            authority: Authority { shard: 9, mode: [9; 16] },
+            cohort: Cohort { profile: Default::default(), coordinator_shard: 9, coordinator_epoch: 1,
+                members: vec![Member { shard: 7, epoch: 1, mode: [7; 16] }] },
+            mapping: Mapping::PartitionEqualsShardV1,
+        };
+        let session = LocalSession { incarnation: [1; 16], token: [2; 32], version: 1 };
+        let cursor = PageCursor { token: [3; 32] };
+        let result = |len: usize| pages::Materialized {
+            query: Query { partition: 7, text: "g.V(1,2).values('x')".into() }, size: 1,
+            data: QueryData { completeness: QueryCompleteness::Unverified, rows: vec![
+                QueryRow::Count(1), QueryRow::Value { source: None, value: Value::Text("x".repeat(len)) },
+            ] },
+            offsets: BTreeMap::from([(cursor.clone(), 1)]),
+            cursors: BTreeMap::from([(1, cursor.clone())]),
+        };
+        let later = |result: &pages::Materialized| Reply::FetchLocalQuery {
+            session: session.clone(), query: result.query.clone(), cursor: Some(cursor.clone()),
+            page_size: 1, page: result.page(1),
+        };
+        let (mut low, mut high) = (0, MAX_RESPONSE_BYTES);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if grpc_codec::encode_fetch(&later(&result(mid))).is_ok() { low = mid; } else { high = mid - 1; }
+        }
+        let result = result(low);
+        let bare = grpc_codec::encode_fetch(&later(&result)).unwrap();
+        assert!(bare.encoded_len() <= MAX_RESPONSE_BYTES);
+        assert_eq!(grpc_codec::preflight_identity(bare, &binding), Err(Error::Capacity));
+        let profile = Some(LocalReadProfile::LocalRead8MiBV1);
+        let first = grpc_codec::encode_open(&open_reply(profile, &session, &result)).unwrap();
+        grpc_codec::preflight_identity(first, &binding).unwrap();
+        let now = Instant::now();
+        let retained = Retained {
+            descriptor: session, requested_profile: profile, expires: now + Duration::from_secs(30),
+            _memory: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(), result,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            http_preflighted: std::sync::atomic::AtomicBool::new(false),
+            grpc_preflighted: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert_eq!(retained.preflight_grpc(&binding, now + Duration::from_secs(20)), Err(Error::Capacity));
+        assert!(!retained.grpc_preflighted.load(std::sync::atomic::Ordering::Acquire));
     }
 }

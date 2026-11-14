@@ -1492,3 +1492,12 @@ pub(super) fn identified_error(error: Error, identity: Option<pb::CallIdentity>)
     detail.identity = identity;
     tonic::Status::with_details(status.code(), status.message(), detail.encode_to_vec().into())
 }
+
+/// Every admitted page must fit a later v2 response on the same fixed binding.
+/// All valid nonces are exactly 16 bytes, so this has the exact identity size,
+/// independent of which request eventually fetches the retained page.
+pub(super) fn preflight_identity<M: Identified>(mut message: M, binding: &Binding) -> Result<()> {
+    *message.identity_mut() = Some(pb::CallIdentity { request_id: vec![255; 16], binding: Some(encode_binding(binding)) });
+    response_size(message)?;
+    Ok(())
+}

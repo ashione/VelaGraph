@@ -69,6 +69,9 @@ fn bounded(data: &QueryData) -> Result<()> {
 /// Request IDs are independent of result identity. Using maximal JSON byte
 /// representations here proves every future replay envelope fits the frame.
 fn preflight(binding: &Binding, reply: Reply) -> Result<()> {
+    if matches!(&reply, Reply::TraversePage { .. }) {
+        grpc_codec::preflight_identity(grpc_codec::encode_fixed_page(&reply)?, binding)?;
+    }
     encode(
         &Response {
             version: VERSION,

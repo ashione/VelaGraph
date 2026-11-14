@@ -143,8 +143,11 @@ pub(super) async fn request(address: SocketAddr, binding: Binding, operation: Op
                 Reply::FetchLocalQueryJob { job: codec::job(required(response.job)?)?, query: codec::query(required(response.query)?)?, cursor: decode_cursor(response.cursor)?, page_size: codec::size(response.page_size)?, version: response.version, page: decode_page(required(response.page)?)? }
             }
         };
-        remaining(end)?;
         let response = Response { version: VERSION, request_id, binding: original.binding.clone(), result: Ok(reply) };
+        // The typed wire may be more compact; keep the original logical reply
+        // budget even for a malicious peer returning highly escaped strings.
+        encode(&response, MAX_RESPONSE_BYTES)?;
+        remaining(end)?;
         validate_reply(&original, response)
     }).await.map_err(|_| Error::Unknown)?
 }

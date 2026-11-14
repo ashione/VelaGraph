@@ -178,10 +178,10 @@ impl Invocation {
         self.live()
     }
     pub(super) fn preflight_grpc(&self) -> Result<()> {
-        if let (Some(retained), Ok(Reply::OpenLocalQuery { .. } | Reply::FetchLocalQuery { .. })) =
+        if let (Some(retained), Ok(Reply::OpenLocalQuery { .. } | Reply::OpenLocalQueryWithProfile { .. } | Reply::FetchLocalQuery { .. })) =
             (&self.local_retained, &self.response.result)
         {
-            retained.preflight_grpc(self.end)?;
+            retained.preflight_grpc(&self.response.binding, self.end)?;
         }
         self.live()
     }
