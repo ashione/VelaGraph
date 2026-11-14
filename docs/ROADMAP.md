@@ -4,6 +4,22 @@
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
+## 当前状态核对（2026-11-14，main `30e6887`）
+
+本次纠偏跟踪 [#285](https://github.com/ashione/VelaGraph/issues/285)，承接已完成的
+#147 和 #280 文档审计；不是新建实现总目标。下表只列已合入基线的能力，不把待合并 PR 当成交付。
+
+| 能力 | 已合入证据 | 仍未完成的边界 |
+| --- | --- | --- |
+| typed managed jobs | #268 / [PR #271](https://github.com/ashione/VelaGraph/pull/271)，`ecf1b87`；Start/Get/Renew/Fetch/Cancel | 非重启后任务恢复；HTTP job parity 未交付 |
+| library 通信退役 | #273/#275/#277/#279；[通信审计](RPC_MIGRATION_STATUS.md) | public HTTP 有意保留；Go、标准错误详情互操作、升级和性能仍独立验收 |
+| 本地物理 checkpoint | [PR #194](https://github.com/ashione/VelaGraph/pull/194)，`c597459`；[双 DB 契约](PHYSICAL_CHECKPOINT.md) | 恢复仍为 `RESTORED_OFFLINE_ONLY`，#193 的 live restart/rejoin 未完成 |
+| 不可变 checkpoint 对象运输 | [已实现接口与验收范围](OBJECT_STORE_CHECKPOINT_API.md)，`crates/checkpoint-object-store` | 不是全局恢复、远程持久 ACK、对象存储权威或 temporal DB 备份 |
+
+#281/#283 的 Go/错误互操作与 #224/#284 的 clean-startup 在此基线尚未合入；
+#195/#282 负责命名及 README 清理，本文不抢改其文件。
+后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
+
 ## 当前完整交付：GraphService 旧协议退役
 
 [#278](https://github.com/ashione/VelaGraph/issues/278) 覆盖剩余 graph library
@@ -32,7 +48,7 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
   OpenHierarchy/Fragment/Close 已增加 typed gRPC 路径；[#248](https://github.com/ashione/VelaGraph/issues/248)
   增加 coordinator observed Query/Job typed gRPC 入口；#260 将 serve/query/jobs 默认统一为 typed RPC，
   退役 serve-grpc 与 --grpc CLI 选择；#264 删除对外 JSON/内部 gRPC 的混合
-  library 入口，差分测试改走真正 typed ingress，保留尚未替代的纯 legacy 语义；复用原执行器、
+  library 入口，当时差分测试改走真正 typed ingress；后续 #273/#275/#277/#279 已退役剩余旧 wire，复用原执行器、
   Jobs 状态机及累计预算。[#274](https://github.com/ashione/VelaGraph/issues/274) 将 coordinator library query/job/consistency
   全部迁到 typed gRPC，保留显式一致性协商和旧peer拒绝；graph/Gateway旧入口随后由 #276/#278 退役。
   [#229](https://github.com/ashione/VelaGraph/issues/229) 增加独立 fixed/renewable query
@@ -47,14 +63,14 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
   [#242](https://github.com/ashione/VelaGraph/issues/242) 将服务入口的 managed 与 graph
   路由固定为 gRPC，移除临时选择开关；[#244](https://github.com/ashione/VelaGraph/issues/244)
   将 Service 生命周期与旧 TCP listener 解耦，graph-service 只绑定配置的公开端口，
-  保留会话过期和 shutdown/drop 清理。旧 library/coordinator 入口仍须逐项
-  迁移或删除，不能将服务入口切换当作统一通信已完成。
+  保留会话过期和 shutdown/drop 清理。其后的 #273/#275/#277/#279 完成旧 library/coordinator
+  wire 退役；#218 仍跟踪跨语言、HTTP 功能面和服务契约验收。
 - **driver/control 切片**：[#251](https://github.com/ashione/VelaGraph/issues/251) 将 process-node
   --control 与 d2-ctl/send_control 的九项操作统一为 typed gRPC，复用原 handler、容量与 deadline，
   同端口替换旧 newline JSON，不保留自动 fallback；见 [control transport](CONTROL_GRPC.md)。
 - **单分片操作切片**：[#254](https://github.com/ashione/VelaGraph/issues/254) 为 Probe/Metadata/Write
-  增加 typed gRPC 服务与显式 CLI，复用原 handler、写入身份及容量边界。旧 catalog/routing adapter
-  和 GraphService listener 的完整迁移/退役仍是后续验收项，不能视为 #218 全部完成。
+  增加 typed gRPC 服务与显式 CLI，复用原 handler、写入身份及容量边界。后续 #256/#279
+  已迁移 catalog/routing adapter 和 GraphService listener；不等于 #218 全部完成。
 - **默认存储链与listener退役**：[#256](https://github.com/ashione/VelaGraph/issues/256) 将
   RemoteStorageNode/catalog/routing默认链、单分片server-query切到typed RPC；graph-node仅
   --graph一个typed入口，拒绝旧--grpc-snapshot双端口选项。旧wire专项测试使用test-only子进程
@@ -287,7 +303,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 
 - **交付物**：Raft 组、日志复制、快照、leader/follower 切换；副本放置策略。
 - **完成定义**：3 节点集群可写入；杀掉 leader 后 30 秒内恢复；重复/乱序消息测试通过。
-- **依赖**：D1；选型已定 openraft `=0.9.25`，见 [`D2_CONSENSUS.md`](D2_CONSENSUS.md)；三节点原型、多进程 TCP 验证已实现；节点使用 RocksDB `raft.db` 持久化日志与 `state.db` 不透明字节批次状态机，重启可恢复；`Suite::test_all` 已通过；D1 本地字节 `StorageNode` 适配已实现，图引擎接线仍待做。
+- **依赖**：D1；选型已定 openraft `=0.9.25`，见 [`D2_CONSENSUS.md`](D2_CONSENSUS.md)；三节点原型、多进程验证已实现（早期 TCP wire 后由 typed Raft/control gRPC 替换）；节点使用 RocksDB `raft.db` 持久化日志与 `state.db` 不透明字节批次状态机，重启可恢复；`Suite::test_all` 已通过；D1 本地字节 `StorageNode` 适配已实现，图引擎接线仍待做。
 
 - **应用语义切片**：版本化 `D1V1` 命令已复制 shard/epoch、request_id、expected sequence 与原子 data/sequence/dedup/applied marker；snapshot/restart 保留重试身份。详见 [`D2_D1_CONTRACT.md`](D2_D1_CONTRACT.md)。已有进程内 `StorageNode`/GraphRecordStore 接线，但未连接 GraphEngine；远程客户端和静态路由见 `REMOTE_ROUTING.md`，固定进程内路由见 D3a；无淘汰去重预算耗尽后明确拒绝新写，不能视为生产容量方案。
 
@@ -319,11 +335,18 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 - **完成定义**：可重复的集群部署；备份可恢复；核心 SLI 有仪表盘和告警。
 - **依赖**：D2–D5；在首个生产试点前完成最小集。
 
-### D6a 远程 checkpoint 与灾难恢复（未来设计，尚未实现）
+### D6a 远程 checkpoint 与灾难恢复（基础备份已实现，全局恢复待实现）
 
-先明确恢复契约，实施仍排在当前通用查询功能之后；本条目不引入云存储适配器，也不表示已有远程备份或恢复工具。
+**已实现**：#194 的本地双 DB 一致物理 checkpoint、manifest/完整性校验和新目录
+离线恢复；另有 `checkpoint-object-store` 不可变上传/下载、最后发布 manifest 和
+S3-compatible 集成验收。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
+[对象运输契约](OBJECT_STORE_CHECKPOINT_API.md)。这不是“尚无 checkpoint/上传工具”。
 
-- **三种能力分开验收**：Raft 副本用于组内复制，不能替代历史备份，也不能防止所有副本所在故障域丢失或错误写入被复制；本地状态机快照/未来 RocksDB checkpoint 是备份构件，和源数据同盘仍会一同丢失；远程备份须把一个可验证恢复集保存在独立故障域，并能脱离原机器恢复。当前 Raft 快照不等于已支持 RocksDB checkpoint 或对象存储备份。
+**仍待实现**：#193 安全 live restart/rejoin，#191 跨组认证恢复集/全局 READY 屏障、
+日志归档与对象存储权威。`RESTORED_OFFLINE_ONLY` 不得移除来伪造完成；temporal 第三 DB
+不在现有双 DB 备份中。以下条目是剩余全局恢复目标，不是对现有运输层的否定。
+
+- **三种能力分开验收**：Raft 副本用于组内复制，不能替代历史备份，也不能防止所有副本所在故障域丢失或错误写入被复制；本地状态机快照/已实现 RocksDB checkpoint 是备份构件，和源数据同盘仍会一同丢失；远程备份须把一个可验证恢复集保存在独立故障域，并能脱离原机器恢复。Raft 快照本身不等于完整灾难恢复；已实现的 checkpoint/对象运输也不证明跨片语义一致。
 - **首版先做协调停写恢复点**：关闭所有数据写入及 catalog/放置变更入口，排空或查明在途和未知结果操作；固定 catalog 与全部数据分片集合，记录各组已提交/已应用位置、应用 sequence、epoch 与格式版本，再捕获匹配的快照。不能分别复制运行中的 `raft.db`/`state.db` 文件并假定一致；后续不停写备份需要新的协调协议，不能暗中降级为逐片随意取快照。
 - **恢复集与发布协议**：同时覆盖 metadata/catalog、全部数据分片及必要的成员/版本/应用重试身份。每次备份使用不可变 generation；分片对象写入并核对大小/checksum 后，才原子发布唯一完整 manifest，列出所有对象、备份/集群身份、catalog revision、group/shard/epoch、applied log index/term、membership、格式版本和 D1 sequence/dedup 恢复位置。上传中断、缺片、混合 generation、校验失败或版本不兼容不得成为“可恢复”成功；checksum 只验证字节完整性，不证明跨片语义一致。
 - **独立故障域与保留**：远端位置、访问控制和备份保留策略须独立于被备份机器；源盘丢失或本地清理不能连带删除唯一恢复副本。具体存储服务、权限、费用、加密和删除策略在实施前另行确认；本路线图不授权配置账户或上传数据。
@@ -417,7 +440,7 @@ global concurrency quota or a heap/RSS hard limit.
 
 ### Same-host graph UDS gateway — retired (#262)
 
-移除旧 Linux UDS JSON listener/client，不保留隐式回退。进程内 RouteResolver 的固定视图、deadline、fencing 与资源回收继续保留并回归；对外服务使用已配置的 HTTP/gRPC managed API，其认证及一致性契约并非旧 UDS 的等价替代。迁移和测试覆盖见 `GRAPH_UDS_GATEWAY.md`。其他 legacy library TCP 路径仍由 #218 跟踪，本项不宣称全部通信迁移完成。
+移除旧 Linux UDS JSON listener/client，不保留隐式回退。进程内 RouteResolver 的固定视图、deadline、fencing 与资源回收继续保留并回归；对外服务使用已配置的 HTTP/gRPC managed API，其认证及一致性契约并非旧 UDS 的等价替代。迁移和测试覆盖见 `GRAPH_UDS_GATEWAY.md`。其他 legacy library wire 后续已由 #273/#275/#277/#279 退役；#218 的跨语言/服务门禁仍开放。
 
 ### D2 TCP resource safety
 
@@ -428,11 +451,12 @@ bounded. Oversized Raft batches retain openraft hints. Control remains
 unauthenticated and development-only, not production administration or D3
 completion. See `D2_TCP_LIMITS.md` and `CONTROL_GRPC.md`.
 
-### Functional remote graph prototype
+### Functional remote graph prototype (historical transport slice)
 
-A separate [development-only TCP graph adapter](REMOTE_GRAPH.md) connects normal
+The original [development-only TCP graph adapter](REMOTE_GRAPH.md) connects normal
 single-shard graph CRUD and client-side Gremlin to independently running Raft
-nodes. It uses bounded atomic snapshot copies and exact conditional D1 writes,
+nodes. That original TCP wire was subsequently replaced by typed gRPC (#279);
+the retained storage path uses bounded atomic snapshot copies and exact conditional D1 writes,
 not a server-side Gremlin protocol or remote D3 resolver. Crash/failover and
 network-partition validation of this new end-to-end graph path are deferred;
 this does not complete D3/D4/D5 or production transport security.
@@ -561,15 +585,17 @@ oracles on both smoke and 200,000-person fixtures.
 
 - Durable request admission foundation: atomically retain external-ID/canonical-command/complete-Plan/Begin with resolution reservation and exact restart recovery. The restricted typed managed network gateway and server-side same-version session registry below use this foundation.
 
-### Restricted managed gateway slice
+### Restricted managed gateway slice (historical transport slice)
 
-A separate trusted-network managed TCP facade now connects durable external request
+The original trusted-network managed TCP facade connected durable external request
 admission/recovery to server-owned managed graph handles and expiring certified
 fixed-version standard Gremlin read sessions through the existing official parser.
 Typed reads remain private execution plumbing. Real loopback tests cover transaction retry, partial
 apply, restart, identity and resource failure paths. This is not multi-host Raft
 placement, auth/TLS, remote GlobalCommittedSnapshot Gremlin, indexed MVCC, GC or
-full D4/D5 production completion. See [gateway contract](MANAGED_GRAPH_GATEWAY.md).
+full D4/D5 production completion. The facade wire was later retired in #277;
+the current library uses typed public RPC with the same domain contracts.
+See [gateway contract](MANAGED_GRAPH_GATEWAY.md).
 
 The gateway additionally supports bounded [conditional property patches](MANAGED_GRAPH_GATEWAY.md#conditional-property-patches) for vertices and edges.
 Exact stored-value conditions share the prepared snapshot and its original
@@ -579,8 +605,9 @@ than checking fresh state. This does not expand lifetime or snapshot capacity.
 ### Fixed remote managed-node transport
 
 The managed gateway can now pin coordinator and participant RPC endpoints in
-separate OS processes while retaining its original external protocol, durable
-request Plan and same-V Gremlin sessions. The local and remote paths share the
+separate OS processes while retaining its original durable
+request Plan and same-V Gremlin sessions. The original external wire was later
+replaced by typed RPC (#277); no legacy fallback remains. The local and remote paths share the
 complete-cohort acquisition algorithm and compare retained terminal-prefix
 evidence. Real child-process tests cover partial publication and persistent
 restart recovery. This is a trusted plaintext, static-placement single-replica
@@ -843,17 +870,21 @@ unproven, rather than inferred from these latency measurements.
 
 ### Typed managed job lifecycle (#268)
 
-The implementation candidate exposes the existing bounded job lifecycle via
+Merged [PR #271](https://github.com/ashione/VelaGraph/pull/271) (`ecf1b87`) delivered
+the existing bounded job lifecycle via
 ManagedQueryJobService Start/Get/Renew/Fetch/Cancel on the public endpoint. It
 reuses fixed-V workers and shared admission rather than introducing an executor.
 The exact contract, evidence matrix and non-goals remain in
-[MANAGED_QUERY_JOBS.md](MANAGED_QUERY_JOBS.md). Acceptance requires final-head
-CI and independent review; this is not completion of all #218 legacy retirement.
+[MANAGED_QUERY_JOBS.md](MANAGED_QUERY_JOBS.md). #268 acceptance is complete;
+future changes still require their own exact-head review and applicable checks.
+Jobs do not resume after gateway restart, and HTTP job parity remains open.
+The later #277/#279 retired legacy wires, not the remaining #218 service gates.
 
-### #276 — managed Gateway library transport retirement
+### #276 — managed Gateway library transport retirement (merged #277)
 
 - Preserve all domain operations, fixed binding/nonce verification and explicit
   bounded capture profiles through typed public RPC, not a JSON envelope.
 - Remove the replaced Gateway listener/client; retain intentional public HTTP.
 - Keep fault, cancellation, unknown-write, session/job and retained-history gates.
-- GraphService retirement remains separate; this slice does not complete #218.
+- GraphService retirement subsequently completed in #279; cross-language, HTTP
+  surface and compatibility/resource gates still keep #218 open.
