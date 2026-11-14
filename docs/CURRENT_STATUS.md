@@ -1,13 +1,12 @@
 # Current capability and work index
 
-Reviewed on **2026-11-13** with main baseline
-[`046488bf`](https://github.com/ashione/VelaGraph/commit/046488bfb7ffd603b4eb66d109ec53cf8d8fcaf0)
-and the #264 hybrid-coordinator retirement in this change. #259 default-storage
-RPC, #261 default coordinator CLI RPC and #263 Unix read gateway retirement are
-merged. See [graph library retirement](GRAPH_LIBRARY_GRPC.md) for the remaining migration candidate and its validation gates.
-This is an API and implementation index, not a new benchmark or an assertion that
-all milestone exit criteria have passed. Linked PRs/issues show later changes;
-the remaining outcomes below must not be inferred from a merged dependency slice.
+Reviewed on **2026-11-14** against main
+[`40e2b9a`](https://github.com/ashione/VelaGraph/commit/40e2b9a419ff941a58761f784c9c7fd500a6bf08).
+GraphService retirement #278 / #279 is merged after exact-head CI and full CoreHR,
+including retained 1025-write lifecycle verification. Supported inter-node and
+library network paths are typed gRPC; public HTTP is intentional. This is not
+completion of the #218 service/interoperability gates or production readiness.
+See the [current communication and evidence audit](RPC_MIGRATION_STATUS.md).
 
 ## Choose an entrypoint
 

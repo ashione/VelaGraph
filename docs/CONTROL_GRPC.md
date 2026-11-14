@@ -1,5 +1,12 @@
 # Process-node driver/control transport v1
 
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
 Tracking: [#251](https://github.com/ashione/VelaGraph/issues/251), part of [#218](https://github.com/ashione/VelaGraph/issues/218).
 
 The existing process-node `--control` endpoint and `d2-ctl`/`send_control` use
