@@ -169,8 +169,12 @@ async fn public_service_node_child() -> anyhow::Result<()> {
         .await?;
     }
     let managed = Server::bind(
-        node.clone(), identity(shard), "127.0.0.1:0".parse()?, BUDGET,
-    ).await?;
+        node.clone(),
+        identity(shard),
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
     let control = managed.local_addr();
     let graph = if shard != 9 {
         Some(
@@ -922,8 +926,13 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
         loop {
             let (mut socket, _) = old_control.accept().await.unwrap();
             let mut first = [0; 4];
-            if socket.read_exact(&mut first).await.is_err() { continue; }
-            assert_eq!(&first, b"PRI ", "must not retry using the retired JSON framing");
+            if socket.read_exact(&mut first).await.is_err() {
+                continue;
+            }
+            assert_eq!(
+                &first, b"PRI ",
+                "must not retry using the retired JSON framing"
+            );
             observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = socket.write_all(&[0, 0, 0, 2, b'{', b'}']).await;
         }
@@ -999,7 +1008,10 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
         );
     }
     assert!(attempts.load(std::sync::atomic::Ordering::Relaxed) > 0);
-    assert!(!rejection_peer.is_finished(), "legacy protocol fixture must observe no fallback");
+    assert!(
+        !rejection_peer.is_finished(),
+        "legacy protocol fixture must observe no fallback"
+    );
     rejection_peer.abort();
     let _ = rejection_peer.await;
     Ok(())

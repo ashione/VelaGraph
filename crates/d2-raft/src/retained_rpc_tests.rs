@@ -4,82 +4,65 @@ fn retained_target_fixture() -> TargetEvidence {
         Journal::decode(include_bytes!("../tests/fixtures/request-journal-v3.json")).unwrap();
     TargetEvidence::from_journal(&journal, [2; 16]).unwrap()
 }
-async fn fake_target_json(value: serde_json::Value) -> (Client, JoinHandle<()>) {
-    let result = serde_json::from_value(value).map(Value::Target).map_err(|_| Error::Protocol);
+async fn fake_target_wire(
+    mutate: impl Fn(&mut grpc::wire::TargetEvidence) + Send + Sync + 'static,
+) -> (Client, JoinHandle<()>) {
     typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
         assert!(matches!(request.operation, Operation::LookupTarget { id: [2, ..], .. }));
-        let result = result.clone();
-        Box::pin(async move { wire_reply(request, result) })
+        let mut reply = wire_reply(request, Ok(Value::Target(retained_target_fixture()))).unwrap();
+        let Some(grpc::wire::reply::Result::Value(value)) = &mut reply.result else { panic!("value reply") };
+        let Some(grpc::wire::value::Kind::Target(target)) = &mut value.kind else { panic!("target evidence") };
+        mutate(target);
+        Box::pin(async move { Ok(reply) })
     }).await
+}
+
+#[test]
+fn retained_target_local_domain_json_requires_explicit_optional_fields() {
+    // These are durable-domain JSON schema checks, not protobuf wire claims.
+    for path in [vec!["record"], vec!["record", "request"], vec!["record", "transaction", "decision"]] {
+        let mut value = serde_json::to_value(retained_target_fixture()).unwrap();
+        let mut parent = &mut value;
+        for key in &path[..path.len() - 1] { parent = &mut parent[*key]; }
+        parent.as_object_mut().unwrap().remove(path[path.len() - 1]);
+        assert!(serde_json::from_value::<TargetEvidence>(value).is_err());
+    }
 }
 
 #[tokio::test]
 async fn matching_target_envelopes_reject_structural_and_original_binding_substitution() {
     let _resources = test_resource_guard().await;
     let original = retained_target_fixture();
-    let value = serde_json::to_value(&original).unwrap();
-    let mut bad = Vec::new();
-    let mut v = value.clone();
-    v["id"] = serde_json::to_value([3; 16]).unwrap();
-    bad.push(v);
-    let mut v = value.clone();
-    v["cut"]["cohort"]["members"][0]["mode"] = serde_json::to_value([8; 16]).unwrap();
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["transaction"]["ordinal"] = 0.into();
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["transaction"]["ordinal"] = u64::MAX.into();
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["transaction"]["prepared"] = serde_json::json!([]);
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["transaction"]["prepared"] = serde_json::json!([false]);
-    v["record"]["transaction"]["decision"] = "Commit".into();
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["request"]["transaction_id"] = serde_json::to_value([4; 16]).unwrap();
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["request"]["id"] = serde_json::to_value([0; 16]).unwrap();
-    bad.push(v);
-    let mut v = value.clone();
-    v.as_object_mut().unwrap().remove("record");
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"].as_object_mut().unwrap().remove("request");
-    bad.push(v);
-    let mut v = value.clone();
-    v["record"]["transaction"]
-        .as_object_mut()
-        .unwrap()
-        .remove("decision");
-    bad.push(v);
-    let mut plan = crate::request_plans::Plan::decode(
-        &original
-            .record
-            .as_ref()
-            .unwrap()
-            .request
-            .as_ref()
-            .unwrap()
-            .payload,
-    )
-    .unwrap();
-    plan.authority.mode = [8; 16];
-    let mut v = value.clone();
-    v["record"]["request"]["payload"] = serde_json::to_value(plan.encode().unwrap()).unwrap();
-    bad.push(v);
-    for (index, value) in bad.into_iter().enumerate() {
-        let (client, peer) = fake_target_json(value).await;
+    for index in 0..11 {
+        let (client, peer) = fake_target_wire(move |target| {
+            match index {
+                0 => target.id = vec![3; 16],
+                1 => target.cut.as_mut().unwrap().cohort.as_mut().unwrap().members[0].mode = vec![8; 16],
+                2 => target.record.as_mut().unwrap().transaction.as_mut().unwrap().ordinal = 0,
+                3 => target.record.as_mut().unwrap().transaction.as_mut().unwrap().ordinal = u64::MAX,
+                4 => target.record.as_mut().unwrap().transaction.as_mut().unwrap().prepared.clear(),
+                5 => {
+                    let tx = target.record.as_mut().unwrap().transaction.as_mut().unwrap();
+                    tx.prepared = vec![false];
+                    tx.decision = Some(grpc::wire::TerminalDecision::Commit as i32);
+                }
+                6 => target.record.as_mut().unwrap().request.as_mut().unwrap().transaction_id = vec![4; 16],
+                7 => target.record.as_mut().unwrap().request.as_mut().unwrap().id = vec![0; 16],
+                8 => {
+                    let payload = &mut target.record.as_mut().unwrap().request.as_mut().unwrap().payload;
+                    let mut plan = crate::request_plans::Plan::decode(payload).unwrap();
+                    plan.authority.mode = [8; 16];
+                    *payload = plan.encode().unwrap();
+                }
+                9 => target.record.as_mut().unwrap().transaction = None,
+                10 => target.record.as_mut().unwrap().transaction.as_mut().unwrap().decision = Some(999),
+                _ => unreachable!(),
+            }
+        }).await;
         let result = NodeRef::Remote(&client)
             .target(&identity().authority, 1, [2; 16])
             .await;
-        assert!(
-            matches!(result, Err(Error::Identity | Error::Protocol)),
-            "case {index}: {result:?}"
-        );
+        assert!(matches!(result, Err(Error::Identity | Error::Protocol)), "case {index}: {result:?}");
         peer.await.unwrap();
     }
     // Explicit null is a source-provided absence result, not a client inclusion

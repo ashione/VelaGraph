@@ -26,7 +26,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
+#[cfg(test)]
+use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 
@@ -575,6 +577,7 @@ fn encode_sync<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
 /// No forwarding, discovery, protocol fallback, or failover occurs.
 #[derive(Clone)]
 pub struct Client {
+    address: SocketAddr,
     transport: Arc<grpc::Transport>,
     identity: Identity,
     timeout: Duration,
@@ -587,6 +590,7 @@ impl Client {
         identity.validate()?;
         valid_timeout(timeout)?;
         Ok(Self {
+            address,
             transport: Arc::new(grpc::Transport::new(address, timeout)?),
             identity,
             timeout,
@@ -795,12 +799,23 @@ impl Client {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| Error::Capacity)?;
             let operation_tag = operation.tag();
-            let reply = self.transport.call(
-                Request { version: PROTOCOL_VERSION, identity: self.identity.clone(), nonce, operation },
-                deadline,
-            ).await?;
-            if reply.version != PROTOCOL_VERSION || reply.operation != operation_tag
-                || reply.identity != self.identity || reply.nonce != nonce {
+            let reply = self
+                .transport
+                .call(
+                    Request {
+                        version: PROTOCOL_VERSION,
+                        identity: self.identity.clone(),
+                        nonce,
+                        operation,
+                    },
+                    deadline,
+                )
+                .await?;
+            if reply.version != PROTOCOL_VERSION
+                || reply.operation != operation_tag
+                || reply.identity != self.identity
+                || reply.nonce != nonce
+            {
                 return Err(Error::Identity);
             }
             reply.result
@@ -2561,34 +2576,54 @@ mod tests {
     }
     #[tonic::async_trait]
     impl grpc::wire::managed_service_server::ManagedService for TypedPeer {
-        async fn call(&self, request: tonic::Request<grpc::wire::Request>) -> Result<tonic::Response<grpc::wire::Reply>, tonic::Status> {
+        async fn call(
+            &self,
+            request: tonic::Request<grpc::wire::Request>,
+        ) -> Result<tonic::Response<grpc::wire::Reply>, tonic::Status> {
             let (request, _) = grpc_codec::request_from_wire(request.into_inner())
                 .map_err(|_| tonic::Status::invalid_argument("test request"))?;
             let result = (self.reply)(request).await;
-            if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 { self.stop.cancel(); }
+            if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
+                self.stop.cancel();
+            }
             result.map(tonic::Response::new)
         }
     }
     async fn typed_peer(
-        id: Identity, timeout: Duration, calls: u64,
+        id: Identity,
+        timeout: Duration,
+        calls: u64,
         reply: impl Fn(Request) -> PeerFuture + Send + Sync + 'static,
     ) -> (Client, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = Client::new(listener.local_addr().unwrap(), id, timeout).unwrap();
         let stop = tokio_util::sync::CancellationToken::new();
-        let service = TypedPeer { reply: Arc::new(reply), remaining: AtomicU64::new(calls), stop: stop.clone() };
+        let service = TypedPeer {
+            reply: Arc::new(reply),
+            remaining: AtomicU64::new(calls),
+            stop: stop.clone(),
+        };
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(grpc::wire::managed_service_server::ManagedServiceServer::new(service))
-                .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), stop.cancelled_owned())
-                .await.unwrap();
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stop.cancelled_owned(),
+                )
+                .await
+                .unwrap();
         });
         (client, task)
     }
     fn wire_reply(request: Request, result: Result<Value, Error>) -> PeerReply {
-        grpc_codec::reply_to_wire(Reply { version: PROTOCOL_VERSION, operation: request.operation.tag(),
-            identity: request.identity, nonce: request.nonce, result })
-            .map_err(|_| tonic::Status::invalid_argument("test reply"))
+        grpc_codec::reply_to_wire(Reply {
+            version: PROTOCOL_VERSION,
+            operation: request.operation.tag(),
+            identity: request.identity,
+            nonce: request.nonce,
+            result,
+        })
+        .map_err(|_| tonic::Status::invalid_argument("test reply"))
     }
 
     #[test]
@@ -2673,22 +2708,32 @@ mod tests {
     async fn forged_replies_and_slow_input_fail_closed() {
         let _resources = test_resource_guard().await;
         for wrong in 0..5 {
-            let (client, peer) = typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
-                Box::pin(async move {
-                    let mut reply = wire_reply(request, Ok(Value::Unit))?;
-                    match wrong {
-                        0 => reply.identity.as_mut().unwrap().group += 1,
-                        1 => reply.nonce += 1,
-                        2 => reply.operation += 1,
-                        3 => reply.version += 1,
-                        _ => reply.version = 4,
-                    }
-                    Ok(reply)
+            let (client, peer) =
+                typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
+                    Box::pin(async move {
+                        let mut reply = wire_reply(request, Ok(Value::Unit))?;
+                        match wrong {
+                            0 => reply.identity.as_mut().unwrap().group += 1,
+                            1 => reply.nonce += 1,
+                            2 => reply.operation += 1,
+                            3 => reply.version += 1,
+                            _ => reply.version = 4,
+                        }
+                        Ok(reply)
+                    })
                 })
-            }).await;
-            let result = client.call(Operation::Journal { authority: identity().authority, epoch: 1 }).await;
-            if wrong >= 3 { assert!(matches!(result, Err(Error::Protocol))); }
-            else { assert!(matches!(result, Err(Error::Identity))); }
+                .await;
+            let result = client
+                .call(Operation::Journal {
+                    authority: identity().authority,
+                    epoch: 1,
+                })
+                .await;
+            if wrong >= 3 {
+                assert!(matches!(result, Err(Error::Protocol)));
+            } else {
+                assert!(matches!(result, Err(Error::Identity)));
+            }
             peer.await.unwrap();
         }
         let (client, peer) = typed_peer(identity(), Duration::from_millis(50), 1, |request| {
@@ -2696,9 +2741,19 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 wire_reply(request, Ok(Value::Unit))
             })
-        }).await;
-        assert!(matches!(client.call(Operation::Journal { authority: identity().authority, epoch: 1 }).await, Err(Error::Unavailable)));
-        peer.abort(); let _ = peer.await;
+        })
+        .await;
+        assert!(matches!(
+            client
+                .call(Operation::Journal {
+                    authority: identity().authority,
+                    epoch: 1
+                })
+                .await,
+            Err(Error::Unavailable)
+        ));
+        peer.abort();
+        let _ = peer.await;
     }
     #[tokio::test]
     async fn server_rejects_unready_state_and_wrong_node_at_startup() {
@@ -3141,7 +3196,8 @@ mod tests {
         typed_peer(id, Duration::from_secs(2), 1, move |request| {
             let value = value.clone();
             Box::pin(async move { wire_reply(request, Ok(value)) })
-        }).await
+        })
+        .await
     }
     fn request_lookup() -> RequestLookup {
         let journal =
@@ -3157,14 +3213,18 @@ mod tests {
             }),
         }
     }
-    async fn fake_request_json(value: serde_json::Value) -> (Client, JoinHandle<()>) {
-        // JSON remains a local durable-domain fixture, not the transport.
-        // Structurally invalid durable evidence is rejected before protobuf conversion.
-        let result = serde_json::from_value(value).map(Value::Request).map_err(|_| Error::Protocol);
+    async fn fake_request_wire(
+        mutate: impl Fn(&mut grpc::wire::RequestLookup) + Send + Sync + 'static,
+    ) -> (Client, JoinHandle<()>) {
         typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
             assert!(matches!(request.operation, Operation::LookupRequest { id: [1, ..], .. }));
-            let result = result.clone();
-            Box::pin(async move { wire_reply(request, result) })
+            // Encode a valid reply first, then corrupt protobuf evidence. The
+            // server must send Value, not manufacture an Error on the client's behalf.
+            let mut reply = wire_reply(request, Ok(Value::Request(request_lookup()))).unwrap();
+            let Some(grpc::wire::reply::Result::Value(value)) = &mut reply.result else { panic!("value reply") };
+            let Some(grpc::wire::value::Kind::Request(lookup)) = &mut value.kind else { panic!("request lookup") };
+            mutate(lookup);
+            Box::pin(async move { Ok(reply) })
         }).await
     }
     #[tokio::test]
@@ -3213,7 +3273,7 @@ mod tests {
             if !present {
                 lookup.record = None;
             }
-            let (client, peer) = fake_request_json(serde_json::to_value(&lookup).unwrap()).await;
+            let (client, peer) = fake_value(identity(), Value::Request(lookup.clone())).await;
             assert_eq!(
                 NodeRef::Remote(&client)
                     .request(&identity().authority, 1, [1; 16])
@@ -3227,98 +3287,67 @@ mod tests {
     #[tokio::test]
     async fn point_request_rejects_substituted_and_malformed_evidence() {
         let _resources = test_resource_guard().await;
-        for fault in 0..25 {
-            let mut value = serde_json::to_value(request_lookup()).unwrap();
-            match fault {
-                0 => value["id"] = serde_json::json!(vec![2; 16]),
-                1 => value["authority"]["shard"] = 8.into(),
-                2 => value["cohort"]["coordinator_epoch"] = 2.into(),
-                3 => value["cohort"]["members"][0]["epoch"] = 2.into(),
-                4 => value["record"]["record"]["id"] = serde_json::json!(vec![2; 16]),
-                5 => value["record"]["record"]["transaction_id"] = serde_json::json!(vec![3; 16]),
-                6 => value["record"]["transaction"]["id"] = serde_json::json!(vec![3; 16]),
-                7 => {
-                    value["record"]["transaction"]["participants"][0]["intent"] =
-                        serde_json::json!(vec![5; 32])
-                }
-                8 => value["record"]["transaction"]["prepared"] = serde_json::json!([]),
-                9 => value["record"]["record"]["payload"] = serde_json::json!([0]),
-                10..=12 => {
-                    let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
-                        "../tests/fixtures/request-plan-v1.json"
-                    ))
-                    .unwrap();
-                    match fault {
-                        10 => plan["version"] = 2.into(),
-                        11 => plan["id"] = serde_json::json!(vec![3; 16]),
-                        _ => plan["extra"] = true.into(),
+        for fault in (0..25).filter(|fault| !(13..=16).contains(fault)) {
+            let (client, peer) = fake_request_wire(move |value| {
+                match fault {
+                    0 => value.id = vec![2; 16],
+                    1 => value.authority.as_mut().unwrap().shard = 8,
+                    2 => value.cohort.as_mut().unwrap().coordinator_epoch = 2,
+                    3 => value.cohort.as_mut().unwrap().members[0].epoch = 2,
+                    4 => value.record.as_mut().unwrap().record.as_mut().unwrap().id = vec![2; 16],
+                    5 => value.record.as_mut().unwrap().record.as_mut().unwrap().transaction_id = vec![3; 16],
+                    6 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().id = vec![3; 16],
+                    7 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().participants[0].intent = vec![5; 32],
+                    8 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().prepared.clear(),
+                    9 => value.record.as_mut().unwrap().record.as_mut().unwrap().payload = vec![0],
+                    10..=12 | 23..=24 => {
+                        // The canonical plan remains an opaque durable byte payload.
+                        let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!("../tests/fixtures/request-plan-v1.json")).unwrap();
+                        match fault {
+                            10 => plan["version"] = 2.into(),
+                            11 => plan["id"] = serde_json::json!(vec![3; 16]),
+                            12 => plan["extra"] = true.into(),
+                            23 => plan["validation_version"] = 1.into(),
+                            _ => {
+                                plan["validation_version"] = 128.into();
+                                value.resolved_prefix = 128;
+                                let tx = value.record.as_mut().unwrap().transaction.as_mut().unwrap();
+                                tx.ordinal = 1;
+                                tx.decision = Some(grpc::wire::TerminalDecision::Abort as i32);
+                            }
+                        }
+                        value.record.as_mut().unwrap().record.as_mut().unwrap().payload = serde_json::to_vec(&plan).unwrap();
                     }
-                    value["record"]["record"]["payload"] =
-                        serde_json::json!(serde_json::to_vec(&plan).unwrap());
+                    17 => value.record.as_mut().unwrap().record.as_mut().unwrap().request = vec![1; crate::transaction_decisions::MAX_REQUEST_BYTES + 1],
+                    18 => value.record.as_mut().unwrap().record.as_mut().unwrap().payload = vec![1; crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES + 1],
+                    19 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().ordinal = 0,
+                    20 => value.resolved_prefix = crate::transaction_decisions::MAX_TRANSACTIONS as u64 + 1,
+                    21 => { value.record = None; value.cohort.as_mut().unwrap().members[0].epoch = 2; }
+                    22 => value.authority.as_mut().unwrap().mode = vec![8; 16],
+                    _ => unreachable!(),
                 }
-                13 => value["extra"] = true.into(),
-                14 => value["record"]["extra"] = true.into(),
-                15 => value["record"]["record"]["extra"] = true.into(),
-                16 => value["record"]["transaction"]["extra"] = true.into(),
-                17 => {
-                    value["record"]["record"]["request"] = serde_json::json!(vec![
-                        1;
-                        crate::transaction_decisions::MAX_REQUEST_BYTES
-                            + 1
-                    ])
-                }
-                18 => {
-                    value["record"]["record"]["payload"] = serde_json::json!(vec![
-                        1;
-                        crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES
-                            + 1
-                    ])
-                }
-                19 => value["record"]["transaction"]["ordinal"] = 0.into(),
-                20 => {
-                    value["resolved_prefix"] =
-                        (crate::transaction_decisions::MAX_TRANSACTIONS as u64 + 1).into()
-                }
-                21 => {
-                    value["record"] = serde_json::Value::Null;
-                    value["cohort"]["members"][0]["epoch"] = 2.into();
-                }
-                22 => value["authority"]["mode"] = serde_json::json!(vec![8; 16]),
-                23 => {
-                    let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
-                        "../tests/fixtures/request-plan-v1.json"
-                    ))
-                    .unwrap();
-                    plan["validation_version"] = 1.into();
-                    value["record"]["record"]["payload"] =
-                        serde_json::json!(serde_json::to_vec(&plan).unwrap());
-                }
-                _ => {
-                    // A terminal transaction may be behind the current watermark,
-                    // but its original admission cut must precede its own ordinal.
-                    let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
-                        "../tests/fixtures/request-plan-v1.json"
-                    ))
-                    .unwrap();
-                    plan["validation_version"] = 128.into();
-                    value["resolved_prefix"] = 128.into();
-                    value["record"]["transaction"]["ordinal"] = 1.into();
-                    value["record"]["transaction"]["decision"] = serde_json::json!("Abort");
-                    value["record"]["record"]["payload"] =
-                        serde_json::json!(serde_json::to_vec(&plan).unwrap());
-                }
+            }).await;
+            let result = NodeRef::Remote(&client)
+                .request(&identity().authority, 1, [1; 16])
+                .await;
+            if matches!(fault, 17 | 18) {
+                // Typed decoding classifies over-budget evidence as Capacity.
+                assert_eq!(result, Err(Error::Capacity), "fault {fault}");
+            } else {
+                assert!(matches!(result, Err(Error::Identity | Error::Protocol)), "fault {fault}: {result:?}");
             }
-            let (client, peer) = fake_request_json(value).await;
-            assert!(
-                matches!(
-                    NodeRef::Remote(&client)
-                        .request(&identity().authority, 1, [1; 16])
-                        .await,
-                    Err(Error::Identity | Error::Protocol)
-                ),
-                "fault {fault}"
-            );
             peer.await.unwrap();
+        }
+    }
+    #[test]
+    fn point_request_local_domain_json_rejects_unknown_fields() {
+        // Durable JSON schema validation, not a protobuf wire/client assertion.
+        for path in [vec![], vec!["record"], vec!["record", "record"], vec!["record", "transaction"]] {
+            let mut value = serde_json::to_value(request_lookup()).unwrap();
+            let mut nested = &mut value;
+            for key in path { nested = &mut nested[key]; }
+            nested["extra"] = true.into();
+            assert!(serde_json::from_value::<RequestLookup>(value).is_err());
         }
     }
     #[test]
@@ -3670,7 +3699,9 @@ mod tests {
     async fn acquisition_requests_only_summary_and_chosen_cut_not_full_archive() {
         let _resources = test_resource_guard().await;
         async fn sequence(id: Identity, values: Vec<Value>) -> (Client, JoinHandle<Vec<u8>>) {
-            let values = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(values)));
+            let values = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                values,
+            )));
             let tags = Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed = tags.clone();
             let calls = values.lock().unwrap().len() as u64;
@@ -3684,8 +3715,12 @@ mod tests {
                 }
                 let value = values.lock().unwrap().pop_front().unwrap();
                 Box::pin(async move { wire_reply(request, Ok(value)) })
-            }).await;
-            let task = tokio::spawn(async move { task.await.unwrap(); tags.lock().unwrap().clone() });
+            })
+            .await;
+            let task = tokio::spawn(async move {
+                task.await.unwrap();
+                tags.lock().unwrap().clone()
+            });
             (client, task)
         }
 
@@ -3916,17 +3951,50 @@ mod tests {
         .unwrap();
         // Previous wire peers fail closed. There is no automatic archive or
         // weaker-read fallback even though durable journal formats are unchanged.
-        let reply = grpc::Transport::new(server.local_addr(), Duration::from_secs(2)).unwrap()
-            .call(Request { version: 5, identity: identity(), nonce: 1,
-                operation: Operation::Journal { authority: identity().authority, epoch: 1 } },
-                tokio::time::Instant::now() + Duration::from_secs(2)).await;
-        assert!(matches!(reply, Err(Error::Protocol)) || matches!(reply, Ok(Reply { result: Err(Error::Protocol), .. })));
+        let reply = grpc::Transport::new(server.local_addr(), Duration::from_secs(2))
+            .unwrap()
+            .call(
+                Request {
+                    version: 5,
+                    identity: identity(),
+                    nonce: 1,
+                    operation: Operation::Journal {
+                        authority: identity().authority,
+                        epoch: 1,
+                    },
+                },
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await;
+        assert!(
+            matches!(reply, Err(Error::Protocol))
+                || matches!(
+                    reply,
+                    Ok(Reply {
+                        result: Err(Error::Protocol),
+                        ..
+                    })
+                )
+        );
         // The removed JSON protocol is not accepted by the HTTP/2 listener.
         let mut slow = TcpStream::connect(server.local_addr()).await.unwrap();
-        slow.write_u32(100).await.unwrap(); slow.write_all(b"{").await.unwrap();
-        let mut byte = [0u8; 1];
-        let rejected = tokio::time::timeout(Duration::from_secs(2), slow.read(&mut byte)).await.unwrap();
-        assert!(matches!(rejected, Ok(0) | Err(_)));
+        slow.write_u32(100).await.unwrap();
+        slow.write_all(b"{").await.unwrap();
+        // HTTP/2 may send SETTINGS before rejecting the invalid preface.
+        // Drain only a bounded amount and require closure within the deadline.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut bytes = [0u8; 1024];
+            let mut received = 0;
+            loop {
+                match slow.read(&mut bytes).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        received += n;
+                        assert!(received <= 64 * 1024, "legacy peer was not rejected");
+                    }
+                }
+            }
+        }).await.expect("legacy JSON peer must close");
         let client = Client::new(server.local_addr(), identity(), Duration::from_secs(2)).unwrap();
         assert_eq!(
             NodeRef::Remote(&client)
@@ -4434,10 +4502,23 @@ mod tests {
             Err(Error::Identity)
         );
         // Bypass domain client validation, but use the real typed RPC listener.
-        let reply = grpc::Transport::new(server.local_addr(), Duration::from_secs(2)).unwrap()
-            .call(Request { version: PROTOCOL_VERSION, identity: id.clone(), nonce: 19,
-                operation: Operation::Command { authority: id.authority.clone(), epoch: 1, command } },
-                tokio::time::Instant::now() + Duration::from_secs(2)).await.unwrap();
+        let reply = grpc::Transport::new(server.local_addr(), Duration::from_secs(2))
+            .unwrap()
+            .call(
+                Request {
+                    version: PROTOCOL_VERSION,
+                    identity: id.clone(),
+                    nonce: 19,
+                    operation: Operation::Command {
+                        authority: id.authority.clone(),
+                        epoch: 1,
+                        command,
+                    },
+                },
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
         assert_eq!(reply.nonce, 19);
         assert!(matches!(reply.result, Err(Error::Identity)));
         let offline_address = observer_server.local_addr();
@@ -4970,7 +5051,9 @@ mod tests {
         let mut high = MAX_FRAME_BYTES;
         while low < high {
             let mid = low + (high - low).div_ceil(2);
-            if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result { snapshot.entries[0].1 = vec![255; mid]; }
+            if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result {
+                snapshot.entries[0].1 = vec![255; mid];
+            }
             match grpc_codec::reply_to_wire(reply.clone()) {
                 Ok(_) => low = mid,
                 Err(Error::Capacity) => high = mid - 1,
@@ -4979,16 +5062,25 @@ mod tests {
         }
         assert!(low > 0 && base < MAX_FRAME_BYTES);
         if let Ok(Value::Snapshot(snapshot, retained)) = &mut reply.result {
-            snapshot.entries[0].1 = vec![255; low]; assert_eq!(*retained, proof);
+            snapshot.entries[0].1 = vec![255; low];
+            assert_eq!(*retained, proof);
         }
         wire = grpc_codec::reply_to_wire(reply.clone()).unwrap();
         assert!(wire.encoded_len() <= MAX_FRAME_BYTES);
-        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result { snapshot.entries[0].1.push(255); }
-        assert!(matches!(grpc_codec::reply_to_wire(reply.clone()), Err(Error::Capacity)));
+        if let Ok(Value::Snapshot(snapshot, _)) = &mut reply.result {
+            snapshot.entries[0].1.push(255);
+        }
+        assert!(matches!(
+            grpc_codec::reply_to_wire(reply.clone()),
+            Err(Error::Capacity)
+        ));
         reply.result = Err(Error::Capacity);
         let fallback = grpc_codec::reply_to_wire(reply).unwrap();
         assert!(fallback.encoded_len() < 4096);
-        assert!(matches!(grpc_codec::reply_from_wire(fallback).unwrap().result, Err(Error::Capacity)));
+        assert!(matches!(
+            grpc_codec::reply_from_wire(fallback).unwrap().result,
+            Err(Error::Capacity)
+        ));
     }
 
     include!("retained_rpc_tests.rs");

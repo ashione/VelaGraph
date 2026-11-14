@@ -170,12 +170,20 @@ async fn actual_grpc_byte_member_uses_compact_history_and_original_plan() {
                 _ => bound.cohort.as_mut().unwrap().coordinator_epoch = 2,
             }
             let request = wire::Request {
-                version: 6, identity: Some(wire_identity), nonce: 100 + fault,
-                operation: Some(wire::Operation { kind: Some(wire::operation::Kind::HistoryStatus(bound)) }),
+                version: 6,
+                identity: Some(wire_identity),
+                nonce: 100 + fault,
+                operation: Some(wire::Operation {
+                    kind: Some(wire::operation::Kind::HistoryStatus(bound)),
+                }),
                 timeout_millis: 5_000,
             };
-            let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", server.local_addr()))
-                .unwrap().connect().await.unwrap();
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://{}", server.local_addr()))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
             let mut client = wire::managed_service_client::ManagedServiceClient::new(channel);
             let result = client.call(request).await;
             if fault == 0 {
@@ -184,12 +192,16 @@ async fn actual_grpc_byte_member_uses_compact_history_and_original_plan() {
                 assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
             } else {
                 let reply = result.unwrap().into_inner();
-                assert!(matches!(reply.result,
+                assert!(matches!(
+                    reply.result,
                     Some(wire::reply::Result::Error(wire::RpcError {
                         kind: Some(wire::rpc_error::Kind::Identity(_))
-                    }))));
+                    }))
+                ));
             }
-        }).await.expect("malformed-request exchange must terminate");
+        })
+        .await
+        .expect("malformed-request exchange must terminate");
     }
 
     let participant = Participant {

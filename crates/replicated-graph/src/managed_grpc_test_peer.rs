@@ -19,14 +19,22 @@ pub struct Peer {
 }
 impl Peer {
     pub async fn finish(mut self) {
-        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
-        if let Some(task) = self.task.take() { task.await.unwrap(); }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.await.unwrap();
+        }
     }
 }
 impl Drop for Peer {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
-        if let Some(task) = self.task.take() { task.abort(); }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 pub fn spawn<F, Fut>(listener: TcpListener, handler: F) -> Peer
@@ -40,24 +48,47 @@ where
         .max_encoding_message_size(MAX_FRAME_BYTES);
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        tonic::transport::Server::builder().add_service(service)
-            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async { let _ = stopped.await; })
-            .await.unwrap();
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
     });
-    Peer { stop: Some(stop), task: Some(task) }
+    Peer {
+        stop: Some(stop),
+        task: Some(task),
+    }
 }
-pub async fn forward(upstream: std::net::SocketAddr, mut request: wire::Request) -> Result<wire::Reply, Status> {
+pub async fn forward(
+    upstream: std::net::SocketAddr,
+    mut request: wire::Request,
+) -> Result<wire::Reply, Status> {
     let timeout = std::time::Duration::from_millis(request.timeout_millis);
     let end = tokio::time::Instant::now() + timeout;
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{upstream}"))
         .map_err(|_| Status::invalid_argument("test endpoint"))?
-        .connect_timeout(timeout).connect().await.map_err(|_| Status::unavailable("test upstream"))?;
+        .connect_timeout(timeout)
+        .connect()
+        .await
+        .map_err(|_| Status::unavailable("test upstream"))?;
     let mut client = wire::managed_service_client::ManagedServiceClient::new(channel)
-        .max_decoding_message_size(MAX_FRAME_BYTES).max_encoding_message_size(MAX_FRAME_BYTES);
-    let remaining = end.checked_duration_since(tokio::time::Instant::now())
+        .max_decoding_message_size(MAX_FRAME_BYTES)
+        .max_encoding_message_size(MAX_FRAME_BYTES);
+    let remaining = end
+        .checked_duration_since(tokio::time::Instant::now())
         .ok_or_else(|| Status::deadline_exceeded("test forwarding budget"))?;
-    request.timeout_millis = remaining.as_millis().try_into().map_err(|_| Status::invalid_argument("test forwarding budget"))?;
-    if request.timeout_millis == 0 { return Err(Status::deadline_exceeded("test forwarding budget")); }
+    request.timeout_millis = remaining
+        .as_millis()
+        .try_into()
+        .map_err(|_| Status::invalid_argument("test forwarding budget"))?;
+    if request.timeout_millis == 0 {
+        return Err(Status::deadline_exceeded("test forwarding budget"));
+    }
     let mut request = Request::new(request);
     request.set_timeout(remaining);
     client.call(request).await.map(Response::into_inner)

@@ -1117,7 +1117,10 @@ struct HistoryPeer {
 }
 impl HistoryPeer {
     async fn finish(self) {
-        assert!(self.steps.lock().unwrap().is_empty(), "all scripted operations must run");
+        assert!(
+            self.steps.lock().unwrap().is_empty(),
+            "all scripted operations must run"
+        );
         self.peer.finish().await;
     }
 }
@@ -1134,7 +1137,12 @@ async fn history_peer_ordering(
     unordered_pages: bool,
 ) -> (managed_rpc::Client, HistoryPeer) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = managed_rpc::Client::new(listener.local_addr().unwrap(), identity, Duration::from_secs(2)).unwrap();
+    let client = managed_rpc::Client::new(
+        listener.local_addr().unwrap(),
+        identity,
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let steps = std::sync::Arc::new(std::sync::Mutex::new(steps));
     let state = steps.clone();
     let peer = rpc_peer::spawn(listener, move |wire| {
@@ -1144,20 +1152,38 @@ async fn history_peer_ordering(
         assert!(request["operation"].get("Journal").is_none());
         assert!(request["operation"].get("Advance").is_none());
         let position = if unordered_pages && request["operation"].get("HistoryPage").is_some() {
-            steps.iter().position(|(expected, _)| *expected == request["operation"]).expect("unexpected or repeated page")
-        } else { 0 };
+            steps
+                .iter()
+                .position(|(expected, _)| *expected == request["operation"])
+                .expect("unexpected or repeated page")
+        } else {
+            0
+        };
         let (expected, result) = steps.remove(position);
         assert_eq!(request["operation"], expected);
         let reply = result.map(|result| {
-            let tag = match expected.as_object().unwrap().keys().next().unwrap().as_str() {
-                "LookupTarget" => 17, "Terminal" => 9, "HistoryStatus" => 11,
-                "HistoryPage" => 12, "SyncHistory" => 13, "AdvanceRetained" => 14,
-                "Prefix" => 6, other => panic!("unexpected catch-up operation {other}"),
+            let tag = match expected
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .as_str()
+            {
+                "LookupTarget" => 17,
+                "Terminal" => 9,
+                "HistoryStatus" => 11,
+                "HistoryPage" => 12,
+                "SyncHistory" => 13,
+                "AdvanceRetained" => 14,
+                "Prefix" => 6,
+                other => panic!("unexpected catch-up operation {other}"),
             };
             managed_rpc::grpc::test_reply_from_json(serde_json::json!({
                 "version": 6, "operation": tag, "identity": request["identity"],
                 "nonce": request["nonce"], "result": result,
-            })).unwrap()
+            }))
+            .unwrap()
         });
         async move { reply.ok_or_else(|| tonic::Status::unavailable("scripted lost response")) }
     });
@@ -1401,19 +1427,39 @@ async fn losing_proxy(
             let operation = &request["operation"];
             assert!(operation.get("Journal").is_none());
             assert!(operation.get("Prepare").is_none());
-            let name = if operation.get("ConfirmCapacity").is_some() { "ConfirmCapacity" }
-                else if operation.get("PrepareRetained").is_some() { "PrepareRetained" }
-                else if operation.get("Command").and_then(|v| v.get("command")).and_then(|v| v.get("AdmitRequest")).is_some() { "AdmitRequest" }
-                else if operation.get("Command").and_then(|v| v.get("command")).and_then(|v| v.get("Decide")).is_some() { "Decide" }
-                else { "other" };
+            let name = if operation.get("ConfirmCapacity").is_some() {
+                "ConfirmCapacity"
+            } else if operation.get("PrepareRetained").is_some() {
+                "PrepareRetained"
+            } else if operation
+                .get("Command")
+                .and_then(|v| v.get("command"))
+                .and_then(|v| v.get("AdmitRequest"))
+                .is_some()
+            {
+                "AdmitRequest"
+            } else if operation
+                .get("Command")
+                .and_then(|v| v.get("command"))
+                .and_then(|v| v.get("Decide"))
+                .is_some()
+            {
+                "Decide"
+            } else {
+                "other"
+            };
             // Obtain the real completed response before withholding its result.
             let reply = rpc_peer::forward(upstream, wire).await?;
             let mut state = state.lock().unwrap();
             if let Some(index) = state.0.iter().position(|loss| *loss == name) {
                 state.0.remove(index);
                 state.1 += 1;
-                Err(tonic::Status::unavailable("response lost after upstream completion"))
-            } else { Ok(reply) }
+                Err(tonic::Status::unavailable(
+                    "response lost after upstream completion",
+                ))
+            } else {
+                Ok(reply)
+            }
         }
     });
     let task = tokio::spawn(async move {

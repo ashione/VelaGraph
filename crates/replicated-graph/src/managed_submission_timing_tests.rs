@@ -149,10 +149,14 @@ async fn hold_first_target(
 ) {
     let gate = Arc::new(std::sync::Mutex::new(Some((reached, release))));
     let peer = rpc_peer::spawn(listener, move |wire| {
-        let held = if matches!(wire.operation.as_ref().and_then(|v| v.kind.as_ref()),
-            Some(managed_rpc::grpc::wire::operation::Kind::LookupTarget(_))) {
+        let held = if matches!(
+            wire.operation.as_ref().and_then(|v| v.kind.as_ref()),
+            Some(managed_rpc::grpc::wire::operation::Kind::LookupTarget(_))
+        ) {
             gate.lock().unwrap().take()
-        } else { None };
+        } else {
+            None
+        };
         async move {
             if let Some((reached, release)) = held {
                 reached.send(()).unwrap();
