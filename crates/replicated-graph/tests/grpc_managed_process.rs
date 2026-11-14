@@ -40,17 +40,16 @@ fn rejected_preface_controls(mut bytes: &[u8]) -> bool {
         if bytes.len() < 9 {
             return false;
         }
-        let length = (usize::from(bytes[0]) << 16)
-            | (usize::from(bytes[1]) << 8)
-            | usize::from(bytes[2]);
+        let length =
+            (usize::from(bytes[0]) << 16) | (usize::from(bytes[1]) << 8) | usize::from(bytes[2]);
         if length > bytes.len() - 9 || bytes[5..9] != [0; 4] {
             return false;
         }
         let payload = &bytes[9..9 + length];
         let valid = match (bytes[3], bytes[4]) {
-            (4, 0) => length % 6 == 0, // SETTINGS
-            (4, 1) => length == 0,     // SETTINGS acknowledgement
-            (7, 0) => length >= 8,     // GOAWAY
+            (4, 0) => length % 6 == 0,                  // SETTINGS
+            (4, 1) => length == 0,                      // SETTINGS acknowledgement
+            (7, 0) => length >= 8,                      // GOAWAY
             (8, 0) => length == 4 && payload != [0; 4], // WINDOW_UPDATE
             _ => false,
         };
@@ -209,7 +208,9 @@ async fn scenario(profile: CapacityProfile, grpc: bool) -> anyhow::Result<Vec<Ve
     }))?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut legacy = tokio::net::TcpStream::connect(c.address).await?;
-    legacy.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    legacy
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     legacy.write_all(&payload).await?;
     let response = tokio::time::timeout(Duration::from_secs(2), async {
         let mut received = Vec::new();
