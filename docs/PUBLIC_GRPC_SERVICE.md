@@ -47,9 +47,9 @@ The read selector is a required oneof: latest certified, exact V (including
 zero), or minimum V. Queries retain one immutable certified V and original
 completeness through all pages. This is not linearizable latest or a certificate
 that arbitrary trusted low-level writers preserved all adjacency. Every
-unsupported Gremlin feature fails explicitly. Query jobs, historical business
-time, custom read profiles and arbitrary graph transactions are not exposed by
-this slice. Limits are unchanged from the existing managed execution path.
+unsupported Gremlin feature fails explicitly. Historical business time, custom
+read profiles and arbitrary graph transactions are not exposed by this slice.
+Limits are unchanged from the existing managed execution path.
 
 All eight currently supported managed mutation forms are typed. Scalar presence
 is mandatory: Null, absent properties, integer/real and finite values remain
@@ -82,9 +82,9 @@ requests never recapture latest automatically.
 All methods share the original Invocation/admission/deadline and response
 ownership machinery. Fixed snapshot acquisition, retained results and individual
 messages keep their existing capacity limits. This is not a data-local scaling
-improvement. HTTP parity for this additional service and the five asynchronous
-managed job operations remain future work. The legacy library Gateway is not
-removed until its remaining semantics have replacements; #218 remains open.
+improvement. HTTP parity for this additional service and for the asynchronous
+managed job service remains future work; typed job RPCs are described below.
+The legacy library Gateway is not removed until its remaining semantics have replacements; #218 remains open.
 
 ## Errors and ownership
 
@@ -155,3 +155,20 @@ authentication, browser-origin protection and stable final HTTP v1 remain out of
 scope. Loopback is not an authorization boundary. Those capabilities are not implied by shipping this experimental slice. The
 finite [v0.0.1 release gates](RELEASE_PLAN.md), including clean startup and exact
 CI/acceptance evidence, still need to be evaluated separately.
+
+## Managed query jobs
+
+`ManagedQueryJobService` adds typed Start/Get/Renew/Fetch/Cancel on this same
+listener. Start uses a nonzero 16-byte operation ID, optional exact V (absence
+selects latest at worker read-cut admission), Query, page size and JobPolicy.
+Its JobHandle is distinct from synchronous and materialized session tokens.
+Get exposes no partial rows; Fetch requires Ready and preserves immutable V,
+query and page bindings. Renew is explicit and never refreshes the selected V.
+
+A dropped Start reply does not cancel admitted work: replay the same ID and exact
+arguments while retained. Do not generate a new ID after an uncertain reply.
+Cancelled metadata retains its shared slot until hard lifetime; restart invalidates
+handles. Capturing renewal is Busy, and a delayed renewal cannot revive expired
+work. Every full page is preflighted against both logical and typed envelopes
+before Ready. No JSON tunnel, extra listener or second execution engine is used.
+See [the complete job contract and validation matrix](MANAGED_QUERY_JOBS.md).

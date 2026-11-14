@@ -831,3 +831,12 @@ unproven, rather than inferred from these latency measurements.
 恢复校验成功后才开放目标视图查询；真实跨片同 V/T 与全规模验收继续跟踪 #196，
 本节更新不关闭该任务，也不声称整体分布式双时间已完成。
 
+
+### Typed managed job lifecycle (#268)
+
+The implementation candidate exposes the existing bounded job lifecycle via
+ManagedQueryJobService Start/Get/Renew/Fetch/Cancel on the public endpoint. It
+reuses fixed-V workers and shared admission rather than introducing an executor.
+The exact contract, evidence matrix and non-goals remain in
+[MANAGED_QUERY_JOBS.md](MANAGED_QUERY_JOBS.md). Acceptance requires final-head
+CI and independent review; this is not completion of all #218 legacy retirement.
