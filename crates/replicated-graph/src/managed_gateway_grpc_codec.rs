@@ -998,7 +998,7 @@ pub(super) fn job_start(r: pb::JobStartRequest) -> Result<Operation> {
     context(&r.context)?;
     let p = required(r.policy)?;
     Ok(Operation::StartLocalQueryJob {
-        operation_id: token(r.operation_id)?,
+        operation_id: token(r.operation_id).map_err(|_| Error::Protocol)?,
         version: r.version,
         query: query(required(r.query)?)?,
         page_size: size(r.page_size)?,
