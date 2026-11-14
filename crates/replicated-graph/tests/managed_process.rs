@@ -2137,9 +2137,8 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
     let address = listener.local_addr()?;
     let upstream = g.local_addr();
     let expected_external_id = write.external_id;
-    let proxy =
-        tokio::spawn(async move {
-            tokio::time::timeout(BUDGET, async move {
+    let proxy = tokio::spawn(async move {
+        tokio::time::timeout(BUDGET, async move {
             let (caller, _) = listener.accept().await?;
             let mut connection = h2::server::Builder::new()
                 .handshake::<_, axum::body::Bytes>(caller)
@@ -2184,18 +2183,25 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
                     request.external_id.as_slice() == expected_external_id.as_slice(),
                     "proxy external ID mismatch"
                 );
-                let context = request.context.as_ref().context("missing request context")?;
+                let context = request
+                    .context
+                    .as_ref()
+                    .context("missing request context")?;
                 anyhow::ensure!(context.version == 2, "proxy requires strict v2 request");
-                let identity = context.identity.clone().context("missing strict identity")?;
+                let identity = context
+                    .identity
+                    .clone()
+                    .context("missing strict identity")?;
                 anyhow::ensure!(
                     identity.request_id.len() == 16 && identity.binding.is_some(),
                     "invalid strict identity"
                 );
-                let channel = tonic::transport::Endpoint::from_shared(format!("http://{upstream}"))?
-                    .connect_timeout(BUDGET)
-                    .timeout(BUDGET)
-                    .connect()
-                    .await?;
+                let channel =
+                    tonic::transport::Endpoint::from_shared(format!("http://{upstream}"))?
+                        .connect_timeout(BUDGET)
+                        .timeout(BUDGET)
+                        .connect()
+                        .await?;
                 let mut client = pb::write_service_client::WriteServiceClient::new(channel)
                     .max_decoding_message_size(gateway::MAX_RESPONSE_BYTES)
                     .max_encoding_message_size(gateway::MAX_REQUEST_BYTES);
@@ -2246,7 +2252,7 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
             Ok::<_, anyhow::Error>(())
         })
         .await?
-        });
+    });
     let result = gateway::request(address, byte_binding(), Operation::Submit(write), BUDGET).await;
     // Join is the evidence barrier: fail if the upstream response was not fully
     // received and verified before the connection was deliberately closed.
