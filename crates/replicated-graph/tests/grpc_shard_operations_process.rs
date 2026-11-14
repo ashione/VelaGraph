@@ -363,11 +363,13 @@ async fn scenario() -> anyhow::Result<()> {
     {
         assert!(wrong_transport.probe(SHARD).await.is_err());
     }
-    assert!(
-        remote::probe_identified(endpoint, identity, SHARD, Duration::from_millis(300))
-            .await
-            .is_err()
+    // Convenience wrappers now use the same typed service as explicit clients.
+    remote::probe_identified(endpoint, identity, SHARD, BUDGET).await?;
+    assert_eq!(
+        remote::metadata_identified(endpoint, identity, SHARD, BUDGET).await?,
+        client.metadata(SHARD).await?
     );
+    raw_legacy_write_is_rejected(endpoint, identity).await?;
     assert_eq!(
         client.metadata(SHARD).await.context("leader metadata")?,
         committed
@@ -385,6 +387,75 @@ async fn scenario() -> anyhow::Result<()> {
     for process in &mut cluster._processes {
         process.success = true;
     }
+    Ok(())
+}
+
+async fn raw_legacy_write_is_rejected(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+) -> anyhow::Result<()> {
+    let mut typed = Client::connect(endpoint, identity, BUDGET).await?;
+    let before = typed.metadata(SHARD).await?;
+    let request = write(240, Some(before.2));
+    let key = vec![b'k', 240, 0, 255];
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "identity": identity,
+        "operation": {"Write": request}
+    }))?;
+    let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    let mut socket = TcpStream::connect(endpoint).await?;
+    timeout(BUDGET, async {
+        if let Err(error) = socket.write_all(&bytes).await {
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) {
+                return Err(error.into());
+            }
+        }
+        let mut received = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            match socket.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    ensure!(received.len() + n <= 4096, "unexpected protocol rejection body");
+                    received.extend_from_slice(&chunk[..n]);
+                }
+                Err(error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // HTTP/2 SETTINGS/GOAWAY bytes alone are not rejection evidence:
+        // the loop must reach EOF/reset. Nor may a legacy JSON adapter answer.
+        if received.len() >= 4 {
+            let size = u32::from_be_bytes(received[..4].try_into().unwrap()) as usize;
+            if size <= received.len() - 4 {
+                ensure!(
+                    serde_json::from_slice::<serde_json::Value>(&received[4..4 + size]).is_err(),
+                    "retired JSON protocol received a legacy response"
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("raw legacy request must terminate, not merely send HTTP/2 settings")??;
+    // A typed leader barrier and full small-fixture snapshot check the rejected
+    // request caused neither a sequence advance nor a hidden graph write.
+    typed.probe(SHARD).await?;
+    assert_eq!(typed.metadata(SHARD).await?, before);
+    let snapshots = SnapshotClient::connect(endpoint, identity, BUDGET).await?;
+    let descriptor = snapshots.open(SHARD, BUDGET).await?;
+    let page = snapshots.page(descriptor.clone(), None, BUDGET).await?;
+    assert!(page.next.is_none(), "small fixture must fit one complete page");
+    assert!(page.entries.iter().all(|(actual, _)| actual != &key));
+    snapshots.close(descriptor, BUDGET).await?;
     Ok(())
 }
 

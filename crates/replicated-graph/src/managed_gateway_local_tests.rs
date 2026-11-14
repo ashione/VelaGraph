@@ -961,7 +961,8 @@ impl fixed_wire::fixed_query_service_server::FixedQueryService for FixedScript {
     async fn fragment_fixed(
         &self,
         request: tonic::Request<fixed_wire::FixedFragmentEnvelope>,
-    ) -> std::result::Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status> {
+    ) -> std::result::Result<tonic::Response<fixed_wire::FixedFragmentResponse>, tonic::Status>
+    {
         match self
             .dispatch(FixedRpc::Fragment(request.into_inner()))
             .await?
