@@ -130,17 +130,20 @@ fn field(s: S, t: u32) -> Option<F> {
         (Response, 8) => f(t, Child(ManagedEnabled)),
         (Response, 9) => f(t, Child(ManagedWritten)),
         (Response, 10) => f(t, Child(ManagedStatusResult)),
-        (Snapshot, 1..=3) => f(t,V),
-        (Snapshot, 4) => r(t,Child(SnapshotEntry)),
-        (SnapshotEntry, 1 | 2) => f(t,Bytes(None)),
-        (ManagedInspect, 1 | 2) | (ManagedEnable, 1..=3) | (ManagedStatusRequest, 1 | 2) => f(t,V),
-        (ManagedEnable, 4) | (ManagedWrite, 1) | (ManagedStatusRequest, 3 | 4) | (ManagedMode | ManagedEnabled | ManagedWritten, 1) => f(t,Bytes(Some(16))),
-        (ManagedWrite, 2) => f(t,Child(Write)),
-        (ManagedMode | ManagedEnabled, 2) => f(t,V),
-        (ManagedModeResult, 1) => f(t,Child(ManagedMode)),
-        (ManagedWritten, 2) => f(t,Child(WriteResult)),
-        (ManagedStatusResult, 1) => f(t,Child(Empty)),
-        (ManagedStatusResult, 2) => f(t,V),
+        (Snapshot, 1..=3) => f(t, V),
+        (Snapshot, 4) => r(t, Child(SnapshotEntry)),
+        (SnapshotEntry, 1 | 2) => f(t, Bytes(None)),
+        (ManagedInspect, 1 | 2) | (ManagedEnable, 1..=3) | (ManagedStatusRequest, 1 | 2) => f(t, V),
+        (ManagedEnable, 4)
+        | (ManagedWrite, 1)
+        | (ManagedStatusRequest, 3 | 4)
+        | (ManagedMode | ManagedEnabled | ManagedWritten, 1) => f(t, Bytes(Some(16))),
+        (ManagedWrite, 2) => f(t, Child(Write)),
+        (ManagedMode | ManagedEnabled, 2) => f(t, V),
+        (ManagedModeResult, 1) => f(t, Child(ManagedMode)),
+        (ManagedWritten, 2) => f(t, Child(WriteResult)),
+        (ManagedStatusResult, 1) => f(t, Child(Empty)),
+        (ManagedStatusResult, 2) => f(t, V),
         (Response, 1) => f(t, V),
         (Response, 2) => f(t, Child(Empty)),
         (Response, 3) => f(t, Child(Metadata)),
@@ -204,10 +207,16 @@ fn charge(left: &mut usize, n: usize) -> Result<(), Status> {
     *left = left.checked_sub(n).ok_or_else(limit)?;
     Ok(())
 }
-fn scan(s:S,d:&[u8],depth:usize,left:&mut usize,end:tokio::time::Instant)->Result<(),Status>{
-    let mut bytes=crate::remote::MAX_SNAPSHOT_BYTES;
-    let mut rows=crate::remote::MAX_SNAPSHOT_ROWS;
-    scan_inner(s,d,depth,left,end,&mut bytes,&mut rows)
+fn scan(
+    s: S,
+    d: &[u8],
+    depth: usize,
+    left: &mut usize,
+    end: tokio::time::Instant,
+) -> Result<(), Status> {
+    let mut bytes = crate::remote::MAX_SNAPSHOT_BYTES;
+    let mut rows = crate::remote::MAX_SNAPSHOT_ROWS;
+    scan_inner(s, d, depth, left, end, &mut bytes, &mut rows)
 }
 fn scan_inner(
     s: S,
@@ -293,16 +302,27 @@ fn scan_inner(
                     return Err(bad());
                 }
                 charge(left, b.len())?;
-                if matches!(s,S::SnapshotEntry) {charge(snapshot_bytes,b.len())?;}
-
+                if matches!(s, S::SnapshotEntry) {
+                    charge(snapshot_bytes, b.len())?;
+                }
             }
             (K::Child(child), 2) => {
                 let b = bytes(&mut d)?;
-                if matches!(child,S::SnapshotEntry) {
-                    charge(snapshot_rows,1)?;
-                    charge(left,std::mem::size_of::<wire::SnapshotEntry>())?;
-                } else {charge(left,256)?;}
-                scan_inner(child, b, depth + 1, left, end,snapshot_bytes,snapshot_rows)?;
+                if matches!(child, S::SnapshotEntry) {
+                    charge(snapshot_rows, 1)?;
+                    charge(left, std::mem::size_of::<wire::SnapshotEntry>())?;
+                } else {
+                    charge(left, 256)?;
+                }
+                scan_inner(
+                    child,
+                    b,
+                    depth + 1,
+                    left,
+                    end,
+                    snapshot_bytes,
+                    snapshot_rows,
+                )?;
             }
             _ => return Err(bad()),
         }
@@ -555,25 +575,77 @@ mod tests {
     }
     #[test]
     fn managed_and_snapshot_prescan_boundaries() {
-        let response=|bytes,rows|wire::Response{version:1,result:Some(wire::response::Result::Snapshot(wire::Snapshot{
-            shard:7,epoch:1,sequence:0,entries:(0..rows).map(|i|wire::SnapshotEntry{key:vec![],value:if i==0{vec![0;bytes]}else{vec![]}}).collect()
-        }))};
-        check::<wire::Response>(&response(crate::remote::MAX_SNAPSHOT_BYTES,1).encode_to_vec()).unwrap();
-        assert_eq!(check::<wire::Response>(&response(crate::remote::MAX_SNAPSHOT_BYTES+1,1).encode_to_vec()).unwrap_err().code(),tonic::Code::ResourceExhausted);
-        check::<wire::Response>(&response(0,crate::remote::MAX_SNAPSHOT_ROWS).encode_to_vec()).unwrap();
-        assert_eq!(check::<wire::Response>(&response(0,crate::remote::MAX_SNAPSHOT_ROWS+1).encode_to_vec()).unwrap_err().code(),tonic::Code::ResourceExhausted);
-        for len in [0,15,17] {
-            let r=wire::Request{version:1,identity:Some(wire::Identity{group:1,node:2}),timeout_millis:1,operation:Some(wire::request::Operation::ManagedEnable(wire::ManagedEnable{shard:7,epoch:1,expected_sequence:0,mode_id:vec![1;len]}))};
+        let response = |bytes, rows| wire::Response {
+            version: 1,
+            result: Some(wire::response::Result::Snapshot(wire::Snapshot {
+                shard: 7,
+                epoch: 1,
+                sequence: 0,
+                entries: (0..rows)
+                    .map(|i| wire::SnapshotEntry {
+                        key: vec![],
+                        value: if i == 0 { vec![0; bytes] } else { vec![] },
+                    })
+                    .collect(),
+            })),
+        };
+        check::<wire::Response>(&response(crate::remote::MAX_SNAPSHOT_BYTES, 1).encode_to_vec())
+            .unwrap();
+        assert_eq!(
+            check::<wire::Response>(
+                &response(crate::remote::MAX_SNAPSHOT_BYTES + 1, 1).encode_to_vec()
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        check::<wire::Response>(&response(0, crate::remote::MAX_SNAPSHOT_ROWS).encode_to_vec())
+            .unwrap();
+        assert_eq!(
+            check::<wire::Response>(
+                &response(0, crate::remote::MAX_SNAPSHOT_ROWS + 1).encode_to_vec()
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        for len in [0, 15, 17] {
+            let r = wire::Request {
+                version: 1,
+                identity: Some(wire::Identity { group: 1, node: 2 }),
+                timeout_millis: 1,
+                operation: Some(wire::request::Operation::ManagedEnable(
+                    wire::ManagedEnable {
+                        shard: 7,
+                        epoch: 1,
+                        expected_sequence: 0,
+                        mode_id: vec![1; len],
+                    },
+                )),
+            };
             // Empty proto3 bytes may be omitted; semantic conversion must reject
             // it even where the prescan has no present field to validate.
-            if len>0 {assert!(check::<wire::Request>(&r.encode_to_vec()).is_err());}
+            if len > 0 {
+                assert!(check::<wire::Request>(&r.encode_to_vec()).is_err());
+            }
             assert!(super::super::codec::operation(r.operation.unwrap()).is_err());
         }
-        let invalid=wire::Response{version:1,result:Some(wire::response::Result::ManagedStatus(wire::ManagedStatusResult{status:None}))};
+        let invalid = wire::Response {
+            version: 1,
+            result: Some(wire::response::Result::ManagedStatus(
+                wire::ManagedStatusResult { status: None },
+            )),
+        };
         assert!(check::<wire::Response>(&invalid.encode_to_vec()).is_err());
         // Both status alternatives and both request operations are forbidden.
-        assert!(scan(S::ManagedStatusResult,&[10,0,16,1],0,&mut 1024,tokio::time::Instant::now()+RPC_TIMEOUT).is_err());
-        assert!(check::<wire::Request>(&[8,1,56,7,66,0]).is_err());
+        assert!(scan(
+            S::ManagedStatusResult,
+            &[10, 0, 16, 1],
+            0,
+            &mut 1024,
+            tokio::time::Instant::now() + RPC_TIMEOUT
+        )
+        .is_err());
+        assert!(check::<wire::Request>(&[8, 1, 56, 7, 66, 0]).is_err());
     }
-
 }

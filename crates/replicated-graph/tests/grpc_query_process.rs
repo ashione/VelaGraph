@@ -453,10 +453,20 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
         })
     };
     // A second typed listener shares the exact same session pool/state.
-    let mut peer = w::query_service_client::QueryServiceClient::connect(format!("http://{}", group.route.endpoint)).await?;
-    let descriptor = peer.open_hierarchy(w::OpenRequest {
-        context: context(), shard: 120,
-    }).await?.into_inner().descriptor.context("hierarchy descriptor")?;
+    let mut peer = w::query_service_client::QueryServiceClient::connect(format!(
+        "http://{}",
+        group.route.endpoint
+    ))
+    .await?;
+    let descriptor = peer
+        .open_hierarchy(w::OpenRequest {
+            context: context(),
+            shard: 120,
+        })
+        .await?
+        .into_inner()
+        .descriptor
+        .context("hierarchy descriptor")?;
     let exists = w::Fragment {
         kind: Some(w::fragment::Kind::Exists(w::VertexId {
             partition: 0,
@@ -547,8 +557,18 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
 
     // Reverse direction: opening on one typed listener and closing on the
     // other must invalidate the original token. Independent pools cannot pass.
-    let opened = client.open(w::OpenRequest { context: context(), shard: 120 }).await?.into_inner();
-    peer.close(w::CloseRequest { context: context(), descriptor: Some(opened.clone()) }).await?;
+    let opened = client
+        .open(w::OpenRequest {
+            context: context(),
+            shard: 120,
+        })
+        .await?
+        .into_inner();
+    peer.close(w::CloseRequest {
+        context: context(),
+        descriptor: Some(opened.clone()),
+    })
+    .await?;
     let request = w::FragmentRequest {
         context: context(),
         descriptor: Some(opened),
@@ -703,7 +723,13 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
                 .into_inner(),
         );
     }
-    let last = peer.open(w::OpenRequest { context: context(), shard: 120 }).await?.into_inner();
+    let last = peer
+        .open(w::OpenRequest {
+            context: context(),
+            shard: 120,
+        })
+        .await?
+        .into_inner();
     assert_eq!(
         client
             .open(w::OpenRequest {
@@ -715,8 +741,17 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
             .code(),
         tonic::Code::ResourceExhausted
     );
-    assert_eq!(peer.open(w::OpenRequest { context: context(), shard: 120 }).await.unwrap_err().code(),
-        tonic::Code::ResourceExhausted, "one process-wide pool across typed listeners");
+    assert_eq!(
+        peer.open(w::OpenRequest {
+            context: context(),
+            shard: 120
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::ResourceExhausted,
+        "one process-wide pool across typed listeners"
+    );
     for descriptor in held {
         client
             .close(w::CloseRequest {
@@ -725,7 +760,11 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
             })
             .await?;
     }
-    peer.close(w::CloseRequest { context: context(), descriptor: Some(last) }).await?;
+    peer.close(w::CloseRequest {
+        context: context(),
+        descriptor: Some(last),
+    })
+    .await?;
     assert_eq!(
         proxy.connections.load(Ordering::SeqCst),
         1,
@@ -1183,7 +1222,9 @@ async fn coordinator_ingress_checks(
         .await;
         assert!(!matches!(received, Ok(Ok(Some(_)))));
     }
-    if let Ok(wrong) = CoordinatorClient::connect(other_graph_listener, Duration::from_millis(300)).await {
+    if let Ok(wrong) =
+        CoordinatorClient::connect(other_graph_listener, Duration::from_millis(300)).await
+    {
         assert!(wrong
             .query(request("g.V(1).count()"), Duration::from_millis(300))
             .await

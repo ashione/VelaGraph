@@ -272,7 +272,9 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::super::typed_test_peer::{Listener as TcpListener, Socket as TcpStream, read_frame, write_frame};
+    use super::super::typed_test_peer::{
+        read_frame, write_frame, Listener as TcpListener, Socket as TcpStream,
+    };
     use super::*;
     use d2_raft::{
         participant_writes::Authority,

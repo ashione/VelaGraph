@@ -37,8 +37,8 @@ pub use paged::grpc;
 pub mod query;
 pub mod single_query_grpc;
 pub use paged::{
-    close_snapshot, grpc_paged_snapshot, open_snapshot, paged_snapshot, paged_snapshot_identified,
-    snapshot_page, SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES,
+    close_snapshot, grpc_paged_snapshot, open_snapshot, paged_snapshot_identified, snapshot_page,
+    SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES,
     MAX_PAGE_ROWS, MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS,
     SESSION_TTL,
 };
@@ -249,29 +249,51 @@ pub struct GraphService {
 }
 impl std::ops::Deref for GraphService {
     type Target = GraphState;
-    fn deref(&self) -> &GraphState { &self.shared }
+    fn deref(&self) -> &GraphState {
+        &self.shared
+    }
 }
 impl GraphService {
-    pub async fn start(node: &d2_raft::tcp::TcpNode, bind: SocketAddr,
-        shard: u64, deadline: Duration) -> Result<Self, RemoteError> {
+    pub async fn start(
+        node: &d2_raft::tcp::TcpNode,
+        bind: SocketAddr,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
         Self::start_identified(node, bind, 0, shard, deadline).await
     }
-    pub async fn start_identified(node: &d2_raft::tcp::TcpNode, bind: SocketAddr,
-        group: u64, shard: u64, deadline: Duration) -> Result<Self, RemoteError> {
+    pub async fn start_identified(
+        node: &d2_raft::tcp::TcpNode,
+        bind: SocketAddr,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
         let shared = GraphState::from_tcp(node, group, shard, deadline)?;
         let transport = grpc::GrpcSnapshotService::start(&shared, bind).await?;
         Ok(Self { shared, transport })
     }
-    pub async fn start_managed(node: &d2_raft::NodeHandle, bind: SocketAddr,
-        group: u64, shard: u64, deadline: Duration) -> Result<Self, RemoteError> {
+    pub async fn start_managed(
+        node: &d2_raft::NodeHandle,
+        bind: SocketAddr,
+        group: u64,
+        shard: u64,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
         let shared = GraphState::from_managed(node, group, shard, deadline)?;
         let transport = grpc::GrpcSnapshotService::start(&shared, bind).await?;
         Ok(Self { shared, transport })
     }
-    pub fn snapshot_stats(&self) -> SnapshotStats { self.shared.snapshot_stats() }
-    pub fn local_addr(&self) -> SocketAddr { self.transport.local_addr() }
+    pub fn snapshot_stats(&self) -> SnapshotStats {
+        self.shared.snapshot_stats()
+    }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.transport.local_addr()
+    }
     /// Submitted Raft commands may still commit after shutdown.
-    pub async fn shutdown(self) { self.transport.shutdown().await; }
+    pub async fn shutdown(self) {
+        self.transport.shutdown().await;
+    }
 }
 
 async fn execute(
@@ -546,7 +568,6 @@ fn validate_write(request: &D1WriteRequest) -> Result<(), RemoteError> {
 
 /// Fetch a bounded whole-shard snapshot; does not follow leader hints.
 
-
 /// Validate the configured group and node for a bounded whole-shard copy.
 pub async fn snapshot_identified(
     endpoint: SocketAddr,
@@ -593,7 +614,6 @@ async fn snapshot_with_identity(
 /// Check local applied metadata for a pinned view. This is not a leader read
 /// barrier and provides the same local-epoch check as the in-process adapter.
 
-
 /// Fetch metadata with the configured group and node.
 pub async fn metadata_identified(
     endpoint: SocketAddr,
@@ -627,7 +647,6 @@ async fn metadata_with_identity(
 }
 /// Submit exact immutable D1 bytes/identity once. Preserve a copy before calling:
 /// timeout, disconnect, or unavailable responses may have an unknown outcome.
-
 
 /// Write with the configured group and node and original request identity.
 pub async fn write_identified(
@@ -703,12 +722,14 @@ async fn typed_operation(
 ) -> Result<Reply, RemoteError> {
     let end = checked_deadline(duration, id)?;
     let identity = identity.ok_or(RemoteError::InvalidArgument)?;
-    let mut client = operations_grpc::Client::connect_lazy(endpoint, identity, duration)?
-        .with_deadline(end);
-    Box::pin(client.call(operation)).await.map_err(|error| match error {
-        RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
-        other => other,
-    })
+    let mut client =
+        operations_grpc::Client::connect_lazy(endpoint, identity, duration)?.with_deadline(end);
+    Box::pin(client.call(operation))
+        .await
+        .map_err(|error| match error {
+            RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
+            other => other,
+        })
 }
 
 // Preserve the caller's stack, deadline and permits while allowing the
@@ -858,29 +879,62 @@ mod tests {
         node.shutdown().await;
     }
 
-
     #[tokio::test]
     async fn oversized_response_rejected_before_body() {
         let (address, seen, task) = raw_test_peer::spawn(Some(MAX_FRAME_BYTES + 1)).await;
-        let result = metadata_identified(address, RemoteIdentity { group: 10, node: 1 }, 7, Duration::from_secs(2)).await;
-        tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
+        let result = metadata_identified(
+            address,
+            RemoteIdentity { group: 10, node: 1 },
+            7,
+            Duration::from_secs(2),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), seen)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
         task.abort();
     }
     #[tokio::test]
     async fn stalled_response_keeps_original_write_identity() {
         let (address, seen, task) = raw_test_peer::spawn(None).await;
-        let request = D1WriteRequest { shard: 7, epoch: 1, request_id: [9; 16], expected_sequence: Some(0),
-            operations: vec![d2_raft::WriteOp::Put { key: vec![1], value: vec![2] }] };
-        let result = write_identified(address, RemoteIdentity { group: 10, node: 1 }, request, Duration::from_millis(500)).await;
-        let frame = tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
+        let request = D1WriteRequest {
+            shard: 7,
+            epoch: 1,
+            request_id: [9; 16],
+            expected_sequence: Some(0),
+            operations: vec![d2_raft::WriteOp::Put {
+                key: vec![1],
+                value: vec![2],
+            }],
+        };
+        let result = write_identified(
+            address,
+            RemoteIdentity { group: 10, node: 1 },
+            request,
+            Duration::from_millis(500),
+        )
+        .await;
+        let frame = tokio::time::timeout(Duration::from_secs(2), seen)
+            .await
+            .unwrap()
+            .unwrap();
         use prost::Message;
         assert_eq!(frame[0], 0);
-        assert_eq!(u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize, frame.len() - 5);
+        assert_eq!(
+            u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize,
+            frame.len() - 5
+        );
         let observed = operations_grpc::wire::Request::decode(&frame[5..]).unwrap();
-        let Some(operations_grpc::wire::request::Operation::Write(observed)) = observed.operation else { panic!("expected typed Write"); };
+        let Some(operations_grpc::wire::request::Operation::Write(observed)) = observed.operation
+        else {
+            panic!("expected typed Write");
+        };
         assert_eq!(observed.request_id, vec![9; 16]);
-        assert!(matches!(result, Err(RemoteError::Timeout { request_id: Some(id) }) if id == [9; 16]));
+        assert!(
+            matches!(result, Err(RemoteError::Timeout { request_id: Some(id) }) if id == [9; 16])
+        );
         task.abort();
     }
 }

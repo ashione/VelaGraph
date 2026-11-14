@@ -686,16 +686,24 @@ impl SnapshotClient {
     }
     /// Build a channel without network activity. Operation admission is acquired
     /// before the first HTTP/2 handshake; the operation owns the total deadline.
-    pub(crate) fn connect_lazy(address: SocketAddr, identity: RemoteIdentity,
-        deadline: Duration) -> Result<Self, RemoteError> {
+    pub(crate) fn connect_lazy(
+        address: SocketAddr,
+        identity: RemoteIdentity,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
         checked_deadline(deadline, None)?;
         let channel = Channel::from_shared(format!("http://{address}"))
             .map_err(|_| RemoteError::InvalidArgument)?
-            .connect_timeout(deadline).buffer_size(MAX_IN_FLIGHT)
-            .concurrency_limit(MAX_IN_FLIGHT).connect_lazy();
-        Ok(Self { client: SnapshotServiceClient::new(channel)
-            .max_decoding_message_size(RESPONSE_LIMIT)
-            .max_encoding_message_size(REQUEST_LIMIT), identity })
+            .connect_timeout(deadline)
+            .buffer_size(MAX_IN_FLIGHT)
+            .concurrency_limit(MAX_IN_FLIGHT)
+            .connect_lazy();
+        Ok(Self {
+            client: SnapshotServiceClient::new(channel)
+                .max_decoding_message_size(RESPONSE_LIMIT)
+                .max_encoding_message_size(REQUEST_LIMIT),
+            identity,
+        })
     }
     fn context(&self, end: Instant) -> Result<wire::Context, RemoteError> {
         check_time(end)?;

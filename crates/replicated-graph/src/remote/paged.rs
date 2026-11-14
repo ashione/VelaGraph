@@ -345,7 +345,9 @@ pub async fn open_snapshot(
     deadline: Duration,
 ) -> Result<SnapshotDescriptor, RemoteError> {
     let identity = identity.ok_or(RemoteError::InvalidArgument)?;
-    grpc::SnapshotClient::connect_lazy(endpoint, identity, deadline)?.open(shard, deadline).await
+    grpc::SnapshotClient::connect_lazy(endpoint, identity, deadline)?
+        .open(shard, deadline)
+        .await
 }
 fn validate_descriptor(
     descriptor: &SnapshotDescriptor,
@@ -373,7 +375,9 @@ pub async fn snapshot_page(
     deadline: Duration,
 ) -> Result<SnapshotPage, RemoteError> {
     let identity = identity.ok_or(RemoteError::InvalidArgument)?;
-    grpc::SnapshotClient::connect_lazy(endpoint, identity, deadline)?.page(descriptor, cursor, deadline).await
+    grpc::SnapshotClient::connect_lazy(endpoint, identity, deadline)?
+        .page(descriptor, cursor, deadline)
+        .await
 }
 fn validate_page(
     descriptor: &SnapshotDescriptor,
@@ -417,33 +421,20 @@ pub async fn close_snapshot(
     deadline: Duration,
 ) -> Result<(), RemoteError> {
     let identity = identity.ok_or(RemoteError::InvalidArgument)?;
-    grpc::SnapshotClient::connect_lazy(endpoint, identity, deadline)?.close(descriptor, deadline).await
+    grpc::SnapshotClient::connect_lazy(endpoint, identity, deadline)?
+        .close(descriptor, deadline)
+        .await
 }
 /// Download a complete frozen shard through bounded pages, with one deadline.
 /// No partial view, automatic retry, leader failover, or lazy remote reads.
-pub async fn paged_snapshot(
-    endpoint: SocketAddr,
-    shard: u64,
-    deadline: Duration,
-) -> Result<RemoteSnapshot, RemoteError> {
-    download(endpoint, None, shard, deadline).await
-}
-/// Identified variant of [`paged_snapshot`].
+/// Download a complete frozen shard using its configured identity.
 pub async fn paged_snapshot_identified(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
     shard: u64,
     deadline: Duration,
 ) -> Result<RemoteSnapshot, RemoteError> {
-    download(endpoint, Some(identity), shard, deadline).await
-}
-async fn download(
-    endpoint: SocketAddr,
-    identity: Option<RemoteIdentity>,
-    shard: u64,
-    deadline: Duration,
-) -> Result<RemoteSnapshot, RemoteError> {
-    grpc_paged_snapshot(endpoint, identity.ok_or(RemoteError::InvalidArgument)?, shard, deadline).await
+    grpc_paged_snapshot(endpoint, identity, shard, deadline).await
 }
 /// Typed full snapshot download with the same aggregate limits and validator as
 /// the legacy explicit transport. No fallback or protocol detection.
@@ -457,23 +448,41 @@ pub async fn grpc_paged_snapshot(
     let _download = DOWNLOAD_ADMISSION
         .try_acquire()
         .map_err(|_| RemoteError::ResourceExhausted)?;
-    let client = grpc::SnapshotClient::connect_lazy(endpoint, identity,
-        end.saturating_duration_since(Instant::now()))?;
+    let client = grpc::SnapshotClient::connect_lazy(
+        endpoint,
+        identity,
+        end.saturating_duration_since(Instant::now()),
+    )?;
     download_complete(DownloadTransport(client), shard, end).await
 }
 struct DownloadTransport(grpc::SnapshotClient);
 impl DownloadTransport {
     async fn open(&self, shard: u64, end: Instant) -> Result<SnapshotDescriptor, RemoteError> {
         check_time(end)?;
-        self.0.open(shard, end.saturating_duration_since(Instant::now())).await
+        self.0
+            .open(shard, end.saturating_duration_since(Instant::now()))
+            .await
     }
-    async fn page(&self, descriptor: SnapshotDescriptor, cursor: Option<SnapshotCursor>, end: Instant) -> Result<SnapshotPage, RemoteError> {
+    async fn page(
+        &self,
+        descriptor: SnapshotDescriptor,
+        cursor: Option<SnapshotCursor>,
+        end: Instant,
+    ) -> Result<SnapshotPage, RemoteError> {
         check_time(end)?;
-        self.0.page(descriptor, cursor, end.saturating_duration_since(Instant::now())).await
+        self.0
+            .page(
+                descriptor,
+                cursor,
+                end.saturating_duration_since(Instant::now()),
+            )
+            .await
     }
     async fn close(&self, descriptor: SnapshotDescriptor, end: Instant) -> Result<(), RemoteError> {
         check_time(end)?;
-        self.0.close(descriptor, end.saturating_duration_since(Instant::now())).await
+        self.0
+            .close(descriptor, end.saturating_duration_since(Instant::now()))
+            .await
     }
 }
 async fn download_complete(

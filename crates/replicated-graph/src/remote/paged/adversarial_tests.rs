@@ -41,7 +41,10 @@ struct ScriptState {
     page_index: usize,
     closed: bool,
     finished: Option<tokio::sync::oneshot::Sender<()>>,
-    close_gate: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    close_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 impl ScriptedPeer {
     fn check_context(&self, context: Option<grpc::wire::Context>) {
@@ -55,7 +58,10 @@ impl ScriptedPeer {
 }
 #[tonic::async_trait]
 impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
-    async fn open(&self, request: tonic::Request<grpc::wire::OpenRequest>) -> Result<tonic::Response<grpc::wire::Descriptor>, tonic::Status> {
+    async fn open(
+        &self,
+        request: tonic::Request<grpc::wire::OpenRequest>,
+    ) -> Result<tonic::Response<grpc::wire::Descriptor>, tonic::Status> {
         let request = request.into_inner();
         self.check_context(request.context);
         assert_eq!(request.shard, 7);
@@ -64,39 +70,72 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
         state.opened = true;
         Ok(tonic::Response::new(self.descriptor.clone().into()))
     }
-    async fn page(&self, request: tonic::Request<grpc::wire::PageRequest>) -> Result<tonic::Response<grpc::wire::PageResponse>, tonic::Status> {
+    async fn page(
+        &self,
+        request: tonic::Request<grpc::wire::PageRequest>,
+    ) -> Result<tonic::Response<grpc::wire::PageResponse>, tonic::Status> {
         let request = request.into_inner();
         self.check_context(request.context);
-        let descriptor: SnapshotDescriptor = request.descriptor.expect("page descriptor").try_into().unwrap();
+        let descriptor: SnapshotDescriptor = request
+            .descriptor
+            .expect("page descriptor")
+            .try_into()
+            .unwrap();
         assert_eq!(descriptor, self.descriptor);
         let (page, finished) = {
             let mut state = self.state.lock().unwrap();
             assert!(state.opened && !state.closed);
-            assert_eq!(request.cursor.map(|c| c.position), (state.page_index != 0).then_some(state.page_index as u64));
+            assert_eq!(
+                request.cursor.map(|c| c.position),
+                (state.page_index != 0).then_some(state.page_index as u64)
+            );
             state.page_index += 1;
-            let page = state.pages.pop_front().expect("unexpected fetch or retry after invalid page");
-            let finished = if state.pages.is_empty() && !self.expect_close { state.finished.take() } else { None };
+            let page = state
+                .pages
+                .pop_front()
+                .expect("unexpected fetch or retry after invalid page");
+            let finished = if state.pages.is_empty() && !self.expect_close {
+                state.finished.take()
+            } else {
+                None
+            };
             (page, finished)
         };
         // Shutdown signal proves the final page was requested even if the client
         // deadline cancels its response. Graceful shutdown drains this RPC.
-        if let Some(finished) = finished { finished.send(()).unwrap(); }
+        if let Some(finished) = finished {
+            finished.send(()).unwrap();
+        }
         tokio::time::sleep(self.delay).await;
         Ok(tonic::Response::new(grpc::wire::PageResponse {
             descriptor: Some(page.descriptor.into()),
-            entries: page.entries.into_iter().map(|(key, value)| grpc::wire::Entry { key, value }).collect(),
+            entries: page
+                .entries
+                .into_iter()
+                .map(|(key, value)| grpc::wire::Entry { key, value })
+                .collect(),
             next: page.next.map(Into::into),
         }))
     }
-    async fn close(&self, request: tonic::Request<grpc::wire::CloseRequest>) -> Result<tonic::Response<grpc::wire::Empty>, tonic::Status> {
+    async fn close(
+        &self,
+        request: tonic::Request<grpc::wire::CloseRequest>,
+    ) -> Result<tonic::Response<grpc::wire::Empty>, tonic::Status> {
         let request = request.into_inner();
         self.check_context(request.context);
-        let descriptor: SnapshotDescriptor = request.descriptor.expect("close descriptor").try_into().unwrap();
+        let descriptor: SnapshotDescriptor = request
+            .descriptor
+            .expect("close descriptor")
+            .try_into()
+            .unwrap();
         assert_eq!(descriptor, self.descriptor);
         let (gate, finished) = {
             let mut state = self.state.lock().unwrap();
             assert!(self.expect_close && state.opened && !state.closed);
-            assert!(state.pages.is_empty(), "must stop fetching at the scripted boundary");
+            assert!(
+                state.pages.is_empty(),
+                "must stop fetching at the scripted boundary"
+            );
             state.closed = true;
             (state.close_gate.take(), state.finished.take())
         };
@@ -121,21 +160,39 @@ async fn peer_with_gate(
     pages: Vec<SnapshotPage>,
     delay: Duration,
     expect_close: bool,
-    close_gate: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    close_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
     let (finished, shutdown) = tokio::sync::oneshot::channel();
     let state = std::sync::Arc::new(std::sync::Mutex::new(ScriptState {
-        opened: false, pages: pages.into(), page_index: 0, closed: false,
-        finished: Some(finished), close_gate,
+        opened: false,
+        pages: pages.into(),
+        page_index: 0,
+        closed: false,
+        finished: Some(finished),
+        close_gate,
     }));
-    let service = ScriptedPeer { descriptor: d, state: state.clone(), delay, expect_close };
+    let service = ScriptedPeer {
+        descriptor: d,
+        state: state.clone(),
+        delay,
+        expect_close,
+    };
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(grpc::wire::snapshot_service_server::SnapshotServiceServer::new(service))
-            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async { let _ = shutdown.await; })
-            .await.unwrap();
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = shutdown.await;
+                },
+            )
+            .await
+            .unwrap();
         let state = state.lock().unwrap();
         assert!(state.opened && state.pages.is_empty());
         assert_eq!(state.closed, expect_close);
@@ -152,7 +209,8 @@ async fn malformed_downloads_fail_and_close_without_partial_results() {
         let pages = vec![page(&d, 1, true), page(&d, last_key, false)];
         let (endpoint, server) = peer(d, pages, Duration::ZERO, true).await;
         assert!(matches!(
-            paged_snapshot_identified(endpoint, descriptor().identity, 7, Duration::from_secs(2)).await,
+            paged_snapshot_identified(endpoint, descriptor().identity, 7, Duration::from_secs(2))
+                .await,
             Err(RemoteError::Protocol)
         ));
         tokio::time::timeout(Duration::from_secs(2), server)
@@ -185,7 +243,8 @@ async fn malformed_downloads_fail_and_close_without_partial_results() {
         }
         let (endpoint, server) = peer(d, vec![bad], Duration::ZERO, true).await;
         assert!(matches!(
-            paged_snapshot_identified(endpoint, descriptor().identity, 7, Duration::from_secs(2)).await,
+            paged_snapshot_identified(endpoint, descriptor().identity, 7, Duration::from_secs(2))
+                .await,
             Err(RemoteError::Protocol)
         ));
         tokio::time::timeout(Duration::from_secs(2), server)
@@ -204,7 +263,13 @@ async fn successive_pages_share_one_deadline() {
     let (endpoint, server) = peer(d, pages, Duration::from_millis(250), false).await;
     let started = Instant::now();
     assert!(matches!(
-        paged_snapshot_identified(endpoint, descriptor().identity, 7, Duration::from_millis(400)).await,
+        paged_snapshot_identified(
+            endpoint,
+            descriptor().identity,
+            7,
+            Duration::from_millis(400)
+        )
+        .await,
         Err(RemoteError::Timeout { request_id: None })
     ));
     assert!(started.elapsed() < Duration::from_millis(900));
@@ -222,10 +287,27 @@ async fn completed_download_retains_admission_until_close_finishes() {
     let (closing, reached_close) = tokio::sync::oneshot::channel();
     let (release_close, released) = tokio::sync::oneshot::channel();
     let entries = (0..100u32)
-        .map(|n| (n.to_be_bytes().to_vec(), vec![0; 1020])).collect();
-    let page = SnapshotPage { descriptor: d.clone(), entries, next: None };
-    let (endpoint, server) = peer_with_gate(d, vec![page], Duration::ZERO, true, Some((closing, released))).await;
-    let download = tokio::spawn(paged_snapshot_identified(endpoint, descriptor().identity, 7, Duration::from_secs(3)));
+        .map(|n| (n.to_be_bytes().to_vec(), vec![0; 1020]))
+        .collect();
+    let page = SnapshotPage {
+        descriptor: d.clone(),
+        entries,
+        next: None,
+    };
+    let (endpoint, server) = peer_with_gate(
+        d,
+        vec![page],
+        Duration::ZERO,
+        true,
+        Some((closing, released)),
+    )
+    .await;
+    let download = tokio::spawn(paged_snapshot_identified(
+        endpoint,
+        descriptor().identity,
+        7,
+        Duration::from_secs(3),
+    ));
     tokio::time::timeout(Duration::from_secs(2), reached_close)
         .await
         .unwrap()

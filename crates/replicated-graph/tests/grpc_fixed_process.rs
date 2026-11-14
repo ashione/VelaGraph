@@ -621,15 +621,26 @@ async fn raw_fixed_checks(
     );
 
     // Both typed listeners share one fixed-session pool and descriptors.
-    let cross = rpc.open_fixed(w::FixedOpenEnvelope {
-        context: context(), request: Some(open.clone()),
-    }).await?.into_inner().descriptor.context("cross descriptor")?;
-    let mut other = w::fixed_query_service_client::FixedQueryServiceClient::connect(
-        format!("http://{}", tcp.endpoint),
-    ).await?;
-    other.close_fixed(w::FixedCloseEnvelope {
-        context: context(), descriptor: Some(cross.clone()),
-    }).await?;
+    let cross = rpc
+        .open_fixed(w::FixedOpenEnvelope {
+            context: context(),
+            request: Some(open.clone()),
+        })
+        .await?
+        .into_inner()
+        .descriptor
+        .context("cross descriptor")?;
+    let mut other = w::fixed_query_service_client::FixedQueryServiceClient::connect(format!(
+        "http://{}",
+        tcp.endpoint
+    ))
+    .await?;
+    other
+        .close_fixed(w::FixedCloseEnvelope {
+            context: context(),
+            descriptor: Some(cross.clone()),
+        })
+        .await?;
     assert_eq!(
         rpc.fragment_fixed(fragment(cross, 0))
             .await
@@ -661,9 +672,17 @@ async fn raw_fixed_checks(
         .code(),
         tonic::Code::ResourceExhausted
     );
-    assert_eq!(other.open_fixed(w::FixedOpenEnvelope {
-        context: context(), request: Some(open.clone()),
-    }).await.unwrap_err().code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        other
+            .open_fixed(w::FixedOpenEnvelope {
+                context: context(),
+                request: Some(open.clone()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
     for descriptor in held {
         rpc.close_fixed(w::FixedCloseEnvelope {
             context: context(),

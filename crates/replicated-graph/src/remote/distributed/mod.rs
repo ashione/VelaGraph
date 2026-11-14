@@ -8,11 +8,11 @@ use velagraph::{
     Value,
 };
 mod adjacency;
-#[cfg(test)]
-mod typed_test_peer;
 pub(crate) mod fixed;
 pub(crate) mod fixed_execution;
 mod fixed_parallel;
+#[cfg(test)]
+mod typed_test_peer;
 use adjacency::Direction;
 pub mod consistency;
 pub mod grpc;
@@ -776,10 +776,14 @@ impl Execution<'_> {
                 break;
             }
             if let Ok(client) = observed_client(self.grpc_clients, route, self.end) {
-                let _ = client.close(
-                    descriptor.clone(),
-                    self.end.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)),
-                ).await;
+                let _ = client
+                    .close(
+                        descriptor.clone(),
+                        self.end
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(20)),
+                    )
+                    .await;
             }
         }
     }
@@ -792,10 +796,16 @@ fn observed_client(
     end: Instant,
 ) -> Result<grpc::QueryClient, QueryFailure> {
     match clients {
-        Some(clients) => clients.get(&route.shard).cloned().ok_or(QueryFailure::Unavailable),
+        Some(clients) => clients
+            .get(&route.shard)
+            .cloned()
+            .ok_or(QueryFailure::Unavailable),
         None => grpc::QueryClient::connect_lazy(
-            route.endpoint, route.identity, end.saturating_duration_since(Instant::now()),
-        ).map_err(remote_failure),
+            route.endpoint,
+            route.identity,
+            end.saturating_duration_since(Instant::now()),
+        )
+        .map_err(remote_failure),
     }
 }
 

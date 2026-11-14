@@ -668,11 +668,9 @@ impl OwnedConfig {
     ) -> Result<crate::remote::distributed::fixed::Client> {
         use crate::remote::distributed::fixed;
         match &self.local_grpc {
-            None => fixed::Client::connect_lazy(endpoint, identity, crate::remote::MAX_DEADLINE).map_err(local::remote_error),
-            Some(clients) => clients
-                .get(&shard)
-                .cloned()
-                .ok_or(Error::Identity),
+            None => fixed::Client::connect_lazy(endpoint, identity, crate::remote::MAX_DEADLINE)
+                .map_err(local::remote_error),
+            Some(clients) => clients.get(&shard).cloned().ok_or(Error::Identity),
         }
     }
     fn endpoints(&self) -> Vec<(NodeRef<'_>, Target)> {

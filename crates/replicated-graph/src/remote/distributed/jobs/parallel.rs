@@ -216,15 +216,8 @@ pub(super) async fn run(
                     Fragment::HierarchyBatch { fragments, .. } => fragments.clone(),
                     _ => unreachable!("job batches are typed"),
                 };
-                let value = execution
-                    .fragment_transport(batch.fragment)
-                    .await;
-                (
-                    batch.indices,
-                    execution.cost,
-                    value,
-                    expected,
-                )
+                let value = execution.fragment_transport(batch.fragment).await;
+                (batch.indices, execution.cost, value, expected)
             }));
         }
         let mut replies: Vec<_> = (0..futures.len()).map(|_| None).collect();
@@ -290,7 +283,9 @@ pub(super) fn reservation_for_test(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::typed_test_peer::{Listener as TcpListener, Socket as TcpStream, read_frame, write_frame};
+    use super::super::super::typed_test_peer::{
+        read_frame, write_frame, Listener as TcpListener, Socket as TcpStream,
+    };
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

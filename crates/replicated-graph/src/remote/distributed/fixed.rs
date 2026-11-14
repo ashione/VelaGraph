@@ -327,17 +327,25 @@ pub(crate) fn renewable_preflight(
 }
 #[cfg(test)]
 pub(crate) async fn renewable_open(
-    endpoint: SocketAddr, identity: RemoteIdentity,
-    request: RenewableFixedOpenRequest, duration: Duration,
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    request: RenewableFixedOpenRequest,
+    duration: Duration,
 ) -> Result<RenewableFixedOpened, RemoteError> {
-    Client::connect_lazy(endpoint, identity, duration)?.renewable_open(request, duration).await
+    Client::connect_lazy(endpoint, identity, duration)?
+        .renewable_open(request, duration)
+        .await
 }
 #[cfg(test)]
 pub(crate) async fn renew(
-    endpoint: SocketAddr, identity: RemoteIdentity,
-    request: FixedRenewRequest, duration: Duration,
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    request: FixedRenewRequest,
+    duration: Duration,
 ) -> Result<FixedLeaseGrant, RemoteError> {
-    Client::connect_lazy(endpoint, identity, duration)?.renew(request, duration).await
+    Client::connect_lazy(endpoint, identity, duration)?
+        .renew(request, duration)
+        .await
 }
 #[cfg(test)]
 pub(super) async fn fragment(
@@ -1024,13 +1032,19 @@ mod tests {
         let end = Instant::now() + Duration::from_secs(5);
         let bytes = frame_size(&response, end).unwrap();
         assert!(bytes > query::MAX_QUERY_RESPONSE_BYTES + 1024 && bytes < MAX_FRAME_BYTES);
-        let listener = super::super::typed_test_peer::Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = super::super::typed_test_peer::Listener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let endpoint = listener.local_addr().unwrap();
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let received: Request = super::super::typed_test_peer::read_frame(&mut stream, end).await.unwrap();
+            let received: Request = super::super::typed_test_peer::read_frame(&mut stream, end)
+                .await
+                .unwrap();
             assert!(matches!(received.operation, Operation::OpenFixedQuery(_)));
-            super::super::typed_test_peer::write_frame(&mut stream, response, end).await.unwrap();
+            super::super::typed_test_peer::write_frame(&mut stream, response, end)
+                .await
+                .unwrap();
         });
         // No certification assertion: this only proves that the new operation
         // has its own 16MiB receive branch; gateway checks the actual proof.

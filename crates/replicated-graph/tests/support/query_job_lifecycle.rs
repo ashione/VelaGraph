@@ -2,9 +2,9 @@
 //! The graph and every managed mutation live in independent child processes.
 use super::*;
 use gateway::{JobHandle, JobPhase, JobPolicy, JobStatus};
+use replicated_graph::remote::distributed::grpc::wire as delay_wire;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
-use replicated_graph::remote::distributed::grpc::wire as delay_wire;
 
 const ROOT: u64 = 2_000_001;
 const EDGE: u64 = 2_000_010;
@@ -52,7 +52,8 @@ impl Drop for ActiveFragment {
 /// RPCs retain their own paths and do not sleep. This is not performance data.
 #[derive(Clone)]
 struct DelayService {
-    client: delay_wire::fixed_query_service_client::FixedQueryServiceClient<tonic::transport::Channel>,
+    client:
+        delay_wire::fixed_query_service_client::FixedQueryServiceClient<tonic::transport::Channel>,
     shard: u64,
     traffic: Arc<FragmentTraffic>,
     fragments: Arc<AtomicU64>,
@@ -60,22 +61,40 @@ struct DelayService {
 }
 #[tonic::async_trait]
 impl delay_wire::fixed_query_service_server::FixedQueryService for DelayService {
-    async fn open_fixed(&self, request: tonic::Request<delay_wire::FixedOpenEnvelope>) -> Result<tonic::Response<delay_wire::FixedOpened>, tonic::Status> {
+    async fn open_fixed(
+        &self,
+        request: tonic::Request<delay_wire::FixedOpenEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::FixedOpened>, tonic::Status> {
         self.client.clone().open_fixed(request).await
     }
-    async fn open_renewable(&self, request: tonic::Request<delay_wire::RenewableOpenEnvelope>) -> Result<tonic::Response<delay_wire::RenewableFixedOpened>, tonic::Status> {
+    async fn open_renewable(
+        &self,
+        request: tonic::Request<delay_wire::RenewableOpenEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::RenewableFixedOpened>, tonic::Status> {
         self.client.clone().open_renewable(request).await
     }
-    async fn renew(&self, request: tonic::Request<delay_wire::FixedRenewEnvelope>) -> Result<tonic::Response<delay_wire::FixedLeaseGrant>, tonic::Status> {
+    async fn renew(
+        &self,
+        request: tonic::Request<delay_wire::FixedRenewEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::FixedLeaseGrant>, tonic::Status> {
         self.client.clone().renew(request).await
     }
-    async fn fragment_fixed(&self, request: tonic::Request<delay_wire::FixedFragmentEnvelope>) -> Result<tonic::Response<delay_wire::FixedFragmentResponse>, tonic::Status> {
+    async fn fragment_fixed(
+        &self,
+        request: tonic::Request<delay_wire::FixedFragmentEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::FixedFragmentResponse>, tonic::Status> {
         let _active = self.traffic.enter(self.shard);
         self.fragments.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(self.delay_millis.load(Ordering::SeqCst))).await;
+        tokio::time::sleep(Duration::from_millis(
+            self.delay_millis.load(Ordering::SeqCst),
+        ))
+        .await;
         self.client.clone().fragment_fixed(request).await
     }
-    async fn close_fixed(&self, request: tonic::Request<delay_wire::FixedCloseEnvelope>) -> Result<tonic::Response<delay_wire::Empty>, tonic::Status> {
+    async fn close_fixed(
+        &self,
+        request: tonic::Request<delay_wire::FixedCloseEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::Empty>, tonic::Status> {
         self.client.clone().close_fixed(request).await
     }
 }
@@ -87,19 +106,28 @@ struct FragmentDelay {
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 impl FragmentDelay {
-    async fn start(upstream: SocketAddr, shard: u64, traffic: Arc<FragmentTraffic>) -> anyhow::Result<Self> {
+    async fn start(
+        upstream: SocketAddr,
+        shard: u64,
+        traffic: Arc<FragmentTraffic>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = listener.local_addr()?;
         let fragments = Arc::new(AtomicU64::new(0));
         let delay_millis = Arc::new(AtomicU64::new(0));
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{upstream}"))?
-            .connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(10))
-            .connect().await?;
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
+            .connect()
+            .await?;
         let service = DelayService {
             client: delay_wire::fixed_query_service_client::FixedQueryServiceClient::new(channel)
                 .max_decoding_message_size(4 * 1024 * 1024)
                 .max_encoding_message_size(4 * 1024 * 1024),
-            shard, traffic, fragments: fragments.clone(), delay_millis: delay_millis.clone(),
+            shard,
+            traffic,
+            fragments: fragments.clone(),
+            delay_millis: delay_millis.clone(),
         };
         let shutdown = tokio_util::sync::CancellationToken::new();
         let stopped = shutdown.clone();
@@ -107,21 +135,39 @@ impl FragmentDelay {
             tonic::transport::Server::builder()
                 .concurrency_limit_per_connection(32)
                 .timeout(Duration::from_secs(10))
-                .add_service(delay_wire::fixed_query_service_server::FixedQueryServiceServer::new(service)
-                    .max_decoding_message_size(4 * 1024 * 1024)
-                    .max_encoding_message_size(4 * 1024 * 1024))
-                .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), stopped.cancelled())
+                .add_service(
+                    delay_wire::fixed_query_service_server::FixedQueryServiceServer::new(service)
+                        .max_decoding_message_size(4 * 1024 * 1024)
+                        .max_encoding_message_size(4 * 1024 * 1024),
+                )
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopped.cancelled(),
+                )
                 .await?;
             Ok(())
         });
-        Ok(Self { endpoint, fragments, delay_millis, shutdown, task })
+        Ok(Self {
+            endpoint,
+            fragments,
+            delay_millis,
+            shutdown,
+            task,
+        })
     }
-    fn delay(&self, millis: u64) { self.delay_millis.store(millis, Ordering::SeqCst); }
-    fn count(&self) -> u64 { self.fragments.load(Ordering::SeqCst) }
+    fn delay(&self, millis: u64) {
+        self.delay_millis.store(millis, Ordering::SeqCst);
+    }
+    fn count(&self) -> u64 {
+        self.fragments.load(Ordering::SeqCst)
+    }
     async fn stop(mut self) {
         self.shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(15), &mut self.task).await
-            .expect("typed delay proxy shutdown deadline").unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(15), &mut self.task)
+            .await
+            .expect("typed delay proxy shutdown deadline")
+            .unwrap()
+            .unwrap();
     }
 }
 impl Drop for FragmentDelay {

@@ -60,7 +60,11 @@ impl NodeSession {
         capture_rows: usize,
     ) -> Result<Self, RemoteError> {
         Ok(Self {
-            transport: fixed::Client::connect_lazy(route.endpoint, route.identity, Duration::from_secs(60))?,
+            transport: fixed::Client::connect_lazy(
+                route.endpoint,
+                route.identity,
+                Duration::from_secs(60),
+            )?,
             route,
             descriptor,
             sequence: 0,

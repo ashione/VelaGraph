@@ -604,10 +604,11 @@ impl Job {
             }
             check(end)?;
             self.charge(1024, 1)?;
-            let (descriptor, max_row_bytes) = observed_client(self.grpc_clients.as_deref(), &route, end)?
-                .open_hierarchy(route.shard, end.saturating_duration_since(Instant::now()))
-                .await
-                .map_err(remote_failure)?;
+            let (descriptor, max_row_bytes) =
+                observed_client(self.grpc_clients.as_deref(), &route, end)?
+                    .open_hierarchy(route.shard, end.saturating_duration_since(Instant::now()))
+                    .await
+                    .map_err(remote_failure)?;
             if descriptor.stamp.identity != route.identity
                 || descriptor.stamp.shard != route.shard
                 || descriptor.stamp.epoch != route.epoch
@@ -1086,7 +1087,9 @@ pub(in crate::remote::distributed) fn hierarchy_reservation_for_test(
 
 #[cfg(test)]
 mod tests {
-    use super::super::typed_test_peer::{Listener as TcpListener, Socket as TcpStream, read_frame, write_frame};
+    use super::super::typed_test_peer::{
+        read_frame, write_frame, Listener as TcpListener, Socket as TcpStream,
+    };
     use super::*;
     fn vertex(id: usize) -> VertexId {
         // Neighboring logical vertices deliberately share the numeric ID.

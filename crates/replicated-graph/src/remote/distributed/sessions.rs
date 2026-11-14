@@ -871,7 +871,10 @@ mod lifetime_tests {
         // Reservation tests also run synchronously; a lazy channel needs a
         // runtime handle but does not connect or execute any network work.
         let runtime = tokio::runtime::Handle::try_current().is_err().then(|| {
-            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
         });
         let _entered = runtime.as_ref().map(|runtime| runtime.enter());
         use d2_raft::{
@@ -918,7 +921,8 @@ mod lifetime_tests {
             descriptor.clone(),
             entries.iter().map(|(k, v)| k.len() + v.len()).sum(),
             entries.len(),
-        ).unwrap();
+        )
+        .unwrap();
         session.sequence = u64::MAX - 1;
         let bound = fixed_parallel::reservation_for_test(&fragment, &session).unwrap();
         let prepared = fixed_execution::prepare(&mut session, fragment.clone(), bound).unwrap();
@@ -1883,9 +1887,9 @@ mod epoch_tests {
 // Exercise real channel framing and session counters without test-only hooks.
 #[cfg(test)]
 mod typed_hierarchy_session_tests {
+    use super::super::typed_test_peer;
     use super::*;
     use openraft::{storage::RaftStateMachine, CommittedLeaderId, Entry, EntryPayload, LogId};
-    use super::super::typed_test_peer;
 
     const IDENTITY: RemoteIdentity = RemoteIdentity { group: 2, node: 1 };
     const SHARD: u64 = 7;
@@ -1893,23 +1897,48 @@ mod typed_hierarchy_session_tests {
 
     async fn fixture() -> (Arc<StateMachine>, Arc<Sessions>, Descriptor) {
         let mut state = Arc::new(StateMachine::default());
-        state.apply([Entry {
-            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
-            payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Activate { shard: SHARD, epoch: 1 })),
-        }]).await.unwrap()[0].d1.as_ref().unwrap().as_ref().unwrap();
+        state
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(LogCommand::D1V1(D1Command::Activate {
+                    shard: SHARD,
+                    epoch: 1,
+                })),
+            }])
+            .await
+            .unwrap()[0]
+            .d1
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
         let sessions = Arc::new(Sessions::new().unwrap());
-        let (descriptor, _) = sessions.open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT).await.unwrap();
+        let (descriptor, _) = sessions
+            .open_hierarchy(&state, IDENTITY, SHARD, Instant::now() + OPERATION_LIMIT)
+            .await
+            .unwrap();
         (state, sessions, descriptor)
     }
     fn request(descriptor: &Descriptor) -> FragmentRequest {
         FragmentRequest {
             descriptor: descriptor.clone(),
-            fragment: Fragment::HierarchyBatch { partition: 0, fragments: vec![Fragment::Exists(VertexId { partition: 0, id: 1 })] },
+            fragment: Fragment::HierarchyBatch {
+                partition: 0,
+                fragments: vec![Fragment::Exists(VertexId {
+                    partition: 0,
+                    id: 1,
+                })],
+            },
             remaining: jobs::JOB_CEILING,
         }
     }
-    async fn start(state: Arc<StateMachine>, sessions: Arc<Sessions>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let listener = typed_test_peer::Listener::bind("127.0.0.1:0").await.unwrap();
+    async fn start(
+        state: Arc<StateMachine>,
+        sessions: Arc<Sessions>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = typed_test_peer::Listener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
         let handler = tokio::spawn(async move {
             loop {
@@ -1917,9 +1946,21 @@ mod typed_hierarchy_session_tests {
                 let end = Instant::now() + OPERATION_LIMIT;
                 let received = typed_test_peer::read_frame(&mut socket, end).await.unwrap();
                 assert_eq!(received.identity, Some(IDENTITY));
-                let Operation::QueryFragment(request) = received.operation else { panic!("typed fragment expected") };
-                let result = sessions.fragment(&state, IDENTITY, SHARD, request, end).await;
-                let _ = typed_test_peer::write_frame(&mut socket, super::super::super::Response { version: VERSION, result }, end).await;
+                let Operation::QueryFragment(request) = received.operation else {
+                    panic!("typed fragment expected")
+                };
+                let result = sessions
+                    .fragment(&state, IDENTITY, SHARD, request, end)
+                    .await;
+                let _ = typed_test_peer::write_frame(
+                    &mut socket,
+                    super::super::super::Response {
+                        version: VERSION,
+                        result,
+                    },
+                    end,
+                )
+                .await;
             }
         });
         (address, handler)
@@ -1937,22 +1978,45 @@ mod typed_hierarchy_session_tests {
         let mut connection = client(address);
         let mut summed = Cost::default();
         for sequence in 0..1025 {
-            if sequence == 1024 { connection = client(address); }
-            let output = connection.fragment(request(&descriptor), OPERATION_LIMIT).await.unwrap().unwrap();
+            if sequence == 1024 {
+                connection = client(address);
+            }
+            let output = connection
+                .fragment(request(&descriptor), OPERATION_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(output.descriptor, descriptor);
-            assert!(matches!(&output.value, FragmentValue::HierarchyBatch(v) if matches!(v.as_slice(), [FragmentValue::Bool(false)])));
-            summed.bytes += output.cost.bytes; summed.work += output.cost.work;
+            assert!(
+                matches!(&output.value, FragmentValue::HierarchyBatch(v) if matches!(v.as_slice(), [FragmentValue::Bool(false)]))
+            );
+            summed.bytes += output.cost.bytes;
+            summed.work += output.cost.work;
             let used = session.used.lock().unwrap();
-            assert_eq!(used.bytes, summed.bytes); assert_eq!(used.work, summed.work);
+            assert_eq!(used.bytes, summed.bytes);
+            assert_eq!(used.work, summed.work);
             assert_eq!(session.node.end, lease_end);
         }
-        assert!(Arc::ptr_eq(&session, &sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap()));
+        assert!(Arc::ptr_eq(
+            &session,
+            &sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap()
+        ));
         *session.used.lock().unwrap() = jobs::JOB_CEILING;
-        assert!(matches!(client(address).fragment(request(&descriptor), OPERATION_LIMIT).await.unwrap(), Err(QueryFailure::ResourceExhausted)));
+        assert!(matches!(
+            client(address)
+                .fragment(request(&descriptor), OPERATION_LIMIT)
+                .await
+                .unwrap(),
+            Err(QueryFailure::ResourceExhausted)
+        ));
         assert_eq!(session.node.end, lease_end);
-        assert_eq!(session.used.lock().unwrap().work, jobs::JOB_CEILING.work + 1);
+        assert_eq!(
+            session.used.lock().unwrap().work,
+            jobs::JOB_CEILING.work + 1
+        );
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
-        handler.abort(); let _ = handler.await;
+        handler.abort();
+        let _ = handler.await;
     }
     #[tokio::test]
     async fn malformed_descriptor_does_not_charge_another_session() {
@@ -1960,12 +2024,17 @@ mod typed_hierarchy_session_tests {
         let (state, sessions, descriptor) = fixture().await;
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let (address, handler) = start(state, sessions.clone()).await;
-        let mut forged = descriptor.clone(); forged.incarnation[0] ^= 1;
-        assert!(client(address).fragment(request(&forged), OPERATION_LIMIT).await.is_err());
+        let mut forged = descriptor.clone();
+        forged.incarnation[0] ^= 1;
+        assert!(client(address)
+            .fragment(request(&forged), OPERATION_LIMIT)
+            .await
+            .is_err());
         assert_eq!(session.used.lock().unwrap().bytes, 0);
         assert_eq!(session.used.lock().unwrap().work, 0);
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
-        handler.abort(); let _ = handler.await;
+        handler.abort();
+        let _ = handler.await;
     }
     #[tokio::test]
     async fn closing_transport_does_not_reopen_or_extend_session() {
@@ -1974,14 +2043,20 @@ mod typed_hierarchy_session_tests {
         let session = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         let lease_end = session.node.end;
         let (address, handler) = start(state, sessions.clone()).await;
-        client(address).fragment(request(&descriptor), OPERATION_LIMIT).await.unwrap().unwrap();
+        client(address)
+            .fragment(request(&descriptor), OPERATION_LIMIT)
+            .await
+            .unwrap()
+            .unwrap();
         let before = *session.used.lock().unwrap();
-        handler.abort(); assert!(handler.await.unwrap_err().is_cancelled());
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
         let retained = sessions.lookup(IDENTITY, SHARD, &descriptor).unwrap();
         assert!(Arc::ptr_eq(&session, &retained));
         assert_eq!(retained.node.end, lease_end);
         let after = *retained.used.lock().unwrap();
-        assert_eq!(before.bytes, after.bytes); assert_eq!(before.work, after.work);
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.work, after.work);
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
     }
 }

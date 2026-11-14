@@ -131,7 +131,6 @@ impl Phase {
             sink: None,
         }
     }
-    #[cfg(test)]
     pub(super) fn stage(&mut self, stage: &'static str) {
         self.stage = stage;
     }

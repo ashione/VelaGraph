@@ -269,10 +269,13 @@ async fn measured_query(
     let forward = tokio::spawn(async move {
         let (socket, _) = listener.accept().await?;
         let mut connection = h2::server::Builder::new()
-            .handshake::<_, axum::body::Bytes>(socket).await?;
+            .handshake::<_, axum::body::Bytes>(socket)
+            .await?;
         let (request, mut response) = connection.accept().await.context("query stream")??;
-        ensure!(request.uri().path() == "/velagraph.internal.query.v1.SingleQueryService/Query",
-            "client attempted a non-query RPC instead of pushdown");
+        ensure!(
+            request.uri().path() == "/velagraph.internal.query.v1.SingleQueryService/Query",
+            "client attempted a non-query RPC instead of pushdown"
+        );
         let mut drivers = tokio::task::JoinSet::new();
         drivers.spawn(async move {
             tokio::select! {
@@ -296,27 +299,37 @@ async fn measured_query(
             body.flow_control().release_capacity(chunk.len())?;
         }
         ensure!(frame.len() >= 5 && frame[0] == 0);
-        let size = u32::from_be_bytes([frame[1],frame[2],frame[3],frame[4]]) as usize;
+        let size = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
         ensure!(size + 5 == frame.len());
         let request = wire::SingleQueryRequest::decode(&frame[5..])?;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))?
-            .connect_timeout(BUDGET).timeout(BUDGET).connect().await?;
+            .connect_timeout(BUDGET)
+            .timeout(BUDGET)
+            .connect()
+            .await?;
         let reply = wire::single_query_service_client::SingleQueryServiceClient::new(channel)
-            .query(request).await?.into_inner();
+            .query(request)
+            .await?
+            .into_inner();
         let payload = reply.encode_to_vec();
         ensure!(payload.len() <= remote::MAX_FRAME_BYTES);
         let bytes = payload.len() + 5;
         let mut frame = vec![0];
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
-        let headers = axum::http::Response::builder().status(200)
-            .header("content-type", "application/grpc").body(())?;
+        let headers = axum::http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())?;
         let mut output = response.send_response(headers, false)?;
         output.send_data(frame.into(), false)?;
         let mut trailers = axum::http::HeaderMap::new();
         trailers.insert("grpc-status", axum::http::HeaderValue::from_static("0"));
         output.send_trailers(trailers)?;
-        drivers.join_next().await.context("missing proxy driver")???;
+        drivers
+            .join_next()
+            .await
+            .context("missing proxy driver")???;
         Ok::<_, anyhow::Error>(bytes)
     });
     let result = query(proxy, Some(identity), req, BUDGET).await;
@@ -344,19 +357,36 @@ async fn query(
 
 // Bypass the domain client's preflight so malformed requests really reach the
 // typed server rather than merely testing local validation.
-async fn raw_query(endpoint: SocketAddr, identity: RemoteIdentity, req: &QueryRequest) -> anyhow::Result<tonic::Status> {
+async fn raw_query(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    req: &QueryRequest,
+) -> anyhow::Result<tonic::Status> {
     use remote::distributed::grpc::wire;
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))?
-        .connect_timeout(BUDGET).timeout(BUDGET).connect().await?;
+        .connect_timeout(BUDGET)
+        .timeout(BUDGET)
+        .connect()
+        .await?;
     let result = wire::single_query_service_client::SingleQueryServiceClient::new(channel)
         .query(wire::SingleQueryRequest {
-            context: Some(wire::Context { version: 1, identity: Some(wire::Identity {
-                group: identity.group, node: identity.node,
-            }), timeout_millis: req.timeout_millis }),
-            shard: req.shard, partition: req.partition,
-            mode: match req.mode { QueryMode::V1 => 1, QueryMode::V2Observed => 2 },
+            context: Some(wire::Context {
+                version: 1,
+                identity: Some(wire::Identity {
+                    group: identity.group,
+                    node: identity.node,
+                }),
+                timeout_millis: req.timeout_millis,
+            }),
+            shard: req.shard,
+            partition: req.partition,
+            mode: match req.mode {
+                QueryMode::V1 => 1,
+                QueryMode::V2Observed => 2,
+            },
             text: req.text.clone(),
-        }).await;
+        })
+        .await;
     Ok(result.expect_err("malformed raw query must be rejected by the server"))
 }
 
@@ -507,7 +537,10 @@ async fn scenario() -> anyhow::Result<()> {
         assert_eq!(output.rows, expected, "local-vs-pushdown: {text}");
         assert_stamp(&output, identity, sequence);
         assert_eq!(output.completeness, QueryCompleteness::SinglePartition);
-        assert!(bytes < 4096, "query returned {bytes} gRPC message bytes for {text}");
+        assert!(
+            bytes < 4096,
+            "query returned {bytes} gRPC message bytes for {text}"
+        );
     }
     let scalar = |source, value| QueryRow::Value {
         source: Some(source),

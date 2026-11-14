@@ -302,7 +302,13 @@ async fn differential() -> anyhow::Result<()> {
     cluster.seed().await?;
     let proxy = Proxy::start(cluster.grpc()).await?;
     let client = SnapshotClient::connect(proxy.address, cluster.identity(), BUDGET).await?;
-    let convenience = remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD, BUDGET).await?;
+    let convenience = remote::open_snapshot(
+        cluster.convenience(),
+        Some(cluster.identity()),
+        SHARD,
+        BUDGET,
+    )
+    .await?;
     let grpc = client.open(SHARD, BUDGET).await?;
     same_view(&convenience, &grpc);
     ensure!(grpc.bytes > remote::MAX_PAGE_BYTES);
@@ -385,7 +391,13 @@ async fn differential() -> anyhow::Result<()> {
         Err(RemoteError::InvalidArgument)
     ));
     assert!(matches!(
-        remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD + 1, BUDGET).await,
+        remote::open_snapshot(
+            cluster.convenience(),
+            Some(cluster.identity()),
+            SHARD + 1,
+            BUDGET
+        )
+        .await,
         Err(RemoteError::InvalidArgument)
     ));
     let wrong = RemoteIdentity {
@@ -403,7 +415,10 @@ async fn differential() -> anyhow::Result<()> {
     ));
     // Shared server pools allow gradual migration without duplicating budgets.
     assert_eq!(
-        client.page(convenience.clone(), None, BUDGET).await?.entries,
+        client
+            .page(convenience.clone(), None, BUDGET)
+            .await?
+            .entries,
         a.entries
     );
     assert_eq!(
@@ -504,7 +519,14 @@ async fn differential() -> anyhow::Result<()> {
         Err(RemoteError::SessionUnavailable)
     ));
     assert!(matches!(
-        remote::snapshot_page(cluster.convenience(), Some(cluster.identity()), convenience, None, BUDGET).await,
+        remote::snapshot_page(
+            cluster.convenience(),
+            Some(cluster.identity()),
+            convenience,
+            None,
+            BUDGET
+        )
+        .await,
         Err(RemoteError::SessionUnavailable)
     ));
     assert!(matches!(
@@ -518,7 +540,13 @@ async fn differential() -> anyhow::Result<()> {
         held.push(if i % 2 == 0 {
             client.open(SHARD, BUDGET).await?
         } else {
-            remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD, BUDGET).await?
+            remote::open_snapshot(
+                cluster.convenience(),
+                Some(cluster.identity()),
+                SHARD,
+                BUDGET,
+            )
+            .await?
         });
     }
     assert!(matches!(
@@ -618,8 +646,13 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
     timeout(Duration::from_secs(120), async {
         let cluster = Cluster::start().await?;
         let client = SnapshotClient::connect(cluster.grpc(), cluster.identity(), BUDGET).await?;
-        let convenience =
-            remote::open_snapshot(cluster.convenience(), Some(cluster.identity()), SHARD, BUDGET).await?;
+        let convenience = remote::open_snapshot(
+            cluster.convenience(),
+            Some(cluster.identity()),
+            SHARD,
+            BUDGET,
+        )
+        .await?;
         let grpc = client.open(SHARD, BUDGET).await?;
         sleep(remote::SESSION_TTL + Duration::from_millis(250)).await;
         assert!(matches!(
@@ -627,7 +660,14 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
             Err(RemoteError::SessionUnavailable)
         ));
         assert!(matches!(
-            remote::snapshot_page(cluster.convenience(), Some(cluster.identity()), convenience, None, BUDGET).await,
+            remote::snapshot_page(
+                cluster.convenience(),
+                Some(cluster.identity()),
+                convenience,
+                None,
+                BUDGET
+            )
+            .await,
             Err(RemoteError::SessionUnavailable)
         ));
         // Expiry is local to the original fixed session. Do not require this

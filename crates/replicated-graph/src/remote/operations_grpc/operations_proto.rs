@@ -19,7 +19,7 @@ pub struct Request {
     pub identity: ::core::option::Option<Identity>,
     #[prost(uint64, tag = "3")]
     pub timeout_millis: u64,
-    #[prost(oneof = "request::Operation", tags = "4, 5, 6")]
+    #[prost(oneof = "request::Operation", tags = "4, 5, 6, 7, 8, 9, 10, 11")]
     pub operation: ::core::option::Option<request::Operation>,
 }
 /// Nested message and enum types in `Request`.
@@ -33,6 +33,16 @@ pub mod request {
         Metadata(u64),
         #[prost(message, tag = "6")]
         Write(d2_raft::managed_rpc::grpc::wire::D1WriteRequest),
+        #[prost(uint64, tag = "7")]
+        Snapshot(u64),
+        #[prost(message, tag = "8")]
+        ManagedInspect(super::ManagedInspect),
+        #[prost(message, tag = "9")]
+        ManagedEnable(super::ManagedEnable),
+        #[prost(message, tag = "10")]
+        ManagedWrite(super::ManagedWrite),
+        #[prost(message, tag = "11")]
+        ManagedStatus(super::ManagedStatusRequest),
     }
 }
 #[allow(clippy::all)]
@@ -97,17 +107,17 @@ pub mod remote_failure {
     }
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Response {
     #[prost(uint32, tag = "1")]
     pub version: u32,
-    #[prost(oneof = "response::Result", tags = "2, 3, 4, 5")]
+    #[prost(oneof = "response::Result", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub result: ::core::option::Option<response::Result>,
 }
 /// Nested message and enum types in `Response`.
 pub mod response {
     #[allow(clippy::all)]
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Result {
         #[prost(message, tag = "2")]
         Probe(super::Empty),
@@ -117,6 +127,16 @@ pub mod response {
         Write(super::WriteResult),
         #[prost(message, tag = "5")]
         Error(super::RemoteFailure),
+        #[prost(message, tag = "6")]
+        Snapshot(super::Snapshot),
+        #[prost(message, tag = "7")]
+        ManagedMode(super::ManagedModeResult),
+        #[prost(message, tag = "8")]
+        ManagedEnabled(super::ManagedEnabled),
+        #[prost(message, tag = "9")]
+        ManagedWritten(super::ManagedWritten),
+        #[prost(message, tag = "10")]
+        ManagedStatus(super::ManagedStatusResult),
     }
 }
 #[allow(clippy::all)]
@@ -152,6 +172,114 @@ pub mod metadata_response {
         Metadata(super::Metadata),
         #[prost(message, tag = "4")]
         Error(super::RemoteFailure),
+    }
+}
+/// Original one-shot snapshot contract, not a paginated snapshot assembled over time.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SnapshotEntry {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub value: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Snapshot {
+    #[prost(uint64, tag = "1")]
+    pub shard: u64,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub sequence: u64,
+    #[prost(message, repeated, tag = "4")]
+    pub entries: ::prost::alloc::vec::Vec<SnapshotEntry>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedInspect {
+    #[prost(uint64, tag = "1")]
+    pub shard: u64,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedEnable {
+    #[prost(uint64, tag = "1")]
+    pub shard: u64,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "3")]
+    pub expected_sequence: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub mode_id: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ManagedWrite {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mode_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub request: ::core::option::Option<d2_raft::managed_rpc::grpc::wire::D1WriteRequest>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedStatusRequest {
+    #[prost(uint64, tag = "1")]
+    pub shard: u64,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub mode_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub request_id: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedMode {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mode_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub activated_sequence: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedModeResult {
+    #[prost(message, optional, tag = "1")]
+    pub mode: ::core::option::Option<ManagedMode>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedEnabled {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mode_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub activated_sequence: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedWritten {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mode_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub result: ::core::option::Option<WriteResult>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedStatusResult {
+    #[prost(oneof = "managed_status_result::Status", tags = "1, 2")]
+    pub status: ::core::option::Option<managed_status_result::Status>,
+}
+/// Nested message and enum types in `ManagedStatusResult`.
+pub mod managed_status_result {
+    #[allow(clippy::all)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Status {
+        #[prost(message, tag = "1")]
+        Unknown(super::Empty),
+        #[prost(uint64, tag = "2")]
+        CommittedSequence(u64),
     }
 }
 #[allow(clippy::all)]

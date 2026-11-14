@@ -115,7 +115,13 @@ pub async fn query(
     request: QueryRequest,
     deadline: Duration,
 ) -> Result<QueryResponse, RemoteError> {
-    super::single_query_grpc::query(endpoint, identity.ok_or(RemoteError::InvalidArgument)?, request, deadline).await
+    super::single_query_grpc::query(
+        endpoint,
+        identity.ok_or(RemoteError::InvalidArgument)?,
+        request,
+        deadline,
+    )
+    .await
 }
 
 struct MapShape {
@@ -896,7 +902,8 @@ mod tests {
     }
     #[tokio::test]
     async fn query_response_length_is_rejected_before_body_allocation() {
-        let (endpoint, seen, server) = raw_test_peer::spawn(Some(MAX_QUERY_RESPONSE_BYTES + 1)).await;
+        let (endpoint, seen, server) =
+            raw_test_peer::spawn(Some(MAX_QUERY_RESPONSE_BYTES + 1)).await;
         let result = query(
             endpoint,
             Some(RemoteIdentity { group: 10, node: 1 }),
@@ -911,7 +918,10 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(RemoteError::ResourceExhausted)));
-        tokio::time::timeout(Duration::from_secs(2), seen).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), seen)
+            .await
+            .unwrap()
+            .unwrap();
         server.abort();
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
