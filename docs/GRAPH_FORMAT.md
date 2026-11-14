@@ -30,9 +30,11 @@ graph/v1/p/<partition>/in/<target>/<label>/<edge>    -> empty
 
 Payloads are hand-encoded protobuf wire format: field numbers and wire types
 below are the compatibility contract. The same schema is checked in as
-[`proto/graph.proto`](../proto/graph.proto) for future RPC/Raft codegen; a
-generated `.proto` is not required at build time, and no `protoc` dependency is
-added.
+[`proto/graph.proto`](../proto/graph.proto) as a declarative storage schema, not an RPC service. Its source package is
+`velagraph.graph.v1`; the earlier `rocksql.graph.v1` name is not embedded in
+record bytes. RPC services have separate schemas under the workspace crates.
+Generated code is not required for this storage codec, and no `protoc`
+dependency is added. See [namespace migration](SQL_REMOVAL.md#declarative-schema-namespace).
 
 ```proto
 message Record {
