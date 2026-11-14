@@ -109,7 +109,11 @@ pub(super) async fn request(
             .connect_timeout(remaining(end)?)
             .buffer_size(MAX_CONNECTIONS)
             .concurrency_limit(MAX_CONNECTIONS);
-        let channel = endpoint.connect().await.map_err(|_| Error::Unknown)?;
+        // Keep the transport state machine off the caller's stack, including
+        // callers that await this operation inside large integration workflows.
+        let channel = Box::pin(endpoint.connect())
+            .await
+            .map_err(|_| Error::Unknown)?;
         let mut writes = pb::write_service_client::WriteServiceClient::new(channel.clone())
             .max_encoding_message_size(MAX_REQUEST_BYTES)
             .max_decoding_message_size(MAX_RESPONSE_BYTES);
@@ -140,8 +144,10 @@ pub(super) async fn request(
                 validate_message(&message)?;
                 let mut request = tonic::Request::new(message);
                 request.set_timeout(remaining(end)?);
-                let response = $client
-                    .$method(request)
+                // Generated unary futures include the HTTP/2 transport stack.
+                // Box at the leaf, rather than boxing the already-large outer
+                // request future after its state has propagated to callers.
+                let response = Box::pin($client.$method(request))
                     .await
                     .map_err(|e| remote_error(e, &expected))?
                     .into_inner();
