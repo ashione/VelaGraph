@@ -272,6 +272,9 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::typed_test_peer::{
+        read_frame, write_frame, Listener as TcpListener, Socket as TcpStream,
+    };
     use super::*;
     use d2_raft::{
         participant_writes::Authority,
@@ -330,7 +333,7 @@ mod tests {
                 version: 8,
                 mode: [shard as u8; 16],
             };
-            nodes.insert(shard, NodeSession::new(route, descriptor, 256, 10));
+            nodes.insert(shard, NodeSession::new(route, descriptor, 256, 10).unwrap());
             listeners.push(listener);
         }
         (nodes, listeners)
@@ -386,7 +389,7 @@ mod tests {
         }
         write_frame(
             socket,
-            &super::super::super::Response {
+            super::super::super::Response {
                 version: VERSION,
                 result: Ok(Reply::FixedQueryFragment(Ok(output))),
             },
@@ -956,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_drops_every_socket_and_preserves_consumed_sequences() {
+    async fn cancellation_drops_every_rpc_future_and_preserves_consumed_sequences() {
         // These fake peers still use the process-wide bounded RPC client.
         let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;

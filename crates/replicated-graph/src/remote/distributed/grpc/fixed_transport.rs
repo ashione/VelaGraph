@@ -181,6 +181,25 @@ impl FixedClient {
             identity,
         })
     }
+    /// Construct a reusable channel without contacting a peer before admission.
+    pub(crate) fn connect_lazy(
+        address: SocketAddr,
+        identity: RemoteIdentity,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
+        checked_deadline(deadline, None)?;
+        let endpoint = Channel::from_shared(format!("http://{address}"))
+            .map_err(|_| RemoteError::InvalidArgument)?
+            .connect_timeout(deadline)
+            .buffer_size(MAX_IN_FLIGHT)
+            .concurrency_limit(MAX_IN_FLIGHT);
+        Ok(Self {
+            client: FixedQueryServiceClient::new(endpoint.connect_lazy())
+                .max_decoding_message_size(MAX_FRAME_BYTES)
+                .max_encoding_message_size(MAX_FRAME_BYTES),
+            identity,
+        })
+    }
     fn context(&self, end: Instant) -> Result<wire::Context, RemoteError> {
         let millis = end.saturating_duration_since(Instant::now()).as_millis();
         if millis == 0 {

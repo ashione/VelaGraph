@@ -2,8 +2,8 @@
 //! Observed semantics only: this does not claim managed/fixed or Raft migration.
 #[path = "support/coordinator_cli.rs"]
 mod coordinator_cli;
-#[path = "support/legacy_graph_node.rs"]
-mod legacy_graph_node;
+#[path = "support/typed_graph_node.rs"]
+mod typed_graph_node;
 use anyhow::Context;
 use replicated_graph::{
     remote::{
@@ -110,7 +110,7 @@ impl Group {
             node: 1,
         };
         let process = Process(
-            legacy_graph_node::command()
+            typed_graph_node::command()
                 .env("TOKIO_WORKER_THREADS", "2")
                 .args([
                     "--allow-insecure-development",
@@ -436,22 +436,6 @@ async fn scenario() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Legacy JSON is used only as the comparison endpoint, never carried inside
-// protobuf or as fallback for the selected gRPC transport.
-async fn legacy(group: &Group, operation: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(group.route.endpoint).await?;
-    let bytes = serde_json::to_vec(
-        &serde_json::json!({"version": 1, "identity": group.route.identity, "operation": operation}),
-    )?;
-    stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
-    let len = stream.read_u32().await? as usize;
-    anyhow::ensure!(len <= remote::MAX_FRAME_BYTES);
-    let mut bytes = vec![0; len];
-    stream.read_exact(&mut bytes).await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
 async fn session_checks(group: &Group) -> anyhow::Result<()> {
     use distributed::grpc::wire as w;
     let proxy = Proxy::start(group.grpc).await?;
@@ -468,26 +452,21 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
             timeout_millis: 5000,
         })
     };
-    let response = legacy(
-        group,
-        serde_json::json!({"OpenHierarchyQuery": {"shard": 120}}),
-    )
+    // A second typed listener shares the exact same session pool/state.
+    let mut peer = w::query_service_client::QueryServiceClient::connect(format!(
+        "http://{}",
+        group.route.endpoint
+    ))
     .await?;
-    let native = &response["result"]["Ok"]["OpenHierarchyQuery"]["descriptor"];
-    let stamp = &native["stamp"];
-    let descriptor = w::Descriptor {
-        stamp: Some(w::QueryStamp {
-            identity: Some(w::Identity {
-                group: 120,
-                node: 1,
-            }),
+    let descriptor = peer
+        .open_hierarchy(w::OpenRequest {
+            context: context(),
             shard: 120,
-            epoch: stamp["epoch"].as_u64().context("epoch")?,
-            sequence: stamp["sequence"].as_u64().context("sequence")?,
-        }),
-        incarnation: serde_json::from_value(native["incarnation"].clone())?,
-        token: serde_json::from_value(native["token"].clone())?,
-    };
+        })
+        .await?
+        .into_inner()
+        .descriptor
+        .context("hierarchy descriptor")?;
     let exists = w::Fragment {
         kind: Some(w::fragment::Kind::Exists(w::VertexId {
             partition: 0,
@@ -576,8 +555,8 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
         tonic::Code::NotFound
     );
 
-    // Reverse direction: a gRPC-opened token is closed through the existing TCP
-    // service, then no longer exists on gRPC. An independent pool cannot pass.
+    // Reverse direction: opening on one typed listener and closing on the
+    // other must invalidate the original token. Independent pools cannot pass.
     let opened = client
         .open(w::OpenRequest {
             context: context(),
@@ -585,14 +564,11 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
         })
         .await?
         .into_inner();
-    let stamp = opened.stamp.as_ref().context("stamp")?;
-    let native = serde_json::json!({"stamp": {"identity": group.route.identity, "shard": stamp.shard, "epoch": stamp.epoch, "sequence": stamp.sequence}, "incarnation": opened.incarnation, "token": opened.token});
-    let closed = legacy(
-        group,
-        serde_json::json!({"CloseQuery": {"descriptor": native}}),
-    )
+    peer.close(w::CloseRequest {
+        context: context(),
+        descriptor: Some(opened.clone()),
+    })
     .await?;
-    assert_eq!(closed["result"]["Ok"], "CloseQuery");
     let request = w::FragmentRequest {
         context: context(),
         descriptor: Some(opened),
@@ -747,12 +723,13 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
                 .into_inner(),
         );
     }
-    let last = legacy(
-        group,
-        serde_json::json!({"OpenQuery": {"shard": 120, "timeout_millis": 5000}}),
-    )
-    .await?;
-    assert!(last["result"]["Ok"]["OpenQuery"].is_object());
+    let last = peer
+        .open(w::OpenRequest {
+            context: context(),
+            shard: 120,
+        })
+        .await?
+        .into_inner();
     assert_eq!(
         client
             .open(w::OpenRequest {
@@ -764,14 +741,16 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
             .code(),
         tonic::Code::ResourceExhausted
     );
-    let exhausted = legacy(
-        group,
-        serde_json::json!({"OpenQuery": {"shard": 120, "timeout_millis": 5000}}),
-    )
-    .await?;
     assert_eq!(
-        exhausted["result"]["Err"], "ResourceExhausted",
-        "one process-wide pool across transports"
+        peer.open(w::OpenRequest {
+            context: context(),
+            shard: 120
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::ResourceExhausted,
+        "one process-wide pool across typed listeners"
     );
     for descriptor in held {
         client
@@ -781,12 +760,11 @@ async fn session_checks(group: &Group) -> anyhow::Result<()> {
             })
             .await?;
     }
-    let closed = legacy(
-        group,
-        serde_json::json!({"CloseQuery": {"descriptor": last["result"]["Ok"]["OpenQuery"]}}),
-    )
+    peer.close(w::CloseRequest {
+        context: context(),
+        descriptor: Some(last),
+    })
     .await?;
-    assert_eq!(closed["result"]["Ok"], "CloseQuery");
     assert_eq!(
         proxy.connections.load(Ordering::SeqCst),
         1,
@@ -1084,7 +1062,7 @@ impl JobClient {
 async fn coordinator_ingress_checks(
     routes: &[PartitionRoute],
     convenience: SocketAddr,
-    legacy_graph: SocketAddr,
+    other_graph_listener: SocketAddr,
 ) -> anyhow::Result<()> {
     use distributed::grpc::{wire as w, CoordinatorClient, GrpcCoordinatorService};
     let directory = tempfile::tempdir()?;
@@ -1155,7 +1133,7 @@ async fn coordinator_ingress_checks(
     }
     coordinator_cli::check(
         endpoint,
-        legacy_graph,
+        other_graph_listener,
         serde_json::to_value(client.query(request("g.V(1).count()"), BUDGET).await??)?,
         hierarchy_count(
             endpoint,
@@ -1244,7 +1222,9 @@ async fn coordinator_ingress_checks(
         .await;
         assert!(!matches!(received, Ok(Ok(Some(_)))));
     }
-    if let Ok(wrong) = CoordinatorClient::connect(legacy_graph, Duration::from_millis(300)).await {
+    if let Ok(wrong) =
+        CoordinatorClient::connect(other_graph_listener, Duration::from_millis(300)).await
+    {
         assert!(wrong
             .query(request("g.V(1).count()"), Duration::from_millis(300))
             .await

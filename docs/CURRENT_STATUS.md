@@ -4,7 +4,7 @@ Reviewed on **2026-11-13** with main baseline
 [`046488bf`](https://github.com/ashione/VelaGraph/commit/046488bfb7ffd603b4eb66d109ec53cf8d8fcaf0)
 and the #264 hybrid-coordinator retirement in this change. #259 default-storage
 RPC, #261 default coordinator CLI RPC and #263 Unix read gateway retirement are
-merged. Remaining legacy library APIs are not all retired.
+merged. See [graph library retirement](GRAPH_LIBRARY_GRPC.md) for the remaining migration candidate and its validation gates.
 This is an API and implementation index, not a new benchmark or an assertion that
 all milestone exit criteria have passed. Linked PRs/issues show later changes;
 the remaining outcomes below must not be inferred from a merged dependency slice.
@@ -120,13 +120,11 @@ Submit/lifecycle speedup. Legacy/in-memory fallback remains separately checked.
 Observed coordinator queries and hierarchy jobs have typed gRPC ingress (#248),
 used by default by `serve` and unflagged query/hierarchy clients (#260).
 `serve-grpc` and `--grpc` are rejected; shared observed execution/Jobs contracts
-remain unchanged. Legacy library coordinator ingress remains retirement work,
-not a fixed/managed consistency endpoint. See [transport](INTERNAL_GRPC_QUERIES.md).
+remain unchanged. Library coordinator ingress is typed (#274), not a fixed/managed consistency endpoint. See [transport](INTERNAL_GRPC_QUERIES.md).
 
 The public graph-service host now initializes listener-free managed `Service`
 state: only configured HTTP/gRPC listeners are opened. Expiration and shutdown/drop
-cleanup remain shared; explicitly selected library `Gateway` TCP entrypoints are
-still pending #218 cleanup. See [service host](PUBLIC_SERVICE_CLI.md).
+cleanup remain shared; the library `Gateway` wrapper also binds typed gRPC (#276). See [service host](PUBLIC_SERVICE_CLI.md).
 
 Single-shard Probe/Metadata/Write also have an explicit
 [typed RPC service and CLI](SHARD_OPERATIONS_GRPC.md). Catalog/routing adapters now use typed snapshots/operations by default;
@@ -136,19 +134,16 @@ applied-epoch check; Probe/Write stay unary. Original default-debug regressions
 and resource/freshness evidence remain the #258 acceptance gate, not a changed
 test profile or a loopback p50 improvement alone.
 The old Linux UDS read gateway is [retired](GRAPH_UDS_GATEWAY.md).
-Explicit graph library legacy fixtures remain
-separate retirement work; this does not complete the all-RPC inventory.
+[Graph library retirement](GRAPH_LIBRARY_GRPC.md) migrates the remaining
+GraphService/library calls and fixtures. Check its PR for exact-head validation;
+this does not establish production readiness or finish every #218 exit gate.
 
-
-The retained legacy managed TCP protocol uses **RPC v6** and legacy gateway
-framing **v1**. Typed managed gRPC has its own versioned service/Context; public
-gRPC, HTTP preview and durable formats are separate version namespaces. See
-[internal managed RPC](INTERNAL_GRPC_MANAGED.md),
-[Raft gRPC](RAFT_GRPC.md) and [public gRPC](PUBLIC_GRPC_SERVICE.md).
-Raft peer traffic is now typed gRPC (no mixed old/new Raft wire cluster support);
-driver/control is now a separate [typed gRPC service](CONTROL_GRPC.md); remaining
-legacy library TCP compatibility paths remain in the
-[communication inventory](INTERNAL_GRPC_MANAGED.md#remaining-communication-inventory). Bound durable
+Typed internal/public gRPC and public HTTP have separate versioned contracts.
+There is no supported old managed/gateway JSON wire alongside them. Historical
+RPC v6 and gateway framing v1 refer to retired protocols, not durable formats.
+See [internal managed RPC](INTERNAL_GRPC_MANAGED.md), [Raft gRPC](RAFT_GRPC.md)
+and [public gRPC](PUBLIC_GRPC_SERVICE.md). Raft peers and driver/control also use
+typed gRPC; mixed old/new wire clusters are unsupported. Bound durable
 coordinator/member metadata is **v16/v17**. Historical v5/v8/v9/v10/v11–v15
 references in foundational documents describe actual legacy modes/migration
 inputs and earlier slices, not permission to run mixed-version peers or downgrade.

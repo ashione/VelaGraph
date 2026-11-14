@@ -1,6 +1,6 @@
-//! Real TCP/three-process pushdown; no failover or transport-security claims.
-#[path = "support/legacy_graph_node.rs"]
-mod legacy_graph_node;
+//! Real typed gRPC/three-process pushdown; no failover or transport-security claims.
+#[path = "support/typed_graph_node.rs"]
+mod typed_graph_node;
 use anyhow::{ensure, Context};
 use d2_raft::{send_control, ControlRequest, ControlResponse};
 use replicated_graph::{
@@ -22,8 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     time::{sleep, timeout},
 };
 use velagraph::{
@@ -254,40 +253,89 @@ fn fixture() -> anyhow::Result<(Export, Vec<Vec<QueryRow>>)> {
     Ok((export, expected))
 }
 
-// The forwarding listener accepts one connection only and inspects its sole
-// request. Exact response bytes are counted on the wire, not estimated from rows.
+// Audit the actual gRPC message body and route. The proxy accepts exactly one
+// SingleQuery RPC: snapshot/fragment fallback or another RPC fails the fixture.
+// Count uncompressed gRPC message bytes, excluding HTTP/2 headers and framing.
 async fn measured_query(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
     req: QueryRequest,
 ) -> anyhow::Result<(QueryResponse, usize)> {
+    use prost::Message;
+    use remote::distributed::grpc::wire;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy = listener.local_addr()?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let forward = tokio::spawn(async move {
-        let (mut client, _) = listener.accept().await?;
-        drop(listener);
-        let n = client.read_u32().await? as usize;
-        ensure!(n <= remote::MAX_FRAME_BYTES);
-        let mut bytes = vec![0; n];
-        client.read_exact(&mut bytes).await?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let (socket, _) = listener.accept().await?;
+        let mut connection = h2::server::Builder::new()
+            .handshake::<_, axum::body::Bytes>(socket)
+            .await?;
+        let (request, mut response) = connection.accept().await.context("query stream")??;
         ensure!(
-            value["operation"].get("Query").is_some(),
-            "client attempted snapshot download instead of Query"
+            request.uri().path() == "/velagraph.internal.query.v1.SingleQueryService/Query",
+            "client attempted a non-query RPC instead of pushdown"
         );
-        let mut server = TcpStream::connect(endpoint).await?;
-        server.write_u32(n as u32).await?;
-        server.write_all(&bytes).await?;
-        let n = server.read_u32().await? as usize;
-        ensure!(n <= remote::MAX_FRAME_BYTES);
-        let mut bytes = vec![0; n];
-        server.read_exact(&mut bytes).await?;
-        client.write_u32(n as u32).await?;
-        client.write_all(&bytes).await?;
-        Ok::<_, anyhow::Error>(n + 4)
+        let mut drivers = tokio::task::JoinSet::new();
+        drivers.spawn(async move {
+            tokio::select! {
+                _ = stopped => Ok::<_, anyhow::Error>(()),
+                extra = connection.accept() => {
+                    ensure!(extra.is_none(), "client attempted an extra RPC or fallback");
+                    Ok(())
+                }
+                extra = listener.accept() => {
+                    let _ = extra?;
+                    anyhow::bail!("client attempted another connection/fallback")
+                }
+            }
+        });
+        let mut body = request.into_body();
+        let mut frame = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk?;
+            ensure!(frame.len().saturating_add(chunk.len()) <= remote::MAX_FRAME_BYTES + 5);
+            frame.extend_from_slice(&chunk);
+            body.flow_control().release_capacity(chunk.len())?;
+        }
+        ensure!(frame.len() >= 5 && frame[0] == 0);
+        let size = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+        ensure!(size + 5 == frame.len());
+        let request = wire::SingleQueryRequest::decode(&frame[5..])?;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))?
+            .connect_timeout(BUDGET)
+            .timeout(BUDGET)
+            .connect()
+            .await?;
+        let reply = wire::single_query_service_client::SingleQueryServiceClient::new(channel)
+            .query(request)
+            .await?
+            .into_inner();
+        let payload = reply.encode_to_vec();
+        ensure!(payload.len() <= remote::MAX_FRAME_BYTES);
+        let bytes = payload.len() + 5;
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let headers = axum::http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())?;
+        let mut output = response.send_response(headers, false)?;
+        output.send_data(frame.into(), false)?;
+        let mut trailers = axum::http::HeaderMap::new();
+        trailers.insert("grpc-status", axum::http::HeaderValue::from_static("0"));
+        output.send_trailers(trailers)?;
+        drivers
+            .join_next()
+            .await
+            .context("missing proxy driver")???;
+        Ok::<_, anyhow::Error>(bytes)
     });
-    let result = query(proxy, Some(identity), req, BUDGET).await?;
-    Ok((result, forward.await??))
+    let result = query(proxy, Some(identity), req, BUDGET).await;
+    let _ = stop.send(());
+    let bytes = timeout(BUDGET, forward).await???;
+    Ok((result?, bytes))
 }
 
 // Failure-only context for this synthetic fixture. Do not add request text to
@@ -307,17 +355,39 @@ async fn query(
     result
 }
 
-async fn raw_query(endpoint: SocketAddr, req: &QueryRequest) -> anyhow::Result<serde_json::Value> {
-    let mut socket = TcpStream::connect(endpoint).await?;
-    let bytes =
-        serde_json::to_vec(&serde_json::json!({"version": 1, "operation": {"Query": req}}))?;
-    socket.write_u32(bytes.len() as u32).await?;
-    socket.write_all(&bytes).await?;
-    let size = socket.read_u32().await? as usize;
-    ensure!(size <= remote::MAX_FRAME_BYTES);
-    let mut bytes = vec![0; size];
-    socket.read_exact(&mut bytes).await?;
-    Ok(serde_json::from_slice(&bytes)?)
+// Bypass the domain client's preflight so malformed requests really reach the
+// typed server rather than merely testing local validation.
+async fn raw_query(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    req: &QueryRequest,
+) -> anyhow::Result<tonic::Status> {
+    use remote::distributed::grpc::wire;
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))?
+        .connect_timeout(BUDGET)
+        .timeout(BUDGET)
+        .connect()
+        .await?;
+    let result = wire::single_query_service_client::SingleQueryServiceClient::new(channel)
+        .query(wire::SingleQueryRequest {
+            context: Some(wire::Context {
+                version: 1,
+                identity: Some(wire::Identity {
+                    group: identity.group,
+                    node: identity.node,
+                }),
+                timeout_millis: req.timeout_millis,
+            }),
+            shard: req.shard,
+            partition: req.partition,
+            mode: match req.mode {
+                QueryMode::V1 => 1,
+                QueryMode::V2Observed => 2,
+            },
+            text: req.text.clone(),
+        })
+        .await;
+    Ok(result.expect_err("malformed raw query must be rejected by the server"))
 }
 
 fn assert_stamp(output: &QueryOutput, identity: RemoteIdentity, sequence: u64) {
@@ -352,7 +422,7 @@ async fn scenario() -> anyhow::Result<()> {
         .collect::<std::io::Result<Vec<_>>>()?;
     let mut processes = Vec::new();
     for i in 0..3 {
-        let mut c = legacy_graph_node::command();
+        let mut c = typed_graph_node::command();
         // Keep fixture runtime threads bounded on high-core shared hosts.
         c.env("TOKIO_WORKER_THREADS", "2");
         c.args([
@@ -438,8 +508,9 @@ async fn scenario() -> anyhow::Result<()> {
         let mut request_id = [0; 16];
         request_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
         request_id[8..].copy_from_slice(b"query-fi");
-        remote::write(
+        remote::write_identified(
             endpoint,
+            identity,
             d2_raft::D1WriteRequest {
                 shard: SHARD,
                 epoch: EPOCH,
@@ -454,7 +525,7 @@ async fn scenario() -> anyhow::Result<()> {
     }
     assert!(
         matches!(
-            remote::snapshot(endpoint, SHARD, BUDGET).await,
+            remote::snapshot_identified(endpoint, identity, SHARD, BUDGET).await,
             Err(RemoteError::ResourceExhausted)
         ),
         "whole snapshot RPC must exceed 2 MiB"
@@ -466,7 +537,10 @@ async fn scenario() -> anyhow::Result<()> {
         assert_eq!(output.rows, expected, "local-vs-pushdown: {text}");
         assert_stamp(&output, identity, sequence);
         assert_eq!(output.completeness, QueryCompleteness::SinglePartition);
-        assert!(bytes < 4096, "query returned {bytes} wire bytes for {text}");
+        assert!(
+            bytes < 4096,
+            "query returned {bytes} gRPC message bytes for {text}"
+        );
     }
     let scalar = |source, value| QueryRow::Value {
         source: Some(source),
@@ -1201,8 +1275,8 @@ async fn scenario() -> anyhow::Result<()> {
         Err(RemoteError::ResourceExhausted)
     ));
     assert_eq!(
-        raw_query(endpoint, &oversized).await?["result"]["Err"],
-        "ResourceExhausted"
+        raw_query(endpoint, identity, &oversized).await?.code(),
+        tonic::Code::ResourceExhausted
     );
     for millis in [0, 5001, u64::MAX] {
         let mut req = request(QueryMode::V1, "g.V().count()");
@@ -1212,8 +1286,8 @@ async fn scenario() -> anyhow::Result<()> {
             Err(RemoteError::InvalidArgument)
         ));
         assert_eq!(
-            raw_query(endpoint, &req).await?["result"]["Err"],
-            "InvalidArgument"
+            raw_query(endpoint, identity, &req).await?.code(),
+            tonic::Code::InvalidArgument
         );
     }
     let follower = (leader + 1) % 3;
@@ -1232,7 +1306,7 @@ async fn scenario() -> anyhow::Result<()> {
     ));
     // No writes were performed by any query, including all failing executions.
     assert_eq!(
-        remote::metadata(endpoint, SHARD, BUDGET).await?,
+        remote::metadata_identified(endpoint, identity, SHARD, BUDGET).await?,
         (SHARD, EPOCH, sequence)
     );
     drop(processes);

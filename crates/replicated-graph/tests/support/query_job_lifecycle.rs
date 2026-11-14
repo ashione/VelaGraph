@@ -2,11 +2,9 @@
 //! The graph and every managed mutation live in independent child processes.
 use super::*;
 use gateway::{JobHandle, JobPhase, JobPolicy, JobStatus};
+use replicated_graph::remote::distributed::grpc::wire as delay_wire;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
-};
+use tokio::net::TcpListener;
 
 const ROOT: u64 = 2_000_001;
 const EDGE: u64 = 2_000_010;
@@ -49,12 +47,62 @@ impl Drop for ActiveFragment {
     }
 }
 
-/// Bounded, transparent one-request TCP proxy. Control traffic never sleeps.
-/// Each accepted task has a deadline; JoinSet owns and aborts all child tasks.
+/// Typed fixed-query proxy: only fragment traffic is delayed/counted. Every
+/// request goes to the real independent child exactly once; lifecycle/control
+/// RPCs retain their own paths and do not sleep. This is not performance data.
+#[derive(Clone)]
+struct DelayService {
+    client:
+        delay_wire::fixed_query_service_client::FixedQueryServiceClient<tonic::transport::Channel>,
+    shard: u64,
+    traffic: Arc<FragmentTraffic>,
+    fragments: Arc<AtomicU64>,
+    delay_millis: Arc<AtomicU64>,
+}
+#[tonic::async_trait]
+impl delay_wire::fixed_query_service_server::FixedQueryService for DelayService {
+    async fn open_fixed(
+        &self,
+        request: tonic::Request<delay_wire::FixedOpenEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::FixedOpened>, tonic::Status> {
+        self.client.clone().open_fixed(request).await
+    }
+    async fn open_renewable(
+        &self,
+        request: tonic::Request<delay_wire::RenewableOpenEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::RenewableFixedOpened>, tonic::Status> {
+        self.client.clone().open_renewable(request).await
+    }
+    async fn renew(
+        &self,
+        request: tonic::Request<delay_wire::FixedRenewEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::FixedLeaseGrant>, tonic::Status> {
+        self.client.clone().renew(request).await
+    }
+    async fn fragment_fixed(
+        &self,
+        request: tonic::Request<delay_wire::FixedFragmentEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::FixedFragmentResponse>, tonic::Status> {
+        let _active = self.traffic.enter(self.shard);
+        self.fragments.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(
+            self.delay_millis.load(Ordering::SeqCst),
+        ))
+        .await;
+        self.client.clone().fragment_fixed(request).await
+    }
+    async fn close_fixed(
+        &self,
+        request: tonic::Request<delay_wire::FixedCloseEnvelope>,
+    ) -> Result<tonic::Response<delay_wire::Empty>, tonic::Status> {
+        self.client.clone().close_fixed(request).await
+    }
+}
 struct FragmentDelay {
     endpoint: SocketAddr,
     fragments: Arc<AtomicU64>,
     delay_millis: Arc<AtomicU64>,
+    shutdown: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 impl FragmentDelay {
@@ -67,56 +115,43 @@ impl FragmentDelay {
         let endpoint = listener.local_addr()?;
         let fragments = Arc::new(AtomicU64::new(0));
         let delay_millis = Arc::new(AtomicU64::new(0));
-        let count = fragments.clone();
-        let delay = delay_millis.clone();
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{upstream}"))?
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
+            .connect()
+            .await?;
+        let service = DelayService {
+            client: delay_wire::fixed_query_service_client::FixedQueryServiceClient::new(channel)
+                .max_decoding_message_size(4 * 1024 * 1024)
+                .max_encoding_message_size(4 * 1024 * 1024),
+            shard,
+            traffic,
+            fragments: fragments.clone(),
+            delay_millis: delay_millis.clone(),
+        };
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopped = shutdown.clone();
         let task = tokio::spawn(async move {
-            let mut children = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (mut incoming, _) = accepted?;
-                        anyhow::ensure!(children.len() < 32, "proxy task bound");
-                        let count = count.clone();
-                        let delay = delay.clone();
-                        let traffic = traffic.clone();
-                        children.spawn(async move {
-                            tokio::time::timeout(Duration::from_secs(10), async move {
-                                let length = incoming.read_u32().await?;
-                                anyhow::ensure!(length <= 4 * 1024 * 1024, "proxy frame bound");
-                                let mut frame = vec![0; length as usize];
-                                incoming.read_exact(&mut frame).await?;
-                                let request: serde_json::Value = serde_json::from_slice(&frame)?;
-                                let _active = request["operation"]
-                                    .get("FixedQueryFragment")
-                                    .map(|_| traffic.enter(shard));
-                                if _active.is_some() {
-                                    count.fetch_add(1, Ordering::SeqCst);
-                                    tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst))).await;
-                                }
-                                let mut outgoing = TcpStream::connect(upstream).await?;
-                                outgoing.write_u32(length).await?;
-                                outgoing.write_all(&frame).await?;
-                                let length = outgoing.read_u32().await?;
-                                anyhow::ensure!(length <= 4 * 1024 * 1024, "proxy response bound");
-                                let mut response = vec![0; length as usize];
-                                outgoing.read_exact(&mut response).await?;
-                                incoming.write_u32(length).await?;
-                                incoming.write_all(&response).await?;
-                                Ok::<_, anyhow::Error>(())
-                            }).await
-                        });
-                    }
-                    Some(result) = children.join_next(), if !children.is_empty() => {
-                        // Socket failures are intentional during cancel and node death.
-                        let _ = result?;
-                    }
-                }
-            }
+            tonic::transport::Server::builder()
+                .concurrency_limit_per_connection(32)
+                .timeout(Duration::from_secs(10))
+                .add_service(
+                    delay_wire::fixed_query_service_server::FixedQueryServiceServer::new(service)
+                        .max_decoding_message_size(4 * 1024 * 1024)
+                        .max_encoding_message_size(4 * 1024 * 1024),
+                )
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopped.cancelled(),
+                )
+                .await?;
+            Ok(())
         });
         Ok(Self {
             endpoint,
             fragments,
             delay_millis,
+            shutdown,
             task,
         })
     }
@@ -127,13 +162,17 @@ impl FragmentDelay {
         self.fragments.load(Ordering::SeqCst)
     }
     async fn stop(mut self) {
-        self.task.abort();
-        let _ = (&mut self.task).await;
+        self.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(15), &mut self.task)
+            .await
+            .expect("typed delay proxy shutdown deadline")
+            .unwrap()
+            .unwrap();
     }
 }
-
 impl Drop for FragmentDelay {
     fn drop(&mut self) {
+        self.shutdown.cancel();
         self.task.abort();
     }
 }

@@ -1,5 +1,5 @@
 //! Opt-in failure metadata, never request/response values. No wire/API changes.
-use super::{Operation, RemoteError};
+use super::RemoteError;
 use std::{
     fmt, io,
     net::SocketAddr,
@@ -31,15 +31,6 @@ pub(super) fn kind(error: &RemoteError) -> &'static str {
         RemoteError::Timeout { .. } => "timeout",
         RemoteError::SessionUnavailable => "session_unavailable",
         RemoteError::Protocol => "protocol",
-    }
-}
-pub(super) fn operation(op: &Operation) -> &'static str {
-    match op {
-        Operation::Query(_) => "query",
-        Operation::OpenSnapshot { .. } => "open_snapshot",
-        Operation::SnapshotPage { .. } => "snapshot_page",
-        Operation::CloseSnapshot { .. } => "close_snapshot",
-        _ => "other",
     }
 }
 /// Classify without formatting Raft errors, which can contain peer/storage data.
@@ -162,6 +153,7 @@ impl Phase {
         }
         failure(args);
     }
+    #[cfg(test)]
     pub(super) fn io(&mut self, error: &io::Error) {
         self.report("io", Some(error));
     }
@@ -219,14 +211,6 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(read_barrier_kind(&error), expected);
         }
-        let request = super::super::query::QueryRequest {
-            shard: 7,
-            partition: 0,
-            mode: super::super::query::QueryMode::V1,
-            text: "private query text".into(),
-            timeout_millis: 5000,
-        };
-        assert_eq!(operation(&Operation::Query(request)), "query");
     }
 
     #[test]

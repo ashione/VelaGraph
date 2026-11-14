@@ -273,7 +273,9 @@ async fn scenario() -> anyhow::Result<()> {
             ..identity
         },
     ] {
-        let mut wrong = Client::connect(endpoint, wrong, BUDGET).await?;
+        let mut wrong = Client::connect(endpoint, wrong, BUDGET)
+            .await
+            .context("connect wrong-identity client")?;
         assert!(matches!(
             wrong.probe(SHARD).await,
             Err(RemoteError::InvalidArgument)
@@ -304,8 +306,9 @@ async fn scenario() -> anyhow::Result<()> {
         }))
     ));
     let follower = (cluster.leader + 1) % 3;
-    let mut other =
-        Client::connect(cluster.grpc(follower), cluster.identity(follower), BUDGET).await?;
+    let mut other = Client::connect(cluster.grpc(follower), cluster.identity(follower), BUDGET)
+        .await
+        .context("connect follower client")?;
     for (operation, result) in [
         ("probe", other.probe(SHARD).await),
         ("write", other.write(write(3, None)).await.map(|_| ())),
@@ -317,7 +320,10 @@ async fn scenario() -> anyhow::Result<()> {
     }
     // Metadata deliberately retains the existing local-read semantics. It is
     // not a leader barrier and must not be advertised as a linearizable read.
-    let local = other.metadata(SHARD).await?;
+    let local = other
+        .metadata(SHARD)
+        .await
+        .context("follower local metadata")?;
     assert_eq!((local.0, local.1), (SHARD, 3));
     assert!(
         local.2 <= committed.2,
@@ -363,16 +369,29 @@ async fn scenario() -> anyhow::Result<()> {
     {
         assert!(wrong_transport.probe(SHARD).await.is_err());
     }
-    assert!(
-        remote::probe_identified(endpoint, identity, SHARD, Duration::from_millis(300))
+    // Convenience wrappers now use the same typed service as explicit clients.
+    remote::probe_identified(endpoint, identity, SHARD, BUDGET)
+        .await
+        .context("typed convenience probe")?;
+    assert_eq!(
+        remote::metadata_identified(endpoint, identity, SHARD, BUDGET)
             .await
-            .is_err()
+            .context("typed convenience metadata")?,
+        client
+            .metadata(SHARD)
+            .await
+            .context("explicit metadata for convenience equivalence")?
     );
+    raw_legacy_write_is_rejected(endpoint, identity)
+        .await
+        .context("raw legacy write rejection and no-side-effect checks")?;
     assert_eq!(
         client.metadata(SHARD).await.context("leader metadata")?,
         committed
     );
-    cli_checks(endpoint, cluster.tcp(cluster.leader), identity, committed.2).await?;
+    cli_checks(endpoint, cluster.tcp(cluster.leader), identity, committed.2)
+        .await
+        .context("typed CLI and retired-port checks")?;
     unknown_outcome(endpoint, identity)
         .await
         .context("unknown outcome")?;
@@ -386,6 +405,220 @@ async fn scenario() -> anyhow::Result<()> {
         process.success = true;
     }
     Ok(())
+}
+
+async fn raw_legacy_write_is_rejected(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+) -> anyhow::Result<()> {
+    let mut typed = Client::connect(endpoint, identity, BUDGET)
+        .await
+        .context("raw rejection: connect typed control client")?;
+    let before = typed
+        .metadata(SHARD)
+        .await
+        .context("raw rejection: baseline metadata")?;
+    let request = write(240, Some(before.2));
+    let key = vec![b'k', 240, 0, 255];
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "identity": identity,
+        "operation": {"Write": request}
+    }))
+    .context("raw rejection: encode legacy write fixture")?;
+    let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    let mut socket = TcpStream::connect(endpoint)
+        .await
+        .context("raw rejection: connect legacy socket")?;
+    timeout(BUDGET, async {
+        if let Err(error) = socket.write_all(&bytes).await {
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) {
+                return Err(error.into());
+            }
+        }
+        let mut received = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            match socket.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    ensure!(
+                        received.len() + n <= 4096,
+                        "unexpected protocol rejection body"
+                    );
+                    received.extend_from_slice(&chunk[..n]);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // EOF/reset above is mandatory; any bytes before it must be complete,
+        // valid HTTP/2 connection-control frames, never an application reply.
+        ensure!(
+            only_h2_connection_control(&received),
+            "raw legacy request received application data or malformed framing"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("raw legacy request must terminate, not merely send HTTP/2 settings")??;
+    // A typed leader barrier and full small-fixture snapshot check the rejected
+    // request caused neither a sequence advance nor a hidden graph write.
+    typed
+        .probe(SHARD)
+        .await
+        .context("raw rejection: post-rejection leader barrier")?;
+    assert_eq!(
+        typed
+            .metadata(SHARD)
+            .await
+            .context("raw rejection: post-rejection metadata")?,
+        before
+    );
+    let snapshots = SnapshotClient::connect(endpoint, identity, BUDGET)
+        .await
+        .context("raw rejection: connect snapshot client")?;
+    let descriptor = snapshots
+        .open(SHARD, BUDGET)
+        .await
+        .context("raw rejection: open absence-check snapshot")?;
+    let page = snapshots
+        .page(descriptor.clone(), None, BUDGET)
+        .await
+        .context("raw rejection: read absence-check page")?;
+    assert!(
+        page.next.is_none(),
+        "small fixture must fit one complete page"
+    );
+    assert!(page.entries.iter().all(|(actual, _)| actual != &key));
+    snapshots
+        .close(descriptor, BUDGET)
+        .await
+        .context("raw rejection: close snapshot")?;
+    Ok(())
+}
+
+fn only_h2_connection_control(mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        if bytes.len() < 9 {
+            return false;
+        }
+        let length =
+            (usize::from(bytes[0]) << 16) | (usize::from(bytes[1]) << 8) | usize::from(bytes[2]);
+        let kind = bytes[3];
+        let flags = bytes[4];
+        // No client streams exist. Also reject a set reserved stream-id bit.
+        if bytes[5..9] != [0, 0, 0, 0] || length > bytes.len() - 9 {
+            return false;
+        }
+        let payload = &bytes[9..9 + length];
+        let settings = payload.as_chunks::<6>().0;
+        let valid = match kind {
+            // SETTINGS: only ACK is defined; ACK must have an empty payload.
+            4 if flags == 1 => payload.is_empty(),
+            4 if flags == 0 && length.is_multiple_of(6) => settings.iter().all(|setting| {
+                let id = u16::from_be_bytes([setting[0], setting[1]]);
+                let value = u32::from_be_bytes(setting[2..6].try_into().unwrap());
+                match id {
+                    2 | 8 => value <= 1,
+                    4 => value <= 0x7fff_ffff,
+                    5 => (16_384..=16_777_215).contains(&value),
+                    _ => true,
+                }
+            }),
+            // PING: eight opaque bytes, only the ACK flag is defined.
+            6 => flags <= 1 && length == 8,
+            // GOAWAY: last stream is necessarily zero, followed by error code
+            // and optional opaque debug bytes.
+            7 => flags == 0 && length >= 8 && payload[..4] == [0, 0, 0, 0],
+            // Connection WINDOW_UPDATE: a nonzero, 31-bit increment.
+            8 if flags == 0 && length == 4 => {
+                let increment = u32::from_be_bytes(payload.try_into().unwrap());
+                (1..=0x7fff_ffff).contains(&increment)
+            }
+            // DATA, HEADERS, stream controls, extensions and unknown framing
+            // are not evidence of rejecting a pre-HTTP/2 JSON request.
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+        bytes = &bytes[9 + length..];
+    }
+    true
+}
+
+#[test]
+fn raw_rejection_accepts_only_complete_h2_connection_controls() {
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let length = payload.len() as u32;
+        let mut bytes = length.to_be_bytes()[1..].to_vec();
+        bytes.extend([kind, flags]);
+        bytes.extend(stream.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+    assert!(only_h2_connection_control(&[]));
+    let controls = [
+        frame(4, 0, 0, &[0, 3, 0, 0, 0, 100]),
+        frame(4, 1, 0, &[]),
+        frame(6, 0, 0, &[0; 8]),
+        frame(6, 1, 0, &[0; 8]),
+        frame(8, 0, 0, &[0, 0, 0, 1]),
+        frame(7, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 1]),
+    ];
+    assert!(only_h2_connection_control(&controls.concat()));
+    for control in &controls {
+        assert!(only_h2_connection_control(control));
+        for length in 1..control.len() {
+            assert!(!only_h2_connection_control(&control[..length]));
+        }
+    }
+    for reply in [
+        serde_json::json!({"version":1,"result":{"Ok":"Probe"}}),
+        serde_json::json!({"version":1,"result":{"Err":"InvalidArgument"}}),
+    ] {
+        let json = serde_json::to_vec(&reply).unwrap();
+        let mut legacy = (json.len() as u32).to_be_bytes().to_vec();
+        legacy.extend_from_slice(&json);
+        assert!(!only_h2_connection_control(&legacy));
+        assert!(!only_h2_connection_control(&json));
+    }
+    for invalid in [
+        frame(0, 0, 0, &[]),
+        frame(0, 1, 1, b"application data"),
+        frame(1, 4, 1, &[]),
+        frame(4, 0, 1, &[]),
+        frame(4, 2, 0, &[]),
+        frame(4, 1, 0, &[0; 6]),
+        frame(4, 0, 0, &[0]),
+        frame(4, 0, 0, &[0, 2, 0, 0, 0, 2]),
+        frame(4, 0, 0, &[0, 4, 128, 0, 0, 0]),
+        frame(4, 0, 0, &[0, 5, 0, 0, 0, 1]),
+        frame(6, 0, 0, &[0; 7]),
+        frame(7, 0, 0, &[0; 7]),
+        frame(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]),
+        frame(8, 0, 0, &[0; 4]),
+        frame(8, 0, 0, &[128, 0, 0, 1]),
+        vec![0],
+        vec![255; 9],
+    ] {
+        assert!(!only_h2_connection_control(&invalid), "{invalid:?}");
+        let mut after_settings = controls[0].clone();
+        after_settings.extend(invalid);
+        assert!(!only_h2_connection_control(&after_settings));
+    }
 }
 
 async fn malformed(endpoint: SocketAddr, identity: RemoteIdentity) -> anyhow::Result<()> {

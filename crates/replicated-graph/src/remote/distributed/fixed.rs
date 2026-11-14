@@ -8,75 +8,8 @@ use d2_raft::{
     versioned_reads::{ReadLimit, Target},
 };
 
-/// Explicit deployment-selected transport, never probe or fall back after a call.
-#[derive(Clone)]
-pub(crate) enum Client {
-    Tcp {
-        endpoint: SocketAddr,
-        identity: RemoteIdentity,
-    },
-    Grpc(super::grpc::FixedClient),
-}
-impl Client {
-    pub(crate) async fn open(
-        &self,
-        request: FixedOpenRequest,
-        duration: Duration,
-    ) -> Result<FixedOpened, RemoteError> {
-        match self {
-            Self::Tcp { endpoint, identity } => open(*endpoint, *identity, request, duration).await,
-            Self::Grpc(client) => client.open(request, duration).await,
-        }
-    }
-    pub(crate) async fn renewable_open(
-        &self,
-        request: RenewableFixedOpenRequest,
-        duration: Duration,
-    ) -> Result<RenewableFixedOpened, RemoteError> {
-        match self {
-            Self::Tcp { endpoint, identity } => {
-                renewable_open(*endpoint, *identity, request, duration).await
-            }
-            Self::Grpc(client) => client.renewable_open(request, duration).await,
-        }
-    }
-    pub(crate) async fn renew(
-        &self,
-        request: FixedRenewRequest,
-        duration: Duration,
-    ) -> Result<FixedLeaseGrant, RemoteError> {
-        match self {
-            Self::Tcp { endpoint, identity } => {
-                renew(*endpoint, *identity, request, duration).await
-            }
-            Self::Grpc(client) => client.renew(request, duration).await,
-        }
-    }
-    pub(super) async fn fragment(
-        &self,
-        request: FixedFragmentRequest,
-        duration: Duration,
-    ) -> Result<Result<FixedFragmentOutput, QueryFailure>, RemoteError> {
-        match self {
-            Self::Tcp { endpoint, identity } => {
-                fragment(*endpoint, *identity, request, duration).await
-            }
-            Self::Grpc(client) => client.fragment(request, duration).await,
-        }
-    }
-    pub(crate) async fn close(
-        &self,
-        descriptor: FixedDescriptor,
-        duration: Duration,
-    ) -> Result<(), RemoteError> {
-        match self {
-            Self::Tcp { endpoint, identity } => {
-                close(*endpoint, *identity, descriptor, duration).await
-            }
-            Self::Grpc(client) => client.close(descriptor, duration).await,
-        }
-    }
-}
+/// Reusable typed transport; legacy JSON/TCP is not supported.
+pub(crate) type Client = super::grpc::FixedClient;
 
 // Membership is independent of worker width and per-process session slots.
 pub(crate) const MAX_MEMBERS: usize = d2_raft::transaction_decisions::MAX_PARTICIPANTS;
@@ -343,33 +276,16 @@ pub(super) fn narrow_open_deadlines(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn open(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
-    mut request: FixedOpenRequest,
+    request: FixedOpenRequest,
     duration: Duration,
 ) -> Result<FixedOpened, RemoteError> {
-    let started = Instant::now();
-    let end = checked_deadline(duration, None)?;
-    preflight(identity, &request, end)?;
-    let now = Instant::now();
-    narrow_open_deadlines(
-        &mut request,
-        now - started,
-        end.saturating_duration_since(now),
-    )?;
-    let reply = rpc(
-        endpoint,
-        Some(identity),
-        Operation::OpenFixedQuery(request),
-        end.saturating_duration_since(Instant::now()),
-        None,
-    )
-    .await?;
-    match reply {
-        Reply::OpenFixedQuery(opened) => Ok(opened),
-        _ => Err(RemoteError::Protocol),
-    }
+    Client::connect_lazy(endpoint, identity, duration)?
+        .open(request, duration)
+        .await
 }
 pub(crate) fn renewable_preflight(
     identity: RemoteIdentity,
@@ -409,93 +325,49 @@ pub(crate) fn renewable_preflight(
     )?;
     Ok(())
 }
+#[cfg(test)]
 pub(crate) async fn renewable_open(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
-    mut request: RenewableFixedOpenRequest,
+    request: RenewableFixedOpenRequest,
     duration: Duration,
 ) -> Result<RenewableFixedOpened, RemoteError> {
-    let started = Instant::now();
-    let end = checked_deadline(duration, None)?;
-    renewable_preflight(identity, &request, end)?;
-    let now = Instant::now();
-    narrow_open_deadlines(
-        &mut request.open,
-        now - started,
-        end.saturating_duration_since(now),
-    )?;
-    request.hard_lifetime_millis = Duration::from_millis(request.hard_lifetime_millis)
-        .saturating_sub(now - started)
-        .as_millis() as u64;
-    match rpc(
-        endpoint,
-        Some(identity),
-        Operation::OpenRenewableFixedQuery(request),
-        end.saturating_duration_since(Instant::now()),
-        None,
-    )
-    .await?
-    {
-        Reply::OpenRenewableFixedQuery(opened) => Ok(opened),
-        _ => Err(RemoteError::Protocol),
-    }
+    Client::connect_lazy(endpoint, identity, duration)?
+        .renewable_open(request, duration)
+        .await
 }
+#[cfg(test)]
 pub(crate) async fn renew(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
     request: FixedRenewRequest,
     duration: Duration,
 ) -> Result<FixedLeaseGrant, RemoteError> {
-    match rpc(
-        endpoint,
-        Some(identity),
-        Operation::RenewFixedQuery(request),
-        duration,
-        None,
-    )
-    .await?
-    {
-        Reply::RenewFixedQuery(grant) => Ok(grant),
-        _ => Err(RemoteError::Protocol),
-    }
+    Client::connect_lazy(endpoint, identity, duration)?
+        .renew(request, duration)
+        .await
 }
+#[cfg(test)]
 pub(super) async fn fragment(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
     request: FixedFragmentRequest,
     duration: Duration,
 ) -> Result<Result<FixedFragmentOutput, QueryFailure>, RemoteError> {
-    match rpc(
-        endpoint,
-        Some(identity),
-        Operation::FixedQueryFragment(request),
-        duration,
-        None,
-    )
-    .await?
-    {
-        Reply::FixedQueryFragment(output) => Ok(output),
-        _ => Err(RemoteError::Protocol),
-    }
+    Client::connect_lazy(endpoint, identity, duration)?
+        .fragment(request, duration)
+        .await
 }
+#[cfg(test)]
 pub(crate) async fn close(
     endpoint: SocketAddr,
     identity: RemoteIdentity,
     descriptor: FixedDescriptor,
     duration: Duration,
 ) -> Result<(), RemoteError> {
-    match rpc(
-        endpoint,
-        Some(identity),
-        Operation::CloseFixedQuery { descriptor },
-        duration,
-        None,
-    )
-    .await?
-    {
-        Reply::CloseFixedQuery => Ok(()),
-        _ => Err(RemoteError::Protocol),
-    }
+    Client::connect_lazy(endpoint, identity, duration)?
+        .close(descriptor, duration)
+        .await
 }
 
 #[cfg(test)]
@@ -1160,13 +1032,19 @@ mod tests {
         let end = Instant::now() + Duration::from_secs(5);
         let bytes = frame_size(&response, end).unwrap();
         assert!(bytes > query::MAX_QUERY_RESPONSE_BYTES + 1024 && bytes < MAX_FRAME_BYTES);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = super::super::typed_test_peer::Listener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let endpoint = listener.local_addr().unwrap();
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let received: Request = read_frame(&mut stream, end).await.unwrap();
+            let received: Request = super::super::typed_test_peer::read_frame(&mut stream, end)
+                .await
+                .unwrap();
             assert!(matches!(received.operation, Operation::OpenFixedQuery(_)));
-            write_frame(&mut stream, &response, end).await.unwrap();
+            super::super::typed_test_peer::write_frame(&mut stream, response, end)
+                .await
+                .unwrap();
         });
         // No certification assertion: this only proves that the new operation
         // has its own 16MiB receive branch; gateway checks the actual proof.

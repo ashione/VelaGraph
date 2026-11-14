@@ -134,7 +134,10 @@ impl ShardOperations for grpc::Handler {
         #[cfg(test)]
         let measured = Instant::now();
         let request_id = match &op {
-            Operation::Write(w) => Some(w.request_id),
+            Operation::Write(w)
+            | Operation::Managed(super::managed::Request::Write { request: w, .. }) => {
+                Some(w.request_id)
+            }
             _ => None,
         };
         let context = grpc::wire::Context {
@@ -184,6 +187,26 @@ pub struct Client {
     absolute_deadline: Option<Instant>,
 }
 impl Client {
+    /// Construct without network I/O; call admission precedes the handshake.
+    pub fn connect_lazy(
+        address: SocketAddr,
+        identity: RemoteIdentity,
+        timeout: Duration,
+    ) -> Result<Self, RemoteError> {
+        if timeout.is_zero() || timeout > MAX_DEADLINE {
+            return Err(RemoteError::InvalidArgument);
+        }
+        let channel = Channel::from_shared(format!("http://{address}"))
+            .map_err(|_| RemoteError::InvalidArgument)?
+            .connect_lazy();
+        Ok(Self {
+            channel,
+            identity,
+            timeout,
+            absolute_deadline: None,
+        })
+    }
+
     pub async fn connect(
         address: SocketAddr,
         identity: RemoteIdentity,
@@ -215,7 +238,7 @@ impl Client {
         self.absolute_deadline = Some(end);
         self
     }
-    async fn call(&mut self, op: Operation) -> Result<Reply, RemoteError> {
+    pub(in crate::remote) async fn call(&mut self, op: Operation) -> Result<Reply, RemoteError> {
         #[cfg(test)]
         let total = Instant::now();
         let end = self.absolute_deadline.map_or_else(
@@ -223,7 +246,10 @@ impl Client {
             |end| end.min(Instant::now() + self.timeout),
         );
         let id = match &op {
-            Operation::Write(w) => Some(w.request_id),
+            Operation::Write(w)
+            | Operation::Managed(super::managed::Request::Write { request: w, .. }) => {
+                Some(w.request_id)
+            }
             _ => None,
         };
         let future = async {

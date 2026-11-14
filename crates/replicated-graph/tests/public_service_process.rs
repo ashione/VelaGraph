@@ -424,54 +424,39 @@ async fn public_scenario() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Result<()> {
-    let (coordinator, a, b) = tokio::try_join!(
-        NodeProcess::start(9, false),
-        NodeProcess::start(7, false),
-        NodeProcess::start(8, false)
-    )?;
     let (grpc_coordinator, grpc_a, grpc_b) = tokio::try_join!(
         NodeProcess::start(9, true),
         NodeProcess::start(7, true),
         NodeProcess::start(8, true)
     )?;
-    // The shipped legacy managed listener is gone. This isolated protocol
-    // rejection fixture speaks only the old frame prefix and records any
-    // attempted fallback; genuine graph-side legacy coverage remains below.
-    let old_control = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let old_control_addr = old_control.local_addr()?;
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observed = attempts.clone();
-    let rejection_peer = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        loop {
-            let (mut socket, _) = old_control.accept().await.unwrap();
-            let mut first = [0; 4];
-            if socket.read_exact(&mut first).await.is_err() {
-                continue;
-            }
-            assert_eq!(
-                &first, b"PRI ",
-                "must not retry using the retired JSON framing"
-            );
-            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = socket.write_all(&[0, 0, 0, 2, b'{', b'}']).await;
-        }
-    });
+    // Both shipped constructors now speak typed RPC. Use isolated old-wire
+    // peers instead: neither peer can forward a request or mutate a real node.
+    // Each route needs its own address: duplicate endpoints are correctly
+    // rejected by topology validation before any network operation.
+    let (old_control_addr, control_attempts, control_peer) = legacy_rejection_peer().await?;
+    let (old_control_a, control_a_attempts, control_a_peer) = legacy_rejection_peer().await?;
+    let (old_control_b, control_b_attempts, control_b_peer) = legacy_rejection_peer().await?;
+    let (old_graph_a, graph_a_attempts, graph_a_peer) = legacy_rejection_peer().await?;
+    let (old_graph_b, graph_b_attempts, graph_b_peer) = legacy_rejection_peer().await?;
+    let control_count = || {
+        [&control_attempts, &control_a_attempts, &control_b_attempts]
+            .into_iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .sum::<usize>()
+    };
+    let graph_count = || {
+        [&graph_a_attempts, &graph_b_attempts]
+            .into_iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .sum::<usize>()
+    };
     let directory = tempfile::tempdir()?;
     // Independently reject legacy control, legacy graph, and both. A failure
     // on one path must not conceal fallback on the other.
     for (legacy_control, legacy_graph) in [(true, true), (true, false), (false, true)] {
-        let (c, ca, cb) = if legacy_control {
-            (&coordinator, &a, &b)
-        } else {
-            (&grpc_coordinator, &grpc_a, &grpc_b)
-        };
-        let (ga, gb) = if legacy_graph {
-            (&a, &b)
-        } else {
-            (&grpc_a, &grpc_b)
-        };
-        let config = json!({"binding":binding(),"coordinator":{"endpoint":if legacy_control { old_control_addr } else { c.ready.control },"identity":identity(9)},"members":[{"endpoint":if legacy_control { old_control_addr } else { ca.ready.control },"identity":identity(7),"graph_endpoint":ga.ready.graph},{"endpoint":if legacy_control { old_control_addr } else { cb.ready.control },"identity":identity(8),"graph_endpoint":gb.ready.graph}]});
+        let control_before = control_count();
+        let graph_before = graph_count();
+        let config = json!({"binding":binding(),"coordinator":{"endpoint":if legacy_control { old_control_addr } else { grpc_coordinator.ready.control },"identity":identity(9)},"members":[{"endpoint":if legacy_control { old_control_a } else { grpc_a.ready.control },"identity":identity(7),"graph_endpoint":if legacy_graph { Some(old_graph_a) } else { grpc_a.ready.graph }},{"endpoint":if legacy_control { old_control_b } else { grpc_b.ready.control },"identity":identity(8),"graph_endpoint":if legacy_graph { Some(old_graph_b) } else { grpc_b.ready.graph }}]});
         let path = directory.path().join("legacy.json");
         fs::write(&path, serde_json::to_vec(&config)?)?;
         if !legacy_control {
@@ -488,6 +473,15 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
                 "wrong graph transport must be unavailable: {body}"
             );
             drop(service);
+            assert!(
+                graph_count() > graph_before,
+                "graph-only failure must actually reach the old-wire graph peer"
+            );
+            assert_eq!(
+                control_count(),
+                control_before,
+                "healthy control routes must not reach the old-wire control peer"
+            );
             continue;
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
@@ -526,13 +520,55 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
             fs::read(&output)?.is_empty(),
             "legacy endpoints must never announce serving"
         );
+        assert!(
+            control_count() > control_before,
+            "control failure must actually reach the old-wire control peer"
+        );
     }
-    assert!(attempts.load(std::sync::atomic::Ordering::Relaxed) > 0);
-    assert!(
-        !rejection_peer.is_finished(),
-        "legacy protocol fixture must observe no fallback"
-    );
-    rejection_peer.abort();
-    let _ = rejection_peer.await;
+    for peer in [
+        control_peer,
+        control_a_peer,
+        control_b_peer,
+        graph_a_peer,
+        graph_b_peer,
+    ] {
+        assert!(
+            !peer.is_finished(),
+            "legacy protocol fixture must observe no fallback"
+        );
+        peer.abort();
+        let _ = peer.await;
+    }
     Ok(())
+}
+
+// Any retired JSON request starts with a length prefix, not the HTTP/2
+// preface. Keep observing every connection so a later fallback is not hidden
+// by the first failed typed request. The only response is a legacy empty frame.
+async fn legacy_rejection_peer() -> anyhow::Result<(
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let peer = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut first = [0; 4];
+            if socket.read_exact(&mut first).await.is_err() {
+                continue;
+            }
+            assert_eq!(
+                &first, b"PRI ",
+                "must not retry using the retired JSON framing"
+            );
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = socket.write_all(&[0, 0, 0, 2, b'{', b'}']).await;
+        }
+    });
+    Ok((address, attempts, peer))
 }

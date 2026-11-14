@@ -1,5 +1,5 @@
 //! Typed fixed-query transport differential in three independent OS processes.
-//! Managed control remains TCP; only data-local fragment transport is gRPC.
+//! Managed control and both data-local entrypoints use typed gRPC.
 // Some exact shared helpers are used only by the other integration targets.
 #![allow(dead_code)]
 
@@ -620,7 +620,7 @@ async fn raw_fixed_checks(
         tonic::Code::NotFound
     );
 
-    // gRPC-opened descriptors can be closed through the original TCP service.
+    // Both typed listeners share one fixed-session pool and descriptors.
     let cross = rpc
         .open_fixed(w::FixedOpenEnvelope {
             context: context(),
@@ -630,14 +630,17 @@ async fn raw_fixed_checks(
         .into_inner()
         .descriptor
         .context("cross descriptor")?;
-    let stamp = cross.stamp.as_ref().context("stamp")?;
-    let native = serde_json::json!({"stamp": {"identity": tcp.identity, "shard": stamp.shard, "epoch": stamp.epoch, "sequence": stamp.sequence}, "incarnation": cross.incarnation, "token": cross.token, "authority": authority(), "cohort": cohort(), "version": cross.version, "mode": cross.mode});
-    let closed = legacy_fixed(
-        tcp.endpoint,
-        serde_json::json!({"CloseFixedQuery": {"descriptor": native}}),
-    )
+    let mut other = w::fixed_query_service_client::FixedQueryServiceClient::connect(format!(
+        "http://{}",
+        tcp.endpoint
+    ))
     .await?;
-    assert_eq!(closed["result"]["Ok"], "CloseFixedQuery");
+    other
+        .close_fixed(w::FixedCloseEnvelope {
+            context: context(),
+            descriptor: Some(cross.clone()),
+        })
+        .await?;
     assert_eq!(
         rpc.fragment_fixed(fragment(cross, 0))
             .await
@@ -669,8 +672,17 @@ async fn raw_fixed_checks(
         .code(),
         tonic::Code::ResourceExhausted
     );
-    let exhausted = legacy_fixed(tcp.endpoint, serde_json::json!({"OpenFixedQuery": {"target": target(7), "proof": proof, "capture_limit": {"rows":10000,"bytes":2097152,"operations":100000}, "ttl_millis":60000,"acquire_timeout_millis":5000}})).await?;
-    assert_eq!(exhausted["result"]["Err"], "ResourceExhausted");
+    assert_eq!(
+        other
+            .open_fixed(w::FixedOpenEnvelope {
+                context: context(),
+                request: Some(open.clone()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
     for descriptor in held {
         rpc.close_fixed(w::FixedCloseEnvelope {
             context: context(),
@@ -684,22 +696,6 @@ async fn raw_fixed_checks(
         "fixed RPCs reuse one physical HTTP/2 connection"
     );
     Ok(())
-}
-async fn legacy_fixed(
-    endpoint: SocketAddr,
-    operation: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let mut stream = TcpStream::connect(endpoint).await?;
-    let data = serde_json::to_vec(
-        &serde_json::json!({"version":1,"identity":{"group":7,"node":1},"operation":operation}),
-    )?;
-    stream.write_u32(data.len() as u32).await?;
-    stream.write_all(&data).await?;
-    let length = stream.read_u32().await? as usize;
-    anyhow::ensure!(length <= replicated_graph::remote::MAX_FRAME_BYTES);
-    let mut data = vec![0; length];
-    stream.read_exact(&mut data).await?;
-    Ok(serde_json::from_slice(&data)?)
 }
 
 struct Proxy {

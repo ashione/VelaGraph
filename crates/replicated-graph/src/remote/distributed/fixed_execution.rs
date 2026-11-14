@@ -58,18 +58,19 @@ impl NodeSession {
         descriptor: FixedDescriptor,
         capture_bytes: usize,
         capture_rows: usize,
-    ) -> Self {
-        Self {
-            transport: fixed::Client::Tcp {
-                endpoint: route.endpoint,
-                identity: route.identity,
-            },
+    ) -> Result<Self, RemoteError> {
+        Ok(Self {
+            transport: fixed::Client::connect_lazy(
+                route.endpoint,
+                route.identity,
+                Duration::from_secs(60),
+            )?,
             route,
             descriptor,
             sequence: 0,
             capture_bytes,
             capture_rows,
-        }
+        })
     }
     pub(crate) fn with_transport(mut self, transport: fixed::Client) -> Self {
         self.transport = transport;

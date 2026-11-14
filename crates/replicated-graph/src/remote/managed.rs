@@ -174,14 +174,14 @@ pub async fn request(
     deadline: Duration,
 ) -> Result<Output, RemoteError> {
     let (_, id) = request.validate()?;
-    let reply = rpc(
-        endpoint,
-        Some(identity),
-        Operation::Managed(request.clone()),
-        deadline,
-        id,
-    )
-    .await?;
+    let mut client = super::operations_grpc::Client::connect_lazy(endpoint, identity, deadline)?;
+    let reply = client
+        .call(Operation::Managed(request.clone()))
+        .await
+        .map_err(|e| match e {
+            RemoteError::Timeout { .. } => RemoteError::Timeout { request_id: id },
+            e => e,
+        })?;
     let Reply::Managed(output) = reply else {
         return Err(RemoteError::Protocol);
     };

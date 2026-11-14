@@ -71,6 +71,17 @@ pub enum S {
     Timeout,
     ApplicationError,
     ErrorPair,
+    Snapshot,
+    SnapshotEntry,
+    ManagedInspect,
+    ManagedEnable,
+    ManagedWrite,
+    ManagedStatusRequest,
+    ManagedMode,
+    ManagedModeResult,
+    ManagedEnabled,
+    ManagedWritten,
+    ManagedStatusResult,
 }
 #[derive(Clone, Copy)]
 enum K {
@@ -107,9 +118,32 @@ fn field(s: S, t: u32) -> Option<F> {
         (MetadataResponse, 1 | 2) => f(t, V),
         (MetadataResponse, 3) => f(t, Child(Metadata)),
         (MetadataResponse, 4) => f(t, Child(Failure)),
-        (Request, 1 | 3 | 4 | 5) => f(t, V),
+        (Request, 1 | 3 | 4 | 5 | 7) => f(t, V),
         (Request, 2) => f(t, Child(Identity)),
         (Request, 6) => f(t, Child(Write)),
+        (Request, 8) => f(t, Child(ManagedInspect)),
+        (Request, 9) => f(t, Child(ManagedEnable)),
+        (Request, 10) => f(t, Child(ManagedWrite)),
+        (Request, 11) => f(t, Child(ManagedStatusRequest)),
+        (Response, 6) => f(t, Child(Snapshot)),
+        (Response, 7) => f(t, Child(ManagedModeResult)),
+        (Response, 8) => f(t, Child(ManagedEnabled)),
+        (Response, 9) => f(t, Child(ManagedWritten)),
+        (Response, 10) => f(t, Child(ManagedStatusResult)),
+        (Snapshot, 1..=3) => f(t, V),
+        (Snapshot, 4) => r(t, Child(SnapshotEntry)),
+        (SnapshotEntry, 1 | 2) => f(t, Bytes(None)),
+        (ManagedInspect, 1 | 2) | (ManagedEnable, 1..=3) | (ManagedStatusRequest, 1 | 2) => f(t, V),
+        (ManagedEnable, 4)
+        | (ManagedWrite, 1)
+        | (ManagedStatusRequest, 3 | 4)
+        | (ManagedMode | ManagedEnabled | ManagedWritten, 1) => f(t, Bytes(Some(16))),
+        (ManagedWrite, 2) => f(t, Child(Write)),
+        (ManagedMode | ManagedEnabled, 2) => f(t, V),
+        (ManagedModeResult, 1) => f(t, Child(ManagedMode)),
+        (ManagedWritten, 2) => f(t, Child(WriteResult)),
+        (ManagedStatusResult, 1) => f(t, Child(Empty)),
+        (ManagedStatusResult, 2) => f(t, V),
         (Response, 1) => f(t, V),
         (Response, 2) => f(t, Child(Empty)),
         (Response, 3) => f(t, Child(Metadata)),
@@ -175,10 +209,23 @@ fn charge(left: &mut usize, n: usize) -> Result<(), Status> {
 }
 fn scan(
     s: S,
+    d: &[u8],
+    depth: usize,
+    left: &mut usize,
+    end: tokio::time::Instant,
+) -> Result<(), Status> {
+    let mut bytes = crate::remote::MAX_SNAPSHOT_BYTES;
+    let mut rows = crate::remote::MAX_SNAPSHOT_ROWS;
+    scan_inner(s, d, depth, left, end, &mut bytes, &mut rows)
+}
+fn scan_inner(
+    s: S,
     mut d: &[u8],
     depth: usize,
     left: &mut usize,
     end: tokio::time::Instant,
+    snapshot_bytes: &mut usize,
+    snapshot_rows: &mut usize,
 ) -> Result<(), Status> {
     if depth > 16 {
         return Err(limit());
@@ -221,7 +268,7 @@ fn scan(
             S::Request => tag >= 4,
             S::Response => tag >= 2,
             S::MetadataResponse => tag >= 3,
-            S::WriteOp | S::Failure | S::ApplicationError => true,
+            S::WriteOp | S::Failure | S::ApplicationError | S::ManagedStatusResult => true,
             _ => false,
         };
         if choice {
@@ -255,11 +302,27 @@ fn scan(
                     return Err(bad());
                 }
                 charge(left, b.len())?;
+                if matches!(s, S::SnapshotEntry) {
+                    charge(snapshot_bytes, b.len())?;
+                }
             }
             (K::Child(child), 2) => {
                 let b = bytes(&mut d)?;
-                charge(left, 256)?;
-                scan(child, b, depth + 1, left, end)?;
+                if matches!(child, S::SnapshotEntry) {
+                    charge(snapshot_rows, 1)?;
+                    charge(left, std::mem::size_of::<wire::SnapshotEntry>())?;
+                } else {
+                    charge(left, 256)?;
+                }
+                scan_inner(
+                    child,
+                    b,
+                    depth + 1,
+                    left,
+                    end,
+                    snapshot_bytes,
+                    snapshot_rows,
+                )?;
             }
             _ => return Err(bad()),
         }
@@ -272,6 +335,7 @@ fn scan(
             | S::WriteOp
             | S::Failure
             | S::ApplicationError
+            | S::ManagedStatusResult
     ) && oneof != 1
     {
         return Err(bad());
@@ -508,5 +572,80 @@ mod tests {
             .code(),
             tonic::Code::DeadlineExceeded
         );
+    }
+    #[test]
+    fn managed_and_snapshot_prescan_boundaries() {
+        let response = |bytes, rows| wire::Response {
+            version: 1,
+            result: Some(wire::response::Result::Snapshot(wire::Snapshot {
+                shard: 7,
+                epoch: 1,
+                sequence: 0,
+                entries: (0..rows)
+                    .map(|i| wire::SnapshotEntry {
+                        key: vec![],
+                        value: if i == 0 { vec![0; bytes] } else { vec![] },
+                    })
+                    .collect(),
+            })),
+        };
+        check::<wire::Response>(&response(crate::remote::MAX_SNAPSHOT_BYTES, 1).encode_to_vec())
+            .unwrap();
+        assert_eq!(
+            check::<wire::Response>(
+                &response(crate::remote::MAX_SNAPSHOT_BYTES + 1, 1).encode_to_vec()
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        check::<wire::Response>(&response(0, crate::remote::MAX_SNAPSHOT_ROWS).encode_to_vec())
+            .unwrap();
+        assert_eq!(
+            check::<wire::Response>(
+                &response(0, crate::remote::MAX_SNAPSHOT_ROWS + 1).encode_to_vec()
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
+        for len in [0, 15, 17] {
+            let r = wire::Request {
+                version: 1,
+                identity: Some(wire::Identity { group: 1, node: 2 }),
+                timeout_millis: 1,
+                operation: Some(wire::request::Operation::ManagedEnable(
+                    wire::ManagedEnable {
+                        shard: 7,
+                        epoch: 1,
+                        expected_sequence: 0,
+                        mode_id: vec![1; len],
+                    },
+                )),
+            };
+            // Empty proto3 bytes may be omitted; semantic conversion must reject
+            // it even where the prescan has no present field to validate.
+            if len > 0 {
+                assert!(check::<wire::Request>(&r.encode_to_vec()).is_err());
+            }
+            assert!(super::super::codec::operation(r.operation.unwrap()).is_err());
+        }
+        let invalid = wire::Response {
+            version: 1,
+            result: Some(wire::response::Result::ManagedStatus(
+                wire::ManagedStatusResult { status: None },
+            )),
+        };
+        assert!(check::<wire::Response>(&invalid.encode_to_vec()).is_err());
+        // Both status alternatives and both request operations are forbidden.
+        assert!(scan(
+            S::ManagedStatusResult,
+            &[10, 0, 16, 1],
+            0,
+            &mut 1024,
+            tokio::time::Instant::now() + RPC_TIMEOUT
+        )
+        .is_err());
+        assert!(check::<wire::Request>(&[8, 1, 56, 7, 66, 0]).is_err());
     }
 }

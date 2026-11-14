@@ -412,6 +412,7 @@ impl State {
                         opened.capture_cost.bytes,
                         opened.capture_cost.rows,
                     )
+                    .map_err(remote_error)?
                     .with_transport(transport),
                 );
                 // Compare the complete retained certificate, not a boolean or V.

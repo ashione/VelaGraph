@@ -544,7 +544,6 @@ mod projection_phase_tests {
             catalog: Arc::new(StaticCatalog { partitions: vec![] }),
             sessions: BTreeMap::new(),
             row_bounds: BTreeMap::new(),
-            connections: None,
             rows: None,
             expires: Instant::now() + Duration::from_secs(5),
             cost: Cost {
