@@ -35,10 +35,16 @@ async fn raw_rpc(
     method: &str,
     bytes: Vec<u8>,
     end_stream: bool,
-) -> (h2::client::ResponseFuture, h2::SendStream<tonic::codegen::Bytes>, RpcDriver) {
+) -> (
+    h2::client::ResponseFuture,
+    h2::SendStream<tonic::codegen::Bytes>,
+    RpcDriver,
+) {
     let socket = TcpStream::connect(address).await.unwrap();
     let (mut sender, connection) = h2::client::handshake(socket).await.unwrap();
-    let driver = RpcDriver(tokio::spawn(async move { let _ = connection.await; }));
+    let driver = RpcDriver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
     let request = tonic::codegen::http::Request::builder()
         .method("POST")
         .uri(format!("http://{address}/{method}"))
@@ -62,9 +68,15 @@ async fn rejected_rpc(response: h2::client::ResponseFuture) {
             body.flow_control().release_capacity(data.len())?;
         }
         let trailers = body.trailers().await?;
-        let status = trailers.as_ref().and_then(|h| h.get("grpc-status")).cloned().or(initial);
+        let status = trailers
+            .as_ref()
+            .and_then(|h| h.get("grpc-status"))
+            .cloned()
+            .or(initial);
         Ok::<_, h2::Error>(status)
-    }).await.expect("rejected RPC must terminate within deadline");
+    })
+    .await
+    .expect("rejected RPC must terminate within deadline");
     if let Ok(status) = result {
         assert!(status.is_some_and(|status| status != "0"));
     }
@@ -72,17 +84,24 @@ async fn rejected_rpc(response: h2::client::ResponseFuture) {
 async fn send_write_lost_ack(g: &Gateway, f: &Fixture, write: &Write) {
     let message = grpc_client::encode_write(public_context(), write).unwrap();
     let (response, mut body, driver) = raw_rpc(
-        g.local_addr(), "velagraph.public.managed.v1.WriteService/Submit",
-        grpc_frame(&message), true,
-    ).await;
+        g.local_addr(),
+        "velagraph.public.managed.v1.WriteService/Submit",
+        grpc_frame(&message),
+        true,
+    )
+    .await;
     // Wait for durable admission, not an arbitrary sleep or socket write. No
     // response is observed, so recovery must preserve this exact external ID.
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if journal(f).await.request(write.external_id).is_some() { break; }
+            if journal(f).await.request(write.external_id).is_some() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     body.send_reset(h2::Reason::CANCEL);
     drop(response);
     drop(driver);
@@ -396,11 +415,23 @@ async fn wrong_typed_binding_and_nonce_reject_before_write_admission() {
         }
         let write = create(90 + case, 7, 90 + u64::from(case));
         assert_eq!(
-            request(g.local_addr(), wrong, Operation::Submit(write.clone()), Duration::from_secs(2)).await,
+            request(
+                g.local_addr(),
+                wrong,
+                Operation::Submit(write.clone()),
+                Duration::from_secs(2)
+            )
+            .await,
             Err(Error::Identity)
         );
         assert!(journal(&f).await.request(write.external_id).is_none());
-        assert!(matches!(call(&g, Operation::Status(write)).await.unwrap(), Reply::Write { status: WriteStatus::Absent, .. }));
+        assert!(matches!(
+            call(&g, Operation::Status(write)).await.unwrap(),
+            Reply::Write {
+                status: WriteStatus::Absent,
+                ..
+            }
+        ));
     }
     let write = create(99, 7, 99);
     let context = Some(public_proto::Context {
@@ -411,11 +442,25 @@ async fn wrong_typed_binding_and_nonce_reject_before_write_admission() {
             binding: Some(grpc_client::encode_binding(&bound())),
         }),
     });
-    let mut client = public_proto::write_service_client::WriteServiceClient::connect(format!("http://{}", g.local_addr())).await.unwrap();
-    let error = client.submit(grpc_client::encode_write(context, &write).unwrap()).await.unwrap_err();
+    let mut client = public_proto::write_service_client::WriteServiceClient::connect(format!(
+        "http://{}",
+        g.local_addr()
+    ))
+    .await
+    .unwrap();
+    let error = client
+        .submit(grpc_client::encode_write(context, &write).unwrap())
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(journal(&f).await.request(write.external_id).is_none());
-    assert!(matches!(call(&g, Operation::Status(write)).await.unwrap(), Reply::Write { status: WriteStatus::Absent, .. }));
+    assert!(matches!(
+        call(&g, Operation::Status(write)).await.unwrap(),
+        Reply::Write {
+            status: WriteStatus::Absent,
+            ..
+        }
+    ));
     assert_eq!(journal(&f).await.resolved_prefix(), 0);
     g.shutdown().await;
     f.stop().await;
@@ -425,12 +470,25 @@ async fn wrong_typed_binding_and_nonce_reject_before_write_admission() {
 async fn typed_client_admission_precedes_connection() {
     let _test = TEST_GATE.lock().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let reserved = CLIENT_ADMISSION.acquire_many(MAX_CONNECTIONS as u32).await.unwrap();
+    let reserved = CLIENT_ADMISSION
+        .acquire_many(MAX_CONNECTIONS as u32)
+        .await
+        .unwrap();
     assert_eq!(
-        request(listener.local_addr().unwrap(), bound(), Operation::Status(create(1, 7, 1)), Duration::from_secs(1)).await,
+        request(
+            listener.local_addr().unwrap(),
+            bound(),
+            Operation::Status(create(1, 7, 1)),
+            Duration::from_secs(1)
+        )
+        .await,
         Err(Error::Capacity)
     );
-    assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
     drop(reserved);
 }
 
@@ -440,7 +498,12 @@ async fn gateway_rejects_non_loopback_before_binding() {
     let f = Fixture::new().await;
     // No external listener is opened: this address must fail the public
     // adapter's policy check, not reach socket bind or graph acquisition.
-    let result = Gateway::bind(f.config(), "0.0.0.0:0".parse().unwrap(), Duration::from_secs(2)).await;
+    let result = Gateway::bind(
+        f.config(),
+        "0.0.0.0:0".parse().unwrap(),
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(matches!(result, Err(Error::Protocol)));
     assert_eq!(journal(&f).await.resolved_prefix(), 0);
     f.stop().await;
@@ -752,7 +815,10 @@ async fn session_budgets_expiry_malformed_fields_and_oversized_frames() {
             token: sessions[0].token.to_vec(),
             version: sessions[0].version,
         }),
-        query: Some(public_proto::Query { partition: 7, text: "g.V(1)".into() }),
+        query: Some(public_proto::Query {
+            partition: 7,
+            text: "g.V(1)".into(),
+        }),
         ..Default::default()
     };
     let mut payload = prost::Message::encode_to_vec(&req);
@@ -761,11 +827,23 @@ async fn session_budgets_expiry_malformed_fields_and_oversized_frames() {
     let mut frame = vec![0];
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.extend(payload);
-    let (response, _body, _driver) = raw_rpc(g.local_addr(), "velagraph.public.managed.v1.FixedSessionService/Read", frame, true).await;
+    let (response, _body, _driver) = raw_rpc(
+        g.local_addr(),
+        "velagraph.public.managed.v1.FixedSessionService/Read",
+        frame,
+        true,
+    )
+    .await;
     rejected_rpc(response).await;
     let mut oversized = vec![0];
     oversized.extend_from_slice(&(MAX_REQUEST_BYTES as u32 + 1).to_be_bytes());
-    let (response, _body, _driver) = raw_rpc(g.local_addr(), "velagraph.public.managed.v1.FixedSessionService/Read", oversized, true).await;
+    let (response, _body, _driver) = raw_rpc(
+        g.local_addr(),
+        "velagraph.public.managed.v1.FixedSessionService/Read",
+        oversized,
+        true,
+    )
+    .await;
     rejected_rpc(response).await;
     for session in sessions {
         close(&g, session).await;
@@ -1090,13 +1168,18 @@ async fn connection_admission_and_total_deadline_leave_no_implicit_write() {
         .acquire_many_owned(MAX_CONNECTIONS as u32)
         .await
         .unwrap();
-    assert!(call(&g, Operation::Status(create(99, 7, 99))).await.is_err());
+    assert!(call(&g, Operation::Status(create(99, 7, 99)))
+        .await
+        .is_err());
     drop(reserved);
     // Incomplete protobuf body must expire without admitting any write.
     let (response, _body, _driver) = raw_rpc(
-        g.local_addr(), "velagraph.public.managed.v1.WriteService/Submit",
-        vec![0, 0, 0, 0, 100, 0x0a], false,
-    ).await;
+        g.local_addr(),
+        "velagraph.public.managed.v1.WriteService/Submit",
+        vec![0, 0, 0, 0, 100, 0x0a],
+        false,
+    )
+    .await;
     rejected_rpc(response).await;
     let serial = g.state.submit.lock().await;
     let submitted = request(
@@ -1129,64 +1212,120 @@ struct FakeFixedPeer {
 }
 #[tonic::async_trait]
 impl public_proto::fixed_session_service_server::FixedSessionService for FakeFixedPeer {
-    async fn open(&self, request: tonic::Request<public_proto::FixedOpenRequest>) -> std::result::Result<tonic::Response<public_proto::FixedOpenResponse>, tonic::Status> {
+    async fn open(
+        &self,
+        request: tonic::Request<public_proto::FixedOpenRequest>,
+    ) -> std::result::Result<tonic::Response<public_proto::FixedOpenResponse>, tonic::Status> {
         let mut identity = request.into_inner().context.and_then(|c| c.identity);
         match self.case {
             0 => identity.as_mut().unwrap().request_id[0] ^= 1,
-            1 => identity.as_mut().unwrap().binding.as_mut().unwrap().authority_mode[0] ^= 1,
+            1 => {
+                identity
+                    .as_mut()
+                    .unwrap()
+                    .binding
+                    .as_mut()
+                    .unwrap()
+                    .authority_mode[0] ^= 1
+            }
             4 => identity = None,
-            5 => { identity.as_mut().unwrap().request_id.pop(); },
+            5 => {
+                identity.as_mut().unwrap().request_id.pop();
+            }
             6 => identity.as_mut().unwrap().binding.as_mut().unwrap().members[0].epoch += 1,
             _ => {}
         }
         Ok(tonic::Response::new(public_proto::FixedOpenResponse {
             session: Some(public_proto::FixedSession {
                 incarnation: vec![1; 16],
-                token: if self.case == 3 { vec![2; MAX_RESPONSE_BYTES + 1] } else { vec![2; 32] },
+                token: if self.case == 3 {
+                    vec![2; MAX_RESPONSE_BYTES + 1]
+                } else {
+                    vec![2; 32]
+                },
                 version: if self.case == 2 { 5 } else { 4 },
             }),
             identity,
         }))
     }
-    async fn read(&self, request: tonic::Request<public_proto::FixedQueryRequest>) -> std::result::Result<tonic::Response<public_proto::FixedQueryResponse>, tonic::Status> {
+    async fn read(
+        &self,
+        request: tonic::Request<public_proto::FixedQueryRequest>,
+    ) -> std::result::Result<tonic::Response<public_proto::FixedQueryResponse>, tonic::Status> {
         use crate::remote::query::QualifiedElement as Q;
         assert!(self.rows);
         let request = request.into_inner();
         let identity = request.context.as_ref().and_then(|c| c.identity.clone());
         let operation = grpc_codec::fixed_read(request).unwrap();
-        let Operation::Read { session, query } = operation else { unreachable!() };
+        let Operation::Read { session, query } = operation else {
+            unreachable!()
+        };
         let rows = match self.case {
             0 => vec![v(7, 2)],
             1 | 2 => vec![e(8, 10)],
             3 => vec![e(10, 10)],
             4 | 5 => vec![],
-            6 => vec![value(Q::Edge { partition: 7, id: 10 }, Value::Integer(11))],
-            _ => vec![value(Q::Vertex { partition: 7, id: 2 }, Value::Null)],
+            6 => vec![value(
+                Q::Edge {
+                    partition: 7,
+                    id: 10,
+                },
+                Value::Integer(11),
+            )],
+            _ => vec![value(
+                Q::Vertex {
+                    partition: 7,
+                    id: 2,
+                },
+                Value::Null,
+            )],
         };
         let mut reply = grpc_codec::encode_fixed_query(&Reply::Read {
-            session, query, data: QueryData { rows, completeness: QueryCompleteness::Unverified },
-        }).unwrap();
+            session,
+            query,
+            data: QueryData {
+                rows,
+                completeness: QueryCompleteness::Unverified,
+            },
+        })
+        .unwrap();
         reply.identity = identity;
         Ok(tonic::Response::new(reply))
     }
-    async fn traverse(&self, _: tonic::Request<public_proto::FixedQueryRequest>) -> std::result::Result<tonic::Response<public_proto::FixedQueryResponse>, tonic::Status> {
+    async fn traverse(
+        &self,
+        _: tonic::Request<public_proto::FixedQueryRequest>,
+    ) -> std::result::Result<tonic::Response<public_proto::FixedQueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a fixture operation"))
     }
-    async fn page(&self, _: tonic::Request<public_proto::FixedPageRequest>) -> std::result::Result<tonic::Response<public_proto::FixedPageResponse>, tonic::Status> {
+    async fn page(
+        &self,
+        _: tonic::Request<public_proto::FixedPageRequest>,
+    ) -> std::result::Result<tonic::Response<public_proto::FixedPageResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a fixture operation"))
     }
-    async fn close(&self, _: tonic::Request<public_proto::FixedCloseRequest>) -> std::result::Result<tonic::Response<public_proto::FixedCloseResponse>, tonic::Status> {
+    async fn close(
+        &self,
+        _: tonic::Request<public_proto::FixedCloseRequest>,
+    ) -> std::result::Result<tonic::Response<public_proto::FixedCloseResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a fixture operation"))
     }
 }
 async fn fake_fixed_peer(case: usize, rows: bool) -> (SocketAddr, RpcDriver) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let service = public_proto::fixed_session_service_server::FixedSessionServiceServer::new(FakeFixedPeer { case, rows })
+    let service =
+        public_proto::fixed_session_service_server::FixedSessionServiceServer::new(FakeFixedPeer {
+            case,
+            rows,
+        })
         .max_encoding_message_size(MAX_RESPONSE_BYTES * 2);
     let task = tokio::spawn(async move {
-        tonic::transport::Server::builder().add_service(service)
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)).await.unwrap();
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     (address, RpcDriver(task))
 }
@@ -1367,9 +1506,12 @@ async fn reset_open_rpc_releases_undelivered_session_over_real_http2() {
             ..Default::default()
         };
         let (response, mut body, driver) = raw_rpc(
-            g.local_addr(), "velagraph.public.managed.v1.FixedSessionService/Open",
-            grpc_frame(&request), true,
-        ).await;
+            g.local_addr(),
+            "velagraph.public.managed.v1.FixedSessionService/Open",
+            grpc_frame(&request),
+            true,
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while g.retained_payload_charge() != SESSION_CHARGE {
                 tokio::task::yield_now().await;
@@ -1944,7 +2086,9 @@ async fn shared_invocation_drop_cleans_new_session_and_holds_admission() {
         let reply = invocation.response.result.as_ref().unwrap();
         let bytes = prost::Message::encode_to_vec(&grpc_codec::encode_fixed_open(reply).unwrap());
         (bytes, invocation)
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(!bytes.is_empty());
     assert_eq!(g.state.connections.available_permits(), MAX_CONNECTIONS - 1);
     drop(invocation); // cancelled or undelivered response: never call delivered

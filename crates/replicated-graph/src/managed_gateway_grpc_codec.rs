@@ -8,7 +8,11 @@ pub(crate) mod bounded;
 
 pub(super) fn context(c: &Option<pb::Context>) -> Result<Duration> {
     let c = c.as_ref().ok_or(Error::Protocol)?;
-    if !matches!(c.version, 1 | 2) || (c.version == 2) != c.identity.is_some() || c.timeout_millis == 0 || c.timeout_millis > 60_000 {
+    if !matches!(c.version, 1 | 2)
+        || (c.version == 2) != c.identity.is_some()
+        || c.timeout_millis == 0
+        || c.timeout_millis > 60_000
+    {
         return Err(Error::Protocol);
     }
     Ok(Duration::from_millis(c.timeout_millis))
@@ -188,7 +192,13 @@ pub(super) fn open(r: pb::OpenRequest) -> Result<Operation> {
             pb::read_selector::Kind::Exact(v) => Some(v),
             pb::read_selector::Kind::Minimum(_) => return Err(Error::Protocol),
         };
-        return Ok(Operation::OpenLocalQueryWithProfile { profile, version, ttl_millis: r.ttl_millis, query, page_size });
+        return Ok(Operation::OpenLocalQueryWithProfile {
+            profile,
+            version,
+            ttl_millis: r.ttl_millis,
+            query,
+            page_size,
+        });
     }
     Ok(match required(required(r.read)?.kind)? {
         pb::read_selector::Kind::Latest(_) => Operation::OpenLocalQuery {
@@ -369,8 +379,25 @@ pub(super) fn encode_write(r: &Reply) -> Result<pb::WriteResponse> {
 }
 pub(super) fn encode_open(r: &Reply) -> Result<pb::OpenResponse> {
     let (profile, session, query, page_size, page) = match r {
-        Reply::OpenLocalQuery { session, query, page_size, page } => (None, session, query, page_size, page),
-        Reply::OpenLocalQueryWithProfile { profile, session, query, page_size, page } => (Some(encode_profile(*profile)), session, query, page_size, page),
+        Reply::OpenLocalQuery {
+            session,
+            query,
+            page_size,
+            page,
+        } => (None, session, query, page_size, page),
+        Reply::OpenLocalQueryWithProfile {
+            profile,
+            session,
+            query,
+            page_size,
+            page,
+        } => (
+            Some(encode_profile(*profile)),
+            session,
+            query,
+            page_size,
+            page,
+        ),
         _ => return Err(Error::Protocol),
     };
     response_size(pb::OpenResponse {
@@ -1184,7 +1211,7 @@ mod job_tests {
     fn start() -> pb::JobStartRequest {
         pb::JobStartRequest {
             context: Some(pb::Context {
-            identity: None,
+                identity: None,
                 version: 1,
                 timeout_millis: 100,
             }),
@@ -1446,26 +1473,59 @@ pub(super) fn encode_binding(binding: &Binding) -> pb::Binding {
         authority_mode: binding.authority.mode.to_vec(),
         coordinator_shard: binding.cohort.coordinator_shard,
         coordinator_epoch: binding.cohort.coordinator_epoch,
-        members: binding.cohort.members.iter().map(|m| pb::BindingMember { shard: m.shard, epoch: m.epoch, mode: m.mode.to_vec() }).collect(),
-        capacity_profile: (match binding.cohort.profile { CapacityProfile::LegacyCountV1 => pb::CapacityProfile::LegacyCountV1, CapacityProfile::ByteBound16MiBV1 => pb::CapacityProfile::ByteBound16MibV1 }) as i32,
+        members: binding
+            .cohort
+            .members
+            .iter()
+            .map(|m| pb::BindingMember {
+                shard: m.shard,
+                epoch: m.epoch,
+                mode: m.mode.to_vec(),
+            })
+            .collect(),
+        capacity_profile: (match binding.cohort.profile {
+            CapacityProfile::LegacyCountV1 => pb::CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1 => pb::CapacityProfile::ByteBound16MibV1,
+        }) as i32,
         mapping: pb::Mapping::PartitionEqualsShardV1 as i32,
     }
 }
 pub(super) fn decode_binding(binding: pb::Binding) -> Result<Binding> {
     use d2_raft::transaction_decisions::{CapacityProfile, Member};
-    if binding.mapping != pb::Mapping::PartitionEqualsShardV1 as i32 { return Err(Error::Identity); }
+    if binding.mapping != pb::Mapping::PartitionEqualsShardV1 as i32 {
+        return Err(Error::Identity);
+    }
     let cohort = Cohort {
         coordinator_shard: binding.coordinator_shard,
         coordinator_epoch: binding.coordinator_epoch,
-        members: binding.members.into_iter().map(|m| Ok(Member { shard: m.shard, epoch: m.epoch, mode: token(m.mode)? })).collect::<Result<_>>()?,
-        profile: match pb::CapacityProfile::try_from(binding.capacity_profile).map_err(|_| Error::Protocol)? {
+        members: binding
+            .members
+            .into_iter()
+            .map(|m| {
+                Ok(Member {
+                    shard: m.shard,
+                    epoch: m.epoch,
+                    mode: token(m.mode)?,
+                })
+            })
+            .collect::<Result<_>>()?,
+        profile: match pb::CapacityProfile::try_from(binding.capacity_profile)
+            .map_err(|_| Error::Protocol)?
+        {
             pb::CapacityProfile::LegacyCountV1 => CapacityProfile::LegacyCountV1,
             pb::CapacityProfile::ByteBound16MibV1 => CapacityProfile::ByteBound16MiBV1,
             _ => return Err(Error::Protocol),
         },
     };
     cohort.validate().map_err(|_| Error::Protocol)?;
-    Ok(Binding { authority: Authority { shard: binding.authority_shard, mode: token(binding.authority_mode)? }, cohort, mapping: Mapping::PartitionEqualsShardV1 })
+    Ok(Binding {
+        authority: Authority {
+            shard: binding.authority_shard,
+            mode: token(binding.authority_mode)?,
+        },
+        cohort,
+        mapping: Mapping::PartitionEqualsShardV1,
+    })
 }
 pub(super) fn decode_profile(value: i32) -> Result<LocalReadProfile> {
     match pb::LocalReadProfile::try_from(value).map_err(|_| Error::Protocol)? {
@@ -1475,7 +1535,10 @@ pub(super) fn decode_profile(value: i32) -> Result<LocalReadProfile> {
     }
 }
 pub(super) fn encode_profile(value: LocalReadProfile) -> i32 {
-    (match value { LocalReadProfile::Parity2MiBV1 => pb::LocalReadProfile::Parity2MibV1, LocalReadProfile::LocalRead8MiBV1 => pb::LocalReadProfile::LocalRead8MibV1 }) as i32
+    (match value {
+        LocalReadProfile::Parity2MiBV1 => pb::LocalReadProfile::Parity2MibV1,
+        LocalReadProfile::LocalRead8MiBV1 => pb::LocalReadProfile::LocalRead8MibV1,
+    }) as i32
 }
 pub(super) trait Identified: Message + bounded::BoundedMessage {
     fn identity_mut(&mut self) -> &mut Option<pb::CallIdentity>;
@@ -1485,19 +1548,39 @@ macro_rules! identities {
         fn identity_mut(&mut self) -> &mut Option<pb::CallIdentity> { &mut self.identity }
     })*};
 }
-identities!(WriteResponse,OpenResponse,FetchResponse,CloseResponse,FixedOpenResponse,FixedQueryResponse,FixedPageResponse,FixedCloseResponse,JobStartResponse,JobStatusResponse,JobRenewResponse,JobFetchResponse);
+identities!(
+    WriteResponse,
+    OpenResponse,
+    FetchResponse,
+    CloseResponse,
+    FixedOpenResponse,
+    FixedQueryResponse,
+    FixedPageResponse,
+    FixedCloseResponse,
+    JobStartResponse,
+    JobStatusResponse,
+    JobRenewResponse,
+    JobFetchResponse
+);
 pub(super) fn identified_error(error: Error, identity: Option<pb::CallIdentity>) -> tonic::Status {
     let status = self::error(error);
     let mut detail = pb::ErrorDetail::decode(status.details()).expect("own error encoding");
     detail.identity = identity;
-    tonic::Status::with_details(status.code(), status.message(), detail.encode_to_vec().into())
+    tonic::Status::with_details(
+        status.code(),
+        status.message(),
+        detail.encode_to_vec().into(),
+    )
 }
 
 /// Every admitted page must fit a later v2 response on the same fixed binding.
 /// All valid nonces are exactly 16 bytes, so this has the exact identity size,
 /// independent of which request eventually fetches the retained page.
 pub(super) fn preflight_identity<M: Identified>(mut message: M, binding: &Binding) -> Result<()> {
-    *message.identity_mut() = Some(pb::CallIdentity { request_id: vec![255; 16], binding: Some(encode_binding(binding)) });
+    *message.identity_mut() = Some(pb::CallIdentity {
+        request_id: vec![255; 16],
+        binding: Some(encode_binding(binding)),
+    });
     response_size(message)?;
     Ok(())
 }

@@ -1987,7 +1987,7 @@ async fn public_grpc_zero_window_deadlines_release_shared_work_and_new_open() {
         let payload = pb::OpenRequest {
             profile: None,
             context: Some(pb::Context {
-            identity: None,
+                identity: None,
                 version: 1,
                 timeout_millis: rpc_ms,
             }),
@@ -2074,7 +2074,9 @@ async fn explicit_profile_large_pages_preserve_v2_identity_and_reject_oversized_
     for id in [1, 2] {
         let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
         let mut vertex = Vertex::new(id);
-        vertex.properties.insert("payload".into(), Value::Text(payload.clone()));
+        vertex
+            .properties
+            .insert("payload".into(), Value::Text(payload.clone()));
         let plan = snapshot.prepare_vertex(7, &vertex).unwrap();
         graph.execute(&plan).await.unwrap();
     }
@@ -2082,11 +2084,23 @@ async fn explicit_profile_large_pages_preserve_v2_identity_and_reject_oversized_
         profile: LocalReadProfile::LocalRead8MiBV1,
         version: None,
         ttl_millis: 60_000,
-        query: Query { partition: 7, text: text.into() },
+        query: Query {
+            partition: 7,
+            text: text.into(),
+        },
         page_size: 3,
     };
-    let first = call(&g, operation("g.V(1,2,1,2,1,2).values('payload')")).await.unwrap();
-    let Reply::OpenLocalQueryWithProfile { profile, session, query, page_size, page } = first.clone() else {
+    let first = call(&g, operation("g.V(1,2,1,2,1,2).values('payload')"))
+        .await
+        .unwrap();
+    let Reply::OpenLocalQueryWithProfile {
+        profile,
+        session,
+        query,
+        page_size,
+        page,
+    } = first.clone()
+    else {
         panic!("explicit profile reply was erased");
     };
     assert_eq!(profile, LocalReadProfile::LocalRead8MiBV1);
@@ -2102,15 +2116,37 @@ async fn explicit_profile_large_pages_preserve_v2_identity_and_reject_oversized_
     assert!(encoded.encoded_len() > 384 * 1024);
     assert!(encoded.encoded_len() <= MAX_RESPONSE_BYTES);
     assert_eq!(encoded.profile, Some(grpc_codec::encode_profile(profile)));
-    let expected = |ids: &[u64]| ids.iter().map(|id| QueryRow::Value {
-        source: Some(crate::remote::query::QualifiedElement::Vertex { partition: 7, id: *id }),
-        value: Value::Text(payload.clone()),
-    }).collect::<Vec<_>>();
+    let expected = |ids: &[u64]| {
+        ids.iter()
+            .map(|id| QueryRow::Value {
+                source: Some(crate::remote::query::QualifiedElement::Vertex {
+                    partition: 7,
+                    id: *id,
+                }),
+                value: Value::Text(payload.clone()),
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(page.data.rows, expected(&[1, 2, 1]));
-    let second = call(&g, Operation::FetchLocalQuery {
-        session: session.clone(), query: query.clone(), cursor: page.next.clone(), page_size: 3,
-    }).await.unwrap();
-    let Reply::FetchLocalQuery { session: returned, page: next, .. } = &second else { panic!("fetch reply"); };
+    let second = call(
+        &g,
+        Operation::FetchLocalQuery {
+            session: session.clone(),
+            query: query.clone(),
+            cursor: page.next.clone(),
+            page_size: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let Reply::FetchLocalQuery {
+        session: returned,
+        page: next,
+        ..
+    } = &second
+    else {
+        panic!("fetch reply");
+    };
     assert_eq!(returned, &session);
     assert_eq!(next.offset, 3);
     assert_eq!(next.total, 6);
@@ -2120,7 +2156,9 @@ async fn explicit_profile_large_pages_preserve_v2_identity_and_reject_oversized_
     encoded.identity = identity;
     assert!(encoded.encoded_len() > 384 * 1024);
     assert!(encoded.encoded_len() <= MAX_RESPONSE_BYTES);
-    call(&g, Operation::CloseLocalQuery { session }).await.unwrap();
+    call(&g, Operation::CloseLocalQuery { session })
+        .await
+        .unwrap();
     assert!(g.state.local_sessions.lock().unwrap().is_empty());
     assert_eq!(g.retained_payload_charge(), 0);
     // Each individual page still fits. The complete bag exceeds the result
@@ -2132,8 +2170,12 @@ async fn explicit_profile_large_pages_preserve_v2_identity_and_reject_oversized_
     assert!(g.state.local_sessions.lock().unwrap().is_empty());
     assert_eq!(g.retained_payload_charge(), 0);
     g.shutdown().await;
-    for graph in graphs { graph.shutdown().await; }
-    for server in servers { server.shutdown().await; }
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
     drop(config);
     f.stop().await;
 }

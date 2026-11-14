@@ -1122,9 +1122,13 @@ mod tests {
         });
         let (_stop, stopped) = watch::channel(false);
         let service = grpc::bind(
-            state.clone(), stopped, "127.0.0.1:0".parse().unwrap(),
+            state.clone(),
+            stopped,
+            "127.0.0.1:0".parse().unwrap(),
             Duration::from_secs(15),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let endpoint = service.local_addr();
         let start = Instant::now();
         assert!(request(

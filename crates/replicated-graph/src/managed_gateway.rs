@@ -14,9 +14,7 @@ use d2_raft::{
     versioned_reads::{ReadLimit, Target},
     NodeHandle,
 };
-use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use velagraph::{
     experimental_graph::{CrossEdge, EdgePropertyPatch, EdgeRef, VertexPropertyPatch, VertexRef},
     Value, Vertex,

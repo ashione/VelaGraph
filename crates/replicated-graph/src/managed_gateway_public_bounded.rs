@@ -58,7 +58,9 @@ fn decode_checked<U: Message + Default + BoundedMessage, B: Buf>(buf: &mut B) ->
     DECODES.with(|n| n.set(n.get() + 1));
     U::decode(buf).map_err(|_| bad())
 }
-pub(super) fn validate_bytes<U: BoundedMessage>(bytes: &[u8]) -> Result<(), Status> {
+pub(in crate::managed_gateway) fn validate_bytes<U: BoundedMessage>(
+    bytes: &[u8],
+) -> Result<(), Status> {
     let request = U::request();
     if bytes.len() > if request { 64 * 1024 } else { 1024 * 1024 } {
         return Err(limit());
@@ -180,10 +182,21 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         (S::Binding, 6) => (K::Var(2), false, false),
         (S::Binding, 7) => (K::Var(1), false, false),
         (S::OpenRequest, 6) | (S::OpenResponse, 5) => (K::Var(2), false, false),
-        (S::WriteResponse | S::OpenResponse | S::FetchResponse | S::CloseResponse
-         | S::FixedOpenResponse | S::FixedQueryResponse | S::FixedPageResponse
-         | S::FixedCloseResponse | S::JobStartResponse | S::JobStatusResponse
-         | S::JobRenewResponse | S::JobFetchResponse, 31) => (K::Message(S::CallIdentity), false, false),
+        (
+            S::WriteResponse
+            | S::OpenResponse
+            | S::FetchResponse
+            | S::CloseResponse
+            | S::FixedOpenResponse
+            | S::FixedQueryResponse
+            | S::FixedPageResponse
+            | S::FixedCloseResponse
+            | S::JobStartResponse
+            | S::JobStatusResponse
+            | S::JobRenewResponse
+            | S::JobFetchResponse,
+            31,
+        ) => (K::Message(S::CallIdentity), false, false),
         (S::JobHandle, 1 | 2)
         | (S::JobCursor, 1)
         | (S::JobStartRequest, 2)
@@ -425,7 +438,9 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                     .filter(|n| *n <= bytes.len())
                     .ok_or_else(bad)?;
                 let exact_width = match (schema, tag) {
-                    (Schema::CallIdentity, 1) | (Schema::Binding, 2) | (Schema::BindingMember, 3)
+                    (Schema::CallIdentity, 1)
+                    | (Schema::Binding, 2)
+                    | (Schema::BindingMember, 3)
                     | (Schema::JobHandle, 1)
                     | (Schema::JobStartRequest, 2)
                     | (Schema::JobStartResponse, 1) => Some(16),
@@ -443,7 +458,8 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
         }
     }
     let required = match schema {
-        Schema::CallIdentity | Schema::JobHandle
+        Schema::CallIdentity
+        | Schema::JobHandle
         | Schema::JobStartResponse
         | Schema::JobGetRequest
         | Schema::JobCancelRequest
@@ -538,7 +554,7 @@ mod tests {
     fn job_start() -> pb::JobStartRequest {
         pb::JobStartRequest {
             context: Some(pb::Context {
-            identity: None,
+                identity: None,
                 version: 1,
                 timeout_millis: 50,
             }),
@@ -615,7 +631,7 @@ mod tests {
                 page_size: 1,
             });
             checked(pb::JobFetchResponse {
-            identity: None,
+                identity: None,
                 job: Some(job_handle()),
                 query: job_start().query,
                 cursor,
@@ -633,7 +649,7 @@ mod tests {
         for phase in 1..=7 {
             let ready = phase == 4;
             checked(pb::JobStatusResponse {
-            identity: None,
+                identity: None,
                 job: Some(job_handle()),
                 status: Some(pb::JobStatus {
                     phase,
@@ -645,7 +661,7 @@ mod tests {
         }
         for failure in 1..=16 {
             checked(pb::JobStatusResponse {
-            identity: None,
+                identity: None,
                 job: Some(job_handle()),
                 status: Some(pb::JobStatus {
                     phase: 7,
@@ -796,7 +812,7 @@ mod tests {
             },
         ] {
             rejected(pb::JobStatusResponse {
-            identity: None,
+                identity: None,
                 job: Some(job_handle()),
                 status: Some(status),
             });
@@ -812,7 +828,7 @@ mod tests {
         for version in [None, Some(0), Some(u64::MAX)] {
             let r = pb::FixedOpenRequest {
                 context: Some(pb::Context {
-            identity: None,
+                    identity: None,
                     version: 1,
                     timeout_millis: 50,
                 }),
@@ -843,7 +859,7 @@ mod tests {
         let r = pb::OpenRequest {
             profile: None,
             context: Some(pb::Context {
-            identity: None,
+                identity: None,
                 version: 1,
                 timeout_millis: 50,
             }),
@@ -894,7 +910,15 @@ mod tests {
     #[test]
     fn identified_context_prescan_rejects_duplicate_nonce_and_member_overflow() {
         fn check(schema: Schema, bytes: &[u8]) -> Result<(), Status> {
-            scan(schema, bytes, 0, &mut Budget { fields: 32768, messages: 16384 })
+            scan(
+                schema,
+                bytes,
+                0,
+                &mut Budget {
+                    fields: 32768,
+                    messages: 16384,
+                },
+            )
         }
         let mut identity = vec![0x0a, 16];
         identity.extend([1; 16]);
@@ -909,7 +933,10 @@ mod tests {
         let mut binding = member.repeat(d2_raft::transaction_decisions::MAX_PARTICIPANTS);
         assert!(check(Schema::Binding, &binding).is_ok());
         binding.extend(member);
-        assert_eq!(check(Schema::Binding, &binding).unwrap_err().code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            check(Schema::Binding, &binding).unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
         let mut response = vec![0x0a, 0, 0xfa, 1, identity.len() as u8];
         response.extend(&identity);
         assert!(check(Schema::FixedOpenResponse, &response).is_ok());
@@ -917,5 +944,4 @@ mod tests {
         response.extend(identity);
         assert!(check(Schema::FixedOpenResponse, &response).is_err());
     }
-
 }
