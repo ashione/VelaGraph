@@ -86,3 +86,75 @@ opened latest view must have a later V and three rows.
 This demonstrates the intended bounded same-host interoperability contract.
 It does not establish arbitrary-language SDK coverage, public/internal feature
 parity, rolling upgrades, multi-host performance, HA or production readiness.
+
+## Proposal and design decision (milestone 1)
+
+Tracking: [issue #281](https://github.com/ashione/VelaGraph/issues/281),
+[PR #283](https://github.com/ashione/VelaGraph/pull/283), and milestone 1
+(the v0.0.1 release gate). Completion means interoperable public behavior with
+evidence for the final candidate, not merely a generated client or merged schema.
+
+### Problem and alternatives
+
+The preview's bare detail trailer gave Rust a domain error but violated the
+standard rich-status envelope consumed by other languages. A successful protobuf
+build alone could not reveal this wire-level incompatibility.
+
+| Option | Benefit | Cost / decision |
+| --- | --- | --- |
+| Standard Status with one typed Any | Ordinary gRPC code/details APIs; typed correlation; explicit bounded validation | Coordinated upgrade of the previous Rust trailer decoder. **Selected.** |
+| Keep bare protobuf and ship a custom Go decoder | Least server change | Makes a language-specific exception permanent and does not satisfy ordinary gRPC interoperability. Rejected. |
+| Encode the reason and identity only in status message | Simple display and no detail DTO | Loses typed fields, invites string parsing, cannot preserve full identity semantics. Rejected. |
+
+A minimal private prost representation of the standard outer messages avoids a
+new runtime dependency without changing their wire layout. It does not define a
+new proprietary wrapper. The public generated ErrorDetail remains the payload.
+
+### Interface semantics and bounded failure
+
+The contract above is normative: exact Any type URL, one detail, matching
+transport/envelope code, matching message/reason, and request-correlated v2
+identity. Parsing occurs under the existing total size and recursive budgets,
+including the outer envelope, rather than allocating an unbounded wrapper
+first. Malformed or contradictory errors fail closed; absence of a domain
+detail does not prove that a write failed to commit. There is no automatic
+write replay to compensate for decoding or connection failures.
+
+Migration changes public error trailers only. Storage records, canonical
+durable commands, internal RPCs, request versions, and query execution remain
+unchanged. There is deliberately no old/new trailer fallback. Deploy the
+matching public server/client pair; rollback also requires a matching pair,
+not one side alone. This proposal does not claim mixed-version rolling upgrade
+support.
+
+### Acceptance history and remaining release gate
+
+The review of the initial candidate identified the bare-trailer incompatibility,
+so the implementation changed to standard Status/Any rather than weakening the
+Go standard-details assertions. A subsequent real Go run on candidate
+`2cea8d` reached the first paginated QueryService Open and failed with
+`QUERY_UNSUPPORTED`. This was a fixture/planner mismatch: that bounded query
+service does not accept terminal valueMap. It was not evidence of integer
+precision loss.
+
+The revised test uses two existing supported paths, without expanding the
+production planner solely to pass this test:
+
+- QueryService Open/Fetch/Close checks qualified vertex IDs, pagination,
+  old-view two-row stability after a third write, and a later latest view.
+- FixedSessionService opens the same old V and Traverse returns property maps
+  for exact scalar, null-versus-absence, and integer-boundary checks. Its session
+  is independent and is also closed.
+- Write Submit/Status and confirmed same-ID/same-mutation replay retain their
+  original assertions; public/internal method isolation and standard error
+  code/details remain mandatory.
+- Rust negative-envelope tests cover malformed, oversized, duplicate,
+  contradictory, wrongly typed, and structurally invalid identity cases.
+
+These are acceptance requirements and recorded debugging outcomes, not a claim
+that the latest combined head has passed. Final acceptance still requires
+exact-head generated-code freshness, dependency locking, gofmt, Rust tests,
+real-process Go interoperability, independent review, and applicable CI against
+the actual merge tree. Record the final run and head in #281/#283 before marking
+the milestone gate complete. Same-host proof does not establish HA,
+multi-host performance, authentication, or general rolling-upgrade safety.

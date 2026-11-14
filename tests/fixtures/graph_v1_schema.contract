@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+
+
+message Record {
+  uint32 version = 1;
+  Kind kind = 2;
+  bytes payload = 3;
+}
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_VERTEX = 1;
+  KIND_EDGE = 2;
+}
+
+message Vertex {
+  uint64 id = 1;
+  repeated string labels = 2;
+  repeated Property properties = 3;
+}
+
+message Edge {
+  uint64 id = 1;
+  uint64 from = 2;
+  uint64 to = 3;
+  string label = 4;
+  repeated Property properties = 5;
+}
+
+message Property {
+  string name = 1;
+  Value value = 2;
+}
+
+message Value {
+  oneof kind {
+    bool null = 1;
+    sint64 integer = 2;
+    double real = 3;
+    string text = 4;
+    bool boolean = 5;
+  }
+}
