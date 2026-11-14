@@ -1,0 +1,94 @@
+name: Quorum investigation 247
+on:
+  push:
+    branches: [investigate-247-fixed-main]
+    paths: [.github/workflows/investigate-247.yml]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
+  INVESTIGATION_SHA: 40e2b9a419ff941a58761f784c9c7fd500a6bf08
+jobs:
+  repeat:
+    name: Repeat ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [grpc_snapshot_process, grpc_shard_operations_process]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.INVESTIGATION_SHA }}
+          persist-credentials: false
+      - name: Record immutable source and runner provenance
+        run: |
+          mkdir -p investigation-evidence
+          test "$(git rev-parse HEAD)" = "$INVESTIGATION_SHA"
+          {
+            git rev-parse HEAD HEAD^{tree}
+            printf 'workflow_sha=%s\nrun=%s\nattempt=%s\ntarget=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "${{ matrix.target }}"
+            uname -a
+            nproc
+            for path in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /proc/meminfo; do
+              echo "$path"; cat "$path" || true
+            done
+          } > investigation-evidence/provenance.txt
+      - name: Install ordinary CI build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          test -n "$libclang_path" && test "$libclang_path" != "."
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-no-debug-rust
+          cache-on-failure: false
+      - name: Compile without running the selected original suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv >> investigation-evidence/provenance.txt
+          cargo -V >> investigation-evidence/provenance.txt
+          cargo test --locked -p replicated-graph --test "${{ matrix.target }}" --no-run 2>&1 | tee investigation-evidence/build.log
+      - name: Ten independent suites; preserve every exit, never retry a mutation
+        env:
+          VELAGRAPH_REMOTE_DIAGNOSTICS: "1"
+        run: |
+          failed=0
+          printf 'sample\texit_code\n' > investigation-evidence/results.tsv
+          for sample in $(seq 1 10); do
+            dir="$GITHUB_WORKSPACE/investigation-evidence/sample-$sample"
+            mkdir -p "$dir"
+            export VELAGRAPH_REMOTE_EVIDENCE_DIR="$dir"
+            date -u +%FT%TZ > "$dir/start.txt"
+            { cat /proc/loadavg; cat /proc/pressure/cpu; cat /proc/pressure/io; cat /proc/pressure/memory; } > "$dir/pressure-before.txt" 2>/dev/null || true
+            set +e
+            timeout --signal=TERM --kill-after=10s 600s cargo test --locked -p replicated-graph --test "${{ matrix.target }}" -- --nocapture 2>&1 | tee "$dir/test.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            printf '%s\n' "$code" > "$dir/exit-code.txt"
+            printf '%s\t%s\n' "$sample" "$code" >> investigation-evidence/results.tsv
+            date -u +%FT%TZ > "$dir/end.txt"
+            { cat /proc/loadavg; cat /proc/pressure/cpu; cat /proc/pressure/io; cat /proc/pressure/memory; } > "$dir/pressure-after.txt" 2>/dev/null || true
+            if [ "$code" -ne 0 ]; then failed=1; fi
+          done
+          # Later success never overwrites a first failure. These are new clusters,
+          # not retries of an operation or continuation of a failed scenario.
+          exit "$failed"
+      - name: Retain first-failure and all other samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigation-247-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: investigation-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
