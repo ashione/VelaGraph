@@ -3217,15 +3217,23 @@ mod tests {
         mutate: impl Fn(&mut grpc::wire::RequestLookup) + Send + Sync + 'static,
     ) -> (Client, JoinHandle<()>) {
         typed_peer(identity(), Duration::from_secs(2), 1, move |request| {
-            assert!(matches!(request.operation, Operation::LookupRequest { id: [1, ..], .. }));
+            assert!(matches!(
+                request.operation,
+                Operation::LookupRequest { id: [1, ..], .. }
+            ));
             // Encode a valid reply first, then corrupt protobuf evidence. The
             // server must send Value, not manufacture an Error on the client's behalf.
             let mut reply = wire_reply(request, Ok(Value::Request(request_lookup()))).unwrap();
-            let Some(grpc::wire::reply::Result::Value(value)) = &mut reply.result else { panic!("value reply") };
-            let Some(grpc::wire::value::Kind::Request(lookup)) = &mut value.kind else { panic!("request lookup") };
+            let Some(grpc::wire::reply::Result::Value(value)) = &mut reply.result else {
+                panic!("value reply")
+            };
+            let Some(grpc::wire::value::Kind::Request(lookup)) = &mut value.kind else {
+                panic!("request lookup")
+            };
             mutate(lookup);
             Box::pin(async move { Ok(reply) })
-        }).await
+        })
+        .await
     }
     #[tokio::test]
     async fn point_request_rejects_invalid_outbound_identity_without_connecting() {
@@ -3295,14 +3303,62 @@ mod tests {
                     2 => value.cohort.as_mut().unwrap().coordinator_epoch = 2,
                     3 => value.cohort.as_mut().unwrap().members[0].epoch = 2,
                     4 => value.record.as_mut().unwrap().record.as_mut().unwrap().id = vec![2; 16],
-                    5 => value.record.as_mut().unwrap().record.as_mut().unwrap().transaction_id = vec![3; 16],
-                    6 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().id = vec![3; 16],
-                    7 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().participants[0].intent = vec![5; 32],
-                    8 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().prepared.clear(),
-                    9 => value.record.as_mut().unwrap().record.as_mut().unwrap().payload = vec![0],
+                    5 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .transaction_id = vec![3; 16]
+                    }
+                    6 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .transaction
+                            .as_mut()
+                            .unwrap()
+                            .id = vec![3; 16]
+                    }
+                    7 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .transaction
+                            .as_mut()
+                            .unwrap()
+                            .participants[0]
+                            .intent = vec![5; 32]
+                    }
+                    8 => value
+                        .record
+                        .as_mut()
+                        .unwrap()
+                        .transaction
+                        .as_mut()
+                        .unwrap()
+                        .prepared
+                        .clear(),
+                    9 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .payload = vec![0]
+                    }
                     10..=12 | 23..=24 => {
                         // The canonical plan remains an opaque durable byte payload.
-                        let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!("../tests/fixtures/request-plan-v1.json")).unwrap();
+                        let mut plan: serde_json::Value = serde_json::from_slice(include_bytes!(
+                            "../tests/fixtures/request-plan-v1.json"
+                        ))
+                        .unwrap();
                         match fault {
                             10 => plan["version"] = 2.into(),
                             11 => plan["id"] = serde_json::json!(vec![3; 16]),
@@ -3311,22 +3367,65 @@ mod tests {
                             _ => {
                                 plan["validation_version"] = 128.into();
                                 value.resolved_prefix = 128;
-                                let tx = value.record.as_mut().unwrap().transaction.as_mut().unwrap();
+                                let tx =
+                                    value.record.as_mut().unwrap().transaction.as_mut().unwrap();
                                 tx.ordinal = 1;
                                 tx.decision = Some(grpc::wire::TerminalDecision::Abort as i32);
                             }
                         }
-                        value.record.as_mut().unwrap().record.as_mut().unwrap().payload = serde_json::to_vec(&plan).unwrap();
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .payload = serde_json::to_vec(&plan).unwrap();
                     }
-                    17 => value.record.as_mut().unwrap().record.as_mut().unwrap().request = vec![1; crate::transaction_decisions::MAX_REQUEST_BYTES + 1],
-                    18 => value.record.as_mut().unwrap().record.as_mut().unwrap().payload = vec![1; crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES + 1],
-                    19 => value.record.as_mut().unwrap().transaction.as_mut().unwrap().ordinal = 0,
-                    20 => value.resolved_prefix = crate::transaction_decisions::MAX_TRANSACTIONS as u64 + 1,
-                    21 => { value.record = None; value.cohort.as_mut().unwrap().members[0].epoch = 2; }
+                    17 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .request = vec![1; crate::transaction_decisions::MAX_REQUEST_BYTES + 1]
+                    }
+                    18 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .payload =
+                            vec![1; crate::transaction_decisions::MAX_REQUEST_PAYLOAD_BYTES + 1]
+                    }
+                    19 => {
+                        value
+                            .record
+                            .as_mut()
+                            .unwrap()
+                            .transaction
+                            .as_mut()
+                            .unwrap()
+                            .ordinal = 0
+                    }
+                    20 => {
+                        value.resolved_prefix =
+                            crate::transaction_decisions::MAX_TRANSACTIONS as u64 + 1
+                    }
+                    21 => {
+                        value.record = None;
+                        value.cohort.as_mut().unwrap().members[0].epoch = 2;
+                    }
                     22 => value.authority.as_mut().unwrap().mode = vec![8; 16],
                     _ => unreachable!(),
                 }
-            }).await;
+            })
+            .await;
             let result = NodeRef::Remote(&client)
                 .request(&identity().authority, 1, [1; 16])
                 .await;
@@ -3334,7 +3433,10 @@ mod tests {
                 // Typed decoding classifies over-budget evidence as Capacity.
                 assert_eq!(result, Err(Error::Capacity), "fault {fault}");
             } else {
-                assert!(matches!(result, Err(Error::Identity | Error::Protocol)), "fault {fault}: {result:?}");
+                assert!(
+                    matches!(result, Err(Error::Identity | Error::Protocol)),
+                    "fault {fault}: {result:?}"
+                );
             }
             peer.await.unwrap();
         }
@@ -3342,10 +3444,17 @@ mod tests {
     #[test]
     fn point_request_local_domain_json_rejects_unknown_fields() {
         // Durable JSON schema validation, not a protobuf wire/client assertion.
-        for path in [vec![], vec!["record"], vec!["record", "record"], vec!["record", "transaction"]] {
+        for path in [
+            vec![],
+            vec!["record"],
+            vec!["record", "record"],
+            vec!["record", "transaction"],
+        ] {
             let mut value = serde_json::to_value(request_lookup()).unwrap();
             let mut nested = &mut value;
-            for key in path { nested = &mut nested[key]; }
+            for key in path {
+                nested = &mut nested[key];
+            }
             nested["extra"] = true.into();
             assert!(serde_json::from_value::<RequestLookup>(value).is_err());
         }
@@ -3994,7 +4103,9 @@ mod tests {
                     }
                 }
             }
-        }).await.expect("legacy JSON peer must close");
+        })
+        .await
+        .expect("legacy JSON peer must close");
         let client = Client::new(server.local_addr(), identity(), Duration::from_secs(2)).unwrap();
         assert_eq!(
             NodeRef::Remote(&client)
