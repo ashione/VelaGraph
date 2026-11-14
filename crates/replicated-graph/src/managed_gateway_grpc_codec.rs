@@ -1228,7 +1228,8 @@ mod job_tests {
         for id in [vec![], vec![3; 15], vec![3; 17], vec![0; 16]] {
             let mut request = start();
             request.operation_id = id;
-            assert_eq!(job_start(request), Err(Error::Identity));
+            // Malformed Start bindings are protocol errors, matching legacy Start.
+            assert_eq!(job_start(request), Err(Error::Protocol));
         }
         for page_size in [0, u32::from(MAX_PAGE_SIZE) + 1, u32::MAX] {
             let mut request = start();
