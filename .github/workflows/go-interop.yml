@@ -1,0 +1,100 @@
+name: Go interoperability
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  generated-client:
+    name: Go client / real Rust service
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.6"
+          cache-dependency-path: examples/go/managed/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev unzip
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          test -n "$libclang_path" && test "$libclang_path" != "."
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-no-debug-rust-go-interop
+          cache-on-failure: false
+      - name: Install pinned official protobuf generators
+        run: |
+          curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip \
+            -o "$RUNNER_TEMP/protoc.zip"
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+      - name: Reproduce public client schema
+        run: |
+          bash scripts/generate-go-managed.sh
+          git diff --exit-code -- examples/go/managed
+          test -z "$(git ls-files --others --exclude-standard examples/go/managed)"
+      - name: Build generated Go client
+        working-directory: examples/go/managed
+        run: |
+          go test -mod=readonly ./...
+          go build -mod=readonly -o "$RUNNER_TEMP/velagraph-go-interop" ./cmd/interop
+      - name: Record exact source and tool versions
+        run: |
+          mkdir -p go-interop-evidence
+          {
+            git rev-parse HEAD
+            git rev-parse 'HEAD^{tree}'
+            go version
+            rustc -Vv
+            protoc --version
+            protoc-gen-go --version
+            protoc-gen-go-grpc --version
+          } | tee go-interop-evidence/provenance.txt
+      - name: Run mandatory independent-process interoperability
+        env:
+          VELAGRAPH_GO_INTEROP_BIN: ${{ runner.temp }}/velagraph-go-interop
+        run: |
+          set -o pipefail
+          test -x "$VELAGRAPH_GO_INTEROP_BIN"
+          cargo test --locked -p replicated-graph --test public_service_go_process \
+            go_client_against_real_managed_service -- --ignored --exact --nocapture \
+            2>&1 | tee go-interop-evidence/process.log
+          grep -q 'test result: ok. 1 passed;' go-interop-evidence/process.log
+      - name: Verify Go source formatting
+        if: ${{ !cancelled() }}
+        run: |
+          gofmt -d examples/go/managed/cmd/interop/main.go | tee go-interop-evidence/gofmt.diff
+          test -z "$(gofmt -l examples/go/managed/cmd/interop/main.go)"
+      - name: Retain interoperability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-interop-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: go-interop-evidence/
+          if-no-files-found: warn
+          retention-days: 7

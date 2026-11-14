@@ -32,8 +32,8 @@ specialized for one dataset.
   execution rules.
 
 Internal graph, managed, coordinator and Raft transports use typed gRPC. See
-[graph library migration](docs/GRAPH_LIBRARY_GRPC.md) for the remaining retirement
-candidate, explicit-identity API changes and validation boundaries. Public HTTP
+[graph library migration](docs/GRAPH_LIBRARY_GRPC.md) for completed legacy-listener retirement,
+explicit-identity API changes and validation boundaries. Public HTTP
 remains supported; old JSON/TCP clients are not a supported fallback.
 
 ## Quick start
@@ -68,6 +68,21 @@ consistency demonstration.
 cross-shard observed queries, or read [CONTRIBUTING](CONTRIBUTING.md) for development
 and tests. The distributed demo uses plaintext loopback, single-voter groups and
 explicit Unverified completeness; it does not establish node-loss tolerance.
+
+### Start a fresh managed service
+
+For a plaintext loopback demo with three independent nodes and a public HTTP/gRPC
+service, use a directory that does not already exist:
+
+```sh
+bash scripts/managed-service-demo.sh /tmp/velagraph-first-demo
+```
+
+The script builds the source and prints the actual HTTP/gRPC addresses. Ctrl-C
+stops the processes; data is retained, but this fresh-only demo refuses to reuse
+or restore that directory. See [write/query examples and limits](docs/MANAGED_SERVICE_DEMO.md)
+and the [design](docs/MANAGED_SERVICE_DEMO_DESIGN.md). Single-voter groups are not
+HA, and these unauthenticated listeners must stay on loopback.
 
 ### Serve an already activated managed cohort
 
@@ -167,7 +182,7 @@ hierarchy shard jobs and [Raft peers](docs/RAFT_GRPC.md) also have typed gRPC pa
 Observed coordinator query/job ingress now has a typed gRPC service: use
 `graph-coordinator serve` and unflagged query/hierarchy client commands. The old
 `serve-grpc` command and `--grpc` flag are rejected. The observed coordinator library now also uses typed RPC, including explicit
-consistency negotiation. Remaining graph library TCP listeners need retirement;
+consistency negotiation. GraphService library listeners now also use typed gRPC;
 [process-node driver/control](docs/CONTROL_GRPC.md) now uses typed gRPC too;
 these internal observed endpoints are not the public managed API.
 
@@ -175,8 +190,10 @@ Single-shard Probe/Metadata/Write also have an explicit
 [typed RPC service and CLI](docs/SHARD_OPERATIONS_GRPC.md). Catalog/routing adapters now use typed snapshots/operations by default;
 graph-node --graph is a single typed listener and --grpc-snapshot is removed.
 The old Linux UDS read gateway is [retired](docs/GRAPH_UDS_GATEWAY.md).
-Explicit graph library legacy fixtures remain
-separate retirement work; this does not complete the all-RPC inventory.
+Retired-protocol fixtures test rejection only; no supported graph library API
+selects a legacy listener. This does not complete cross-language interoperability,
+HTTP feature parity, upgrade compatibility or production-readiness gates in
+[#218](https://github.com/ashione/VelaGraph/issues/218).
 
 
 Local RocksDB/Raft remains the durable authority. The object-store library can

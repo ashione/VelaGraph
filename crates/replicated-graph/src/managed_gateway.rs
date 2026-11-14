@@ -34,6 +34,12 @@ mod grpc_codec;
 #[path = "managed_gateway_public_proto.rs"]
 pub mod public_proto;
 pub use grpc::GrpcService;
+/// Decode and validate the standard rich gRPC error envelope for this public API.
+/// Transport errors without application details are not evidence of an aborted write.
+pub fn decode_grpc_error_detail(status: &tonic::Status) -> Result<public_proto::ErrorDetail> {
+    grpc_codec::decode_error_detail(status)
+}
+
 #[path = "managed_gateway_grpc_client.rs"]
 mod grpc_client;
 #[path = "managed_gateway_jobs.rs"]
