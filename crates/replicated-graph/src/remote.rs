@@ -38,9 +38,8 @@ pub mod query;
 pub mod single_query_grpc;
 pub use paged::{
     close_snapshot, grpc_paged_snapshot, open_snapshot, paged_snapshot_identified, snapshot_page,
-    SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES,
-    MAX_PAGE_ROWS, MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS,
-    SESSION_TTL,
+    SnapshotCursor, SnapshotDescriptor, SnapshotPage, SnapshotStats, MAX_PAGE_BYTES, MAX_PAGE_ROWS,
+    MAX_RETAINED_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_SESSION_ROWS, SESSION_TTL,
 };
 
 static CLIENT_ADMISSION: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
@@ -567,7 +566,6 @@ fn validate_write(request: &D1WriteRequest) -> Result<(), RemoteError> {
 }
 
 /// Fetch a bounded whole-shard snapshot; does not follow leader hints.
-
 /// Validate the configured group and node for a bounded whole-shard copy.
 pub async fn snapshot_identified(
     endpoint: SocketAddr,
@@ -613,7 +611,6 @@ async fn snapshot_with_identity(
 }
 /// Check local applied metadata for a pinned view. This is not a leader read
 /// barrier and provides the same local-epoch check as the in-process adapter.
-
 /// Fetch metadata with the configured group and node.
 pub async fn metadata_identified(
     endpoint: SocketAddr,
@@ -647,7 +644,6 @@ async fn metadata_with_identity(
 }
 /// Submit exact immutable D1 bytes/identity once. Preserve a copy before calling:
 /// timeout, disconnect, or unavailable responses may have an unknown outcome.
-
 /// Write with the configured group and node and original request identity.
 pub async fn write_identified(
     endpoint: SocketAddr,

@@ -5,11 +5,13 @@ use grpc::wire;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Response as RpcResponse, Status};
 
+/// One RPC stream observation, not a physical TCP socket.
 pub(super) struct Socket {
     request: Option<super::super::Request>,
     reply: Option<oneshot::Sender<Result<Reply, RemoteError>>>,
 }
 impl Socket {
+    // Completion observes handler/stream cancellation, not connection closure.
     pub(super) async fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
         if let Some(reply) = &mut self.reply {
             reply.closed().await;

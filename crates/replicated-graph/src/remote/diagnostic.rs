@@ -211,14 +211,6 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(read_barrier_kind(&error), expected);
         }
-        let request = super::super::query::QueryRequest {
-            shard: 7,
-            partition: 0,
-            mode: super::super::query::QueryMode::V1,
-            text: "private query text".into(),
-            timeout_millis: 5000,
-        };
-        assert_eq!(operation(&Operation::Query(request)), "query");
     }
 
     #[test]

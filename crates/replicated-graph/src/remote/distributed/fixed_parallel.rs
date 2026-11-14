@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_drops_every_socket_and_preserves_consumed_sequences() {
+    async fn cancellation_drops_every_rpc_future_and_preserves_consumed_sequences() {
         // These fake peers still use the process-wide bounded RPC client.
         let _sessions = fixed_execution::lock_session_fixtures().await;
         let (mut nodes, mut listeners) = fixture().await;

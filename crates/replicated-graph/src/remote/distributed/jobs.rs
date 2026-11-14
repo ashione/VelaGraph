@@ -299,12 +299,10 @@ impl Jobs {
         self.values.lock().unwrap().clear();
     }
     pub(super) fn expire(&self) {
-        self.values.lock().unwrap().retain(|_, entry| {
-            if Instant::now() >= entry.expires {
-                return false;
-            }
-            true
-        });
+        self.values
+            .lock()
+            .unwrap()
+            .retain(|_, entry| Instant::now() < entry.expires);
     }
     pub(super) async fn handle(
         &self,
@@ -576,8 +574,8 @@ impl Job {
         if self.grpc_clients.is_none() {
             let mut clients = BTreeMap::new();
             for route in &self.catalog.partitions {
-                if !clients.contains_key(&route.shard) {
-                    clients.insert(route.shard, observed_client(None, route, end)?);
+                if let std::collections::btree_map::Entry::Vacant(entry) = clients.entry(route.shard) {
+                    entry.insert(observed_client(None, route, end)?);
                 }
             }
             self.grpc_clients = Some(Arc::new(clients));
