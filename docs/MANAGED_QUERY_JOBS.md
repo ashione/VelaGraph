@@ -264,6 +264,9 @@ Transport-only performance claims require separate matched measurements.
 
 `grpc_job_process.rs` exercises the public typed client against independent
 service and managed node processes using a fixture-owned qualified-path oracle.
+It also runs direct legacy-wire versus typed-RPC calls against the same job
+registry and independent node fixture, comparing replayed handles, Ready V and
+counts, every row/page/cursor, renewal generation and cancellation/error mapping.
 It covers fixed results across later deletion, Start argument replay, failure
 precedence, immutable pages, lease replay, expiration without implicit renewal,
 shared-slot exhaustion, incarnation fencing and dropped control replies. The

@@ -184,6 +184,7 @@ async fn scenario() -> anyhow::Result<()> {
         )
         .await?;
     }
+    legacy_differential(&coordinator, &a, &b, version).await?;
     let request = start_job(40, Some(version));
     let admitted = jobs.start(request.clone()).await?.into_inner();
     assert_eq!(admitted.operation_id, request.operation_id);
@@ -602,4 +603,104 @@ impl ResponseGate {
             task,
         })
     }
+}
+
+// Direct adapter differential: both wire protocols address the same job registry
+// and the same independent managed-node fixture. No production listener changes.
+async fn legacy_differential(
+    coordinator: &NodeProcess,
+    a: &NodeProcess,
+    b: &NodeProcess,
+    version: u64,
+) -> anyhow::Result<()> {
+    use d2_raft::managed_rpc::Client;
+    use replicated_graph::managed_gateway::{self as gw, Operation as Op, Reply};
+    use replicated_graph::remote::query::{QualifiedElement as E, QueryRow};
+    let members = [(a, 7), (b, 8)];
+    let gateway = gw::Gateway::bind_remote_local_queries_grpc(
+        gw::RemoteConfig {
+            coordinator: Client::new_grpc(coordinator.ready.control, identity(9), BUDGET)?,
+            binding: binding(),
+            members: members.iter().map(|(node, shard)| Client::new_grpc(node.ready.control, identity(*shard), BUDGET)).collect::<Result<_, _>>()?,
+        },
+        members.iter().map(|(node, shard)| Ok(gw::LocalGraphRoute {
+            endpoint: node.ready.graph.context("graph endpoint")?,
+            identity: replicated_graph::remote::RemoteIdentity { group: *shard, node: 1 },
+            managed_identity: identity(*shard),
+        })).collect::<anyhow::Result<_>>()?,
+        "127.0.0.1:0".parse()?, BUDGET, 2, 2,
+    ).await?;
+    let rpc = gateway.bind_grpc("127.0.0.1:0".parse()?, BUDGET).await?;
+    let mut typed = Jobs::new(grpc_channel(rpc.local_addr()).await?);
+    let call = |operation| gw::request(gateway.local_addr(), binding(), operation, BUDGET);
+    let request = start_job(90, Some(version));
+    let query = gw::Query { partition: request.query.as_ref().unwrap().partition, text: request.query.as_ref().unwrap().text.clone() };
+    let policy = request.policy.as_ref().unwrap();
+    let legacy_start = Op::StartLocalQueryJob {
+        operation_id: [90; 16], version: Some(version), query: query.clone(), page_size: 1,
+        policy: gw::JobPolicy { idle_millis: policy.idle_millis, execution_millis: policy.execution_millis, lifetime_millis: policy.lifetime_millis },
+    };
+    let Reply::StartLocalQueryJob { operation_id, job } = call(legacy_start.clone()).await? else { anyhow::bail!("legacy start reply") };
+    let handle = pb::JobHandle { incarnation: job.incarnation.to_vec(), token: job.token.to_vec() };
+    let admitted = typed.start(request.clone()).await?.into_inner();
+    assert_eq!(admitted.operation_id, operation_id);
+    assert_eq!(admitted.job.as_ref(), Some(&handle));
+    assert_eq!(call(legacy_start.clone()).await?, Reply::StartLocalQueryJob { operation_id, job: job.clone() });
+    let status = ready(&mut typed, &handle).await?;
+    let Reply::GetLocalQueryJob { status: old, .. } = call(Op::GetLocalQueryJob { job: job.clone() }).await? else { anyhow::bail!("legacy status reply") };
+    assert_eq!(old.phase, gw::JobPhase::Ready);
+    assert_eq!((status.version, status.total), (old.version, old.total));
+    assert!(old.failure.is_none());
+    let mut cursor = None;
+    let mut rows = Vec::new();
+    loop {
+        let operation = Op::FetchLocalQueryJob { job: job.clone(), query: query.clone(), cursor: cursor.clone(), page_size: 1 };
+        let reply = call(operation.clone()).await?;
+        assert_eq!(call(operation).await?, reply);
+        let Reply::FetchLocalQueryJob { version: old_version, page, .. } = reply else { anyhow::bail!("legacy fetch reply") };
+        let mut fetch = fetch_job(&handle, &request);
+        fetch.cursor = cursor.map(|c: gw::PageCursor| pb::Cursor { token: c.token.to_vec() });
+        let response = typed.fetch(fetch).await?.into_inner();
+        assert_eq!(response.version, old_version);
+        let actual = response.page.context("typed page")?;
+        assert_eq!((actual.offset, actual.total), (page.offset, page.total));
+        assert_eq!(actual.next.as_ref().map(|c| c.token.as_slice()), page.next.as_ref().map(|c| c.token.as_slice()));
+        let completeness = match page.data.completeness {
+            replicated_graph::remote::query::QueryCompleteness::SinglePartition => pb::Completeness::SinglePartition,
+            replicated_graph::remote::query::QueryCompleteness::Unverified => pb::Completeness::Unverified,
+        };
+        assert_eq!(actual.completeness, completeness as i32);
+        let expected = page.data.rows.into_iter().map(|row| {
+            let QueryRow::Path(elements) = row else { panic!("path fixture returned non-path") };
+            pb::Row { kind: Some(pb::row::Kind::Path(pb::Path { elements: elements.into_iter().map(|e| pb::QualifiedElement { kind: Some(match e {
+                E::Vertex { partition, id } => pb::qualified_element::Kind::Vertex(pb::Entity { partition, id }),
+                E::Edge { partition, id } => pb::qualified_element::Kind::Edge(pb::Entity { partition, id }),
+            }) }).collect() })) }
+        }).collect::<Vec<_>>();
+        assert_eq!(actual.rows, expected);
+        rows.extend(actual.rows);
+        cursor = page.next;
+        if cursor.is_none() { break; }
+    }
+    assert_eq!(rows, expected_paths());
+    let mut conflict = request.clone();
+    conflict.version = None;
+    let mut old_conflict = legacy_start;
+    if let Op::StartLocalQueryJob { version, .. } = &mut old_conflict { *version = None; }
+    assert_eq!(call(old_conflict).await.unwrap_err(), gw::Error::Identity);
+    assert_reason(&typed.start(conflict).await.unwrap_err(), pb::error_detail::Reason::IdentityMismatch);
+    let Reply::RenewLocalQueryJob { grant, .. } = call(Op::RenewLocalQueryJob { job: job.clone(), expected_generation: 0 }).await? else { anyhow::bail!("legacy renew reply") };
+    let replay = typed.renew(pb::JobRenewRequest { context: context(), job: Some(handle.clone()), expected_generation: 0 }).await?.into_inner();
+    assert_eq!(replay.generation, grant.generation);
+    assert!(replay.remaining_millis <= grant.remaining_millis);
+    let cancelled = typed.cancel(pb::JobCancelRequest { context: context(), job: Some(handle.clone()) }).await?.into_inner().status.context("cancel status")?;
+    let Reply::CancelLocalQueryJob { status: old, .. } = call(Op::CancelLocalQueryJob { job: job.clone() }).await? else { anyhow::bail!("legacy cancel reply") };
+    assert_eq!(old.phase, gw::JobPhase::Cancelled);
+    assert_eq!(cancelled.phase, pb::JobPhase::Cancelled as i32);
+    assert_eq!(call(Op::FetchLocalQueryJob { job, query, cursor: None, page_size: 1 }).await.unwrap_err(), gw::Error::SessionUnavailable);
+    assert_reason(&typed.fetch(fetch_job(&handle, &request)).await.unwrap_err(), pb::error_detail::Reason::SessionUnavailable);
+    drop(typed);
+    rpc.shutdown().await;
+    gateway.shutdown().await;
+    Ok(())
 }
