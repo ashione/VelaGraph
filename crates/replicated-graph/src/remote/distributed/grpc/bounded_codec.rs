@@ -534,13 +534,11 @@ impl BoundedMessage for wire::CoordinatorQueryRequest {
     }
 }
 impl BoundedMessage for wire::CoordinatorQueryResponse {
-            accepted_consistency: Some(1),
     fn schema() -> Schema {
         Schema::CoordinatorQueryResponse
     }
 }
 impl BoundedMessage for wire::CoordinatorJobRequest {
-            required_consistency: Some(1),
     fn schema() -> Schema {
         Schema::CoordinatorJobRequest
     }
