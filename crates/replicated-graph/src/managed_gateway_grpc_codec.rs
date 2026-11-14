@@ -461,10 +461,33 @@ pub(super) fn encode_close(r: &Reply) -> Result<pb::CloseResponse> {
         session: Some(out_session(session)),
     })
 }
-pub(super) fn error(e: Error) -> tonic::Status {
+// Standard google.rpc.Status and google.protobuf.Any wire layouts. These
+// private DTOs avoid a dependency while remaining interoperable with generated
+// clients; the only admitted Any payload is the versioned public ErrorDetail.
+pub(super) const ERROR_TYPE_URL: &str =
+    "type.googleapis.com/velagraph.public.managed.v1.ErrorDetail";
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    pub(super) code: i32,
+    #[prost(string, tag = "2")]
+    pub(super) message: String,
+    // google.rpc.Status declares repeated Any; this contract requires exactly
+    // one, so singular optional has identical wire bytes and bounded decoding.
+    #[prost(message, optional, tag = "3")]
+    pub(super) detail: Option<RpcAny>,
+}
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct RpcAny {
+    #[prost(string, tag = "1")]
+    pub(super) type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub(super) value: Vec<u8>,
+}
+fn error_parts(e: Error) -> (tonic::Code, pb::error_detail::Reason) {
     use pb::error_detail::Reason as R;
     use tonic::Code as C;
-    let (code, reason) = match e {
+    match e {
         Error::Protocol => (C::InvalidArgument, R::InvalidArgument),
         Error::Identity => (C::FailedPrecondition, R::IdentityMismatch),
         Error::Capacity => (C::ResourceExhausted, R::ResourceExhausted),
@@ -483,17 +506,50 @@ pub(super) fn error(e: Error) -> tonic::Status {
             QueryFailure::IncompleteOrCorrupt => (C::Unavailable, R::QueryIncompleteOrCorrupt),
             QueryFailure::Unavailable => (C::Unavailable, R::QueryUnavailable),
         },
-    };
-    tonic::Status::with_details(
-        code,
-        reason.as_str_name(),
-        pb::ErrorDetail {
-            identity: None,
-            reason: reason as i32,
-        }
-        .encode_to_vec()
-        .into(),
-    )
+    }
+}
+pub(super) fn error(e: Error) -> tonic::Status {
+    identified_error(e, None)
+}
+fn error_from_reason(reason: i32) -> Result<Error> {
+    use pb::error_detail::Reason as R;
+    Ok(match R::try_from(reason).map_err(|_| Error::Protocol)? {
+        R::InvalidArgument => Error::Protocol,
+        R::IdentityMismatch => Error::Identity,
+        R::ResourceExhausted => Error::Capacity,
+        R::RejectedOutcomeUncertain => Error::Rejected,
+        R::PreconditionFailed => Error::PreconditionFailed,
+        R::OutcomeUnknown => Error::Unknown,
+        R::SessionUnavailable => Error::SessionUnavailable,
+        R::JobBusy => Error::JobBusy,
+        R::QuerySyntax => Error::Query(QueryFailure::Parse),
+        R::QueryUnsupported => Error::Query(QueryFailure::Unsupported),
+        R::QueryUnsupportedScope => Error::Query(QueryFailure::UnsupportedScope),
+        R::QueryInvalidArgument => Error::Query(QueryFailure::InvalidArgument),
+        R::QueryResourceExhausted => Error::Query(QueryFailure::ResourceExhausted),
+        R::QueryDeadline => Error::Query(QueryFailure::Timeout),
+        R::QueryIncompleteOrCorrupt => Error::Query(QueryFailure::IncompleteOrCorrupt),
+        R::QueryUnavailable => Error::Query(QueryFailure::Unavailable),
+        R::Unspecified => return Err(Error::Protocol),
+    })
+}
+pub(super) fn decode_error_detail(status: &tonic::Status) -> Result<pb::ErrorDetail> {
+    // Validate outer envelope, Any and nested detail before any prost allocation.
+    bounded::validate_bytes::<RpcStatus>(status.details()).map_err(|_| Error::Protocol)?;
+    let rich = RpcStatus::decode(status.details()).map_err(|_| Error::Protocol)?;
+    if rich.code != status.code() as i32 || rich.message != status.message() {
+        return Err(Error::Protocol);
+    }
+    let any = required(rich.detail)?;
+    if any.type_url != ERROR_TYPE_URL {
+        return Err(Error::Protocol);
+    }
+    let detail = pb::ErrorDetail::decode(any.value.as_slice()).map_err(|_| Error::Protocol)?;
+    let (code, reason) = error_parts(error_from_reason(detail.reason)?);
+    if code != status.code() || reason.as_str_name() != status.message() {
+        return Err(Error::Protocol);
+    }
+    Ok(detail)
 }
 
 // Fixed snapshot sessions deliberately use a distinct public DTO from local
@@ -1047,7 +1103,7 @@ mod tests {
         let err = error(Error::Unknown);
         assert_eq!(err.code(), tonic::Code::Unavailable);
         assert_eq!(
-            pb::ErrorDetail::decode(err.details()).unwrap().reason,
+            decode_error_detail(&err).unwrap().reason,
             pb::error_detail::Reason::OutcomeUnknown as i32
         );
     }
@@ -1586,14 +1642,16 @@ identities!(
     JobFetchResponse
 );
 pub(super) fn identified_error(error: Error, identity: Option<pb::CallIdentity>) -> tonic::Status {
-    let status = self::error(error);
-    let mut detail = pb::ErrorDetail::decode(status.details()).expect("own error encoding");
-    detail.identity = identity;
-    tonic::Status::with_details(
-        status.code(),
-        status.message(),
-        detail.encode_to_vec().into(),
-    )
+    let (code, reason) = error_parts(error);
+    let rich = RpcStatus {
+        code: code as i32,
+        message: reason.as_str_name().to_owned(),
+        detail: Some(RpcAny {
+            type_url: ERROR_TYPE_URL.to_owned(),
+            value: pb::ErrorDetail { reason: reason as i32, identity }.encode_to_vec(),
+        }),
+    };
+    tonic::Status::with_details(code, reason.as_str_name(), rich.encode_to_vec().into())
 }
 
 /// Every admitted page must fit a later v2 response on the same fixed binding.

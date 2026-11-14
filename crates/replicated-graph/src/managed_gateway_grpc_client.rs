@@ -42,10 +42,7 @@ fn remote_error(status: tonic::Status, expected: &pb::CallIdentity) -> Error {
             _ => Error::Unknown,
         };
     }
-    if codec::bounded::validate_bytes::<pb::ErrorDetail>(status.details()).is_err() {
-        return Error::Protocol;
-    }
-    let Ok(detail) = pb::ErrorDetail::decode(status.details()) else {
+    let Ok(detail) = codec::decode_error_detail(&status) else {
         return Error::Protocol;
     };
     if let Err(error) = verify_identity(detail.identity.as_ref(), expected) {
@@ -817,6 +814,19 @@ mod tests {
         assert_eq!(
             remote_error(codec::error(Error::Rejected), &identity),
             Error::Identity
+        );
+        // Old raw trailers are not an alternative protocol after standardization.
+        let raw = pb::ErrorDetail {
+            reason: pb::error_detail::Reason::RejectedOutcomeUncertain as i32,
+            identity: Some(identity.clone()),
+        }.encode_to_vec();
+        assert_eq!(
+            remote_error(tonic::Status::with_details(
+                tonic::Code::Unavailable,
+                "REJECTED_OUTCOME_UNCERTAIN",
+                raw.into(),
+            ), &identity),
+            Error::Protocol
         );
         let mut wrong = identity.clone();
         wrong.request_id[0] ^= 1;

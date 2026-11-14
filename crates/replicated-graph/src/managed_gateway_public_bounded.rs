@@ -81,6 +81,8 @@ fn limit() -> Status {
 pub enum Schema {
     Empty,
     ErrorDetail,
+    RpcStatus,
+    RpcAny,
     Context,
     CallIdentity,
     Binding,
@@ -171,6 +173,10 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         };
     }
     let (kind, repeated, oneof) = match (s, t) {
+        (S::RpcStatus, 1) => (K::Var(16), false, false),
+        (S::RpcStatus, 2) | (S::RpcAny, 1) => (K::Bytes, false, false),
+        (S::RpcStatus, 3) => (K::Message(S::RpcAny), false, false),
+        (S::RpcAny, 2) => (K::Message(S::ErrorDetail), false, false),
         (S::ErrorDetail, 1) => (K::Var(16), false, false),
         (S::ErrorDetail, 2) => (K::Message(S::CallIdentity), false, false),
         (S::Context, 3) => (K::Message(S::CallIdentity), false, false),
@@ -450,6 +456,14 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                 if exact_width.is_some_and(|width| len != width) {
                     return Err(bad());
                 }
+                if matches!(schema, Schema::RpcAny) && tag == 1
+                    && &bytes[at..end] != super::ERROR_TYPE_URL.as_bytes()
+                {
+                    return Err(bad());
+                }
+                if matches!(schema, Schema::RpcStatus) && tag == 2 && len > 128 {
+                    return Err(limit());
+                }
                 if let Kind::Message(child) = field.kind {
                     scan(child, &bytes[at..end], depth + 1, budget)?;
                 }
@@ -458,6 +472,9 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
         }
     }
     let required = match schema {
+        Schema::RpcStatus => (1 << 1) | (1 << 2) | (1 << 3),
+        Schema::RpcAny => (1 << 1) | (1 << 2),
+        Schema::ErrorDetail => 1 << 1,
         Schema::CallIdentity
         | Schema::JobHandle
         | Schema::JobStartResponse
@@ -514,6 +531,10 @@ macro_rules! message {
             }
         }
     };
+}
+impl BoundedMessage for super::RpcStatus {
+    fn schema() -> Schema { Schema::RpcStatus }
+    fn request() -> bool { false }
 }
 message!(ErrorDetail, false);
 message!(WriteRequest, true);

@@ -313,7 +313,7 @@ async fn public_scenario() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        pb::ErrorDetail::decode(closed.details())?.reason,
+        replicated_graph::managed_gateway::decode_grpc_error_detail(&closed)?.reason,
         pb::error_detail::Reason::SessionUnavailable as i32
     );
     let fresh = json!({"read":{"type":"minimum","version":"4"},"ttl_millis":60000,"query":query,"page_size":1});
@@ -355,7 +355,7 @@ async fn public_scenario() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        pb::ErrorDetail::decode(stale_rpc.details())?.reason,
+        replicated_graph::managed_gateway::decode_grpc_error_detail(&stale_rpc)?.reason,
         pb::error_detail::Reason::SessionUnavailable as i32
     );
     let mut fixed_queries =

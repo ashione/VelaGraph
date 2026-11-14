@@ -3,6 +3,7 @@
 // The shared fixture also contains HTTP/Rust-client helpers used by its other target.
 #![allow(dead_code)]
 include!("support/public_service_fixture.rs");
+use prost::Message;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VELAGRAPH_GO_INTEROP_BIN; mandatory in the Go interoperability job"]
@@ -64,7 +65,7 @@ async fn go_client_against_real_managed_service() -> anyhow::Result<()> {
             "-partition",
             "7",
             "-first-id",
-            "900001",
+            "9007199254740993",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(fs::File::create(&stdout_path)?))

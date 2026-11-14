@@ -56,7 +56,9 @@ func expectError(err error, code codes.Code, reason pb.ErrorDetail_Reason) {
 func scalarProps() []*pb.Property {
 	return []*pb.Property{
 		{Key: "nil", Value: &pb.Scalar{Kind: &pb.Scalar_Null{Null: &pb.Empty{}}}},
-		{Key: "integer", Value: &pb.Scalar{Kind: &pb.Scalar_Integer{Integer: -42}}},
+		{Key: "integer", Value: &pb.Scalar{Kind: &pb.Scalar_Integer{Integer: -9223372036854775808}}},
+		{Key: "imax", Value: &pb.Scalar{Kind: &pb.Scalar_Integer{Integer: 9223372036854775807}}},
+		{Key: "precise", Value: &pb.Scalar{Kind: &pb.Scalar_Integer{Integer: 9007199254740993}}},
 		{Key: "real", Value: &pb.Scalar{Kind: &pb.Scalar_Real{Real: 1.25}}},
 		{Key: "text", Value: &pb.Scalar{Kind: &pb.Scalar_Text{Text: "Go → Rust"}}},
 		{Key: "boolean", Value: &pb.Scalar{Kind: &pb.Scalar_Boolean{Boolean: true}}},
@@ -126,7 +128,7 @@ func rows(page *pb.Page, partition uint32, first uint64, seen map[uint64]bool) {
 	}
 }
 func (c *client) pages(partition uint32, first uint64) {
-	q := &pb.Query{Partition: partition, Text: fmt.Sprintf("g.V(%d,%d).valueMap('nil','integer','real','text','boolean','absent')", first, first+1)}
+	q := &pb.Query{Partition: partition, Text: fmt.Sprintf("g.V(%d,%d,%d).valueMap('nil','integer','imax','precise','real','text','boolean','absent')", first, first+1, first+2)}
 	req := &pb.OpenRequest{Context: c.envelope(), Read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}, TtlMillis: 10000, Query: q, PageSize: 1}
 	opened, err := c.query.Open(c.ctx, req)
 	check(err == nil, "Open: %v", err)
@@ -137,6 +139,8 @@ func (c *client) pages(partition uint32, first uint64) {
 	page := opened.Page
 	check(page != nil && page.Total == 2 && page.Offset == 0 && len(page.Rows) == 1 && page.Next != nil, "first page not paginated: %v", page)
 	rows(page, partition, first, seen)
+	// Write after capture: the old cursor must stay at V and exclude the new vertex.
+	c.create(partition, first+2)
 	fetch := &pb.FetchRequest{Context: c.envelope(), Session: opened.Session, Query: q, Cursor: page.Next, PageSize: 1}
 	next, err := c.query.Fetch(c.ctx, fetch)
 	check(err == nil, "Fetch: %v", err)
@@ -145,6 +149,15 @@ func (c *client) pages(partition uint32, first uint64) {
 	check(next.Page != nil && next.Page.Offset == 1 && next.Page.Total == 2 && next.Page.Next == nil, "last page shape: %v", next.Page)
 	rows(next.Page, partition, first, seen)
 	check(len(seen) == 2, "missing results")
+	freshReq := &pb.OpenRequest{Context: c.envelope(), Read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}, TtlMillis: 10000, Query: q, PageSize: 10}
+	fresh, err := c.query.Open(c.ctx, freshReq)
+	check(err == nil, "fresh Open: %v", err)
+	identity(freshReq.Context.Identity, fresh.Identity)
+	check(fresh.Session != nil && fresh.Session.Version > opened.Session.Version && fresh.Page != nil && fresh.Page.Total == 3, "fresh view failed to observe concurrent write")
+	freshClose := &pb.CloseRequest{Context: c.envelope(), Session: fresh.Session}
+	freshClosed, err := c.query.Close(c.ctx, freshClose)
+	check(err == nil, "fresh Close: %v", err)
+	identity(freshClose.Context.Identity, freshClosed.Identity)
 	closeReq := &pb.CloseRequest{Context: c.envelope(), Session: opened.Session}
 	closed, err := c.query.Close(c.ctx, closeReq)
 	check(err == nil, "Close: %v", err)
@@ -158,10 +171,10 @@ func run() {
 	endpoint := flag.String("endpoint", "", "loopback Rust public gRPC address")
 	bindingPath := flag.String("binding-proto", "", "protobuf binary Binding from Rust fixture")
 	partition := flag.Uint("partition", 7, "fixture partition")
-	first := flag.Uint64("first-id", 900001, "two fresh vertex IDs")
+	first := flag.Uint64("first-id", 9007199254740993, "three fresh vertex IDs above 2^53")
 	flag.Parse()
 	check(*endpoint != "" && *bindingPath != "", "endpoint and binding-proto are required")
-	check(*partition <= uint(^uint32(0)) && *first > 0 && *first < ^uint64(0), "invalid IDs")
+	check(*partition <= uint(^uint32(0)) && *first > 0 && *first <= 9223372036854775805, "invalid IDs")
 	data, err := os.ReadFile(*bindingPath)
 	check(err == nil, "binding: %v", err)
 	binding := new(pb.Binding)
@@ -183,8 +196,14 @@ func run() {
 	_, err = c.query.Open(ctx, invalid)
 	expectError(err, codes.InvalidArgument, pb.ErrorDetail_INVALID_ARGUMENT)
 	// An internal service must not be exposed through the public listener.
-	err = conn.Invoke(ctx, "/velagraph.internal.managed.v1.ManagedService/Call", &emptypb.Empty{}, &emptypb.Empty{})
-	check(status.Code(err) == codes.Unimplemented, "public listener exposed internal service: %v", err)
+	for _, method := range []string{
+		"/velagraph.internal.managed.v1.ManagedService/Call",
+		"/velagraph.internal.raft.v1.RaftService/Vote",
+		"/velagraph.internal.operations.v1.ShardOperations/Call",
+	} {
+		err = conn.Invoke(ctx, method, &emptypb.Empty{}, &emptypb.Empty{})
+		check(status.Code(err) == codes.Unimplemented, "public listener exposed %s: %v", method, err)
+	}
 	c.create(uint32(*partition), *first)
 	c.create(uint32(*partition), *first+1)
 	c.pages(uint32(*partition), *first)
