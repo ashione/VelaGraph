@@ -47,7 +47,7 @@ The test checks:
 - Unsupported envelope version and malformed Gremlin via standard
   `status.Code` and `status.Details` decoded as `ErrorDetail`.
   Raw custom trailer decoding is deliberately not accepted.
-- The internal ManagedService method is absent from the public listener.
+- Internal ManagedService/Call, RaftService/Vote and ShardOperations/Call are absent from the public listener.
 - Three fresh typed vertex writes (the third after query capture),
   absent/committed Status, and intentional
   same-ID/same-mutation Submit replay only after confirmed commit.
@@ -58,6 +58,8 @@ The test checks:
   version, completeness, exact row identities and post-close rejection.
   A write between pages must not enter the retained two-row view; a fresh latest
   view must observe all three rows at a later version.
+
+QueryService uses supported explicit-ID element queries for paging; it does not support valueMap. Property values are verified separately through FixedSessionService.Traverse at the same exact retained V, after the third write. Both session types use independent 32-byte tokens and 16-byte incarnations. Their completeness is explicitly Unverified, not silently promoted to certified adjacency completeness.
 
 All operations share a 90-second overall deadline; each request advertises a
 5-second server budget. gRPC automatic retry is disabled. A failed Submit is

@@ -85,6 +85,11 @@ jobs:
             go_client_against_real_managed_service -- --ignored --exact --nocapture \
             2>&1 | tee go-interop-evidence/process.log
           grep -q 'test result: ok. 1 passed;' go-interop-evidence/process.log
+      - name: Verify Go source formatting
+        if: ${{ !cancelled() }}
+        run: |
+          gofmt -d examples/go/managed/cmd/interop/main.go | tee go-interop-evidence/gofmt.diff
+          test -z "$(gofmt -l examples/go/managed/cmd/interop/main.go)"
       - name: Retain interoperability evidence
         if: always()
         uses: actions/upload-artifact@v4
