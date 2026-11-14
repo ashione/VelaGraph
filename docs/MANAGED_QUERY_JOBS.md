@@ -166,24 +166,24 @@ All exact-head regression and CI outcomes, including failures, must be recorded
 before acceptance. New API success never substitutes for the unchanged original
 pin, observed CoreHR or release1025 gates.
 
-## Planned typed public job service (#268)
+## Typed public job service (#268)
 
-**Design only, not an available API.** This section records the migration target
-against main `d9399e7b`. It neither expands the lifecycle above nor retires the
-legacy managed gateway. The related fixed-session work (#266 / #267) is separate:
+**Implementation candidate under validation.** The typed job service uses the
+existing public gRPC listener and the lifecycle above; it does not retire the
+legacy managed gateway or establish full #218 completion. The related fixed-session work (#266 / #267) is separate:
 materialized fixed sessions, synchronous local query sessions and jobs must not
 share interchangeable tokens. #218 remains the transport umbrella.
 
 ### Contract and adapter boundary
 
-Add `ManagedQueryJobService` to the existing
-`velagraph.public.managed.v1` endpoint. Reuse `State`,
+`ManagedQueryJobService` is registered on the existing
+`velagraph.public.managed.v1` endpoint. It reuses `State`,
 `Invocation::begin/live/delivery_end`, `Handler::run`, admission, workers,
 executor and error mapping. No new listener, executor or transparent retry layer.
-Use the same typed Query/Page/Context vocabulary, but a distinct JobHandle with
+It uses the same typed Query/Page/Context vocabulary, but a distinct JobHandle with
 16-byte incarnation and 32-byte token; neither is a credential.
 
-| Proposed RPC | Existing operation | Request and response contract |
+| RPC | Existing operation | Request and response contract |
 | --- | --- | --- |
 | Start | StartLocalQueryJob | Nonzero 16-byte operation ID, optional exact version (absence means latest at the worker's read-cut admission, not at Start RPC or job-slot admission; explicit zero remains exact zero), Query, page size, required JobPolicy. Return operation ID and handle only. |
 | Get | GetLocalQueryJob | Exact handle; return handle and phase/status. No partial rows, implicit renewal or mutation of selected V. |
@@ -259,3 +259,14 @@ Transport-only performance claims require separate matched measurements.
 3. Record exact candidate evidence and update this document plus public transport
    inventories. Only then assess legacy retirement in its own verified slice;
    do not remove unconverted operations or declare #218 complete.
+
+### Typed lifecycle integration evidence
+
+`grpc_job_process.rs` exercises the public typed client against independent
+service and managed node processes using a fixture-owned qualified-path oracle.
+It covers fixed results across later deletion, Start argument replay, failure
+precedence, immutable pages, lease replay, expiration without implicit renewal,
+shared-slot exhaustion, incarnation fencing and dropped control replies.
+The existing deterministic lifecycle tests remain the evidence for running
+renewal races and last-owner resource retention. This candidate must pass
+independent review and exact-head CI before #268 acceptance.
