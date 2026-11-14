@@ -1519,7 +1519,7 @@ async fn reset_open_rpc_releases_undelivered_session_over_real_http2() {
         .unwrap();
         body.send_reset(h2::Reason::CANCEL);
         drop(response);
-        drop(paused);
+        // Keep capture paused until the server has observed queued RST_STREAM.
         tokio::time::timeout(Duration::from_secs(2), async {
             while g.state.connections.available_permits() != MAX_CONNECTIONS {
                 tokio::task::yield_now().await;
@@ -1529,6 +1529,7 @@ async fn reset_open_rpc_releases_undelivered_session_over_real_http2() {
         .unwrap();
         assert_eq!(g.retained_payload_charge(), 0);
         assert!(g.state.sessions.lock().unwrap().is_empty());
+        drop(paused);
         drop(driver);
     }
     let session = open(&g, None).await;

@@ -86,7 +86,7 @@ fn conditions(input: Vec<pb::PropertyCondition>) -> Result<PropertyConditions> {
     }
     Ok(out)
 }
-fn mutation(m: pb::Mutation) -> Result<Mutation> {
+fn mutation(m: pb::Mutation, validate: bool) -> Result<Mutation> {
     use pb::mutation::Kind;
     let m = match required(m.kind)? {
         Kind::CreateVertex(v) => {
@@ -127,7 +127,9 @@ fn mutation(m: pb::Mutation) -> Result<Mutation> {
             replacement: edge(required(e.replacement)?)?,
         },
     };
-    m.validate()?;
+    if validate {
+        m.validate()?;
+    }
     Ok(m)
 }
 fn request_size<M: Message>(m: &M) -> Result<()> {
@@ -140,9 +142,19 @@ fn request_size<M: Message>(m: &M) -> Result<()> {
 fn write(r: pb::WriteRequest) -> Result<Write> {
     request_size(&r)?;
     context(&r.context)?;
+    let domain_request = r.context.as_ref().is_some_and(|c| c.version == 2);
+    // The v2 domain client replaces the original Gateway protocol. Preserve
+    // the shared Submit handler's canonical/identity checks and diagnostics;
+    // an exact-width zero external ID is a semantic rejection, not malformed
+    // framing. It never reaches transaction admission in State::execute.
+    let external_id = if domain_request {
+        r.external_id.try_into().map_err(|_| Error::Identity)?
+    } else {
+        token(r.external_id)?
+    };
     Ok(Write {
-        external_id: token(r.external_id)?,
-        mutation: mutation(required(r.mutation)?)?,
+        external_id,
+        mutation: mutation(required(r.mutation)?, !domain_request)?,
     })
 }
 pub(super) fn submit(r: pb::WriteRequest) -> Result<Operation> {
@@ -155,9 +167,9 @@ pub(super) fn abort(r: pb::WriteRequest) -> Result<Operation> {
     Ok(Operation::Abort(write(r)?))
 }
 pub(super) fn query(q: pb::Query) -> Result<Query> {
-    if q.text.len() > crate::remote::query::MAX_QUERY_TEXT_BYTES {
-        return Err(Error::Capacity);
-    }
+    // The bounded message envelope limits transport memory. The official
+    // Gremlin parser owns its text/depth limits and exact query error taxonomy.
+    // Do not turn its Parse error into a transport Capacity error here.
     Ok(Query {
         partition: q.partition,
         text: q.text,

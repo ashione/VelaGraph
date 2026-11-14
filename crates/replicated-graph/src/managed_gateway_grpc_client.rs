@@ -37,7 +37,7 @@ fn remote_error(status: tonic::Status, expected: &pb::CallIdentity) -> Error {
         // These retain transport decode/admission classification. Like the old
         // response-frame capacity error, neither proves a mutation rolled back.
         return match status.code() {
-            tonic::Code::ResourceExhausted => Error::Capacity,
+            tonic::Code::ResourceExhausted | tonic::Code::OutOfRange => Error::Capacity,
             tonic::Code::InvalidArgument => Error::Protocol,
             _ => Error::Unknown,
         };
@@ -477,7 +477,8 @@ pub(super) fn encode_write(
     write: &Write,
 ) -> Result<pb::WriteRequest> {
     use pb::mutation::Kind;
-    write.mutation.validate()?;
+    // The shared Submit handler owns semantic validation and its timing
+    // diagnostics. Typed encoding validates representation, not admission.
     let kind = match &write.mutation {
         Mutation::CreateVertex { partition, vertex } => Kind::CreateVertex(pb::CreateVertex {
             partition: *partition,
@@ -801,6 +802,13 @@ mod tests {
             Error::Capacity
         );
         assert_eq!(
+            remote_error(
+                tonic::Status::out_of_range("decoded message length"),
+                &identity
+            ),
+            Error::Capacity
+        );
+        assert_eq!(
             remote_error(codec::error(Error::Rejected), &identity),
             Error::Identity
         );
@@ -822,6 +830,57 @@ mod tests {
             ),
             Error::Identity
         );
+    }
+    #[test]
+    fn domain_submit_keeps_zero_id_rejection_in_shared_handler() {
+        let write = Write {
+            external_id: [0; 16],
+            mutation: Mutation::CreateVertex {
+                partition: 2,
+                vertex: VertexData {
+                    id: 1,
+                    labels: vec![],
+                    properties: BTreeMap::new(),
+                },
+            },
+        };
+        let context = Some(pb::Context {
+            version: 2,
+            timeout_millis: 1000,
+            identity: Some(identity()),
+        });
+        let message = encode_write(context, &write).unwrap();
+        assert_eq!(
+            codec::submit(message).unwrap(),
+            Operation::Submit(write.clone())
+        );
+        // Existing v1 public DTO validation remains explicit, while v2's
+        // shared State rejection retains Attempt/Queue/Canonical diagnostics.
+        let message = encode_write(
+            Some(pb::Context {
+                version: 1,
+                timeout_millis: 1000,
+                identity: None,
+            }),
+            &write,
+        )
+        .unwrap();
+        assert_eq!(codec::submit(message), Err(Error::Identity));
+    }
+    #[test]
+    fn typed_query_preserves_official_parser_text_limit_error() {
+        let text = format!(
+            "g.V(1).values('{}')",
+            "x".repeat(velagraph::MAX_GREMLIN_QUERY_BYTES)
+        );
+        let query = codec::query(pb::Query {
+            partition: 2,
+            text: text.clone(),
+        })
+        .unwrap();
+        assert_eq!(query.text, text);
+        let error = velagraph::ObservedGremlinQuery::parse(&query.text).unwrap_err();
+        assert_eq!(crate::remote::query::graph_error(error), QueryFailure::Parse);
     }
     #[test]
     fn explicit_profile_and_zero_version_survive_typed_request() {
