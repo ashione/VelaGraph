@@ -68,8 +68,10 @@ fn latency_us(operations: usize, elapsed: Duration) -> f64 {
 }
 
 fn main() {
-    let directory =
-        std::env::temp_dir().join(format!("rocksql-storage-node-bench-{}", std::process::id()));
+    let directory = std::env::temp_dir().join(format!(
+        "velagraph-storage-node-bench-{}",
+        std::process::id()
+    ));
     if directory.exists() {
         std::fs::remove_dir_all(&directory).expect("clean old benchmark directory");
     }

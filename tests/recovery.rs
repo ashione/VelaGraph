@@ -19,8 +19,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use velagraph::{Edge, Error, GraphEngine, Value, Vertex};
 
-const MODE_ENV: &str = "ROCKSQL_CRASH_MODE";
-const DIR_ENV: &str = "ROCKSQL_CRASH_DIR";
+const MODE_ENV: &str = "VELAGRAPH_CRASH_MODE";
+const DIR_ENV: &str = "VELAGRAPH_CRASH_DIR";
 const MARKER: &str = "READY_TO_COMMIT";
 
 fn open(path: &Path) -> GraphEngine {
