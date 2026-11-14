@@ -19,6 +19,9 @@
 #281/#283 的 Go/错误互操作与 #224/#284 的 clean-startup 在此基线尚未合入；
 #195/#282 负责命名及 README 清理，本文不抢改其文件。
 后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
+相当规模的设计须保留完整 proposal/design doc，关联 issue、实现 PR、milestone/Project；
+按 [贡献规范](../CONTRIBUTING.md#proposals-and-design-records) 区分提议、接受、实现与验证，
+不以简短 checklist 替代设计，也不凭文档合入宣称功能完成。
 
 ## 当前完整交付：GraphService 旧协议退役
 
