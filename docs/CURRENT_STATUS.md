@@ -85,9 +85,11 @@ The [graph-service CLI](PUBLIC_SERVICE_CLI.md) hosts HTTP `/preview1` and typed
 public gRPC over shared handlers/budgets. Its internal managed and graph routes
 are gRPC-only. Its `FixedSessionService` exposes the original bounded materialized
 snapshot session (Open/Read/Traverse/Page/Close), separately from the data-local
-`QueryService`. The typed `ManagedQueryJobService` candidate adds the existing
-renewable job lifecycle on the same endpoint; legacy entrypoint retirement still
-requires separate #218 acceptance.
+`QueryService`. The typed `ManagedQueryJobService` delivered by merged #271
+(#268) exposes Start/Get/Renew/Fetch/Cancel on the same endpoint. Later #277/#279
+retired the Gateway/GraphService legacy wires. HTTP job parity, cross-language
+interoperability and other #218 service gates remain separate; jobs do not
+resume after gateway restart.
 This is a loopback development preview requiring an already
 activated fixed cohort, not cluster bootstrap, production serving or global
 restore. Graph channel connection is not typed-service readiness; an incompatible
@@ -163,7 +165,9 @@ are fully materialized, not file-backed streams. The purge/install safety work
 [#124](https://github.com/ashione/VelaGraph/issues/124) and streaming delivery
 [#118](https://github.com/ashione/VelaGraph/issues/118) remain open and are **not
 implemented or released by this documentation update**. Active checkpoints are
-not the future remote disaster-recovery backup plan in [D6a](ROADMAP.md#d6a-远程-checkpoint-与灾难恢复未来设计尚未实现).
+distinct from the already implemented physical checkpoint/object-store backup
+transport and the still-unimplemented global disaster recovery in
+[D6a](ROADMAP.md#d6a-远程-checkpoint-与灾难恢复基础备份已实现全局恢复待实现).
 
 ## Open work and dependencies
 
