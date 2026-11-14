@@ -4435,12 +4435,21 @@ mod tests {
                 4 => value.grants[0].activation.nonce = [0; 32],
                 _ => value.authority.mode = [3; 16],
             }
+            // The typed decoder rejects invalid grant structure before the
+            // client checks a structurally valid response's pinned authority.
+            let wire: grpc::wire::CohortCapacity = value.clone().into();
+            let decoded = CohortCapacity::try_from(wire);
+            if fault < 5 {
+                assert_eq!(decoded, Err(Error::Protocol), "decode fault {fault}");
+            } else {
+                assert!(decoded.is_ok(), "authority binding is a client check");
+            }
             let (client, peer) = fake_value(coordinator.clone(), Value::Capacity(value)).await;
             assert_eq!(
                 NodeRef::Remote(&client)
                     .confirm_capacity(&coordinator.authority, 1)
                     .await,
-                Err(if fault == 4 {
+                Err(if fault < 5 {
                     Error::Protocol
                 } else {
                     Error::Identity
