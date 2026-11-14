@@ -1,0 +1,54 @@
+name: Diagnose Gateway process contracts
+on:
+  push:
+    branches: [feat/retire-managed-gateway]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - byte_bound_independent_processes_small_lifecycle_recovery
+          - independent_managed_processes_partial_commit_and_durable_recovery
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libclang and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          test -n "$libclang_path"
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-no-debug-rust
+          cache-on-failure: false
+      - name: Record exact source and unchanged stack configuration
+        run: |
+          git rev-parse HEAD HEAD^{tree}
+          rustc -Vv
+          printf 'RUST_MIN_STACK=%s\n' "${RUST_MIN_STACK-unset}"
+          mkdir -p remote-process-evidence
+      - name: Run existing process regression without capture
+        env:
+          VELAGRAPH_REMOTE_DIAGNOSTICS: "1"
+          VELAGRAPH_REMOTE_EVIDENCE_DIR: ${{ github.workspace }}/remote-process-evidence
+        run: cargo test --locked -p replicated-graph --test managed_process ${{ matrix.case }} -- --exact --nocapture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gateway-diagnostic-${{ matrix.case }}-${{ github.sha }}
+          path: remote-process-evidence/
+          if-no-files-found: warn
+          retention-days: 7
