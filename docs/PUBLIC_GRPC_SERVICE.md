@@ -155,3 +155,20 @@ authentication, browser-origin protection and stable final HTTP v1 remain out of
 scope. Loopback is not an authorization boundary. Those capabilities are not implied by shipping this experimental slice. The
 finite [v0.0.1 release gates](RELEASE_PLAN.md), including clean startup and exact
 CI/acceptance evidence, still need to be evaluated separately.
+
+## Managed query jobs
+
+`ManagedQueryJobService` adds typed Start/Get/Renew/Fetch/Cancel on this same
+listener. Start uses a nonzero 16-byte operation ID, optional exact V (absence
+selects latest at worker read-cut admission), Query, page size and JobPolicy.
+Its JobHandle is distinct from synchronous and materialized session tokens.
+Get exposes no partial rows; Fetch requires Ready and preserves immutable V,
+query and page bindings. Renew is explicit and never refreshes the selected V.
+
+A dropped Start reply does not cancel admitted work: replay the same ID and exact
+arguments while retained. Do not generate a new ID after an uncertain reply.
+Cancelled metadata retains its shared slot until hard lifetime; restart invalidates
+handles. Capturing renewal is Busy, and a delayed renewal cannot revive expired
+work. Every full page is preflighted against both logical and typed envelopes
+before Ready. No JSON tunnel, extra listener or second execution engine is used.
+See [the complete job contract and validation matrix](MANAGED_QUERY_JOBS.md).

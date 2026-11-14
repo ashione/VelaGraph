@@ -988,85 +988,430 @@ mod tests {
 }
 
 fn job(h: pb::JobHandle) -> Result<JobHandle> {
-    Ok(JobHandle { incarnation: token(h.incarnation)?, token: token(h.token)? })
+    Ok(JobHandle {
+        incarnation: token(h.incarnation)?,
+        token: token(h.token)?,
+    })
 }
 pub(super) fn job_start(r: pb::JobStartRequest) -> Result<Operation> {
     request_size(&r)?;
     context(&r.context)?;
     let p = required(r.policy)?;
     Ok(Operation::StartLocalQueryJob {
-        operation_id: token(r.operation_id)?, version: r.version,
-        query: query(required(r.query)?)?, page_size: size(r.page_size)?,
-        policy: JobPolicy { idle_millis: p.idle_millis, execution_millis: p.execution_millis, lifetime_millis: p.lifetime_millis },
+        operation_id: token(r.operation_id)?,
+        version: r.version,
+        query: query(required(r.query)?)?,
+        page_size: size(r.page_size)?,
+        policy: JobPolicy {
+            idle_millis: p.idle_millis,
+            execution_millis: p.execution_millis,
+            lifetime_millis: p.lifetime_millis,
+        },
     })
 }
 pub(super) fn job_get(r: pb::JobGetRequest) -> Result<Operation> {
-    request_size(&r)?; context(&r.context)?;
-    Ok(Operation::GetLocalQueryJob { job: job(required(r.job)?)? })
+    request_size(&r)?;
+    context(&r.context)?;
+    Ok(Operation::GetLocalQueryJob {
+        job: job(required(r.job)?)?,
+    })
 }
 pub(super) fn job_cancel(r: pb::JobCancelRequest) -> Result<Operation> {
-    request_size(&r)?; context(&r.context)?;
-    Ok(Operation::CancelLocalQueryJob { job: job(required(r.job)?)? })
+    request_size(&r)?;
+    context(&r.context)?;
+    Ok(Operation::CancelLocalQueryJob {
+        job: job(required(r.job)?)?,
+    })
 }
 pub(super) fn job_renew(r: pb::JobRenewRequest) -> Result<Operation> {
-    request_size(&r)?; context(&r.context)?;
-    Ok(Operation::RenewLocalQueryJob { job: job(required(r.job)?)?, expected_generation: r.expected_generation })
+    request_size(&r)?;
+    context(&r.context)?;
+    Ok(Operation::RenewLocalQueryJob {
+        job: job(required(r.job)?)?,
+        expected_generation: r.expected_generation,
+    })
 }
 pub(super) fn job_fetch(r: pb::JobFetchRequest) -> Result<Operation> {
-    request_size(&r)?; context(&r.context)?;
+    request_size(&r)?;
+    context(&r.context)?;
     Ok(Operation::FetchLocalQueryJob {
-        job: job(required(r.job)?)?, query: query(required(r.query)?)?,
-        cursor: r.cursor.map(|c| Ok::<_, Error>(PageCursor { token: token(c.token)? })).transpose()?,
+        job: job(required(r.job)?)?,
+        query: query(required(r.query)?)?,
+        cursor: r
+            .cursor
+            .map(|c| {
+                Ok::<_, Error>(PageCursor {
+                    token: token(c.token)?,
+                })
+            })
+            .transpose()?,
         page_size: size(r.page_size)?,
     })
 }
 fn out_job(j: &JobHandle) -> pb::JobHandle {
-    pb::JobHandle { incarnation: j.incarnation.to_vec(), token: j.token.to_vec() }
+    pb::JobHandle {
+        incarnation: j.incarnation.to_vec(),
+        token: j.token.to_vec(),
+    }
 }
 fn out_job_failure(e: &Error) -> pb::JobFailure {
     use pb::JobFailure as F;
     match e {
-        Error::Protocol => F::Protocol, Error::JobBusy => F::Busy,
-        Error::Identity => F::Identity, Error::Capacity => F::Capacity,
-        Error::Rejected => F::Rejected, Error::PreconditionFailed => F::PreconditionFailed,
-        Error::Unknown => F::Unknown, Error::SessionUnavailable => F::SessionUnavailable,
+        Error::Protocol => F::Protocol,
+        Error::JobBusy => F::Busy,
+        Error::Identity => F::Identity,
+        Error::Capacity => F::Capacity,
+        Error::Rejected => F::Rejected,
+        Error::PreconditionFailed => F::PreconditionFailed,
+        Error::Unknown => F::Unknown,
+        Error::SessionUnavailable => F::SessionUnavailable,
         Error::Query(q) => match q {
-            QueryFailure::Parse => F::QueryParse, QueryFailure::Unsupported => F::QueryUnsupported,
+            QueryFailure::Parse => F::QueryParse,
+            QueryFailure::Unsupported => F::QueryUnsupported,
             QueryFailure::InvalidArgument => F::QueryInvalidArgument,
             QueryFailure::ResourceExhausted => F::QueryResourceExhausted,
-            QueryFailure::Timeout => F::QueryTimeout, QueryFailure::UnsupportedScope => F::QueryUnsupportedScope,
+            QueryFailure::Timeout => F::QueryTimeout,
+            QueryFailure::UnsupportedScope => F::QueryUnsupportedScope,
             QueryFailure::IncompleteOrCorrupt => F::QueryIncompleteOrCorrupt,
             QueryFailure::Unavailable => F::QueryUnavailable,
         },
     }
 }
 fn out_job_status(s: &JobStatus) -> Result<pb::JobStatus> {
-    if !jobs::valid_status(s) { return Err(Error::Protocol); }
+    if !jobs::valid_status(s) {
+        return Err(Error::Protocol);
+    }
     use pb::JobPhase as P;
     Ok(pb::JobStatus {
-        phase: match s.phase { JobPhase::Capturing => P::Capturing, JobPhase::Running => P::Running,
-            JobPhase::Sealing => P::Sealing, JobPhase::Ready => P::Ready, JobPhase::Cancelled => P::Cancelled,
-            JobPhase::Expired => P::Expired, JobPhase::Failed => P::Failed } as i32,
-        version: s.version, total: s.total, failure: s.failure.as_ref().map(|e| out_job_failure(e) as i32),
+        phase: match s.phase {
+            JobPhase::Capturing => P::Capturing,
+            JobPhase::Running => P::Running,
+            JobPhase::Sealing => P::Sealing,
+            JobPhase::Ready => P::Ready,
+            JobPhase::Cancelled => P::Cancelled,
+            JobPhase::Expired => P::Expired,
+            JobPhase::Failed => P::Failed,
+        } as i32,
+        version: s.version,
+        total: s.total,
+        failure: s.failure.as_ref().map(|e| out_job_failure(e) as i32),
     })
 }
 pub(super) fn encode_job_start(r: &Reply) -> Result<pb::JobStartResponse> {
-    let Reply::StartLocalQueryJob { operation_id, job } = r else { return Err(Error::Protocol); };
-    response_size(pb::JobStartResponse { operation_id: operation_id.to_vec(), job: Some(out_job(job)) })
+    let Reply::StartLocalQueryJob { operation_id, job } = r else {
+        return Err(Error::Protocol);
+    };
+    response_size(pb::JobStartResponse {
+        operation_id: operation_id.to_vec(),
+        job: Some(out_job(job)),
+    })
 }
 pub(super) fn encode_job_status(r: &Reply) -> Result<pb::JobStatusResponse> {
     let (job, status) = match r {
-        Reply::GetLocalQueryJob { job, status } | Reply::CancelLocalQueryJob { job, status } => (job, status),
+        Reply::GetLocalQueryJob { job, status } | Reply::CancelLocalQueryJob { job, status } => {
+            (job, status)
+        }
         _ => return Err(Error::Protocol),
     };
-    response_size(pb::JobStatusResponse { job: Some(out_job(job)), status: Some(out_job_status(status)?) })
+    response_size(pb::JobStatusResponse {
+        job: Some(out_job(job)),
+        status: Some(out_job_status(status)?),
+    })
 }
 pub(super) fn encode_job_renew(r: &Reply) -> Result<pb::JobRenewResponse> {
-    let Reply::RenewLocalQueryJob { job, grant } = r else { return Err(Error::Protocol); };
-    response_size(pb::JobRenewResponse { job: Some(out_job(job)), generation: grant.generation, remaining_millis: grant.remaining_millis })
+    let Reply::RenewLocalQueryJob { job, grant } = r else {
+        return Err(Error::Protocol);
+    };
+    response_size(pb::JobRenewResponse {
+        job: Some(out_job(job)),
+        generation: grant.generation,
+        remaining_millis: grant.remaining_millis,
+    })
 }
 pub(super) fn encode_job_fetch(r: &Reply) -> Result<pb::JobFetchResponse> {
-    let Reply::FetchLocalQueryJob { job, query, cursor, page_size, version, page } = r else { return Err(Error::Protocol); };
-    response_size(pb::JobFetchResponse { job: Some(out_job(job)), query: Some(out_query(query)), cursor: cursor.as_ref().map(out_cursor),
-        page_size: u32::from(*page_size), version: *version, page: Some(out_page(page)?) })
+    let Reply::FetchLocalQueryJob {
+        job,
+        query,
+        cursor,
+        page_size,
+        version,
+        page,
+    } = r
+    else {
+        return Err(Error::Protocol);
+    };
+    response_size(pb::JobFetchResponse {
+        job: Some(out_job(job)),
+        query: Some(out_query(query)),
+        cursor: cursor.as_ref().map(out_cursor),
+        page_size: u32::from(*page_size),
+        version: *version,
+        page: Some(out_page(page)?),
+    })
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    fn handle() -> JobHandle {
+        JobHandle {
+            incarnation: [1; 16],
+            token: [2; 32],
+        }
+    }
+
+    fn start() -> pb::JobStartRequest {
+        pb::JobStartRequest {
+            context: Some(pb::Context {
+                version: 1,
+                timeout_millis: 100,
+            }),
+            operation_id: vec![3; 16],
+            version: None,
+            query: Some(pb::Query {
+                partition: 7,
+                text: "g.V(1).out()".into(),
+            }),
+            page_size: 2,
+            policy: Some(pb::JobPolicy {
+                idle_millis: 1000,
+                execution_millis: 2000,
+                lifetime_millis: 3000,
+            }),
+        }
+    }
+
+    #[test]
+    fn job_start_preserves_exact_domain_arguments() {
+        for version in [None, Some(0), Some(u64::MAX)] {
+            let mut request = start();
+            request.version = version;
+            assert_eq!(
+                job_start(request).unwrap(),
+                Operation::StartLocalQueryJob {
+                    operation_id: [3; 16],
+                    version,
+                    query: Query {
+                        partition: 7,
+                        text: "g.V(1).out()".into(),
+                    },
+                    page_size: 2,
+                    policy: JobPolicy {
+                        idle_millis: 1000,
+                        execution_millis: 2000,
+                        lifetime_millis: 3000,
+                    },
+                }
+            );
+        }
+        let reply = encode_job_start(&Reply::StartLocalQueryJob {
+            operation_id: [3; 16],
+            job: handle(),
+        })
+        .unwrap();
+        assert_eq!(reply.operation_id, vec![3; 16]);
+        assert_eq!(reply.job, Some(out_job(&handle())));
+    }
+
+    #[test]
+    fn job_codec_rejects_missing_or_malformed_inputs() {
+        let mut request = start();
+        request.context = None;
+        assert_eq!(job_start(request), Err(Error::Protocol));
+        let mut request = start();
+        request.query = None;
+        assert_eq!(job_start(request), Err(Error::Protocol));
+        let mut request = start();
+        request.policy = None;
+        assert_eq!(job_start(request), Err(Error::Protocol));
+        for id in [vec![], vec![3; 15], vec![3; 17], vec![0; 16]] {
+            let mut request = start();
+            request.operation_id = id;
+            assert_eq!(job_start(request), Err(Error::Identity));
+        }
+        for page_size in [0, u32::from(MAX_PAGE_SIZE) + 1, u32::MAX] {
+            let mut request = start();
+            request.page_size = page_size;
+            assert_eq!(job_start(request), Err(Error::Protocol));
+        }
+        assert_eq!(
+            job_get(pb::JobGetRequest {
+                context: start().context,
+                job: None,
+            }),
+            Err(Error::Protocol)
+        );
+        for bytes in [vec![], vec![2; 31], vec![2; 33], vec![0; 32]] {
+            let mut job = out_job(&handle());
+            job.token = bytes;
+            assert_eq!(
+                job_cancel(pb::JobCancelRequest {
+                    context: start().context,
+                    job: Some(job),
+                }),
+                Err(Error::Identity)
+            );
+        }
+        let mut request = pb::JobFetchRequest {
+            context: start().context,
+            job: Some(out_job(&handle())),
+            query: start().query,
+            cursor: None,
+            page_size: 2,
+        };
+        assert!(matches!(
+            job_fetch(request.clone()).unwrap(),
+            Operation::FetchLocalQueryJob { cursor: None, .. }
+        ));
+        request.cursor = Some(pb::Cursor { token: vec![] });
+        assert_eq!(job_fetch(request), Err(Error::Identity));
+    }
+
+    #[test]
+    fn job_status_maps_every_phase_and_preserves_failure_distinctions() {
+        use pb::{JobFailure as F, JobPhase as P};
+        for (phase, wire) in [
+            (JobPhase::Capturing, P::Capturing),
+            (JobPhase::Running, P::Running),
+            (JobPhase::Sealing, P::Sealing),
+            (JobPhase::Ready, P::Ready),
+            (JobPhase::Cancelled, P::Cancelled),
+            (JobPhase::Expired, P::Expired),
+            (JobPhase::Failed, P::Failed),
+        ] {
+            let ready = phase == JobPhase::Ready;
+            let status = encode_job_status(&Reply::GetLocalQueryJob {
+                job: handle(),
+                status: JobStatus {
+                    phase,
+                    version: ready.then_some(0),
+                    total: ready.then_some(0),
+                    failure: None,
+                },
+            })
+            .unwrap();
+            assert_eq!(status.job, Some(out_job(&handle())));
+            assert_eq!(
+                status.status,
+                Some(pb::JobStatus {
+                    phase: wire as i32,
+                    version: ready.then_some(0),
+                    total: ready.then_some(0),
+                    failure: None,
+                })
+            );
+        }
+        for (error, wire) in [
+            (Error::Protocol, F::Protocol),
+            (Error::JobBusy, F::Busy),
+            (Error::Identity, F::Identity),
+            (Error::Capacity, F::Capacity),
+            (Error::Rejected, F::Rejected),
+            (Error::PreconditionFailed, F::PreconditionFailed),
+            (Error::Unknown, F::Unknown),
+            (Error::SessionUnavailable, F::SessionUnavailable),
+            (Error::Query(QueryFailure::Parse), F::QueryParse),
+            (Error::Query(QueryFailure::Unsupported), F::QueryUnsupported),
+            (
+                Error::Query(QueryFailure::InvalidArgument),
+                F::QueryInvalidArgument,
+            ),
+            (
+                Error::Query(QueryFailure::ResourceExhausted),
+                F::QueryResourceExhausted,
+            ),
+            (Error::Query(QueryFailure::Timeout), F::QueryTimeout),
+            (
+                Error::Query(QueryFailure::UnsupportedScope),
+                F::QueryUnsupportedScope,
+            ),
+            (
+                Error::Query(QueryFailure::IncompleteOrCorrupt),
+                F::QueryIncompleteOrCorrupt,
+            ),
+            (Error::Query(QueryFailure::Unavailable), F::QueryUnavailable),
+        ] {
+            let status = encode_job_status(&Reply::GetLocalQueryJob {
+                job: handle(),
+                status: JobStatus {
+                    phase: JobPhase::Failed,
+                    version: None,
+                    total: None,
+                    failure: Some(error),
+                },
+            })
+            .unwrap();
+            assert_eq!(status.status.unwrap().failure, Some(wire as i32));
+        }
+        assert_ne!(F::QueryUnsupported as i32, F::QueryUnsupportedScope as i32);
+        let invalid = Reply::GetLocalQueryJob {
+            job: handle(),
+            status: JobStatus {
+                phase: JobPhase::Running,
+                version: Some(0),
+                total: None,
+                failure: None,
+            },
+        };
+        assert_eq!(encode_job_status(&invalid), Err(Error::Protocol));
+    }
+
+    #[test]
+    fn job_fetch_and_renew_keep_identity_generation_and_page_binding() {
+        let query = Query {
+            partition: 7,
+            text: "g.V(1).out()".into(),
+        };
+        let cursor = PageCursor { token: [4; 32] };
+        let next = PageCursor { token: [5; 32] };
+        let page = QueryPage {
+            data: QueryData {
+                completeness: QueryCompleteness::Unverified,
+                rows: vec![QueryRow::Count(7)],
+            },
+            next: Some(next.clone()),
+            offset: 2,
+            total: 4,
+        };
+        let reply = encode_job_fetch(&Reply::FetchLocalQueryJob {
+            job: handle(),
+            query: query.clone(),
+            cursor: Some(cursor.clone()),
+            page_size: 2,
+            version: u64::MAX,
+            page: page.clone(),
+        })
+        .unwrap();
+        assert_eq!(reply.job, Some(out_job(&handle())));
+        assert_eq!(reply.query, Some(out_query(&query)));
+        assert_eq!(reply.cursor, Some(out_cursor(&cursor)));
+        assert_eq!(reply.page_size, 2);
+        assert_eq!(reply.version, u64::MAX);
+        assert_eq!(reply.page, Some(out_page(&page).unwrap()));
+        assert_eq!(reply.page.unwrap().next, Some(out_cursor(&next)));
+        assert_eq!(
+            job_renew(pb::JobRenewRequest {
+                context: start().context,
+                job: Some(out_job(&handle())),
+                expected_generation: u64::MAX,
+            })
+            .unwrap(),
+            Operation::RenewLocalQueryJob {
+                job: handle(),
+                expected_generation: u64::MAX,
+            }
+        );
+        let grant = encode_job_renew(&Reply::RenewLocalQueryJob {
+            job: handle(),
+            grant: JobGrant {
+                generation: u64::MAX,
+                remaining_millis: 1,
+            },
+        })
+        .unwrap();
+        assert_eq!(grant.job, Some(out_job(&handle())));
+        assert_eq!(grant.generation, u64::MAX);
+        assert_eq!(grant.remaining_millis, 1);
+    }
 }

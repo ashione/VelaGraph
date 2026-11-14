@@ -16,8 +16,8 @@ use tonic::{
     Status,
 };
 use wire::{
-    managed_query_job_service_server::{ManagedQueryJobService, ManagedQueryJobServiceServer},
     fixed_session_service_server::{FixedSessionService, FixedSessionServiceServer},
+    managed_query_job_service_server::{ManagedQueryJobService, ManagedQueryJobServiceServer},
     query_service_server::{QueryService, QueryServiceServer},
     write_service_server::{WriteService, WriteServiceServer},
 };
@@ -567,34 +567,54 @@ pub(super) async fn bind(
 
 #[tonic::async_trait]
 impl ManagedQueryJobService for Handler {
-    async fn start(&self, request: tonic::Request<wire::JobStartRequest>) -> std::result::Result<tonic::Response<wire::JobStartResponse>, Status> {
+    async fn start(
+        &self,
+        request: tonic::Request<wire::JobStartRequest>,
+    ) -> std::result::Result<tonic::Response<wire::JobStartResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::job_start(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_start).await
+        self.run(call, operation, budget, codec::encode_job_start)
+            .await
     }
-    async fn get(&self, request: tonic::Request<wire::JobGetRequest>) -> std::result::Result<tonic::Response<wire::JobStatusResponse>, Status> {
+    async fn get(
+        &self,
+        request: tonic::Request<wire::JobGetRequest>,
+    ) -> std::result::Result<tonic::Response<wire::JobStatusResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::job_get(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_status).await
+        self.run(call, operation, budget, codec::encode_job_status)
+            .await
     }
-    async fn renew(&self, request: tonic::Request<wire::JobRenewRequest>) -> std::result::Result<tonic::Response<wire::JobRenewResponse>, Status> {
+    async fn renew(
+        &self,
+        request: tonic::Request<wire::JobRenewRequest>,
+    ) -> std::result::Result<tonic::Response<wire::JobRenewResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::job_renew(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_renew).await
+        self.run(call, operation, budget, codec::encode_job_renew)
+            .await
     }
-    async fn fetch(&self, request: tonic::Request<wire::JobFetchRequest>) -> std::result::Result<tonic::Response<wire::JobFetchResponse>, Status> {
+    async fn fetch(
+        &self,
+        request: tonic::Request<wire::JobFetchRequest>,
+    ) -> std::result::Result<tonic::Response<wire::JobFetchResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::job_fetch(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_fetch).await
+        self.run(call, operation, budget, codec::encode_job_fetch)
+            .await
     }
-    async fn cancel(&self, request: tonic::Request<wire::JobCancelRequest>) -> std::result::Result<tonic::Response<wire::JobStatusResponse>, Status> {
+    async fn cancel(
+        &self,
+        request: tonic::Request<wire::JobCancelRequest>,
+    ) -> std::result::Result<tonic::Response<wire::JobStatusResponse>, Status> {
         let call = admitted(&request)?;
         let budget = codec::context(&request.get_ref().context).map_err(codec::error)?;
         let operation = codec::job_cancel(request.into_inner()).map_err(codec::error)?;
-        self.run(call, operation, budget, codec::encode_job_status).await
+        self.run(call, operation, budget, codec::encode_job_status)
+            .await
     }
 }

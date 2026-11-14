@@ -595,6 +595,134 @@ pub struct FixedCloseResponse {
     pub session: ::core::option::Option<FixedSession>,
 }
 #[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobHandle {
+    #[prost(bytes = "vec", tag = "1")]
+    pub incarnation: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub token: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobPolicy {
+    #[prost(uint64, tag = "1")]
+    pub idle_millis: u64,
+    #[prost(uint64, tag = "2")]
+    pub execution_millis: u64,
+    #[prost(uint64, tag = "3")]
+    pub lifetime_millis: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStatus {
+    #[prost(enumeration = "JobPhase", tag = "1")]
+    pub phase: i32,
+    #[prost(uint64, optional, tag = "2")]
+    pub version: ::core::option::Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub total: ::core::option::Option<u32>,
+    #[prost(enumeration = "JobFailure", optional, tag = "4")]
+    pub failure: ::core::option::Option<i32>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStartRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<Context>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub operation_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, optional, tag = "3")]
+    pub version: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "4")]
+    pub query: ::core::option::Option<Query>,
+    #[prost(uint32, tag = "5")]
+    pub page_size: u32,
+    #[prost(message, optional, tag = "6")]
+    pub policy: ::core::option::Option<JobPolicy>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStartResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub operation_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub job: ::core::option::Option<JobHandle>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobGetRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<Context>,
+    #[prost(message, optional, tag = "2")]
+    pub job: ::core::option::Option<JobHandle>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobCancelRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<Context>,
+    #[prost(message, optional, tag = "2")]
+    pub job: ::core::option::Option<JobHandle>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStatusResponse {
+    #[prost(message, optional, tag = "1")]
+    pub job: ::core::option::Option<JobHandle>,
+    #[prost(message, optional, tag = "2")]
+    pub status: ::core::option::Option<JobStatus>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobRenewRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<Context>,
+    #[prost(message, optional, tag = "2")]
+    pub job: ::core::option::Option<JobHandle>,
+    #[prost(uint64, tag = "3")]
+    pub expected_generation: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobRenewResponse {
+    #[prost(message, optional, tag = "1")]
+    pub job: ::core::option::Option<JobHandle>,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub remaining_millis: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobFetchRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<Context>,
+    #[prost(message, optional, tag = "2")]
+    pub job: ::core::option::Option<JobHandle>,
+    #[prost(message, optional, tag = "3")]
+    pub query: ::core::option::Option<Query>,
+    #[prost(message, optional, tag = "4")]
+    pub cursor: ::core::option::Option<Cursor>,
+    #[prost(uint32, tag = "5")]
+    pub page_size: u32,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobFetchResponse {
+    #[prost(message, optional, tag = "1")]
+    pub job: ::core::option::Option<JobHandle>,
+    #[prost(message, optional, tag = "2")]
+    pub query: ::core::option::Option<Query>,
+    #[prost(message, optional, tag = "3")]
+    pub cursor: ::core::option::Option<Cursor>,
+    #[prost(uint32, tag = "4")]
+    pub page_size: u32,
+    #[prost(uint64, tag = "5")]
+    pub version: u64,
+    #[prost(message, optional, tag = "6")]
+    pub page: ::core::option::Option<Page>,
+}
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Completeness {
@@ -620,6 +748,124 @@ impl Completeness {
             "COMPLETENESS_UNSPECIFIED" => Some(Self::Unspecified),
             "SINGLE_PARTITION" => Some(Self::SinglePartition),
             "UNVERIFIED" => Some(Self::Unverified),
+            _ => None,
+        }
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum JobPhase {
+    Unspecified = 0,
+    Capturing = 1,
+    Running = 2,
+    Sealing = 3,
+    Ready = 4,
+    Cancelled = 5,
+    Expired = 6,
+    Failed = 7,
+}
+impl JobPhase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "JOB_PHASE_UNSPECIFIED",
+            Self::Capturing => "CAPTURING",
+            Self::Running => "RUNNING",
+            Self::Sealing => "SEALING",
+            Self::Ready => "READY",
+            Self::Cancelled => "CANCELLED",
+            Self::Expired => "EXPIRED",
+            Self::Failed => "FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "JOB_PHASE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CAPTURING" => Some(Self::Capturing),
+            "RUNNING" => Some(Self::Running),
+            "SEALING" => Some(Self::Sealing),
+            "READY" => Some(Self::Ready),
+            "CANCELLED" => Some(Self::Cancelled),
+            "EXPIRED" => Some(Self::Expired),
+            "FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+/// Unlike RPC status details, retained failure preserves every domain distinction.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum JobFailure {
+    Unspecified = 0,
+    Protocol = 1,
+    Busy = 2,
+    Identity = 3,
+    Capacity = 4,
+    Rejected = 5,
+    PreconditionFailed = 6,
+    Unknown = 7,
+    SessionUnavailable = 8,
+    QueryParse = 9,
+    QueryUnsupported = 10,
+    QueryInvalidArgument = 11,
+    QueryResourceExhausted = 12,
+    QueryTimeout = 13,
+    QueryUnsupportedScope = 14,
+    QueryIncompleteOrCorrupt = 15,
+    QueryUnavailable = 16,
+}
+impl JobFailure {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "JOB_FAILURE_UNSPECIFIED",
+            Self::Protocol => "PROTOCOL",
+            Self::Busy => "BUSY",
+            Self::Identity => "IDENTITY",
+            Self::Capacity => "CAPACITY",
+            Self::Rejected => "REJECTED",
+            Self::PreconditionFailed => "PRECONDITION_FAILED",
+            Self::Unknown => "UNKNOWN",
+            Self::SessionUnavailable => "SESSION_UNAVAILABLE",
+            Self::QueryParse => "QUERY_PARSE",
+            Self::QueryUnsupported => "QUERY_UNSUPPORTED",
+            Self::QueryInvalidArgument => "QUERY_INVALID_ARGUMENT",
+            Self::QueryResourceExhausted => "QUERY_RESOURCE_EXHAUSTED",
+            Self::QueryTimeout => "QUERY_TIMEOUT",
+            Self::QueryUnsupportedScope => "QUERY_UNSUPPORTED_SCOPE",
+            Self::QueryIncompleteOrCorrupt => "QUERY_INCOMPLETE_OR_CORRUPT",
+            Self::QueryUnavailable => "QUERY_UNAVAILABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "JOB_FAILURE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROTOCOL" => Some(Self::Protocol),
+            "BUSY" => Some(Self::Busy),
+            "IDENTITY" => Some(Self::Identity),
+            "CAPACITY" => Some(Self::Capacity),
+            "REJECTED" => Some(Self::Rejected),
+            "PRECONDITION_FAILED" => Some(Self::PreconditionFailed),
+            "UNKNOWN" => Some(Self::Unknown),
+            "SESSION_UNAVAILABLE" => Some(Self::SessionUnavailable),
+            "QUERY_PARSE" => Some(Self::QueryParse),
+            "QUERY_UNSUPPORTED" => Some(Self::QueryUnsupported),
+            "QUERY_INVALID_ARGUMENT" => Some(Self::QueryInvalidArgument),
+            "QUERY_RESOURCE_EXHAUSTED" => Some(Self::QueryResourceExhausted),
+            "QUERY_TIMEOUT" => Some(Self::QueryTimeout),
+            "QUERY_UNSUPPORTED_SCOPE" => Some(Self::QueryUnsupportedScope),
+            "QUERY_INCOMPLETE_OR_CORRUPT" => Some(Self::QueryIncompleteOrCorrupt),
+            "QUERY_UNAVAILABLE" => Some(Self::QueryUnavailable),
             _ => None,
         }
     }
@@ -1957,6 +2203,541 @@ pub mod fixed_session_service_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "velagraph.public.managed.v1.FixedSessionService";
     impl<T> tonic::server::NamedService for FixedSessionServiceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod managed_query_job_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value
+    )]
+    use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
+    /// Process-local bounded jobs on the same public listener. No durable resume.
+    #[derive(Debug, Clone)]
+    pub struct ManagedQueryJobServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl ManagedQueryJobServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> ManagedQueryJobServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> ManagedQueryJobServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            ManagedQueryJobServiceClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn start(
+            &mut self,
+            request: impl tonic::IntoRequest<super::JobStartRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobStartResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Start",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.public.managed.v1.ManagedQueryJobService",
+                "Start",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get(
+            &mut self,
+            request: impl tonic::IntoRequest<super::JobGetRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobStatusResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Get",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.public.managed.v1.ManagedQueryJobService",
+                "Get",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn renew(
+            &mut self,
+            request: impl tonic::IntoRequest<super::JobRenewRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobRenewResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Renew",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.public.managed.v1.ManagedQueryJobService",
+                "Renew",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn fetch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::JobFetchRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobFetchResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Fetch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.public.managed.v1.ManagedQueryJobService",
+                "Fetch",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn cancel(
+            &mut self,
+            request: impl tonic::IntoRequest<super::JobCancelRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobStatusResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Cancel",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "velagraph.public.managed.v1.ManagedQueryJobService",
+                "Cancel",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod managed_query_job_service_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with ManagedQueryJobServiceServer.
+    #[async_trait]
+    pub trait ManagedQueryJobService: std::marker::Send + std::marker::Sync + 'static {
+        async fn start(
+            &self,
+            request: tonic::Request<super::JobStartRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobStartResponse>, tonic::Status>;
+        async fn get(
+            &self,
+            request: tonic::Request<super::JobGetRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobStatusResponse>, tonic::Status>;
+        async fn renew(
+            &self,
+            request: tonic::Request<super::JobRenewRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobRenewResponse>, tonic::Status>;
+        async fn fetch(
+            &self,
+            request: tonic::Request<super::JobFetchRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobFetchResponse>, tonic::Status>;
+        async fn cancel(
+            &self,
+            request: tonic::Request<super::JobCancelRequest>,
+        ) -> std::result::Result<tonic::Response<super::JobStatusResponse>, tonic::Status>;
+    }
+    /// Process-local bounded jobs on the same public listener. No durable resume.
+    #[derive(Debug)]
+    pub struct ManagedQueryJobServiceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> ManagedQueryJobServiceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ManagedQueryJobServiceServer<T>
+    where
+        T: ManagedQueryJobService,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Start" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartSvc<T: ManagedQueryJobService>(pub Arc<T>);
+                    impl<T: ManagedQueryJobService>
+                        tonic::server::UnaryService<super::JobStartRequest> for StartSvc<T>
+                    {
+                        type Response = super::JobStartResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::JobStartRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ManagedQueryJobService>::start(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartSvc(inner);
+                        let codec =
+                            crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Get" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSvc<T: ManagedQueryJobService>(pub Arc<T>);
+                    impl<T: ManagedQueryJobService>
+                        tonic::server::UnaryService<super::JobGetRequest> for GetSvc<T>
+                    {
+                        type Response = super::JobStatusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::JobGetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ManagedQueryJobService>::get(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSvc(inner);
+                        let codec =
+                            crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Renew" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenewSvc<T: ManagedQueryJobService>(pub Arc<T>);
+                    impl<T: ManagedQueryJobService>
+                        tonic::server::UnaryService<super::JobRenewRequest> for RenewSvc<T>
+                    {
+                        type Response = super::JobRenewResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::JobRenewRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ManagedQueryJobService>::renew(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenewSvc(inner);
+                        let codec =
+                            crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Fetch" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchSvc<T: ManagedQueryJobService>(pub Arc<T>);
+                    impl<T: ManagedQueryJobService>
+                        tonic::server::UnaryService<super::JobFetchRequest> for FetchSvc<T>
+                    {
+                        type Response = super::JobFetchResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::JobFetchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ManagedQueryJobService>::fetch(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchSvc(inner);
+                        let codec =
+                            crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/velagraph.public.managed.v1.ManagedQueryJobService/Cancel" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelSvc<T: ManagedQueryJobService>(pub Arc<T>);
+                    impl<T: ManagedQueryJobService>
+                        tonic::server::UnaryService<super::JobCancelRequest> for CancelSvc<T>
+                    {
+                        type Response = super::JobStatusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::JobCancelRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ManagedQueryJobService>::cancel(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelSvc(inner);
+                        let codec =
+                            crate::managed_gateway::grpc_codec::bounded::BoundedCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
+            }
+        }
+    }
+    impl<T> Clone for ManagedQueryJobServiceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "velagraph.public.managed.v1.ManagedQueryJobService";
+    impl<T> tonic::server::NamedService for ManagedQueryJobServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
