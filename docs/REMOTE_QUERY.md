@@ -1,5 +1,12 @@
 # Experimental single-partition server query pushdown
 
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
 This additive trusted-network RPC executes standard Gremlin on the contacted
 server instead of downloading the whole shard to the client. It is a functional
 prototype, not a production Gremlin server, global query coordinator, or failover
@@ -226,6 +233,6 @@ upstream integrity/scope failures or enlarge budgets. V1, legacy observed v1/v2
 and separate server-coordinator/job entrypoints remain unchanged. See the
 [shared contract](MANAGED_FIXED_TRAVERSALS.md#bounded-simple-and-cyclic-path-filters).
 
-The old `remote::query::query` JSON API remains only for explicit library legacy
-fixtures. Product graph-node exposes the typed service on --graph, and
-graph-client server-query uses it without protocol fallback.
+The `remote::query::query` convenience API now delegates to typed gRPC and
+requires explicit identity; `None` is rejected. Product graph-node and library
+GraphService expose the same typed service, without a legacy listener or fallback.

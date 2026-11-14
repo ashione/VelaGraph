@@ -1,5 +1,12 @@
 # Single-shard operations over typed gRPC
 
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
 Tracking: [#254](https://github.com/ashione/VelaGraph/issues/254), part of [#218](https://github.com/ashione/VelaGraph/issues/218).
 
 The graph gRPC listener exposes a separate versioned service for `Probe`,

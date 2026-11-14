@@ -2,7 +2,8 @@
 
 The loopback service exposes `velagraph.public.managed.v1.WriteService`
 (Submit, Status, Abort), `QueryService` (Open, Fetch, Close), and
-`FixedSessionService` (Open, Read, Traverse, Page, Close). The schema is
+`FixedSessionService` (Open, Read, Traverse, Page, Close), and
+`ManagedQueryJobService` (Start, Get, Renew, Fetch, Cancel). The schema is
 [`public_managed.proto`](../crates/replicated-graph/proto/public_managed.proto);
 generated Rust clients and messages are exported at
 `replicated_graph::managed_gateway::public_proto`. This is an experimental
@@ -21,8 +22,7 @@ Both public adapters and the typed library Gateway use the same
 `Invocation`, state, canonical mutation identity, original-Plan recovery,
 certified fixed-V query executor, admission and retention budgets. There is no
 extra TCP proxy hop between a public adapter and the business handler, and no
-observed-read fallback. Internal managed/node RPCs still use their currently
-supported transport; this public slice does not claim they all became gRPC.
+observed-read fallback. Internal managed/node and graph RPCs now also use typed gRPC after #279.
 
 HTTP remains the isolated [preview JSON contract](PUBLIC_HTTP_PREVIEW.md), not
 protobuf JSON. gRPC carries real typed protobuf messages, not opaque JSON bytes.
@@ -86,7 +86,8 @@ messages keep their existing capacity limits. This is not a data-local scaling
 improvement. HTTP parity for this additional service and for the asynchronous
 managed job service remains future work; typed job RPCs are described below.
 The library Gateway now binds this typed service instead of JSON/TCP; #218
-remains open for the separate graph library transport retirement.
+remains open for cross-language, compatibility and service-surface evidence;
+graph library transport retirement is complete in #279.
 
 ## Errors and ownership
 

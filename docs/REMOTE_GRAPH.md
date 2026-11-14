@@ -1,5 +1,12 @@
 # Development-only remote graph service
 
+> Current transport baseline: main `40e2b9a` (#279, 2026-11-14). Supported
+> graph, coordinator, Gateway, managed-member, Raft and control network paths use
+> typed gRPC; old JSON/TCP library listeners and fallback are retired. Public HTTP
+> remains intentional. Historical transport details below are not a supported
+> compatibility mode. See [current RPC audit](RPC_MIGRATION_STATUS.md).
+
+
 This slice closes the **normal functional path** between a client process and
 three independent Raft server processes: graph vertex/edge CRUD, exact prepared
 mutation replay, point reads, and standard Gremlin queries. It is not a
@@ -68,9 +75,9 @@ budgets, deadline handling, slow-reader availability limits, and validation.
 bounded pages, then constructs the same **complete local `ReadView`**. It is
 not an on-demand remote view: all shard bytes are transferred before success.
 Point reads, local scan cursors and Gremlin retain their existing semantics.
-The old `snapshot` / `snapshot_identified` APIs and single `Snapshot` RPC remain
-only as explicit legacy library/parity APIs with their original 2 MiB /
-100,000-row limits; graph-node no longer serves that wire. There is no fallback.
+The identified `snapshot_identified` helper and typed single-shot Snapshot keep
+their original 2 MiB / 100,000-row limits. The unidentified `snapshot` helper is
+removed. Both single-shot and paged contracts use typed gRPC; neither falls back.
 
 `open_snapshot` performs the barrier and captures one immutable copy. Its
 versioned descriptor binds server group/node, random startup incarnation,
@@ -116,7 +123,7 @@ not caller-retained returned snapshots/ReadViews. Payload plus row/object and
 frame caps are not exact heap/RSS guarantees. Typed unary shard operations
 preserve the historical 16 MiB canonical-JSON logical budget (including byte-array
 expansion) in addition to protobuf wire/allocation limits; JSON is not the new
-wire format. The explicit legacy library retains its length-prefixed JSON frame.
+wire format. The former library JSON frame is retired.
 A legal local D1 batch may not fit the remote budget and fails explicitly.
 Existing D1 writes, dedup and query execution limits are unchanged.
 
@@ -201,11 +208,11 @@ cryptographic protocol or authentication claim is introduced.
 operation and CLI commands. Existing snapshot download APIs remain unchanged.
 This does not add cross-shard global consistency, retry, TLS or authentication.
 
-## JSON scheduling and cancellation
+## Historical JSON scheduling (retired wire)
 
 On multithread Tokio runtimes, bounded frame encoding and decoding keep the
 caller's stack and admission permit while `block_in_place` lets Tokio replace the
-occupied worker. Current-thread runtimes keep the previous inline behavior.
+occupied worker. Current-thread runtimes kept the previous inline behavior.
 Encoding uses a fixed 8 KiB scratch buffer, flushes through the same bounded
 writer, and checks the original absolute deadline before sending any frame
 bytes. The extra scratch does not increase the accepted frame limit. Decoding

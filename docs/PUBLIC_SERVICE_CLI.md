@@ -69,9 +69,10 @@ made-up identity values just to make a service start.
 
 The gRPC schema is
 [`public_managed.proto`](../crates/replicated-graph/proto/public_managed.proto),
-with WriteService Submit/Status/Abort and QueryService Open/Fetch/Close. Rust
-clients are available under `managed_gateway::public_proto`; `Context.version`
-is 1 and the caller supplies a finite timeout. gRPC carries typed protobuf
+with WriteService, QueryService, FixedSessionService and ManagedQueryJobService.
+Rust clients are available under `managed_gateway::public_proto`. Generated public
+clients use Context version 1; the identified library protocol also supports
+version 2 with exact binding/call identity. All calls supply a finite timeout. gRPC carries typed protobuf
 values and binary tokens, while HTTP `/preview1` retains its documented JSON
 preview encoding. They are semantically equivalent adapters, not the same wire
 format or a claim that HTTP is protobuf JSON. A session opened over either
@@ -82,8 +83,9 @@ graph fragment/session routes. Configure their gRPC listener addresses. The form
 `--internal-grpc` switch is removed; legacy managed endpoints fail the startup identity probe, without fallback.
 A connected graph channel does not prove typed-service readiness; a wrong graph
 endpoint fails its first operation. The startup announcement is not a graph health
-check. Other library/test/control entrypoints, including explicitly selected legacy
-Gateway listeners, remain separate #218 cleanup work.
+check. Library Gateway, coordinator and GraphService legacy wires are retired
+in #275/#277/#279. Cross-language, HTTP-surface and readiness gates remain;
+see [current RPC audit](RPC_MIGRATION_STATUS.md).
 
 ## Process acceptance scope
 
