@@ -880,7 +880,10 @@ mod tests {
         .unwrap();
         assert_eq!(query.text, text);
         let error = velagraph::ObservedGremlinQuery::parse(&query.text).unwrap_err();
-        assert_eq!(crate::remote::query::graph_error(error), QueryFailure::Parse);
+        assert_eq!(
+            crate::remote::query::graph_error(error),
+            QueryFailure::Parse
+        );
     }
     #[test]
     fn explicit_profile_and_zero_version_survive_typed_request() {
