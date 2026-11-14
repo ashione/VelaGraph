@@ -135,8 +135,7 @@ async fn remote_submission_timing_preserves_success_and_original_id_retry() {
     assert_eq!(observed[0], (1, vec![], vec![v(7, 1)], 1));
 }
 
-#[path = "managed_grpc_test_peer.rs"]
-mod rpc_peer;
+use crate::managed_grpc_test_peer as rpc_peer;
 
 // Hold the first typed LookupTarget before forwarding. Admission and recovery
 // lookup have already completed; cancellation cannot dispatch the held read.

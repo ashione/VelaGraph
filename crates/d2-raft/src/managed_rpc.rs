@@ -3923,7 +3923,11 @@ mod tests {
                 NodeRef::Remote(&client)
                     .summary(&identity().authority, 1)
                     .await,
-                Err(Error::Identity)
+                Err(if fault == 3 {
+                    Error::Protocol
+                } else {
+                    Error::Identity
+                })
             );
             peer.await.unwrap();
         }
@@ -4405,7 +4409,11 @@ mod tests {
                 NodeRef::Remote(&client)
                     .grant_status(&id.authority, &id.target, &id.cohort)
                     .await,
-                Err(Error::Identity),
+                Err(if fault >= 5 {
+                    Error::Protocol
+                } else {
+                    Error::Identity
+                }),
                 "fault {fault}"
             );
             peer.await.unwrap();
@@ -4432,7 +4440,11 @@ mod tests {
                 NodeRef::Remote(&client)
                     .confirm_capacity(&coordinator.authority, 1)
                     .await,
-                Err(Error::Identity),
+                Err(if fault == 4 {
+                    Error::Protocol
+                } else {
+                    Error::Identity
+                }),
                 "confirmation fault {fault}"
             );
             peer.await.unwrap();

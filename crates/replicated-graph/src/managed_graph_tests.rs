@@ -1107,8 +1107,7 @@ async fn incremental_history_catches_up_every_member_after_observed_only_page() 
 // top-level entrypoints; helpers and internal concurrent operations stay parallel.
 static REMOTE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[path = "managed_grpc_test_peer.rs"]
-mod rpc_peer;
+use crate::managed_grpc_test_peer as rpc_peer;
 
 type HistorySteps = Vec<(serde_json::Value, Option<serde_json::Value>)>;
 struct HistoryPeer {
