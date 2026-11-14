@@ -11,7 +11,7 @@ use replicated_graph::remote::{
     RemoteError, RemoteIdentity,
 };
 use std::{
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -54,20 +54,27 @@ fn log_tail(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 impl Drop for ObservedProcess {
     fn drop(&mut self) {
         if !self.success {
-            eprintln!(
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
                 "shard_fixture node={} pid={} pre_cleanup_exit={:?}",
                 self.node,
                 self.process.0.id(),
                 self.process.0.try_wait()
             );
             match log_tail(self.log.path()) {
-                Ok(bytes) => eprintln!(
-                    "shard_fixture node={} log_tail_bytes={}\\n{}",
-                    self.node,
-                    bytes.len(),
-                    String::from_utf8_lossy(&bytes)
-                ),
-                Err(error) => eprintln!("shard_fixture node={} log_error={error}", self.node),
+                Ok(bytes) => {
+                    let _ = writeln!(
+                        stderr,
+                        "shard_fixture node={} log_tail_bytes={}\n{}",
+                        self.node,
+                        bytes.len(),
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(stderr, "shard_fixture node={} log_error={error}", self.node);
+                }
             }
         }
     }
@@ -853,7 +860,6 @@ async fn server_query_cli(endpoint: SocketAddr, identity: RemoteIdentity) -> any
 
 #[test]
 fn diagnostic_tail_is_bounded_and_does_not_move_writer_offset() -> anyhow::Result<()> {
-    use std::io::Write;
     let file = tempfile::NamedTempFile::new()?;
     let mut writer = file.reopen()?;
     writer.write_all(&vec![b'a'; 20 * 1024])?;
