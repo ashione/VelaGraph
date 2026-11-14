@@ -43,8 +43,11 @@ fn historical_record_bytes_open_without_namespace_migration() {
     let vertex_key = key(b"vertex/", 1);
     let edge_key = key(b"edge/", 7);
     let dir = TempDir::new().unwrap();
+    let mut options = rocksdb::Options::default();
+    options.create_if_missing(true);
+    options.set_compression_type(rocksdb::DBCompressionType::None);
     {
-        let db = rocksdb::DB::open_default(dir.path()).unwrap();
+        let db = rocksdb::DB::open(&options, dir.path()).unwrap();
         db.put(&vertex_key, vertex_bytes).unwrap();
         db.put(&edge_key, edge_bytes).unwrap();
         db.flush().unwrap();
@@ -63,7 +66,7 @@ fn historical_record_bytes_open_without_namespace_migration() {
         assert_eq!(graph.get_vertex(1).unwrap(), Some(expected_vertex.clone()));
         assert_eq!(graph.get_edge(7).unwrap(), Some(expected_edge.clone()));
     }
-    let db = rocksdb::DB::open_default(dir.path()).unwrap();
+    let db = rocksdb::DB::open(&options, dir.path()).unwrap();
     assert_eq!(db.get(vertex_key).unwrap().unwrap(), vertex_bytes);
     assert_eq!(db.get(edge_key).unwrap().unwrap(), edge_bytes);
 }
