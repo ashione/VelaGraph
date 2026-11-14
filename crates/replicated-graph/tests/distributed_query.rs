@@ -1,7 +1,5 @@
 //! Real independent data processes; coordinator runs in this test process.
 //! This verifies distributed query semantics, not failover or transport security.
-#[path = "support/legacy_graph_node.rs"]
-mod legacy_graph_node;
 use anyhow::{ensure, Context};
 use replicated_graph::{
     catalog::{Catalog, Placement},
@@ -30,8 +28,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::Notify,
     time::{sleep, timeout},
 };
@@ -123,16 +120,15 @@ impl Group {
         let raft_addr = raft.local_addr()?;
         let control_addr = control.local_addr()?;
         let endpoint = graph.local_addr()?;
-        let grpc_listener = TcpListener::bind("127.0.0.1:0").await?;
-        let grpc = grpc_listener.local_addr()?;
+        let grpc = endpoint;
         let dir = tempfile::tempdir()?;
-        drop((raft, control, graph, grpc_listener));
+        drop((raft, control, graph));
         let identity = RemoteIdentity {
             group: shard,
             node: 1,
         };
         let process = Process(
-            legacy_graph_node::command()
+            Command::new(env!("CARGO_BIN_EXE_graph-node"))
                 .env("TOKIO_WORKER_THREADS", "2")
                 .args([
                     "--allow-insecure-development",
@@ -146,8 +142,6 @@ impl Group {
                     &control_addr.to_string(),
                     "--graph",
                     &endpoint.to_string(),
-                    "--grpc-snapshot",
-                    &grpc.to_string(),
                     "--shard",
                     &shard.to_string(),
                     "--epoch",
@@ -163,10 +157,7 @@ impl Group {
         );
         timeout(Duration::from_secs(30), async {
             loop {
-                if remote::probe_identified(endpoint, identity, shard, Duration::from_millis(300))
-                    .await
-                    .is_ok()
-                {
+                if typed_probe(endpoint, identity, shard).await.is_ok() {
                     break;
                 }
                 sleep(Duration::from_millis(25)).await;
@@ -209,7 +200,7 @@ impl Group {
             let mut request_id = [0; 16];
             request_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             request_id[8..].copy_from_slice(&self.route.shard.to_be_bytes());
-            remote::write_identified(
+            typed_write(
                 self.route.endpoint,
                 self.route.identity,
                 d2_raft::D1WriteRequest {
@@ -467,8 +458,8 @@ fn fixture() -> anyhow::Result<(Export, Export)> {
     Ok((a.admin().export()?, damaged))
 }
 
-// Record each data-node operation on the wire. Reject full-snapshot downloads
-// even if a future implementation accidentally adds a fallback.
+// Typed audit endpoint exposes only query fragments. Snapshot services are not
+// registered, so full-shard downloads fail instead of bypassing the proxy.
 #[derive(Default)]
 struct FragmentGate {
     pause_open: AtomicBool,
@@ -490,7 +481,139 @@ impl Drop for AuditProxy {
         self.task.abort();
     }
 }
+use distributed::grpc::wire as query_wire;
+#[derive(Clone)]
+struct QueryAudit {
+    client: query_wire::query_service_client::QueryServiceClient<tonic::transport::Channel>,
+    bytes: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
+    opened: Arc<AtomicUsize>,
+    gate: Arc<FragmentGate>,
+}
+impl QueryAudit {
+    async fn opening(&self) {
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        if self.gate.pause_open.swap(false, Ordering::SeqCst) {
+            self.gate.entered.notify_one();
+            self.gate.resume.notified().await;
+        }
+    }
+    fn record<T: prost::Message>(&self, response: &tonic::Response<T>) {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        // Count protobuf message bytes plus the gRPC message prefix, not JSON.
+        self.bytes
+            .fetch_add(response.get_ref().encoded_len() + 5, Ordering::SeqCst);
+    }
+}
+#[tonic::async_trait]
+impl query_wire::query_service_server::QueryService for QueryAudit {
+    async fn open(
+        &self,
+        request: tonic::Request<query_wire::OpenRequest>,
+    ) -> Result<tonic::Response<query_wire::Descriptor>, tonic::Status> {
+        self.opening().await;
+        let response = self.client.clone().open(request).await?;
+        self.record(&response);
+        Ok(response)
+    }
+    async fn open_hierarchy(
+        &self,
+        request: tonic::Request<query_wire::OpenRequest>,
+    ) -> Result<tonic::Response<query_wire::HierarchyDescriptor>, tonic::Status> {
+        self.opening().await;
+        let response = self.client.clone().open_hierarchy(request).await?;
+        self.record(&response);
+        Ok(response)
+    }
+    async fn fragment(
+        &self,
+        request: tonic::Request<query_wire::FragmentRequest>,
+    ) -> Result<tonic::Response<query_wire::FragmentResponse>, tonic::Status> {
+        if self.gate.pause.swap(false, Ordering::SeqCst) {
+            self.gate.entered.notify_one();
+            self.gate.resume.notified().await;
+        }
+        let response = self.client.clone().fragment(request).await?;
+        self.record(&response);
+        Ok(response)
+    }
+    async fn close(
+        &self,
+        request: tonic::Request<query_wire::CloseRequest>,
+    ) -> Result<tonic::Response<query_wire::Empty>, tonic::Status> {
+        let response = self.client.clone().close(request).await?;
+        self.record(&response);
+        Ok(response)
+    }
+}
+// Wrap the generated service before routing, rather than wrapping only known
+// handlers: attempts to use snapshots or any future fallback are observable.
+#[derive(Clone)]
+struct AuditedQueryService {
+    inner: query_wire::query_service_server::QueryServiceServer<QueryAudit>,
+    forbidden: Arc<AtomicUsize>,
+}
+impl tonic::codegen::Service<tonic::codegen::http::Request<hyper::body::Incoming>>
+    for AuditedQueryService
+{
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = <query_wire::query_service_server::QueryServiceServer<QueryAudit> as tonic::codegen::Service<
+        tonic::codegen::http::Request<hyper::body::Incoming>,
+    >>::Future;
+
+    fn poll_ready(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        <query_wire::query_service_server::QueryServiceServer<QueryAudit> as tonic::codegen::Service<
+            tonic::codegen::http::Request<hyper::body::Incoming>,
+        >>::poll_ready(&mut self.inner, context)
+    }
+
+    fn call(
+        &mut self,
+        request: tonic::codegen::http::Request<hyper::body::Incoming>,
+    ) -> Self::Future {
+        if !matches!(
+            request.uri().path(),
+            "/velagraph.internal.query.v1.QueryService/Open"
+                | "/velagraph.internal.query.v1.QueryService/OpenHierarchy"
+                | "/velagraph.internal.query.v1.QueryService/Fragment"
+                | "/velagraph.internal.query.v1.QueryService/Close"
+        ) {
+            self.forbidden.fetch_add(1, Ordering::SeqCst);
+        }
+        tonic::codegen::Service::call(&mut self.inner, request)
+    }
+}
 impl AuditProxy {
+    async fn rejects_snapshots(&self) -> anyhow::Result<()> {
+        use remote::grpc::wire as snapshot;
+        assert_eq!(
+            self.forbidden.load(Ordering::SeqCst),
+            0,
+            "executor attempted a snapshot or unknown RPC"
+        );
+        let mut client = snapshot::snapshot_service_client::SnapshotServiceClient::connect(
+            format!("http://{}", self.endpoint),
+        )
+        .await?;
+        let error = client
+            .open(snapshot::OpenRequest {
+                context: None,
+                shard: 120,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert_eq!(
+            self.forbidden.load(Ordering::SeqCst),
+            1,
+            "only the explicit negative probe is allowed"
+        );
+        Ok(())
+    }
     async fn start(target: SocketAddr) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = listener.local_addr()?;
@@ -498,89 +621,46 @@ impl AuditProxy {
         let requests = Arc::new(AtomicUsize::new(0));
         let forbidden = Arc::new(AtomicUsize::new(0));
         let opened = Arc::new(AtomicUsize::new(0));
-        let (b, r, f, o) = (
-            bytes.clone(),
-            requests.clone(),
-            forbidden.clone(),
-            opened.clone(),
-        );
         let gate = Arc::new(FragmentGate::default());
-        let worker_gate = gate.clone();
+        let client = query_wire::query_service_client::QueryServiceClient::connect(format!(
+            "http://{target}"
+        ))
+        .await?
+        .max_decoding_message_size(remote::MAX_FRAME_BYTES)
+        .max_encoding_message_size(remote::MAX_FRAME_BYTES);
+        let service = query_wire::query_service_server::QueryServiceServer::new(QueryAudit {
+            client,
+            bytes: bytes.clone(),
+            requests: requests.clone(),
+            opened: opened.clone(),
+            gate: gate.clone(),
+        })
+        .max_decoding_message_size(remote::MAX_FRAME_BYTES)
+        .max_encoding_message_size(remote::MAX_FRAME_BYTES);
+        let service = AuditedQueryService {
+            inner: service,
+            forbidden: forbidden.clone(),
+        };
         let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((mut client, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    result = listener.accept() => result,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let Ok((socket, _)) = accepted else {
                     break;
                 };
-                let (b, r, f, o) = (b.clone(), r.clone(), f.clone(), o.clone());
-                let gate = worker_gate.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        let mut server: Option<TcpStream> = None;
-                        client.set_nodelay(true)?;
-                        let mut channel = false;
-                        loop {
-                            let n = match client.read_u32().await {
-                                Ok(n) => n as usize,
-                                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                    break
-                                }
-                                Err(error) => return Err(error.into()),
-                            };
-                            ensure!(n <= remote::MAX_FRAME_BYTES);
-                            let mut data = vec![0; n];
-                            client.read_exact(&mut data).await?;
-                            let value: serde_json::Value = serde_json::from_slice(&data)?;
-                            let operation = &value["operation"];
-                            if operation.get("OpenQuery").is_some() {
-                                o.fetch_add(1, Ordering::SeqCst);
-                                if gate.pause_open.swap(false, Ordering::SeqCst) {
-                                    gate.entered.notify_one();
-                                    gate.resume.notified().await;
-                                }
-                            }
-                            if ["Snapshot", "SnapshotPage"]
-                                .iter()
-                                .any(|key| operation.get(key).is_some())
-                            {
-                                f.fetch_add(1, Ordering::SeqCst);
-                                anyhow::bail!("full-shard download forbidden");
-                            }
-                            channel |= operation.get("OpenHierarchyChannel").is_some();
-                            if (channel || operation.get("QueryFragment").is_some())
-                                && gate.pause.swap(false, Ordering::SeqCst)
-                            {
-                                gate.entered.notify_one();
-                                gate.resume.notified().await;
-                            }
-                            if server.is_none() {
-                                let stream = TcpStream::connect(target).await?;
-                                stream.set_nodelay(true)?;
-                                server = Some(stream);
-                            }
-                            let server = server.as_mut().unwrap();
-                            r.fetch_add(1, Ordering::SeqCst);
-                            server.write_u32(n as u32).await?;
-                            server.write_all(&data).await?;
-                            let n = server.read_u32().await? as usize;
-                            ensure!(n <= remote::MAX_FRAME_BYTES);
-                            let mut data = vec![0; n];
-                            server.read_exact(&mut data).await?;
-                            b.fetch_add(n + 4, Ordering::SeqCst);
-                            client.write_u32(n as u32).await?;
-                            client.write_all(&data).await?;
-                            if !channel
-                                || serde_json::from_slice::<serde_json::Value>(&data)?["retire"]
-                                    == true
-                            {
-                                break;
-                            }
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    }
+                let service = service.clone();
+                connections.spawn(async move {
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(
+                        hyper_util::rt::TokioIo::new(socket),
+                        hyper_util::service::TowerToHyperService::new(service),
+                    )
                     .await;
-                    if let Err(error) = result {
-                        eprintln!("query audit proxy: {error:#}");
-                    }
                 });
             }
         });
@@ -594,6 +674,27 @@ impl AuditProxy {
             task,
         })
     }
+}
+async fn typed_probe(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    shard: u64,
+) -> Result<(), remote::RemoteError> {
+    remote::operations_grpc::Client::connect(endpoint, identity, Duration::from_millis(300))
+        .await?
+        .probe(shard)
+        .await
+}
+async fn typed_write(
+    endpoint: SocketAddr,
+    identity: RemoteIdentity,
+    request: d2_raft::D1WriteRequest,
+    budget: Duration,
+) -> Result<d2_raft::D1Result, remote::RemoteError> {
+    remote::operations_grpc::Client::connect(endpoint, identity, budget)
+        .await?
+        .write(request)
+        .await
 }
 // The old interpreter is an independent semantic oracle. Only this explicit
 // oracle path downloads snapshots, over direct endpoints outside audit proxies.
@@ -1241,7 +1342,7 @@ async fn scenario() -> anyhow::Result<()> {
         Ok(node.admin().export()?)
     })
     .await??;
-    remote::write_identified(
+    typed_write(
         b.route.endpoint,
         b.route.identity,
         d2_raft::D1WriteRequest {
@@ -1386,10 +1487,6 @@ async fn scenario() -> anyhow::Result<()> {
 
     cli_service.shutdown().await;
 
-    assert_eq!(
-        ap.forbidden.load(Ordering::SeqCst) + bp.forbidden.load(Ordering::SeqCst),
-        0
-    );
     assert!(ap.requests.load(Ordering::SeqCst) > 0 && bp.requests.load(Ordering::SeqCst) > 0);
     jobs::fixed_snapshot(endpoint, &a)
         .await
@@ -1413,6 +1510,8 @@ async fn scenario() -> anyhow::Result<()> {
         !matches!(unavailable, Ok(Ok(_))),
         "missing shard returned partial success"
     );
+    ap.rejects_snapshots().await?;
+    bp.rejects_snapshots().await?;
     service.shutdown().await;
     Ok(())
 }

@@ -158,21 +158,20 @@ pub(super) struct QueryClient {
     identity: RemoteIdentity,
 }
 impl QueryClient {
-    pub(super) async fn connect(
+    pub(super) fn connect_lazy(
         address: SocketAddr,
         identity: RemoteIdentity,
         deadline: Duration,
     ) -> Result<Self, RemoteError> {
-        let end = checked_deadline(deadline, None)?;
+        checked_deadline(deadline, None)?;
         let endpoint = Channel::from_shared(format!("http://{address}"))
             .map_err(|_| RemoteError::InvalidArgument)?
             .connect_timeout(deadline)
             .buffer_size(MAX_IN_FLIGHT)
             .concurrency_limit(MAX_IN_FLIGHT);
-        let channel = tokio::time::timeout_at(end, endpoint.connect())
-            .await
-            .map_err(|_| RemoteError::Timeout { request_id: None })?
-            .map_err(|_| RemoteError::Unavailable)?;
+        // Establish on first admitted operation, never during consistency negotiation.
+        // Channel queue and concurrency stay bounded; each RPC supplies its deadline.
+        let channel = endpoint.connect_lazy();
         Ok(Self {
             client: QueryServiceClient::new(channel)
                 .max_decoding_message_size(RESPONSE_LIMIT)

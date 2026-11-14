@@ -32,14 +32,16 @@ The hybrid library `CoordinatorService::start_grpc` (TCP ingress with gRPC
 shard backends) is removed under #264. Use `GrpcCoordinatorService` and
 `CoordinatorClient` together instead; the full ordered-row/error/job differential
 suite now crosses typed ingress as well as typed shard transport.
-`CoordinatorService::start`, `distributed::query`, consistency negotiation and
-`jobs::request` retain explicit legacy library behavior pending their own semantic
-replacement/retirement. They are not CLI modes. There is no protocol probing,
-fallback, application-request retry, or leader-following.
+`CoordinatorService::start` now aliases this same typed service; `distributed::query`,
+`jobs::request` and explicit consistency APIs also use gRPC. Both ends and shard
+catalog endpoints must migrate together. There is no legacy coordinator listener,
+protocol probing, fallback, application-request retry or leader-following.
+Convenience calls include connection establishment within the same total deadline;
+use `CoordinatorClient` to reuse a channel across multiple requests.
 The tonic channel may reconnect a transport connection; this is not application
 replay or reopening a lost query session. A wrong port or
-identity fails. One channel per unique shard is established during startup and
-reused across query Open/Fragment/Close calls, rather than connecting per fragment.
+identity fails. One bounded channel per unique shard is configured during startup, connected
+lazily only when an admitted operation needs the shard, and reused across query Open/Fragment/Close calls, rather than connecting per fragment.
 Hierarchy jobs use typed OpenHierarchy (including the conservative stored-row byte
 bound), followed by the same typed Fragment/Close calls. Each job retains its
 selected clients; it never falls back to the old shard transport.
@@ -70,20 +72,21 @@ selected clients; it never falls back to the old shard transport.
 
 ## Deliberate exclusions and removal plan
 
-The gRPC-backed coordinator supports observed hierarchy count/row jobs but still
-rejects explicit consistency requests with typed `Unsupported`. Fixed/renewable
-query sessions have a separate [managed-gateway gRPC entrypoint](INTERNAL_GRPC_FIXED_QUERIES.md).
-The new coordinator ingress covers ordinary observed queries and the existing
-Start/StartRows/Read/Advance/Cancel jobs, with typed output/failure oneofs, snapshot
-stamps and property values. It exposes no fixed/managed Consistent RPC. A caller
-using an unknown method receives an explicit gRPC Unimplemented response. Legacy
-coordinator and Unix gateway paths still require retirement or
-migration; this is not completion of #218.
+The coordinator supports ordinary observed queries and Start/StartRows/Read/
+Advance/Cancel jobs with typed outputs, failures, snapshot stamps and values.
+Explicit `IndependentShardSnapshots` negotiation is represented in protobuf and
+acknowledged in the response. `GlobalCommittedSnapshot` and unknown requirements
+fail closed before shard contact, session creation, job allocation or token lookup.
+A strict client rejects a missing/mismatched acknowledgement from an older peer;
+it cannot silently accept ordinary independent-snapshot results as a global cut.
+This is not distributed MVCC or managed consistency. Fixed/renewable queries have
+a separate [managed-gateway contract](INTERNAL_GRPC_FIXED_QUERIES.md).
 
 The original job state machine retains cumulative budgets, shard parallelism,
-immutable page/replay behavior, cancellation and leases. Explicit TCP selection
-is retained for differential tests until all callers migrate; it is not a second
-query engine. Storage record encoding and consensus are unchanged.
+immutable page/replay behavior, cancellation and leases. GraphService and public
+Gateway legacy library paths remain separate retirement work under #218. Unix
+read gateway retirement is already complete. Storage records and consensus are
+unchanged; this slice does not establish production readiness or resolve #247.
 
 The endpoint remains plaintext and unauthenticated for trusted development
 networks. Matching a configured identity is not authentication. Session tokens
@@ -93,8 +96,8 @@ regenerate with `scripts/generate-internal-query-proto.sh`.
 
 ## Verification
 
-`grpc_query_process` exercises actual graph-node processes with TCP/gRPC
-coordinators against the same data and compares ordered results and failures,
+`grpc_query_process` exercises actual graph-node processes with typed coordinator
+convenience and reusable clients and compares ordered results and failures,
 including hierarchy count jobs, snapshot stamps and repeated Advance replay.
 Codec tests cover typed shapes and malformed messages. Existing snapshot and
 legacy query suites remain regression gates. Successful tests establish semantic

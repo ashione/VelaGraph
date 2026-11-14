@@ -7,11 +7,13 @@ v1 queries and client-side observed traversal APIs retain their contracts.
 
 ## Deployment and scope
 
-`remote::distributed::CoordinatorService` is the retained legacy TCP service.
-The typed gRPC ingress is `remote::distributed::grpc::GrpcCoordinatorService`,
-used by default by `graph-coordinator serve`; clients use `query` or
-`CoordinatorClient::query`. See [transport and migration](INTERNAL_GRPC_QUERIES.md).
-Both reuse the same executor and observed semantics below. The shared
+`remote::distributed::CoordinatorService` names the typed gRPC service
+(`remote::distributed::grpc::GrpcCoordinatorService`), also used by
+`graph-coordinator serve`. Library `query`/`jobs::request` convenience calls
+and reusable `CoordinatorClient` use the same typed wire, with no JSON listener
+or fallback. Catalog endpoints must name typed graph ports. See
+[transport and migration](INTERNAL_GRPC_QUERIES.md). All reuse the original
+executor and observed semantics below. The shared
 `StaticCatalog { partitions: Vec<PartitionRoute> }` is immutable startup
 configuration. Each route identifies a partition, shard, epoch, replica identity
 and endpoint. This entrypoint does **not** read a live metadata catalog and does

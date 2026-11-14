@@ -33,7 +33,7 @@ async fn update(group: &Group, revision: i64) -> anyhow::Result<()> {
     request_id[8..].copy_from_slice(&shard.to_be_bytes());
     // Distinguish update IDs from Group::seed IDs, including revision zero.
     request_id[0] = 0x7f;
-    remote::write_identified(
+    typed_write(
         group.route.endpoint,
         group.route.identity,
         d2_raft::D1WriteRequest {
@@ -241,9 +241,7 @@ async fn scenario() -> anyhow::Result<()> {
         super::rows(endpoint, "g.V(1).valueMap('revision')").await?,
         vec![projected(0, 4)]
     );
-    assert_eq!(
-        ap.forbidden.load(Ordering::SeqCst) + bp.forbidden.load(Ordering::SeqCst),
-        0
-    );
+    ap.rejects_snapshots().await?;
+    bp.rejects_snapshots().await?;
     Ok(())
 }

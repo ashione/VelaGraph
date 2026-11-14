@@ -1,4 +1,4 @@
-//! Real independent shard processes; TCP versus typed gRPC fragment transport.
+//! Real independent shard processes; typed coordinator and shard-fragment contracts.
 //! Observed semantics only: this does not claim managed/fixed or Raft migration.
 #[path = "support/coordinator_cli.rs"]
 mod coordinator_cli;
@@ -283,7 +283,7 @@ fn request(text: &str) -> DistributedRequest {
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn typed_fragments_match_tcp_across_real_shards() -> anyhow::Result<()> {
+async fn typed_coordinator_clients_match_across_real_shards() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), scenario()).await?
 }
 async fn scenario() -> anyhow::Result<()> {
@@ -292,10 +292,19 @@ async fn scenario() -> anyhow::Result<()> {
     let (ad, bd) = run_blocking(fixture).await??;
     a.seed(ad).await?;
     b.seed(bd).await?;
-    let tcp = CoordinatorService::start(
+    let convenience = CoordinatorService::start(
         "127.0.0.1:0".parse()?,
         StaticCatalog {
-            partitions: vec![b.route.clone(), a.route.clone()],
+            partitions: vec![
+                PartitionRoute {
+                    endpoint: b.grpc,
+                    ..b.route.clone()
+                },
+                PartitionRoute {
+                    endpoint: a.grpc,
+                    ..a.route.clone()
+                },
+            ],
         },
         BUDGET,
     )
@@ -332,9 +341,13 @@ async fn scenario() -> anyhow::Result<()> {
         "g.V().has('enabled').limit(2).values('name')",
         "g.V(1).repeat(out('knows')).times(2).path()",
     ] {
-        let expected = distributed::query(tcp.local_addr(), request(text), BUDGET).await??;
+        let expected =
+            distributed::query(convenience.local_addr(), request(text), BUDGET).await??;
         let actual = client.query(request(text), BUDGET).await??;
-        assert_eq!(actual, expected, "ordered TCP/gRPC differential: {text}");
+        assert_eq!(
+            actual, expected,
+            "ordered convenience/reusable gRPC differential: {text}"
+        );
         assert_eq!(actual.completeness, QueryCompleteness::Unverified);
     }
     let rows = client
@@ -347,7 +360,7 @@ async fn scenario() -> anyhow::Result<()> {
         "bag multiplicity and edge-ID order are preserved"
     );
     for text in ["g.V(", "g.V(139).out('missing')", "g.V(1).unsupported()"] {
-        let expected = distributed::query(tcp.local_addr(), request(text), BUDGET).await?;
+        let expected = distributed::query(convenience.local_addr(), request(text), BUDGET).await?;
         let actual = client.query(request(text), BUDGET).await?;
         assert!(
             expected.is_err(),
@@ -359,46 +372,51 @@ async fn scenario() -> anyhow::Result<()> {
         client.query(request("g.V("), BUDGET).await?,
         Err(QueryFailure::Parse)
     );
-    // Removed JSON consistency envelopes cannot reach the typed ingress.
-    // The typed observed API does not advertise fixed/global consistency.
-    for required in [
+    // Explicit consistency negotiation uses the same typed coordinator. A
+    // global committed cut remains unsupported, never silently downgraded.
+    assert!(distributed::consistency::query_with_consistency(
+        grpc.local_addr(),
+        request("g.V(1).count()"),
         distributed::consistency::ReadConsistency::IndependentShardSnapshots,
-        distributed::consistency::ReadConsistency::GlobalCommittedSnapshot,
-    ] {
-        assert!(distributed::consistency::query_with_consistency(
+        BUDGET
+    )
+    .await?
+    .is_ok());
+    assert_eq!(
+        distributed::consistency::query_with_consistency(
             grpc.local_addr(),
             request("g.V(1).count()"),
-            required,
+            distributed::consistency::ReadConsistency::GlobalCommittedSnapshot,
             BUDGET
         )
-        .await
-        .is_err());
-    }
+        .await?,
+        Err(QueryFailure::Unsupported)
+    );
     for text in [
         "g.V(1).repeat(__.out('knows')).times(1).count()",
         "g.V(1,1).repeat(__.out('knows')).emit().times(2).count()",
         "g.V(1).repeat(__.out('knows')).emit().times(2).dedup().count()",
     ] {
         assert_eq!(
-            hierarchy_count(tcp.local_addr(), false, text).await?,
+            hierarchy_count(convenience.local_addr(), false, text).await?,
             hierarchy_count(grpc.local_addr(), true, text).await?
         );
     }
     assert_eq!(
-        hierarchy_rows(tcp.local_addr(), false).await?,
+        hierarchy_rows(convenience.local_addr(), false).await?,
         hierarchy_rows(grpc.local_addr(), true).await?
     );
-    hierarchy_cancel(tcp.local_addr(), false).await?;
+    hierarchy_cancel(convenience.local_addr(), false).await?;
     hierarchy_cancel(grpc.local_addr(), true).await?;
     session_checks(&a).await?;
     // Teardown releases local job admission immediately; remote read leases
     // may remain until their bounded TTL, so run exact shard-slot checks first.
-    coordinator_ingress_checks(&[br, ar], tcp.local_addr())
+    coordinator_ingress_checks(&[br, ar], convenience.local_addr(), a.route.endpoint)
         .await
         .context("coordinator ingress checks")?;
     a._process.0.kill()?;
     a._process.0.wait()?;
-    for (endpoint, typed) in [(tcp.local_addr(), false), (grpc.local_addr(), true)] {
+    for (endpoint, typed) in [(convenience.local_addr(), false), (grpc.local_addr(), true)] {
         let client = JobClient::connect(endpoint, typed).await?;
         assert!(matches!(
             client
@@ -414,7 +432,7 @@ async fn scenario() -> anyhow::Result<()> {
         ));
     }
     grpc.shutdown().await;
-    tcp.shutdown().await;
+    convenience.shutdown().await;
     Ok(())
 }
 
@@ -1038,7 +1056,7 @@ async fn hierarchy_cancel(endpoint: SocketAddr, grpc: bool) -> anyhow::Result<()
 }
 
 enum JobClient {
-    Legacy(SocketAddr),
+    Convenience(SocketAddr),
     Grpc(distributed::grpc::CoordinatorClient),
 }
 impl JobClient {
@@ -1046,7 +1064,7 @@ impl JobClient {
         Ok(if grpc {
             Self::Grpc(distributed::grpc::CoordinatorClient::connect(endpoint, BUDGET).await?)
         } else {
-            Self::Legacy(endpoint)
+            Self::Convenience(endpoint)
         })
     }
     async fn request(
@@ -1056,7 +1074,7 @@ impl JobClient {
     ) -> Result<distributed::jobs::Response, remote::RemoteError> {
         match self {
             Self::Grpc(client) => client.job(request, deadline).await,
-            Self::Legacy(endpoint) => {
+            Self::Convenience(endpoint) => {
                 distributed::jobs::request(*endpoint, request, deadline).await
             }
         }
@@ -1065,7 +1083,8 @@ impl JobClient {
 
 async fn coordinator_ingress_checks(
     routes: &[PartitionRoute],
-    legacy: SocketAddr,
+    convenience: SocketAddr,
+    legacy_graph: SocketAddr,
 ) -> anyhow::Result<()> {
     use distributed::grpc::{wire as w, CoordinatorClient, GrpcCoordinatorService};
     let directory = tempfile::tempdir()?;
@@ -1130,13 +1149,13 @@ async fn coordinator_ingress_checks(
                 .query(request(text), BUDGET)
                 .await
                 .with_context(|| format!("typed query {text}"))?,
-            distributed::query(legacy, request(text), BUDGET).await?,
+            distributed::query(convenience, request(text), BUDGET).await?,
             "coordinator ingress parity: {text}"
         );
     }
     coordinator_cli::check(
         endpoint,
-        legacy,
+        legacy_graph,
         serde_json::to_value(client.query(request("g.V(1).count()"), BUDGET).await??)?,
         hierarchy_count(
             endpoint,
@@ -1152,19 +1171,19 @@ async fn coordinator_ingress_checks(
         hierarchy_count(endpoint, true, text)
             .await
             .context("typed count job")?,
-        hierarchy_count(legacy, false, text).await?
+        hierarchy_count(convenience, false, text).await?
     );
     assert_eq!(
         hierarchy_rows(endpoint, true)
             .await
             .context("typed rows job")?,
-        hierarchy_rows(legacy, false).await?
+        hierarchy_rows(convenience, false).await?
     );
     assert_eq!(
         projected_rows(endpoint, true)
             .await
             .context("typed projected job")?,
-        projected_rows(legacy, false).await?
+        projected_rows(convenience, false).await?
     );
     hierarchy_cancel(endpoint, true)
         .await
@@ -1177,6 +1196,7 @@ async fn coordinator_ingress_checks(
     for (version, millis) in [(99, 5000), (1, 0), (1, 5001)] {
         assert!(raw
             .query(w::CoordinatorQueryRequest {
+                required_consistency: None,
                 version,
                 timeout_millis: millis,
                 start_partition: 0,
@@ -1187,6 +1207,7 @@ async fn coordinator_ingress_checks(
     }
     assert!(raw
         .job(w::CoordinatorJobRequest {
+            required_consistency: None,
             version: 1,
             timeout_millis: 5000,
             request: None,
@@ -1195,6 +1216,7 @@ async fn coordinator_ingress_checks(
         .is_err());
     assert!(raw
         .job(w::CoordinatorJobRequest {
+            required_consistency: None,
             version: 1,
             timeout_millis: 5000,
             request: Some(w::coordinator_job_request::Request::Cancel(w::JobCancel {
@@ -1203,15 +1225,26 @@ async fn coordinator_ingress_checks(
         })
         .await
         .is_err());
-    // Wrong transport must fail, rather than silently probing/falling back.
-    assert!(distributed::query(
-        endpoint,
-        request("g.V(1).count()"),
-        Duration::from_millis(300)
-    )
-    .await
-    .is_err());
-    if let Ok(wrong) = CoordinatorClient::connect(legacy, Duration::from_millis(300)).await {
+    // The removed JSON ingress must fail; no protocol probing or fallback.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = TcpStream::connect(endpoint).await?;
+        let bytes = serde_json::to_vec(&request("g.V(1).count()"))?;
+        socket.write_u32(bytes.len() as u32).await?;
+        socket.write_all(&bytes).await?;
+        let received = timeout(Duration::from_millis(300), async {
+            let length = socket.read_u32().await? as usize;
+            if length > 1024 * 1024 {
+                return Ok::<_, std::io::Error>(None);
+            }
+            let mut payload = vec![0; length];
+            socket.read_exact(&mut payload).await?;
+            Ok(serde_json::from_slice::<distributed::DistributedResponse>(&payload).ok())
+        })
+        .await;
+        assert!(!matches!(received, Ok(Ok(Some(_)))));
+    }
+    if let Ok(wrong) = CoordinatorClient::connect(legacy_graph, Duration::from_millis(300)).await {
         assert!(wrong
             .query(request("g.V(1).count()"), Duration::from_millis(300))
             .await

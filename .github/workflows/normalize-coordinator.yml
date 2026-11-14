@@ -1,0 +1,25 @@
+name: Normalize coordinator migration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/normalize-coordinator.yml'
+permissions:
+  contents: read
+jobs:
+  normalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: scripts/generate-internal-query-proto.sh
+      - run: cargo fmt --all
+      - run: git diff --binary > normalization.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coordinator-normalization
+          path: normalization.patch

@@ -828,14 +828,6 @@ impl Execution<'_> {
     }
 }
 
-async fn execute(
-    catalog: &StaticCatalog,
-    request: DistributedRequest,
-    end: Instant,
-) -> DistributedResponse {
-    execute_transport(catalog, request, end, None).await
-}
-
 async fn execute_transport(
     catalog: &StaticCatalog,
     request: DistributedRequest,
@@ -986,158 +978,29 @@ fn bounded_serialize<T: Serialize>(
     Ok((writer.bytes, writer.size))
 }
 
-/// Dedicated coordinator endpoint; it cannot mutate graph state or choose endpoints from a request.
-/// All callers must explicitly restrict this plaintext service to a trusted network.
-pub struct CoordinatorService {
-    address: SocketAddr,
-    stop: watch::Sender<bool>,
-    task: Option<JoinHandle<()>>,
-}
-impl CoordinatorService {
-    pub async fn start(
-        bind: SocketAddr,
-        catalog: StaticCatalog,
-        deadline: Duration,
-    ) -> Result<Self, RemoteError> {
-        catalog.validate()?;
-        checked_deadline(deadline, None)?;
-        let listener = TcpListener::bind(bind)
-            .await
-            .map_err(|_| RemoteError::Unavailable)?;
-        let address = listener
-            .local_addr()
-            .map_err(|_| RemoteError::Unavailable)?;
-        let (stop, mut stopped) = watch::channel(false);
-        let catalog = Arc::new(catalog);
-        let jobs = Arc::new(jobs::Jobs::new());
-        let task = tokio::spawn(async move {
-            let mut handlers = JoinSet::new();
-            let mut cleanup = tokio::time::interval(Duration::from_millis(100));
-            let admission = Arc::new(Semaphore::new(2));
-            loop {
-                let accepted = tokio::select! { _ = stopped.changed() => break, _ = cleanup.tick() => { jobs.expire(); continue; }, _ = handlers.join_next(), if !handlers.is_empty() => continue, value = listener.accept() => value };
-                let Ok((mut socket, _)) = accepted else {
-                    break;
-                };
-                let Ok(permit) = admission.clone().try_acquire_owned() else {
-                    continue;
-                };
-                let catalog = catalog.clone();
-                let jobs = jobs.clone();
-                jobs.expire();
-                handlers.spawn(async move {
-                    let _permit = permit;
-                    let end = Instant::now() + deadline.min(Duration::from_millis(MAX_TIMEOUT));
-                    let work = async {
-                        #[derive(Deserialize)]
-                        #[serde(untagged)]
-                        enum IncomingRequest {
-                            Query(DistributedRequest),
-                            Job(jobs::Envelope),
-                            Consistent(consistency::Envelope),
-                        }
-                        let request: IncomingRequest = read_frame_limited(
-                            &mut socket,
-                            end,
-                            query::MAX_QUERY_TEXT_BYTES + 1024,
-                        )
-                        .await?;
-                        // The shorter ordinary request deadline also governs sending.
-                        let end = match &request {
-                            IncomingRequest::Query(request) => {
-                                validate_request(request)?;
-                                end.min(
-                                    Instant::now() + Duration::from_millis(request.timeout_millis),
-                                )
-                            }
-                            IncomingRequest::Job(_) => end,
-                            IncomingRequest::Consistent(envelope) => {
-                                envelope.consistency_request.deadline(end)?
-                            }
-                        };
-                        let bytes = match request {
-                            IncomingRequest::Consistent(envelope) => {
-                                consistency::handle(
-                                    catalog,
-                                    &jobs,
-                                    envelope.consistency_request,
-                                    end,
-                                )
-                                .await
-                            }
-                            IncomingRequest::Query(request) => bounded_encode(
-                                &execute_transport(&catalog, request, end, None).await,
-                                end,
-                            ),
-                            IncomingRequest::Job(envelope) => bounded_encode(
-                                &jobs.handle(catalog, envelope.hierarchy_job, end).await,
-                                end,
-                            ),
-                        }
-                        .map_err(|_| RemoteError::ResourceExhausted)?;
-                        tokio::time::timeout_at(end, async {
-                            socket.write_u32(bytes.len() as u32).await?;
-                            socket.write_all(&bytes).await
-                        })
-                        .await
-                        .map_err(|_| RemoteError::Timeout { request_id: None })?
-                        .map_err(|_| RemoteError::Unavailable)
-                    };
-                    let _ = tokio::time::timeout_at(end, work).await;
-                });
-            }
-            handlers.abort_all();
-            while handlers.join_next().await.is_some() {}
-        });
-        Ok(Self {
-            address,
-            stop,
-            task: Some(task),
-        })
-    }
-    pub fn local_addr(&self) -> SocketAddr {
-        self.address
-    }
-    pub async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-impl Drop for CoordinatorService {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
-    }
-}
+/// Typed gRPC coordinator endpoint. No JSON listener or transport fallback.
+/// Restrict this plaintext experimental service to a trusted network.
+pub use grpc::GrpcCoordinatorService as CoordinatorService;
 
-/// One request to the selected coordinator. No client-side graph execution or fallback.
+/// One typed request to the selected coordinator; no retry or local execution.
+/// Use `grpc::CoordinatorClient` to reuse a channel across requests.
 pub async fn query(
     endpoint: SocketAddr,
     request: DistributedRequest,
     deadline: Duration,
 ) -> Result<DistributedResponse, RemoteError> {
     validate_request(&request)?;
-    let end = checked_deadline(deadline, None)?;
-    let _permit = CLIENT_ADMISSION
-        .try_acquire()
-        .map_err(|_| RemoteError::ResourceExhausted)?;
+    let end = checked_deadline(
+        deadline.min(Duration::from_millis(request.timeout_millis)),
+        None,
+    )?;
     tokio::time::timeout_at(end, async {
-        let mut socket = TcpStream::connect(endpoint)
-            .await
-            .map_err(|_| RemoteError::Unavailable)?;
-        write_frame(&mut socket, &request, end).await?;
-        let result: DistributedResponse = read_frame_limited(&mut socket, end, MAX_WIRE).await?;
-        if let Ok(output) = &result {
-            validate_output(output, &request)?;
-        }
-        if Instant::now() >= end {
-            return Err(RemoteError::Timeout { request_id: None });
-        }
-        Ok(result)
-    })
-    .await
-    .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
+        let client = grpc::CoordinatorClient::connect_lazy(
+            endpoint,
+            end.saturating_duration_since(Instant::now()),
+        )?;
+        client.query(request, end.saturating_duration_since(Instant::now())).await
+    }).await.unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }
 fn validate_output(
     output: &DistributedOutput,

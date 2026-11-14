@@ -242,8 +242,8 @@ async fn explicit_both_order_paths_bounds_and_fail_closed() -> anyhow::Result<()
             "{text}: {result:?}"
         );
     }
-    assert_eq!(ap.forbidden.load(Ordering::SeqCst), 0);
-    assert_eq!(bp.forbidden.load(Ordering::SeqCst), 0);
+    ap.rejects_snapshots().await?;
+    bp.rejects_snapshots().await?;
     service.shutdown().await;
     Ok(())
 }

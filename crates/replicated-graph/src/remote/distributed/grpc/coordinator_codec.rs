@@ -25,7 +25,7 @@ fn completeness(v: QueryCompleteness) -> i32 {
     }
 }
 fn timeout(version: u32, millis: u64) -> Result<Duration, RemoteError> {
-    if version != 1 {
+    if version != 1 && version != 2 {
         return Err(RemoteError::Protocol);
     }
     if !(1..=MAX_TIMEOUT).contains(&millis) {
@@ -148,6 +148,7 @@ impl TryFrom<wire::QueryRow> for QueryRow {
 }
 pub(super) fn encode_query_request(v: DistributedRequest) -> wire::CoordinatorQueryRequest {
     wire::CoordinatorQueryRequest {
+        required_consistency: None,
         version: 1,
         timeout_millis: v.timeout_millis,
         start_partition: v.start_partition,
@@ -158,6 +159,9 @@ pub(super) fn decode_query_request(
     v: wire::CoordinatorQueryRequest,
 ) -> Result<DistributedRequest, RemoteError> {
     timeout(v.version, v.timeout_millis)?;
+    if v.version == 2 && v.required_consistency.is_none() {
+        return Err(RemoteError::Protocol);
+    }
     let r = DistributedRequest {
         start_partition: v.start_partition,
         text: v.text,
@@ -169,6 +173,7 @@ pub(super) fn decode_query_request(
 pub(super) fn encode_query_response(v: DistributedResponse) -> wire::CoordinatorQueryResponse {
     use wire::coordinator_query_response::Result;
     wire::CoordinatorQueryResponse {
+        accepted_consistency: None,
         result: Some(match v {
             Ok(v) => Result::Output(wire::CoordinatorQueryOutput {
                 completeness: completeness(v.completeness),
@@ -206,6 +211,7 @@ pub(super) fn encode_job_request(
 ) -> wire::CoordinatorJobRequest {
     use wire::coordinator_job_request::Request as R;
     wire::CoordinatorJobRequest {
+        required_consistency: None,
         version: 1,
         timeout_millis: duration.as_millis().min(u64::MAX as u128) as u64,
         request: Some(match v {
@@ -244,6 +250,9 @@ pub(super) fn decode_job_request(
 ) -> Result<(jobs::Request, Duration), RemoteError> {
     use wire::coordinator_job_request::Request as R;
     let duration = timeout(v.version, v.timeout_millis)?;
+    if v.version == 2 && v.required_consistency.is_none() {
+        return Err(RemoteError::Protocol);
+    }
     let request = match required(v.request)? {
         R::Start(v) => jobs::Request::Start {
             start_partition: v.start_partition,
@@ -349,6 +358,7 @@ pub(super) fn encode_job_response(v: jobs::Response) -> wire::CoordinatorJobResp
         }),
     };
     wire::CoordinatorJobResponse {
+        accepted_consistency: None,
         result: Some(result),
     }
 }
@@ -606,6 +616,7 @@ mod tests {
     #[test]
     fn malformed_versions_tokens_enums_values_and_duplicate_properties_fail() {
         let mut request = wire::CoordinatorQueryRequest {
+        required_consistency: None,
             version: 1,
             timeout_millis: 1,
             start_partition: 7,
@@ -616,9 +627,10 @@ mod tests {
         request.version = 1;
         request.timeout_millis = 0;
         assert!(decode_query_request(request).is_err());
-        assert!(decode_query_response(wire::CoordinatorQueryResponse { result: None }).is_err());
+        assert!(decode_query_response(wire::CoordinatorQueryResponse { result: None, accepted_consistency: None }).is_err());
         for e in [0, 999] {
             assert!(decode_query_response(wire::CoordinatorQueryResponse {
+        accepted_consistency: None,
                 result: Some(wire::coordinator_query_response::Result::Failure(e))
             })
             .is_err());
