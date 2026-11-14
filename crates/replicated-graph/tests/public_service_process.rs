@@ -433,6 +433,29 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
         NodeProcess::start(7, true),
         NodeProcess::start(8, true)
     )?;
+    // The shipped legacy managed listener is gone. This isolated protocol
+    // rejection fixture speaks only the old frame prefix and records any
+    // attempted fallback; genuine graph-side legacy coverage remains below.
+    let old_control = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let old_control_addr = old_control.local_addr()?;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let rejection_peer = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, _) = old_control.accept().await.unwrap();
+            let mut first = [0; 4];
+            if socket.read_exact(&mut first).await.is_err() {
+                continue;
+            }
+            assert_eq!(
+                &first, b"PRI ",
+                "must not retry using the retired JSON framing"
+            );
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = socket.write_all(&[0, 0, 0, 2, b'{', b'}']).await;
+        }
+    });
     let directory = tempfile::tempdir()?;
     // Independently reject legacy control, legacy graph, and both. A failure
     // on one path must not conceal fallback on the other.
@@ -447,7 +470,7 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
         } else {
             (&grpc_a, &grpc_b)
         };
-        let config = json!({"binding":binding(),"coordinator":{"endpoint":c.ready.control,"identity":identity(9)},"members":[{"endpoint":ca.ready.control,"identity":identity(7),"graph_endpoint":ga.ready.graph},{"endpoint":cb.ready.control,"identity":identity(8),"graph_endpoint":gb.ready.graph}]});
+        let config = json!({"binding":binding(),"coordinator":{"endpoint":if legacy_control { old_control_addr } else { c.ready.control },"identity":identity(9)},"members":[{"endpoint":if legacy_control { old_control_addr } else { ca.ready.control },"identity":identity(7),"graph_endpoint":ga.ready.graph},{"endpoint":if legacy_control { old_control_addr } else { cb.ready.control },"identity":identity(8),"graph_endpoint":gb.ready.graph}]});
         let path = directory.path().join("legacy.json");
         fs::write(&path, serde_json::to_vec(&config)?)?;
         if !legacy_control {
@@ -503,5 +526,12 @@ async fn service_never_falls_back_to_legacy_internal_endpoints() -> anyhow::Resu
             "legacy endpoints must never announce serving"
         );
     }
+    assert!(attempts.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert!(
+        !rejection_peer.is_finished(),
+        "legacy protocol fixture must observe no fallback"
+    );
+    rejection_peer.abort();
+    let _ = rejection_peer.await;
     Ok(())
 }

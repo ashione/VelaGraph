@@ -167,41 +167,14 @@ async fn public_service_node_child() -> anyhow::Result<()> {
         )
         .await?;
     }
-    let (tcp, grpc) = if internal_grpc {
-        (
-            None,
-            Some(
-                d2_raft::managed_rpc::grpc::Server::bind(
-                    node.clone(),
-                    identity(shard),
-                    "127.0.0.1:0".parse()?,
-                    BUDGET,
-                )
-                .await?,
-            ),
-        )
-    } else {
-        (
-            Some(
-                Server::bind(
-                    node.clone(),
-                    identity(shard),
-                    "127.0.0.1:0".parse()?,
-                    BUDGET,
-                )
-                .await?,
-            ),
-            None,
-        )
-    };
-    let control = tcp
-        .as_ref()
-        .map(Server::local_addr)
-        .or_else(|| {
-            grpc.as_ref()
-                .map(d2_raft::managed_rpc::grpc::Server::local_addr)
-        })
-        .context("selected managed listener")?;
+    let managed = Server::bind(
+        node.clone(),
+        identity(shard),
+        "127.0.0.1:0".parse()?,
+        BUDGET,
+    )
+    .await?;
+    let control = managed.local_addr();
     let graph = if shard != 9 {
         Some(
             GraphService::start_managed(&node, "127.0.0.1:0".parse()?, shard, shard, BUDGET)
@@ -509,6 +482,7 @@ fn assert_reason(status: &tonic::Status, reason: pb::error_detail::Reason) {
         reason as i32
     );
 }
+
 // Inspect this process's owned socket inodes, not every socket in its network
 // namespace. A hidden ephemeral compatibility listener must fail this check.
 #[cfg(target_os = "linux")]

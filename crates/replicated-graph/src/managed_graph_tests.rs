@@ -1107,20 +1107,34 @@ async fn incremental_history_catches_up_every_member_after_observed_only_page() 
 // top-level entrypoints; helpers and internal concurrent operations stay parallel.
 static REMOTE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Raw scripted peers verify the real managed wire path without permitting an
-/// accidental full Journal/Advance fallback, including lost acknowledgements.
+use crate::managed_grpc_test_peer as rpc_peer;
+
+type HistorySteps = Vec<(serde_json::Value, Option<serde_json::Value>)>;
+struct HistoryPeer {
+    peer: rpc_peer::Peer,
+    steps: std::sync::Arc<std::sync::Mutex<HistorySteps>>,
+}
+impl HistoryPeer {
+    async fn finish(self) {
+        assert!(
+            self.steps.lock().unwrap().is_empty(),
+            "all scripted operations must run"
+        );
+        self.peer.finish().await;
+    }
+}
+/// Scripted peers validate typed managed RPC without a full Journal/Advance fallback.
 async fn history_peer(
     identity: managed_rpc::Identity,
     steps: Vec<(serde_json::Value, Option<serde_json::Value>)>,
-) -> (managed_rpc::Client, tokio::task::JoinHandle<()>) {
+) -> (managed_rpc::Client, HistoryPeer) {
     history_peer_ordering(identity, steps, false).await
 }
 async fn history_peer_ordering(
     identity: managed_rpc::Identity,
-    mut steps: Vec<(serde_json::Value, Option<serde_json::Value>)>,
+    steps: Vec<(serde_json::Value, Option<serde_json::Value>)>,
     unordered_pages: bool,
-) -> (managed_rpc::Client, tokio::task::JoinHandle<()>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+) -> (managed_rpc::Client, HistoryPeer) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = managed_rpc::Client::new(
         listener.local_addr().unwrap(),
@@ -1128,33 +1142,25 @@ async fn history_peer_ordering(
         Duration::from_secs(2),
     )
     .unwrap();
-    let peer = tokio::spawn(async move {
-        while !steps.is_empty() {
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
-            let length = stream.read_u32().await.unwrap() as usize;
-            assert!(length <= managed_rpc::MAX_FRAME_BYTES);
-            let mut bytes = vec![0; length];
-            stream.read_exact(&mut bytes).await.unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(request["version"], 6);
-            assert!(request["operation"].get("Journal").is_none());
-            assert!(request["operation"].get("Advance").is_none());
-            let position = if unordered_pages && request["operation"].get("HistoryPage").is_some() {
-                steps
-                    .iter()
-                    .position(|(expected, _)| *expected == request["operation"])
-                    .expect("unexpected or repeated page")
-            } else {
-                0
-            };
-            let (expected, result) = steps.remove(position);
-            assert_eq!(request["operation"], expected);
-            let Some(result) = result else {
-                continue;
-            };
+    let steps = std::sync::Arc::new(std::sync::Mutex::new(steps));
+    let state = steps.clone();
+    let peer = rpc_peer::spawn(listener, move |wire| {
+        let request = managed_rpc::grpc::test_request_json(wire).unwrap();
+        let mut steps = state.lock().unwrap();
+        assert_eq!(request["version"], 6);
+        assert!(request["operation"].get("Journal").is_none());
+        assert!(request["operation"].get("Advance").is_none());
+        let position = if unordered_pages && request["operation"].get("HistoryPage").is_some() {
+            steps
+                .iter()
+                .position(|(expected, _)| *expected == request["operation"])
+                .expect("unexpected or repeated page")
+        } else {
+            0
+        };
+        let (expected, result) = steps.remove(position);
+        assert_eq!(request["operation"], expected);
+        let reply = result.map(|result| {
             let tag = match expected
                 .as_object()
                 .unwrap()
@@ -1172,16 +1178,15 @@ async fn history_peer_ordering(
                 "Prefix" => 6,
                 other => panic!("unexpected catch-up operation {other}"),
             };
-            let reply = serde_json::json!({
+            managed_rpc::grpc::test_reply_from_json(serde_json::json!({
                 "version": 6, "operation": tag, "identity": request["identity"],
                 "nonce": request["nonce"], "result": result,
-            });
-            let bytes = serde_json::to_vec(&reply).unwrap();
-            stream.write_u32(bytes.len() as u32).await.unwrap();
-            stream.write_all(&bytes).await.unwrap();
-        }
+            }))
+            .unwrap()
+        });
+        async move { reply.ok_or_else(|| tonic::Status::unavailable("scripted lost response")) }
     });
-    (client, peer)
+    (client, HistoryPeer { peer, steps })
 }
 fn history_identity(shard: u64) -> managed_rpc::Identity {
     managed_rpc::Identity {
@@ -1355,9 +1360,9 @@ async fn check_exact_history_retries(width: usize) {
         .advance_to(&history_plan(), journal.transaction([20; 16]).unwrap())
         .await
         .unwrap();
-    coordinator_peer.await.unwrap();
+    coordinator_peer.finish().await;
     for peer in peers {
-        peer.await.unwrap();
+        peer.finish().await;
     }
 }
 
@@ -1394,8 +1399,8 @@ async fn advance_to_new_protocol_failure_has_no_archive_fallback() {
             .await,
         Err(Error::Identity)
     ));
-    c_peer.await.unwrap();
-    m_peer.await.unwrap();
+    c_peer.finish().await;
+    m_peer.finish().await;
 }
 
 /// Forward genuine managed requests to the real server and lose selected replies
@@ -1409,23 +1414,15 @@ async fn losing_proxy(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<usize>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let (stop, mut stopped) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let mut losses = losses;
-        let mut lost = 0;
-        loop {
-            let (mut incoming, _) = tokio::select! {
-                _ = &mut stopped => break,
-                connection = listener.accept() => connection.unwrap(),
-            };
-            let length = incoming.read_u32().await.unwrap() as usize;
-            assert!(length <= managed_rpc::MAX_FRAME_BYTES);
-            let mut bytes = vec![0; length];
-            incoming.read_exact(&mut bytes).await.unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let losses = std::sync::Arc::new(std::sync::Mutex::new((losses, 0usize)));
+    let state = losses.clone();
+    let peer = rpc_peer::spawn(listener, move |wire| {
+        let state = state.clone();
+        async move {
+            let request = managed_rpc::grpc::test_request_json(wire.clone()).unwrap();
             let operation = &request["operation"];
             assert!(operation.get("Journal").is_none());
             assert!(operation.get("Prepare").is_none());
@@ -1450,23 +1447,26 @@ async fn losing_proxy(
             } else {
                 "other"
             };
-            let mut outgoing = tokio::net::TcpStream::connect(upstream).await.unwrap();
-            outgoing.write_u32(length as u32).await.unwrap();
-            outgoing.write_all(&bytes).await.unwrap();
-            let length = outgoing.read_u32().await.unwrap() as usize;
-            assert!(length <= managed_rpc::MAX_FRAME_BYTES);
-            let mut reply = vec![0; length];
-            outgoing.read_exact(&mut reply).await.unwrap();
-            if let Some(index) = losses.iter().position(|loss| *loss == name) {
-                losses.remove(index);
-                lost += 1;
+            // Obtain the real completed response before withholding its result.
+            let reply = rpc_peer::forward(upstream, wire).await?;
+            let mut state = state.lock().unwrap();
+            if let Some(index) = state.0.iter().position(|loss| *loss == name) {
+                state.0.remove(index);
+                state.1 += 1;
+                Err(tonic::Status::unavailable(
+                    "response lost after upstream completion",
+                ))
             } else {
-                incoming.write_u32(length as u32).await.unwrap();
-                incoming.write_all(&reply).await.unwrap();
+                Ok(reply)
             }
         }
-        assert!(losses.is_empty(), "every planned ACK loss must occur");
-        lost
+    });
+    let task = tokio::spawn(async move {
+        let _ = stopped.await;
+        peer.finish().await;
+        let state = losses.lock().unwrap();
+        assert!(state.0.is_empty(), "every planned ACK loss must occur");
+        state.1
     });
     (address, stop, task)
 }
@@ -1834,7 +1834,7 @@ async fn status_never_combines_target_with_a_different_same_ordinal_proof() {
             visible: false
         })
     );
-    peer.await.unwrap();
+    peer.finish().await;
 }
 
 #[path = "managed_edge_replace_tests.rs"]
@@ -1913,8 +1913,8 @@ async fn member_waves_bound_work_and_stop_after_error() {
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn member_parallelism_is_checked_without_contacting_endpoints() {
+#[tokio::test]
+async fn member_parallelism_is_checked_without_contacting_endpoints() {
     let client = managed_rpc::Client::new(
         "127.0.0.1:1".parse().unwrap(),
         history_identity(9),

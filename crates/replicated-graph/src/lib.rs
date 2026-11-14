@@ -11,6 +11,8 @@ mod adapter;
 pub mod catalog;
 pub mod managed_gateway;
 pub mod managed_graph;
+#[cfg(test)]
+mod managed_grpc_test_peer;
 pub mod managed_submission_timing;
 pub mod remote;
 pub mod remote_storage;
