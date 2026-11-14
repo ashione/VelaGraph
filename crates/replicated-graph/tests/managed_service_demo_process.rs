@@ -29,7 +29,7 @@ impl Drop for Demo {
         if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         }
-        let end = Instant::now() + Duration::from_secs(10);
+        let end = Instant::now() + Duration::from_secs(30);
         while Instant::now() < end {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
@@ -133,7 +133,7 @@ async fn await_ready(demo: &mut Demo, output: &Path, error: &Path) -> anyhow::Re
                 fs::read_to_string(error)?
             );
             let text = fs::read_to_string(output)?;
-            if let Some(line) = text.lines().next() {
+            if let Some((line, _)) = text.split_once('\n') {
                 let ready: Ready = serde_json::from_str(line).context("demo readiness JSON")?;
                 anyhow::ensure!(ready.pid == demo.child.id(), "wrong demo PID");
                 return Ok(ready);
@@ -190,6 +190,7 @@ async fn write_http(address: SocketAddr) -> anyhow::Result<()> {
         let response = sender.send_request(request).await?;
         let status = response.status();
         let bytes = to_bytes(Body::new(response.into_body()), 1024 * 1024).await?;
+        drop(sender);
         driver.await??;
         let result: Value = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(status.as_u16() == 200, "HTTP write failed: {result}");

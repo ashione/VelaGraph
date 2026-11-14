@@ -46,6 +46,39 @@ jobs:
           rustc -Vv >> demo-evidence/source.txt
       - name: Build actual demo and service
         run: cargo build --locked -p replicated-graph --example managed_service_demo --bin graph-service
+      - name: Verify the documented shell entrypoint
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, signal, subprocess, tempfile, time
+          with tempfile.TemporaryDirectory() as root:
+              root = pathlib.Path(root)
+              with open("demo-evidence/shell.stdout", "w") as out, open("demo-evidence/shell.stderr", "w") as err:
+                  p = subprocess.Popen(["bash", "scripts/managed-service-demo.sh", str(root / "fresh")], stdout=out, stderr=err)
+                  try:
+                      deadline = time.monotonic() + 120
+                      while True:
+                          if p.poll() is not None:
+                              raise RuntimeError("shell entrypoint exited before readiness")
+                          text = pathlib.Path("demo-evidence/shell.stdout").read_text()
+                          if "\n" in text:
+                              ready = json.loads(text.split("\n", 1)[0])
+                              assert ready["pid"] == p.pid and ready["fresh_only"]
+                              assert ready["restore_supported"] is False
+                              break
+                          if time.monotonic() >= deadline:
+                              raise TimeoutError("shell readiness")
+                          time.sleep(0.05)
+                      p.send_signal(signal.SIGINT)
+                      assert p.wait(timeout=30) == 0
+                  finally:
+                      if p.poll() is None:
+                          p.send_signal(signal.SIGTERM)
+                          try:
+                              p.wait(timeout=30)
+                          except subprocess.TimeoutExpired:
+                              p.kill()
+                              p.wait()
+          PY
       - name: Verify clean process startup and shutdown
         env:
           VELAGRAPH_MANAGED_DEMO_BIN: ${{ github.workspace }}/target/debug/examples/managed_service_demo
