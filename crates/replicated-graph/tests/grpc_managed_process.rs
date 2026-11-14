@@ -33,6 +33,53 @@ use std::{
 use velagraph::Value;
 include!("support/managed_process_fixture.rs");
 
+// A rejected preface may produce connection-level HTTP/2 control frames, never
+// DATA/HEADERS or a legacy length-prefixed JSON success/error response.
+fn rejected_preface_controls(mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        if bytes.len() < 9 {
+            return false;
+        }
+        let length = (usize::from(bytes[0]) << 16)
+            | (usize::from(bytes[1]) << 8)
+            | usize::from(bytes[2]);
+        if length > bytes.len() - 9 || bytes[5..9] != [0; 4] {
+            return false;
+        }
+        let payload = &bytes[9..9 + length];
+        let valid = match (bytes[3], bytes[4]) {
+            (4, 0) => length % 6 == 0, // SETTINGS
+            (4, 1) => length == 0,     // SETTINGS acknowledgement
+            (7, 0) => length >= 8,     // GOAWAY
+            (8, 0) => length == 4 && payload != [0; 4], // WINDOW_UPDATE
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+        bytes = &bytes[9 + length..];
+    }
+    true
+}
+#[test]
+fn rejected_preface_does_not_accept_legacy_success_or_error_replies() {
+    for result in [
+        serde_json::json!({"Ok": {}}),
+        serde_json::json!({"Err": "Protocol"}),
+    ] {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 6, "identity": {}, "nonce": 1, "operation": 8, "result": result
+        }))
+        .unwrap();
+        let mut response = (payload.len() as u32).to_be_bytes().to_vec();
+        response.extend(payload);
+        assert!(!rejected_preface_controls(&response));
+    }
+    assert!(rejected_preface_controls(&[]));
+    assert!(rejected_preface_controls(&[0, 0, 0, 4, 0, 0, 0, 0, 0]));
+    assert!(!rejected_preface_controls(&[0, 0, 0, 0, 0, 0, 0, 0, 0]));
+}
+
 async fn process(
     shard: u64,
     binding: &Binding,
@@ -164,21 +211,26 @@ async fn scenario(profile: CapacityProfile, grpc: bool) -> anyhow::Result<Vec<Ve
     let mut legacy = tokio::net::TcpStream::connect(c.address).await?;
     legacy.write_all(&(payload.len() as u32).to_be_bytes()).await?;
     legacy.write_all(&payload).await?;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let mut received = 0;
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut received = Vec::new();
         let mut buffer = [0; 4096];
         loop {
             match legacy.read(&mut buffer).await {
                 Ok(0) | Err(_) => break,
                 Ok(bytes) => {
-                    received += bytes;
-                    assert!(received <= 64 * 1024, "legacy peer was not rejected");
+                    received.extend_from_slice(&buffer[..bytes]);
+                    assert!(received.len() <= 64 * 1024, "legacy peer was not rejected");
                 }
             }
         }
+        received
     })
     .await
     .context("legacy JSON peer must close, even after HTTP/2 SETTINGS")?;
+    assert!(
+        rejected_preface_controls(&response),
+        "retired JSON peer received a non-control or legacy response: {response:?}"
+    );
     assert_eq!(
         NodeRef::Remote(&c_client).summary(&authority(), 1).await?,
         before
