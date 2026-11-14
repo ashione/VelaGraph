@@ -1,0 +1,25 @@
+name: Job proto generation (temporary)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/replicated-graph/proto/public_managed.proto'
+      - 'scripts/generate-public-managed-proto.sh'
+      - '.github/workflows/job-proto-generate.yml'
+permissions:
+  contents: read
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: bash scripts/generate-public-managed-proto.sh
+      - name: Export generated binding
+        run: |
+          echo GENERATED_BINDING_BEGIN
+          base64 -w 120 crates/replicated-graph/src/managed_gateway_public_proto.rs
+          echo GENERATED_BINDING_END
