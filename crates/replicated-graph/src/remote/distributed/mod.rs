@@ -999,8 +999,12 @@ pub async fn query(
             endpoint,
             end.saturating_duration_since(Instant::now()),
         )?;
-        client.query(request, end.saturating_duration_since(Instant::now())).await
-    }).await.unwrap_or(Err(RemoteError::Timeout { request_id: None }))
+        client
+            .query(request, end.saturating_duration_since(Instant::now()))
+            .await
+    })
+    .await
+    .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }
 fn validate_output(
     output: &DistributedOutput,

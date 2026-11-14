@@ -437,9 +437,10 @@ fn scan(schema: Schema, mut data: &[u8], depth: usize, batches: usize) -> Result
         | Schema::QualifiedElement
         | Schema::QueryRow
         | Schema::SingleQueryResponse
-        | Schema::CoordinatorJobOutput
-        => Some(counts.iter().sum::<usize>()),
-        Schema::CoordinatorQueryResponse | Schema::CoordinatorJobResponse => Some(counts[..2].iter().sum::<usize>()),
+        | Schema::CoordinatorJobOutput => Some(counts.iter().sum::<usize>()),
+        Schema::CoordinatorQueryResponse | Schema::CoordinatorJobResponse => {
+            Some(counts[..2].iter().sum::<usize>())
+        }
         Schema::CoordinatorJobRequest => Some(counts[2..7].iter().sum::<usize>()),
         _ => None,
     };
@@ -751,7 +752,7 @@ mod coordinator_tests {
         };
         reject::<wire::CoordinatorQueryResponse>(
             wire::CoordinatorQueryResponse {
-            accepted_consistency: Some(1),
+                accepted_consistency: Some(1),
                 result: Some(wire::coordinator_query_response::Result::Output(output)),
             }
             .encode_to_vec(),
@@ -768,7 +769,7 @@ mod coordinator_tests {
         };
         reject::<wire::CoordinatorQueryResponse>(
             wire::CoordinatorQueryResponse {
-            accepted_consistency: Some(1),
+                accepted_consistency: Some(1),
                 result: Some(wire::coordinator_query_response::Result::Output(output)),
             }
             .encode_to_vec(),

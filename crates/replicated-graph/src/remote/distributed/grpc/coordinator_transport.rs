@@ -27,7 +27,9 @@ impl CoordinatorService for CoordinatorHandler {
         let required = message.required_consistency;
         let request = codec::decode_query_request(message).map_err(status)?;
         if let Err(error) = admit_consistency(required) {
-            return Ok(tonic::Response::new(codec::encode_query_response(Err(error))));
+            return Ok(tonic::Response::new(codec::encode_query_response(Err(
+                error,
+            ))));
         }
         validate_request(&request).map_err(status)?;
         let end = Instant::now()
@@ -107,7 +109,11 @@ impl GrpcCoordinatorService {
         let mut clients = BTreeMap::new();
         for route in &catalog.partitions {
             if let std::collections::btree_map::Entry::Vacant(entry) = clients.entry(route.shard) {
-                entry.insert(QueryClient::connect_lazy(route.endpoint, route.identity, deadline)?);
+                entry.insert(QueryClient::connect_lazy(
+                    route.endpoint,
+                    route.identity,
+                    deadline,
+                )?);
             }
         }
         let clients = Arc::new(clients);
@@ -219,7 +225,10 @@ impl CoordinatorClient {
     }
     /// Defer connection until an operation holds CLIENT_ADMISSION. Convenience
     /// calls use this path so their handshake cannot bypass bounded admission.
-    pub(in crate::remote::distributed) fn connect_lazy(address: SocketAddr, deadline: Duration) -> Result<Self, RemoteError> {
+    pub(in crate::remote::distributed) fn connect_lazy(
+        address: SocketAddr,
+        deadline: Duration,
+    ) -> Result<Self, RemoteError> {
         checked_deadline(deadline, None)?;
         let channel = Channel::from_shared(format!("http://{address}"))
             .map_err(|_| RemoteError::InvalidArgument)?
@@ -246,7 +255,8 @@ impl CoordinatorClient {
         required: consistency::ReadConsistency,
         deadline: Duration,
     ) -> Result<DistributedResponse, RemoteError> {
-        self.query_inner(request, Some(required.into()), deadline).await
+        self.query_inner(request, Some(required.into()), deadline)
+            .await
     }
     async fn query_inner(
         &self,
@@ -303,7 +313,8 @@ impl CoordinatorClient {
         required: consistency::ReadConsistency,
         deadline: Duration,
     ) -> Result<jobs::Response, RemoteError> {
-        self.job_inner(request, Some(required.into()), deadline).await
+        self.job_inner(request, Some(required.into()), deadline)
+            .await
     }
     async fn job_inner(
         &self,
@@ -349,13 +360,21 @@ impl CoordinatorClient {
 fn admit_consistency(required: Option<i32>) -> Result<(), QueryFailure> {
     match required {
         None => Ok(()),
-        Some(value) if value == wire::ConsistencyRequirement::IndependentShardSnapshots as i32 => Ok(()),
+        Some(value) if value == wire::ConsistencyRequirement::IndependentShardSnapshots as i32 => {
+            Ok(())
+        }
         _ => Err(QueryFailure::Unsupported),
     }
 }
-fn validate_consistency(required: Option<i32>, accepted: Option<i32>, success: bool) -> Result<(), RemoteError> {
-    if success && required.is_some()
-        && (required != accepted || accepted != Some(wire::ConsistencyRequirement::IndependentShardSnapshots as i32))
+fn validate_consistency(
+    required: Option<i32>,
+    accepted: Option<i32>,
+    success: bool,
+) -> Result<(), RemoteError> {
+    if success
+        && required.is_some()
+        && (required != accepted
+            || accepted != Some(wire::ConsistencyRequirement::IndependentShardSnapshots as i32))
     {
         return Err(RemoteError::Protocol);
     }
@@ -376,8 +395,14 @@ mod tests {
     #[tokio::test]
     async fn convenience_channel_does_not_connect_before_operation_admission() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = CoordinatorClient::connect_lazy(listener.local_addr().unwrap(), Duration::from_secs(1)).unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        let client =
+            CoordinatorClient::connect_lazy(listener.local_addr().unwrap(), Duration::from_secs(1))
+                .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
         drop(client);
     }
     #[test]
@@ -406,11 +431,16 @@ mod tests {
         });
         query.version = 2;
         assert!(codec::decode_query_request(query.clone()).is_err());
-        query.required_consistency = Some(wire::ConsistencyRequirement::IndependentShardSnapshots as i32);
-        let decoded = wire::CoordinatorQueryRequest::decode(query.encode_to_vec().as_slice()).unwrap();
+        query.required_consistency =
+            Some(wire::ConsistencyRequirement::IndependentShardSnapshots as i32);
+        let decoded =
+            wire::CoordinatorQueryRequest::decode(query.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.required_consistency, query.required_consistency);
         assert!(codec::decode_query_request(decoded).is_ok());
-        let mut job = codec::encode_job_request(jobs::Request::Cancel { token: [1; 16] }, Duration::from_secs(1));
+        let mut job = codec::encode_job_request(
+            jobs::Request::Cancel { token: [1; 16] },
+            Duration::from_secs(1),
+        );
         job.version = 2;
         assert!(codec::decode_job_request(job.clone()).is_err());
         job.required_consistency = query.required_consistency;

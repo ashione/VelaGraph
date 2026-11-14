@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn malformed_versions_tokens_enums_values_and_duplicate_properties_fail() {
         let mut request = wire::CoordinatorQueryRequest {
-        required_consistency: None,
+            required_consistency: None,
             version: 1,
             timeout_millis: 1,
             start_partition: 7,
@@ -627,10 +627,14 @@ mod tests {
         request.version = 1;
         request.timeout_millis = 0;
         assert!(decode_query_request(request).is_err());
-        assert!(decode_query_response(wire::CoordinatorQueryResponse { result: None, accepted_consistency: None }).is_err());
+        assert!(decode_query_response(wire::CoordinatorQueryResponse {
+            result: None,
+            accepted_consistency: None
+        })
+        .is_err());
         for e in [0, 999] {
             assert!(decode_query_response(wire::CoordinatorQueryResponse {
-        accepted_consistency: None,
+                accepted_consistency: None,
                 result: Some(wire::coordinator_query_response::Result::Failure(e))
             })
             .is_err());

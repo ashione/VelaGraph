@@ -864,10 +864,10 @@ pub struct CoordinatorQueryOutput {
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CoordinatorQueryResponse {
-    #[prost(oneof = "coordinator_query_response::Result", tags = "1, 2")]
-    pub result: ::core::option::Option<coordinator_query_response::Result>,
     #[prost(enumeration = "ConsistencyRequirement", optional, tag = "3")]
     pub accepted_consistency: ::core::option::Option<i32>,
+    #[prost(oneof = "coordinator_query_response::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<coordinator_query_response::Result>,
 }
 /// Nested message and enum types in `CoordinatorQueryResponse`.
 pub mod coordinator_query_response {
@@ -927,10 +927,10 @@ pub struct CoordinatorJobRequest {
     pub version: u32,
     #[prost(uint64, tag = "2")]
     pub timeout_millis: u64,
-    #[prost(oneof = "coordinator_job_request::Request", tags = "3, 4, 5, 6, 7")]
-    pub request: ::core::option::Option<coordinator_job_request::Request>,
     #[prost(enumeration = "ConsistencyRequirement", optional, tag = "8")]
     pub required_consistency: ::core::option::Option<i32>,
+    #[prost(oneof = "coordinator_job_request::Request", tags = "3, 4, 5, 6, 7")]
+    pub request: ::core::option::Option<coordinator_job_request::Request>,
 }
 /// Nested message and enum types in `CoordinatorJobRequest`.
 pub mod coordinator_job_request {
@@ -1041,10 +1041,10 @@ pub mod coordinator_job_output {
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CoordinatorJobResponse {
-    #[prost(oneof = "coordinator_job_response::Result", tags = "1, 2")]
-    pub result: ::core::option::Option<coordinator_job_response::Result>,
     #[prost(enumeration = "ConsistencyRequirement", optional, tag = "3")]
     pub accepted_consistency: ::core::option::Option<i32>,
+    #[prost(oneof = "coordinator_job_response::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<coordinator_job_response::Result>,
 }
 /// Nested message and enum types in `CoordinatorJobResponse`.
 pub mod coordinator_job_response {
@@ -1293,6 +1293,46 @@ impl CoordinatorError {
             "COORDINATOR_CAPACITY_NOT_CONFIRMED" => Some(Self::CoordinatorCapacityNotConfirmed),
             "COORDINATOR_INVALID_JOURNAL" => Some(Self::CoordinatorInvalidJournal),
             "COORDINATOR_INCOMPATIBLE_HISTORY" => Some(Self::CoordinatorIncompatibleHistory),
+            _ => None,
+        }
+    }
+}
+/// Version 1 omits the requirement and retains observed independent snapshots.
+/// Explicit negotiation uses version 2, requires field presence, and success
+/// echoes the accepted contract; old servers reject version 2 before execution.
+/// Global committed snapshots remain unsupported for this observed service.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ConsistencyRequirement {
+    Unspecified = 0,
+    IndependentShardSnapshots = 1,
+    GlobalCommittedSnapshot = 2,
+}
+impl ConsistencyRequirement {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONSISTENCY_REQUIREMENT_UNSPECIFIED",
+            Self::IndependentShardSnapshots => {
+                "CONSISTENCY_REQUIREMENT_INDEPENDENT_SHARD_SNAPSHOTS"
+            }
+            Self::GlobalCommittedSnapshot => "CONSISTENCY_REQUIREMENT_GLOBAL_COMMITTED_SNAPSHOT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONSISTENCY_REQUIREMENT_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONSISTENCY_REQUIREMENT_INDEPENDENT_SHARD_SNAPSHOTS" => {
+                Some(Self::IndependentShardSnapshots)
+            }
+            "CONSISTENCY_REQUIREMENT_GLOBAL_COMMITTED_SNAPSHOT" => {
+                Some(Self::GlobalCommittedSnapshot)
+            }
             _ => None,
         }
     }
@@ -2986,31 +3026,5 @@ pub mod single_query_service_server {
     pub const SERVICE_NAME: &str = "velagraph.internal.query.v1.SingleQueryService";
     impl<T> tonic::server::NamedService for SingleQueryServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
-    }
-}
-
-#[allow(clippy::all)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum ConsistencyRequirement {
-    Unspecified = 0,
-    IndependentShardSnapshots = 1,
-    GlobalCommittedSnapshot = 2,
-}
-impl ConsistencyRequirement {
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "CONSISTENCY_REQUIREMENT_UNSPECIFIED",
-            Self::IndependentShardSnapshots => "CONSISTENCY_REQUIREMENT_INDEPENDENT_SHARD_SNAPSHOTS",
-            Self::GlobalCommittedSnapshot => "CONSISTENCY_REQUIREMENT_GLOBAL_COMMITTED_SNAPSHOT",
-        }
-    }
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "CONSISTENCY_REQUIREMENT_UNSPECIFIED" => Some(Self::Unspecified),
-            "CONSISTENCY_REQUIREMENT_INDEPENDENT_SHARD_SNAPSHOTS" => Some(Self::IndependentShardSnapshots),
-            "CONSISTENCY_REQUIREMENT_GLOBAL_COMMITTED_SNAPSHOT" => Some(Self::GlobalCommittedSnapshot),
-            _ => None,
-        }
     }
 }

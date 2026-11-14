@@ -17,8 +17,12 @@ impl From<ReadConsistency> for i32 {
     fn from(value: ReadConsistency) -> Self {
         use grpc::wire::ConsistencyRequirement;
         match value {
-            ReadConsistency::IndependentShardSnapshots => ConsistencyRequirement::IndependentShardSnapshots as i32,
-            ReadConsistency::GlobalCommittedSnapshot => ConsistencyRequirement::GlobalCommittedSnapshot as i32,
+            ReadConsistency::IndependentShardSnapshots => {
+                ConsistencyRequirement::IndependentShardSnapshots as i32
+            }
+            ReadConsistency::GlobalCommittedSnapshot => {
+                ConsistencyRequirement::GlobalCommittedSnapshot as i32
+            }
         }
     }
 }
@@ -37,8 +41,16 @@ pub async fn query_with_consistency(
     let end = checked_deadline(deadline, None)?;
     tokio::time::timeout_at(end, async {
         let client = grpc::CoordinatorClient::connect_lazy(endpoint, deadline)?;
-        client.query_with_consistency(request, required, end.saturating_duration_since(Instant::now())).await
-    }).await.unwrap_or(Err(RemoteError::Timeout { request_id: None }))
+        client
+            .query_with_consistency(
+                request,
+                required,
+                end.saturating_duration_since(Instant::now()),
+            )
+            .await
+    })
+    .await
+    .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }
 
 /// Start, advance, read or cancel a job without silently weakening consistency.
@@ -49,13 +61,22 @@ pub async fn job_with_consistency(
     required: ReadConsistency,
     deadline: Duration,
 ) -> Result<jobs::Response, RemoteError> {
-    if matches!(&request, jobs::Request::Start {text,..} | jobs::Request::StartRows {text,..} if text.len() > query::MAX_QUERY_TEXT_BYTES) {
+    if matches!(&request, jobs::Request::Start {text,..} | jobs::Request::StartRows {text,..} if text.len() > query::MAX_QUERY_TEXT_BYTES)
+    {
         return Err(RemoteError::ResourceExhausted);
     }
     let deadline = deadline.min(Duration::from_millis(MAX_TIMEOUT));
     let end = checked_deadline(deadline, None)?;
     tokio::time::timeout_at(end, async {
         let client = grpc::CoordinatorClient::connect_lazy(endpoint, deadline)?;
-        client.job_with_consistency(request, required, end.saturating_duration_since(Instant::now())).await
-    }).await.unwrap_or(Err(RemoteError::Timeout { request_id: None }))
+        client
+            .job_with_consistency(
+                request,
+                required,
+                end.saturating_duration_since(Instant::now()),
+            )
+            .await
+    })
+    .await
+    .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }

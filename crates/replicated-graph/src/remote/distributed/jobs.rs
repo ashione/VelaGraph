@@ -942,8 +942,12 @@ pub async fn request(
             endpoint,
             end.saturating_duration_since(Instant::now()),
         )?;
-        client.job(request, end.saturating_duration_since(Instant::now())).await
-    }).await.unwrap_or(Err(RemoteError::Timeout { request_id: None }))
+        client
+            .job(request, end.saturating_duration_since(Instant::now()))
+            .await
+    })
+    .await
+    .unwrap_or(Err(RemoteError::Timeout { request_id: None }))
 }
 
 fn validate_stamps(
