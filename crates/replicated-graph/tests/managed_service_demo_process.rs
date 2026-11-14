@@ -78,7 +78,10 @@ impl Drop for Evidence {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if matches!(path.extension().and_then(|s| s.to_str()), Some("stdout" | "stderr")) {
+            if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("stdout" | "stderr")
+            ) {
                 // Logs only; never copy graph data or unrelated files.
                 match log_tail(&path) {
                     Ok(bytes) => {
@@ -145,7 +148,12 @@ async fn await_ready(demo: &mut Demo, output: &Path, error: &Path) -> anyhow::Re
     .context("demo startup deadline")?
 }
 
-async fn rejected_existing(binary: &Path, data: &Path, logs: &Path, label: &str) -> anyhow::Result<()> {
+async fn rejected_existing(
+    binary: &Path,
+    data: &Path,
+    logs: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
     let output = logs.join(format!("{label}.stdout"));
     let error = logs.join(format!("{label}.stderr"));
     let mut rejected = launch(binary, data, &output, &error)?;
