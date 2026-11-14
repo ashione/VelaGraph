@@ -37,7 +37,6 @@ use velagraph::{
     Value,
 };
 
-
 // Share only fixture helpers, never another target's acceptance tests.
 include!("support/managed_process_fixture.rs");
 
@@ -2138,8 +2137,9 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
     let address = listener.local_addr()?;
     let upstream = g.local_addr();
     let expected_external_id = write.external_id;
-    let proxy = tokio::spawn(async move {
-        tokio::time::timeout(BUDGET, async move {
+    let proxy =
+        tokio::spawn(async move {
+            tokio::time::timeout(BUDGET, async move {
             let (caller, _) = listener.accept().await?;
             let mut connection = h2::server::Builder::new()
                 .handshake::<_, axum::body::Bytes>(caller)
@@ -2251,7 +2251,7 @@ async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
             Ok::<_, anyhow::Error>(())
         })
         .await?
-    });
+        });
     let result = gateway::request(address, byte_binding(), Operation::Submit(write), BUDGET).await;
     // Join is the evidence barrier: fail if the upstream response was not fully
     // received and verified before the connection was deliberately closed.
