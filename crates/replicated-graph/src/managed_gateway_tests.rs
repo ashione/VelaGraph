@@ -819,7 +819,6 @@ async fn session_budgets_expiry_malformed_fields_and_oversized_frames() {
             partition: 7,
             text: "g.V(1)".into(),
         }),
-        ..Default::default()
     };
     let mut payload = prost::Message::encode_to_vec(&req);
     // Unknown field 127 must fail the strict protobuf prescan.
@@ -1503,7 +1502,6 @@ async fn reset_open_rpc_releases_undelivered_session_over_real_http2() {
             context: public_context(),
             version: None,
             ttl_millis: 60000,
-            ..Default::default()
         };
         let (response, mut body, driver) = raw_rpc(
             g.local_addr(),
@@ -2166,11 +2164,9 @@ async fn listener_free_service_expires_and_releases_sessions_on_shutdown_or_drop
     let _guard = TEST_GATE.lock().await;
     let fixture = Fixture::new().await;
     for graceful in [true, false] {
-        let (service, address) =
-            Service::start(fixture.config().into(), None, Duration::from_secs(15), None)
-                .await
-                .unwrap();
-        assert_eq!(address, None);
+        let service = Service::start(fixture.config().into(), Duration::from_secs(15), None)
+            .await
+            .unwrap();
         let http = service
             .bind_http("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
             .await

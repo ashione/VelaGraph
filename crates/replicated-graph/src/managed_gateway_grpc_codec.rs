@@ -617,7 +617,7 @@ mod tests {
             ttl_millis: 500,
         };
         assert_eq!(
-            fixed_open(request).unwrap(),
+            fixed_open(request.clone()).unwrap(),
             Operation::OpenSession {
                 version: Some(0),
                 ttl_millis: 500
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(
             fixed_open(pb::FixedOpenRequest {
                 version: None,
-                ..request
+                ..request.clone()
             })
             .unwrap(),
             Operation::OpenSession {
@@ -636,17 +636,17 @@ mod tests {
         );
         assert!(fixed_open(pb::FixedOpenRequest {
             context: None,
-            ..request
+            ..request.clone()
         })
         .is_err());
         assert!(fixed_open(pb::FixedOpenRequest {
             ttl_millis: 0,
-            ..request
+            ..request.clone()
         })
         .is_err());
         assert!(fixed_open(pb::FixedOpenRequest {
             ttl_millis: MAX_TTL.as_millis() as u64 + 1,
-            ..request
+            ..request.clone()
         })
         .is_err());
         let session = pb::FixedSession {

@@ -2,7 +2,6 @@
 //! and HTTP; loopback-only, not an authenticated production service.
 use super::*;
 use super::{grpc_codec as codec, public_proto as wire};
-use prost::Message;
 use std::{
     future::Future,
     pin::Pin,
