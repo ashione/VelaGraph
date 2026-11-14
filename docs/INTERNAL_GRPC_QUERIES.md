@@ -83,8 +83,9 @@ This is not distributed MVCC or managed consistency. Fixed/renewable queries hav
 a separate [managed-gateway contract](INTERNAL_GRPC_FIXED_QUERIES.md).
 
 The original job state machine retains cumulative budgets, shard parallelism,
-immutable page/replay behavior, cancellation and leases. GraphService and public
-Gateway legacy library paths remain separate retirement work under #218. Unix
+immutable page/replay behavior, cancellation and leases. GraphService legacy
+library paths remain separate retirement work under #218. Gateway has migrated
+under #276. Unix
 read gateway retirement is already complete. Storage records and consensus are
 unchanged; this slice does not establish production readiness or resolve #247.
 

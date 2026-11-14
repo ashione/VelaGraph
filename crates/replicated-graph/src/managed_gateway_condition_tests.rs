@@ -182,19 +182,7 @@ async fn conditional_tcp_preserves_versions_identity_and_edge_guards() {
         Err(Error::Identity)
     );
     let edge_write = conditional(7, true, PropertyCondition::Missing, Value::Real(-0.0));
-    // Send a complete request and intentionally lose the final reply. An exact
-    // retry, whether admitted before or after this socket closes, is one write.
-    let request = Request {
-        version: VERSION,
-        request_id: [99; 16],
-        binding: bound(),
-        operation: Operation::Submit(edge_write.clone()),
-    };
-    let mut socket = TcpStream::connect(g.local_addr()).await.unwrap();
-    write_bytes(&mut socket, &encode(&request, MAX_REQUEST_BYTES).unwrap())
-        .await
-        .unwrap();
-    drop(socket);
+    send_write_lost_ack(&g, &f, &edge_write).await;
     let edge_reply = call(&g, Operation::Submit(edge_write.clone()))
         .await
         .unwrap();

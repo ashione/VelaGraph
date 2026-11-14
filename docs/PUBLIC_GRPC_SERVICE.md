@@ -17,7 +17,7 @@ raw Plan/KV, membership or administration service is registered.
 
 ## Shared behavior, distinct wire formats
 
-Both public adapters and the original managed TCP entry use the same
+Both public adapters and the typed library Gateway use the same
 `Invocation`, state, canonical mutation identity, original-Plan recovery,
 certified fixed-V query executor, admission and retention budgets. There is no
 extra TCP proxy hop between a public adapter and the business handler, and no
@@ -47,8 +47,9 @@ The read selector is a required oneof: latest certified, exact V (including
 zero), or minimum V. Queries retain one immutable certified V and original
 completeness through all pages. This is not linearizable latest or a certificate
 that arbitrary trusted low-level writers preserved all adjacency. Every
-unsupported Gremlin feature fails explicitly. Historical business time, custom
-read profiles and arbitrary graph transactions are not exposed by this slice.
+unsupported Gremlin feature fails explicitly. Historical business time and arbitrary graph transactions are not exposed.
+Version-2 identified library requests may explicitly select the existing bounded
+Parity2MiBV1 or LocalRead8MiBV1 capture profile; this does not raise any budget.
 Limits are unchanged from the existing managed execution path.
 
 All eight currently supported managed mutation forms are typed. Scalar presence
@@ -84,7 +85,8 @@ ownership machinery. Fixed snapshot acquisition, retained results and individual
 messages keep their existing capacity limits. This is not a data-local scaling
 improvement. HTTP parity for this additional service and for the asynchronous
 managed job service remains future work; typed job RPCs are described below.
-The legacy library Gateway is not removed until its remaining semantics have replacements; #218 remains open.
+The library Gateway now binds this typed service instead of JSON/TCP; #218
+remains open for the separate graph library transport retirement.
 
 ## Errors and ownership
 
@@ -109,7 +111,7 @@ do not run protoc or require a JVM.
 
 For data-local `QueryService`, every future gRPC page envelope is checked
 before the first gRPC page is returned. A successful proof is cached on the immutable retained result,
-including the first gRPC use of an HTTP/TCP-created session. Subsequent fetches
+including the first gRPC use of an HTTP/library-created session. Subsequent fetches
 still check liveness/expiry and encode their own page, without quadratic
 whole-result revalidation. Failed checks are not cached.
 
@@ -172,3 +174,26 @@ handles. Capturing renewal is Busy, and a delayed renewal cannot revive expired
 work. Every full page is preflighted against both logical and typed envelopes
 before Ready. No JSON tunnel, extra listener or second execution engine is used.
 See [the complete job contract and validation matrix](MANAGED_QUERY_JOBS.md).
+
+## Gateway library migration (#276)
+
+`Gateway::bind*` and `managed_gateway::request` retain their domain operations,
+but the announced port now speaks typed gRPC only. Upgrade peers together; no
+wire sniffing, JSON fallback or transparent write retry is provided. Public HTTP
+remains intentional. `Gateway` binding now requires loopback, matching the public
+adapter: a formerly non-loopback legacy address is explicitly rejected rather
+than silently expanding public-service exposure.
+
+The library client uses context version 2 with a nonzero call nonce and exact
+authority/cohort/mapping binding. The server checks it before domain execution;
+typed replies and application errors acknowledge the binding and nonce. This is
+placement/correlation validation, not authentication. Old version-1 generated
+clients omit identity and retain their existing contract. An older server rejects
+version 2 instead of silently accepting a request without its required binding.
+
+One client admission permit covers connection setup, encoding, dispatch and
+validation within the original absolute deadline. A timeout or lost response is
+Unknown, not Abort: inspect/recover the original external ID and exact command.
+The shared executor, fixed V, page/job/session ownership and delivery cleanup
+are unchanged. No global snapshot, new transaction or higher throughput claim
+follows from this transport migration.

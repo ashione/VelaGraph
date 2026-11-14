@@ -76,7 +76,7 @@ inter-node graph transports and are not replaced by this service migration.
 | Observed hierarchy jobs | Shard Open/Fragment/Close typed gRPC (#236); typed coordinator Query/Job ingress (#248), default CLI transport (#260); library query/job/consistency ingress migrated to typed RPC (#274) |
 | graph-service managed state | Listener-free Service lifecycle; only configured public HTTP/gRPC listeners are bound (#244) |
 | Single-shard graph-node and catalog/routing storage | [Default typed operations, snapshots and single-partition query](RPC_STORAGE_ROUTING.md); graph-node no longer opens legacy TCP (#256). Explicit library legacy fixtures remain separately retained |
-| Legacy library graph/Gateway | Still need separate retirement/migration; observed coordinator library now uses typed RPC (#274); graph-service has no hidden legacy listener |
+| Legacy library graph | GraphService still needs separate retirement; Gateway library uses identified typed gRPC (#276), observed coordinator uses typed RPC (#274); graph-service has no hidden legacy listener |
 | Unix read gateway | Removed under #262; [migration and retained semantic coverage](GRAPH_UDS_GATEWAY.md). No replacement Unix listener |
 
 The exit gate is to make supported service paths RPC-only, remove superseded
@@ -103,13 +103,12 @@ not-run stages separately. A short process test is not a substitute for the
 managed state without opening a compatibility TCP listener. HTTP and gRPC adapters
 share its session/job cleanup and stop signal. Expiry runs even when no requests
 arrive; shutdown/drop stops both adapters and cancels retained jobs/sessions, but
-does not undo a durable write or resolve an unknown outcome. The legacy `Gateway`
-wrapper still provides explicitly selected TCP library entrypoints, including
-asynchronous local-query jobs not yet exposed by the public gRPC adapter.
-The separate public `FixedSessionService` (#266) now maps the original materialized
-OpenSession/Read/Traverse/TraversePage/Close operations without changing their
-fixed-V semantics; it is not the data-local `QueryService` session contract. Removing that wrapper requires replacement coverage first;
-changing defaults must not silently remove these semantics. Retiring that wrapper and other legacy library TCP ingress paths remains #218 work.
+does not undo a durable write or resolve an unknown outcome. The library `Gateway` wrapper now binds the same public typed gRPC adapter.
+Its domain request API uses identified version-2 calls with exact binding/nonce
+validation, including materialized fixed sessions, explicit bounded capture
+profiles and asynchronous jobs. The previous JSON listener/client is removed;
+see [migration](PUBLIC_GRPC_SERVICE.md#gateway-library-migration-276).
+The separate graph library transport is still tracked by #218.
 
 Validation includes actual-process owned socket-inode checks on Linux: only the
 announced public ports listen. Lifecycle tests keep adapter handles alive while
@@ -131,6 +130,6 @@ network. Strict durable-record parsing still rejects malformed records, whereas
 protobuf collection/field/envelope checks protect the live RPC boundary. Tests
 for foreign identities/nonces, unavailable outcomes, capacity, history, retained
 reads and end-to-end process behavior must pass on the final commit. This change
-does not retire `managed_gateway::Gateway`, `remote::GraphService` or the old
-library observed coordinator. These remain #218 work and must not be described
+does not itself retire `remote::GraphService`. Gateway and observed coordinator
+library ingress were separately migrated under #276 and #274; graph ingress remains #218 work and must not be described
 as complete merely because managed member traffic is now typed-only.

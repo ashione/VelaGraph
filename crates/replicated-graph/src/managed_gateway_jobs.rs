@@ -556,7 +556,7 @@ impl State {
                 // Ready is transport-independent: retain the logical envelope
                 // check and also preflight every typed page before publication.
                 local::preflight(&binding, reply.clone())?;
-                grpc_codec::encode_job_fetch(&reply)?;
+                grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply)?, &binding)?;
             }
             worker.deadline()?;
             Ok(Arc::new(result))
@@ -1120,22 +1120,16 @@ mod tests {
             submit: tokio::sync::Mutex::new(()),
             timing: None,
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap();
-        let worker = state.clone();
-        let handler = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let permit = Arc::new(worker.connections.clone().try_acquire_owned().unwrap());
-            // Reproduce a gateway configured for fifteen seconds, proving the
-            // new operation applies its stricter total five-second profile.
-            let _ = serve(
-                socket,
-                worker,
-                permit,
-                Instant::now() + Duration::from_secs(15),
-            )
-            .await;
-        });
+        let (_stop, stopped) = watch::channel(false);
+        let service = grpc::bind(
+            state.clone(),
+            stopped,
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        let endpoint = service.local_addr();
         let start = Instant::now();
         assert!(request(
             endpoint,
@@ -1149,7 +1143,7 @@ mod tests {
         .await
         .is_err());
         assert!(start.elapsed() < Duration::from_secs(7));
-        handler.await.unwrap();
+        service.shutdown().await;
         for responder in responders {
             responder.await.unwrap();
         }

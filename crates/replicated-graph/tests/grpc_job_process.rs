@@ -184,7 +184,7 @@ async fn scenario() -> anyhow::Result<()> {
         )
         .await?;
     }
-    legacy_differential(&coordinator, &a, &b, version).await?;
+    typed_domain_client_differential(&coordinator, &a, &b, version).await?;
     let request = start_job(40, Some(version));
     let admitted = jobs.start(request.clone()).await?.into_inner();
     assert_eq!(admitted.operation_id, request.operation_id);
@@ -607,7 +607,7 @@ impl ResponseGate {
 
 // Direct adapter differential: both wire protocols address the same job registry
 // and the same independent managed-node fixture. No production listener changes.
-async fn legacy_differential(
+async fn typed_domain_client_differential(
     coordinator: &NodeProcess,
     a: &NodeProcess,
     b: &NodeProcess,
@@ -654,7 +654,7 @@ async fn legacy_differential(
         text: request.query.as_ref().unwrap().text.clone(),
     };
     let policy = request.policy.as_ref().unwrap();
-    let legacy_start = Op::StartLocalQueryJob {
+    let domain_start = Op::StartLocalQueryJob {
         operation_id: [90; 16],
         version: Some(version),
         query: query.clone(),
@@ -665,8 +665,8 @@ async fn legacy_differential(
             lifetime_millis: policy.lifetime_millis,
         },
     };
-    let Reply::StartLocalQueryJob { operation_id, job } = call(legacy_start.clone()).await? else {
-        anyhow::bail!("legacy start reply")
+    let Reply::StartLocalQueryJob { operation_id, job } = call(domain_start.clone()).await? else {
+        anyhow::bail!("domain client start reply")
     };
     let handle = pb::JobHandle {
         incarnation: job.incarnation.to_vec(),
@@ -676,7 +676,7 @@ async fn legacy_differential(
     assert_eq!(admitted.operation_id, operation_id);
     assert_eq!(admitted.job.as_ref(), Some(&handle));
     assert_eq!(
-        call(legacy_start.clone()).await?,
+        call(domain_start.clone()).await?,
         Reply::StartLocalQueryJob {
             operation_id,
             job: job.clone()
@@ -686,7 +686,7 @@ async fn legacy_differential(
     let Reply::GetLocalQueryJob { status: old, .. } =
         call(Op::GetLocalQueryJob { job: job.clone() }).await?
     else {
-        anyhow::bail!("legacy status reply")
+        anyhow::bail!("domain client status reply")
     };
     assert_eq!(old.phase, gw::JobPhase::Ready);
     assert_eq!((status.version, status.total), (old.version, old.total));
@@ -708,7 +708,7 @@ async fn legacy_differential(
             ..
         } = reply
         else {
-            anyhow::bail!("legacy fetch reply")
+            anyhow::bail!("domain client fetch reply")
         };
         let mut fetch = fetch_job(&handle, &request);
         fetch.cursor = cursor.map(|c: gw::PageCursor| pb::Cursor {
@@ -774,7 +774,7 @@ async fn legacy_differential(
     assert_eq!(rows, expected_paths());
     let mut conflict = request.clone();
     conflict.version = None;
-    let mut old_conflict = legacy_start;
+    let mut old_conflict = domain_start;
     if let Op::StartLocalQueryJob { version, .. } = &mut old_conflict {
         *version = None;
     }
@@ -789,7 +789,7 @@ async fn legacy_differential(
     })
     .await?
     else {
-        anyhow::bail!("legacy renew reply")
+        anyhow::bail!("domain client renew reply")
     };
     let replay = typed
         .renew(pb::JobRenewRequest {
@@ -813,7 +813,7 @@ async fn legacy_differential(
     let Reply::CancelLocalQueryJob { status: old, .. } =
         call(Op::CancelLocalQueryJob { job: job.clone() }).await?
     else {
-        anyhow::bail!("legacy cancel reply")
+        anyhow::bail!("domain client cancel reply")
     };
     assert_eq!(old.phase, gw::JobPhase::Cancelled);
     assert_eq!(cancelled.phase, pb::JobPhase::Cancelled as i32);

@@ -274,6 +274,7 @@ async fn public_scenario() -> anyhow::Result<()> {
     // gRPC-opened session is the same owner-bound state seen by HTTP fetch/close.
     let grpc_open = grpc_queries
         .open(pb::OpenRequest {
+            profile: None,
             context: context(),
             read: Some(pb::ReadSelector {
                 kind: Some(pb::read_selector::Kind::Minimum(4)),

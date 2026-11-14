@@ -136,7 +136,7 @@ applied-epoch check; Probe/Write stay unary. Original default-debug regressions
 and resource/freshness evidence remain the #258 acceptance gate, not a changed
 test profile or a loopback p50 improvement alone.
 The old Linux UDS read gateway is [retired](GRAPH_UDS_GATEWAY.md).
-Explicit graph library legacy fixtures and Gateway TCP entrypoints remain
+Explicit graph library legacy fixtures remain
 separate retirement work; this does not complete the all-RPC inventory.
 
 

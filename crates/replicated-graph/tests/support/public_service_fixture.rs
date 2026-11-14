@@ -406,6 +406,7 @@ fn vertex(external: u8, partition: u32, id: &str) -> Value {
 }
 fn context() -> Option<pb::Context> {
     Some(pb::Context {
+            identity: None,
         version: 1,
         timeout_millis: 15_000,
     })

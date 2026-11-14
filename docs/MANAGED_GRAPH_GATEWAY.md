@@ -1,6 +1,6 @@
-# Trusted managed graph TCP gateway
+# Trusted managed graph RPC gateway
 
-Status: experimental managed TCP facade over server-owned real Raft handles
+Status: experimental managed typed gRPC facade over server-owned real Raft handles
 or explicitly configured [remote managed-node endpoints](REMOTE_MANAGED_TRANSPORT.md).
 This is an additive restricted API, not a new Gremlin dialect or a production
 distributed graph deployment. Existing remote GlobalCommittedSnapshot
@@ -17,10 +17,11 @@ remote client can activate roles, change ownership, choose participants, supply
 raw Plan/KV bytes, import a baseline, or redirect a partition. Partition `u32`
 equals shard `u64`, under the versioned `PartitionEqualsShardV1` mapping.
 
-The plaintext listener must be restricted to a trusted network. There is no
+The plaintext Gateway listener is restricted to loopback, matching the public
+gRPC preview. Former non-loopback legacy bindings are explicitly rejected. There is no
 TLS, authentication, authorization, multi-tenant isolation, cluster discovery,
 leadership routing, multi-host Raft placement, failover, or public deployment.
-The tests bind only loopback. The binding and random tokens are identity checks,
+The tests also bind only loopback. The binding and random tokens are identity checks,
 not cryptographic certification or access-control credentials. Trusted low-level
 Raft/KV APIs can bypass graph invariants and must not be mixed with graph writes.
 External graph queries are standard Gremlin text parsed by the existing official
@@ -29,13 +30,14 @@ the former unpublished typed Read wire is rejected, not translated or retained.
 
 ## Requests, identity and unknown outcomes
 
-Each connection carries one big-endian u32 length-prefixed JSON request and one
-reply. Protocol v1 requests specify an unpredictable per-call nonce, exact
-expected authority/cohort/mapping, and one typed operation. Unknown struct or
-enum fields, unsupported versions, and malformed values fail closed. Clients
-validate echoed binding, nonce, operation identity, session token and version
-before accepting any response. There is no transparent retry. The additive
-TraversePage operation below has a separate immutable-result cursor protocol.
+The library facade now uses the [public typed gRPC services](PUBLIC_GRPC_SERVICE.md),
+not a length-prefixed JSON listener. Its identified context version 2 carries an
+unpredictable per-call nonce and exact expected authority/cohort/mapping.
+Responses acknowledge that identity; clients also validate operation identity,
+session token, fixed version, query and cursor before accepting a result.
+Unknown fields, unsupported versions and malformed values fail closed.
+Old JSON peers must migrate together; there is no wire fallback or transparent
+retry. The TraversePage operation retains its immutable-result cursor contract.
 
 Submit accepts a nonzero external 128-bit request ID and one of:
 
@@ -227,7 +229,7 @@ process-local materialized pins, not durable GC leases, indexed MVCC, or an inde
 
 ## Validation scope
 
-Targeted lib tests use real Raft handles behind actual bounded loopback TCP.
+Targeted lib tests use real Raft handles behind actual bounded loopback gRPC.
 They cover typed create/patch/delete and old/new fixed-version reads during
 writes, concurrent same-ID submissions, type/operation conflicts, dropped final
 responses, partial apply/common old cuts, Commit-preserving Abort, stale admitted

@@ -58,7 +58,9 @@ fn decode_checked<U: Message + Default + BoundedMessage, B: Buf>(buf: &mut B) ->
     DECODES.with(|n| n.set(n.get() + 1));
     U::decode(buf).map_err(|_| bad())
 }
-pub(super) fn validate_bytes<U: BoundedMessage>(bytes: &[u8]) -> Result<(), Status> {
+pub(in crate::managed_gateway) fn validate_bytes<U: BoundedMessage>(
+    bytes: &[u8],
+) -> Result<(), Status> {
     let request = U::request();
     if bytes.len() > if request { 64 * 1024 } else { 1024 * 1024 } {
         return Err(limit());
@@ -78,7 +80,11 @@ fn limit() -> Status {
 #[derive(Clone, Copy)]
 pub enum Schema {
     Empty,
+    ErrorDetail,
     Context,
+    CallIdentity,
+    Binding,
+    BindingMember,
     Scalar,
     Property,
     Entity,
@@ -165,6 +171,32 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         };
     }
     let (kind, repeated, oneof) = match (s, t) {
+        (S::ErrorDetail, 1) => (K::Var(16), false, false),
+        (S::ErrorDetail, 2) => (K::Message(S::CallIdentity), false, false),
+        (S::Context, 3) => (K::Message(S::CallIdentity), false, false),
+        (S::CallIdentity, 1) => (K::Bytes, false, false),
+        (S::CallIdentity, 2) => (K::Message(S::Binding), false, false),
+        (S::Binding, 1 | 3 | 4) | (S::BindingMember, 1 | 2) => (K::Var(u64::MAX), false, false),
+        (S::Binding, 2) | (S::BindingMember, 3) => (K::Bytes, false, false),
+        (S::Binding, 5) => (K::Message(S::BindingMember), true, false),
+        (S::Binding, 6) => (K::Var(2), false, false),
+        (S::Binding, 7) => (K::Var(1), false, false),
+        (S::OpenRequest, 6) | (S::OpenResponse, 5) => (K::Var(2), false, false),
+        (
+            S::WriteResponse
+            | S::OpenResponse
+            | S::FetchResponse
+            | S::CloseResponse
+            | S::FixedOpenResponse
+            | S::FixedQueryResponse
+            | S::FixedPageResponse
+            | S::FixedCloseResponse
+            | S::JobStartResponse
+            | S::JobStatusResponse
+            | S::JobRenewResponse
+            | S::JobFetchResponse,
+            31,
+        ) => (K::Message(S::CallIdentity), false, false),
         (S::JobHandle, 1 | 2)
         | (S::JobCursor, 1)
         | (S::JobStartRequest, 2)
@@ -348,12 +380,19 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
     let mut seen = 0u64;
     let mut oneof = false;
     let mut job_phase = 0;
+    let mut members = 0usize;
     while at < bytes.len() {
         budget.fields = budget.fields.checked_sub(1).ok_or_else(limit)?;
         let key = var(bytes, &mut at)?;
         let tag = u32::try_from(key >> 3).map_err(|_| bad())?;
         let wire = key & 7;
         let field = field(schema, tag).ok_or_else(bad)?;
+        if matches!(schema, Schema::Binding) && tag == 5 {
+            members += 1;
+            if members > d2_raft::transaction_decisions::MAX_PARTICIPANTS {
+                return Err(limit());
+            }
+        }
         let bit = 1u64.checked_shl(tag).ok_or_else(bad)?;
         if !field.repeated && seen & bit != 0 {
             return Err(bad());
@@ -399,7 +438,10 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                     .filter(|n| *n <= bytes.len())
                     .ok_or_else(bad)?;
                 let exact_width = match (schema, tag) {
-                    (Schema::JobHandle, 1)
+                    (Schema::CallIdentity, 1)
+                    | (Schema::Binding, 2)
+                    | (Schema::BindingMember, 3)
+                    | (Schema::JobHandle, 1)
                     | (Schema::JobStartRequest, 2)
                     | (Schema::JobStartResponse, 1) => Some(16),
                     (Schema::JobHandle, 2) | (Schema::JobCursor, 1) => Some(32),
@@ -416,7 +458,8 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
         }
     }
     let required = match schema {
-        Schema::JobHandle
+        Schema::CallIdentity
+        | Schema::JobHandle
         | Schema::JobStartResponse
         | Schema::JobGetRequest
         | Schema::JobCancelRequest
@@ -472,6 +515,7 @@ macro_rules! message {
         }
     };
 }
+message!(ErrorDetail, false);
 message!(WriteRequest, true);
 message!(OpenRequest, true);
 message!(FetchRequest, true);
@@ -510,6 +554,7 @@ mod tests {
     fn job_start() -> pb::JobStartRequest {
         pb::JobStartRequest {
             context: Some(pb::Context {
+                identity: None,
                 version: 1,
                 timeout_millis: 50,
             }),
@@ -554,6 +599,7 @@ mod tests {
             checked(start);
         }
         checked(pb::JobStartResponse {
+            identity: None,
             operation_id: vec![3; 16],
             job: Some(job_handle()),
         });
@@ -571,6 +617,7 @@ mod tests {
             expected_generation: u64::MAX,
         });
         checked(pb::JobRenewResponse {
+            identity: None,
             job: Some(job_handle()),
             generation: u64::MAX,
             remaining_millis: 1,
@@ -584,6 +631,7 @@ mod tests {
                 page_size: 1,
             });
             checked(pb::JobFetchResponse {
+                identity: None,
                 job: Some(job_handle()),
                 query: job_start().query,
                 cursor,
@@ -601,6 +649,7 @@ mod tests {
         for phase in 1..=7 {
             let ready = phase == 4;
             checked(pb::JobStatusResponse {
+                identity: None,
                 job: Some(job_handle()),
                 status: Some(pb::JobStatus {
                     phase,
@@ -612,6 +661,7 @@ mod tests {
         }
         for failure in 1..=16 {
             checked(pb::JobStatusResponse {
+                identity: None,
                 job: Some(job_handle()),
                 status: Some(pb::JobStatus {
                     phase: 7,
@@ -659,6 +709,7 @@ mod tests {
             job: None,
         });
         rejected(pb::JobStatusResponse {
+            identity: None,
             job: Some(job_handle()),
             status: None,
         });
@@ -670,6 +721,7 @@ mod tests {
             page_size: 1,
         });
         rejected(pb::JobFetchResponse {
+            identity: None,
             job: Some(job_handle()),
             query: job_start().query,
             cursor: None,
@@ -760,6 +812,7 @@ mod tests {
             },
         ] {
             rejected(pb::JobStatusResponse {
+                identity: None,
                 job: Some(job_handle()),
                 status: Some(status),
             });
@@ -775,6 +828,7 @@ mod tests {
         for version in [None, Some(0), Some(u64::MAX)] {
             let r = pb::FixedOpenRequest {
                 context: Some(pb::Context {
+                    identity: None,
                     version: 1,
                     timeout_millis: 50,
                 }),
@@ -803,7 +857,9 @@ mod tests {
     #[test]
     fn valid_exact_zero_roundtrip() {
         let r = pb::OpenRequest {
+            profile: None,
             context: Some(pb::Context {
+                identity: None,
                 version: 1,
                 timeout_millis: 50,
             }),
@@ -850,5 +906,42 @@ mod tests {
                 .code(),
             tonic::Code::ResourceExhausted
         );
+    }
+    #[test]
+    fn identified_context_prescan_rejects_duplicate_nonce_and_member_overflow() {
+        fn check(schema: Schema, bytes: &[u8]) -> Result<(), Status> {
+            scan(
+                schema,
+                bytes,
+                0,
+                &mut Budget {
+                    fields: 32768,
+                    messages: 16384,
+                },
+            )
+        }
+        let mut identity = vec![0x0a, 16];
+        identity.extend([1; 16]);
+        identity.extend([0x12, 0]);
+        assert!(check(Schema::CallIdentity, &identity).is_ok());
+        let mut duplicate = identity.clone();
+        duplicate.extend([0x0a, 16]);
+        duplicate.extend([2; 16]);
+        assert!(check(Schema::CallIdentity, &duplicate).is_err());
+        assert!(check(Schema::CallIdentity, &[0x0a, 1, 1, 0x12, 0]).is_err());
+        let member = [0x2a, 0];
+        let mut binding = member.repeat(d2_raft::transaction_decisions::MAX_PARTICIPANTS);
+        assert!(check(Schema::Binding, &binding).is_ok());
+        binding.extend(member);
+        assert_eq!(
+            check(Schema::Binding, &binding).unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        let mut response = vec![0x0a, 0, 0xfa, 1, identity.len() as u8];
+        response.extend(&identity);
+        assert!(check(Schema::FixedOpenResponse, &response).is_ok());
+        response.extend([0xfa, 1, identity.len() as u8]);
+        response.extend(identity);
+        assert!(check(Schema::FixedOpenResponse, &response).is_err());
     }
 }

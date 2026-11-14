@@ -2,13 +2,53 @@
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
+/// Version 2 requires exact identity; version 1 must omit it. Old servers reject
+/// version 2 before mutations. Identity is correlation/placement, not authentication.
 #[allow(clippy::all)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Context {
     #[prost(uint32, tag = "1")]
     pub version: u32,
     #[prost(uint64, tag = "2")]
     pub timeout_millis: u64,
+    #[prost(message, optional, tag = "3")]
+    pub identity: ::core::option::Option<CallIdentity>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BindingMember {
+    #[prost(uint64, tag = "1")]
+    pub shard: u64,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub mode: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Binding {
+    #[prost(uint64, tag = "1")]
+    pub authority_shard: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub authority_mode: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub coordinator_shard: u64,
+    #[prost(uint64, tag = "4")]
+    pub coordinator_epoch: u64,
+    #[prost(message, repeated, tag = "5")]
+    pub members: ::prost::alloc::vec::Vec<BindingMember>,
+    #[prost(enumeration = "CapacityProfile", tag = "6")]
+    pub capacity_profile: i32,
+    #[prost(enumeration = "Mapping", tag = "7")]
+    pub mapping: i32,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CallIdentity {
+    #[prost(bytes = "vec", tag = "1")]
+    pub request_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub binding: ::core::option::Option<Binding>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -196,12 +236,14 @@ pub struct TerminalDecision {
     pub visible: bool,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriteResponse {
     #[prost(bytes = "vec", tag = "1")]
     pub external_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", optional, tag = "2")]
     pub transaction_id: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
     #[prost(oneof = "write_response::Status", tags = "3, 4, 5, 6")]
     pub status: ::core::option::Option<write_response::Status>,
 }
@@ -266,7 +308,7 @@ pub struct Cursor {
     pub token: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -278,9 +320,11 @@ pub struct OpenRequest {
     pub query: ::core::option::Option<Query>,
     #[prost(uint32, tag = "5")]
     pub page_size: u32,
+    #[prost(enumeration = "LocalReadProfile", optional, tag = "6")]
+    pub profile: ::core::option::Option<i32>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FetchRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -294,7 +338,7 @@ pub struct FetchRequest {
     pub page_size: u32,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CloseRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -396,6 +440,10 @@ pub struct OpenResponse {
     pub page_size: u32,
     #[prost(message, optional, tag = "4")]
     pub page: ::core::option::Option<Page>,
+    #[prost(enumeration = "LocalReadProfile", optional, tag = "5")]
+    pub profile: ::core::option::Option<i32>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -410,20 +458,26 @@ pub struct FetchResponse {
     pub page_size: u32,
     #[prost(message, optional, tag = "5")]
     pub page: ::core::option::Option<Page>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CloseResponse {
     #[prost(message, optional, tag = "1")]
     pub session: ::core::option::Option<Session>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 /// Stable domain detail carried in Status.details. Transport disconnection may
 /// have no detail: it must never be interpreted as an aborted write.
 #[allow(clippy::all)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorDetail {
     #[prost(enumeration = "error_detail::Reason", tag = "1")]
     pub reason: i32,
+    #[prost(message, optional, tag = "2")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 /// Nested message and enum types in `ErrorDetail`.
 pub mod error_detail {
@@ -447,6 +501,7 @@ pub mod error_detail {
         QueryDeadline = 13,
         QueryIncompleteOrCorrupt = 14,
         QueryUnavailable = 15,
+        QueryUnsupportedScope = 16,
     }
     impl Reason {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -471,6 +526,7 @@ pub mod error_detail {
                 Self::QueryDeadline => "QUERY_DEADLINE",
                 Self::QueryIncompleteOrCorrupt => "QUERY_INCOMPLETE_OR_CORRUPT",
                 Self::QueryUnavailable => "QUERY_UNAVAILABLE",
+                Self::QueryUnsupportedScope => "QUERY_UNSUPPORTED_SCOPE",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -492,6 +548,7 @@ pub mod error_detail {
                 "QUERY_DEADLINE" => Some(Self::QueryDeadline),
                 "QUERY_INCOMPLETE_OR_CORRUPT" => Some(Self::QueryIncompleteOrCorrupt),
                 "QUERY_UNAVAILABLE" => Some(Self::QueryUnavailable),
+                "QUERY_UNSUPPORTED_SCOPE" => Some(Self::QueryUnsupportedScope),
                 _ => None,
             }
         }
@@ -509,7 +566,7 @@ pub struct FixedSession {
 }
 /// Absence selects latest once; present zero selects exact V=0, not latest.
 #[allow(clippy::all)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedOpenRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -519,13 +576,15 @@ pub struct FixedOpenRequest {
     pub ttl_millis: u64,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedOpenResponse {
     #[prost(message, optional, tag = "1")]
     pub session: ::core::option::Option<FixedSession>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedQueryRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -551,9 +610,11 @@ pub struct FixedQueryResponse {
     pub query: ::core::option::Option<Query>,
     #[prost(message, optional, tag = "3")]
     pub data: ::core::option::Option<QueryData>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedPageRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -579,9 +640,11 @@ pub struct FixedPageResponse {
     pub page_size: u32,
     #[prost(message, optional, tag = "5")]
     pub page: ::core::option::Option<Page>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedCloseRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -589,10 +652,12 @@ pub struct FixedCloseRequest {
     pub session: ::core::option::Option<FixedSession>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedCloseResponse {
     #[prost(message, optional, tag = "1")]
     pub session: ::core::option::Option<FixedSession>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -625,7 +690,7 @@ pub struct JobStatus {
     pub failure: ::core::option::Option<i32>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobStartRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -641,15 +706,17 @@ pub struct JobStartRequest {
     pub policy: ::core::option::Option<JobPolicy>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobStartResponse {
     #[prost(bytes = "vec", tag = "1")]
     pub operation_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, optional, tag = "2")]
     pub job: ::core::option::Option<JobHandle>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobGetRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -657,7 +724,7 @@ pub struct JobGetRequest {
     pub job: ::core::option::Option<JobHandle>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobCancelRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -665,15 +732,17 @@ pub struct JobCancelRequest {
     pub job: ::core::option::Option<JobHandle>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobStatusResponse {
     #[prost(message, optional, tag = "1")]
     pub job: ::core::option::Option<JobHandle>,
     #[prost(message, optional, tag = "2")]
     pub status: ::core::option::Option<JobStatus>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobRenewRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -683,7 +752,7 @@ pub struct JobRenewRequest {
     pub expected_generation: u64,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobRenewResponse {
     #[prost(message, optional, tag = "1")]
     pub job: ::core::option::Option<JobHandle>,
@@ -691,9 +760,11 @@ pub struct JobRenewResponse {
     pub generation: u64,
     #[prost(uint64, tag = "3")]
     pub remaining_millis: u64,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
 }
 #[allow(clippy::all)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JobFetchRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<Context>,
@@ -721,6 +792,95 @@ pub struct JobFetchResponse {
     pub version: u64,
     #[prost(message, optional, tag = "6")]
     pub page: ::core::option::Option<Page>,
+    #[prost(message, optional, tag = "31")]
+    pub identity: ::core::option::Option<CallIdentity>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CapacityProfile {
+    Unspecified = 0,
+    LegacyCountV1 = 1,
+    ByteBound16MibV1 = 2,
+}
+impl CapacityProfile {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CAPACITY_PROFILE_UNSPECIFIED",
+            Self::LegacyCountV1 => "LEGACY_COUNT_V1",
+            Self::ByteBound16MibV1 => "BYTE_BOUND16_MIB_V1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CAPACITY_PROFILE_UNSPECIFIED" => Some(Self::Unspecified),
+            "LEGACY_COUNT_V1" => Some(Self::LegacyCountV1),
+            "BYTE_BOUND16_MIB_V1" => Some(Self::ByteBound16MibV1),
+            _ => None,
+        }
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Mapping {
+    Unspecified = 0,
+    PartitionEqualsShardV1 = 1,
+}
+impl Mapping {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MAPPING_UNSPECIFIED",
+            Self::PartitionEqualsShardV1 => "PARTITION_EQUALS_SHARD_V1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MAPPING_UNSPECIFIED" => Some(Self::Unspecified),
+            "PARTITION_EQUALS_SHARD_V1" => Some(Self::PartitionEqualsShardV1),
+            _ => None,
+        }
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LocalReadProfile {
+    Unspecified = 0,
+    Parity2MibV1 = 1,
+    LocalRead8MibV1 = 2,
+}
+impl LocalReadProfile {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOCAL_READ_PROFILE_UNSPECIFIED",
+            Self::Parity2MibV1 => "PARITY2_MIB_V1",
+            Self::LocalRead8MibV1 => "LOCAL_READ8_MIB_V1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOCAL_READ_PROFILE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PARITY2_MIB_V1" => Some(Self::Parity2MibV1),
+            "LOCAL_READ8_MIB_V1" => Some(Self::LocalRead8MibV1),
+            _ => None,
+        }
+    }
 }
 #[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

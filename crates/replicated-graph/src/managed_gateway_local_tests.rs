@@ -1985,7 +1985,9 @@ async fn public_grpc_zero_window_deadlines_release_shared_work_and_new_open() {
             .unwrap();
         let (response, mut send) = sender.send_request(request, false).unwrap();
         let payload = pb::OpenRequest {
+            profile: None,
             context: Some(pb::Context {
+                identity: None,
                 version: 1,
                 timeout_millis: rpc_ms,
             }),
@@ -2054,5 +2056,145 @@ async fn public_grpc_zero_window_deadlines_release_shared_work_and_new_open() {
     for server in servers {
         server.shutdown().await;
     }
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_profile_captures_large_values_and_paginates_supported_paths() {
+    use crate::remote::query::QualifiedElement as E;
+    use prost::Message;
+    let _test = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    // Large stored properties exercise capture, not unsupported values() output.
+    // Exact response-size boundaries are covered by synthetic Retained pages.
+    let config = OwnedConfig::from(f.config());
+    let graph = config.graph();
+    let payload = "x".repeat(128 * 1024);
+    for id in [1, 2] {
+        let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+        let mut vertex = Vertex::new(id);
+        vertex
+            .properties
+            .insert("payload".into(), Value::Text(payload.clone()));
+        let plan = snapshot.prepare_vertex(7, &vertex).unwrap();
+        graph.execute(&plan).await.unwrap();
+    }
+    let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+    let plan = snapshot.prepare_vertex(7, &Vertex::new(3)).unwrap();
+    graph.execute(&plan).await.unwrap();
+    for index in 0..6u64 {
+        let edge = EdgeData {
+            id: 10 + index,
+            from: entity(7, 3),
+            to: entity(7, 1 + index % 2),
+            label: "payload".into(),
+            properties: BTreeMap::new(),
+        };
+        let snapshot = graph.snapshot(None, limit(), MAX_TTL).await.unwrap();
+        let plan = snapshot.prepare_edge(&edge.graph()).unwrap();
+        graph.execute(&plan).await.unwrap();
+    }
+    let first = call(
+        &g,
+        Operation::OpenLocalQueryWithProfile {
+            profile: LocalReadProfile::LocalRead8MiBV1,
+            version: None,
+            ttl_millis: 60_000,
+            query: Query {
+                partition: 7,
+                text: "g.V(3).out('payload').path()".into(),
+            },
+            page_size: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let Reply::OpenLocalQueryWithProfile {
+        profile,
+        session,
+        query,
+        page_size,
+        page,
+    } = first.clone()
+    else {
+        panic!("explicit profile reply was erased");
+    };
+    assert_eq!(profile, LocalReadProfile::LocalRead8MiBV1);
+    assert_eq!(page_size, 3);
+    assert_eq!(page.total, 6);
+    assert_eq!(page.offset, 0);
+    assert!(page.next.is_some());
+    let identity = Some(public_proto::CallIdentity {
+        request_id: vec![255; 16],
+        binding: Some(grpc_client::encode_binding(&bound())),
+    });
+    let mut encoded = grpc_codec::encode_open(&first).unwrap();
+    encoded.identity = identity.clone();
+    assert!(encoded.encoded_len() <= MAX_RESPONSE_BYTES);
+    assert_eq!(encoded.profile, Some(grpc_codec::encode_profile(profile)));
+    let expected = |start: u64| {
+        (start..start + 3)
+            .map(|index| {
+                QueryRow::Path(vec![
+                    E::Vertex {
+                        partition: 7,
+                        id: 3,
+                    },
+                    E::Edge {
+                        partition: 7,
+                        id: 10 + index,
+                    },
+                    E::Vertex {
+                        partition: 7,
+                        id: 1 + index % 2,
+                    },
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page.data.rows, expected(0));
+    let second = call(
+        &g,
+        Operation::FetchLocalQuery {
+            session: session.clone(),
+            query: query.clone(),
+            cursor: page.next.clone(),
+            page_size: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let Reply::FetchLocalQuery {
+        session: returned,
+        page: next,
+        ..
+    } = &second
+    else {
+        panic!("fetch reply");
+    };
+    assert_eq!(returned, &session);
+    assert_eq!(next.offset, 3);
+    assert_eq!(next.total, 6);
+    assert_eq!(next.next, None);
+    assert_eq!(next.data.rows, expected(3));
+    let mut encoded = grpc_codec::encode_fetch(&second).unwrap();
+    encoded.identity = identity;
+    assert!(encoded.encoded_len() <= MAX_RESPONSE_BYTES);
+    call(&g, Operation::CloseLocalQuery { session })
+        .await
+        .unwrap();
+    assert!(g.state.local_sessions.lock().unwrap().is_empty());
+    assert_eq!(g.retained_payload_charge(), 0);
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    drop(graph);
+    drop(config);
     f.stop().await;
 }

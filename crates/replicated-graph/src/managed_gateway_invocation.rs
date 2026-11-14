@@ -178,23 +178,18 @@ impl Invocation {
         self.live()
     }
     pub(super) fn preflight_grpc(&self) -> Result<()> {
-        if let (Some(retained), Ok(Reply::OpenLocalQuery { .. } | Reply::FetchLocalQuery { .. })) =
-            (&self.local_retained, &self.response.result)
+        if let (
+            Some(retained),
+            Ok(
+                Reply::OpenLocalQuery { .. }
+                | Reply::OpenLocalQueryWithProfile { .. }
+                | Reply::FetchLocalQuery { .. },
+            ),
+        ) = (&self.local_retained, &self.response.result)
         {
-            retained.preflight_grpc(self.end)?;
+            retained.preflight_grpc(&self.response.binding, self.end)?;
         }
         self.live()
-    }
-    pub(super) fn encode_tcp(mut self) -> Result<(Vec<u8>, Self)> {
-        let encoded = match encode(&self.response, MAX_RESPONSE_BYTES) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                self.response.result = Err(Error::Capacity);
-                encode(&self.response, MAX_RESPONSE_BYTES)?
-            }
-        };
-        self.live()?;
-        Ok((encoded, self))
     }
     pub(super) fn delivered(&mut self) {
         if self.response.result.is_ok() {

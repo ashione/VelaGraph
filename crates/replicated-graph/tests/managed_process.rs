@@ -37,8 +37,6 @@ use velagraph::{
     Value,
 };
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 // Share only fixture helpers, never another target's acceptance tests.
 include!("support/managed_process_fixture.rs");
 
@@ -2128,42 +2126,136 @@ async fn verify_retained_lifecycle(
     Ok(())
 }
 
-/// Forward the actual gateway request verbatim, receive its entire bounded
+/// Forward the typed gateway request without changing its semantics, receive its bounded
 /// response, then close without forwarding a byte of the ACK. The caller must
 /// observe Unknown; this is transport ACK loss, not a fabricated status.
 async fn discard_gateway_ack(g: &Gateway, write: Write) -> anyhow::Result<()> {
+    use gateway::public_proto as pb;
+    use prost::Message;
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let upstream = g.local_addr();
+    let expected_external_id = write.external_id;
     let proxy = tokio::spawn(async move {
         tokio::time::timeout(BUDGET, async move {
-            let (mut caller, _) = listener.accept().await?;
-            let length = caller.read_u32().await?;
+            let (caller, _) = listener.accept().await?;
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, axum::body::Bytes>(caller)
+                .await?;
+            let (request, response) = connection
+                .accept()
+                .await
+                .context("ACK-loss caller closed before Submit")??;
             anyhow::ensure!(
-                length as usize <= gateway::MAX_REQUEST_BYTES,
-                "proxy request frame"
+                request.method() == axum::http::Method::POST
+                    && request.uri().path() == "/velagraph.public.managed.v1.WriteService/Submit"
+                    && request
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        == Some("application/grpc"),
+                "ACK-loss proxy received a non-Submit RPC"
             );
-            let mut bytes = vec![0; length as usize];
-            caller.read_exact(&mut bytes).await?;
-            let mut server = tokio::net::TcpStream::connect(upstream).await?;
-            server.write_u32(length).await?;
-            server.write_all(&bytes).await?;
-            let length = server.read_u32().await?;
-            anyhow::ensure!(
-                length as usize <= gateway::MAX_RESPONSE_BYTES,
-                "proxy response frame"
-            );
-            let mut discarded = vec![0; length as usize];
-            server.read_exact(&mut discarded).await?;
-            // Validate a full JSON response was lost, without telling the client its
-            // outcome. The durable point lookup below is the recovery authority.
-            let _: serde_json::Value = serde_json::from_slice(&discarded)?;
-            drop(caller);
+            let mut body = request.into_body();
+            let forwarding = async move {
+                let mut frame = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk?;
+                    anyhow::ensure!(
+                        frame.len().saturating_add(chunk.len()) <= gateway::MAX_REQUEST_BYTES + 5,
+                        "proxy request frame exceeds limit"
+                    );
+                    frame.extend_from_slice(&chunk);
+                    body.flow_control().release_capacity(chunk.len())?;
+                }
+                anyhow::ensure!(
+                    frame.len() >= 5 && frame[0] == 0,
+                    "proxy expected one uncompressed gRPC message"
+                );
+                let length = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+                anyhow::ensure!(
+                    length <= gateway::MAX_REQUEST_BYTES && frame.len() == length + 5,
+                    "proxy request frame length mismatch"
+                );
+                let request = pb::WriteRequest::decode(&frame[5..])?;
+                anyhow::ensure!(
+                    request.external_id.as_slice() == expected_external_id.as_slice(),
+                    "proxy external ID mismatch"
+                );
+                let context = request
+                    .context
+                    .as_ref()
+                    .context("missing request context")?;
+                anyhow::ensure!(context.version == 2, "proxy requires strict v2 request");
+                let identity = context
+                    .identity
+                    .clone()
+                    .context("missing strict identity")?;
+                anyhow::ensure!(
+                    identity.request_id.len() == 16 && identity.binding.is_some(),
+                    "invalid strict identity"
+                );
+                let channel =
+                    tonic::transport::Endpoint::from_shared(format!("http://{upstream}"))?
+                        .connect_timeout(BUDGET)
+                        .timeout(BUDGET)
+                        .connect()
+                        .await?;
+                let mut client = pb::write_service_client::WriteServiceClient::new(channel)
+                    .max_decoding_message_size(gateway::MAX_RESPONSE_BYTES)
+                    .max_encoding_message_size(gateway::MAX_REQUEST_BYTES);
+                // Exactly one real upstream Submit, with the original decoded
+                // request and identity. Never retry inside this failure injector.
+                let discarded = client.submit(request).await?.into_inner();
+                anyhow::ensure!(
+                    discarded.external_id.as_slice() == expected_external_id.as_slice()
+                        && discarded.identity.as_ref() == Some(&identity),
+                    "upstream response identity mismatch"
+                );
+                anyhow::ensure!(
+                    discarded
+                        .transaction_id
+                        .as_ref()
+                        .is_some_and(|id| id.len() == 16),
+                    "upstream response missing transaction ID"
+                );
+                anyhow::ensure!(
+                    matches!(
+                        discarded.status,
+                        Some(pb::write_response::Status::Committed(ref decision))
+                            if decision.visible && decision.ordinal > 0
+                    ),
+                    "upstream Submit did not fully commit: {discarded:?}"
+                );
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::pin!(forwarding);
+            // Keep driving HTTP/2 while reading the request and waiting for the
+            // real upstream response. No downstream response headers, data, or
+            // fabricated gRPC status are ever sent.
+            tokio::select! {
+                result = &mut forwarding => result?,
+                extra = connection.accept() => {
+                    match extra {
+                        Some(Ok(_)) => anyhow::bail!("unexpected second ACK-loss RPC"),
+                        Some(Err(error)) => return Err(error.into()),
+                        None => anyhow::bail!("caller disconnected before ACK-loss evidence"),
+                    }
+                }
+            }
+            // Successful upstream response is now verified. Drop this exact
+            // socket owner, not merely a tonic accept task with live children:
+            // the caller loses the real ACK and receives transport failure.
+            drop(response);
+            drop(connection);
             Ok::<_, anyhow::Error>(())
         })
         .await?
     });
     let result = gateway::request(address, byte_binding(), Operation::Submit(write), BUDGET).await;
+    // Join is the evidence barrier: fail if the upstream response was not fully
+    // received and verified before the connection was deliberately closed.
     tokio::time::timeout(BUDGET, proxy).await???;
     assert_eq!(result, Err(gateway::Error::Unknown));
     Ok(())
