@@ -1189,6 +1189,7 @@ mod tests {
             memory,
             connections: Arc::new(Semaphore::new(1)),
             submit: tokio::sync::Mutex::new(()),
+            readiness: Arc::new(Semaphore::new(1)),
             timing: None,
         });
         let (_stop, stopped) = watch::channel(false);

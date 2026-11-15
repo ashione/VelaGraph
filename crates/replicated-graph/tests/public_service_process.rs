@@ -698,3 +698,132 @@ async fn two_gateways_preserve_owner_pages_and_original_write_status() -> anyhow
     other.graceful_stop().await?;
     Ok(())
 }
+
+/// The control listener being alive is insufficient: acquisition also needs
+/// every separately configured graph-query listener and its retained proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_readiness_observes_graph_listener_failure() -> anyhow::Result<()> {
+    let (coordinator, a, mut b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("readiness.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut service =
+        ServiceProcess::start(&config_path, directory.path().join("readiness.stdout")).await?;
+    let mut rpc = pb::readiness_service_client::ReadinessServiceClient::new(
+        grpc_channel(service.grpc).await?,
+    );
+    let check = || pb::ReadinessRequest { context: context() };
+    for version in 0..=1 {
+        let (status, body) = post(service.address, "/preview1/readiness", json!({})).await?;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["state"], "fixed_session_read_captured");
+        assert_eq!(body["version"], version);
+        assert_eq!(body["profile"], "parity2_mib_v1");
+        assert_eq!(body["restore_supported"], false);
+        assert_eq!(body["production_ready"], false);
+        let observed = rpc.check(check()).await?.into_inner();
+        assert_eq!(observed.version, version);
+        assert!(observed.identity.is_none());
+        if version == 0 {
+            let (status, body) = post(
+                service.address,
+                "/preview1/writes:submit",
+                vertex(1, 7, "1"),
+            )
+            .await?;
+            assert_eq!(status, 200, "{body}");
+        }
+    }
+    let (status, _) = post(
+        service.address,
+        "/preview1/readiness",
+        json!({"query":"g.V()"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "readiness must not accept a query");
+    for invalid in [json!([]), json!(null), json!(true), json!("{}")] {
+        let (status, body) = post(service.address, "/preview1/readiness", invalid.clone()).await?;
+        assert_eq!(status, 400, "non-object readiness body {invalid}: {body}");
+    }
+
+    let expected_identity = pb::CallIdentity {
+        request_id: vec![42; 16],
+        binding: Some(pb::Binding {
+            authority_shard: 9,
+            authority_mode: vec![9; 16],
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: [7, 8]
+                .map(|shard| pb::BindingMember {
+                    shard,
+                    epoch: 1,
+                    mode: vec![shard as u8; 16],
+                })
+                .to_vec(),
+            capacity_profile: pb::CapacityProfile::LegacyCountV1 as i32,
+            mapping: pb::Mapping::PartitionEqualsShardV1 as i32,
+        }),
+    };
+    let identified = pb::ReadinessRequest {
+        context: Some(pb::Context {
+            version: 2,
+            timeout_millis: 15_000,
+            identity: Some(expected_identity.clone()),
+        }),
+    };
+    let response = rpc.check(identified.clone()).await?.into_inner();
+    assert_eq!(response.version, 1);
+    assert_eq!(response.identity, Some(expected_identity));
+    let mut mismatched = identified;
+    mismatched
+        .context
+        .as_mut()
+        .unwrap()
+        .identity
+        .as_mut()
+        .unwrap()
+        .binding
+        .as_mut()
+        .unwrap()
+        .coordinator_epoch += 1;
+    let error = rpc.check(mismatched).await.unwrap_err();
+    assert_reason(&error, pb::error_detail::Reason::IdentityMismatch);
+
+    fs::write(b._directory.path().join("stop-graph"), b"stop")?;
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            anyhow::ensure!(
+                b.child.try_wait()?.is_none(),
+                "node exited instead of just stopping graph listeners"
+            );
+            if b._directory.path().join("graph-stopped").exists() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    // The previously committed write remains discoverable through control.
+    let (status, body) = post(
+        service.address,
+        "/preview1/writes:status",
+        vertex(1, 7, "1"),
+    )
+    .await?;
+    assert_eq!(status, 200, "control path must remain usable: {body}");
+    let (status, body) = post(service.address, "/preview1/readiness", json!({})).await?;
+    assert_ne!(
+        status, 200,
+        "dead graph listener was reported ready: {body}"
+    );
+    assert!(body.get("error").is_some(), "{body}");
+    let failed = rpc.check(check()).await.unwrap_err();
+    assert_ne!(failed.code(), tonic::Code::Ok);
+    service.graceful_stop().await?;
+    Ok(())
+}

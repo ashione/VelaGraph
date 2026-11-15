@@ -162,3 +162,11 @@ not continuous readiness or load-balancer health discovery. FixedSession/job
 failover, overload/rolling removal and automatic balancing remain separate
 [#221](https://github.com/ashione/VelaGraph/issues/221) acceptance; the issue stays
 open. No listener or execution semantics change in this test/contract slice.
+
+## Live versus fixed-read capture readiness
+
+`GET /preview1/service` reports static process liveness. To actively probe one
+bounded fixed-session read capture, use `POST /preview1/readiness` or the typed
+`ReadinessService.Check` RPC. Read [the probe contract](FIXED_READ_READINESS.md)
+before polling: it uses the default profile, can be expensive, and must not be
+mistaken for general load-balancer, write, restore or production readiness.

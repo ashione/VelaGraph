@@ -901,3 +901,12 @@ The later #277/#279 retired legacy wires, not the remaining #218 service gates.
 - Keep fault, cancellation, unknown-write, session/job and retained-history gates.
 - GraphService retirement subsequently completed in #279; cross-language, HTTP
   surface and compatibility/resource gates still keep #218 open.
+
+### #221 fixed-session readiness slice
+
+[The shared HTTP/gRPC capture probe](FIXED_READ_READINESS.md) is a bounded,
+default-profile observation across the configured graph-query endpoints. It
+adds no general write readiness, automatic routing/load balancing, checkpoint
+activation or HA. #221 remains open; exact revision test/CI evidence must precede
+any claim that this slice is delivered. The static process-liveness route remains
+separate.

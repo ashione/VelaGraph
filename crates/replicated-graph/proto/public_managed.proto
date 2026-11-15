@@ -167,3 +167,13 @@ message JobRenewRequest { Context context = 1; JobHandle job = 2; uint64 expecte
 message JobRenewResponse { JobHandle job = 1; uint64 generation = 2; uint64 remaining_millis = 3;  CallIdentity identity = 31; }
 message JobFetchRequest { Context context = 1; JobHandle job = 2; Query query = 3; Cursor cursor = 4; uint32 page_size = 5; }
 message JobFetchResponse { JobHandle job = 1; Query query = 2; Cursor cursor = 3; uint32 page_size = 4; uint64 version = 5; Page page = 6;  CallIdentity identity = 31; }
+
+// Point-in-time certified fixed-session read capture under Parity2MiBV1.
+// All configured graph routes must fit the default profile. Not a general
+// query-capacity test or durable restore readiness,
+// future availability, write availability, or a production healthcheck.
+service ReadinessService {
+  rpc Check(ReadinessRequest) returns (ReadinessResponse);
+}
+message ReadinessRequest { Context context = 1; }
+message ReadinessResponse { uint64 version = 1; CallIdentity identity = 2; }
