@@ -306,25 +306,34 @@ async fn scenario() -> anyhow::Result<()> {
             Reason::SessionUnavailable,
         );
     }
-    // Malformed JSON hex is HTTP Protocol; malformed protobuf bytes are Identity.
-    // Representation validation differs, while valid opaque cursor mismatches agree.
+    // Structural decoding rejects an empty protobuf cursor before the handler,
+    // so this transport error has no domain ErrorDetail.
     let mut bad_cursor = fetch.clone();
     bad_cursor["cursor"] = json!("");
-    error(
-        service.address,
-        "fetch",
-        bad_cursor,
-        400,
-        "invalid_argument",
-    )
-    .await?;
+    error(service.address, "fetch", bad_cursor, 400, "invalid_argument").await?;
+    let malformed = jobs
+        .fetch(pb::JobFetchRequest {
+            context: context(),
+            job: Some(typed_job.clone()),
+            query: start_proto(&start).query,
+            cursor: Some(pb::Cursor { token: vec![] }),
+            page_size: 1,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+    assert!(malformed.details().is_empty());
+    // A correctly sized but unknown cursor reaches the shared domain handler.
+    let mut unknown_cursor = fetch.clone();
+    unknown_cursor["cursor"] = json!("00".repeat(32));
+    error(service.address, "fetch", unknown_cursor, 409, "identity_mismatch").await?;
     assert_reason(
         &jobs
             .fetch(pb::JobFetchRequest {
                 context: context(),
                 job: Some(typed_job.clone()),
                 query: start_proto(&start).query,
-                cursor: Some(pb::Cursor { token: vec![] }),
+                cursor: Some(pb::Cursor { token: vec![0; 32] }),
                 page_size: 1,
             })
             .await
