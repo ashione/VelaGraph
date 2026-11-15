@@ -30,7 +30,10 @@ HTTP/2 readiness, the RPC and response validation share the caller's original
 absolute deadline. The endpoint buffer and transport concurrency stay bounded
 by the existing eight-call limit. A failed/cancelled initial connection does not
 poison the client: a later **explicit call** may try connection setup again. No
-failed RPC is replayed by this client.
+failed RPC is replayed by this client. A shared channel may still perform
+background transport reconnection after one caller times out, bounded separately
+by the transport connection timeout. The caller deadline bounds waiting for the
+RPC result; it is not a promise that all channel background work has stopped.
 
 The address and binding cannot change after construction. Each operation gets
 its own correlation nonce and sends context version 2; replies and typed errors
