@@ -745,6 +745,7 @@ struct State {
     memory: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     submit: tokio::sync::Mutex<()>,
+    readiness: Arc<Semaphore>,
     timing: Option<timing::Sender>,
 }
 impl State {
@@ -1301,6 +1302,7 @@ impl Service {
             memory: Arc::new(Semaphore::new(MAX_SESSIONS)),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             submit: tokio::sync::Mutex::new(()),
+            readiness: Arc::new(Semaphore::new(1)),
         });
         // Validate live identities and persistent zero baseline before accepting.
         tokio::time::timeout(

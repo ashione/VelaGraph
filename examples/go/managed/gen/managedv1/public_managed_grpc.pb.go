@@ -898,3 +898,115 @@ var ManagedQueryJobService_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "public_managed.proto",
 }
+
+const (
+	ReadinessService_Check_FullMethodName = "/velagraph.public.managed.v1.ReadinessService/Check"
+)
+
+// ReadinessServiceClient is the client API for ReadinessService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Point-in-time certified fixed-session read capture under Parity2MiBV1.
+// All configured graph routes must fit the default profile. Not a general
+// query-capacity test or durable restore readiness,
+// future availability, write availability, or a production healthcheck.
+type ReadinessServiceClient interface {
+	Check(ctx context.Context, in *ReadinessRequest, opts ...grpc.CallOption) (*ReadinessResponse, error)
+}
+
+type readinessServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewReadinessServiceClient(cc grpc.ClientConnInterface) ReadinessServiceClient {
+	return &readinessServiceClient{cc}
+}
+
+func (c *readinessServiceClient) Check(ctx context.Context, in *ReadinessRequest, opts ...grpc.CallOption) (*ReadinessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReadinessResponse)
+	err := c.cc.Invoke(ctx, ReadinessService_Check_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ReadinessServiceServer is the server API for ReadinessService service.
+// All implementations must embed UnimplementedReadinessServiceServer
+// for forward compatibility.
+//
+// Point-in-time certified fixed-session read capture under Parity2MiBV1.
+// All configured graph routes must fit the default profile. Not a general
+// query-capacity test or durable restore readiness,
+// future availability, write availability, or a production healthcheck.
+type ReadinessServiceServer interface {
+	Check(context.Context, *ReadinessRequest) (*ReadinessResponse, error)
+	mustEmbedUnimplementedReadinessServiceServer()
+}
+
+// UnimplementedReadinessServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedReadinessServiceServer struct{}
+
+func (UnimplementedReadinessServiceServer) Check(context.Context, *ReadinessRequest) (*ReadinessResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Check not implemented")
+}
+func (UnimplementedReadinessServiceServer) mustEmbedUnimplementedReadinessServiceServer() {}
+func (UnimplementedReadinessServiceServer) testEmbeddedByValue()                          {}
+
+// UnsafeReadinessServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ReadinessServiceServer will
+// result in compilation errors.
+type UnsafeReadinessServiceServer interface {
+	mustEmbedUnimplementedReadinessServiceServer()
+}
+
+func RegisterReadinessServiceServer(s grpc.ServiceRegistrar, srv ReadinessServiceServer) {
+	// If the following call pancis, it indicates UnimplementedReadinessServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ReadinessService_ServiceDesc, srv)
+}
+
+func _ReadinessService_Check_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadinessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReadinessServiceServer).Check(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ReadinessService_Check_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReadinessServiceServer).Check(ctx, req.(*ReadinessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ReadinessService_ServiceDesc is the grpc.ServiceDesc for ReadinessService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ReadinessService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "velagraph.public.managed.v1.ReadinessService",
+	HandlerType: (*ReadinessServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Check",
+			Handler:    _ReadinessService_Check_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "public_managed.proto",
+}

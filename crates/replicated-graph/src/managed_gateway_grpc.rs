@@ -2,6 +2,7 @@
 //! and HTTP; loopback-only, not an authenticated production service.
 use super::*;
 use super::{grpc_codec as codec, public_proto as wire};
+use prost::Message;
 use std::{
     future::Future,
     pin::Pin,
@@ -18,6 +19,7 @@ use wire::{
     fixed_session_service_server::{FixedSessionService, FixedSessionServiceServer},
     managed_query_job_service_server::{ManagedQueryJobService, ManagedQueryJobServiceServer},
     query_service_server::{QueryService, QueryServiceServer},
+    readiness_service_server::{ReadinessService, ReadinessServiceServer},
     write_service_server::{WriteService, WriteServiceServer},
 };
 
@@ -571,6 +573,9 @@ pub(super) async fn bind(
         let jobs = ManagedQueryJobServiceServer::new(handler.clone())
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
+        let readiness = ReadinessServiceServer::new(handler.clone())
+            .max_decoding_message_size(MAX_REQUEST_BYTES)
+            .max_encoding_message_size(MAX_RESPONSE_BYTES);
         let queries = QueryServiceServer::new(handler)
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
@@ -593,6 +598,11 @@ pub(super) async fn bind(
             })
             .add_service(Admitted {
                 inner: jobs,
+                state: state.clone(),
+                deadline,
+            })
+            .add_service(Admitted {
+                inner: readiness,
                 state: state.clone(),
                 deadline,
             })
@@ -669,5 +679,40 @@ impl ManagedQueryJobService for Handler {
             .map_err(|e| codec::identified_error(e, identity.clone()))?;
         self.run(call, operation, budget, identity, codec::encode_job_status)
             .await
+    }
+}
+
+#[tonic::async_trait]
+impl ReadinessService for Handler {
+    async fn check(
+        &self,
+        request: tonic::Request<wire::ReadinessRequest>,
+    ) -> std::result::Result<tonic::Response<wire::ReadinessResponse>, Status> {
+        let call = admitted(&request)?;
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        if self
+            .state
+            .jobs_stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(codec::identified_error(Error::Rejected, identity));
+        }
+        let end = call.end.min(call.started + budget);
+        call.budget.send_replace(end);
+        let result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(end),
+            self.state.probe_readiness(call.work.clone(), end),
+        )
+        .await;
+        let version = match result {
+            Ok(result) => result.map_err(|e| codec::identified_error(e, identity.clone()))?,
+            Err(_) => return Err(codec::identified_error(Error::Unknown, identity)),
+        };
+        before_deadline(end).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        let message = wire::ReadinessResponse { version, identity };
+        codec::bounded::validate_bytes::<wire::ReadinessResponse>(&message.encode_to_vec())?;
+        let mut response = tonic::Response::new(message);
+        response.extensions_mut().insert(ResponseEnd(end));
+        Ok(response)
     }
 }

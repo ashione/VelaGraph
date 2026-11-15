@@ -198,3 +198,11 @@ Unknown, not Abort: inspect/recover the original external ID and exact command.
 The shared executor, fixed V, page/job/session ownership and delivery cleanup
 are unchanged. No global snapshot, new transaction or higher throughput claim
 follows from this transport migration.
+
+## Fixed-session capture readiness
+
+The additive `ReadinessService.Check` RPC observes a bounded default-profile
+certified capture across every configured graph-query route. Its context follows
+the existing identity/deadline contract. See [scope, protocol and limits](FIXED_READ_READINESS.md):
+this is not `grpc.health.v1`, general write/restore readiness or a promise about a
+future query.

@@ -213,6 +213,19 @@ async fn public_service_node_child() -> anyhow::Result<()> {
         })?,
     )?;
     fs::rename(directory.join("ready.tmp"), directory.join("ready.json"))?;
+    // Test-only fault injection: stop just the graph-query listeners while
+    // the managed participant/control and Raft node remain alive.
+    loop {
+        if directory.join("stop-graph").exists() {
+            // Drop hard-cancels the graph transport, including retained
+            // connections; do not wait for graceful client drainage here.
+            drop(graph_grpc);
+            drop(graph);
+            fs::write(directory.join("graph-stopped"), b"stopped")?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -405,7 +418,7 @@ fn vertex(external: u8, partition: u32, id: &str) -> Value {
 }
 fn context() -> Option<pb::Context> {
     Some(pb::Context {
-            identity: None,
+        identity: None,
         version: 1,
         timeout_millis: 15_000,
     })
@@ -478,7 +491,9 @@ fn fixed_request(session: &pb::FixedSession, text: &str) -> pb::FixedQueryReques
 }
 fn assert_reason(status: &tonic::Status, reason: pb::error_detail::Reason) {
     assert_eq!(
-        replicated_graph::managed_gateway::decode_grpc_error_detail(status).unwrap().reason,
+        replicated_graph::managed_gateway::decode_grpc_error_detail(status)
+            .unwrap()
+            .reason,
         reason as i32
     );
 }

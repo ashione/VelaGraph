@@ -132,3 +132,11 @@ benchmarks, global restore tests or release-gate evidence. The separate [dual-pr
 independent processes and cross-protocol semantics. Clean startup packaging and exact CI/release checks remain required before
 v0.0.1; the finite preview feature/compatibility matrix must be explicit. Test results must be read from
 the exact submitted commit rather than inferred from this document.
+
+## Fixed-session capture readiness
+
+`POST /preview1/readiness` with `{}` performs the bounded default-profile
+[fixed-session read probe](FIXED_READ_READINESS.md), not Gremlin execution.
+`GET /preview1/service` remains static liveness. A successful capture observation
+is not general service/restore readiness or an inexpensive load-balancer check;
+see the linked contract for profile limits, cost and cleanup behavior.

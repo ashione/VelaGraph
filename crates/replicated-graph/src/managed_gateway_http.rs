@@ -197,6 +197,20 @@ async fn handle(
             .await
             .map_err(|_| Error::Capacity)?;
         before_deadline(end)?;
+        if path == "/preview1/readiness" {
+            // Empty JSON object only: no query, client-specified route or lease.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Probe {}
+            let _: Probe = serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)?;
+            let version = state.probe_readiness(work, end).await?;
+            before_deadline(end)?;
+            return Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!("{{\"state\":\"fixed_session_read_captured\",\"version\":{version},\"profile\":\"parity2_mib_v1\",\"restore_supported\":false,\"production_ready\":false}}")))
+                .unwrap());
+        }
         let operation = http_codec::decode(&path, &bytes)?;
         let end = invocation::operation_end(&operation, end);
         budget.send_replace(end);
