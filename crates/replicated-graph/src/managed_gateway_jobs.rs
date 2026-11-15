@@ -219,16 +219,19 @@ pub(super) fn valid_status(status: &JobStatus) -> bool {
     }
 }
 // Shared sealing path: no transport may publish Ready before every page fits.
-fn seal_result(worker: &Job, binding: &Binding, version: u64, rows: Vec<QueryRow>) -> Result<Arc<pages::Materialized>> {
+fn seal_result(
+    worker: &Job,
+    binding: &Binding,
+    version: u64,
+    rows: Vec<QueryRow>,
+) -> Result<Arc<pages::Materialized>> {
     let query = worker.key.query.clone();
     let data = QueryData {
         rows,
         completeness: QueryCompleteness::Unverified,
     };
     worker.deadline()?;
-    if data.rows.len() > pages::MAX_ROWS
-        || !query::valid_traversal_output(&query, &data, binding)
-    {
+    if data.rows.len() > pages::MAX_ROWS || !query::valid_traversal_output(&query, &data, binding) {
         return Err(Error::Capacity);
     }
     encode(&data, pages::MAX_RESULT_BYTES)?;
@@ -898,10 +901,19 @@ mod tests {
         mutable.key.query.text = "g.V(1).out('reports_to').values('name')".into();
         mutable.key.page_size = MAX_PAGE_SIZE;
         let binding = Binding {
-            authority: Authority { shard: 9, mode: [9; 16] },
+            authority: Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
             cohort: Cohort {
-                profile: Default::default(), coordinator_shard: 9, coordinator_epoch: 1,
-                members: vec![Member { shard: 7, epoch: 1, mode: [7; 16] }],
+                profile: Default::default(),
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                members: vec![Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                }],
             },
             mapping: Mapping::PartitionEqualsShardV1,
         };
@@ -909,34 +921,62 @@ mod tests {
         // envelope. Find the first failing text length, rather than depending on
         // a hand-counted serialization overhead that changes with the schema.
         let make_reply = |length: usize| Reply::FetchLocalQueryJob {
-            job: job.handle.clone(), query: job.key.query.clone(), cursor: None,
-            page_size: MAX_PAGE_SIZE, version: 7,
+            job: job.handle.clone(),
+            query: job.key.query.clone(),
+            cursor: None,
+            page_size: MAX_PAGE_SIZE,
+            version: 7,
             page: QueryPage {
                 data: QueryData {
-                    rows: vec![QueryRow::Value {
-                        source: Some(QualifiedElement::Vertex { partition: 7, id: 1 }),
-                        value: Value::Text("x".repeat(length)),
-                    }; usize::from(MAX_PAGE_SIZE)],
+                    rows: vec![
+                        QueryRow::Value {
+                            source: Some(QualifiedElement::Vertex {
+                                partition: 7,
+                                id: 1
+                            }),
+                            value: Value::Text("x".repeat(length)),
+                        };
+                        usize::from(MAX_PAGE_SIZE)
+                    ],
                     completeness: QueryCompleteness::Unverified,
                 },
-                next: None, offset: 0, total: u32::from(MAX_PAGE_SIZE),
+                next: None,
+                offset: 0,
+                total: u32::from(MAX_PAGE_SIZE),
             },
         };
         let mut low = 0;
         let mut high = MAX_RESPONSE_BYTES / usize::from(MAX_PAGE_SIZE) + 1;
         assert!(http_codec::encode(&Ok(make_reply(low))).is_ok());
-        assert_eq!(http_codec::encode(&Ok(make_reply(high))).err(), Some(Error::Capacity));
+        assert_eq!(
+            http_codec::encode(&Ok(make_reply(high))).err(),
+            Some(Error::Capacity)
+        );
         while low + 1 < high {
             let mid = (low + high) / 2;
-            if http_codec::encode(&Ok(make_reply(mid))).is_ok() { low = mid; } else { high = mid; }
+            if http_codec::encode(&Ok(make_reply(mid))).is_ok() {
+                low = mid;
+            } else {
+                high = mid;
+            }
         }
         let reply = make_reply(high);
         local::preflight(&binding, reply.clone()).unwrap();
-        grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply).unwrap(), &binding).unwrap();
-        assert_eq!(http_codec::encode(&Ok(reply.clone())).err(), Some(Error::Capacity));
-        let Reply::FetchLocalQueryJob { page, .. } = reply else { unreachable!() };
+        grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply).unwrap(), &binding)
+            .unwrap();
+        assert_eq!(
+            http_codec::encode(&Ok(reply.clone())).err(),
+            Some(Error::Capacity)
+        );
+        let Reply::FetchLocalQueryJob { page, .. } = reply else {
+            unreachable!()
+        };
         encode(&page.data, pages::MAX_RESULT_BYTES).unwrap();
-        assert!(query::valid_traversal_output(&job.key.query, &page.data, &binding));
+        assert!(query::valid_traversal_output(
+            &job.key.query,
+            &page.data,
+            &binding
+        ));
         {
             let mut inner = job.inner.lock().unwrap();
             inner.life.captured(Instant::now()).unwrap();
@@ -945,7 +985,9 @@ mod tests {
         assert_eq!(job.status(false).phase, JobPhase::Sealing);
         // Exercise the production sealing helper and the worker's terminal
         // failure path, not merely the HTTP codec in isolation.
-        let error = seal_result(&job, &binding, 7, page.data.rows).err().unwrap();
+        let error = seal_result(&job, &binding, 7, page.data.rows)
+            .err()
+            .unwrap();
         assert_eq!(error, Error::Capacity);
         job.fail(error);
         let status = job.status(false);

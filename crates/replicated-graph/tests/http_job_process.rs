@@ -395,22 +395,58 @@ async fn scenario() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let response = ok(service.address, "get", json!({"job":short_job})).await?;
-            if response["status"]["phase"] == "expired" { break; }
-            anyhow::ensure!(matches!(response["status"]["phase"].as_str(), Some("capturing" | "running" | "sealing" | "ready")), "unexpected status {response}");
+            if response["status"]["phase"] == "expired" {
+                break;
+            }
+            anyhow::ensure!(
+                matches!(
+                    response["status"]["phase"].as_str(),
+                    Some("capturing" | "running" | "sealing" | "ready")
+                ),
+                "unexpected status {response}"
+            );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         Ok::<_, anyhow::Error>(())
-    }).await??;
-    error(service.address, "renew", json!({"job":short_job,"expected_generation":"0"}), 410, "session_unavailable").await?;
+    })
+    .await??;
+    error(
+        service.address,
+        "renew",
+        json!({"job":short_job,"expected_generation":"0"}),
+        410,
+        "session_unavailable",
+    )
+    .await?;
     service.graceful_stop().await?;
     drop((jobs, writes));
-    let mut restarted = ServiceProcess::start(&config_path, directory.path().join("http-jobs2.stdout")).await?;
-    error(restarted.address, "get", json!({"job":job}), 410, "session_unavailable").await?;
+    let mut restarted =
+        ServiceProcess::start(&config_path, directory.path().join("http-jobs2.stdout")).await?;
+    error(
+        restarted.address,
+        "get",
+        json!({"job":job}),
+        410,
+        "session_unavailable",
+    )
+    .await?;
     let mut jobs = Jobs::new(grpc_channel(restarted.grpc).await?);
-    assert_reason(&jobs.get(pb::JobGetRequest { context: context(), job: Some(typed_job) }).await.unwrap_err(), Reason::SessionUnavailable);
+    assert_reason(
+        &jobs
+            .get(pb::JobGetRequest {
+                context: context(),
+                job: Some(typed_job),
+            })
+            .await
+            .unwrap_err(),
+        Reason::SessionUnavailable,
+    );
     let fresh = ok(restarted.address, "start", start).await?;
     assert_ne!(fresh["job"]["incarnation"], job["incarnation"]);
-    assert_eq!(ready_http(restarted.address, &fresh["job"]).await?["version"], version.to_string());
+    assert_eq!(
+        ready_http(restarted.address, &fresh["job"]).await?["version"],
+        version.to_string()
+    );
     lost_start_ack(restarted.address, &mut jobs, version).await?;
     restarted.graceful_stop().await?;
     Ok(())
@@ -425,24 +461,29 @@ async fn lost_start_ack(address: SocketAddr, jobs: &mut Jobs, version: u64) -> a
     let (captured, mut responses) = tokio::sync::mpsc::unbounded_channel();
     let proxy = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
-        let handler = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-            let captured = captured.clone();
-            async move {
-                let path = request.uri().path().to_string();
-                let bytes = to_bytes(Body::new(request.into_body()), 1024 * 1024).await?;
-                let body: Value = serde_json::from_slice(&bytes)?;
-                let response = post(address, &path, body).await?;
-                captured.send(response).map_err(|_| anyhow!("response gate receiver closed"))?;
-                std::future::pending::<anyhow::Result<hyper::Response<Body>>>().await
-            }
-        });
+        let handler =
+            hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                let captured = captured.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    let bytes = to_bytes(Body::new(request.into_body()), 1024 * 1024).await?;
+                    let body: Value = serde_json::from_slice(&bytes)?;
+                    let response = post(address, &path, body).await?;
+                    captured
+                        .send(response)
+                        .map_err(|_| anyhow!("response gate receiver closed"))?;
+                    std::future::pending::<anyhow::Result<hyper::Response<Body>>>().await
+                }
+            });
         hyper::server::conn::http1::Builder::new()
-            .serve_connection(hyper_util::rt::TokioIo::new(stream), handler).await?;
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), handler)
+            .await?;
         Ok::<_, anyhow::Error>(())
     });
     let start = start_body(90, Some(version));
     let request = start.clone();
-    let pending = tokio::spawn(async move { post(proxy_address, "/preview1/jobs:start", request).await });
+    let pending =
+        tokio::spawn(async move { post(proxy_address, "/preview1/jobs:start", request).await });
     let captured = tokio::time::timeout(BUDGET, responses.recv()).await;
     // Always stop the client and proxy, including failures, so no process test
     // leaves a detached pending response future running.
@@ -462,6 +503,9 @@ async fn lost_start_ack(address: SocketAddr, jobs: &mut Jobs, version: u64) -> a
     let typed = jobs.start(start_proto(&start)).await?.into_inner();
     assert_eq!(typed.job.as_ref(), Some(&job));
     assert_eq!(typed.operation_id, decode_hex(&start["operation_id"]));
-    assert_eq!(ready_http(address, &admitted["job"]).await?["version"], version.to_string());
+    assert_eq!(
+        ready_http(address, &admitted["job"]).await?["version"],
+        version.to_string()
+    );
     Ok(())
 }
