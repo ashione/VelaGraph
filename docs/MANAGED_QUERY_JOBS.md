@@ -1,6 +1,14 @@
 # Bounded data-local fixed-version query jobs
 
-Status: experimental opt-in implementation under validation. This is a separate
+Status audit (2026-11-14, main `30e6887`): the typed public job lifecycle was
+merged in [PR #271](https://github.com/ashione/VelaGraph/pull/271) (`ecf1b87`),
+and [#268](https://github.com/ashione/VelaGraph/issues/268) is closed. The delivered
+scope is bounded, process-local jobs; durable restart/resume and HTTP job parity
+are not implemented. This is not a production-readiness claim. The delivery
+sequence and migration-comparison evidence below are retained historical records,
+not instructions to reopen #268 or use retired legacy-wire listeners.
+
+This is a separate
 lifecycle from the original materialized `OpenSession` and synchronous
 `OpenLocalQuery` APIs. Their absolute 60-second TTLs and tests are unchanged.
 This feature does not fix or waive the existing original-pin acceptance failure.
@@ -168,7 +176,7 @@ pin, observed CoreHR or release1025 gates.
 
 ## Typed public job service (#268)
 
-**Implementation candidate under validation.** The typed job service uses the
+**Delivered by #271; historical design and acceptance record follows.** The typed job service uses the
 existing public gRPC listener and the lifecycle above; it does not retire the
 legacy managed gateway or establish full #218 completion. The related fixed-session work (#266 / #267) is separate:
 materialized fixed sessions, synchronous local query sessions and jobs must not
@@ -249,7 +257,7 @@ support fixture, are the semantic base. Extend or reuse them rather than creatin
 another query engine or accepting observed-query evidence as managed-job proof.
 Transport-only performance claims require separate matched measurements.
 
-### Delivery sequence
+### Historical delivery sequence (completed by #271)
 
 1. Review this matrix independently of #267; design approval is not implementation
    completion. Keep #268 open and linked to its implementation PR.
@@ -275,5 +283,7 @@ before discarding it; control frames and headers are not business-completion
 evidence. Replay is issued only after the captured Start/Renew response proves
 the operation completed without delivering that response to its caller.
 The existing deterministic lifecycle tests remain the evidence for running
-renewal races and last-owner resource retention. This candidate must pass
-independent review and exact-head CI before #268 acceptance.
+renewal races and last-owner resource retention. At implementation time, this
+candidate required independent review and exact-head CI before #268 acceptance;
+that delivery was completed in #271. Later transport retirement does not restore
+legacy listeners merely because this historical comparison is recorded here.
