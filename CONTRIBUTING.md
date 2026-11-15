@@ -79,6 +79,27 @@ relaxation of required checks. Do not disable a gate to obtain a green PR.
 For local reproduction and evidence formats see [CoreHR CI](docs/COREHR_CI.md)
 and [checkpoint transport](docs/OBJECT_STORE_CHECKPOINT_API.md).
 
+## Proposals and design records
+
+For substantial architecture, distributed protocol, persistence, recovery or
+cross-cutting API changes, keep a complete proposal and design document in
+`docs/` before treating implementation as ready for review. A checklist or PR
+summary alone is not a substitute. Small localized fixes may use an issue/PR
+explanation proportional to their scope.
+
+Record the problem and goals/non-goals, current evidence, alternatives and
+tradeoffs, chosen design, interfaces and state transitions, consistency and
+failure semantics, compatibility/migration, resource/deadline bounds, rollout
+and verification plan, and unresolved questions. Distinguish proposed, accepted,
+implemented and validated status; acceptance of a design is not delivery.
+
+Link the document bidirectionally with its tracking issue, implementation PRs
+and release milestone/Project item. Update the document with material design
+changes and final evidence in the implementation PR. Preserve superseded designs
+as explicitly historical records with replacement links, not contradictory
+current instructions. Do not retroactively claim a missing design was reviewed
+or that planned behavior already exists.
+
 ## Change standards
 
 - Use the official Gremlin parser; reject unsupported behavior explicitly.
