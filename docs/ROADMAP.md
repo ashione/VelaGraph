@@ -20,7 +20,14 @@
 `google.rpc.Status`/`Any` 错误详情与 generated Go 真实进程互操作切片；
 [兼容说明](PUBLIC_GRPC_ERROR_COMPATIBILITY.md) 要求旧客户端与服务端配套升级，
 不支持该变更的混合版本滚动升级，也不等于完整 Go API parity。
-#195/#282 已完成命名及 README 清理；#224/#284 clean-startup 尚未合入。
+#195/#282 已完成命名及 README 清理。
+2026-11-15 增量更新：[PR #284](https://github.com/ashione/VelaGraph/pull/284)
+已 squash 合入 `83c8af4`，交付 [fresh-only 启动示例](MANAGED_SERVICE_DEMO.md)：
+一个 coordinator、两个 graph shard 和独立 HTTP/gRPC 服务，拒绝复用既有目录，
+正常中断回收子进程。准确合并树已通过独立审查、CI、Go、真实启动写查/退出及
+CoreHR 1025 门禁；[验证索引](CURRENT_STATUS.md#fresh-service-startup-delivery-2026-11-15)。
+仅限 loopback、明文无认证、single-voter 开发演示；不支持 restart/restore/HA，
+父进程 SIGKILL 不保证回收。#224 仍开放，尚未完成 v0.0.1 全部验收或发布。
 后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
 相当规模的设计须保留完整 proposal/design doc，关联 issue、实现 PR、milestone/Project；
 按 [贡献规范](../CONTRIBUTING.md#proposals-and-design-records) 区分提议、接受、实现与验证，

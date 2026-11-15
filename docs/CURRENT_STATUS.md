@@ -8,6 +8,26 @@ library network paths are typed gRPC; public HTTP is intentional. This is not
 completion of the #218 service/interoperability gates or production readiness.
 See the [current communication and evidence audit](RPC_MIGRATION_STATUS.md).
 
+## Fresh-service startup delivery (2026-11-15)
+
+[PR #284](https://github.com/ashione/VelaGraph/pull/284) is merged as
+[`83c8af4`](https://github.com/ashione/VelaGraph/commit/83c8af4fda7632518d3a94d6e1f87e8b06d3d85a).
+The [documented startup command](MANAGED_SERVICE_DEMO.md) creates a fresh fixed
+cohort with one coordinator, two graph shards and a separate public HTTP/gRPC
+service. Existing directories are rejected; graceful interruption reaps children.
+This is a loopback, unauthenticated, single-voter development demo, **not** restart,
+restore, HA or production provisioning. Parent SIGKILL cleanup is not guaranteed.
+
+The exact merged tree passed independent static review, [ordinary CI](https://github.com/ashione/VelaGraph/actions/runs/43733888628),
+[clean-startup shell and process regression](https://github.com/ashione/VelaGraph/actions/runs/43733888614),
+[Go interoperability](https://github.com/ashione/VelaGraph/actions/runs/43733888712)
+and [CoreHR including the retained 1025-write lifecycle](https://github.com/ashione/VelaGraph/actions/runs/43733888687).
+A separate cloud build and the explicit startup/write/query/rejected-reuse/child-exit
+process test also passed on Rust 1.100.0. These are correctness/startup checks,
+not a graph throughput benchmark. #224 remains open: this slice alone neither
+completes v0.0.1 acceptance nor publishes a release. The older transport audit
+above retains its original baseline; this section updates only startup delivery.
+
 ## Choose an entrypoint
 
 | Path | Entry and contract | Consistency and scope |
