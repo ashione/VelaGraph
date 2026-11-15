@@ -572,3 +572,129 @@ async fn legacy_rejection_peer() -> anyhow::Result<(
     });
     Ok((address, attempts, peer))
 }
+
+// #221: ingress selection must never be mistaken for portable session state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_gateways_preserve_owner_pages_and_original_write_status() -> anyhow::Result<()> {
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("service.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut owner =
+        ServiceProcess::start(&config_path, directory.path().join("owner.stdout")).await?;
+    let mut other =
+        ServiceProcess::start(&config_path, directory.path().join("other.stdout")).await?;
+    assert_ne!(owner.child.id(), other.child.id());
+    let original = vertex(1, 7, "1");
+    let (status, committed) =
+        post(owner.address, "/preview1/writes:submit", original.clone()).await?;
+    assert_eq!(status, 200, "{committed}");
+    // This is status recovery, not a new ID or an automatic mutation retry.
+    let (status, recovered) =
+        post(other.address, "/preview1/writes:status", original.clone()).await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(recovered, committed);
+
+    // Two known outgoing edges create a real continuation and whole-row oracle.
+    for (id, vertex_id) in [(2, "2"), (3, "3")] {
+        let (status, reply) = post(
+            owner.address,
+            "/preview1/writes:submit",
+            vertex(id, 7, vertex_id),
+        )
+        .await?;
+        assert_eq!(status, 200, "{reply}");
+    }
+    let edge = |external: u8, id: &str, to: &str| json!({"external_id":format!("{external:02x}").repeat(16),"mutation":{"type":"create_edge","edge":{"id":id,"from":{"partition":7,"id":"1"},"to":{"partition":7,"id":to},"label":"link","properties":{}}}});
+    for write in [edge(4, "10", "2"), edge(5, "11", "3")] {
+        let (status, reply) = post(owner.address, "/preview1/writes:submit", write).await?;
+        assert_eq!(status, 200, "{reply}");
+    }
+    let query = json!({"partition":7,"text":"g.V(1).out().path()"});
+    let open = json!({"read":{"type":"minimum","version":"5"},"ttl_millis":60000,"query":query,"page_size":1});
+    let (status, opened) = post(owner.address, "/preview1/queries:open", open.clone()).await?;
+    assert_eq!(status, 200, "{opened}");
+    let session = opened["result"]["session"].clone();
+    let page = opened["result"]["page"].clone();
+    assert_eq!(session["version"], "5");
+    assert_eq!(page["total"], 2);
+    assert!(!page["next"].is_null(), "must exercise a real continuation");
+    let fetch = json!({"session":session,"query":query,"cursor":page["next"],"page_size":1});
+    let (status, wrong_owner) =
+        post(other.address, "/preview1/queries:fetch", fetch.clone()).await?;
+    assert_eq!(status, 410, "{wrong_owner}");
+    assert_eq!(wrong_owner["error"]["code"], "session_unavailable");
+
+    let other_channel = grpc_channel(other.grpc).await?;
+    let mut other_queries = pb::query_service_client::QueryServiceClient::new(other_channel);
+    let wrong_rpc = other_queries
+        .fetch(pb::FetchRequest {
+            context: context(),
+            session: Some(session_proto(&session)),
+            query: Some(pb::Query {
+                partition: 7,
+                text: "g.V(1).out().path()".into(),
+            }),
+            cursor: Some(pb::Cursor {
+                token: decode_hex(&page["next"]),
+            }),
+            page_size: 1,
+        })
+        .await
+        .unwrap_err();
+    assert_reason(&wrong_rpc, pb::error_detail::Reason::SessionUnavailable);
+
+    // Writes through another ingress do not advance the owner's pinned result.
+    let (status, added) =
+        post(other.address, "/preview1/writes:submit", edge(6, "12", "2")).await?;
+    assert_eq!(status, 200, "{added}");
+    let (status, continued) = post(owner.address, "/preview1/queries:fetch", fetch.clone()).await?;
+    assert_eq!(status, 200, "{continued}");
+    assert_eq!(continued["result"]["session"], session);
+    let expected_path = |edge_id: &str, to: &str| json!([{"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"},{"type":"edge","partition":7,"id":edge_id},{"type":"vertex","partition":7,"id":to}]}]);
+    assert_eq!(page["rows"], expected_path("10", "2"));
+    assert_eq!(
+        continued["result"]["page"]["rows"],
+        expected_path("11", "3")
+    );
+    assert_eq!(continued["result"]["page"]["total"], 2);
+    assert!(continued["result"]["page"]["next"].is_null());
+    assert_eq!(
+        post(owner.address, "/preview1/queries:fetch", fetch.clone())
+            .await?
+            .1,
+        continued
+    );
+
+    owner.graceful_stop().await?;
+    let (status, unavailable) =
+        post(other.address, "/preview1/queries:fetch", fetch.clone()).await?;
+    assert_eq!(status, 410, "{unavailable}");
+    assert_eq!(unavailable["error"]["code"], "session_unavailable");
+    let (status, recovered) = post(other.address, "/preview1/writes:status", original).await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(recovered, committed);
+    // Healthy ingress can open a new explicit session, never relabel the old one.
+    let (status, fresh) = post(other.address, "/preview1/queries:open", open).await?;
+    assert_eq!(status, 200, "{fresh}");
+    assert_ne!(
+        fresh["result"]["session"]["incarnation"],
+        session["incarnation"]
+    );
+    assert_eq!(fresh["result"]["session"]["version"], "6");
+    assert_eq!(fresh["result"]["page"]["total"], 3);
+
+    let mut restarted =
+        ServiceProcess::start(&config_path, directory.path().join("restarted.stdout")).await?;
+    let (status, stale) = post(restarted.address, "/preview1/queries:fetch", fetch).await?;
+    assert_eq!(status, 410, "{stale}");
+    assert_eq!(stale["error"]["code"], "session_unavailable");
+    restarted.graceful_stop().await?;
+    other.graceful_stop().await?;
+    Ok(())
+}

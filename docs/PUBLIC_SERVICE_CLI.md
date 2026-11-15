@@ -125,3 +125,40 @@ recover the same original external ID and exact mutation. A successful gRPC
 trailer handoff means the transport consumed the body, not proof the socket
 flushed or the client application received it. See
 [the gRPC lifecycle and test boundary](PUBLIC_GRPC_SERVICE.md).
+
+## Ingress ownership: two processes are not a session failover pair
+
+A client chooses one public service endpoint before opening a query. Keep the
+returned session and every continuation on that same process incarnation. HTTP
+and gRPC on that process share state; a second service attached to the same
+cohort does **not** share its session registry. Ingress selection is separate from
+the service's fixed member/shard routing. There is no built-in load balancer,
+owner-forwarder, portable session store or automatic routing discovery.
+
+Do not place round-robin per-request balancing in front of session operations.
+Applications must retain the original endpoint (or use externally verified
+sticky routing). A wrong owner, stopped owner or restarted owner is not permission
+to reopen the query at latest and append its rows to an older result. Wrong-owner
+and stale-session requests to a reachable service return HTTP 410
+`session_unavailable` / the typed gRPC `SessionUnavailable` detail; an unreachable
+owner can instead fail at transport level. Clients must explicitly start a new
+query if they choose to abandon the old fixed view.
+
+Write recovery is different: the persisted original external ID plus exact
+mutation can be submitted to the existing `writes:status` endpoint on another
+service bound to the **same verified cohort**. This is a status lookup, not a
+blanket license to retry a timed-out mutation, change its ID or route to an
+unrelated cohort. A lost ACK remains unknown until status establishes its outcome.
+
+The ordinary `public_service_process` regression
+`two_gateways_preserve_owner_pages_and_original_write_status` starts two real
+services with the same three-node cohort. It checks HTTP/gRPC rejection of a real
+foreign continuation, whole-row fixed-V pages across another-ingress writes,
+page replay, graceful owner removal, stale tokens after restart, and exact
+original-ID status responses through the surviving ingress. It does not inject
+a lost ACK, demonstrate crash/partition recovery or establish concurrent-write
+throughput. The public CLI's existing startup checks still apply; this test is
+not continuous readiness or load-balancer health discovery. FixedSession/job
+failover, overload/rolling removal and automatic balancing remain separate
+[#221](https://github.com/ashione/VelaGraph/issues/221) acceptance; the issue stays
+open. No listener or execution semantics change in this test/contract slice.
