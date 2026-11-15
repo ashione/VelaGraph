@@ -914,3 +914,10 @@ adds no general write readiness, automatic routing/load balancing, checkpoint
 activation or HA. #221 remains open; exact revision test/CI evidence must precede
 any claim that this slice is delivered. The static process-liveness route remains
 separate.
+
+### Public gateway channel reuse (#221)
+
+The owned [`GatewayClient`](GATEWAY_CLIENT_CHANNEL.md) provides bounded channel
+reuse for a fixed endpoint/binding, preserving caller deadlines, global call
+admission and existing session identities. It does not add automatic retries,
+ingress balancing or owner forwarding; #221 overall acceptance remains pending.

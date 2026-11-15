@@ -42,6 +42,7 @@ pub fn decode_grpc_error_detail(status: &tonic::Status) -> Result<public_proto::
 
 #[path = "managed_gateway_grpc_client.rs"]
 mod grpc_client;
+pub use grpc_client::GatewayClient;
 #[path = "managed_gateway_jobs.rs"]
 mod jobs;
 #[path = "managed_gateway_local.rs"]
@@ -1392,7 +1393,8 @@ impl Drop for Service {
         let _ = self.stop.send(true);
     }
 }
-/// Performs no automatic retry. Reuse the exact original external ID and
+/// One-shot request without automatic retry. Use [`GatewayClient`] to reuse a
+/// bounded channel across requests. Recover the exact original external ID and
 /// mutation after Unknown. The typed server confirms binding and request identity.
 pub async fn request(
     address: SocketAddr,
@@ -1400,7 +1402,9 @@ pub async fn request(
     operation: Operation,
     deadline: Duration,
 ) -> Result<Reply> {
-    grpc_client::request(address, binding, operation, deadline).await
+    GatewayClient::new(address, binding)
+        .request(operation, deadline)
+        .await
 }
 fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
     if response.version != VERSION

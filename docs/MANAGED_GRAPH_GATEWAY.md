@@ -273,3 +273,11 @@ ones. Current internal managed peers require [S4 RPC v6](RETAINED_GATEWAY_CONTRO
 and durable full-cohort confirmation; the byte-profile slice originally used v5.
 No Gremlin mutation syntax, partial result fallback or unlimited write contract is
 introduced. Existing cohorts cannot be retagged or reset to select this profile.
+
+## Reusable domain client
+
+[`GatewayClient`](GATEWAY_CLIENT_CHANNEL.md) reuses a bounded typed gRPC channel
+across explicit calls and clones for one immutable endpoint/binding. The free
+`request` helper is one-shot. All calls preserve the original deadline, shared
+admission, response correlation and incarnation-bound sessions; transport
+reconnection does not authorize mutation retry or session failover.
