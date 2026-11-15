@@ -1,6 +1,10 @@
 syntax = "proto3";
 
-package rocksql.graph.v1;
+package velagraph.graph.v1;
+
+// Declarative storage schema, not an RPC service. Package names are not encoded
+// in stored records. Numeric fields and canonical bytes remain format v1;
+// generated source/descriptor names changed (see docs/SQL_REMOVAL.md).
 
 // Envelope stored under graph/v1/p/<partition>/{vertex,edge}/<id>.
 message Record {

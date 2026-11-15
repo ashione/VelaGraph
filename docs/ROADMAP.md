@@ -4,7 +4,7 @@
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
-## 当前状态核对（2026-11-14，main `30e6887`）
+## 当前状态核对（2026-11-15，main `ab94394`）
 
 本次纠偏跟踪 [#285](https://github.com/ashione/VelaGraph/issues/285)，承接已完成的
 #147 和 #280 文档审计；不是新建实现总目标。下表只列已合入基线的能力，不把待合并 PR 当成交付。
@@ -12,12 +12,15 @@
 | 能力 | 已合入证据 | 仍未完成的边界 |
 | --- | --- | --- |
 | typed managed jobs | #268 / [PR #271](https://github.com/ashione/VelaGraph/pull/271)，`ecf1b87`；Start/Get/Renew/Fetch/Cancel | 非重启后任务恢复；HTTP job parity 未交付 |
-| library 通信退役 | #273/#275/#277/#279；[通信审计](RPC_MIGRATION_STATUS.md) | public HTTP 有意保留；Go、标准错误详情互操作、升级和性能仍独立验收 |
+| library 通信退役 | #273/#275/#277/#279；[通信审计](RPC_MIGRATION_STATUS.md) | public HTTP 有意保留；完整 Go/HTTP parity、升级和性能仍独立验收 |
 | 本地物理 checkpoint | [PR #194](https://github.com/ashione/VelaGraph/pull/194)，`c597459`；[双 DB 契约](PHYSICAL_CHECKPOINT.md) | 恢复仍为 `RESTORED_OFFLINE_ONLY`，#193 的 live restart/rejoin 未完成 |
 | 不可变 checkpoint 对象运输 | [已实现接口与验收范围](OBJECT_STORE_CHECKPOINT_API.md)，`crates/checkpoint-object-store` | 不是全局恢复、远程持久 ACK、对象存储权威或 temporal DB 备份 |
 
-#281/#283 的 Go/错误互操作与 #224/#284 的 clean-startup 在此基线尚未合入；
-#195/#282 负责命名及 README 清理，本文不抢改其文件。
+#281 / [PR #283](https://github.com/ashione/VelaGraph/pull/283) 已合入标准
+`google.rpc.Status`/`Any` 错误详情与 generated Go 真实进程互操作切片；
+[兼容说明](PUBLIC_GRPC_ERROR_COMPATIBILITY.md) 要求旧客户端与服务端配套升级，
+不支持该变更的混合版本滚动升级，也不等于完整 Go API parity。
+#195/#282 已完成命名及 README 清理；#224/#284 clean-startup 尚未合入。
 后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
 相当规模的设计须保留完整 proposal/design doc，关联 issue、实现 PR、milestone/Project；
 按 [贡献规范](../CONTRIBUTING.md#proposals-and-design-records) 区分提议、接受、实现与验证，

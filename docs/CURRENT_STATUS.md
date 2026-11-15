@@ -87,8 +87,12 @@ are gRPC-only. Its `FixedSessionService` exposes the original bounded materializ
 snapshot session (Open/Read/Traverse/Page/Close), separately from the data-local
 `QueryService`. The typed `ManagedQueryJobService` delivered by merged #271
 (#268) exposes Start/Get/Renew/Fetch/Cancel on the same endpoint. Later #277/#279
-retired the Gateway/GraphService legacy wires. HTTP job parity, cross-language
-interoperability and other #218 service gates remain separate; jobs do not
+retired the Gateway/GraphService legacy wires. Merged #283 adds standard rich
+gRPC errors and a bounded generated-Go real-process interoperability slice; see
+[compatibility](PUBLIC_GRPC_ERROR_COMPATIBILITY.md). Old clients and servers must
+upgrade together; mixed-version rolling upgrade is not supported for that change.
+HTTP job parity, complete cross-language API coverage and other #218 service gates
+remain separate; jobs do not
 resume after gateway restart.
 This is a loopback development preview requiring an already
 activated fixed cohort, not cluster bootstrap, production serving or global
