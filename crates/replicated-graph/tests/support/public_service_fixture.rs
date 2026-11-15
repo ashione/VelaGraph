@@ -8,7 +8,6 @@ use d2_raft::{
     versioned_reads::Target,
     Cluster, D1Command, LogCommand, NodeHandle,
 };
-use prost::Message;
 use replicated_graph::managed_gateway::public_proto as pb;
 use replicated_graph::{
     managed_gateway::{Binding, Mapping},
@@ -479,7 +478,7 @@ fn fixed_request(session: &pb::FixedSession, text: &str) -> pb::FixedQueryReques
 }
 fn assert_reason(status: &tonic::Status, reason: pb::error_detail::Reason) {
     assert_eq!(
-        pb::ErrorDetail::decode(status.details()).unwrap().reason,
+        replicated_graph::managed_gateway::decode_grpc_error_detail(status).unwrap().reason,
         reason as i32
     );
 }
