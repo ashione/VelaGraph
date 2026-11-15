@@ -2625,7 +2625,7 @@ async fn reusable_gateway_client_cold_cancel_allows_later_explicit_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reusable_gateway_client_expired_queued_mutation_is_not_sent_on_reconnect() {
+async fn reusable_gateway_client_expired_queued_mutation_body_is_not_dispatched() {
     use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let _test = TEST_GATE.lock().await;
@@ -2651,26 +2651,75 @@ async fn reusable_gateway_client_expired_queued_mutation_is_not_sent_on_reconnec
         drop(incoming);
         drop(outgoing);
         let (socket, _) = listener.accept().await.unwrap();
-        accepted.send(()).unwrap();
-        // TCP reconnect has happened, but HTTP/2 cannot become ready until
-        // the caller has observed its mutation deadline and releases us.
-        resumed.await.unwrap();
-        let mut connection = h2::server::handshake(socket).await.unwrap();
-        let mut replies = JoinSet::new();
-        while let Some(call) = connection.accept().await {
-            let (request, mut response) = call.unwrap();
-            if request.uri().path().ends_with("/Submit") {
-                received_submissions.fetch_add(1, Ordering::SeqCst);
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake::<_, tonic::codegen::Bytes>(socket)
+            .await
+            .unwrap();
+        // The read-only reconnect driver occupies the single allowed stream.
+        // Merely delaying handshake is NOT a queue barrier: h2 may send a
+        // request before receiving server SETTINGS. Wait for SETTINGS ACK too.
+        let first = connection.accept().await.unwrap();
+        assert!(first.as_ref().unwrap().0.uri().path().ends_with("/Status"));
+        std::future::poll_fn(|cx| {
+            assert!(connection.poll_accept(cx).is_pending());
+            if connection.max_concurrent_recv_streams() == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
             }
+        })
+        .await;
+        accepted.send(()).unwrap();
+        tokio::select! {
+            _ = resumed => {},
+            unexpected = connection.accept() => panic!("request bypassed occupied single stream: {unexpected:?}"),
+        }
+        let mut first = Some(first);
+        let mut replies = JoinSet::new();
+        loop {
+            let call = if let Some(first) = first.take() {
+                Some(first)
+            } else {
+                connection.accept().await
+            };
+            let Some(call) = call else { break };
+            let (request, mut response) = call.unwrap();
+            let is_submit = request.uri().path().ends_with("/Submit");
+            let received_submissions = received_submissions.clone();
             replies.spawn(async move {
                 let mut body = request.into_body();
                 let mut bytes = Vec::new();
+                let mut counted = false;
                 while let Some(chunk) = body.data().await {
                     let Ok(chunk) = chunk else { return };
-                    body.flow_control().release_capacity(chunk.len()).unwrap();
+                    if body.flow_control().release_capacity(chunk.len()).is_err() {
+                        return;
+                    }
                     bytes.extend_from_slice(&chunk);
+                    // HEADERS can arrive for a cancelled buffered request.
+                    // Count a mutation only when a complete, valid unary gRPC
+                    // WriteRequest body is present, even if RST follows it.
+                    if is_submit && !counted && bytes.len() >= 5 && bytes[0] == 0 {
+                        let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+                        if bytes.len() == length + 5
+                            && public_proto::WriteRequest::decode(&bytes[5..]).is_ok()
+                        {
+                            received_submissions.fetch_add(1, Ordering::SeqCst);
+                            counted = true;
+                        }
+                    }
                 }
-                let write = public_proto::WriteRequest::decode(&bytes[5..]).unwrap();
+                if bytes.len() < 5 || bytes[0] != 0 {
+                    return;
+                }
+                let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+                if bytes.len() != length + 5 {
+                    return;
+                }
+                let Ok(write) = public_proto::WriteRequest::decode(&bytes[5..]) else {
+                    return;
+                };
                 let reply = public_proto::WriteResponse {
                     external_id: write.external_id,
                     transaction_id: None,
@@ -2710,7 +2759,8 @@ async fn reusable_gateway_client_expired_queued_mutation_is_not_sent_on_reconnec
     ));
     disconnect.send(()).unwrap();
     // Read-only calls drive failure detection and reconnection. This does not
-    // replay a mutation, and accept is the barrier proving reconnect began.
+    // replay a mutation. The barrier proves its stream occupies the sole
+    // acknowledged HTTP/2 stream slot on the replacement connection.
     let reader = client.clone();
     let status_write = write.clone();
     let read_driver = RpcDriver(tokio::spawn(async move {
@@ -2728,18 +2778,42 @@ async fn reusable_gateway_client_expired_queued_mutation_is_not_sent_on_reconnec
         .await
         .unwrap()
         .unwrap();
-    let mutation_started = tokio::time::Instant::now();
-    assert_eq!(
-        client
-            .request(Operation::Submit(write.clone()), Duration::from_millis(50))
-            .await,
-        Err(Error::Unknown)
-    );
-    assert!(mutation_started.elapsed() >= Duration::from_millis(50));
+    // Timed-out bodies still retained by the transport must keep admission
+    // charged. Repeated short calls cannot accumulate an unbounded queue.
+    let mut timed_out = 0;
+    let mut capacity_rejected = 0;
+    for external_id in 100..200 {
+        let mutation_started = tokio::time::Instant::now();
+        match client
+            .request(
+                Operation::Submit(create(external_id, 7, 1)),
+                Duration::from_millis(50),
+            )
+            .await
+        {
+            Err(Error::Unknown) => {
+                assert!(mutation_started.elapsed() >= Duration::from_millis(50));
+                timed_out += 1;
+            }
+            Err(Error::Capacity) => capacity_rejected += 1,
+            other => panic!("unexpected queued mutation outcome: {other:?}"),
+        }
+    }
+    assert!(timed_out > 0 && timed_out <= MAX_CONNECTIONS);
+    assert!(capacity_rejected > 0);
+    assert_eq!(CLIENT_ADMISSION.available_permits(), 0);
     drop(read_driver);
     resume.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     // A new explicit call traverses the recovered channel and obtains a valid
-    // correlated response; the timed-out Submit must not appear at the peer.
+    // correlated response. Expired Submit HEADERS may appear, but no complete
+    // mutation body may dispatch. This cannot retract already buffered DATA.
     let reply = client
         .request(Operation::Status(write), Duration::from_secs(15))
         .await
