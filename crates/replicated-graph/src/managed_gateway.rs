@@ -71,6 +71,28 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+// Adapter-local admission fence. The first drain fixes an absolute bound;
+// repeated calls cannot reopen admission or extend the grace period.
+#[derive(Default)]
+struct Drain {
+    end: Mutex<Option<Instant>>,
+}
+impl Drain {
+    fn begin(&self, grace: Duration) -> Result<()> {
+        check_deadline(grace)?;
+        let mut end = self.end.lock().unwrap();
+        let proposed = Instant::now() + grace;
+        *end = Some(end.unwrap_or(proposed));
+        Ok(())
+    }
+    fn end(&self) -> Option<Instant> {
+        *self.end.lock().unwrap()
+    }
+    fn admitting(&self) -> bool {
+        self.end().is_none()
+    }
+}
+
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 8;
@@ -1712,3 +1734,22 @@ async fn grpc_local_config(
 #[cfg(test)]
 #[path = "managed_gateway_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    #[test]
+    fn drain_fences_once_and_never_extends() {
+        let drain = Drain::default();
+        assert!(drain.admitting());
+        assert!(drain.begin(Duration::ZERO).is_err());
+        assert!(drain.admitting());
+        drain.begin(Duration::from_secs(1)).unwrap();
+        let first = drain.end().unwrap();
+        assert!(!drain.admitting());
+        drain.begin(Duration::from_secs(60)).unwrap();
+        assert_eq!(drain.end(), Some(first));
+        drain.begin(Duration::from_millis(1)).unwrap();
+        assert_eq!(drain.end(), Some(first));
+    }
+}

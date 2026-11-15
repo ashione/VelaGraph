@@ -298,6 +298,9 @@ struct ServiceProcess {
 }
 impl ServiceProcess {
     async fn start(config: &Path, output: PathBuf) -> anyhow::Result<Self> {
+        Self::start_with_drain(config, output, 5000).await
+    }
+    async fn start_with_drain(config: &Path, output: PathBuf, drain_ms: u64) -> anyhow::Result<Self> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
         command.args([
             "--config",
@@ -310,6 +313,7 @@ impl ServiceProcess {
             "--timeout-ms",
             "15000",
         ]);
+        command.args(["--drain-timeout-ms", &drain_ms.to_string()]);
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(fs::File::create(&output)?))

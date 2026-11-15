@@ -120,6 +120,10 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
 [流控边界](https://grpc.io/docs/guides/flow-control/) 和
 [Protobuf 演进](https://protobuf.dev/programming-guides/proto3/)。
 
+服务进程的有界移除见 [drain 契约](SERVICE_DRAIN.md)：同时停止两种入口的新请求，
+保留已入场调用原 deadline，宽限期后取消；不迁移会话、不自动重放写入，
+不将请求排空等同于 #221 的完整弹性负载均衡或恢复后就绪。
+
 ## 已吸收的架构方向：通用执行、路由与可持续一致视图
 
 2026-11-13 对照 NebulaGraph Community 3.8 后，采用其职责分层、图语义批量

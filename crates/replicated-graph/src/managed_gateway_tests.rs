@@ -2236,3 +2236,116 @@ async fn listener_free_service_expires_and_releases_sessions_on_shutdown_or_drop
     }
     fixture.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_drain_finishes_admitted_call_rejects_new_stream_and_bounds_stall() {
+    use prost::Message;
+    let _guard = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    let service = Service::start(fixture.config().into(), Duration::from_secs(15), None)
+        .await
+        .unwrap();
+    for finish in [true, false] {
+        let grpc = service
+            .bind_grpc("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+            .await
+            .unwrap();
+        let socket = TcpStream::connect(grpc.local_addr()).await.unwrap();
+        let (mut sender, connection) = h2::client::handshake(socket).await.unwrap();
+        let _driver = RpcDriver(tokio::spawn(async move {
+            let _ = connection.await;
+        }));
+        let request = || {
+            tonic::codegen::http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "http://{}/velagraph.public.managed.v1.WriteService/Status",
+                    grpc.local_addr()
+                ))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .unwrap()
+        };
+        let (response, mut body) = sender.send_request(request(), false).unwrap();
+        // Header admission is observable before sending the unary message body.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.state.connections.available_permits() == MAX_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        grpc.begin_drain(Duration::from_millis(if finish { 5000 } else { 200 }))
+            .unwrap();
+        // An existing HTTP/2 channel cannot bypass the admission fence. GOAWAY
+        // may reject it at transport level, or the wrapper returns typed rejection.
+        if let Ok((extra, mut extra_body)) = sender.send_request(request(), false) {
+            let _ = extra_body.send_data(
+                grpc_frame(
+                    &grpc_client::encode_write(public_context(), &create(98, 7, 98)).unwrap(),
+                )
+                .into(),
+                true,
+            );
+            rejected_rpc(extra).await;
+        }
+        if finish {
+            let write = create(99, 7, 99);
+            body.send_data(
+                grpc_frame(&grpc_client::encode_write(public_context(), &write).unwrap()).into(),
+                true,
+            )
+            .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut incoming = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(data) = incoming.data().await {
+                let data = data.unwrap();
+                incoming
+                    .flow_control()
+                    .release_capacity(data.len())
+                    .unwrap();
+                bytes.extend_from_slice(&data);
+            }
+            let trailers = incoming.trailers().await.unwrap().unwrap();
+            assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+            assert!(bytes.len() >= 5);
+            assert_eq!(bytes[0], 0);
+            assert_eq!(
+                u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize,
+                bytes.len() - 5
+            );
+            let reply = public_proto::WriteResponse::decode(&bytes[5..]).unwrap();
+            assert_eq!(reply.external_id, write.external_id);
+            assert!(reply.transaction_id.is_none());
+            assert!(matches!(
+                reply.status,
+                Some(public_proto::write_response::Status::Absent(_))
+            ));
+        } else {
+            // begin_drain enforces its own bound, without a shutdown() waiter.
+            rejected_rpc(response).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while TcpStream::connect(grpc.local_addr()).await.is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        grpc.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.state.connections.available_permits() != MAX_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    service.shutdown().await;
+    fixture.stop().await;
+}
