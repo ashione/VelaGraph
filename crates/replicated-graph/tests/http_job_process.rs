@@ -310,7 +310,14 @@ async fn scenario() -> anyhow::Result<()> {
     // so this transport error has no domain ErrorDetail.
     let mut bad_cursor = fetch.clone();
     bad_cursor["cursor"] = json!("");
-    error(service.address, "fetch", bad_cursor, 400, "invalid_argument").await?;
+    error(
+        service.address,
+        "fetch",
+        bad_cursor,
+        400,
+        "invalid_argument",
+    )
+    .await?;
     let malformed = jobs
         .fetch(pb::JobFetchRequest {
             context: context(),
@@ -332,7 +339,14 @@ async fn scenario() -> anyhow::Result<()> {
     assert_ne!(unknown_token, next_token);
     let mut unknown_cursor = fetch.clone();
     unknown_cursor["cursor"] = json!(hex_bytes(&unknown_token));
-    error(service.address, "fetch", unknown_cursor, 409, "identity_mismatch").await?;
+    error(
+        service.address,
+        "fetch",
+        unknown_cursor,
+        409,
+        "identity_mismatch",
+    )
+    .await?;
     assert_reason(
         &jobs
             .fetch(pb::JobFetchRequest {
