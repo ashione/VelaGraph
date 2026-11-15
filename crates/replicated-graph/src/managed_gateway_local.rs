@@ -548,7 +548,7 @@ impl State {
             .try_acquire_owned()
             .map_err(|_| Error::Capacity)?;
         let mut capture = CapturedLocal::new(work, memory, execution, None);
-        let (version, expires) = self
+        let captured = self
             .capture_local(
                 requested_profile.unwrap_or_default(),
                 version,
@@ -557,7 +557,16 @@ impl State {
                 end,
                 &mut capture,
             )
-            .await?;
+            .await;
+        let (version, expires) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                // Ordinary failure preserves the synchronous cleanup contract.
+                // Drop is only the fallback when this future is cancelled.
+                capture.close().await;
+                return Err(error);
+            }
+        };
         let result = fixed_execution::execute(
             &mut capture.sessions,
             &req,

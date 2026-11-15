@@ -802,11 +802,14 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
     let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
     let f = Fixture::new().await;
     let (g, servers, graphs) = local_gateway(&f).await;
-    for downgrade_profile in [false, true] {
+    for (downgrade_profile, direct) in [(false, true), (true, true), (false, false), (true, false)]
+    {
         let mut routes = g.state.config.local_routes.clone().unwrap();
         let real = routes[0].endpoint;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         routes[0].endpoint = listener.local_addr().unwrap();
+        let (close_seen_tx, close_seen_rx) = tokio::sync::oneshot::channel();
+        let (close_release_tx, close_release_rx) = tokio::sync::oneshot::channel();
         let proxy = tokio::spawn(run_fixed_script(listener, move |mut events| async move {
             let event = events.recv().await.unwrap();
             let FixedRpc::Open(mut open) = event.request else {
@@ -844,6 +847,10 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
                 panic!("expected CloseFixed")
             };
             assert_eq!(close.descriptor.as_ref(), Some(&descriptor));
+            if direct {
+                close_seen_tx.send(()).unwrap();
+                close_release_rx.await.unwrap();
+            }
             let reply = forward_fixed(real, event.request).await;
             assert!(event.reply.send(Ok(reply)).is_ok());
         }));
@@ -863,27 +870,61 @@ async fn fixed_local_rejects_same_v_actual_retained_proof_substitution() {
         )
         .await
         .unwrap();
-        assert_eq!(
-            call(
-                &bad,
-                if downgrade_profile {
-                    Operation::OpenLocalQueryWithProfile {
-                        profile: LocalReadProfile::LocalRead8MiBV1,
-                        version: Some(0),
-                        ttl_millis: 60_000,
-                        query: Query {
-                            partition: 7,
-                            text: "g.V(999).count()".into(),
-                        },
-                        page_size: 1,
+        if direct {
+            // Poll the core operation itself, not a socket response: a normal
+            // acquisition error must await cleanup before returning. The proxy
+            // withholds Close's reply at a deterministic handshake boundary.
+            let work = Arc::new(bad.state.connections.clone().try_acquire_owned().unwrap());
+            let opened = bad.state.open_local(
+                downgrade_profile.then_some(LocalReadProfile::LocalRead8MiBV1),
+                Some(0),
+                None,
+                60_000,
+                Query {
+                    partition: 7,
+                    text: "g.V(999).count()".into(),
+                },
+                1,
+                work,
+                Instant::now() + Duration::from_secs(15),
+            );
+            tokio::pin!(opened);
+            tokio::select! {
+                biased;
+                result = &mut opened => panic!("ordinary capture error returned before cleanup: {result:?}"),
+                reached = close_seen_rx => reached.unwrap(),
+            }
+            assert!(bad.retained_payload_charge() > 0);
+            close_release_tx.send(()).unwrap();
+            assert_eq!(opened.await, Err(Error::Identity));
+            assert_eq!(
+                bad.retained_payload_charge(),
+                0,
+                "ordinary failure must release before return"
+            );
+        } else {
+            assert_eq!(
+                call(
+                    &bad,
+                    if downgrade_profile {
+                        Operation::OpenLocalQueryWithProfile {
+                            profile: LocalReadProfile::LocalRead8MiBV1,
+                            version: Some(0),
+                            ttl_millis: 60_000,
+                            query: Query {
+                                partition: 7,
+                                text: "g.V(999).count()".into(),
+                            },
+                            page_size: 1,
+                        }
+                    } else {
+                        local_open(Some(0), "g.V(999).count()", 1)
                     }
-                } else {
-                    local_open(Some(0), "g.V(999).count()", 1)
-                }
-            )
-            .await,
-            Err(Error::Identity)
-        );
+                )
+                .await,
+                Err(Error::Identity)
+            );
+        }
         tokio::time::timeout(Duration::from_secs(15), proxy)
             .await
             .unwrap()
