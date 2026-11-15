@@ -40,3 +40,33 @@ Existing graph data needs no migration or rebuild because of this rename.
 Historical evidence documents may mention SQL test counts or state that a past
 change left SQL untouched. Those are observations for their named revisions,
 not assertions that the removed engine remains part of the current product.
+
+## Declarative schema namespace
+
+For the v0.0.1 experimental release, `proto/graph.proto` now declares
+`velagraph.graph.v1` instead of `rocksql.graph.v1` (#195). This fulfills the
+remaining source-name cleanup; it does not change storage format v1 or the
+separately versioned RPC service schemas.
+
+The checked-in schema has no service, imports or `google.protobuf.Any` fields.
+The graph codec is hand-written and encodes numeric field tags, not package
+names. Fields, field numbers, wire types, enum values, graph/v1 keys, record
+versions and canonical bytes are unchanged. Existing graph data must be kept;
+no deletion, rewrite or database migration is needed. Existing golden vectors
+remain unchanged, and `tests/schema_namespace.rs` opens literal pre-rename
+record bytes, reads them with the current API and checks them unchanged after
+reopen. This is a storage compatibility test, not a new RPC compatibility claim.
+
+External consumers that independently generated code from this declarative
+schema must regenerate it and update imports and fully-qualified descriptor
+names. Reflection lookups and externally constructed Any type URLs using the
+old name are source/descriptor-incompatible; VelaGraph does not implement an
+alias or an automatic migration for those external envelopes. Preserve the old
+schema in that external integration until its own migration is complete. This
+intentional pre-release source change does not silently redefine stored bytes.
+
+`proto/graph_v2.proto` retains `graph.experimental.v2`: it is a distinct
+experimental record contract, not a SQL-branded package or an RPC endpoint.
+Historical documents and the old names in these migration instructions remain
+as evidence. Private test-child environment names and benchmark temporary-file
+prefixes use VelaGraph; no public old-name compatibility aliases are retained.

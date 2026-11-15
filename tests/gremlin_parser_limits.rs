@@ -7,7 +7,7 @@ use velagraph::{
 
 #[test]
 fn parser_stress_isolated() {
-    const CHILD: &str = "ROCKSQL_PARSER_STRESS_CHILD";
+    const CHILD: &str = "VELAGRAPH_PARSER_STRESS_CHILD";
     if let Ok(case) = std::env::var(CHILD) {
         std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
