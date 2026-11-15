@@ -21,3 +21,5 @@ jobs:
         with:
           name: http-job-format
           path: formatted.patch
+
+# Refresh formatting after additional lifecycle regressions.

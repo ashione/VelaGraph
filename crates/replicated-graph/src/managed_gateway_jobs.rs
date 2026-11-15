@@ -218,6 +218,59 @@ pub(super) fn valid_status(status: &JobStatus) -> bool {
         _ => status.version.is_none() && status.total.is_none(),
     }
 }
+// Shared sealing path: no transport may publish Ready before every page fits.
+fn seal_result(worker: &Job, binding: &Binding, version: u64, rows: Vec<QueryRow>) -> Result<Arc<pages::Materialized>> {
+    let query = worker.key.query.clone();
+    let data = QueryData {
+        rows,
+        completeness: QueryCompleteness::Unverified,
+    };
+    worker.deadline()?;
+    if data.rows.len() > pages::MAX_ROWS
+        || !query::valid_traversal_output(&query, &data, binding)
+    {
+        return Err(Error::Capacity);
+    }
+    encode(&data, pages::MAX_RESULT_BYTES)?;
+    let mut result = pages::Materialized {
+        query,
+        size: worker.key.page_size,
+        data,
+        offsets: BTreeMap::new(),
+        cursors: BTreeMap::new(),
+    };
+    for offset in
+        (usize::from(result.size)..result.data.rows.len()).step_by(usize::from(result.size))
+    {
+        worker.deadline()?;
+        let cursor = PageCursor { token: random()? };
+        if result.offsets.insert(cursor.clone(), offset).is_some() {
+            return Err(Error::Unknown);
+        }
+        result.cursors.insert(offset, cursor);
+    }
+    for offset in (0..result.data.rows.len().max(1)).step_by(usize::from(result.size)) {
+        worker.deadline()?;
+        let reply = Reply::FetchLocalQueryJob {
+            job: worker.handle.clone(),
+            query: result.query.clone(),
+            cursor: result.cursors.get(&offset).cloned(),
+            page_size: result.size,
+            version,
+            page: result.page(offset),
+        };
+        // Ready is transport-independent: retain the logical envelope
+        // check and also preflight every typed page before publication.
+        local::preflight(binding, reply.clone())?;
+        grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply)?, binding)?;
+        // All public transports must deliver every page before Ready.
+        // JSON escaping can expand a page beyond its protobuf size.
+        http_codec::encode(&Ok(reply))?;
+    }
+    worker.deadline()?;
+    Ok(Arc::new(result))
+}
+
 impl State {
     pub(super) fn expire_jobs(&self) {
         self.jobs.lock().unwrap().retain(|_, job| {
@@ -514,55 +567,7 @@ impl State {
         let result = tokio::task::spawn_blocking(move || {
             // Both reservation owners survive async cancellation until encoding exits.
             let _execution = execution;
-            let query = worker.key.query.clone();
-            let data = QueryData {
-                rows,
-                completeness: QueryCompleteness::Unverified,
-            };
-            worker.deadline()?;
-            if data.rows.len() > pages::MAX_ROWS
-                || !query::valid_traversal_output(&query, &data, &binding)
-            {
-                return Err(Error::Capacity);
-            }
-            encode(&data, pages::MAX_RESULT_BYTES)?;
-            let mut result = pages::Materialized {
-                query,
-                size: worker.key.page_size,
-                data,
-                offsets: BTreeMap::new(),
-                cursors: BTreeMap::new(),
-            };
-            for offset in
-                (usize::from(result.size)..result.data.rows.len()).step_by(usize::from(result.size))
-            {
-                worker.deadline()?;
-                let cursor = PageCursor { token: random()? };
-                if result.offsets.insert(cursor.clone(), offset).is_some() {
-                    return Err(Error::Unknown);
-                }
-                result.cursors.insert(offset, cursor);
-            }
-            for offset in (0..result.data.rows.len().max(1)).step_by(usize::from(result.size)) {
-                worker.deadline()?;
-                let reply = Reply::FetchLocalQueryJob {
-                    job: worker.handle.clone(),
-                    query: result.query.clone(),
-                    cursor: result.cursors.get(&offset).cloned(),
-                    page_size: result.size,
-                    version,
-                    page: result.page(offset),
-                };
-                // Ready is transport-independent: retain the logical envelope
-                // check and also preflight every typed page before publication.
-                local::preflight(&binding, reply.clone())?;
-                grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply)?, &binding)?;
-                // All public transports must deliver every page before Ready.
-                // JSON escaping can expand a page beyond its protobuf size.
-                http_codec::encode(&Ok(reply))?;
-            }
-            worker.deadline()?;
-            Ok(Arc::new(result))
+            seal_result(&worker, &binding, version, rows)
         })
         .await
         .map_err(|_| Error::Unknown)??;
@@ -882,6 +887,77 @@ mod tests {
             offsets: BTreeMap::new(),
             cursors: BTreeMap::new(),
         }));
+    }
+    #[test]
+    fn http_only_page_overflow_fails_sealing_without_publishing_ready() {
+        use crate::remote::query::QualifiedElement;
+        use d2_raft::transaction_decisions::Member;
+        let pool = Arc::new(Semaphore::new(1));
+        let mut job = fixture(pool.clone(), Instant::now());
+        let mutable = Arc::get_mut(&mut job).unwrap();
+        mutable.key.query.text = "g.V(1).out('reports_to').values('name')".into();
+        mutable.key.page_size = MAX_PAGE_SIZE;
+        let binding = Binding {
+            authority: Authority { shard: 9, mode: [9; 16] },
+            cohort: Cohort {
+                profile: Default::default(), coordinator_shard: 9, coordinator_epoch: 1,
+                members: vec![Member { shard: 7, epoch: 1, mode: [7; 16] }],
+            },
+            mapping: Mapping::PartitionEqualsShardV1,
+        };
+        // Many scalar envelopes make public JSON larger than the logical JSON
+        // envelope. Find the first failing text length, rather than depending on
+        // a hand-counted serialization overhead that changes with the schema.
+        let make_reply = |length: usize| Reply::FetchLocalQueryJob {
+            job: job.handle.clone(), query: job.key.query.clone(), cursor: None,
+            page_size: MAX_PAGE_SIZE, version: 7,
+            page: QueryPage {
+                data: QueryData {
+                    rows: vec![QueryRow::Value {
+                        source: Some(QualifiedElement::Vertex { partition: 7, id: 1 }),
+                        value: Value::Text("x".repeat(length)),
+                    }; usize::from(MAX_PAGE_SIZE)],
+                    completeness: QueryCompleteness::Unverified,
+                },
+                next: None, offset: 0, total: u32::from(MAX_PAGE_SIZE),
+            },
+        };
+        let mut low = 0;
+        let mut high = MAX_RESPONSE_BYTES / usize::from(MAX_PAGE_SIZE) + 1;
+        assert!(http_codec::encode(&Ok(make_reply(low))).is_ok());
+        assert_eq!(http_codec::encode(&Ok(make_reply(high))).err(), Some(Error::Capacity));
+        while low + 1 < high {
+            let mid = (low + high) / 2;
+            if http_codec::encode(&Ok(make_reply(mid))).is_ok() { low = mid; } else { high = mid; }
+        }
+        let reply = make_reply(high);
+        local::preflight(&binding, reply.clone()).unwrap();
+        grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply).unwrap(), &binding).unwrap();
+        assert_eq!(http_codec::encode(&Ok(reply.clone())).err(), Some(Error::Capacity));
+        let Reply::FetchLocalQueryJob { page, .. } = reply else { unreachable!() };
+        encode(&page.data, pages::MAX_RESULT_BYTES).unwrap();
+        assert!(query::valid_traversal_output(&job.key.query, &page.data, &binding));
+        {
+            let mut inner = job.inner.lock().unwrap();
+            inner.life.captured(Instant::now()).unwrap();
+            inner.life.reads_finished(Instant::now()).unwrap();
+        }
+        assert_eq!(job.status(false).phase, JobPhase::Sealing);
+        // Exercise the production sealing helper and the worker's terminal
+        // failure path, not merely the HTTP codec in isolation.
+        let error = seal_result(&job, &binding, 7, page.data.rows).err().unwrap();
+        assert_eq!(error, Error::Capacity);
+        job.fail(error);
+        let status = job.status(false);
+        assert_eq!(status.phase, JobPhase::Failed);
+        assert_eq!(status.failure, Some(Error::Capacity));
+        assert_eq!(status.version, None);
+        assert_eq!(status.total, None);
+        assert!(job.inner.lock().unwrap().result.is_none());
+        assert_eq!(job.live_ready(), Err(Error::SessionUnavailable));
+        assert_eq!(pool.available_permits(), 0);
+        drop(job);
+        assert_eq!(pool.available_permits(), 1);
     }
     #[test]
     fn terminal_records_drop_payload_but_keep_shared_slot_until_forgotten() {

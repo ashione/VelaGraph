@@ -434,7 +434,9 @@ pub(super) fn decode(path: &str, input: &[u8]) -> Result<Operation> {
             let version = match r.read {
                 ReadSelector::Latest {} => None,
                 ReadSelector::Exact { version } => Some(uint(&version)?),
-                ReadSelector::Minimum { .. } => return Err(Error::Query(QueryFailure::Unsupported)),
+                ReadSelector::Minimum { .. } => {
+                    return Err(Error::Query(QueryFailure::Unsupported))
+                }
             };
             let operation_id = unhex(&r.operation_id)?;
             if operation_id == [0; 16] || !(1..=MAX_PAGE_SIZE).contains(&r.page_size) {
@@ -469,7 +471,10 @@ pub(super) fn decode(path: &str, input: &[u8]) -> Result<Operation> {
             Operation::FetchLocalQueryJob {
                 job: r.job.domain()?,
                 query: r.query.domain()?,
-                cursor: r.cursor.map(|s| Ok::<_, Error>(PageCursor { token: unhex(&s)? })).transpose()?,
+                cursor: r
+                    .cursor
+                    .map(|s| Ok::<_, Error>(PageCursor { token: unhex(&s)? }))
+                    .transpose()?,
                 page_size: r.page_size,
             }
         }
@@ -595,7 +600,10 @@ fn job_status(s: &JobStatus) -> Json {
 }
 fn reply(r: &Reply) -> Result<Json> {
     Ok(match r {
-        Reply::StartLocalQueryJob { operation_id, job: j } => {
+        Reply::StartLocalQueryJob {
+            operation_id,
+            job: j,
+        } => {
             json!({"type":"job_started","operation_id":hex(operation_id),"job":job(j)})
         }
         Reply::GetLocalQueryJob { job: j, status } => {
@@ -607,7 +615,14 @@ fn reply(r: &Reply) -> Result<Json> {
         Reply::RenewLocalQueryJob { job: j, grant } => {
             json!({"type":"job_renewed","job":job(j),"grant":{"generation":grant.generation.to_string(),"remaining_millis":grant.remaining_millis}})
         }
-        Reply::FetchLocalQueryJob { job: j, query: q, cursor, page_size, version, page: p } => {
+        Reply::FetchLocalQueryJob {
+            job: j,
+            query: q,
+            cursor,
+            page_size,
+            version,
+            page: p,
+        } => {
             json!({"type":"job_page","job":job(j),"query":query(q),"cursor":cursor.as_ref().map(|c|hex(&c.token)),"page_size":page_size,"version":version.to_string(),"page":page(p)?})
         }
         Reply::Write {
@@ -717,25 +732,51 @@ mod tests {
             "policy":{"idle_millis":1000,"execution_millis":1000,"lifetime_millis":2000}
         });
         let parse = |v: &Json| decode("/preview1/jobs:start", &serde_json::to_vec(v).unwrap());
-        assert!(matches!(parse(&start).unwrap(), Operation::StartLocalQueryJob { version:Some(0), operation_id, .. } if operation_id == [1; 16]));
+        assert!(
+            matches!(parse(&start).unwrap(), Operation::StartLocalQueryJob { version:Some(0), operation_id, .. } if operation_id == [1; 16])
+        );
         let mut latest = start.clone();
         latest["read"] = json!({"type":"latest"});
-        assert!(matches!(parse(&latest).unwrap(), Operation::StartLocalQueryJob { version:None, .. }));
+        assert!(matches!(
+            parse(&latest).unwrap(),
+            Operation::StartLocalQueryJob { version: None, .. }
+        ));
         let mut minimum = start.clone();
         minimum["read"]["type"] = json!("minimum");
-        assert_eq!(parse(&minimum).unwrap_err(), Error::Query(QueryFailure::Unsupported));
+        assert_eq!(
+            parse(&minimum).unwrap_err(),
+            Error::Query(QueryFailure::Unsupported)
+        );
         for path in ["/preview1/jobs:get", "/preview1/jobs:cancel"] {
             let body = json!({"job":{"incarnation":"01010101010101010101010101010101","token":"02".repeat(32)}});
             assert!(decode(path, &serde_json::to_vec(&body).unwrap()).is_ok());
             let mut extra = body;
             extra["job"]["unexpected"] = json!(true);
-            assert_eq!(decode(path, &serde_json::to_vec(&extra).unwrap()).unwrap_err(), Error::Protocol);
+            assert_eq!(
+                decode(path, &serde_json::to_vec(&extra).unwrap()).unwrap_err(),
+                Error::Protocol
+            );
         }
         let renewal = json!({"job":{"incarnation":"01".repeat(16),"token":"02".repeat(32)},"expected_generation":u64::MAX.to_string()});
-        assert!(matches!(decode("/preview1/jobs:renew", &serde_json::to_vec(&renewal).unwrap()).unwrap(), Operation::RenewLocalQueryJob { expected_generation:u64::MAX, .. }));
+        assert!(matches!(
+            decode(
+                "/preview1/jobs:renew",
+                &serde_json::to_vec(&renewal).unwrap()
+            )
+            .unwrap(),
+            Operation::RenewLocalQueryJob {
+                expected_generation: u64::MAX,
+                ..
+            }
+        ));
         let bytes = serde_json::to_vec(&start).unwrap();
-        let duplicate = String::from_utf8(bytes).unwrap().replace("\"page_size\":1", "\"page_size\":1,\"page_size\":2");
-        assert_eq!(decode("/preview1/jobs:start", duplicate.as_bytes()).unwrap_err(), Error::Protocol);
+        let duplicate = String::from_utf8(bytes)
+            .unwrap()
+            .replace("\"page_size\":1", "\"page_size\":1,\"page_size\":2");
+        assert_eq!(
+            decode("/preview1/jobs:start", duplicate.as_bytes()).unwrap_err(),
+            Error::Protocol
+        );
         let mut bad_policy = start.clone();
         bad_policy["policy"]["surprise"] = json!(1);
         assert_eq!(parse(&bad_policy).unwrap_err(), Error::Protocol);
@@ -745,22 +786,78 @@ mod tests {
     }
     #[test]
     fn job_status_and_page_keep_failure_and_large_versions() {
-        let status = JobStatus { phase: JobPhase::Failed, version: None, total: None, failure: Some(Error::Query(QueryFailure::Timeout)) };
-        let j = JobHandle { incarnation: [1;16], token: [2;32] };
-        let (_, bytes) = encode(&Ok(Reply::GetLocalQueryJob { job:j.clone(), status })).unwrap();
+        let status = JobStatus {
+            phase: JobPhase::Failed,
+            version: None,
+            total: None,
+            failure: Some(Error::Query(QueryFailure::Timeout)),
+        };
+        let j = JobHandle {
+            incarnation: [1; 16],
+            token: [2; 32],
+        };
+        let (_, bytes) = encode(&Ok(Reply::GetLocalQueryJob {
+            job: j.clone(),
+            status,
+        }))
+        .unwrap();
         let output: Json = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(output["result"]["status"]["phase"], "failed");
-        assert_eq!(output["result"]["status"]["failure"]["code"], "query_deadline");
+        assert_eq!(
+            output["result"]["status"]["failure"]["code"],
+            "query_deadline"
+        );
         assert!(output["result"]["status"]["version"].is_null());
-        let reply = Reply::FetchLocalQueryJob { job:j, query: Query {partition:7,text:"g.V(1)".into()}, cursor:None,page_size:1, version:u64::MAX,
-            page:QueryPage {data:QueryData {rows:vec![], completeness:QueryCompleteness::Unverified},next:None,offset:0,total:0} };
+        let reply = Reply::FetchLocalQueryJob {
+            job: j,
+            query: Query {
+                partition: 7,
+                text: "g.V(1)".into(),
+            },
+            cursor: None,
+            page_size: 1,
+            version: u64::MAX,
+            page: QueryPage {
+                data: QueryData {
+                    rows: vec![],
+                    completeness: QueryCompleteness::Unverified,
+                },
+                next: None,
+                offset: 0,
+                total: 0,
+            },
+        };
         let (_, bytes) = encode(&Ok(reply.clone())).unwrap();
         let output: Json = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(output["result"]["version"], u64::MAX.to_string());
-        let Reply::FetchLocalQueryJob { mut page, job, query, cursor, page_size, version } = reply else { unreachable!() };
-        page.data.rows.push(QueryRow::Value { source:None,value:Value::Text("\0".repeat(MAX_RESPONSE_BYTES / 2)) });
+        let Reply::FetchLocalQueryJob {
+            mut page,
+            job,
+            query,
+            cursor,
+            page_size,
+            version,
+        } = reply
+        else {
+            unreachable!()
+        };
+        page.data.rows.push(QueryRow::Value {
+            source: None,
+            value: Value::Text("\0".repeat(MAX_RESPONSE_BYTES / 2)),
+        });
         page.total = 1;
-        assert_eq!(encode(&Ok(Reply::FetchLocalQueryJob {job,query,cursor,page_size,version,page})).unwrap_err(), Error::Capacity);
+        assert_eq!(
+            encode(&Ok(Reply::FetchLocalQueryJob {
+                job,
+                query,
+                cursor,
+                page_size,
+                version,
+                page
+            }))
+            .unwrap_err(),
+            Error::Capacity
+        );
     }
     const OPEN: &str = r#"{"read":{"type":"exact","version":"0"},"ttl_millis":1000,"query":{"partition":1,"text":"g.V().count()"},"page_size":5}"#;
     #[test]

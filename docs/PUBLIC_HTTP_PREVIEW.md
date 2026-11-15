@@ -131,7 +131,7 @@ writes or imply a distributed transaction abort.
 
 ## Verification boundary
 
-Focused tests exercise real loopback HTTP with the same managed gateway as TCP,
+Focused tests exercise real loopback HTTP with the same managed gateway as gRPC,
 strict codecs and delivery/admission ownership. These are not multi-machine
 benchmarks, global restore tests or release-gate evidence. The separate [dual-protocol process test](PUBLIC_SERVICE_CLI.md) adds actual
 independent processes and cross-protocol semantics. Clean startup packaging and exact CI/release checks remain required before
@@ -167,6 +167,10 @@ Get/Cancel take `{"job":{...}}` and return `job_status`/`job_cancelled` with
 `sealing`, `ready`, `cancelled`, `expired`, `failed`. Version is a decimal string
 or null, total is an integer or null, and failure is null or `{"code":...}`
 using the same error table as request errors. No intermediate rows are exposed.
+Malformed HTTP hex is invalid_argument (400), while the protobuf bytes codec may
+classify malformed lengths as identity mismatch; valid-but-wrong identities
+retain the shared domain errors. Representation validation is not a promise of
+one-to-one transport status codes.
 
 Renew takes `job` and decimal-string `expected_generation`. Its `job_renewed`
 reply includes `grant={generation,remaining_millis}`; generation is a decimal
