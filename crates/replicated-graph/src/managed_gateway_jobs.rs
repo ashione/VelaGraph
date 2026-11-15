@@ -898,7 +898,8 @@ mod tests {
         let pool = Arc::new(Semaphore::new(1));
         let mut job = fixture(pool.clone(), Instant::now());
         let mutable = Arc::get_mut(&mut job).unwrap();
-        mutable.key.query.text = "g.V(1).out('reports_to').values('name')".into();
+        // Explicit limit admits all 1,000 fixture rows; the implicit query limit is smaller.
+        mutable.key.query.text = "g.V(1).out('reports_to').values('name').limit(1000)".into();
         mutable.key.page_size = MAX_PAGE_SIZE;
         let binding = Binding {
             authority: Authority {
