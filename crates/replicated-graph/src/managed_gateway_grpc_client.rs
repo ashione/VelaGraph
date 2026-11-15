@@ -74,9 +74,46 @@ fn remote_error(status: tonic::Status, expected: &pb::CallIdentity) -> Error {
     error
 }
 
-pub(super) async fn request(
+/// An owned, clonable public gRPC client pinned to one endpoint and binding.
+///
+/// Clones share one lazily connected channel. Connection setup, queueing and the
+/// RPC all consume the caller's original deadline and global client admission.
+/// No RPC is retried and no alternate endpoint is selected. Transport reconnect
+/// may establish a new socket to the same address; every response still verifies
+/// the binding/correlation identity, and old session/job tokens remain tied to
+/// their server incarnation. This is not authenticated discovery or failover.
+#[derive(Clone)]
+pub struct GatewayClient {
+    inner: Arc<ClientState>,
+}
+struct ClientState {
     address: SocketAddr,
     binding: Binding,
+    channel: tokio::sync::OnceCell<Channel>,
+}
+impl GatewayClient {
+    /// Construct a client without network I/O. A Tokio runtime is needed only
+    /// when a request is performed. Dropping the final clone releases the cached
+    /// channel; no process-global endpoint registry is retained.
+    pub fn new(address: SocketAddr, binding: Binding) -> Self {
+        Self {
+            inner: Arc::new(ClientState {
+                address,
+                binding,
+                channel: tokio::sync::OnceCell::new(),
+            }),
+        }
+    }
+
+    /// Perform one operation without retry. Unknown write outcomes require
+    /// explicit original-ID recovery, never automatic mutation replay.
+    pub async fn request(&self, operation: Operation, deadline: Duration) -> Result<Reply> {
+        request(self, operation, deadline).await
+    }
+}
+
+async fn request(
+    client: &GatewayClient,
     operation: Operation,
     deadline: Duration,
 ) -> Result<Reply> {
@@ -86,6 +123,7 @@ pub(super) async fn request(
         .try_acquire()
         .map_err(|_| Error::Capacity)?;
     let end = Instant::now() + deadline;
+    let binding = client.inner.binding.clone();
     let request_id = random()?;
     let expected = pb::CallIdentity {
         request_id: request_id.to_vec(),
@@ -101,16 +139,28 @@ pub(super) async fn request(
         // Preserve the original logical request envelope budget before opening
         // a socket. Protobuf compression is not permission to expand admission.
         encode(&original, MAX_REQUEST_BYTES)?;
-        let endpoint = Channel::from_shared(format!("http://{address}"))
-            .map_err(|_| Error::Protocol)?
-            .connect_timeout(remaining(end)?)
-            .buffer_size(MAX_CONNECTIONS)
-            .concurrency_limit(MAX_CONNECTIONS);
-        // Keep the transport state machine off the caller's stack, including
-        // callers that await this operation inside large integration workflows.
-        let channel = Box::pin(endpoint.connect())
-            .await
-            .map_err(|_| Error::Unknown)?;
+        // OnceCell serializes cold connection establishment among clones without
+        // holding a synchronous mutex across await. Failure/cancellation leaves
+        // it empty, so a later explicit operation may establish the connection.
+        // The request timeout includes waiting for this single-flight setup.
+        let channel = client
+            .inner
+            .channel
+            .get_or_try_init(|| async {
+                let endpoint = Channel::from_shared(format!("http://{}", client.inner.address))
+                    .map_err(|_| Error::Protocol)?
+                    // Do not freeze the first caller's shorter budget into all
+                    // later reconnects. The outer absolute deadline bounds each
+                    // call; this separately bounds transport connection work.
+                    .connect_timeout(MAX_DEADLINE)
+                    .buffer_size(MAX_CONNECTIONS)
+                    .concurrency_limit(MAX_CONNECTIONS);
+                Box::pin(endpoint.connect())
+                    .await
+                    .map_err(|_| Error::Unknown)
+            })
+            .await?
+            .clone();
         let mut writes = pb::write_service_client::WriteServiceClient::new(channel.clone())
             .max_encoding_message_size(MAX_REQUEST_BYTES)
             .max_decoding_message_size(MAX_RESPONSE_BYTES);

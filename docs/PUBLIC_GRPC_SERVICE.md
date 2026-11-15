@@ -192,6 +192,10 @@ placement/correlation validation, not authentication. Old version-1 generated
 clients omit identity and retain their existing contract. An older server rejects
 version 2 instead of silently accepting a request without its required binding.
 
+Use [`GatewayClient`](GATEWAY_CLIENT_CHANNEL.md) to reuse one bounded channel
+across calls/clones pinned to an address and binding. The free `request` helper
+remains one-shot. Neither retries failed RPCs or substitutes another endpoint.
+
 One client admission permit covers connection setup, encoding, dispatch and
 validation within the original absolute deadline. A timeout or lost response is
 Unknown, not Abort: inspect/recover the original external ID and exact command.
