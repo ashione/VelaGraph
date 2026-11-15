@@ -202,6 +202,11 @@ async fn handle(
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Probe {}
+            // Serde's empty named struct also accepts an empty sequence.
+            // Require an object at the boundary; serde still validates all JSON.
+            if !bytes.trim_ascii_start().starts_with(b"{") {
+                return Err(Error::Protocol);
+            }
             let _: Probe = serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)?;
             let version = state.probe_readiness(work, end).await?;
             before_deadline(end)?;

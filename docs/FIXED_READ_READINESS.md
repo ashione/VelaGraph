@@ -61,7 +61,8 @@ unbounded queue. Operators must choose a low probe frequency and back off on
 failures, not have every client repeatedly capture the entire cohort.
 
 Acquisition respects the original request deadline. Known acquired node sessions
-are closed after success/failure, including cancellation cleanup. Teardown has
+receive bounded best-effort close attempts after success/failure, including
+cancellation cleanup. Failed close RPCs also rely on node TTL. Teardown has
 its own bounded cleanup budget and holds admission while it runs; it does not
 extend the caller's acquisition deadline. An Open reply lost before a trustworthy
 descriptor reaches the gateway cannot be explicitly closed and expires by its
@@ -78,7 +79,7 @@ production-readiness certificate, automatic load balancing or failover.
 
 `public_service_process::fixed_readiness_observes_graph_listener_failure` uses
 three real managed-node processes and a separate service process. It checks HTTP
-and gRPC at V0 and after a committed write, rejects an unknown HTTP request field,
+and gRPC at V0 and after a committed write, rejects unknown fields and non-object HTTP bodies,
 then stops only one node's graph listeners while keeping its managed control/Raft
 process alive. The committed write status remains accessible but both probes
 must fail. This is local multi-process evidence, not multi-host deployment or

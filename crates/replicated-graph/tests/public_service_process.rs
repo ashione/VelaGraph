@@ -746,6 +746,10 @@ async fn fixed_readiness_observes_graph_listener_failure() -> anyhow::Result<()>
     )
     .await?;
     assert_eq!(status, 400, "readiness must not accept a query");
+    for invalid in [json!([]), json!(null), json!(true), json!("{}")] {
+        let (status, body) = post(service.address, "/preview1/readiness", invalid.clone()).await?;
+        assert_eq!(status, 400, "non-object readiness body {invalid}: {body}");
+    }
 
     let expected_identity = pb::CallIdentity {
         request_id: vec![42; 16],
