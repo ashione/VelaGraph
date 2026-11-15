@@ -557,6 +557,9 @@ impl State {
                 // check and also preflight every typed page before publication.
                 local::preflight(&binding, reply.clone())?;
                 grpc_codec::preflight_identity(grpc_codec::encode_job_fetch(&reply)?, &binding)?;
+                // All public transports must deliver every page before Ready.
+                // JSON escaping can expand a page beyond its protobuf size.
+                http_codec::encode(&Ok(reply))?;
             }
             worker.deadline()?;
             Ok(Arc::new(result))

@@ -83,8 +83,8 @@ requests never recapture latest automatically.
 All methods share the original Invocation/admission/deadline and response
 ownership machinery. Fixed snapshot acquisition, retained results and individual
 messages keep their existing capacity limits. This is not a data-local scaling
-improvement. HTTP parity for this additional service and for the asynchronous
-managed job service remains future work; typed job RPCs are described below.
+improvement. HTTP parity for this FixedSession service remains future work. Managed jobs now
+also expose the five lifecycle actions through the shared [HTTP preview](PUBLIC_HTTP_PREVIEW.md#managed-asynchronous-jobs); typed job RPCs are described below.
 The library Gateway now binds this typed service instead of JSON/TCP; #218
 remains open for cross-language, compatibility and service-surface evidence;
 graph library transport retirement is complete in #279.

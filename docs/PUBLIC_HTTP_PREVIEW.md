@@ -26,7 +26,7 @@ restore READY certificate, availability promise or proof that the next request
 can obtain a certified view. Every business operation retains its existing
 identity/certification checks. A stopping gateway rejects new work.
 
-Both HTTP and legacy managed TCP share the same eight admission slots, retained
+Both HTTP and typed managed gRPC share the same eight admission slots, retained
 query budgets and submit serialization. The first HTTP implementation accepts
 one request per connection (`Connection: close` behavior); persistent HTTP client
 connections are not advertised. The separate typed public gRPC adapter is now
@@ -60,6 +60,11 @@ layer. No stable v1 client compatibility is promised here.
 | `/preview1/queries:open` | read selector, ttl_millis, query, page_size |
 | `/preview1/queries:fetch` | session, identical query, cursor, identical page_size |
 | `/preview1/queries:close` | session |
+| `/preview1/jobs:start` | operation_id, read, query, page_size, policy |
+| `/preview1/jobs:get` | job |
+| `/preview1/jobs:renew` | job, expected_generation |
+| `/preview1/jobs:fetch` | job, identical query, cursor, identical page_size |
+| `/preview1/jobs:cancel` | job |
 
 Example vertex write body:
 
@@ -132,3 +137,55 @@ benchmarks, global restore tests or release-gate evidence. The separate [dual-pr
 independent processes and cross-protocol semantics. Clean startup packaging and exact CI/release checks remain required before
 v0.0.1; the finite preview feature/compatibility matrix must be explicit. Test results must be read from
 the exact submitted commit rather than inferred from this document.
+
+
+## Managed asynchronous jobs
+
+The five `/preview1/jobs:*` actions reuse the same managed jobs as public gRPC;
+they are not a second executor. This closes the preview job lifecycle only.
+FixedSession HTTP parity and a stable HTTP v1 schema remain unfinished under
+[#218](https://github.com/ashione/VelaGraph/issues/218).
+
+Start example:
+
+```json
+{"operation_id":"01010101010101010101010101010101","read":{"type":"latest"},"query":{"partition":7,"text":"g.V(1,2)"},"page_size":1,"policy":{"idle_millis":10000,"execution_millis":10000,"lifetime_millis":30000}}
+```
+
+`read` accepts latest or exact (including exact `"0"`); minimum-version job
+admission is unsupported and returns `query_unsupported`, never downgraded to
+latest. Durations have the existing job-policy limits. Start returns
+`type=job_started`, the original operation_id and `job={incarnation,token}`
+(lowercase hex, 16/32 bytes). Accepted is not Ready and contains no rows.
+Exact repeated Start reuses the existing job; changed arguments with the same
+operation ID conflict. A lost HTTP response does not cancel an admitted job;
+recover with the same operation ID and exact arguments, never generate a new ID
+as an automatic retry. Jobs remain process-local and restart invalidates them.
+
+Get/Cancel take `{"job":{...}}` and return `job_status`/`job_cancelled` with
+`status={phase,version,total,failure}`. Phases are `capturing`, `running`,
+`sealing`, `ready`, `cancelled`, `expired`, `failed`. Version is a decimal string
+or null, total is an integer or null, and failure is null or `{"code":...}`
+using the same error table as request errors. No intermediate rows are exposed.
+
+Renew takes `job` and decimal-string `expected_generation`. Its `job_renewed`
+reply includes `grant={generation,remaining_millis}`; generation is a decimal
+string. Anchor remaining milliseconds at the request's send time. An exact
+renewal replay does not extend expiry. Renewal does not extend the execution or
+hard lifetime, and polling/fetching does not renew the lease.
+
+Fetch takes `job`, the identical query/page_size, and optional lowercase-hex
+cursor (null for the first page). `job_page` echoes these fields and returns
+one fixed decimal-string `version` and the existing typed `page`. HTTP and gRPC
+handles/cursors are interchangeable only at the same owning gateway. Fetch
+before Ready returns `job_busy`; cancelled/expired/restarted handles cannot
+silently obtain a new V. Cancel uses the existing idempotent cancellation rules.
+
+Every immutable page is checked against both protobuf and HTTP JSON output
+limits before Ready, including JSON escaping expansion. A result too large for
+one public representation fails with resource exhaustion rather than becoming
+Ready with undeliverable later pages. The existing retained reservation remains
+owned through HTTP encode and socket delivery. Job methods cap the remaining
+request budget at five seconds, independently of the job execution/lease budget;
+there is no fresh per-phase timeout. All existing shared admission and loopback
+restrictions remain in force.

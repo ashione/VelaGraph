@@ -12,7 +12,7 @@ Audited against main [40e2b9a](https://github.com/ashione/VelaGraph/commit/40e2b
 | Observed coordinator | `remote/distributed/mod.rs:946–972` uses typed service/client | Observed consistency is unchanged; it is not managed fixed-V consistency |
 | Gateway library | `managed_gateway.rs:1235–1250,1367` uses public typed service/client | Identified v2 library context; original public v1 remains separate |
 | Public service | `managed_gateway_grpc.rs:565–604` registers Write, Query, FixedSession and ManagedQueryJob only | No internal Raft/restore/participant service is registered on this listener |
-| Public HTTP | Hyper adapter, six preview write/query operations | Intentional external HTTP, not a legacy inter-node transport |
+| Public HTTP | Hyper adapter, preview write/query and managed-job operations | Intentional external HTTP, not a legacy inter-node transport |
 
 Production paths do not select or sniff a second JSON/TCP wire. Retired-wire rejection fixtures, cfg(test) frame helpers, HTTP listeners, in-process calls, storage I/O and object-store HTTP are not evidence of a production fallback.
 
@@ -36,7 +36,7 @@ A passing later run does not identify the cause of earlier generic Unavailable f
 
 1. **Generated Go interoperability:** this baseline contains no .go/go.mod or Go CI. Test the real Rust service with generated Go clients, write IDs/replay, typed values/presence, paging/fixed V, deadlines and public/internal isolation. Rust-to-Rust tests are not this evidence.
 2. **Cross-language error details:** public codecs currently place custom ErrorDetail bytes in tonic Status::with_details (managed_gateway_grpc_codec.rs:487–495,1588–1595). Compatibility with standard rich-status clients must be verified; do not silently discard machine-readable detail to obtain a green smoke test.
-3. **HTTP surface:** the preview adapter supports Submit/Status/Abort and Open/Fetch/Close only (managed_gateway_http_codec.rs:389–442). FixedSession and ManagedQueryJob HTTP parity and a stable HTTP contract are not delivered.
+3. **HTTP surface:** the preview adapter supports Submit/Status/Abort, Open/Fetch/Close and managed-job Start/Get/Renew/Fetch/Cancel through shared handlers. FixedSession HTTP parity and a stable HTTP contract are not delivered.
 4. **Version/upgrade matrix:** existing services reject unsupported versions and old wire; Raft does not support a mixed JSON/gRPC cluster. This is not rolling-upgrade compatibility or an implemented online restart/recovery plan.
 5. **Resource/performance evidence:** retain application admission, budgets and unknown write outcomes. Existing Metadata microbenchmarks are not end-to-end cold/warm, p50/p95/p99, CPU/RSS/network or multi-host scaling evidence.
 6. **Service readiness:** trusted/loopback preview is intentional. #221/#222 routing/ownership/readiness and recovery/security/product gates remain distinct.
