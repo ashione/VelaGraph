@@ -7,6 +7,10 @@ public production gateway, global restore controller or the final
 v0.0.1 release. Both adapters share one managed gateway and its original
 canonical commands, query sessions and resource budgets.
 
+For a fresh loopback demonstration that creates its own isolated cohort, use the
+[managed-service demo](MANAGED_SERVICE_DEMO.md). That fresh-only launcher is not
+an activation or restore mode of this service host.
+
 ## Prerequisite and command
 
 The coordinator and all configured members must already be live, activated and
