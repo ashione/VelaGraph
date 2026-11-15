@@ -20,10 +20,18 @@ pub struct HttpService {
     address: SocketAddr,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    drain: Arc<Drain>,
 }
 impl HttpService {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+    /// Stop new requests immediately and allow already admitted requests to finish
+    /// within this grace period and their original deadlines. Does not migrate sessions.
+    pub fn begin_drain(&self, grace: Duration) -> Result<()> {
+        self.drain.begin(grace)?;
+        let _ = self.stop.send(true);
+        Ok(())
     }
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
@@ -35,6 +43,9 @@ impl HttpService {
 impl Drop for HttpService {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -53,6 +64,8 @@ pub(super) async fn bind(
     let listener = TcpListener::bind(bind).await.map_err(|_| Error::Unknown)?;
     let address = listener.local_addr().map_err(|_| Error::Unknown)?;
     let (stop, mut stopped) = watch::channel(false);
+    let drain = Arc::new(Drain::default());
+    let draining = drain.clone();
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         loop {
@@ -69,6 +82,7 @@ pub(super) async fn bind(
                 continue;
             };
             let state = state.clone();
+            let request_drain = draining.clone();
             let end = Instant::now() + deadline;
             connections.spawn(async move {
                 let work = Arc::new(permit);
@@ -83,6 +97,7 @@ pub(super) async fn bind(
                         end,
                         response_delivery.clone(),
                         budget.clone(),
+                        request_drain.clone(),
                     )
                 });
                 let connection = hyper::server::conn::http1::Builder::new()
@@ -103,6 +118,13 @@ pub(super) async fn bind(
                 // Existing sessions and uncertain durable writes are not undone.
             });
         }
+        drop(listener);
+        if let Some(end) = draining.end().filter(|_| !*gateway_stop.borrow()) {
+            let _ = tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
+                while connections.join_next().await.is_some() {}
+            })
+            .await;
+        }
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     });
@@ -110,6 +132,7 @@ pub(super) async fn bind(
         address,
         stop,
         task: Some(task),
+        drain,
     })
 }
 
@@ -141,12 +164,14 @@ async fn handle(
     end: Instant,
     delivery: Delivery,
     budget: watch::Sender<Instant>,
+    drain: Arc<Drain>,
 ) -> std::result::Result<HttpResponse<Body>, Infallible> {
     // Admission was acquired before HTTP header/body parsing, and the entire
     // connection has a deadline. HTTP cannot allocate an independent queue.
-    if state
-        .jobs_stopping
-        .load(std::sync::atomic::Ordering::Acquire)
+    if !drain.admitting()
+        || state
+            .jobs_stopping
+            .load(std::sync::atomic::Ordering::Acquire)
     {
         return Ok(error_response(Error::Rejected));
     }

@@ -21,9 +21,11 @@ struct Options {
     http: SocketAddr,
     grpc: Option<SocketAddr>,
     timeout_ms: u64,
+    drain_timeout_ms: u64,
 }
 fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
     let (mut config, mut http, mut grpc, mut timeout_ms) = (None, None, None, None);
+    let mut drain_timeout_ms = None;
     let mut trusted = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -43,6 +45,13 @@ fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
                     args.next()
                         .context("--grpc needs an address")?
                         .parse::<SocketAddr>()?,
+                );
+            }
+            "--drain-timeout-ms" if drain_timeout_ms.is_none() => {
+                drain_timeout_ms = Some(
+                    args.next()
+                        .context("--drain-timeout-ms needs a value")?
+                        .parse::<u64>()?,
                 );
             }
             "--timeout-ms" if timeout_ms.is_none() => {
@@ -70,11 +79,17 @@ fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
         (1..=60_000).contains(&timeout_ms),
         "--timeout-ms must be 1..=60000"
     );
+    let drain_timeout_ms = drain_timeout_ms.unwrap_or(5_000);
+    anyhow::ensure!(
+        (1..=60_000).contains(&drain_timeout_ms),
+        "--drain-timeout-ms must be 1..=60000"
+    );
     Ok(Options {
         config: config.context("--config is required")?,
         http,
         grpc,
         timeout_ms,
+        drain_timeout_ms,
     })
 }
 #[derive(Deserialize)]
@@ -197,10 +212,18 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => shutdown_signal().await,
         Err(error) => Err(error),
     };
-    if let Some(grpc) = grpc {
-        grpc.shutdown().await;
+    // Fence both adapters before awaiting either one. This bounds the whole
+    // drain window rather than stacking one grace period per protocol.
+    let grace = Duration::from_millis(options.drain_timeout_ms);
+    http.begin_drain(grace)?;
+    if let Some(grpc) = &grpc {
+        grpc.begin_drain(grace)?;
     }
-    http.shutdown().await;
+    tokio::join!(http.shutdown(), async {
+        if let Some(grpc) = grpc {
+            grpc.shutdown().await;
+        }
+    });
     gateway.shutdown().await;
     result
 }
@@ -279,6 +302,9 @@ mod tests {
     #[test]
     fn repeated_flags_and_bad_budgets_reject() {
         for rest in [
+            vec!["--drain-timeout-ms", "0"],
+            vec!["--drain-timeout-ms", "60001"],
+            vec!["--drain-timeout-ms", "1", "--drain-timeout-ms", "1"],
             vec!["--timeout-ms", "0"],
             vec!["--timeout-ms", "60001"],
             vec!["--http", "127.0.0.1:1"],

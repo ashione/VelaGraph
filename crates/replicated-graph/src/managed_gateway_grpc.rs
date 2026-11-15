@@ -300,6 +300,7 @@ impl FixedSessionService for Handler {
 #[derive(Clone)]
 struct Admitted<S> {
     inner: S,
+    drain: Arc<Drain>,
     state: Arc<State>,
     deadline: Duration,
 }
@@ -325,6 +326,9 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
+        if !self.drain.admitting() {
+            return Box::pin(async { Ok(codec::error(Error::Rejected).into_http()) });
+        }
         let Ok(permit) = self.state.connections.clone().try_acquire_owned() else {
             return Box::pin(async { Ok(codec::error(Error::Capacity).into_http()) });
         };
@@ -493,6 +497,7 @@ pub struct GrpcService {
     address: SocketAddr,
     stop: watch::Sender<bool>,
     hard_stop: CancellationToken,
+    drain: Arc<Drain>,
     task: Option<JoinHandle<()>>,
     deadline: Duration,
 }
@@ -500,14 +505,25 @@ impl GrpcService {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
+    /// Fence new RPC admission and send GOAWAY, allowing admitted RPCs to finish
+    /// within the grace period and original deadlines. Sessions are not transferred.
+    pub fn begin_drain(&self, grace: Duration) -> Result<()> {
+        self.drain.begin(grace)?;
+        let _ = self.stop.send(true);
+        Ok(())
+    }
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
-        self.hard_stop.cancel();
+        let remaining = match self.drain.end() {
+            Some(end) => end.saturating_duration_since(Instant::now()),
+            None => {
+                self.hard_stop.cancel();
+                self.deadline
+            }
+        };
         if let Some(mut task) = self.task.take() {
-            if tokio::time::timeout(self.deadline, &mut task)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(remaining, &mut task).await.is_err() {
+                self.hard_stop.cancel();
                 task.abort();
                 let _ = task.await;
             }
@@ -535,6 +551,10 @@ pub(super) async fn bind(
     let (stop, mut stopped) = watch::channel(false);
     let hard_stop = CancellationToken::new();
     let cancellation = hard_stop.clone();
+    let drain = Arc::new(Drain::default());
+    let draining = drain.clone();
+    let mut bound_stop = stop.subscribe();
+    let mut bound_gateway = gateway_stop.clone();
     let task = tokio::spawn(async move {
         let connection_budget = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let connection_stop = cancellation.clone();
@@ -579,45 +599,68 @@ pub(super) async fn bind(
         let queries = QueryServiceServer::new(handler)
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
+        let bound_drain = draining.clone();
+        let bound_cancel = cancellation.clone();
+        let hard_limit = async move {
+            tokio::select! { _ = bound_stop.changed() => {}, _ = bound_gateway.changed() => {} }
+            if let Some(end) = bound_drain.end().filter(|_| !*bound_gateway.borrow()) {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(end)) => {},
+                    _ = bound_gateway.changed() => {},
+                }
+            }
+            bound_cancel.cancel();
+        };
+        let shutdown_drain = draining.clone();
         let shutdown = async move {
             tokio::select! {_=stopped.changed()=>{},_=gateway_stop.changed()=>{}}
-            cancellation.cancel();
+            if shutdown_drain.admitting() || *gateway_stop.borrow() {
+                cancellation.cancel();
+            }
         };
-        let _ = tonic::transport::Server::builder()
+        let server = tonic::transport::Server::builder()
             .timeout(deadline)
             .max_concurrent_streams(Some(MAX_CONNECTIONS as u32))
             .add_service(Admitted {
+                drain: draining.clone(),
                 inner: writes,
                 state: state.clone(),
                 deadline,
             })
             .add_service(Admitted {
+                drain: draining.clone(),
                 inner: fixed,
                 state: state.clone(),
                 deadline,
             })
             .add_service(Admitted {
+                drain: draining.clone(),
                 inner: jobs,
                 state: state.clone(),
                 deadline,
             })
             .add_service(Admitted {
+                drain: draining.clone(),
                 inner: readiness,
                 state: state.clone(),
                 deadline,
             })
             .add_service(Admitted {
+                drain: draining.clone(),
                 inner: queries,
                 state,
                 deadline,
             })
-            .serve_with_incoming_shutdown(incoming, shutdown)
-            .await;
+            .serve_with_incoming_shutdown(incoming, shutdown);
+        // Enforce the bound even if the owner calls begin_drain without awaiting
+        // shutdown. Closing the IO tokens also stops Tonic's spawned connections.
+        tokio::select! { _ = server => {}, _ = hard_limit => {} }
     });
     Ok(GrpcService {
         address,
         stop,
         hard_stop,
+        drain,
         task: Some(task),
         deadline,
     })

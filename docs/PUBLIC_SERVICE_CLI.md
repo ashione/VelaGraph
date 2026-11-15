@@ -47,8 +47,12 @@ checkpoint was loaded or that future requests cannot fail. It explicitly reports
 `restore_supported: false` and `production_ready: false`. The managed state lifecycle opens no compatibility TCP listener. Only the
 configured public HTTP and optional gRPC listeners are bound.
 
-Ctrl-C and, on Unix, SIGTERM trigger orderly gRPC, HTTP and managed-gateway
-shutdown.
+Ctrl-C and, on Unix, SIGTERM start bounded drain on both public listeners
+before waiting for admitted requests. `--drain-timeout-ms` (1..60000, default
+5000) bounds this phase; original request deadlines still apply. New requests
+are rejected and remaining work is cancelled at the deadline. The managed
+gateway is then shut down. See [drain semantics and client obligations](SERVICE_DRAIN.md);
+this is not session transfer or transparent rolling upgrade.
 A startup identity mismatch or listener failure exits nonzero without publishing
 a service announcement. No automatic restart, retry, graph reinitialization or
 cohort replacement is performed.

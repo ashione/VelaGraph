@@ -827,3 +827,169 @@ async fn fixed_readiness_observes_graph_listener_failure() -> anyhow::Result<()>
     service.graceful_stop().await?;
     Ok(())
 }
+
+/// A real HTTP/1 100-continue exchange is a barrier: the service has entered
+/// the request handler and polled its body before the termination signal.
+#[cfg(unix)]
+async fn admitted_partial_probe(address: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
+    admitted_partial_probe_with_timeout(address, 15000).await
+}
+#[cfg(unix)]
+async fn admitted_partial_probe_with_timeout(
+    address: SocketAddr,
+    timeout_ms: u64,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(address).await?;
+    socket.write_all(format!("POST /preview1/readiness HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nExpect: 100-continue\r\nConnection: close\r\nx-velagraph-timeout-ms: {timeout_ms}\r\n\r\n").as_bytes()).await?;
+    let mut interim = Vec::new();
+    tokio::time::timeout(BUDGET, async {
+        while !interim.ends_with(b"\r\n\r\n") {
+            anyhow::ensure!(interim.len() < 4096, "unexpected interim response");
+            interim.push(socket.read_u8().await?);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert_eq!(interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+    Ok(socket)
+}
+
+#[cfg(unix)]
+async fn wait_ingress_closed(service: &ServiceProcess) -> anyhow::Result<()> {
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            let http_closed = tokio::net::TcpStream::connect(service.address)
+                .await
+                .is_err();
+            let grpc_closed = tokio::net::TcpStream::connect(service.grpc).await.is_err();
+            if http_closed && grpc_closed {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// SIGTERM stops both ingress listeners while an admitted request finishes;
+/// a body that never arrives cannot hold process removal past the drain budget.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_drain_finishes_admitted_request_and_bounds_stalled_body() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("drain.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut other =
+        ServiceProcess::start(&config_path, directory.path().join("drain-other.stdout")).await?;
+    let mut owner = ServiceProcess::start_with_drain(
+        &config_path,
+        directory.path().join("drain-owner.stdout"),
+        5000,
+    )
+    .await?;
+    let mut admitted = admitted_partial_probe(owner.address).await?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(owner.child.id() as i32).context("owner pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    // Do not release the admitted request until both listeners have actually
+    // stopped accepting. This is not a sleep-based guess about signal delivery.
+    wait_ingress_closed(&owner).await?;
+    assert!(
+        owner.child.try_wait()?.is_none(),
+        "admitted request was aborted at drain start"
+    );
+    admitted.write_all(b"{}").await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(BUDGET, admitted.read_to_end(&mut response)).await??;
+    let split = response
+        .windows(4)
+        .position(|s| s == b"\r\n\r\n")
+        .context("response headers")?
+        + 4;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let body: Value = serde_json::from_slice(&response[split..])?;
+    assert_eq!(
+        body,
+        json!({"state":"fixed_session_read_captured","version":0,"profile":"parity2_mib_v1","restore_supported":false,"production_ready":false})
+    );
+    // Wait for the already signalled owner; do not send TERM a second time.
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Some(status) = owner.child.try_wait()? {
+                anyhow::ensure!(status.success(), "drained owner failed: {status}");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    let (status, live) = post(other.address, "/preview1/readiness", json!({})).await?;
+    assert_eq!(status, 200, "other ingress must survive removal: {live}");
+
+    let mut stalled = ServiceProcess::start_with_drain(
+        &config_path,
+        directory.path().join("drain-stalled.stdout"),
+        100,
+    )
+    .await?;
+    let _unfinished = admitted_partial_probe(stalled.address).await?;
+    let started = std::time::Instant::now();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(stalled.child.id() as i32).context("stalled pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    // A generous process/scheduler margin, still well below the 15s request
+    // timeout. The configured 100ms budget is not asserted as a real-time SLA.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = stalled.child.try_wait()? {
+                anyhow::ensure!(status.success(), "stalled drain failed: {status}");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("stalled request outlived bounded process drain")??;
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // The grace period cannot extend a shorter original caller deadline.
+    let mut short = ServiceProcess::start_with_drain(
+        &config_path,
+        directory.path().join("drain-short.stdout"),
+        5000,
+    )
+    .await?;
+    let _short_body = admitted_partial_probe_with_timeout(short.address, 1000).await?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(short.child.id() as i32).context("short pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(status) = short.child.try_wait()? {
+                anyhow::ensure!(status.success(), "short-deadline drain failed: {status}");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("drain extended original caller deadline")??;
+    other.graceful_stop().await?;
+    Ok(())
+}
