@@ -324,8 +324,14 @@ async fn scenario() -> anyhow::Result<()> {
     assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
     assert!(malformed.details().is_empty());
     // A correctly sized but unknown cursor reaches the shared domain handler.
+    let next_token = decode_hex(&first["page"]["next"]);
+    let mut unknown_token = vec![1; 32];
+    if unknown_token == next_token {
+        unknown_token[0] = 2;
+    }
+    assert_ne!(unknown_token, next_token);
     let mut unknown_cursor = fetch.clone();
-    unknown_cursor["cursor"] = json!("00".repeat(32));
+    unknown_cursor["cursor"] = json!(hex_bytes(&unknown_token));
     error(service.address, "fetch", unknown_cursor, 409, "identity_mismatch").await?;
     assert_reason(
         &jobs
@@ -333,7 +339,9 @@ async fn scenario() -> anyhow::Result<()> {
                 context: context(),
                 job: Some(typed_job.clone()),
                 query: start_proto(&start).query,
-                cursor: Some(pb::Cursor { token: vec![0; 32] }),
+                cursor: Some(pb::Cursor {
+                    token: unknown_token,
+                }),
                 page_size: 1,
             })
             .await
