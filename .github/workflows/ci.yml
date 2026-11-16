@@ -31,6 +31,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test controlled-comparison evidence validation
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s scripts -p 'test_managed_timing_compare.py'
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
