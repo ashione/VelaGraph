@@ -65,6 +65,11 @@ async fn actual_s3_checkpoint_transport() {
             .unwrap()
             .manifest_sha256
     );
+    let verified = remote.verify(&receipt).await.unwrap();
+    assert_eq!(
+        (verified.files, verified.bytes, verified.chunks),
+        (2, 16394, 18)
+    );
     let destination = dir.path().join("download");
     remote.download(&receipt, &destination).await.unwrap();
     for name in [
@@ -86,9 +91,11 @@ async fn actual_s3_checkpoint_transport() {
     let missing = dir.path().join("missing");
     assert!(remote.download(&receipt, &missing).await.is_err());
     assert!(!missing.join("checkpoint.json").exists());
+    assert!(remote.verify(&receipt).await.is_err());
     inner.put(&blob, "corrupt".into()).await.unwrap();
     let corrupt = dir.path().join("corrupt");
     assert!(remote.download(&receipt, &corrupt).await.is_err());
     assert!(!corrupt.join("checkpoint.json").exists());
+    assert!(remote.verify(&receipt).await.is_err());
     println!("real S3 race, chunk transfer, retry and corruption rejection passed; synthetic bytes, not RocksDB restore");
 }
