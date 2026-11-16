@@ -327,6 +327,8 @@ pub struct StateMachine {
     #[cfg(test)]
     member_verifications: AtomicU64,
     #[cfg(test)]
+    complete_history_loads: AtomicU64,
+    #[cfg(test)]
     history_status_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     storage: Option<Arc<StateMachineStorage>>,
@@ -533,6 +535,8 @@ impl StateMachine {
             #[cfg(test)]
             member_verifications: AtomicU64::new(0),
             #[cfg(test)]
+            complete_history_loads: AtomicU64::new(0),
+            #[cfg(test)]
             history_status_gate: Default::default(),
             current_snapshot: RwLock::new(current_snapshot),
             storage: Some(storage),
@@ -637,6 +641,8 @@ impl StateMachine {
             applied == state.last_applied_log,
             "state applied marker changed"
         );
+        #[cfg(test)]
+        self.complete_history_loads.fetch_add(1, Ordering::Relaxed);
         let loaded = state_codec::load(&storage.db, applied)?;
         match (&loaded, &state.d1) {
             (Some(loaded), Some(current)) => {
@@ -1181,7 +1187,8 @@ impl StateMachine {
         {
             return Err(D1Error::VisibilityHistory);
         }
-        self.decision_prefix(&state, d1, version)?;
+        // Reuse the complete authority already validated under this read lock.
+        self.decision_prefix(&state, history_state, version)?;
         Ok(visibility
             .journal
             .full()
@@ -1252,7 +1259,8 @@ impl StateMachine {
         {
             return Err(D1Error::VisibilityHistory);
         }
-        self.decision_prefix(&state, d1, version)?;
+        // Reuse the complete authority already validated under this read lock.
+        self.decision_prefix(&state, history_state, version)?;
         let snapshot = d1.read_at(version, limit)?;
         Ok((
             snapshot,
