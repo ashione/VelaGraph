@@ -10,15 +10,17 @@ use replicated_graph::managed_gateway::GatewayClient;
 let client = GatewayClient::new(address, binding);
 let shared = client.clone();
 let reply = shared.request(operation, deadline).await?;
+client.close(); // Terminal for every clone; transport cleanup is asynchronous.
 ```
 
 Construction performs no I/O. The first request lazily establishes a channel;
 clones share that channel and a single cold-connection initializer. Keep the
 client within the Tokio runtime that drives its transport. There is no global
-endpoint cache or background discovery. Drop all clones when the endpoint is no
-longer needed; an in-flight call may still own its channel until it completes or
-is cancelled. Idle channels occupy a server connection slot, so callers must
-bound their own set of client objects. Creating a client per operation defeats
+endpoint cache or background discovery. Call `close()` when the endpoint is no
+longer needed, including when a stalled peer retains admission leases. Dropping
+a clone alone is not an explicit transport shutdown; an in-flight call may still
+own its channel until it completes or is cancelled. Idle channels occupy a server
+connection slot, so callers must bound their own set of client objects. Creating a client per operation defeats
 reuse. The original free `managed_gateway::request` remains a one-shot helper
 using the same implementation, not a second protocol.
 
@@ -29,7 +31,7 @@ before connection work, encoding and dispatch. Cold-channel waiting, connect,
 HTTP/2 readiness, the RPC and response validation share the caller's original
 absolute deadline for waiting on a result. The endpoint buffer and transport concurrency stay bounded
 by the existing eight-call limit. A failed/cancelled initial connection does not
-poison the client: a later **explicit call** may try connection setup again. No
+poison an open client: a later **explicit call** may try connection setup again. No
 failed RPC is replayed by this client. A shared channel may still perform
 background transport reconnection after one caller times out, bounded separately
 by the transport connection timeout. The caller deadline bounds waiting for the
@@ -63,6 +65,22 @@ or retry. A failed write can have an unknown outcome; follow the
 external ID and exact command through the existing Status contract. Dropping a
 client or timing out an RPC is not a write rollback.
 
+## Explicit close
+
+`close()` is an idempotent, synchronous terminal cancellation signal shared by
+all clones. `is_closed()` exposes that terminal state. It cancels cold setup and
+existing transport I/O; it is not graceful draining. New calls return `Unknown`
+without connecting, and this client cannot be reopened. Pending calls also
+return conservatively as `Unknown`. Resource release follows asynchronous
+transport cleanup on the live Tokio runtime, not the return of `close()`. This
+includes bodies retaining admission leases behind a peer that never releases
+its HTTP/2 stream quota.
+
+Close does not retract already-sent writes, close server-side sessions, or prove
+that a write failed to execute. Use a separately, explicitly created client for
+Status recovery with the original external ID and exact command; do not replay
+a mutation merely because close interrupted its response.
+
 ## Acceptance boundary
 
 The connection regression uses the real public gRPC adapter through a counting
@@ -73,6 +91,12 @@ A single-stream HTTP/2 quota with acknowledged SETTINGS provides a real queued
 body barrier: repeated expired Submit calls must not reach full body dispatch
 after the quota is released. This controlled-peer test does not claim that a
 request already delivered to a real gateway can be cancelled or rolled back.
+Additional real-transport regressions close a quota-stalled connection without
+peer quota recovery and check that all eight admission permits return, exercise
+cold setup cancellation and repeated close across clones, and reject requests
+on a client closed before first use. A full decoded Submit body is also observed
+by a controlled peer before close: the interrupted caller gets `Unknown`, not
+proof of non-execution. That peer does not model durable commit.
 Record exact test results for the candidate before claiming this acceptance has
 passed. No multi-machine throughput, dynamic routing, automatic retry, HA or
 session migration is implied. Internal graph/member channels have their own
