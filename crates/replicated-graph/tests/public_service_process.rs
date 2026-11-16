@@ -1096,3 +1096,245 @@ async fn process_drain_finishes_admitted_request_and_bounds_stalled_body() -> an
     other.graceful_stop().await?;
     Ok(())
 }
+
+/// Public HTTP/gRPC cross-process admission with a three-voter coordinator.
+/// Raft peers share the node child process; DropPolicy is a test partition,
+/// NOT evidence of independent-host or independent-voter-process availability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_interfaces_fail_closed_without_coordinator_quorum_and_recover() -> anyhow::Result<()>
+{
+    let (mut coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start_with_quorum(9, true, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("quorum.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut service =
+        ServiceProcess::start(&config_path, directory.path().join("service.stdout")).await?;
+    let original = vertex(71, 7, "1");
+    let (status, baseline) =
+        post(service.address, "/preview1/writes:submit", original.clone()).await?;
+    assert_eq!(status, 200, "{baseline}");
+    let query = json!({"read":{"type":"minimum","version":"1"},"ttl_millis":60000,"query":{"partition":7,"text":"g.V(1,2,3).path()"},"page_size":10});
+    let (status, before) = post(service.address, "/preview1/queries:open", query.clone()).await?;
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(before["result"]["page"]["total"], 1);
+
+    fs::write(
+        coordinator._directory.path().join("isolate-quorum"),
+        b"isolate",
+    )?;
+    tokio::time::timeout(BUDGET, async {
+        while !coordinator
+            ._directory
+            .path()
+            .join("quorum-isolated")
+            .exists()
+        {
+            anyhow::ensure!(
+                coordinator.child.try_wait()?.is_none(),
+                "coordinator process exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    // No client/server budget is raised. The same ordinary public requests must
+    // not turn an absent majority into a successful latest read or write ACK.
+    let (status, unavailable) =
+        post(service.address, "/preview1/queries:open", query.clone()).await?;
+    eprintln!("quorum query HTTP status={status} body={unavailable}");
+    assert_eq!(status, 503, "{unavailable}");
+    assert_eq!(unavailable["error"]["code"], "outcome_unknown");
+    assert!(unavailable.get("error").is_some(), "{unavailable}");
+    let mut reads = pb::readiness_service_client::ReadinessServiceClient::new(
+        grpc_channel(service.grpc).await?,
+    );
+    let unavailable_rpc = reads
+        .check(pb::ReadinessRequest { context: context() })
+        .await
+        .unwrap_err();
+    assert_reason(&unavailable_rpc, pb::error_detail::Reason::OutcomeUnknown);
+    let channel = grpc_channel(service.grpc).await?;
+    let mut grpc_queries = pb::query_service_client::QueryServiceClient::new(channel.clone());
+    let grpc_open = pb::OpenRequest {
+        context: context(),
+        profile: None,
+        read: Some(pb::ReadSelector {
+            kind: Some(pb::read_selector::Kind::Minimum(1)),
+        }),
+        ttl_millis: 60_000,
+        query: Some(pb::Query {
+            partition: 7,
+            text: "g.V(1,2,3).path()".into(),
+        }),
+        page_size: 10,
+    };
+    let query_error = grpc_queries.open(grpc_open.clone()).await.unwrap_err();
+    assert_reason(&query_error, pb::error_detail::Reason::OutcomeUnknown);
+    let mut grpc_writes = pb::write_service_client::WriteServiceClient::new(channel);
+    let write_rpc = pb::WriteRequest {
+        context: context(),
+        external_id: vec![73; 16],
+        mutation: Some(pb::Mutation {
+            kind: Some(pb::mutation::Kind::CreateVertex(pb::CreateVertex {
+                partition: 7,
+                vertex: Some(pb::Vertex {
+                    id: 3,
+                    labels: vec!["person".into()],
+                    properties: Vec::new(),
+                }),
+            })),
+        }),
+    };
+    let rpc_failed = grpc_writes.submit(write_rpc).await;
+    assert_reason(
+        &rpc_failed.unwrap_err(),
+        pb::error_detail::Reason::OutcomeUnknown,
+    );
+    let uncertain = vertex(72, 7, "2");
+    let (write_status, write_response) = post(
+        service.address,
+        "/preview1/writes:submit",
+        uncertain.clone(),
+    )
+    .await?;
+    eprintln!("quorum write HTTP status={write_status} body={write_response}");
+    assert_eq!(write_status, 503, "{write_response}");
+    assert_eq!(write_response["error"]["code"], "outcome_unknown");
+    anyhow::ensure!(
+        coordinator.child.try_wait()?.is_none(),
+        "partition test killed coordinator process"
+    );
+
+    fs::write(coordinator._directory.path().join("heal-quorum"), b"heal")?;
+    tokio::time::timeout(BUDGET, async {
+        while !coordinator._directory.path().join("quorum-healed").exists() {
+            anyhow::ensure!(
+                coordinator.child.try_wait()?.is_none(),
+                "coordinator process exited during recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let (status, retained) = post(service.address, "/preview1/writes:status", original).await?;
+    assert_eq!(status, 200, "{retained}");
+    assert_eq!(retained, baseline, "previous committed decision changed");
+    // Determine the uncertain original-ID outcome before a deliberate exact-ID
+    // replay. Never infer an abort or silently issue a replacement transaction.
+    let (status, outcome) = post(
+        service.address,
+        "/preview1/writes:status",
+        uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{outcome}");
+    assert!(
+        matches!(
+            outcome["result"]["status"]["type"].as_str(),
+            Some("absent" | "pending" | "committed")
+        ),
+        "unexpected original-ID outcome: {outcome}"
+    );
+    assert_eq!(outcome["result"]["external_id"], uncertain["external_id"]);
+    let (status, recovered) = post(
+        service.address,
+        "/preview1/writes:submit",
+        uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(
+        recovered["result"]["status"],
+        json!({"type":"committed","ordinal":"2","visible":true})
+    );
+    let (status, replayed) = post(service.address, "/preview1/writes:submit", uncertain).await?;
+    assert_eq!(status, 200, "{replayed}");
+    assert_eq!(replayed, recovered);
+    let rpc_uncertain = vertex(73, 7, "3");
+    let (status, outcome) = post(
+        service.address,
+        "/preview1/writes:status",
+        rpc_uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{outcome}");
+    assert!(
+        matches!(
+            outcome["result"]["status"]["type"].as_str(),
+            Some("absent" | "pending" | "committed")
+        ),
+        "unexpected original-ID outcome: {outcome}"
+    );
+    let (status, rpc_recovered) = post(
+        service.address,
+        "/preview1/writes:submit",
+        rpc_uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{rpc_recovered}");
+    assert_eq!(
+        rpc_recovered["result"]["status"],
+        json!({"type":"committed","ordinal":"3","visible":true})
+    );
+    let (status, rpc_replayed) =
+        post(service.address, "/preview1/writes:submit", rpc_uncertain).await?;
+    assert_eq!(status, 200, "{rpc_replayed}");
+    assert_eq!(
+        rpc_replayed, rpc_recovered,
+        "gRPC original ID must retain its one decision"
+    );
+    let (status, complete) = post(service.address, "/preview1/queries:open", query).await?;
+    assert_eq!(status, 200, "{complete}");
+    assert_eq!(complete["result"]["session"]["version"], "3");
+    assert_eq!(complete["result"]["page"]["total"], 3);
+    assert_eq!(
+        complete["result"]["page"]["rows"],
+        json!([
+            {"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"}]},
+            {"type":"path","elements":[{"type":"vertex","partition":7,"id":"2"}]},
+            {"type":"path","elements":[{"type":"vertex","partition":7,"id":"3"}]}
+        ])
+    );
+    assert!(complete["result"]["page"]["next"].is_null());
+    let (status, old_page) = post(service.address, "/preview1/queries:fetch", json!({
+        "session": before["result"]["session"], "query": {"partition":7,"text":"g.V(1,2,3).path()"}, "cursor":null,"page_size":10
+    })).await?;
+    assert_eq!(status, 200, "{old_page}");
+    assert_eq!(old_page["result"]["session"], before["result"]["session"]);
+    assert_eq!(
+        old_page["result"]["page"], before["result"]["page"],
+        "admitted old-V result changed after quorum loss/recovery"
+    );
+    let grpc_recovered = grpc_queries.open(grpc_open).await?.into_inner();
+    assert_eq!(grpc_recovered.session.unwrap().version, 3);
+    let grpc_page = grpc_recovered.page.unwrap();
+    assert_eq!(grpc_page.total, 3);
+    assert_eq!(
+        grpc_page.rows,
+        (1..=3)
+            .map(|id| pb::Row {
+                kind: Some(pb::row::Kind::Path(pb::Path {
+                    elements: vec![pb::QualifiedElement {
+                        kind: Some(pb::qualified_element::Kind::Vertex(pb::Entity {
+                            partition: 7,
+                            id
+                        }))
+                    }]
+                }))
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(grpc_page.next.is_none());
+    reads
+        .check(pb::ReadinessRequest { context: context() })
+        .await?;
+    service.graceful_stop().await?;
+    Ok(())
+}
