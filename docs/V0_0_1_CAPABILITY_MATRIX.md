@@ -1,7 +1,8 @@
 # v0.0.1 candidate capability and compatibility matrix
 
-Source inventory: main `a7525e217a2f26ab84c5f9710dc0d0d5ba829483`
-(2026-11-16, including #295). **Not a release announcement or completed acceptance.**
+Source inventory: main `35d0a8ee5a09bfbf0686dcc862d3f972c7cbb1b8`, tree
+`0959ff268fc860f74974838b340ff40f3869c303` (2026-11-16, including #297,
+#299 and #300). **Not a release announcement or completed acceptance.**
 This page consolidates the implemented service surface; the existing
 [release plan](RELEASE_PLAN.md#v001--bounded-fixed-topology-experimental-service)
 remains the acceptance standard. A merged implementation or test is not proof
@@ -66,7 +67,7 @@ adjacency completeness is never promoted to `Complete`.
 | Deadlines | Finite request budget up to 60 seconds, shortened by caller/method/session limits; default host maximum 15 seconds. RPC deadline and retained session/job lifetime are different clocks. |
 | Session ownership | HTTP/QueryService continuations can cross protocols on the same process, not gateways. Wrong owner, restart, expiry or close rejects; no silent re-open at latest. FixedSession/job tokens have their own contracts. |
 | Drain/restart | [Bounded drain](SERVICE_DRAIN.md) stops new requests and waits for admitted calls (default 5 seconds, maximum 60 seconds), then cancels. It does not transfer sessions, roll back writes or provide transparent rolling upgrade. |
-| Client cancellation | GatewayClient blocks future DATA polling after expiry/cancel and retains admission while transport owns the body. Already-buffered bytes cannot be recalled. A permanently stalled peer can retain permits until transport recovery/close. |
+| Client cancellation | GatewayClient blocks future DATA polling after expiry/cancel and retains admission while transport owns the body. Already-buffered bytes cannot be recalled. A permanently stalled peer can retain permits until transport recovery or explicit terminal `close()`. Close affects all clones and prevents reconnect; resource reclamation requires the owning runtime to run, and it does not cancel server sessions or settle writes. |
 | Write uncertainty | Lost ACK, cancellation or deadline may mean Unknown, not rollback. Recover original ID/exact command via Status. Absent is an observation, not proof that delayed admission is impossible. No automatic write replay/hedging. |
 | Deployment/recovery | Fixed topology and development-only; HTTP requires separate explicit opt-in for trusted-network access. No authentication, TLS/public exposure, dynamic ingress balancing, online global restore, automatic node failover or mixed-version rolling recovery claim. Offline restore guards remain enforced. |
 
@@ -87,6 +88,8 @@ failure with a known application rejection. See the exact
 | Probe #292 | Graph-query listener failure rejects a capture while static liveness can remain available. Cleanup has bounded best-effort close and TTL fallback. Not global restore acceptance. |
 | Drain #293 | HTTP/gRPC admission stop, admitted calls completing or reaching their deadline. Not session migration. |
 | Reused client #294 | Counted connection reuse, cancellation/queue limits and recovery in controlled HTTP/2 tests. Not multi-host throughput, discovery or proof that already-dispatched writes can be cancelled. |
+| Terminal client close #297 | Real transport tests cover stalled quota, cold close/no reconnect and complete Submit DATA-before-close returning Unknown. Close initiation is not synchronous reclamation or proof of server rollback. |
+| Public quorum failure #299 | HTTP/gRPC reject new query/write success during coordinator inter-voter isolation, then verify original-ID decisions, complete result oracle and old-V pages after explicit healing. Three voters live inside one node child; this is not independent-voter-process HA, automatic leader routing or a historical #128/#247 root-cause finding. |
 | Generated Go suite | Real Rust-service typed values/presence, original-ID replay, fixed pages, standard rich errors and listener isolation. Not all-method coverage, production SDK maturity or upgrade compatibility. |
 
 For a release candidate, record the **exact head/base/tested tree**, independent
@@ -105,6 +108,25 @@ that did not reproduce the failure is not a repair. Before release, determine
 whether each defect affects the advertised finite scope, fix it with evidence or
 explicitly exclude the affected feature with a reproducible limitation as the
 existing release plan requires. Do not silently remove failing gates.
+
+## Candidate packaging and remaining acceptance
+
+The planned **repository/product prerelease is v0.0.1**. The four Cargo packages
+currently declare **0.1.0**; that package metadata is not a released product tag
+or a crates.io publication. The initial packaging direction is source-only:
+no prebuilt binary or binary compatibility claim follows from it. Preserve the
+root `LICENSE`, the OpenRaft-derived `crates/d2-raft/NOTICE` and its two upstream
+license copies in source archives. A future binary distribution needs its own
+artifact validation, checksums and dependency/notice review.
+
+The source inventory above is not a frozen release candidate. After remaining
+risk disposition and documentation are integrated, bind final independent review,
+normal CI, real-process Go interoperability, documented clean startup, complete
+CoreHR and retained 1025-write lifecycle evidence to the final exact commit/tree.
+Keep passed, failed and not-run distinct. #300's opt-in lifecycle timing comparison
+is measurement infrastructure, not an extra v0.0.1 feature or release gate.
+Do not create a tag/prerelease while required checks or the risk decision remain
+unresolved. This inventory update neither lowers #224's scope nor grants a waiver.
 
 This matrix records remaining work rather than marking #218, #221 or #224 done.
 Global recovery, elastic routing, production security and later milestones remain

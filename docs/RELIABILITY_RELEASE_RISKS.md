@@ -46,6 +46,25 @@ quorum-loss and unresponsive-control negative tests; shard fixtures emit bounded
 per-node logs before cleanup on unexpected failure. These are targeted tests,
 not a full-suite, release-scale, or production-latency claim.
 
+## Public failure-boundary evidence (#299)
+
+Main includes `public_interfaces_fail_closed_without_coordinator_quorum_and_recover`.
+It sends real HTTP/gRPC requests to a separate service process while all links
+between three coordinator voters inside one node child are isolated with the
+existing `DropPolicy`. New query-open and write-submit calls must return typed
+OutcomeUnknown/HTTP 503, not a successful read or commit acknowledgment. After
+explicit link restoration and fixture leader election, the test checks original-ID
+status before deliberate same-ID replay, complete result oracles and old-V pages.
+The existing [service contract](PUBLIC_SERVICE_CLI.md#public-admission-under-coordinator-quorum-loss)
+records the exact boundary.
+
+This is additional fail-closed/recovery acceptance, not a reproduction of either
+historical incident. It does not establish independent-voter-process availability,
+automatic leader routing or public managed multi-voter provisioning. It does not
+satisfy #224's unresolved-defect disposition merely by passing. Both #128 and
+#247 remain separately tracked; preserve the first unexpected failure and its
+exact source before considering any later successful sample.
+
 ## Candidate validation and stop conditions
 
 Use the exact release candidate SHA, preserve its source/tree identity and the
