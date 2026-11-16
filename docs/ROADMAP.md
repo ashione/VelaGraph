@@ -921,3 +921,12 @@ The owned [`GatewayClient`](GATEWAY_CLIENT_CHANNEL.md) provides bounded channel
 reuse for a fixed endpoint/binding, preserving caller deadlines, global call
 admission and existing session identities. It does not add automatic retries,
 ingress balancing or owner forwarding; #221 overall acceptance remains pending.
+
+### Cross-gateway original-ID recovery acceptance (#221)
+
+The [lost-reply recovery contract](SERVICE_WRITE_RECOVERY.md) distinguishes
+durable write decisions from process-local query/session ownership. The
+independent-process acceptance injects a lost public reply and checks recovery
+from a second gateway plus unchanged certified V and complete data after explicit
+original-ID replay. This adds no automatic retry or session failover; the
+remaining multi-gateway routing and availability gates keep #221 open.

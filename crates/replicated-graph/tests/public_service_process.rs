@@ -699,6 +699,109 @@ async fn two_gateways_preserve_owner_pages_and_original_write_status() -> anyhow
     Ok(())
 }
 
+/// Lose the public acknowledgement only after the real gateway completed Submit.
+/// Recovery uses the persisted request at another ingress, not a mutation retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_write_ack_recovers_original_decision_through_other_gateway() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("service.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut owner =
+        ServiceProcess::start(&config_path, directory.path().join("owner.stdout")).await?;
+    let mut other =
+        ServiceProcess::start(&config_path, directory.path().join("other.stdout")).await?;
+    assert_ne!(owner.child.id(), other.child.id());
+    let original = vertex(1, 7, "1");
+
+    // One-shot fault ingress: consume exactly this bounded HTTP request, forward
+    // it once, then discard the entire real response. No timing race or sleep
+    // decides whether the write committed before the client loses its ACK.
+    let body = serde_json::to_vec(&original)?;
+    let mut request = format!("POST /preview1/writes:submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+    request.extend_from_slice(&body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let expected_request = request.clone();
+    let forwarded = original.clone();
+    let owner_address = owner.address;
+    let fault = tokio::spawn(async move {
+        tokio::time::timeout(BUDGET, async move {
+            let (mut client, _) = listener.accept().await?;
+            let mut received = vec![0; expected_request.len()];
+            client.read_exact(&mut received).await?;
+            anyhow::ensure!(
+                received == expected_request,
+                "fault ingress request changed"
+            );
+            let actual_ack = post(owner_address, "/preview1/writes:submit", forwarded).await?;
+            // The frontend receives neither status line nor body. The returned
+            // ACK is test instrumentation, never supplied to the recovering client.
+            client.shutdown().await?;
+            Ok::<_, anyhow::Error>(actual_ack)
+        })
+        .await?
+    });
+    tokio::time::timeout(BUDGET, async {
+        let mut client = tokio::net::TcpStream::connect(address).await?;
+        client.write_all(&request).await?;
+        let mut received = Vec::new();
+        client.take(1).read_to_end(&mut received).await?;
+        anyhow::ensure!(
+            received.is_empty(),
+            "lost-ACK client unexpectedly received response bytes"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let (status, discarded_ack) = fault.await??;
+    assert_eq!(status, 200, "{discarded_ack}");
+    assert_eq!(
+        discarded_ack["result"]["status"],
+        json!({"type":"committed","ordinal":"1","visible":true})
+    );
+    owner.graceful_stop().await?;
+
+    // First recovery action is Status with the original ID AND exact command.
+    let (status, recovered) =
+        post(other.address, "/preview1/writes:status", original.clone()).await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(recovered, discarded_ack);
+    assert_eq!(recovered["result"]["external_id"], original["external_id"]);
+
+    // Only after establishing the outcome do we deliberately exercise explicit
+    // same-command replay. It must retain the decision, not advance logical V.
+    let (status, replay) = post(other.address, "/preview1/writes:submit", original).await?;
+    assert_eq!(status, 200, "{replay}");
+    assert_eq!(replay, recovered);
+    let changed = vertex(1, 7, "2");
+    for route in ["/preview1/writes:status", "/preview1/writes:submit"] {
+        let (status, rejected) = post(other.address, route, changed.clone()).await?;
+        assert_eq!(status, 409, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "identity_mismatch");
+    }
+    let (status, opened) = post(other.address, "/preview1/queries:open", json!({"read":{"type":"minimum","version":"1"},"ttl_millis":60000,"query":{"partition":7,"text":"g.V(1,2).path()"},"page_size":10})).await?;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(opened["result"]["session"]["version"], "1");
+    assert_eq!(opened["result"]["page"]["total"], 1);
+    assert_eq!(opened["result"]["page"]["offset"], 0);
+    assert_eq!(opened["result"]["page"]["completeness"], "unverified");
+    assert_eq!(
+        opened["result"]["page"]["rows"],
+        json!([{"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"}]}])
+    );
+    assert!(opened["result"]["page"]["next"].is_null());
+    other.graceful_stop().await?;
+    Ok(())
+}
+
 /// The control listener being alive is insufficient: acquisition also needs
 /// every separately configured graph-query listener and its retained proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
