@@ -2236,3 +2236,841 @@ async fn listener_free_service_expires_and_releases_sessions_on_shutdown_or_drop
     }
     fixture.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_drain_finishes_admitted_call_rejects_new_stream_and_bounds_stall() {
+    use prost::Message;
+    let _guard = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    let service = Service::start(fixture.config().into(), Duration::from_secs(15), None)
+        .await
+        .unwrap();
+    for finish in [true, false] {
+        let grpc = service
+            .bind_grpc("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+            .await
+            .unwrap();
+        let socket = TcpStream::connect(grpc.local_addr()).await.unwrap();
+        let (mut sender, connection) = h2::client::handshake(socket).await.unwrap();
+        let _driver = RpcDriver(tokio::spawn(async move {
+            let _ = connection.await;
+        }));
+        let request = || {
+            tonic::codegen::http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "http://{}/velagraph.public.managed.v1.WriteService/Status",
+                    grpc.local_addr()
+                ))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .unwrap()
+        };
+        let (response, mut body) = sender.send_request(request(), false).unwrap();
+        // Header admission is observable before sending the unary message body.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.state.connections.available_permits() == MAX_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        grpc.begin_drain(Duration::from_millis(if finish { 5000 } else { 200 }))
+            .unwrap();
+        // An existing HTTP/2 channel cannot bypass the admission fence. GOAWAY
+        // may reject it at transport level, or the wrapper returns typed rejection.
+        if let Ok((extra, mut extra_body)) = sender.send_request(request(), false) {
+            let _ = extra_body.send_data(
+                grpc_frame(
+                    &grpc_client::encode_write(public_context(), &create(98, 7, 98)).unwrap(),
+                )
+                .into(),
+                true,
+            );
+            rejected_rpc(extra).await;
+        }
+        if finish {
+            let write = create(99, 7, 99);
+            body.send_data(
+                grpc_frame(&grpc_client::encode_write(public_context(), &write).unwrap()).into(),
+                true,
+            )
+            .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut incoming = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(data) = incoming.data().await {
+                let data = data.unwrap();
+                incoming
+                    .flow_control()
+                    .release_capacity(data.len())
+                    .unwrap();
+                bytes.extend_from_slice(&data);
+            }
+            let trailers = incoming.trailers().await.unwrap().unwrap();
+            assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+            assert!(bytes.len() >= 5);
+            assert_eq!(bytes[0], 0);
+            assert_eq!(
+                u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize,
+                bytes.len() - 5
+            );
+            let reply = public_proto::WriteResponse::decode(&bytes[5..]).unwrap();
+            assert_eq!(reply.external_id, write.external_id);
+            assert!(reply.transaction_id.is_none());
+            assert!(matches!(
+                reply.status,
+                Some(public_proto::write_response::Status::Absent(_))
+            ));
+        } else {
+            // begin_drain enforces its own bound, without a shutdown() waiter.
+            rejected_rpc(response).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while TcpStream::connect(grpc.local_addr()).await.is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        grpc.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.state.connections.available_permits() != MAX_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    service.shutdown().await;
+    fixture.stop().await;
+}
+
+// Counts actual TCP transports while forwarding real public gRPC traffic. Each
+// connection is owned by the task's JoinSet and is aborted when the proxy drops.
+async fn counted_gateway_proxy(
+    destination: SocketAddr,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, RpcDriver) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = count.clone();
+    let driver = RpcDriver(tokio::spawn(async move {
+        let mut copies = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((mut incoming, _)) = accepted else { break };
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    copies.spawn(async move {
+                        let mut outgoing = TcpStream::connect(destination).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                    });
+                }
+                _ = copies.join_next(), if !copies.is_empty() => {}
+            }
+        }
+    }));
+    (address, count, driver)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_clones_share_transport_and_preserve_tokens() {
+    let _test = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    let gateway = fixture.gateway().await;
+    let (address, connections, proxy) = counted_gateway_proxy(gateway.local_addr()).await;
+    let client = GatewayClient::new(address, bound());
+    let cloned = client.clone();
+    let deadline = Duration::from_secs(15);
+    let write = create(91, 7, 1);
+    // Both clones enter the first (cold) connection concurrently.
+    let (cold_left, cold_right) = tokio::join!(
+        client.request(Operation::Status(write.clone()), deadline),
+        cloned.request(Operation::Status(write.clone()), deadline)
+    );
+    assert_eq!(cold_left.unwrap(), cold_right.unwrap());
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let reply = client
+        .request(Operation::Submit(write.clone()), deadline)
+        .await
+        .unwrap();
+    assert_eq!(committed(&reply).1, 1);
+    let (left, right) = tokio::join!(
+        client.request(Operation::Status(write.clone()), deadline),
+        cloned.request(Operation::Status(write), deadline)
+    );
+    assert_eq!(left.unwrap(), reply);
+    assert_eq!(right.unwrap(), reply);
+    let session = match cloned
+        .request(
+            Operation::OpenSession {
+                version: Some(1),
+                ttl_millis: 60000,
+            },
+            deadline,
+        )
+        .await
+        .unwrap()
+    {
+        Reply::OpenSession(session) => session,
+        other => panic!("unexpected session: {other:?}"),
+    };
+    let query = query(7, "g.V(1)");
+    let result = client
+        .request(
+            Operation::Read {
+                session: session.clone(),
+                query: query.clone(),
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+    match result {
+        Reply::Read {
+            session: actual,
+            query: actual_query,
+            data,
+        } => {
+            assert_eq!(actual, session);
+            assert_eq!(actual_query, query);
+            assert_eq!(data.rows, vec![v(7, 1)]);
+            assert_eq!(data.completeness, QueryCompleteness::Unverified);
+        }
+        other => panic!("unexpected read: {other:?}"),
+    }
+    let mut stale = session.clone();
+    stale.incarnation[0] ^= 1;
+    assert_eq!(
+        cloned
+            .request(
+                Operation::Read {
+                    session: stale,
+                    query: query.clone()
+                },
+                deadline
+            )
+            .await,
+        Err(Error::SessionUnavailable)
+    );
+    client
+        .request(
+            Operation::Close {
+                session: session.clone(),
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cloned
+            .request(Operation::Read { session, query }, deadline)
+            .await,
+        Err(Error::SessionUnavailable)
+    );
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(cloned);
+    drop(client);
+    drop(proxy);
+    gateway.shutdown().await;
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_admission_and_cold_handshake_use_request_budget() {
+    let _test = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = GatewayClient::new(listener.local_addr().unwrap(), bound());
+    let reserved = CLIENT_ADMISSION
+        .acquire_many(MAX_CONNECTIONS as u32)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .request(Operation::Status(create(92, 7, 1)), Duration::from_secs(1))
+            .await,
+        Err(Error::Capacity)
+    );
+    // No transport can be opened while admission is denied. Poll accept only
+    // after the request has returned; the short bound is an absence assertion.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    drop(reserved);
+    let (accepted, waiting) = tokio::join!(
+        listener.accept(),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.request(
+                Operation::Status(create(92, 7, 1)),
+                Duration::from_millis(50)
+            )
+        )
+    );
+    let (socket, _) = accepted.unwrap();
+    assert_eq!(waiting.unwrap(), Err(Error::Unknown));
+    assert_eq!(CLIENT_ADMISSION.available_permits(), MAX_CONNECTIONS);
+    drop(socket);
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let gateway = Gateway::bind(fixture.config(), address, Duration::from_secs(15))
+        .await
+        .unwrap();
+    let write = create(92, 7, 1);
+    let reply = client
+        .request(Operation::Submit(write), Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(committed(&reply).1, 1);
+    assert_eq!(
+        client
+            .request(Operation::Status(create(92, 7, 1)), Duration::ZERO)
+            .await,
+        Err(Error::Protocol)
+    );
+    drop(client);
+    gateway.shutdown().await;
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_does_not_replay_mutation_after_stream_reset() {
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let peer = RpcDriver(tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        while let Some(call) = connection.accept().await {
+            let (request, mut response) = call.unwrap();
+            assert_eq!(
+                request.uri().path(),
+                "/velagraph.public.managed.v1.WriteService/Submit"
+            );
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // This peer deliberately provides no application result: the
+            // caller cannot infer whether the mutation committed or aborted.
+            response.send_reset(h2::Reason::CANCEL);
+        }
+    }));
+    let client = GatewayClient::new(address, bound());
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.request(Operation::Submit(create(93, 7, 1)), Duration::from_secs(2))
+        )
+        .await
+        .unwrap(),
+        Err(Error::Unknown)
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(CLIENT_ADMISSION.available_permits(), MAX_CONNECTIONS);
+    drop(client);
+    drop(peer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_cold_cancel_allows_later_explicit_request() {
+    let _test = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = GatewayClient::new(address, bound());
+    let pending_client = client.clone();
+    let pending = tokio::spawn(async move {
+        pending_client
+            .request(Operation::Status(create(94, 7, 1)), Duration::from_secs(5))
+            .await
+    });
+    let (socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    // An accepted socket proves initialization is underway; no elapsed-time
+    // guess is needed to abort the caller before any application reply.
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert_eq!(CLIENT_ADMISSION.available_permits(), MAX_CONNECTIONS);
+    drop(socket);
+    drop(listener);
+    let gateway = Gateway::bind(fixture.config(), address, Duration::from_secs(15))
+        .await
+        .unwrap();
+    let write = create(94, 7, 1);
+    let outcome = client
+        .request(Operation::Submit(write.clone()), Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(committed(&outcome).1, 1);
+    assert_eq!(
+        client
+            .request(Operation::Status(write), Duration::from_secs(15))
+            .await
+            .unwrap(),
+        outcome
+    );
+    drop(client);
+    gateway.shutdown().await;
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_expired_queued_mutation_body_is_not_dispatched() {
+    use prost::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _test = TEST_GATE.lock().await;
+    let fixture = Fixture::new().await;
+    let gateway = fixture.gateway().await;
+    let destination = gateway.local_addr();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (disconnect, disconnected) = tokio::sync::oneshot::channel();
+    let (accepted, reconnect_accepted) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let received_submissions = submissions.clone();
+    let peer = RpcDriver(tokio::spawn(async move {
+        // Warm the cached Channel against the real service, then drop both
+        // sockets at an explicit barrier, not after a guessed sleep.
+        let (mut incoming, _) = listener.accept().await.unwrap();
+        let mut outgoing = TcpStream::connect(destination).await.unwrap();
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing) => {},
+            _ = disconnected => {},
+        }
+        drop(incoming);
+        drop(outgoing);
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake::<_, tonic::codegen::Bytes>(socket)
+            .await
+            .unwrap();
+        // The read-only reconnect driver occupies the single allowed stream.
+        // Merely delaying handshake is NOT a queue barrier: h2 may send a
+        // request before receiving server SETTINGS. Wait for SETTINGS ACK too.
+        let first = connection.accept().await.unwrap();
+        assert!(first.as_ref().unwrap().0.uri().path().ends_with("/Status"));
+        std::future::poll_fn(|cx| {
+            assert!(connection.poll_accept(cx).is_pending());
+            if connection.max_concurrent_recv_streams() == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        accepted.send(()).unwrap();
+        tokio::select! {
+            biased;
+            _ = resumed => {},
+            unexpected = connection.accept() => panic!("request bypassed occupied single stream: {unexpected:?}"),
+        }
+        let mut first = Some(first);
+        let mut replies = JoinSet::new();
+        loop {
+            let call = if let Some(first) = first.take() {
+                Some(first)
+            } else {
+                connection.accept().await
+            };
+            let Some(call) = call else { break };
+            let (request, mut response) = call.unwrap();
+            let is_submit = request.uri().path().ends_with("/Submit");
+            let received_submissions = received_submissions.clone();
+            replies.spawn(async move {
+                let mut body = request.into_body();
+                let mut bytes = Vec::new();
+                let mut counted = false;
+                while let Some(chunk) = body.data().await {
+                    let Ok(chunk) = chunk else { return };
+                    if body.flow_control().release_capacity(chunk.len()).is_err() {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                    // HEADERS can arrive for a cancelled buffered request.
+                    // Count a mutation only when a complete, valid unary gRPC
+                    // WriteRequest body is present, even if RST follows it.
+                    if is_submit && !counted && bytes.len() >= 5 && bytes[0] == 0 {
+                        let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+                        if bytes.len() == length + 5
+                            && public_proto::WriteRequest::decode(&bytes[5..]).is_ok()
+                        {
+                            received_submissions.fetch_add(1, Ordering::SeqCst);
+                            counted = true;
+                        }
+                    }
+                }
+                if bytes.len() < 5 || bytes[0] != 0 {
+                    return;
+                }
+                let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+                if bytes.len() != length + 5 {
+                    return;
+                }
+                let Ok(write) = public_proto::WriteRequest::decode(&bytes[5..]) else {
+                    return;
+                };
+                let reply = public_proto::WriteResponse {
+                    external_id: write.external_id,
+                    transaction_id: None,
+                    status: Some(public_proto::write_response::Status::Absent(
+                        public_proto::Empty {},
+                    )),
+                    identity: write.context.and_then(|context| context.identity),
+                };
+                let headers = tonic::codegen::http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let Ok(mut stream) = response.send_response(headers, false) else {
+                    return;
+                };
+                if stream.send_data(grpc_frame(&reply).into(), false).is_err() {
+                    return;
+                }
+                let mut trailers = tonic::codegen::http::HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().unwrap());
+                let _ = stream.send_trailers(trailers);
+            });
+        }
+    }));
+    let client = GatewayClient::new(address, bound());
+    let write = create(95, 7, 1);
+    assert!(matches!(
+        client
+            .request(Operation::Status(write.clone()), Duration::from_secs(15))
+            .await
+            .unwrap(),
+        Reply::Write {
+            status: WriteStatus::Absent,
+            ..
+        }
+    ));
+    disconnect.send(()).unwrap();
+    // Read-only calls drive failure detection and reconnection. This does not
+    // replay a mutation. The barrier proves its stream occupies the sole
+    // acknowledged HTTP/2 stream slot on the replacement connection.
+    let reader = client.clone();
+    let status_write = write.clone();
+    let read_driver = RpcDriver(tokio::spawn(async move {
+        loop {
+            let _ = reader
+                .request(
+                    Operation::Status(status_write.clone()),
+                    Duration::from_secs(15),
+                )
+                .await;
+            tokio::task::yield_now().await;
+        }
+    }));
+    tokio::time::timeout(Duration::from_secs(5), reconnect_accepted)
+        .await
+        .unwrap()
+        .unwrap();
+    // Timed-out bodies still retained by the transport must keep admission
+    // charged. Repeated short calls cannot accumulate an unbounded queue.
+    let mut timed_out = 0;
+    let mut capacity_rejected = 0;
+    for external_id in 100..200 {
+        let mutation_started = tokio::time::Instant::now();
+        match client
+            .request(
+                Operation::Submit(create(external_id, 7, 1)),
+                Duration::from_millis(50),
+            )
+            .await
+        {
+            Err(Error::Unknown) => {
+                assert!(mutation_started.elapsed() >= Duration::from_millis(50));
+                timed_out += 1;
+            }
+            Err(Error::Capacity) => capacity_rejected += 1,
+            other => panic!("unexpected queued mutation outcome: {other:?}"),
+        }
+    }
+    assert!(timed_out > 0 && timed_out <= MAX_CONNECTIONS);
+    assert!(capacity_rejected > 0);
+    assert_eq!(CLIENT_ADMISSION.available_permits(), 0);
+    // Release the observation barrier before cancelling the occupying stream.
+    // Its RST can immediately allow expired HEADERS through; that is permitted
+    // and the body oracle below, not this pre-release barrier, judges dispatch.
+    resume.send(()).unwrap();
+    drop(read_driver);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A new explicit call traverses the recovered channel and obtains a valid
+    // correlated response. Expired Submit HEADERS may appear, but no complete
+    // mutation body may dispatch. This cannot retract already buffered DATA.
+    let reply = client
+        .request(Operation::Status(write), Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(matches!(
+        reply,
+        Reply::Write {
+            status: WriteStatus::Absent,
+            ..
+        }
+    ));
+    assert_eq!(submissions.load(Ordering::SeqCst), 0);
+    drop(client);
+    drop(peer);
+    gateway.shutdown().await;
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_close_reclaims_permits_without_peer_quota_recovery() {
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready, queued) = tokio::sync::oneshot::channel();
+    let (disconnected, closed) = tokio::sync::oneshot::channel();
+    let mut peer = RpcDriver(tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake::<_, tonic::codegen::Bytes>(socket)
+            .await
+            .unwrap();
+        // The first unanswered Status occupies the only acknowledged slot.
+        // Never release it or raise SETTINGS: client close must tear down IO.
+        let first = connection.accept().await.unwrap().unwrap();
+        assert!(first.0.uri().path().ends_with("/Status"));
+        std::future::poll_fn(|cx| {
+            assert!(connection.poll_accept(cx).is_pending());
+            if connection.max_concurrent_recv_streams() == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        ready.send(()).unwrap();
+        match connection.accept().await {
+            None | Some(Err(_)) => {}
+            Some(Ok(call)) => panic!(
+                "unexpected request while quota occupied: {:?}",
+                call.0.uri()
+            ),
+        }
+        drop(first);
+        disconnected.send(()).unwrap();
+        // The listener stays available: a closed client must not reconnect.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }));
+    let client = GatewayClient::new(address, bound());
+    let cloned = client.clone();
+    let first_client = client.clone();
+    let first = tokio::spawn(async move {
+        first_client
+            .request(
+                Operation::Status(create(201, 7, 1)),
+                Duration::from_secs(15),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in 202..202 + MAX_CONNECTIONS as u8 - 1 {
+        assert_eq!(
+            client
+                .request(
+                    Operation::Submit(create(id, 7, 1)),
+                    Duration::from_millis(30)
+                )
+                .await,
+            Err(Error::Unknown)
+        );
+    }
+    assert_eq!(CLIENT_ADMISSION.available_permits(), 0);
+    assert_eq!(
+        client
+            .request(Operation::Status(create(229, 7, 1)), Duration::from_secs(1))
+            .await,
+        Err(Error::Capacity)
+    );
+    cloned.close();
+    client.close();
+    assert!(client.is_closed() && cloned.is_closed());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::Unknown)
+    );
+    tokio::time::timeout(Duration::from_secs(3), closed)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for owner in [&client, &cloned] {
+        assert_eq!(
+            owner
+                .request(Operation::Submit(create(229, 7, 1)), Duration::from_secs(1))
+                .await,
+            Err(Error::Unknown)
+        );
+    }
+    // Await the absence check rather than aborting the peer before it runs.
+    (&mut peer.0).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_close_during_cold_call_and_before_first_use() {
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = GatewayClient::new(listener.local_addr().unwrap(), bound());
+    let cloned = client.clone();
+    let pending = tokio::spawn(async move {
+        cloned
+            .request(
+                Operation::Status(create(231, 7, 1)),
+                Duration::from_secs(15),
+            )
+            .await
+    });
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    client.close();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::Unknown)
+    );
+    // Drain already-written handshake bytes until EOF. Merely aborting the
+    // request would not establish that background transport had closed.
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::io::AsyncReadExt::read_to_end(&mut socket, &mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let never_connected = GatewayClient::new(listener.local_addr().unwrap(), bound());
+    never_connected.close();
+    never_connected.clone().close();
+    assert!(never_connected.is_closed());
+    assert_eq!(
+        never_connected
+            .request(Operation::Status(create(232, 7, 1)), Duration::from_secs(1))
+            .await,
+        Err(Error::Unknown)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_close_after_submit_dispatch_is_unknown() {
+    use prost::Message;
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sent, dispatched) = tokio::sync::oneshot::channel();
+    let mut peer = RpcDriver(tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .handshake::<_, tonic::codegen::Bytes>(socket)
+            .await
+            .unwrap();
+        let (request, response) = connection.accept().await.unwrap().unwrap();
+        assert!(request.uri().path().ends_with("/Submit"));
+        let read = async move {
+            let mut body = request.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+            assert!(bytes.len() > 5);
+            assert_eq!(bytes[0], 0);
+            assert_eq!(
+                u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize,
+                bytes.len() - 5
+            );
+            public_proto::WriteRequest::decode(&bytes[5..]).unwrap();
+            // Full mutation DATA crossed the wire; intentionally withhold ACK.
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(response);
+        };
+        tokio::pin!(read);
+        tokio::select! {
+            _ = &mut read => unreachable!(),
+            result = connection.accept() => assert!(result.is_none() || result.unwrap().is_err()),
+        }
+    }));
+    let client = GatewayClient::new(address, bound());
+    let pending_client = client.clone();
+    let pending = tokio::spawn(async move {
+        pending_client
+            .request(
+                Operation::Submit(create(233, 7, 1)),
+                Duration::from_secs(15),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), dispatched)
+        .await
+        .unwrap()
+        .unwrap();
+    client.close();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::Unknown)
+    );
+    tokio::time::timeout(Duration::from_secs(3), &mut peer.0)
+        .await
+        .unwrap()
+        .unwrap();
+    // The controlled peer received the command. Unknown must not be interpreted
+    // as proof of non-execution; this test does not simulate a durable commit.
+}

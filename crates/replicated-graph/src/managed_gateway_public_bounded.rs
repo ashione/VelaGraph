@@ -84,6 +84,8 @@ pub enum Schema {
     RpcStatus,
     RpcAny,
     Context,
+    ReadinessRequest,
+    ReadinessResponse,
     CallIdentity,
     Binding,
     BindingMember,
@@ -179,6 +181,9 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         (S::RpcAny, 2) => (K::Message(S::ErrorDetail), false, false),
         (S::ErrorDetail, 1) => (K::Var(16), false, false),
         (S::ErrorDetail, 2) => (K::Message(S::CallIdentity), false, false),
+        (S::ReadinessRequest, 1) => (K::Message(S::Context), false, false),
+        (S::ReadinessResponse, 1) => (K::Var(u64::MAX), false, false),
+        (S::ReadinessResponse, 2) => (K::Message(S::CallIdentity), false, false),
         (S::Context, 3) => (K::Message(S::CallIdentity), false, false),
         (S::CallIdentity, 1) => (K::Bytes, false, false),
         (S::CallIdentity, 2) => (K::Message(S::Binding), false, false),
@@ -558,6 +563,8 @@ message!(FixedOpenResponse, false);
 message!(FixedQueryResponse, false);
 message!(FixedPageResponse, false);
 message!(FixedCloseResponse, false);
+message!(ReadinessRequest, true);
+message!(ReadinessResponse, false);
 message!(JobStartRequest, true);
 message!(JobGetRequest, true);
 message!(JobCancelRequest, true);
@@ -571,6 +578,31 @@ message!(JobFetchResponse, false);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_prescan_rejects_unknown_and_duplicate_fields() {
+        let request = pb::ReadinessRequest {
+            context: Some(pb::Context {
+                version: 1,
+                timeout_millis: 100,
+                identity: None,
+            }),
+        }
+        .encode_to_vec();
+        assert!(validate_bytes::<pb::ReadinessRequest>(&request).is_ok());
+        let mut duplicate = request.clone();
+        duplicate.extend_from_slice(&request);
+        assert!(validate_bytes::<pb::ReadinessRequest>(&duplicate).is_err());
+        let mut unknown = request;
+        unknown.extend_from_slice(&[0x10, 1]);
+        assert!(validate_bytes::<pb::ReadinessRequest>(&unknown).is_err());
+        // Version zero is a valid certified version and uses protobuf omission.
+        let response = pb::ReadinessResponse {
+            version: 0,
+            identity: None,
+        };
+        assert!(validate_bytes::<pb::ReadinessResponse>(&response.encode_to_vec()).is_ok());
+        assert!(validate_bytes::<pb::ReadinessResponse>(&[0x08, 1, 0x08, 2]).is_err());
+    }
     fn job_handle() -> pb::JobHandle {
         pb::JobHandle {
             incarnation: vec![1; 16],

@@ -1,11 +1,15 @@
 # Managed service process preview
 
-`graph-service` is a standalone loopback host for the
+`graph-service` is a standalone default-loopback host for the
 [managed HTTP preview](PUBLIC_HTTP_PREVIEW.md) and typed public managed gRPC,
 using the same existing managed cohort execution and recovery identity. It is not a cluster bootstrap tool,
 public production gateway, global restore controller or the final
 v0.0.1 release. Both adapters share one managed gateway and its original
 canonical commands, query sessions and resource budgets.
+
+For a fresh loopback demonstration that creates its own isolated cohort, use the
+[managed-service demo](MANAGED_SERVICE_DEMO.md). That fresh-only launcher is not
+an activation or restore mode of this service host.
 
 ## Prerequisite and command
 
@@ -24,10 +28,15 @@ cargo run --locked -p replicated-graph --bin graph-service -- \
   --allow-insecure-development
 ```
 
-All configuration endpoints and both public listeners must be loopback.
+All configuration endpoints and the gRPC listener must be loopback. HTTP is
+loopback-only unless the separate `--allow-insecure-network` flag is supplied
+with an explicit `--http ADDRESS:PORT` and `--allow-insecure-development`.
+This is plaintext, unauthenticated trusted-network access, not production
+exposure; use an authenticated TLS reverse proxy or a controlled private network.
+No network/firewall settings or deployment are changed by these options.
 `--http` is required; `--grpc` is optional and explicit (omit it for the
 HTTP-only preview). The two flags bind separate ports; neither protocol silently
-falls back to the other. The port is explicit; port 0 requests an ephemeral loopback port. An optional
+falls back to the other. The port is explicit; port 0 requests an ephemeral port on the selected interface. An optional
 `--timeout-ms` (1..60000, default 15000) supplies the maximum request budget;
 method limits, caller timeouts and session expiry can shorten it. Unknown or
 repeated command flags fail before startup. No credentials or telemetry payloads
@@ -43,8 +52,12 @@ checkpoint was loaded or that future requests cannot fail. It explicitly reports
 `restore_supported: false` and `production_ready: false`. The managed state lifecycle opens no compatibility TCP listener. Only the
 configured public HTTP and optional gRPC listeners are bound.
 
-Ctrl-C and, on Unix, SIGTERM trigger orderly gRPC, HTTP and managed-gateway
-shutdown.
+Ctrl-C and, on Unix, SIGTERM start bounded drain on both public listeners
+before waiting for admitted requests. `--drain-timeout-ms` (1..60000, default
+5000) bounds this phase; original request deadlines still apply. New requests
+are rejected and remaining work is cancelled at the deadline. The managed
+gateway is then shut down. See [drain semantics and client obligations](SERVICE_DRAIN.md);
+this is not session transfer or transparent rolling upgrade.
 A startup identity mismatch or listener failure exits nonzero without publishing
 a service announcement. No automatic restart, retry, graph reinitialization or
 cohort replacement is performed.
@@ -121,3 +134,74 @@ recover the same original external ID and exact mutation. A successful gRPC
 trailer handoff means the transport consumed the body, not proof the socket
 flushed or the client application received it. See
 [the gRPC lifecycle and test boundary](PUBLIC_GRPC_SERVICE.md).
+
+## Ingress ownership: two processes are not a session failover pair
+
+A client chooses one public service endpoint before opening a query. Keep the
+returned session and every continuation on that same process incarnation. HTTP
+and gRPC on that process share state; a second service attached to the same
+cohort does **not** share its session registry. Ingress selection is separate from
+the service's fixed member/shard routing. There is no built-in load balancer,
+owner-forwarder, portable session store or automatic routing discovery.
+
+Do not place round-robin per-request balancing in front of session operations.
+Applications must retain the original endpoint (or use externally verified
+sticky routing). A wrong owner, stopped owner or restarted owner is not permission
+to reopen the query at latest and append its rows to an older result. Wrong-owner
+and stale-session requests to a reachable service return HTTP 410
+`session_unavailable` / the typed gRPC `SessionUnavailable` detail; an unreachable
+owner can instead fail at transport level. Clients must explicitly start a new
+query if they choose to abandon the old fixed view.
+
+Write recovery is different: the persisted original external ID plus exact
+mutation can be submitted to the existing `writes:status` endpoint on another
+service bound to the **same verified cohort**. This is a status lookup, not a
+blanket license to retry a timed-out mutation, change its ID or route to an
+unrelated cohort. A lost ACK remains unknown until status establishes its outcome.
+
+The ordinary `public_service_process` regression
+`two_gateways_preserve_owner_pages_and_original_write_status` starts two real
+services with the same three-node cohort. It checks HTTP/gRPC rejection of a real
+foreign continuation, whole-row fixed-V pages across another-ingress writes,
+page replay, graceful owner removal, stale tokens after restart, and exact
+original-ID status responses through the surviving ingress. It does not inject
+a lost ACK, demonstrate crash/partition recovery or establish concurrent-write
+throughput. The public CLI's existing startup checks still apply; this test is
+not continuous readiness or load-balancer health discovery. FixedSession/job
+failover, overload/rolling removal and automatic balancing remain separate
+[#221](https://github.com/ashione/VelaGraph/issues/221) acceptance; the issue stays
+open. No listener or execution semantics change in this test/contract slice.
+
+## Live versus fixed-read capture readiness
+
+`GET /preview1/service` reports static process liveness. To actively probe one
+bounded fixed-session read capture, use `POST /preview1/readiness` or the typed
+`ReadinessService.Check` RPC. Read [the probe contract](FIXED_READ_READINESS.md)
+before polling: it uses the default profile, can be expensive, and must not be
+mistaken for general load-balancer, write, restore or production readiness.
+
+### Public admission under coordinator quorum loss
+
+The `public_interfaces_fail_closed_without_coordinator_quorum_and_recover`
+process test adds three durable coordinator Raft voters **inside one node child
+process**. Existing `DropPolicy` isolates all inter-voter links while the child,
+managed RPC listener and public service stay alive. This is deterministic
+in-process Raft fault injection across a real public HTTP/gRPC process boundary,
+not an independent-voter-process network partition or multi-host availability test.
+
+Both public query-open and write-submit protocols must return typed
+`OutcomeUnknown`/HTTP 503 during the partition, rather than a successful read or
+commit ACK. Recovery explicitly restores links and elects the statically
+configured coordinator in the fixture; it does not demonstrate automatic leader
+routing. The test reads original-ID status before deliberate exact-ID replay,
+checks original committed decisions, one decision per ID, the complete result
+oracle through both protocols, and the already-admitted old-V page. No request
+budget, production retry policy or write cancellation semantics is changed.
+
+This bounds a supported failure response and recovery scenario; it does not
+identify the missing historical cause in #128 or #247 or waive their release
+acceptance. The ordinary single-voter quickstart still does not provision a
+cross-process multi-voter managed group. The current managed RPC server binds
+`NodeHandle` (the in-process consensus network), not `TcpNode`; independent-voter
+managed provisioning would need its own implementation and validation before it
+can be advertised.

@@ -192,9 +192,21 @@ placement/correlation validation, not authentication. Old version-1 generated
 clients omit identity and retain their existing contract. An older server rejects
 version 2 instead of silently accepting a request without its required binding.
 
+Use [`GatewayClient`](GATEWAY_CLIENT_CHANNEL.md) to reuse one bounded channel
+across calls/clones pinned to an address and binding. The free `request` helper
+remains one-shot. Neither retries failed RPCs or substitutes another endpoint.
+
 One client admission permit covers connection setup, encoding, dispatch and
 validation within the original absolute deadline. A timeout or lost response is
 Unknown, not Abort: inspect/recover the original external ID and exact command.
 The shared executor, fixed V, page/job/session ownership and delivery cleanup
 are unchanged. No global snapshot, new transaction or higher throughput claim
 follows from this transport migration.
+
+## Fixed-session capture readiness
+
+The additive `ReadinessService.Check` RPC observes a bounded default-profile
+certified capture across every configured graph-query route. Its context follows
+the existing identity/deadline contract. See [scope, protocol and limits](FIXED_READ_READINESS.md):
+this is not `grpc.health.v1`, general write/restore readiness or a promise about a
+future query.

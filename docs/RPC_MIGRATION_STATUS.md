@@ -1,6 +1,9 @@
 # RPC migration: current paths and remaining gates
 
-Audited against main [40e2b9a](https://github.com/ashione/VelaGraph/commit/40e2b9a419ff941a58761f784c9c7fd500a6bf08), 2026-11-14. This is the current inventory for #218, not a claim of production readiness.
+Audited against main [40e2b9a](https://github.com/ashione/VelaGraph/commit/40e2b9a419ff941a58761f784c9c7fd500a6bf08), 2026-11-14. The retirement evidence below retains that historical baseline. The current
+service inventory through main `a7525e2` (#295) is the
+[candidate capability matrix](V0_0_1_CAPABILITY_MATRIX.md), not a production
+readiness or completed #218 claim.
 
 ## Supported network paths
 
@@ -32,13 +35,17 @@ Raft snapshot data is an existing snapshot image carried with typed metadata/off
 
 A passing later run does not identify the cause of earlier generic Unavailable failures; #247 remains open. Controlled cancellation fixtures prove RPC-stream cancellation, not necessarily physical TCP closure.
 
-## Remaining #218 gates
+## #218 gates updated through #295 (2026-11-16)
 
-1. **Generated Go interoperability:** this baseline contains no .go/go.mod or Go CI. Test the real Rust service with generated Go clients, write IDs/replay, typed values/presence, paging/fixed V, deadlines and public/internal isolation. Rust-to-Rust tests are not this evidence.
-2. **Cross-language error details:** public codecs currently place custom ErrorDetail bytes in tonic Status::with_details (managed_gateway_grpc_codec.rs:487–495,1588–1595). Compatibility with standard rich-status clients must be verified; do not silently discard machine-readable detail to obtain a green smoke test.
-3. **HTTP surface:** the preview adapter supports Submit/Status/Abort, Open/Fetch/Close and managed-job Start/Get/Renew/Fetch/Cancel through shared handlers. FixedSession HTTP parity and a stable HTTP contract are not delivered.
+1. **Generated Go interoperability:** implemented after the retirement baseline. `examples/go/managed` and `.github/workflows/go-interop.yml` now generate/build a real Go client and run it against a Rust service. Coverage includes write IDs/replay, typed values/presence, paging/fixed V and listener isolation; see the [exact example coverage](../examples/go/managed/README.md). This is not all-method interoperability, upgrade or production SDK evidence.
+2. **Cross-language error details:** the public codec now emits standard `google.rpc.Status` with one typed `ErrorDetail` Any. Go checks standard `status.Details()` rather than a custom raw trailer parser. The old bare trailer is not supported as a fallback; see [compatibility and upgrade bounds](PUBLIC_GRPC_ERROR_COMPATIBILITY.md).
+3. **HTTP surface:** the preview supports Submit/Status/Abort, Open/Fetch/Close, static liveness and the bounded fixed-read probe. Managed-job Start/Get/Renew/Fetch/Cancel now reuse shared handlers. FixedSession HTTP parity and a stable HTTP contract remain separate.
 4. **Version/upgrade matrix:** existing services reject unsupported versions and old wire; Raft does not support a mixed JSON/gRPC cluster. This is not rolling-upgrade compatibility or an implemented online restart/recovery plan.
 5. **Resource/performance evidence:** retain application admission, budgets and unknown write outcomes. Existing Metadata microbenchmarks are not end-to-end cold/warm, p50/p95/p99, CPU/RSS/network or multi-host scaling evidence.
 6. **Service readiness:** trusted/loopback preview is intentional. #221/#222 routing/ownership/readiness and recovery/security/product gates remain distinct.
 
-The next useful closure is real cross-language public service verification, including errors, rather than another transport alias or deleting durable serializers. Keep #218 open until its remaining gates have explicit evidence or an owner-approved scope change.
+Do not reopen the already implemented Go/error-format work merely because the
+historical baseline predates it. Keep #218 open until the remaining surface,
+compatibility, resource/performance and service gates have explicit evidence or
+an owner-approved scope change. The current candidate matrix distinguishes those
+gates from later milestone work.

@@ -1,4 +1,4 @@
-//! Bounded loopback HTTP/1 preview. One request per connection deliberately
+//! Bounded HTTP/1 preview; loopback by default, explicit trusted-network opt-in. One request per connection deliberately
 //! keeps response-delivery ownership coupled to the actual connection outcome.
 use super::*;
 use axum::{
@@ -14,16 +14,24 @@ use std::{
     task::{Context, Poll},
 };
 
-/// Loopback-only HTTP adapter sharing the managed gateway's admission and state.
+/// HTTP adapter sharing the managed gateway's admission and state.
 /// It is not an authentication boundary or a global-restore implementation.
 pub struct HttpService {
     address: SocketAddr,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    drain: Arc<Drain>,
 }
 impl HttpService {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+    /// Stop new requests immediately and allow already admitted requests to finish
+    /// within this grace period and their original deadlines. Does not migrate sessions.
+    pub fn begin_drain(&self, grace: Duration) -> Result<()> {
+        self.drain.begin(grace)?;
+        let _ = self.stop.send(true);
+        Ok(())
     }
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
@@ -35,6 +43,9 @@ impl HttpService {
 impl Drop for HttpService {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -45,14 +56,17 @@ pub(super) async fn bind(
     mut gateway_stop: watch::Receiver<bool>,
     bind: SocketAddr,
     deadline: Duration,
+    allow_non_loopback: bool,
 ) -> Result<HttpService> {
-    if !bind.ip().is_loopback() || *gateway_stop.borrow() {
+    if (!allow_non_loopback && !bind.ip().is_loopback()) || *gateway_stop.borrow() {
         return Err(Error::Rejected);
     }
     check_deadline(deadline)?;
     let listener = TcpListener::bind(bind).await.map_err(|_| Error::Unknown)?;
     let address = listener.local_addr().map_err(|_| Error::Unknown)?;
     let (stop, mut stopped) = watch::channel(false);
+    let drain = Arc::new(Drain::default());
+    let draining = drain.clone();
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         loop {
@@ -69,6 +83,7 @@ pub(super) async fn bind(
                 continue;
             };
             let state = state.clone();
+            let request_drain = draining.clone();
             let end = Instant::now() + deadline;
             connections.spawn(async move {
                 let work = Arc::new(permit);
@@ -83,6 +98,7 @@ pub(super) async fn bind(
                         end,
                         response_delivery.clone(),
                         budget.clone(),
+                        request_drain.clone(),
                     )
                 });
                 let connection = hyper::server::conn::http1::Builder::new()
@@ -103,6 +119,13 @@ pub(super) async fn bind(
                 // Existing sessions and uncertain durable writes are not undone.
             });
         }
+        drop(listener);
+        if let Some(end) = draining.end().filter(|_| !*gateway_stop.borrow()) {
+            let _ = tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
+                while connections.join_next().await.is_some() {}
+            })
+            .await;
+        }
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     });
@@ -110,6 +133,7 @@ pub(super) async fn bind(
         address,
         stop,
         task: Some(task),
+        drain,
     })
 }
 
@@ -141,12 +165,14 @@ async fn handle(
     end: Instant,
     delivery: Delivery,
     budget: watch::Sender<Instant>,
+    drain: Arc<Drain>,
 ) -> std::result::Result<HttpResponse<Body>, Infallible> {
     // Admission was acquired before HTTP header/body parsing, and the entire
     // connection has a deadline. HTTP cannot allocate an independent queue.
-    if state
-        .jobs_stopping
-        .load(std::sync::atomic::Ordering::Acquire)
+    if !drain.admitting()
+        || state
+            .jobs_stopping
+            .load(std::sync::atomic::Ordering::Acquire)
     {
         return Ok(error_response(Error::Rejected));
     }
@@ -197,6 +223,25 @@ async fn handle(
             .await
             .map_err(|_| Error::Capacity)?;
         before_deadline(end)?;
+        if path == "/preview1/readiness" {
+            // Empty JSON object only: no query, client-specified route or lease.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Probe {}
+            // Serde's empty named struct also accepts an empty sequence.
+            // Require an object at the boundary; serde still validates all JSON.
+            if !bytes.trim_ascii_start().starts_with(b"{") {
+                return Err(Error::Protocol);
+            }
+            let _: Probe = serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)?;
+            let version = state.probe_readiness(work, end).await?;
+            before_deadline(end)?;
+            return Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!("{{\"state\":\"fixed_session_read_captured\",\"version\":{version},\"profile\":\"parity2_mib_v1\",\"restore_supported\":false,\"production_ready\":false}}")))
+                .unwrap());
+        }
         let operation = http_codec::decode(&path, &bytes)?;
         let end = invocation::operation_end(&operation, end);
         budget.send_replace(end);

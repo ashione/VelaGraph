@@ -4,7 +4,208 @@ use super::grpc_codec as codec;
 use super::public_proto as pb;
 use super::*;
 use prost::Message;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::CancellationToken;
+use tonic::codegen::{http, Service};
 use tonic::transport::Channel;
+
+// Closing a client must stop the actual socket, not merely drop its cached
+// Channel handle: Hyper can still own queued request bodies and their leases.
+struct CloseableIo {
+    stream: Option<tokio::net::TcpStream>,
+    stop: CancellationToken,
+    read_stop: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    write_stop: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+impl CloseableIo {
+    fn new(stream: tokio::net::TcpStream, stop: CancellationToken) -> Self {
+        Self {
+            stream: Some(stream),
+            read_stop: Box::pin(stop.clone().cancelled_owned()),
+            write_stop: Box::pin(stop.clone().cancelled_owned()),
+            stop,
+        }
+    }
+    fn check_open(&mut self, cx: &mut TaskContext<'_>, read: bool) -> std::io::Result<()> {
+        let cancelled = if read {
+            self.read_stop.as_mut().poll(cx).is_ready()
+        } else {
+            self.write_stop.as_mut().poll(cx).is_ready()
+        };
+        if cancelled || self.stop.is_cancelled() || self.stream.is_none() {
+            self.stream.take();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "gateway client closed",
+            ));
+        }
+        Ok(())
+    }
+}
+impl AsyncRead for CloseableIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_open(cx, true) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for CloseableIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check_open(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_open(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_open(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_shutdown(cx)
+    }
+}
+#[derive(Clone)]
+struct ClientConnector {
+    address: SocketAddr,
+    stop: CancellationToken,
+}
+impl Service<http::Uri> for ClientConnector {
+    type Response = hyper_util::rt::TokioIo<CloseableIo>;
+    type Error = std::io::Error;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = std::io::Result<Self::Response>> + Send>>;
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if self.stop.is_cancelled() {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "gateway client closed",
+            )))
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn call(&mut self, _uri: http::Uri) -> Self::Future {
+        let address = self.address;
+        let stop = self.stop.clone();
+        Box::pin(async move {
+            let stream = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "gateway client closed")),
+                stream = tokio::net::TcpStream::connect(address) => stream?,
+            };
+            stream.set_nodelay(true)?;
+            if stop.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "gateway client closed",
+                ));
+            }
+            Ok(hyper_util::rt::TokioIo::new(CloseableIo::new(stream, stop)))
+        })
+    }
+}
+
+// The shared transport can retain a pending HTTP/2 stream after its caller
+// drops the response future. Guard the outbound body at the point the transport
+// consumes it, not only at enqueue. Bytes already consumed by hyper/h2 cannot
+// be recalled: a timed-out write remains Unknown, never a rollback promise.
+struct OutboundLifetime {
+    cancelled: Arc<AtomicBool>,
+    permit: Arc<tokio::sync::SemaphorePermit<'static>>,
+}
+impl Drop for OutboundLifetime {
+    fn drop(&mut self) {
+        self.cancelled.store(true, AtomicOrdering::Release);
+    }
+}
+#[derive(Clone)]
+struct GuardedChannel {
+    channel: Channel,
+    permit: Arc<tokio::sync::SemaphorePermit<'static>>,
+    end: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+impl Service<http::Request<tonic::body::Body>> for GuardedChannel {
+    type Response = <Channel as Service<http::Request<tonic::body::Body>>>::Response;
+    type Error = <Channel as Service<http::Request<tonic::body::Body>>>::Error;
+    type Future = <Channel as Service<http::Request<tonic::body::Body>>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        self.channel.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let end = self.end;
+        let cancelled = self.cancelled.clone();
+        let permit = self.permit.clone();
+        self.channel.call(request.map(|inner| {
+            tonic::body::Body::new(GuardedBody {
+                _permit: permit,
+                inner,
+                end,
+                cancelled,
+            })
+        }))
+    }
+}
+struct GuardedBody {
+    // Caller timeout must not release admission while a buffered transport
+    // request still retains its outbound payload. This lease is shared, not
+    // another semaphore acquisition; it lasts until the body is dropped.
+    _permit: Arc<tokio::sync::SemaphorePermit<'static>>,
+    inner: tonic::body::Body,
+    end: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+impl http_body::Body for GuardedBody {
+    type Data = <tonic::body::Body as http_body::Body>::Data;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.cancelled.load(AtomicOrdering::Acquire) || Instant::now() >= self.end {
+            // An error resets the stream; successful EOF could instead make a
+            // partially consumed request appear complete to the receiver.
+            return Poll::Ready(Some(Err(tonic::Status::cancelled(
+                "outbound request expired",
+            ))));
+        }
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 pub(super) use codec::encode_binding;
 fn required<T>(value: Option<T>) -> Result<T> {
@@ -74,18 +275,79 @@ fn remote_error(status: tonic::Status, expected: &pb::CallIdentity) -> Error {
     error
 }
 
-pub(super) async fn request(
+/// An owned, clonable public gRPC client pinned to one endpoint and binding.
+///
+/// Clones share one lazily connected channel. Connection setup, queueing and the
+/// RPC all consume the caller's original deadline and global client admission.
+/// No RPC is retried and no alternate endpoint is selected. Transport reconnect
+/// may establish a new socket to the same address; every response still verifies
+/// the binding/correlation identity, and old session/job tokens remain tied to
+/// their server incarnation. This is not authenticated discovery or failover.
+#[derive(Clone)]
+pub struct GatewayClient {
+    inner: Arc<ClientState>,
+}
+struct ClientState {
     address: SocketAddr,
     binding: Binding,
+    channel: tokio::sync::OnceCell<Channel>,
+    closed: CancellationToken,
+}
+impl GatewayClient {
+    /// Construct a client without network I/O. A Tokio runtime is needed only
+    /// when a request is performed. Dropping the final clone releases the cached
+    /// channel; no process-global endpoint registry is retained.
+    pub fn new(address: SocketAddr, binding: Binding) -> Self {
+        Self {
+            inner: Arc::new(ClientState {
+                address,
+                binding,
+                channel: tokio::sync::OnceCell::new(),
+                closed: CancellationToken::new(),
+            }),
+        }
+    }
+
+    /// Permanently stop this client and all its clones. Socket/queue cleanup
+    /// runs on the owning Tokio runtime; this signal does not wait for cleanup.
+    /// Already-dispatched writes remain unknown, not rolled back.
+    pub fn close(&self) {
+        self.inner.closed.cancel();
+    }
+
+    /// Whether explicit close has been requested for this shared client.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.is_cancelled()
+    }
+
+    /// Perform one operation without retry. Unknown write outcomes require
+    /// explicit original-ID recovery, never automatic mutation replay.
+    pub async fn request(&self, operation: Operation, deadline: Duration) -> Result<Reply> {
+        request(self, operation, deadline).await
+    }
+}
+
+async fn request(
+    client: &GatewayClient,
     operation: Operation,
     deadline: Duration,
 ) -> Result<Reply> {
     check_deadline(deadline)?;
+    if client.is_closed() {
+        return Err(Error::Unknown);
+    }
     // Admission precedes construction and connection, including cold requests.
-    let _permit = CLIENT_ADMISSION
-        .try_acquire()
-        .map_err(|_| Error::Capacity)?;
+    let permit = Arc::new(
+        CLIENT_ADMISSION
+            .try_acquire()
+            .map_err(|_| Error::Capacity)?,
+    );
     let end = Instant::now() + deadline;
+    let outbound = OutboundLifetime {
+        permit,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+    let binding = client.inner.binding.clone();
     let request_id = random()?;
     let expected = pb::CallIdentity {
         request_id: request_id.to_vec(),
@@ -97,20 +359,41 @@ pub(super) async fn request(
         binding,
         operation,
     };
-    tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
+    tokio::select! {
+        biased;
+        _ = client.inner.closed.cancelled() => Err(Error::Unknown),
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
         // Preserve the original logical request envelope budget before opening
         // a socket. Protobuf compression is not permission to expand admission.
         encode(&original, MAX_REQUEST_BYTES)?;
-        let endpoint = Channel::from_shared(format!("http://{address}"))
-            .map_err(|_| Error::Protocol)?
-            .connect_timeout(remaining(end)?)
-            .buffer_size(MAX_CONNECTIONS)
-            .concurrency_limit(MAX_CONNECTIONS);
-        // Keep the transport state machine off the caller's stack, including
-        // callers that await this operation inside large integration workflows.
-        let channel = Box::pin(endpoint.connect())
-            .await
-            .map_err(|_| Error::Unknown)?;
+        // OnceCell serializes cold connection establishment among clones without
+        // holding a synchronous mutex across await. Failure/cancellation leaves
+        // it empty, so a later explicit operation may establish the connection.
+        // The request timeout includes waiting for this single-flight setup.
+        let channel = client
+            .inner
+            .channel
+            .get_or_try_init(|| async {
+                let endpoint = Channel::from_shared(format!("http://{}", client.inner.address))
+                    .map_err(|_| Error::Protocol)?
+                    // Do not freeze the first caller's shorter budget into all
+                    // later reconnects. The outer absolute deadline bounds each
+                    // call; this separately bounds transport connection work.
+                    .connect_timeout(MAX_DEADLINE)
+                    .buffer_size(MAX_CONNECTIONS)
+                    .concurrency_limit(MAX_CONNECTIONS);
+                Box::pin(endpoint.connect_with_connector(ClientConnector { address: client.inner.address, stop: client.inner.closed.clone() }))
+                    .await
+                    .map_err(|_| Error::Unknown)
+            })
+            .await?
+            .clone();
+        let channel = GuardedChannel {
+            permit: outbound.permit.clone(),
+            channel,
+            end,
+            cancelled: outbound.cancelled.clone(),
+        };
         let mut writes = pb::write_service_client::WriteServiceClient::new(channel.clone())
             .max_encoding_message_size(MAX_REQUEST_BYTES)
             .max_decoding_message_size(MAX_RESPONSE_BYTES);
@@ -420,9 +703,8 @@ pub(super) async fn request(
         encode(&response, MAX_RESPONSE_BYTES)?;
         remaining(end)?;
         validate_reply(&original, response)
-    })
-    .await
-    .map_err(|_| Error::Unknown)?
+    }) => result.map_err(|_| Error::Unknown)?,
+    }
 }
 
 fn properties(values: &BTreeMap<String, Value>) -> Result<Vec<pb::Property>> {
@@ -753,6 +1035,118 @@ fn validate_message<M: Message + codec::bounded::BoundedMessage>(message: &M) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestBody {
+        pending: Arc<AtomicBool>,
+        frames: std::collections::VecDeque<http_body::Frame<axum::body::Bytes>>,
+    }
+    impl http_body::Body for TestBody {
+        type Data = axum::body::Bytes;
+        type Error = tonic::Status;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if self.pending.load(AtomicOrdering::Acquire) {
+                Poll::Pending
+            } else {
+                Poll::Ready(self.frames.pop_front().map(Ok))
+            }
+        }
+        fn size_hint(&self) -> http_body::SizeHint {
+            http_body::SizeHint::with_exact(
+                self.frames
+                    .iter()
+                    .filter_map(|f| f.data_ref())
+                    .map(|b| b.len() as u64)
+                    .sum(),
+            )
+        }
+        fn is_end_stream(&self) -> bool {
+            self.frames.is_empty()
+        }
+    }
+    fn guarded_test_body(pending: bool) -> (GuardedBody, OutboundLifetime, Arc<AtomicBool>) {
+        static TEST_ADMISSION: Semaphore = Semaphore::const_new(32);
+        let permit = Arc::new(TEST_ADMISSION.try_acquire().unwrap());
+        let pending = Arc::new(AtomicBool::new(pending));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("test-trailer", http::HeaderValue::from_static("ok"));
+        let body = TestBody {
+            pending: pending.clone(),
+            frames: [
+                http_body::Frame::data(axum::body::Bytes::from_static(b"payload")),
+                http_body::Frame::trailers(trailers),
+            ]
+            .into(),
+        };
+        (
+            GuardedBody {
+                _permit: permit.clone(),
+                inner: tonic::body::Body::new(body),
+                end: Instant::now() + Duration::from_secs(10),
+                cancelled: cancelled.clone(),
+            },
+            OutboundLifetime { cancelled, permit },
+            pending,
+        )
+    }
+    #[test]
+    fn outbound_body_preserves_data_trailers_and_hints() {
+        use http_body::Body;
+        let (mut body, _owner, _) = guarded_test_body(false);
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        assert_eq!(body.size_hint().exact(), Some(7));
+        assert!(!body.is_end_stream());
+        let Poll::Ready(Some(Ok(data))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("missing data")
+        };
+        assert_eq!(data.into_data().unwrap(), "payload");
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(!body.is_end_stream());
+        let Poll::Ready(Some(Ok(trailers))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("missing trailers")
+        };
+        assert_eq!(trailers.into_trailers().unwrap()["test-trailer"], "ok");
+        assert!(body.is_end_stream());
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+    #[test]
+    fn outbound_body_pending_then_expired_rejects_frame() {
+        use http_body::Body;
+        let (mut body, _owner, pending) = guarded_test_body(true);
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
+        body.end = Instant::now();
+        pending.store(false, AtomicOrdering::Release);
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Err(_)))
+        ));
+    }
+    #[test]
+    fn outbound_body_pending_then_owner_future_dropped_rejects_frame() {
+        use http_body::Body;
+        let (mut body, owner, pending) = guarded_test_body(true);
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        let mut request = Box::pin(async move {
+            let _owner = owner;
+            std::future::pending::<()>().await;
+        });
+        assert!(std::future::Future::poll(request.as_mut(), &mut cx).is_pending());
+        assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
+        drop(request);
+        pending.store(false, AtomicOrdering::Release);
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Err(_)))
+        ));
+    }
+
     fn identity() -> pb::CallIdentity {
         pb::CallIdentity {
             request_id: vec![1; 16],

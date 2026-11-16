@@ -100,8 +100,27 @@ async fn public_service_node_child() -> anyhow::Result<()> {
     let internal_grpc = std::env::var("VELAGRAPH_PUBLIC_SERVICE_INTERNAL_GRPC")? == "1";
     let cluster = Cluster::new().in_group(shard);
     let node = Arc::new(cluster.start_durable(1, directory.join("data")).await?);
+    // Optional test-only replicated coordinator. Peers are real durable Raft
+    // nodes in this child process, using the deterministic in-process network.
+    let quorum = std::env::var("VELAGRAPH_PUBLIC_SERVICE_QUORUM").as_deref() == Ok("1");
+    let mut peers = Vec::new();
+    if quorum {
+        for id in 2..=3 {
+            peers.push(
+                cluster
+                    .start_durable(id, directory.join(format!("peer-{id}")))
+                    .await?,
+            );
+        }
+    }
+    let voters = if quorum { vec![1, 2, 3] } else { vec![1] };
     node.raft
-        .initialize(BTreeMap::from([(1, openraft::BasicNode::default())]))
+        .initialize(
+            voters
+                .into_iter()
+                .map(|id| (id, openraft::BasicNode::default()))
+                .collect::<BTreeMap<_, _>>(),
+        )
         .await?;
     tokio::time::timeout(BUDGET, async {
         while node.raft.ensure_linearizable().await.is_err() {
@@ -213,6 +232,50 @@ async fn public_service_node_child() -> anyhow::Result<()> {
         })?,
     )?;
     fs::rename(directory.join("ready.tmp"), directory.join("ready.json"))?;
+    // Test-only fault injection: stop just the graph-query listeners while
+    // the managed participant/control and Raft node remain alive.
+    let mut partitioned = false;
+    loop {
+        if quorum && !partitioned && directory.join("isolate-quorum").exists() {
+            for from in 1..=3 {
+                for to in 1..=3 {
+                    if from != to {
+                        cluster.policy.deny(from, to).await;
+                    }
+                }
+            }
+            partitioned = true;
+            fs::write(directory.join("quorum-isolated"), b"isolated")?;
+        }
+        if quorum && partitioned && directory.join("heal-quorum").exists() {
+            cluster.policy.clear().await;
+            // Explicit fixture recovery of the statically addressed leader,
+            // not a claim that the product discovers or routes a new leader.
+            tokio::time::timeout(BUDGET, async {
+                loop {
+                    node.raft.trigger().elect().await?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if node.raft.ensure_linearizable().await.is_ok() {
+                        break;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            fs::write(directory.join("quorum-healed"), b"healed")?;
+            partitioned = false;
+            fs::remove_file(directory.join("isolate-quorum"))?;
+        }
+        if directory.join("stop-graph").exists() {
+            // Drop hard-cancels the graph transport, including retained
+            // connections; do not wait for graceful client drainage here.
+            drop(graph_grpc);
+            drop(graph);
+            fs::write(directory.join("graph-stopped"), b"stopped")?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -223,6 +286,13 @@ struct NodeProcess {
 }
 impl NodeProcess {
     async fn start(shard: u64, internal_grpc: bool) -> anyhow::Result<Self> {
+        Self::start_with_quorum(shard, internal_grpc, false).await
+    }
+    async fn start_with_quorum(
+        shard: u64,
+        internal_grpc: bool,
+        quorum: bool,
+    ) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir()?;
         let mut child = Command::new(std::env::current_exe()?)
             .args([
@@ -232,6 +302,10 @@ impl NodeProcess {
                 "--nocapture",
             ])
             .env(CHILD_ENV, directory.path())
+            .env(
+                "VELAGRAPH_PUBLIC_SERVICE_QUORUM",
+                if quorum { "1" } else { "0" },
+            )
             .env("VELAGRAPH_PUBLIC_SERVICE_NODE_SHARD", shard.to_string())
             .env(
                 "VELAGRAPH_PUBLIC_SERVICE_INTERNAL_GRPC",
@@ -285,18 +359,38 @@ struct ServiceProcess {
 }
 impl ServiceProcess {
     async fn start(config: &Path, output: PathBuf) -> anyhow::Result<Self> {
+        Self::start_with_drain(config, output, 5000).await
+    }
+    async fn start_with_drain(
+        config: &Path,
+        output: PathBuf,
+        drain_ms: u64,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_http(config, output, drain_ms, "127.0.0.1:0".parse()?).await
+    }
+    async fn start_with_http(
+        config: &Path,
+        output: PathBuf,
+        drain_ms: u64,
+        http: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        let http_string = http.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
+        if !http.ip().is_loopback() {
+            command.arg("--allow-insecure-network");
+        }
         command.args([
             "--config",
             config.to_str().context("config path")?,
             "--http",
-            "127.0.0.1:0",
+            &http_string,
             "--grpc",
             "127.0.0.1:0",
             "--allow-insecure-development",
             "--timeout-ms",
             "15000",
         ]);
+        command.args(["--drain-timeout-ms", &drain_ms.to_string()]);
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(fs::File::create(&output)?))
@@ -405,7 +499,7 @@ fn vertex(external: u8, partition: u32, id: &str) -> Value {
 }
 fn context() -> Option<pb::Context> {
     Some(pb::Context {
-            identity: None,
+        identity: None,
         version: 1,
         timeout_millis: 15_000,
     })
@@ -478,7 +572,9 @@ fn fixed_request(session: &pb::FixedSession, text: &str) -> pb::FixedQueryReques
 }
 fn assert_reason(status: &tonic::Status, reason: pb::error_detail::Reason) {
     assert_eq!(
-        replicated_graph::managed_gateway::decode_grpc_error_detail(status).unwrap().reason,
+        replicated_graph::managed_gateway::decode_grpc_error_detail(status)
+            .unwrap()
+            .reason,
         reason as i32
     );
 }

@@ -572,3 +572,769 @@ async fn legacy_rejection_peer() -> anyhow::Result<(
     });
     Ok((address, attempts, peer))
 }
+
+// #221: ingress selection must never be mistaken for portable session state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_gateways_preserve_owner_pages_and_original_write_status() -> anyhow::Result<()> {
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("service.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut owner =
+        ServiceProcess::start(&config_path, directory.path().join("owner.stdout")).await?;
+    let mut other =
+        ServiceProcess::start(&config_path, directory.path().join("other.stdout")).await?;
+    assert_ne!(owner.child.id(), other.child.id());
+    let original = vertex(1, 7, "1");
+    let (status, committed) =
+        post(owner.address, "/preview1/writes:submit", original.clone()).await?;
+    assert_eq!(status, 200, "{committed}");
+    // This is status recovery, not a new ID or an automatic mutation retry.
+    let (status, recovered) =
+        post(other.address, "/preview1/writes:status", original.clone()).await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(recovered, committed);
+
+    // Two known outgoing edges create a real continuation and whole-row oracle.
+    for (id, vertex_id) in [(2, "2"), (3, "3")] {
+        let (status, reply) = post(
+            owner.address,
+            "/preview1/writes:submit",
+            vertex(id, 7, vertex_id),
+        )
+        .await?;
+        assert_eq!(status, 200, "{reply}");
+    }
+    let edge = |external: u8, id: &str, to: &str| json!({"external_id":format!("{external:02x}").repeat(16),"mutation":{"type":"create_edge","edge":{"id":id,"from":{"partition":7,"id":"1"},"to":{"partition":7,"id":to},"label":"link","properties":{}}}});
+    for write in [edge(4, "10", "2"), edge(5, "11", "3")] {
+        let (status, reply) = post(owner.address, "/preview1/writes:submit", write).await?;
+        assert_eq!(status, 200, "{reply}");
+    }
+    let query = json!({"partition":7,"text":"g.V(1).out().path()"});
+    let open = json!({"read":{"type":"minimum","version":"5"},"ttl_millis":60000,"query":query,"page_size":1});
+    let (status, opened) = post(owner.address, "/preview1/queries:open", open.clone()).await?;
+    assert_eq!(status, 200, "{opened}");
+    let session = opened["result"]["session"].clone();
+    let page = opened["result"]["page"].clone();
+    assert_eq!(session["version"], "5");
+    assert_eq!(page["total"], 2);
+    assert!(!page["next"].is_null(), "must exercise a real continuation");
+    let fetch = json!({"session":session,"query":query,"cursor":page["next"],"page_size":1});
+    let (status, wrong_owner) =
+        post(other.address, "/preview1/queries:fetch", fetch.clone()).await?;
+    assert_eq!(status, 410, "{wrong_owner}");
+    assert_eq!(wrong_owner["error"]["code"], "session_unavailable");
+
+    let other_channel = grpc_channel(other.grpc).await?;
+    let mut other_queries = pb::query_service_client::QueryServiceClient::new(other_channel);
+    let wrong_rpc = other_queries
+        .fetch(pb::FetchRequest {
+            context: context(),
+            session: Some(session_proto(&session)),
+            query: Some(pb::Query {
+                partition: 7,
+                text: "g.V(1).out().path()".into(),
+            }),
+            cursor: Some(pb::Cursor {
+                token: decode_hex(&page["next"]),
+            }),
+            page_size: 1,
+        })
+        .await
+        .unwrap_err();
+    assert_reason(&wrong_rpc, pb::error_detail::Reason::SessionUnavailable);
+
+    // Writes through another ingress do not advance the owner's pinned result.
+    let (status, added) =
+        post(other.address, "/preview1/writes:submit", edge(6, "12", "2")).await?;
+    assert_eq!(status, 200, "{added}");
+    let (status, continued) = post(owner.address, "/preview1/queries:fetch", fetch.clone()).await?;
+    assert_eq!(status, 200, "{continued}");
+    assert_eq!(continued["result"]["session"], session);
+    let expected_path = |edge_id: &str, to: &str| json!([{"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"},{"type":"edge","partition":7,"id":edge_id},{"type":"vertex","partition":7,"id":to}]}]);
+    assert_eq!(page["rows"], expected_path("10", "2"));
+    assert_eq!(
+        continued["result"]["page"]["rows"],
+        expected_path("11", "3")
+    );
+    assert_eq!(continued["result"]["page"]["total"], 2);
+    assert!(continued["result"]["page"]["next"].is_null());
+    assert_eq!(
+        post(owner.address, "/preview1/queries:fetch", fetch.clone())
+            .await?
+            .1,
+        continued
+    );
+
+    owner.graceful_stop().await?;
+    let (status, unavailable) =
+        post(other.address, "/preview1/queries:fetch", fetch.clone()).await?;
+    assert_eq!(status, 410, "{unavailable}");
+    assert_eq!(unavailable["error"]["code"], "session_unavailable");
+    let (status, recovered) = post(other.address, "/preview1/writes:status", original).await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(recovered, committed);
+    // Healthy ingress can open a new explicit session, never relabel the old one.
+    let (status, fresh) = post(other.address, "/preview1/queries:open", open).await?;
+    assert_eq!(status, 200, "{fresh}");
+    assert_ne!(
+        fresh["result"]["session"]["incarnation"],
+        session["incarnation"]
+    );
+    assert_eq!(fresh["result"]["session"]["version"], "6");
+    assert_eq!(fresh["result"]["page"]["total"], 3);
+
+    let mut restarted =
+        ServiceProcess::start(&config_path, directory.path().join("restarted.stdout")).await?;
+    let (status, stale) = post(restarted.address, "/preview1/queries:fetch", fetch).await?;
+    assert_eq!(status, 410, "{stale}");
+    assert_eq!(stale["error"]["code"], "session_unavailable");
+    restarted.graceful_stop().await?;
+    other.graceful_stop().await?;
+    Ok(())
+}
+
+/// Lose the public acknowledgement only after the real gateway completed Submit.
+/// Recovery uses the persisted request at another ingress, not a mutation retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_write_ack_recovers_original_decision_through_other_gateway() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("service.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut owner =
+        ServiceProcess::start(&config_path, directory.path().join("owner.stdout")).await?;
+    let mut other =
+        ServiceProcess::start(&config_path, directory.path().join("other.stdout")).await?;
+    assert_ne!(owner.child.id(), other.child.id());
+    let original = vertex(1, 7, "1");
+
+    // One-shot fault ingress: consume exactly this bounded HTTP request, forward
+    // it once, then discard the entire real response. No timing race or sleep
+    // decides whether the write committed before the client loses its ACK.
+    let body = serde_json::to_vec(&original)?;
+    let mut request = format!("POST /preview1/writes:submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+    request.extend_from_slice(&body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let expected_request = request.clone();
+    let forwarded = original.clone();
+    let owner_address = owner.address;
+    let fault = tokio::spawn(async move {
+        tokio::time::timeout(BUDGET, async move {
+            let (mut client, _) = listener.accept().await?;
+            let mut received = vec![0; expected_request.len()];
+            client.read_exact(&mut received).await?;
+            anyhow::ensure!(
+                received == expected_request,
+                "fault ingress request changed"
+            );
+            let actual_ack = post(owner_address, "/preview1/writes:submit", forwarded).await?;
+            // The frontend receives neither status line nor body. The returned
+            // ACK is test instrumentation, never supplied to the recovering client.
+            client.shutdown().await?;
+            Ok::<_, anyhow::Error>(actual_ack)
+        })
+        .await?
+    });
+    tokio::time::timeout(BUDGET, async {
+        let mut client = tokio::net::TcpStream::connect(address).await?;
+        client.write_all(&request).await?;
+        let mut received = Vec::new();
+        client.take(1).read_to_end(&mut received).await?;
+        anyhow::ensure!(
+            received.is_empty(),
+            "lost-ACK client unexpectedly received response bytes"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let (status, discarded_ack) = fault.await??;
+    assert_eq!(status, 200, "{discarded_ack}");
+    assert_eq!(
+        discarded_ack["result"]["status"],
+        json!({"type":"committed","ordinal":"1","visible":true})
+    );
+    owner.graceful_stop().await?;
+
+    // First recovery action is Status with the original ID AND exact command.
+    let (status, recovered) =
+        post(other.address, "/preview1/writes:status", original.clone()).await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(recovered, discarded_ack);
+    assert_eq!(recovered["result"]["external_id"], original["external_id"]);
+
+    // Only after establishing the outcome do we deliberately exercise explicit
+    // same-command replay. It must retain the decision, not advance logical V.
+    let (status, replay) = post(other.address, "/preview1/writes:submit", original).await?;
+    assert_eq!(status, 200, "{replay}");
+    assert_eq!(replay, recovered);
+    let changed = vertex(1, 7, "2");
+    for route in ["/preview1/writes:status", "/preview1/writes:submit"] {
+        let (status, rejected) = post(other.address, route, changed.clone()).await?;
+        assert_eq!(status, 409, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "identity_mismatch");
+    }
+    let (status, opened) = post(other.address, "/preview1/queries:open", json!({"read":{"type":"minimum","version":"1"},"ttl_millis":60000,"query":{"partition":7,"text":"g.V(1,2).path()"},"page_size":10})).await?;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(opened["result"]["session"]["version"], "1");
+    assert_eq!(opened["result"]["page"]["total"], 1);
+    assert_eq!(opened["result"]["page"]["offset"], 0);
+    assert_eq!(opened["result"]["page"]["completeness"], "unverified");
+    assert_eq!(
+        opened["result"]["page"]["rows"],
+        json!([{"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"}]}])
+    );
+    assert!(opened["result"]["page"]["next"].is_null());
+    other.graceful_stop().await?;
+    Ok(())
+}
+
+/// The control listener being alive is insufficient: acquisition also needs
+/// every separately configured graph-query listener and its retained proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_readiness_observes_graph_listener_failure() -> anyhow::Result<()> {
+    let (coordinator, a, mut b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("readiness.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut service =
+        ServiceProcess::start(&config_path, directory.path().join("readiness.stdout")).await?;
+    let mut rpc = pb::readiness_service_client::ReadinessServiceClient::new(
+        grpc_channel(service.grpc).await?,
+    );
+    let check = || pb::ReadinessRequest { context: context() };
+    for version in 0..=1 {
+        let (status, body) = post(service.address, "/preview1/readiness", json!({})).await?;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["state"], "fixed_session_read_captured");
+        assert_eq!(body["version"], version);
+        assert_eq!(body["profile"], "parity2_mib_v1");
+        assert_eq!(body["restore_supported"], false);
+        assert_eq!(body["production_ready"], false);
+        let observed = rpc.check(check()).await?.into_inner();
+        assert_eq!(observed.version, version);
+        assert!(observed.identity.is_none());
+        if version == 0 {
+            let (status, body) = post(
+                service.address,
+                "/preview1/writes:submit",
+                vertex(1, 7, "1"),
+            )
+            .await?;
+            assert_eq!(status, 200, "{body}");
+        }
+    }
+    let (status, _) = post(
+        service.address,
+        "/preview1/readiness",
+        json!({"query":"g.V()"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "readiness must not accept a query");
+    for invalid in [json!([]), json!(null), json!(true), json!("{}")] {
+        let (status, body) = post(service.address, "/preview1/readiness", invalid.clone()).await?;
+        assert_eq!(status, 400, "non-object readiness body {invalid}: {body}");
+    }
+
+    let expected_identity = pb::CallIdentity {
+        request_id: vec![42; 16],
+        binding: Some(pb::Binding {
+            authority_shard: 9,
+            authority_mode: vec![9; 16],
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: [7, 8]
+                .map(|shard| pb::BindingMember {
+                    shard,
+                    epoch: 1,
+                    mode: vec![shard as u8; 16],
+                })
+                .to_vec(),
+            capacity_profile: pb::CapacityProfile::LegacyCountV1 as i32,
+            mapping: pb::Mapping::PartitionEqualsShardV1 as i32,
+        }),
+    };
+    let identified = pb::ReadinessRequest {
+        context: Some(pb::Context {
+            version: 2,
+            timeout_millis: 15_000,
+            identity: Some(expected_identity.clone()),
+        }),
+    };
+    let response = rpc.check(identified.clone()).await?.into_inner();
+    assert_eq!(response.version, 1);
+    assert_eq!(response.identity, Some(expected_identity));
+    let mut mismatched = identified;
+    mismatched
+        .context
+        .as_mut()
+        .unwrap()
+        .identity
+        .as_mut()
+        .unwrap()
+        .binding
+        .as_mut()
+        .unwrap()
+        .coordinator_epoch += 1;
+    let error = rpc.check(mismatched).await.unwrap_err();
+    assert_reason(&error, pb::error_detail::Reason::IdentityMismatch);
+
+    fs::write(b._directory.path().join("stop-graph"), b"stop")?;
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            anyhow::ensure!(
+                b.child.try_wait()?.is_none(),
+                "node exited instead of just stopping graph listeners"
+            );
+            if b._directory.path().join("graph-stopped").exists() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    // The previously committed write remains discoverable through control.
+    let (status, body) = post(
+        service.address,
+        "/preview1/writes:status",
+        vertex(1, 7, "1"),
+    )
+    .await?;
+    assert_eq!(status, 200, "control path must remain usable: {body}");
+    let (status, body) = post(service.address, "/preview1/readiness", json!({})).await?;
+    assert_ne!(
+        status, 200,
+        "dead graph listener was reported ready: {body}"
+    );
+    assert!(body.get("error").is_some(), "{body}");
+    let failed = rpc.check(check()).await.unwrap_err();
+    assert_ne!(failed.code(), tonic::Code::Ok);
+    service.graceful_stop().await?;
+    Ok(())
+}
+
+/// A real HTTP/1 100-continue exchange is a barrier: the service has entered
+/// the request handler and polled its body before the termination signal.
+#[cfg(unix)]
+async fn admitted_partial_probe(address: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
+    admitted_partial_probe_with_timeout(address, 15000).await
+}
+#[cfg(unix)]
+async fn admitted_partial_probe_with_timeout(
+    address: SocketAddr,
+    timeout_ms: u64,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(address).await?;
+    socket.write_all(format!("POST /preview1/readiness HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nExpect: 100-continue\r\nConnection: close\r\nx-velagraph-timeout-ms: {timeout_ms}\r\n\r\n").as_bytes()).await?;
+    let mut interim = Vec::new();
+    tokio::time::timeout(BUDGET, async {
+        while !interim.ends_with(b"\r\n\r\n") {
+            anyhow::ensure!(interim.len() < 4096, "unexpected interim response");
+            interim.push(socket.read_u8().await?);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert_eq!(interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+    Ok(socket)
+}
+
+#[cfg(unix)]
+async fn wait_ingress_closed(service: &ServiceProcess) -> anyhow::Result<()> {
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            let http_closed = tokio::net::TcpStream::connect(service.address)
+                .await
+                .is_err();
+            let grpc_closed = tokio::net::TcpStream::connect(service.grpc).await.is_err();
+            if http_closed && grpc_closed {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// SIGTERM stops both ingress listeners while an admitted request finishes;
+/// a body that never arrives cannot hold process removal past the drain budget.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_drain_finishes_admitted_request_and_bounds_stalled_body() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start(9, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("drain.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut other =
+        ServiceProcess::start(&config_path, directory.path().join("drain-other.stdout")).await?;
+    let mut owner = ServiceProcess::start_with_drain(
+        &config_path,
+        directory.path().join("drain-owner.stdout"),
+        5000,
+    )
+    .await?;
+    let mut admitted = admitted_partial_probe(owner.address).await?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(owner.child.id() as i32).context("owner pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    // Do not release the admitted request until both listeners have actually
+    // stopped accepting. This is not a sleep-based guess about signal delivery.
+    wait_ingress_closed(&owner).await?;
+    assert!(
+        owner.child.try_wait()?.is_none(),
+        "admitted request was aborted at drain start"
+    );
+    admitted.write_all(b"{}").await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(BUDGET, admitted.read_to_end(&mut response)).await??;
+    let split = response
+        .windows(4)
+        .position(|s| s == b"\r\n\r\n")
+        .context("response headers")?
+        + 4;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let body: Value = serde_json::from_slice(&response[split..])?;
+    assert_eq!(
+        body,
+        json!({"state":"fixed_session_read_captured","version":0,"profile":"parity2_mib_v1","restore_supported":false,"production_ready":false})
+    );
+    // Wait for the already signalled owner; do not send TERM a second time.
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Some(status) = owner.child.try_wait()? {
+                anyhow::ensure!(status.success(), "drained owner failed: {status}");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    let (status, live) = post(other.address, "/preview1/readiness", json!({})).await?;
+    assert_eq!(status, 200, "other ingress must survive removal: {live}");
+
+    let mut stalled = ServiceProcess::start_with_drain(
+        &config_path,
+        directory.path().join("drain-stalled.stdout"),
+        100,
+    )
+    .await?;
+    let _unfinished = admitted_partial_probe(stalled.address).await?;
+    let started = std::time::Instant::now();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(stalled.child.id() as i32).context("stalled pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    // A generous process/scheduler margin, still well below the 15s request
+    // timeout. The configured 100ms budget is not asserted as a real-time SLA.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = stalled.child.try_wait()? {
+                anyhow::ensure!(status.success(), "stalled drain failed: {status}");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("stalled request outlived bounded process drain")??;
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // The grace period cannot extend a shorter original caller deadline.
+    let mut short = ServiceProcess::start_with_drain(
+        &config_path,
+        directory.path().join("drain-short.stdout"),
+        5000,
+    )
+    .await?;
+    let _short_body = admitted_partial_probe_with_timeout(short.address, 1000).await?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(short.child.id() as i32).context("short pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(status) = short.child.try_wait()? {
+                anyhow::ensure!(status.success(), "short-deadline drain failed: {status}");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("drain extended original caller deadline")??;
+    other.graceful_stop().await?;
+    Ok(())
+}
+
+/// Public HTTP/gRPC cross-process admission with a three-voter coordinator.
+/// Raft peers share the node child process; DropPolicy is a test partition,
+/// NOT evidence of independent-host or independent-voter-process availability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_interfaces_fail_closed_without_coordinator_quorum_and_recover() -> anyhow::Result<()>
+{
+    let (mut coordinator, a, b) = tokio::try_join!(
+        NodeProcess::start_with_quorum(9, true, true),
+        NodeProcess::start(7, true),
+        NodeProcess::start(8, true)
+    )?;
+    let directory = tempfile::tempdir()?;
+    let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
+    let config_path = directory.path().join("quorum.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let mut service =
+        ServiceProcess::start(&config_path, directory.path().join("service.stdout")).await?;
+    let original = vertex(71, 7, "1");
+    let (status, baseline) =
+        post(service.address, "/preview1/writes:submit", original.clone()).await?;
+    assert_eq!(status, 200, "{baseline}");
+    let query = json!({"read":{"type":"minimum","version":"1"},"ttl_millis":60000,"query":{"partition":7,"text":"g.V(1,2,3).path()"},"page_size":10});
+    let (status, before) = post(service.address, "/preview1/queries:open", query.clone()).await?;
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(before["result"]["page"]["total"], 1);
+
+    fs::write(
+        coordinator._directory.path().join("isolate-quorum"),
+        b"isolate",
+    )?;
+    tokio::time::timeout(BUDGET, async {
+        while !coordinator
+            ._directory
+            .path()
+            .join("quorum-isolated")
+            .exists()
+        {
+            anyhow::ensure!(
+                coordinator.child.try_wait()?.is_none(),
+                "coordinator process exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    // No client/server budget is raised. The same ordinary public requests must
+    // not turn an absent majority into a successful latest read or write ACK.
+    let (status, unavailable) =
+        post(service.address, "/preview1/queries:open", query.clone()).await?;
+    eprintln!("quorum query HTTP status={status} body={unavailable}");
+    assert_eq!(status, 503, "{unavailable}");
+    assert_eq!(unavailable["error"]["code"], "outcome_unknown");
+    assert!(unavailable.get("error").is_some(), "{unavailable}");
+    let mut reads = pb::readiness_service_client::ReadinessServiceClient::new(
+        grpc_channel(service.grpc).await?,
+    );
+    let unavailable_rpc = reads
+        .check(pb::ReadinessRequest { context: context() })
+        .await
+        .unwrap_err();
+    assert_reason(&unavailable_rpc, pb::error_detail::Reason::OutcomeUnknown);
+    let channel = grpc_channel(service.grpc).await?;
+    let mut grpc_queries = pb::query_service_client::QueryServiceClient::new(channel.clone());
+    let grpc_open = pb::OpenRequest {
+        context: context(),
+        profile: None,
+        read: Some(pb::ReadSelector {
+            kind: Some(pb::read_selector::Kind::Minimum(1)),
+        }),
+        ttl_millis: 60_000,
+        query: Some(pb::Query {
+            partition: 7,
+            text: "g.V(1,2,3).path()".into(),
+        }),
+        page_size: 10,
+    };
+    let query_error = grpc_queries.open(grpc_open.clone()).await.unwrap_err();
+    assert_reason(&query_error, pb::error_detail::Reason::OutcomeUnknown);
+    let mut grpc_writes = pb::write_service_client::WriteServiceClient::new(channel);
+    let write_rpc = pb::WriteRequest {
+        context: context(),
+        external_id: vec![73; 16],
+        mutation: Some(pb::Mutation {
+            kind: Some(pb::mutation::Kind::CreateVertex(pb::CreateVertex {
+                partition: 7,
+                vertex: Some(pb::Vertex {
+                    id: 3,
+                    labels: vec!["person".into()],
+                    properties: Vec::new(),
+                }),
+            })),
+        }),
+    };
+    let rpc_failed = grpc_writes.submit(write_rpc).await;
+    assert_reason(
+        &rpc_failed.unwrap_err(),
+        pb::error_detail::Reason::OutcomeUnknown,
+    );
+    let uncertain = vertex(72, 7, "2");
+    let (write_status, write_response) = post(
+        service.address,
+        "/preview1/writes:submit",
+        uncertain.clone(),
+    )
+    .await?;
+    eprintln!("quorum write HTTP status={write_status} body={write_response}");
+    assert_eq!(write_status, 503, "{write_response}");
+    assert_eq!(write_response["error"]["code"], "outcome_unknown");
+    anyhow::ensure!(
+        coordinator.child.try_wait()?.is_none(),
+        "partition test killed coordinator process"
+    );
+
+    fs::write(coordinator._directory.path().join("heal-quorum"), b"heal")?;
+    tokio::time::timeout(BUDGET, async {
+        while !coordinator._directory.path().join("quorum-healed").exists() {
+            anyhow::ensure!(
+                coordinator.child.try_wait()?.is_none(),
+                "coordinator process exited during recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let (status, retained) = post(service.address, "/preview1/writes:status", original).await?;
+    assert_eq!(status, 200, "{retained}");
+    assert_eq!(retained, baseline, "previous committed decision changed");
+    // Determine the uncertain original-ID outcome before a deliberate exact-ID
+    // replay. Never infer an abort or silently issue a replacement transaction.
+    let (status, outcome) = post(
+        service.address,
+        "/preview1/writes:status",
+        uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{outcome}");
+    assert!(
+        matches!(
+            outcome["result"]["status"]["type"].as_str(),
+            Some("absent" | "pending" | "committed")
+        ),
+        "unexpected original-ID outcome: {outcome}"
+    );
+    assert_eq!(outcome["result"]["external_id"], uncertain["external_id"]);
+    let (status, recovered) = post(
+        service.address,
+        "/preview1/writes:submit",
+        uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{recovered}");
+    assert_eq!(
+        recovered["result"]["status"],
+        json!({"type":"committed","ordinal":"2","visible":true})
+    );
+    let (status, replayed) = post(service.address, "/preview1/writes:submit", uncertain).await?;
+    assert_eq!(status, 200, "{replayed}");
+    assert_eq!(replayed, recovered);
+    let rpc_uncertain = vertex(73, 7, "3");
+    let (status, outcome) = post(
+        service.address,
+        "/preview1/writes:status",
+        rpc_uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{outcome}");
+    assert!(
+        matches!(
+            outcome["result"]["status"]["type"].as_str(),
+            Some("absent" | "pending" | "committed")
+        ),
+        "unexpected original-ID outcome: {outcome}"
+    );
+    let (status, rpc_recovered) = post(
+        service.address,
+        "/preview1/writes:submit",
+        rpc_uncertain.clone(),
+    )
+    .await?;
+    assert_eq!(status, 200, "{rpc_recovered}");
+    assert_eq!(
+        rpc_recovered["result"]["status"],
+        json!({"type":"committed","ordinal":"3","visible":true})
+    );
+    let (status, rpc_replayed) =
+        post(service.address, "/preview1/writes:submit", rpc_uncertain).await?;
+    assert_eq!(status, 200, "{rpc_replayed}");
+    assert_eq!(
+        rpc_replayed, rpc_recovered,
+        "gRPC original ID must retain its one decision"
+    );
+    let (status, complete) = post(service.address, "/preview1/queries:open", query).await?;
+    assert_eq!(status, 200, "{complete}");
+    assert_eq!(complete["result"]["session"]["version"], "3");
+    assert_eq!(complete["result"]["page"]["total"], 3);
+    assert_eq!(
+        complete["result"]["page"]["rows"],
+        json!([
+            {"type":"path","elements":[{"type":"vertex","partition":7,"id":"1"}]},
+            {"type":"path","elements":[{"type":"vertex","partition":7,"id":"2"}]},
+            {"type":"path","elements":[{"type":"vertex","partition":7,"id":"3"}]}
+        ])
+    );
+    assert!(complete["result"]["page"]["next"].is_null());
+    let (status, old_page) = post(service.address, "/preview1/queries:fetch", json!({
+        "session": before["result"]["session"], "query": {"partition":7,"text":"g.V(1,2,3).path()"}, "cursor":null,"page_size":10
+    })).await?;
+    assert_eq!(status, 200, "{old_page}");
+    assert_eq!(old_page["result"]["session"], before["result"]["session"]);
+    assert_eq!(
+        old_page["result"]["page"], before["result"]["page"],
+        "admitted old-V result changed after quorum loss/recovery"
+    );
+    let grpc_recovered = grpc_queries.open(grpc_open).await?.into_inner();
+    assert_eq!(grpc_recovered.session.unwrap().version, 3);
+    let grpc_page = grpc_recovered.page.unwrap();
+    assert_eq!(grpc_page.total, 3);
+    assert_eq!(
+        grpc_page.rows,
+        (1..=3)
+            .map(|id| pb::Row {
+                kind: Some(pb::row::Kind::Path(pb::Path {
+                    elements: vec![pb::QualifiedElement {
+                        kind: Some(pb::qualified_element::Kind::Vertex(pb::Entity {
+                            partition: 7,
+                            id
+                        }))
+                    }]
+                }))
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(grpc_page.next.is_none());
+    reads
+        .check(pb::ReadinessRequest { context: context() })
+        .await?;
+    service.graceful_stop().await?;
+    Ok(())
+}

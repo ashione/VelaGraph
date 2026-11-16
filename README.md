@@ -10,7 +10,7 @@ specialized for one dataset.
 > **Experimental, not production-ready.** Several APIs deliberately have different
 > consistency and capacity contracts. Choose the path below before building on it.
 > Network services are unauthenticated plaintext development endpoints; the public
-> HTTP/gRPC preview is loopback-only, not production-ready.
+> HTTP/gRPC preview defaults to loopback; HTTP has an explicit trusted-network opt-in. Neither is production-ready.
 
 [Quick start](#quick-start) · [Capabilities](#choose-your-graph-path) ·
 [Architecture](#architecture) · [Roadmap](docs/ROADMAP.md) ·
@@ -69,9 +69,24 @@ cross-shard observed queries, or read [CONTRIBUTING](CONTRIBUTING.md) for develo
 and tests. The distributed demo uses plaintext loopback, single-voter groups and
 explicit Unverified completeness; it does not establish node-loss tolerance.
 
+### Start a fresh managed service
+
+For a plaintext loopback demo with three independent nodes and a public HTTP/gRPC
+service, use a directory that does not already exist:
+
+```sh
+bash scripts/managed-service-demo.sh /tmp/velagraph-first-demo
+```
+
+The script builds the source and prints the actual HTTP/gRPC addresses. Ctrl-C
+stops the processes; data is retained, but this fresh-only demo refuses to reuse
+or restore that directory. See [write/query examples and limits](docs/MANAGED_SERVICE_DEMO.md)
+and the [design](docs/MANAGED_SERVICE_DEMO_DESIGN.md). Single-voter groups are not
+HA, and these unauthenticated listeners must stay on loopback.
+
 ### Serve an already activated managed cohort
 
-The [graph-service guide](docs/PUBLIC_SERVICE_CLI.md) documents the loopback
+The [graph-service guide](docs/PUBLIC_SERVICE_CLI.md) documents the default-loopback
 HTTP/gRPC preview, configuration and exact launch command. It requires existing
 activated managed nodes and their gRPC endpoints; it is not a one-command cluster
 bootstrap or restore workflow. HTTP `/preview1` is not the final protobuf JSON

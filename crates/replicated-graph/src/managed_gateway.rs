@@ -42,6 +42,7 @@ pub fn decode_grpc_error_detail(status: &tonic::Status) -> Result<public_proto::
 
 #[path = "managed_gateway_grpc_client.rs"]
 mod grpc_client;
+pub use grpc_client::GatewayClient;
 #[path = "managed_gateway_jobs.rs"]
 mod jobs;
 #[path = "managed_gateway_local.rs"]
@@ -70,6 +71,28 @@ use tokio::{
     sync::{watch, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
 };
+
+// Adapter-local admission fence. The first drain fixes an absolute bound;
+// repeated calls cannot reopen admission or extend the grace period.
+#[derive(Default)]
+struct Drain {
+    end: Mutex<Option<Instant>>,
+}
+impl Drain {
+    fn begin(&self, grace: Duration) -> Result<()> {
+        check_deadline(grace)?;
+        let mut end = self.end.lock().unwrap();
+        let proposed = Instant::now() + grace;
+        *end = Some(end.unwrap_or(proposed));
+        Ok(())
+    }
+    fn end(&self) -> Option<Instant> {
+        *self.end.lock().unwrap()
+    }
+    fn admitting(&self) -> bool {
+        self.end().is_none()
+    }
+}
 
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -745,6 +768,7 @@ struct State {
     memory: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     submit: tokio::sync::Mutex<()>,
+    readiness: Arc<Semaphore>,
     timing: Option<timing::Sender>,
 }
 impl State {
@@ -1301,6 +1325,7 @@ impl Service {
             memory: Arc::new(Semaphore::new(MAX_SESSIONS)),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             submit: tokio::sync::Mutex::new(()),
+            readiness: Arc::new(Semaphore::new(1)),
         });
         // Validate live identities and persistent zero baseline before accepting.
         tokio::time::timeout(
@@ -1344,7 +1369,31 @@ impl Service {
     /// validated live managed gateway. Offline restored nodes cannot create this
     /// gateway; no restore marker or readiness override is provided here.
     pub async fn bind_http(&self, bind: SocketAddr, deadline: Duration) -> Result<HttpService> {
-        http::bind(self.state.clone(), self.stop.subscribe(), bind, deadline).await
+        http::bind(
+            self.state.clone(),
+            self.stop.subscribe(),
+            bind,
+            deadline,
+            false,
+        )
+        .await
+    }
+    /// Explicit plaintext HTTP opt-in for a trusted network or authenticated proxy.
+    /// This provides neither authentication nor TLS. Never expose directly to an
+    /// untrusted network. Admission, identity and recovery checks are unchanged.
+    pub async fn bind_http_trusted_network(
+        &self,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<HttpService> {
+        http::bind(
+            self.state.clone(),
+            self.stop.subscribe(),
+            bind,
+            deadline,
+            true,
+        )
+        .await
     }
     /// Bind the typed public gRPC adapter to the same live managed state.
     /// Only loopback listeners are accepted; no restore or authentication bypass.
@@ -1368,7 +1417,8 @@ impl Drop for Service {
         let _ = self.stop.send(true);
     }
 }
-/// Performs no automatic retry. Reuse the exact original external ID and
+/// One-shot request without automatic retry. Use [`GatewayClient`] to reuse a
+/// bounded channel across requests. Recover the exact original external ID and
 /// mutation after Unknown. The typed server confirms binding and request identity.
 pub async fn request(
     address: SocketAddr,
@@ -1376,7 +1426,9 @@ pub async fn request(
     operation: Operation,
     deadline: Duration,
 ) -> Result<Reply> {
-    grpc_client::request(address, binding, operation, deadline).await
+    GatewayClient::new(address, binding)
+        .request(operation, deadline)
+        .await
 }
 fn validate_reply(request: &Request, response: Response) -> Result<Reply> {
     if response.version != VERSION
@@ -1710,3 +1762,22 @@ async fn grpc_local_config(
 #[cfg(test)]
 #[path = "managed_gateway_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    #[test]
+    fn drain_fences_once_and_never_extends() {
+        let drain = Drain::default();
+        assert!(drain.admitting());
+        assert!(drain.begin(Duration::ZERO).is_err());
+        assert!(drain.admitting());
+        drain.begin(Duration::from_secs(1)).unwrap();
+        let first = drain.end().unwrap();
+        assert!(!drain.admitting());
+        drain.begin(Duration::from_secs(60)).unwrap();
+        assert_eq!(drain.end(), Some(first));
+        drain.begin(Duration::from_millis(1)).unwrap();
+        assert_eq!(drain.end(), Some(first));
+    }
+}

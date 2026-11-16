@@ -2441,6 +2441,37 @@ async fn byte_bound_independent_processes_small_lifecycle_recovery() -> anyhow::
     .await?
 }
 
+/// Opt-in paired experiment, not a release correctness gate or a speedup claim.
+/// Each sample retains the complete existing small lifecycle and its deadlines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled diagnostic overhead comparison; run with managed_timing_compare.py"]
+async fn managed_diagnostics_controlled_comparison() -> anyhow::Result<()> {
+    let _scenario = PROCESS_SCENARIO.lock().await;
+    // Warm both modes without using their measurements. Alternate ABBA/BAAB
+    // blocks to reduce (not eliminate) cache, startup and ordering confounding.
+    small_lifecycle_recovery(false).await?;
+    small_lifecycle_recovery(true).await?;
+    let order = [false, true, true, false, true, false, false, true];
+    let mut samples = Vec::new();
+    for (index, enabled) in order.into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        small_lifecycle_recovery(enabled).await?;
+        samples.push(serde_json::json!({
+            "index": index, "enabled": enabled,
+            "lifecycle_elapsed_ns": started.elapsed().as_nanos(),
+        }));
+    }
+    // No successful comparison is emitted if any correctness assertion fails.
+    eprintln!(
+        "managed diagnostic comparison: {}",
+        serde_json::json!({
+            "format": 1, "warmups": 2, "samples": samples,
+            "scope": "whole small lifecycle including startup, writes, queries, reopen and restore; not pure instrumentation cost",
+        })
+    );
+    Ok(())
+}
+
 async fn small_lifecycle_recovery(enabled: bool) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(240), async {
         let config = ProcessConfig {

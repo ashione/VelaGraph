@@ -240,66 +240,83 @@ pub(super) fn valid_page(
     fixed_execution::validate(&request(query)).is_ok()
         && pages::valid_page(query, cursor, size, page, binding)
 }
-impl State {
-    pub(super) fn get_local(&self, descriptor: &LocalSession) -> Result<Arc<Retained>> {
-        self.expire();
-        if descriptor.incarnation != self.incarnation {
-            return Err(Error::SessionUnavailable);
+// Acquisition owns cleanup and admission even when its caller is cancelled.
+// An Open whose reply is lost has no trustworthy descriptor; its node TTL is
+// still the final backstop. Cleanup never retries an open or a mutation.
+struct CapturedLocal {
+    sessions: BTreeMap<u64, fixed_execution::NodeSession>,
+    work: Option<Arc<OwnedSemaphorePermit>>,
+    memory: Option<OwnedSemaphorePermit>,
+    execution: Option<tokio::sync::SemaphorePermit<'static>>,
+    flight: Option<OwnedSemaphorePermit>,
+}
+impl CapturedLocal {
+    fn new(
+        work: Arc<OwnedSemaphorePermit>,
+        memory: OwnedSemaphorePermit,
+        execution: tokio::sync::SemaphorePermit<'static>,
+        flight: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            work: Some(work),
+            memory: Some(memory),
+            execution: Some(execution),
+            flight,
         }
-        let sessions = self.local_sessions.lock().unwrap();
-        let found = sessions
-            .get(&descriptor.token)
-            .ok_or(Error::SessionUnavailable)?;
-        if found.descriptor != *descriptor {
-            return Err(Error::Identity);
-        }
-        if found.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::SessionUnavailable);
-        }
-        Ok(found.clone())
     }
+    async fn close(&mut self) {
+        // Separate bounded teardown budget, not an extension to acquisition.
+        fixed_execution::close(
+            &self.sessions,
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await;
+        self.sessions.clear();
+    }
+}
+impl Drop for CapturedLocal {
+    fn drop(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let sessions = std::mem::take(&mut self.sessions);
+        let permits = (
+            self.work.take(),
+            self.memory.take(),
+            self.execution.take(),
+            self.flight.take(),
+        );
+        runtime.spawn(async move {
+            let _permits = permits;
+            fixed_execution::close(
+                &sessions,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )
+            .await;
+        });
+    }
+}
+
+impl State {
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn open_local(
+    async fn capture_local(
         &self,
-        requested_profile: Option<LocalReadProfile>,
+        profile: LocalReadProfile,
         version: Option<u64>,
         minimum_version: Option<u64>,
-        ttl_millis: u64,
-        query: Query,
-        page_size: u16,
-        work: Arc<OwnedSemaphorePermit>,
+        ttl: Duration,
         end: Instant,
-    ) -> Result<Reply> {
+        capture: &mut CapturedLocal,
+    ) -> Result<(u64, Instant)> {
         let routes = self
             .config
             .local_routes
             .as_ref()
             .ok_or(Error::Query(QueryFailure::Unsupported))?;
-        let ttl = Duration::from_millis(ttl_millis);
-        if ttl.is_zero() || ttl > MAX_TTL || !(1..=MAX_PAGE_SIZE).contains(&page_size) {
-            return Err(Error::Protocol);
-        }
-        let req = request(&query);
-        fixed_execution::validate(&req).map_err(Error::Query)?;
-        if !self
-            .config
-            .binding
-            .cohort
-            .members
-            .iter()
-            .any(|m| m.shard == u64::from(query.partition))
-        {
-            return Err(Error::Identity);
-        }
-        // Reuse the existing process-wide observed coordinator execution gate.
-        // Certification and proof preflight are part of the same admitted work.
-        let execution = fixed_execution::admit_execution().map_err(Error::Query)?;
-        self.expire();
-        let memory = self
-            .memory
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Capacity)?;
         let cut = if let Some(minimum) = minimum_version {
             cohort_reads::admit_endpoints_at_least(
                 self.config.coordinator.reference(),
@@ -331,7 +348,6 @@ impl State {
         }
         let expires = cut.expires_at();
         let acquire_end = end.min(cut.deadline());
-        let profile = requested_profile.unwrap_or_default();
         let limit = profile.capture_limit();
         let remaining_limit = |rows: usize, bytes: usize, ops: usize| ReadLimit {
             rows: limit.rows.saturating_sub(rows),
@@ -362,96 +378,213 @@ impl State {
             )
             .map_err(remote_error)?;
         }
-        let mut sessions = BTreeMap::new();
-        let result = async {
-            let (mut rows, mut bytes, mut operations) = (0usize, 0usize, 0usize);
-            for (route, (_, target)) in routes.iter().zip(cut.members()) {
-                cut.check().map_err(snapshot_error)?;
-                before_deadline(acquire_end)?;
-                let remaining = remaining_limit(rows, bytes, operations);
-                // Match materialized acquisition: even a later empty member
-                // cannot turn an exhausted aggregate budget into success.
-                if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
-                    return Err(Error::Capacity);
-                }
-                let transport = self.config.local_transport(route)?;
-                let opened = transport
-                    .open(
-                        make_open(target.clone(), remaining),
-                        acquire_end.saturating_duration_since(Instant::now()),
-                    )
-                    .await
-                    .map_err(remote_error)?;
-                let descriptor = &opened.descriptor;
-                if descriptor.authority != *cut.authority()
-                    || descriptor.cohort != *cut.cohort()
-                    || descriptor.version != cut.version()
-                    || descriptor.mode != target.mode
-                    || descriptor.stamp.identity != route.identity
-                    || descriptor.stamp.shard != target.shard
-                    || descriptor.stamp.epoch != target.epoch
-                    || descriptor.incarnation == [0; 16]
-                    || descriptor.token == [0; 16]
-                {
-                    return Err(Error::Identity);
-                }
-                // Once endpoint/descriptor identity is safe, own cleanup even
-                // if subsequent proof or aggregate-cost validation fails.
-                let partition = u32::try_from(target.shard).map_err(|_| Error::Identity)?;
-                sessions.insert(
-                    target.shard,
-                    fixed_execution::NodeSession::new(
-                        PartitionRoute {
-                            partition,
-                            shard: target.shard,
-                            epoch: target.epoch,
-                            identity: route.identity,
-                            endpoint: route.endpoint,
-                        },
-                        opened.descriptor.clone(),
-                        opened.capture_cost.bytes,
-                        opened.capture_cost.rows,
-                    )
-                    .map_err(remote_error)?
-                    .with_transport(transport),
-                );
-                // Compare the complete retained certificate, not a boolean or V.
-                if opened.descriptor.profile != profile || opened.retained_proof != *cut.proof() {
-                    return Err(Error::Identity);
-                }
-                rows = rows
-                    .checked_add(opened.capture_cost.rows)
-                    .ok_or(Error::Capacity)?;
-                bytes = bytes
-                    .checked_add(opened.capture_cost.bytes)
-                    .ok_or(Error::Capacity)?;
-                operations = operations
-                    .checked_add(opened.capture_cost.replay_operations)
-                    .ok_or(Error::Capacity)?;
-                if rows > limit.rows || bytes > limit.bytes || operations > limit.operations {
-                    return Err(Error::Capacity);
-                }
-            }
+        let (mut rows, mut bytes, mut operations) = (0usize, 0usize, 0usize);
+        for (route, (_, target)) in routes.iter().zip(cut.members()) {
             cut.check().map_err(snapshot_error)?;
-            fixed_execution::execute(
-                &mut sessions,
-                &req,
-                self.config.local_query_parallelism,
-                tokio::time::Instant::from_std(end.min(expires)),
-            )
-            .await
-            .map_err(Error::Query)
+            before_deadline(acquire_end)?;
+            let remaining = remaining_limit(rows, bytes, operations);
+            // Match materialized acquisition: even a later empty member
+            // cannot turn an exhausted aggregate budget into success.
+            if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
+                return Err(Error::Capacity);
+            }
+            let transport = self.config.local_transport(route)?;
+            let opened = transport
+                .open(
+                    make_open(target.clone(), remaining),
+                    acquire_end.saturating_duration_since(Instant::now()),
+                )
+                .await
+                .map_err(remote_error)?;
+            let descriptor = &opened.descriptor;
+            if descriptor.authority != *cut.authority()
+                || descriptor.cohort != *cut.cohort()
+                || descriptor.version != cut.version()
+                || descriptor.mode != target.mode
+                || descriptor.stamp.identity != route.identity
+                || descriptor.stamp.shard != target.shard
+                || descriptor.stamp.epoch != target.epoch
+                || descriptor.incarnation == [0; 16]
+                || descriptor.token == [0; 16]
+            {
+                return Err(Error::Identity);
+            }
+            // Once endpoint/descriptor identity is safe, own cleanup even
+            // if subsequent proof or aggregate-cost validation fails.
+            let partition = u32::try_from(target.shard).map_err(|_| Error::Identity)?;
+            capture.sessions.insert(
+                target.shard,
+                fixed_execution::NodeSession::new(
+                    PartitionRoute {
+                        partition,
+                        shard: target.shard,
+                        epoch: target.epoch,
+                        identity: route.identity,
+                        endpoint: route.endpoint,
+                    },
+                    opened.descriptor.clone(),
+                    opened.capture_cost.bytes,
+                    opened.capture_cost.rows,
+                )
+                .map_err(remote_error)?
+                .with_transport(transport),
+            );
+            // Compare the complete retained certificate, not a boolean or V.
+            if opened.descriptor.profile != profile || opened.retained_proof != *cut.proof() {
+                return Err(Error::Identity);
+            }
+            rows = rows
+                .checked_add(opened.capture_cost.rows)
+                .ok_or(Error::Capacity)?;
+            bytes = bytes
+                .checked_add(opened.capture_cost.bytes)
+                .ok_or(Error::Capacity)?;
+            operations = operations
+                .checked_add(opened.capture_cost.replay_operations)
+                .ok_or(Error::Capacity)?;
+            if rows > limit.rows || bytes > limit.bytes || operations > limit.operations {
+                return Err(Error::Capacity);
+            }
         }
-        .await;
-        // Successful cleanup is not an extra required graph read and cannot
-        // convert an already complete result into a stronger liveness promise.
-        fixed_execution::close(&sessions, tokio::time::Instant::from_std(end.min(expires))).await;
+        cut.check().map_err(snapshot_error)?;
+        before_deadline(end)?;
+        Ok((cut.version(), expires))
+    }
+
+    pub(super) async fn probe_readiness(
+        &self,
+        work: Arc<OwnedSemaphorePermit>,
+        end: Instant,
+    ) -> Result<u64> {
+        before_deadline(end)?;
+        if self
+            .jobs_stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Rejected);
+        }
+        let flight = self
+            .readiness
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Capacity)?;
+        let execution = fixed_execution::admit_execution().map_err(Error::Query)?;
+        self.expire();
+        let memory = self
+            .memory
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Capacity)?;
+        let mut capture = CapturedLocal::new(work, memory, execution, Some(flight));
+        // This is deliberately the existing default query capture profile.
+        // Capacity failure is NOT a positive readiness observation.
+        let result = self
+            .capture_local(
+                LocalReadProfile::default(),
+                None,
+                None,
+                MAX_TTL,
+                end,
+                &mut capture,
+            )
+            .await;
+        capture.close().await;
+        before_deadline(end)?;
+        result.map(|(version, _)| version)
+    }
+
+    pub(super) fn get_local(&self, descriptor: &LocalSession) -> Result<Arc<Retained>> {
+        self.expire();
+        if descriptor.incarnation != self.incarnation {
+            return Err(Error::SessionUnavailable);
+        }
+        let sessions = self.local_sessions.lock().unwrap();
+        let found = sessions
+            .get(&descriptor.token)
+            .ok_or(Error::SessionUnavailable)?;
+        if found.descriptor != *descriptor {
+            return Err(Error::Identity);
+        }
+        if found.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::SessionUnavailable);
+        }
+        Ok(found.clone())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn open_local(
+        &self,
+        requested_profile: Option<LocalReadProfile>,
+        version: Option<u64>,
+        minimum_version: Option<u64>,
+        ttl_millis: u64,
+        query: Query,
+        page_size: u16,
+        work: Arc<OwnedSemaphorePermit>,
+        end: Instant,
+    ) -> Result<Reply> {
+        let ttl = Duration::from_millis(ttl_millis);
+        if ttl.is_zero() || ttl > MAX_TTL || !(1..=MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(Error::Protocol);
+        }
+        let req = request(&query);
+        fixed_execution::validate(&req).map_err(Error::Query)?;
+        if !self
+            .config
+            .binding
+            .cohort
+            .members
+            .iter()
+            .any(|m| m.shard == u64::from(query.partition))
+        {
+            return Err(Error::Identity);
+        }
+        // Reuse the existing process-wide observed coordinator execution gate.
+        // Certification and proof preflight are part of the same admitted work.
+        let execution = fixed_execution::admit_execution().map_err(Error::Query)?;
+        self.expire();
+        let memory = self
+            .memory
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Capacity)?;
+        let mut capture = CapturedLocal::new(work, memory, execution, None);
+        let captured = self
+            .capture_local(
+                requested_profile.unwrap_or_default(),
+                version,
+                minimum_version,
+                ttl,
+                end,
+                &mut capture,
+            )
+            .await;
+        let (version, expires) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                // Ordinary failure preserves the synchronous cleanup contract.
+                // Drop is only the fallback when this future is cancelled.
+                capture.close().await;
+                return Err(error);
+            }
+        };
+        let result = fixed_execution::execute(
+            &mut capture.sessions,
+            &req,
+            self.config.local_query_parallelism,
+            tokio::time::Instant::from_std(end.min(expires)),
+        )
+        .await
+        .map_err(Error::Query);
+        capture.close().await;
         let rows = result?;
         let descriptor = LocalSession {
             incarnation: self.incarnation,
             token: random()?,
-            version: cut.version(),
+            version,
         };
+        let work = capture.work.take().expect("capture owns admission");
+        let execution = capture.execution.take().expect("capture owns execution");
+        let memory = capture.memory.take().expect("capture owns memory");
         let binding = self.config.binding.clone();
         let retained = tokio::task::spawn_blocking(move || {
             // Blocking encoding cannot be canceled; hold both shared permits.
@@ -898,5 +1031,182 @@ mod grpc_identity_boundary_tests {
         assert!(!retained
             .grpc_preflighted
             .load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod readiness_cleanup_tests {
+    use super::*;
+    use crate::remote::query::QueryStamp;
+    use d2_raft::transaction_decisions::Member;
+
+    #[tokio::test]
+    async fn saturated_readiness_does_not_queue_or_contact_dependencies() {
+        let _fixtures = fixed_execution::lock_session_fixtures().await;
+        use d2_raft::managed_rpc::Client;
+        let cohort = Cohort {
+            profile: Default::default(),
+            coordinator_shard: 9,
+            coordinator_epoch: 1,
+            members: vec![Member {
+                shard: 7,
+                epoch: 1,
+                mode: [7; 16],
+            }],
+        };
+        let authority = Authority {
+            shard: 9,
+            mode: [9; 16],
+        };
+        let coordinator = Client::new(
+            "127.0.0.1:1".parse().unwrap(),
+            Identity {
+                group: 9,
+                node: 1,
+                target: Target {
+                    shard: 9,
+                    epoch: 1,
+                    mode: [9; 16],
+                },
+                role: Role::Coordinator,
+                authority: authority.clone(),
+                cohort: cohort.clone(),
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let state = State {
+            config: RemoteConfig {
+                coordinator,
+                members: vec![],
+                binding: Binding {
+                    authority,
+                    cohort,
+                    mapping: Mapping::PartitionEqualsShardV1,
+                },
+            }
+            .into(),
+            incarnation: [1; 16],
+            sessions: Mutex::new(BTreeMap::new()),
+            local_sessions: Mutex::new(BTreeMap::new()),
+            jobs: Mutex::new(BTreeMap::new()),
+            job_tasks: Mutex::new(JoinSet::new()),
+            job_rpc_budget: Duration::from_secs(5),
+            jobs_stopping: std::sync::atomic::AtomicBool::new(false),
+            memory: Arc::new(Semaphore::new(1)),
+            connections: Arc::new(Semaphore::new(1)),
+            submit: tokio::sync::Mutex::new(()),
+            readiness: Arc::new(Semaphore::new(1)),
+            timing: None,
+        };
+        let flight = state.readiness.clone().try_acquire_owned().unwrap();
+        let work = Arc::new(state.connections.clone().try_acquire_owned().unwrap());
+        assert_eq!(
+            state
+                .probe_readiness(work.clone(), Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(Error::Capacity)
+        );
+        drop(flight);
+        let memory = state.memory.clone().try_acquire_owned().unwrap();
+        assert_eq!(
+            state
+                .probe_readiness(work.clone(), Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(Error::Capacity)
+        );
+        assert_eq!(state.readiness.available_permits(), 1);
+        drop(memory);
+        state
+            .jobs_stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            state
+                .probe_readiness(work, Instant::now() + Duration::from_secs(5))
+                .await,
+            Err(Error::Rejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_capture_holds_admission_until_bounded_cleanup() {
+        let _fixtures = fixed_execution::lock_session_fixtures().await;
+        // A listening TCP peer that never speaks gRPC forces cleanup to wait
+        // for its deadline, rather than winning a connection-refused race.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let work = Arc::new(Semaphore::new(1));
+        let memory = Arc::new(Semaphore::new(1));
+        let flight = Arc::new(Semaphore::new(1));
+        let execution = fixed_execution::admit_execution().unwrap();
+        let mut capture = CapturedLocal::new(
+            Arc::new(work.clone().try_acquire_owned().unwrap()),
+            memory.clone().try_acquire_owned().unwrap(),
+            execution,
+            Some(flight.clone().try_acquire_owned().unwrap()),
+        );
+        let identity = RemoteIdentity { group: 7, node: 1 };
+        let descriptor = fixed::FixedDescriptor {
+            profile: LocalReadProfile::default(),
+            stamp: QueryStamp {
+                identity,
+                shard: 7,
+                epoch: 1,
+                sequence: 0,
+            },
+            incarnation: [1; 16],
+            token: [2; 16],
+            authority: Authority {
+                shard: 9,
+                mode: [9; 16],
+            },
+            cohort: Cohort {
+                profile: Default::default(),
+                coordinator_shard: 9,
+                coordinator_epoch: 1,
+                members: vec![Member {
+                    shard: 7,
+                    epoch: 1,
+                    mode: [7; 16],
+                }],
+            },
+            version: 0,
+            mode: [7; 16],
+        };
+        capture.sessions.insert(
+            7,
+            fixed_execution::NodeSession::new(
+                PartitionRoute {
+                    partition: 7,
+                    shard: 7,
+                    epoch: 1,
+                    identity,
+                    endpoint,
+                },
+                descriptor,
+                0,
+                0,
+            )
+            .unwrap(),
+        );
+        drop(capture);
+        // Drop has transferred admission to cleanup before scheduling it.
+        assert_eq!(work.available_permits(), 0);
+        assert_eq!(memory.available_permits(), 0);
+        assert_eq!(flight.available_permits(), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if work.available_permits() == 1
+                    && memory.available_permits() == 1
+                    && flight.available_permits() == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(listener);
     }
 }

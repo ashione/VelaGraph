@@ -20,7 +20,14 @@
 `google.rpc.Status`/`Any` 错误详情与 generated Go 真实进程互操作切片；
 [兼容说明](PUBLIC_GRPC_ERROR_COMPATIBILITY.md) 要求旧客户端与服务端配套升级，
 不支持该变更的混合版本滚动升级，也不等于完整 Go API parity。
-#195/#282 已完成命名及 README 清理；#224/#284 clean-startup 尚未合入。
+#195/#282 已完成命名及 README 清理。
+2026-11-15 增量更新：[PR #284](https://github.com/ashione/VelaGraph/pull/284)
+已 squash 合入 `83c8af4`，交付 [fresh-only 启动示例](MANAGED_SERVICE_DEMO.md)：
+一个 coordinator、两个 graph shard 和独立 HTTP/gRPC 服务，拒绝复用既有目录，
+正常中断回收子进程。准确合并树已通过独立审查、CI、Go、真实启动写查/退出及
+CoreHR 1025 门禁；[验证索引](CURRENT_STATUS.md#fresh-service-startup-delivery-2026-11-15)。
+仅限 loopback、明文无认证、single-voter 开发演示；不支持 restart/restore/HA，
+父进程 SIGKILL 不保证回收。#224 仍开放，尚未完成 v0.0.1 全部验收或发布。
 后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
 相当规模的设计须保留完整 proposal/design doc，关联 issue、实现 PR、milestone/Project；
 按 [贡献规范](../CONTRIBUTING.md#proposals-and-design-records) 区分提议、接受、实现与验证，
@@ -112,6 +119,10 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
 [gRPC deadline](https://grpc.io/docs/guides/deadlines/)、
 [流控边界](https://grpc.io/docs/guides/flow-control/) 和
 [Protobuf 演进](https://protobuf.dev/programming-guides/proto3/)。
+
+服务进程的有界移除见 [drain 契约](SERVICE_DRAIN.md)：同时停止两种入口的新请求，
+保留已入场调用原 deadline，宽限期后取消；不迁移会话、不自动重放写入，
+不将请求排空等同于 #221 的完整弹性负载均衡或恢复后就绪。
 
 ## 已吸收的架构方向：通用执行、路由与可持续一致视图
 
@@ -894,3 +905,28 @@ The later #277/#279 retired legacy wires, not the remaining #218 service gates.
 - Keep fault, cancellation, unknown-write, session/job and retained-history gates.
 - GraphService retirement subsequently completed in #279; cross-language, HTTP
   surface and compatibility/resource gates still keep #218 open.
+
+### #221 fixed-session readiness slice
+
+[The shared HTTP/gRPC capture probe](FIXED_READ_READINESS.md) is a bounded,
+default-profile observation across the configured graph-query endpoints. It
+adds no general write readiness, automatic routing/load balancing, checkpoint
+activation or HA. #221 remains open; exact revision test/CI evidence must precede
+any claim that this slice is delivered. The static process-liveness route remains
+separate.
+
+### Public gateway channel reuse (#221)
+
+The owned [`GatewayClient`](GATEWAY_CLIENT_CHANNEL.md) provides bounded channel
+reuse for a fixed endpoint/binding, preserving caller deadlines, global call
+admission and existing session identities. It does not add automatic retries,
+ingress balancing or owner forwarding; #221 overall acceptance remains pending.
+
+### Cross-gateway original-ID recovery acceptance (#221)
+
+The [lost-reply recovery contract](SERVICE_WRITE_RECOVERY.md) distinguishes
+durable write decisions from process-local query/session ownership. The
+independent-process acceptance injects a lost public reply and checks recovery
+from a second gateway plus unchanged certified V and complete data after explicit
+original-ID replay. This adds no automatic retry or session failover; the
+remaining multi-gateway routing and availability gates keep #221 open.

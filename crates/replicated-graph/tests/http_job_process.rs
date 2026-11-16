@@ -102,9 +102,24 @@ fn row_json(row: &pb::Row) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_jobs_share_typed_lifecycle_fixed_version_and_restart_boundary() -> anyhow::Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(180), scenario()).await?
+    tokio::time::timeout(Duration::from_secs(180), scenario("127.0.0.1:0".parse()?)).await?
 }
-async fn scenario() -> anyhow::Result<()> {
+// This tests a real non-loopback interface in one host namespace, not Internet
+// reachability, TLS, authentication, or multi-host deployment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a routed non-loopback interface; explicit network acceptance gate"]
+async fn http_jobs_explicit_trusted_network_independent_process() -> anyhow::Result<()> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    // UDP connect selects a local routed address without sending a datagram.
+    socket.connect("192.0.2.1:9")?;
+    let ip = socket.local_addr()?.ip();
+    anyhow::ensure!(
+        !ip.is_loopback() && !ip.is_unspecified(),
+        "non-loopback interface required"
+    );
+    tokio::time::timeout(Duration::from_secs(180), scenario(SocketAddr::new(ip, 0))).await?
+}
+async fn scenario(http_bind: SocketAddr) -> anyhow::Result<()> {
     use pb::error_detail::Reason;
     let (coordinator, a, b) = tokio::try_join!(
         NodeProcess::start(9, true),
@@ -115,8 +130,13 @@ async fn scenario() -> anyhow::Result<()> {
     let config = json!({"binding":binding(),"coordinator":{"endpoint":coordinator.ready.control,"identity":identity(9)},"members":[{"endpoint":a.ready.control,"identity":identity(7),"graph_endpoint":a.ready.graph},{"endpoint":b.ready.control,"identity":identity(8),"graph_endpoint":b.ready.graph}]});
     let config_path = directory.path().join("service.json");
     fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    let mut service =
-        ServiceProcess::start(&config_path, directory.path().join("http-jobs1.stdout")).await?;
+    let mut service = ServiceProcess::start_with_http(
+        &config_path,
+        directory.path().join("http-jobs1.stdout"),
+        5000,
+        http_bind,
+    )
+    .await?;
     assert_eq!(
         [
             std::process::id(),
@@ -451,8 +471,13 @@ async fn scenario() -> anyhow::Result<()> {
     .await?;
     service.graceful_stop().await?;
     drop((jobs, writes));
-    let mut restarted =
-        ServiceProcess::start(&config_path, directory.path().join("http-jobs2.stdout")).await?;
+    let mut restarted = ServiceProcess::start_with_http(
+        &config_path,
+        directory.path().join("http-jobs2.stdout"),
+        5000,
+        http_bind,
+    )
+    .await?;
     error(
         restarted.address,
         "get",

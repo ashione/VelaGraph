@@ -4,7 +4,7 @@ This is an **experimental library entrypoint**, not the v0.0.1 release or the
 final protobuf/HTTP contract. It uses the existing certified managed gateway
 business implementation. A [typed public gRPC adapter](PUBLIC_GRPC_SERVICE.md) and
 [standalone service host](PUBLIC_SERVICE_CLI.md) are separate slices sharing this
-managed business path. A final stable dual-protocol contract and clean cluster
+managed business path. A final stable dual-protocol contract and production cluster
 startup packaging remain work under [#218](https://github.com/ashione/VelaGraph/issues/218). See the separate
 [shared service design](PUBLIC_SERVICE_DESIGN.md).
 
@@ -13,9 +13,10 @@ startup packaging remain work under [#218](https://github.com/ashione/VelaGraph/
 After constructing an existing validated live `managed_gateway::Gateway`, call
 `gateway.bind_http("127.0.0.1:0".parse()?, deadline).await`. Use its `local_addr()`
 and keep both gateway and returned `HttpService` alive. Call `shutdown().await`
-for orderly cleanup. Dropping either server signals shutdown. Any non-loopback
-bind is rejected; there is no implicit public bind, TLS, authentication or
-production exposure. Loopback alone is not an authentication or browser-attack
+for orderly cleanup. Dropping either server signals shutdown. The default `bind_http` rejects non-loopback addresses. The explicit
+`bind_http_trusted_network` API and CLI `--allow-insecure-network` opt-in accept
+a caller-selected HTTP address; there is still no implicit public bind, TLS or
+authentication. Use only a trusted network or authenticated TLS reverse proxy. Loopback alone is not an authentication or browser-attack
 boundary; do not expose this preview to untrusted local clients. Host/Origin
 policy and credentials belong to the later hardened service entry. Restored/offline nodes cannot bypass their existing startup
 guards through this adapter. No public restore or readiness override is added.
@@ -26,7 +27,7 @@ restore READY certificate, availability promise or proof that the next request
 can obtain a certified view. Every business operation retains its existing
 identity/certification checks. A stopping gateway rejects new work.
 
-Both HTTP and typed managed gRPC share the same eight admission slots, retained
+Both HTTP and public gRPC share the same eight admission slots, retained
 query budgets and submit serialization. The first HTTP implementation accepts
 one request per connection (`Connection: close` behavior); persistent HTTP client
 connections are not advertised. The separate typed public gRPC adapter is now
@@ -98,7 +99,7 @@ query, page size and page. The page contains typed rows, original completeness,
 next cursor, offset and total. Use the returned session/query unchanged for
 fetch, with cursor null to replay the first page or the prior `next` cursor to
 advance. Every page is preflighted against the HTTP wire budget before the first
-HTTP page is delivered, including sessions originally opened via managed TCP.
+HTTP page is delivered, including sessions originally opened via public gRPC.
 The successful whole-result HTTP preflight is cached on that immutable retained
 session; later fetches still check liveness and their own response encoding,
 but do not re-encode the entire result. Pages cannot exceed the full result or
@@ -131,12 +132,20 @@ writes or imply a distributed transaction abort.
 
 ## Verification boundary
 
-Focused tests exercise real loopback HTTP with the same managed gateway as gRPC,
+Focused tests exercise real loopback HTTP with the same managed gateway as public gRPC,
 strict codecs and delivery/admission ownership. These are not multi-machine
 benchmarks, global restore tests or release-gate evidence. The separate [dual-protocol process test](PUBLIC_SERVICE_CLI.md) adds actual
-independent processes and cross-protocol semantics. Clean startup packaging and exact CI/release checks remain required before
+independent processes and cross-protocol semantics. The fresh-only [development launcher](MANAGED_SERVICE_DEMO.md) is implemented; exact CI/release checks remain required before
 v0.0.1; the finite preview feature/compatibility matrix must be explicit. Test results must be read from
 the exact submitted commit rather than inferred from this document.
+
+## Fixed-session capture readiness
+
+`POST /preview1/readiness` with `{}` performs the bounded default-profile
+[fixed-session read probe](FIXED_READ_READINESS.md), not Gremlin execution.
+`GET /preview1/service` remains static liveness. A successful capture observation
+is not general service/restore readiness or an inexpensive load-balancer check;
+see the linked contract for profile limits, cost and cleanup behavior.
 
 
 ## Managed asynchronous jobs
@@ -191,5 +200,28 @@ one public representation fails with resource exhaustion rather than becoming
 Ready with undeliverable later pages. The existing retained reservation remains
 owned through HTTP encode and socket delivery. Job methods cap the remaining
 request budget at five seconds, independently of the job execution/lease budget;
-there is no fresh per-phase timeout. All existing shared admission and loopback
-restrictions remain in force.
+there is no fresh per-phase timeout. All shared admission and recovery restrictions remain in force; external HTTP
+requires the separate explicit trusted-network listener opt-in.
+
+## External HTTP access boundary
+
+The CLI requires both `--allow-insecure-development` and
+`--allow-insecure-network` plus an explicit `--http ADDRESS:PORT` to accept
+non-loopback HTTP. No default wildcard, firewall changes, reverse-proxy deployment,
+TLS or authentication are supplied. Internal routes and the gRPC listener remain
+loopback-only. HTTP authorization must be supplied by the trusted deployment
+boundary; do not expose this plaintext mutation/query API directly to the Internet.
+
+`http_jobs_explicit_trusted_network_independent_process` exercises the whole job
+lifecycle over an actual non-loopback host interface with separate node/service
+processes. It is same-host networking evidence, not a public-Internet or
+multi-host/TLS/security acceptance test. An environment without a routed
+non-loopback interface fails the test explicitly instead of silently substituting
+loopback. It is ignored in the default offline test suite and run explicitly by
+the CI network acceptance step:
+
+```sh
+cargo test --locked -p replicated-graph --test http_job_process http_jobs_explicit_trusted_network_independent_process -- --ignored --exact
+```
+
+Test execution status must be read from exact-source evidence.
