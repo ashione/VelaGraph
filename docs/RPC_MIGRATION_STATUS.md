@@ -15,7 +15,7 @@ readiness or completed #218 claim.
 | Observed coordinator | `remote/distributed/mod.rs:946–972` uses typed service/client | Observed consistency is unchanged; it is not managed fixed-V consistency |
 | Gateway library | `managed_gateway.rs:1235–1250,1367` uses public typed service/client | Identified v2 library context; original public v1 remains separate |
 | Public service | `managed_gateway_grpc.rs:565–604` registers Write, Query, FixedSession and ManagedQueryJob only | No internal Raft/restore/participant service is registered on this listener |
-| Public HTTP | Hyper adapter, six preview write/query operations | Intentional external HTTP, not a legacy inter-node transport |
+| Public HTTP | Hyper adapter, preview write/query and managed-job operations | Intentional external HTTP, not a legacy inter-node transport |
 
 Production paths do not select or sniff a second JSON/TCP wire. Retired-wire rejection fixtures, cfg(test) frame helpers, HTTP listeners, in-process calls, storage I/O and object-store HTTP are not evidence of a production fallback.
 
@@ -39,7 +39,7 @@ A passing later run does not identify the cause of earlier generic Unavailable f
 
 1. **Generated Go interoperability:** implemented after the retirement baseline. `examples/go/managed` and `.github/workflows/go-interop.yml` now generate/build a real Go client and run it against a Rust service. Coverage includes write IDs/replay, typed values/presence, paging/fixed V and listener isolation; see the [exact example coverage](../examples/go/managed/README.md). This is not all-method interoperability, upgrade or production SDK evidence.
 2. **Cross-language error details:** the public codec now emits standard `google.rpc.Status` with one typed `ErrorDetail` Any. Go checks standard `status.Details()` rather than a custom raw trailer parser. The old bare trailer is not supported as a fallback; see [compatibility and upgrade bounds](PUBLIC_GRPC_ERROR_COMPATIBILITY.md).
-3. **HTTP surface:** the preview supports Submit/Status/Abort, Open/Fetch/Close, static liveness and the bounded fixed-read probe. FixedSession and ManagedQueryJob HTTP parity and a stable HTTP contract are not delivered; an open PR is not mainline delivery.
+3. **HTTP surface:** the preview supports Submit/Status/Abort, Open/Fetch/Close, static liveness and the bounded fixed-read probe. Managed-job Start/Get/Renew/Fetch/Cancel now reuse shared handlers. FixedSession HTTP parity and a stable HTTP contract remain separate.
 4. **Version/upgrade matrix:** existing services reject unsupported versions and old wire; Raft does not support a mixed JSON/gRPC cluster. This is not rolling-upgrade compatibility or an implemented online restart/recovery plan.
 5. **Resource/performance evidence:** retain application admission, budgets and unknown write outcomes. Existing Metadata microbenchmarks are not end-to-end cold/warm, p50/p95/p99, CPU/RSS/network or multi-host scaling evidence.
 6. **Service readiness:** trusted/loopback preview is intentional. #221/#222 routing/ownership/readiness and recovery/security/product gates remain distinct.

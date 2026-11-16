@@ -14,7 +14,9 @@ that every release requirement is satisfied.
   It creates separate node/service processes, rejects an existing directory and
   is not a restart, recovery or production provisioning command.
 - Existing live, activated, identity-matched cohort: [graph-service](PUBLIC_SERVICE_CLI.md).
-  Explicit loopback HTTP and optional gRPC ports, development opt-in required.
+  Explicit default-loopback HTTP and optional loopback gRPC ports, development
+  opt-in required. Separate trusted-network HTTP opt-in is a platform extension,
+  not a new v0.0.1 release or public-exposure certification.
   It cannot install snapshots, clear offline restore guards or force READY.
 - Rust reusable domain client: [GatewayClient](GATEWAY_CLIENT_CHANNEL.md).
   One fixed endpoint/binding per client; clones reuse a channel. No discovery,
@@ -35,11 +37,12 @@ participant, raw KV/Plan, membership, restore or administrative methods.
 | Typed write submit/status/abort | `POST /preview1/writes:submit`, `:status`, `:abort` | `WriteService.Submit`, `Status`, `Abort` | Status needs original external ID **and exact mutation**, not ID alone. Abort is explicit, never inferred from timeout. |
 | Data-local Gremlin result session | `POST /preview1/queries:open`, `:fetch`, `:close` | `QueryService.Open`, `Fetch`, `Close` | Supported subset only; immutable V/result and owner-bound token. Latest, exact and supported minimum-V selector retain their existing semantics. |
 | Fixed-snapshot session | Not implemented | `FixedSessionService.Open`, `Read`, `Traverse`, `Page`, `Close` | Separate registry/token type from QueryService; bounded cohort capture, not unlimited query or data-local scaling. |
-| Managed asynchronous query job | Not implemented | `ManagedQueryJobService.Start`, `Get`, `Renew`, `Fetch`, `Cancel` | Existing fixed-V job/lifetime/budget contract; not a durable cross-owner job store. |
+| Managed asynchronous query job | `POST /preview1/jobs:start`, `:get`, `:renew`, `:fetch`, `:cancel` | `ManagedQueryJobService.Start`, `Get`, `Renew`, `Fetch`, `Cancel` | Existing fixed-V job/lifetime/budget contract; not a durable cross-owner job store. |
 | Static process liveness | `GET /preview1/service` | No equivalent public liveness RPC | Alive does not certify graph-query routes or restore completion. |
 | Bounded fixed-read observation | `POST /preview1/readiness` with `{}` | `ReadinessService.Check` | Expensive default-profile capture, not general LB health, write readiness or restore READY. |
 
-HTTP FixedSession/job parity is **not shipped** by the open #288 PR. Do not use
+HTTP job parity is implemented in the platform extension; FixedSession parity
+remains absent. Do not use
 proposed `/v1/...` routes from the target design as runnable APIs. The finite
 release plan requires both protocols to support writes and supported queries;
 this matrix does not weaken that requirement or claim that additional gRPC-only
@@ -66,7 +69,7 @@ adjacency completeness is never promoted to `Complete`.
 | Drain/restart | [Bounded drain](SERVICE_DRAIN.md) stops new requests and waits for admitted calls (default 5 seconds, maximum 60 seconds), then cancels. It does not transfer sessions, roll back writes or provide transparent rolling upgrade. |
 | Client cancellation | GatewayClient blocks future DATA polling after expiry/cancel and retains admission while transport owns the body. Already-buffered bytes cannot be recalled. A permanently stalled peer can retain permits until transport recovery or explicit terminal `close()`. Close affects all clones and prevents reconnect; resource reclamation requires the owning runtime to run, and it does not cancel server sessions or settle writes. |
 | Write uncertainty | Lost ACK, cancellation or deadline may mean Unknown, not rollback. Recover original ID/exact command via Status. Absent is an observation, not proof that delayed admission is impossible. No automatic write replay/hedging. |
-| Deployment/recovery | Fixed topology, loopback and development-only. No authentication, TLS/public exposure, dynamic ingress balancing, online global restore, automatic node failover or mixed-version rolling recovery claim. Offline restore guards remain enforced. |
+| Deployment/recovery | Fixed topology and development-only; HTTP requires separate explicit opt-in for trusted-network access. No authentication, TLS/public exposure, dynamic ingress balancing, online global restore, automatic node failover or mixed-version rolling recovery claim. Offline restore guards remain enforced. |
 
 Machine-readable failures are part of the interface: HTTP uses `error.code`
 with 400 invalid, 409 identity/precondition, 410 unavailable session, 429 capacity,

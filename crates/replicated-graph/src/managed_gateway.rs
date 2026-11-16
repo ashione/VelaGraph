@@ -1369,7 +1369,31 @@ impl Service {
     /// validated live managed gateway. Offline restored nodes cannot create this
     /// gateway; no restore marker or readiness override is provided here.
     pub async fn bind_http(&self, bind: SocketAddr, deadline: Duration) -> Result<HttpService> {
-        http::bind(self.state.clone(), self.stop.subscribe(), bind, deadline).await
+        http::bind(
+            self.state.clone(),
+            self.stop.subscribe(),
+            bind,
+            deadline,
+            false,
+        )
+        .await
+    }
+    /// Explicit plaintext HTTP opt-in for a trusted network or authenticated proxy.
+    /// This provides neither authentication nor TLS. Never expose directly to an
+    /// untrusted network. Admission, identity and recovery checks are unchanged.
+    pub async fn bind_http_trusted_network(
+        &self,
+        bind: SocketAddr,
+        deadline: Duration,
+    ) -> Result<HttpService> {
+        http::bind(
+            self.state.clone(),
+            self.stop.subscribe(),
+            bind,
+            deadline,
+            true,
+        )
+        .await
     }
     /// Bind the typed public gRPC adapter to the same live managed state.
     /// Only loopback listeners are accepted; no restore or authentication bypass.
