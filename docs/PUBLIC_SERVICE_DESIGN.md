@@ -3,7 +3,10 @@
 Status: **target design with implemented loopback preview slices**.
 The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed gRPC slice](PUBLIC_GRPC_SERVICE.md)
 and [service host](PUBLIC_SERVICE_CLI.md) reuse a shared invocation/delivery seam.
-The final stable HTTP/schema, clean startup and full release gates remain open. Reviewed against
+The final stable HTTP/schema and full release gates remain open. Fresh-only
+clean startup was delivered by #284; see the
+[current candidate matrix](V0_0_1_CAPABILITY_MATRIX.md) for the implemented surface
+through #295. This target design was originally reviewed against
 main `fa202c51` on 2026-11-13. The source of truth for runnable endpoints is the
 linked preview/CLI contracts, not the proposed stable routes below.
 Tracks [#218](https://github.com/ashione/VelaGraph/issues/218),
