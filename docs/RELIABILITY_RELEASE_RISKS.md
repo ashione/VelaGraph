@@ -7,7 +7,7 @@ an earlier intermittent failure. Issue status is not proof of resolved causality
 
 | Tracking | Established evidence | Still not established |
 | --- | --- | --- |
-| [#128](https://github.com/ashione/VelaGraph/issues/128) | Original paged-download failure lacked phase-level evidence; #131 added diagnostics. Subsequent successful observations apply only to their tested revisions/conditions. | The cause of the original `Unavailable`. The issue is closed, but its final investigation comments and `CURRENT_STATUS.md` still describe an unresolved cause. Do not treat closure as a root-cause finding. |
+| [#128](https://github.com/ashione/VelaGraph/issues/128) | Original paged-download failure lacked phase-level evidence; #131 added diagnostics. Subsequent successful observations apply only to their tested revisions/conditions. | The cause of the original `Unavailable`. The issue was reopened on 2026-11-16 after a status/acceptance audit; its final investigation comments and `CURRENT_STATUS.md` still describe an unresolved cause. The prior closure was not a root-cause finding. |
 | [#247](https://github.com/ashione/VelaGraph/issues/247) | A controlled two-follower pause reproduces read-confirmation failure. #253 added bounded fresh read confirmations under the original absolute deadline, without retrying mutations. #270 added per-RPC and bounded process diagnostics for a later shard-operation failure. | That scheduling caused either historical CI failure, or that all generic `Unavailable` results share a cause. #270 is diagnosis support, not a production root-cause fix. |
 
 The original #247 failed-attempt artifact retained source provenance but not the
