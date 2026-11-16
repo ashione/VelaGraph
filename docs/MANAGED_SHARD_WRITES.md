@@ -68,6 +68,30 @@ Status identifies a transaction ID; exact-body retry is required to check that
 ID's intended operations match. No prepare records, durable abort decisions,
 2PC participant protocol or commit-prefix watermark exists in this slice.
 
+## Read-confirmation recovery
+
+Shard-local `Inspect` and original-ID `Status` use the same bounded fresh quorum
+confirmation as snapshot/query reads: at most three confirmations, separated by
+10 ms, entirely within the original absolute caller/server deadline. Only typed
+`QuorumNotEnough` is retryable. A successful fresh confirmation plus apply wait is
+still required; no cached leader result authorizes a read. Not-leader and fatal
+errors retain the existing `Unavailable` mapping and are not retried.
+
+This retries neither RPC requests nor `Enable`/`Write` mutations, does not renew
+a deadline and does not imply rollback when a write outcome is unknown. Status
+still requires the original shard/epoch/mode/request identity. Persistent quorum
+loss can remain unavailable before the caller's larger budget expires.
+
+The explicit Unix process regression
+`managed_inspect_status_recover_transient_quorum_without_replaying_write` pauses
+both followers for 180 ms, checks recovery of Inspect/committed Status, requires
+50 ms reads to time out, and verifies the original write remains at sequence 1.
+It is ignored in the ordinary suite and can be run with `cargo test -p
+replicated-graph --test grpc_snapshot_process --locked
+managed_inspect_status_recover_transient_quorum_without_replaying_write --
+--ignored --exact --nocapture`. This covers a controlled mechanism, not the
+historical cause of #128/#247 or a multi-machine availability guarantee.
+
 ## Write-entrypoint coverage and limits
 
 - Existing remote Write, RemoteStorageNode/ReplicatedStorageNode graph writes,

@@ -326,7 +326,7 @@ async fn execute(
         return Err(RemoteError::InvalidArgument);
     }
     match request.operation {
-        Operation::Managed(request) => managed::handle(raft, state, shard, request)
+        Operation::Managed(request) => managed::handle(raft, state, shard, request, end)
             .await
             .map(Reply::Managed),
         Operation::OpenFixedQuery(request) => {
