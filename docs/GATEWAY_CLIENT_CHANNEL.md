@@ -87,6 +87,11 @@ The connection regression uses the real public gRPC adapter through a counting
 TCP relay, so success responses alone cannot masquerade as channel reuse.
 Tests cover repeated/clone calls, cold-call admission and deadlines, disconnect
 without mutation replay, and the existing response/session identity contract.
+The cold-cancellation regression uses a per-client test-only barrier before the
+connector returns its socket, so the Channel cannot already own a request body.
+TCP accept alone does not establish that phase. A separate body-lifetime assertion
+checks that dropping the caller retains the exact admission lease until the
+outbound body itself is disposed; cancellation is not immediate transport cleanup.
 A single-stream HTTP/2 quota with acknowledged SETTINGS provides a real queued
 body barrier: repeated expired Submit calls must not reach full body dispatch
 after the quota is released. This controlled-peer test does not claim that a
@@ -94,7 +99,9 @@ request already delivered to a real gateway can be cancelled or rolled back.
 Additional real-transport regressions close a quota-stalled connection without
 peer quota recovery and check that all eight admission permits return, exercise
 cold setup cancellation and repeated close across clones, and reject requests
-on a client closed before first use. A full decoded Submit body is also observed
+on a client closed before first use. The stalled-close test establishes actual
+admission saturation with bounded, distinct explicit calls: `Unknown` can also
+mean expiry before enqueue, so a fixed count of timeouts is not proof of saturation. A full decoded Submit body is also observed
 by a controlled peer before close: the interrupted caller gets `Unknown`, not
 proof of non-execution. That peer does not model durable commit.
 Record exact test results for the candidate before claiming this acceptance has
