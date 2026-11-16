@@ -121,12 +121,24 @@ The test contains these acceptance assertions:
 - SIGINT exits successfully and all announced child PIDs disappear.
 - A later launch against the stopped directory still rejects and preserves
   the sentinel.
+- A service child that exits before readiness causes a failed parent exit, no
+  public readiness announcement, and all previously started nodes to be reaped.
+- Cancellation while a test service is blocked before readiness fails startup
+  and reaps all four children without a public readiness announcement.
+- Loss of one participant after readiness fails the parent, reaps all remaining
+  children, and closes both public listeners. This is not parent-SIGKILL recovery.
+- Each failure preserves its fresh data directory and a subsequent launch still
+  rejects that existing directory; fault injection never permits restore/reuse.
 - Bounded stdout/stderr evidence is retained on CI failure when configured;
   graph data is not copied as diagnostic output.
 
-Non-loopback rejection and startup-cancellation cleanup are implementation
-contracts, not claims that the listed end-to-end test exercises every failure
-interleaving. SIGKILL recovery is explicitly outside the supported contract.
+Non-loopback rejection remains an implementation contract, not a claim that
+this end-to-end test exercises it or every failure interleaving. Fault cases use
+test-only shell service fixtures and bounded waits; production budgets and
+launcher behavior are unchanged. Best-effort PID-incarnation guards limit
+cleanup to recorded child identities if a regression interrupts the test; the
+check and signal are not atomic pidfd fencing. Parent SIGKILL recovery remains
+explicitly outside the supported contract.
 The HTTP assertion plus subsequent gRPC read proves the tested write became
 visible; it is not a general guarantee that every HTTP 200 means a final
 committed decision.

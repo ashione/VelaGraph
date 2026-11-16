@@ -13,6 +13,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 
+pub(crate) mod collector;
 pub mod transport;
 
 /// Canonical segment size. Only the final segment may contain fewer records.

@@ -310,7 +310,7 @@ async fn boundaries_holes_and_member_applied_are_distinct() {
 }
 
 #[tokio::test]
-async fn indexed_reads_detect_online_corruption_and_do_not_read_later_segments() {
+async fn indexed_reads_preserve_coordinator_ranges_and_verify_full_member_namespace() {
     for member_mode in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
@@ -328,7 +328,21 @@ async fn indexed_reads_detect_online_corruption_and_do_not_read_later_segments()
         let stored = rows(&sm);
         let db = &sm.storage.as_ref().unwrap().db;
         db.put(&stored[1].0, b"broken later segment").unwrap();
-        assert_eq!(prefix(&sm, 1, member_mode).await, old); // Does not scan unrelated segment.
+        if member_mode {
+            // Active member authority closes all rows even for an old prefix.
+            assert_eq!(
+                sm.participant_terminal_prefix(7, 1, [7; 16], &old).await,
+                Err(D1Error::DecisionIndexHistory)
+            );
+            assert_eq!(
+                sm.certified_terminal_read(7, 1, [7; 16], limit(), &old)
+                    .await,
+                Err(D1Error::DecisionIndexHistory)
+            );
+        } else {
+            // The independent coordinator requested-range contract is unchanged.
+            assert_eq!(prefix(&sm, 1, false).await, old);
+        }
         if member_mode {
             let expected = journal(33).terminal_prefix(33).unwrap();
             assert_eq!(
@@ -355,8 +369,21 @@ async fn indexed_reads_detect_online_corruption_and_do_not_read_later_segments()
                 Err(D1Error::DecisionIndexHistory)
             );
         }
-        // V0 requires the exact manifest/domain but no terminal rows.
-        assert_eq!(prefix(&sm, 0, member_mode).await.version(), 0);
+        if member_mode {
+            let zero = journal(0).terminal_prefix(0).unwrap();
+            assert_eq!(
+                sm.participant_terminal_prefix(7, 1, [7; 16], &zero).await,
+                Err(D1Error::DecisionIndexHistory)
+            );
+            assert_eq!(
+                sm.certified_terminal_read(7, 1, [7; 16], limit(), &zero)
+                    .await,
+                Err(D1Error::DecisionIndexHistory)
+            );
+        } else {
+            // Coordinator V0 still needs the manifest/domain but no rows.
+            assert_eq!(prefix(&sm, 0, false).await.version(), 0);
+        }
         db.put(MANIFEST_KEY, b"{}").unwrap();
         if member_mode {
             assert_eq!(
