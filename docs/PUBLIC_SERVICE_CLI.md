@@ -174,3 +174,29 @@ bounded fixed-session read capture, use `POST /preview1/readiness` or the typed
 `ReadinessService.Check` RPC. Read [the probe contract](FIXED_READ_READINESS.md)
 before polling: it uses the default profile, can be expensive, and must not be
 mistaken for general load-balancer, write, restore or production readiness.
+
+### Public admission under coordinator quorum loss
+
+The `public_interfaces_fail_closed_without_coordinator_quorum_and_recover`
+process test adds three durable coordinator Raft voters **inside one node child
+process**. Existing `DropPolicy` isolates all inter-voter links while the child,
+managed RPC listener and public service stay alive. This is deterministic
+in-process Raft fault injection across a real public HTTP/gRPC process boundary,
+not an independent-voter-process network partition or multi-host availability test.
+
+Both public query-open and write-submit protocols must return typed
+`OutcomeUnknown`/HTTP 503 during the partition, rather than a successful read or
+commit ACK. Recovery explicitly restores links and elects the statically
+configured coordinator in the fixture; it does not demonstrate automatic leader
+routing. The test reads original-ID status before deliberate exact-ID replay,
+checks original committed decisions, one decision per ID, the complete result
+oracle through both protocols, and the already-admitted old-V page. No request
+budget, production retry policy or write cancellation semantics is changed.
+
+This bounds a supported failure response and recovery scenario; it does not
+identify the missing historical cause in #128 or #247 or waive their release
+acceptance. The ordinary single-voter quickstart still does not provision a
+cross-process multi-voter managed group. The current managed RPC server binds
+`NodeHandle` (the in-process consensus network), not `TcpNode`; independent-voter
+managed provisioning would need its own implementation and validation before it
+can be advertised.
