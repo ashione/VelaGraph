@@ -7,8 +7,123 @@ use prost::Message;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::CancellationToken;
 use tonic::codegen::{http, Service};
 use tonic::transport::Channel;
+
+// Closing a client must stop the actual socket, not merely drop its cached
+// Channel handle: Hyper can still own queued request bodies and their leases.
+struct CloseableIo {
+    stream: Option<tokio::net::TcpStream>,
+    stop: CancellationToken,
+    read_stop: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    write_stop: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+impl CloseableIo {
+    fn new(stream: tokio::net::TcpStream, stop: CancellationToken) -> Self {
+        Self {
+            stream: Some(stream),
+            read_stop: Box::pin(stop.clone().cancelled_owned()),
+            write_stop: Box::pin(stop.clone().cancelled_owned()),
+            stop,
+        }
+    }
+    fn check_open(&mut self, cx: &mut TaskContext<'_>, read: bool) -> std::io::Result<()> {
+        let cancelled = if read {
+            self.read_stop.as_mut().poll(cx).is_ready()
+        } else {
+            self.write_stop.as_mut().poll(cx).is_ready()
+        };
+        if cancelled || self.stop.is_cancelled() || self.stream.is_none() {
+            self.stream.take();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "gateway client closed",
+            ));
+        }
+        Ok(())
+    }
+}
+impl AsyncRead for CloseableIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_open(cx, true) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for CloseableIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check_open(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_open(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_open(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(self.stream.as_mut().expect("checked open")).poll_shutdown(cx)
+    }
+}
+#[derive(Clone)]
+struct ClientConnector {
+    address: SocketAddr,
+    stop: CancellationToken,
+}
+impl Service<http::Uri> for ClientConnector {
+    type Response = hyper_util::rt::TokioIo<CloseableIo>;
+    type Error = std::io::Error;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = std::io::Result<Self::Response>> + Send>>;
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if self.stop.is_cancelled() {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "gateway client closed",
+            )))
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn call(&mut self, _uri: http::Uri) -> Self::Future {
+        let address = self.address;
+        let stop = self.stop.clone();
+        Box::pin(async move {
+            let stream = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "gateway client closed")),
+                stream = tokio::net::TcpStream::connect(address) => stream?,
+            };
+            stream.set_nodelay(true)?;
+            if stop.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "gateway client closed",
+                ));
+            }
+            Ok(hyper_util::rt::TokioIo::new(CloseableIo::new(stream, stop)))
+        })
+    }
+}
 
 // The shared transport can retain a pending HTTP/2 stream after its caller
 // drops the response future. Guard the outbound body at the point the transport
@@ -176,6 +291,7 @@ struct ClientState {
     address: SocketAddr,
     binding: Binding,
     channel: tokio::sync::OnceCell<Channel>,
+    closed: CancellationToken,
 }
 impl GatewayClient {
     /// Construct a client without network I/O. A Tokio runtime is needed only
@@ -187,8 +303,21 @@ impl GatewayClient {
                 address,
                 binding,
                 channel: tokio::sync::OnceCell::new(),
+                closed: CancellationToken::new(),
             }),
         }
+    }
+
+    /// Permanently stop this client and all its clones. Socket/queue cleanup
+    /// runs on the owning Tokio runtime; this signal does not wait for cleanup.
+    /// Already-dispatched writes remain unknown, not rolled back.
+    pub fn close(&self) {
+        self.inner.closed.cancel();
+    }
+
+    /// Whether explicit close has been requested for this shared client.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.is_cancelled()
     }
 
     /// Perform one operation without retry. Unknown write outcomes require
@@ -204,6 +333,9 @@ async fn request(
     deadline: Duration,
 ) -> Result<Reply> {
     check_deadline(deadline)?;
+    if client.is_closed() {
+        return Err(Error::Unknown);
+    }
     // Admission precedes construction and connection, including cold requests.
     let permit = Arc::new(
         CLIENT_ADMISSION
@@ -227,7 +359,10 @@ async fn request(
         binding,
         operation,
     };
-    tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
+    tokio::select! {
+        biased;
+        _ = client.inner.closed.cancelled() => Err(Error::Unknown),
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
         // Preserve the original logical request envelope budget before opening
         // a socket. Protobuf compression is not permission to expand admission.
         encode(&original, MAX_REQUEST_BYTES)?;
@@ -247,7 +382,7 @@ async fn request(
                     .connect_timeout(MAX_DEADLINE)
                     .buffer_size(MAX_CONNECTIONS)
                     .concurrency_limit(MAX_CONNECTIONS);
-                Box::pin(endpoint.connect())
+                Box::pin(endpoint.connect_with_connector(ClientConnector { address: client.inner.address, stop: client.inner.closed.clone() }))
                     .await
                     .map_err(|_| Error::Unknown)
             })
@@ -568,9 +703,8 @@ async fn request(
         encode(&response, MAX_RESPONSE_BYTES)?;
         remaining(end)?;
         validate_reply(&original, response)
-    })
-    .await
-    .map_err(|_| Error::Unknown)?
+    }) => result.map_err(|_| Error::Unknown)?,
+    }
 }
 
 fn properties(values: &BTreeMap<String, Value>) -> Result<Vec<pb::Property>> {
