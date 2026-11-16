@@ -95,9 +95,9 @@ The original paged-snapshot failure tracked by [#128](https://github.com/ashione
 and the snapshot seed/quorum failure in [#247](https://github.com/ashione/VelaGraph/issues/247)
 remain unresolved reliability evidence in their recorded diagnosis. See the
 [release risk disposition](RELIABILITY_RELEASE_RISKS.md) for the exact evidence
-and remaining decision gate. #128's
-closed GitHub state is not a root-cause disposition: its stated acceptance and
-last documented analysis still require one. A green run, diagnostics or a test
+and remaining decision gate. #128 was reopened on 2026-11-16 after a status/acceptance audit: its prior
+closed GitHub state was not a root-cause disposition, and its stated acceptance
+and last documented analysis still require one. A green run, diagnostics or a test
 that did not reproduce the failure is not a repair. Before release, determine
 whether each defect affects the advertised finite scope, fix it with evidence or
 explicitly exclude the affected feature with a reproducible limitation as the
