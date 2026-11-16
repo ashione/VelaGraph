@@ -107,6 +107,9 @@ jobs:
           VELAGRAPH_REMOTE_EVIDENCE_DIR: ${{ github.workspace }}/remote-process-evidence
         run: cargo test --locked
 
+      - name: Verify explicit trusted-network HTTP listener
+        run: cargo test --locked -p replicated-graph --test http_job_process http_jobs_explicit_trusted_network_independent_process -- --ignored --exact
+
       - name: Retain ordinary remote process evidence
         if: always()
         uses: actions/upload-artifact@v4

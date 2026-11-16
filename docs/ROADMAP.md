@@ -11,7 +11,7 @@
 
 | 能力 | 已合入证据 | 仍未完成的边界 |
 | --- | --- | --- |
-| typed managed jobs | #268 / [PR #271](https://github.com/ashione/VelaGraph/pull/271)，`ecf1b87`；Start/Get/Renew/Fetch/Cancel | 非重启后任务恢复；HTTP job parity 未交付 |
+| typed managed jobs | #268 / [PR #271](https://github.com/ashione/VelaGraph/pull/271)，`ecf1b87`；Start/Get/Renew/Fetch/Cancel | 非重启后任务恢复；HTTP preview job lifecycle 通过同一执行器提供，稳定 HTTP v1 仍待验收 |
 | library 通信退役 | #273/#275/#277/#279；[通信审计](RPC_MIGRATION_STATUS.md) | public HTTP 有意保留；完整 Go/HTTP parity、升级和性能仍独立验收 |
 | 本地物理 checkpoint | [PR #194](https://github.com/ashione/VelaGraph/pull/194)，`c597459`；[双 DB 契约](PHYSICAL_CHECKPOINT.md) | 恢复仍为 `RESTORED_OFFLINE_ONLY`，#193 的 live restart/rejoin 未完成 |
 | 不可变 checkpoint 对象运输 | [已实现接口与验收范围](OBJECT_STORE_CHECKPOINT_API.md)，`crates/checkpoint-object-store` | 不是全局恢复、远程持久 ACK、对象存储权威或 temporal DB 备份 |
