@@ -115,6 +115,9 @@ no prebuilt binary or binary compatibility claim follows from it. Preserve the
 root `LICENSE`, the OpenRaft-derived `crates/d2-raft/NOTICE` and its two upstream
 license copies in source archives. A future binary distribution needs its own
 artifact validation, checksums and dependency/notice review.
+The [source-package structure check](SOURCE_PACKAGE_CHECK.md) provides a bounded
+no-build check for required source/notice files and archive path/type boundaries;
+it is not clean-system installation or final release acceptance.
 
 The source inventory above is not a frozen release candidate. After remaining
 risk disposition and documentation are integrated, bind final independent review,
