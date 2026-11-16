@@ -2672,6 +2672,7 @@ async fn reusable_gateway_client_expired_queued_mutation_body_is_not_dispatched(
         .await;
         accepted.send(()).unwrap();
         tokio::select! {
+            biased;
             _ = resumed => {},
             unexpected = connection.accept() => panic!("request bypassed occupied single stream: {unexpected:?}"),
         }
@@ -2802,8 +2803,11 @@ async fn reusable_gateway_client_expired_queued_mutation_body_is_not_dispatched(
     assert!(timed_out > 0 && timed_out <= MAX_CONNECTIONS);
     assert!(capacity_rejected > 0);
     assert_eq!(CLIENT_ADMISSION.available_permits(), 0);
-    drop(read_driver);
+    // Release the observation barrier before cancelling the occupying stream.
+    // Its RST can immediately allow expired HEADERS through; that is permitted
+    // and the body oracle below, not this pre-release barrier, judges dispatch.
     resume.send(()).unwrap();
+    drop(read_driver);
     tokio::time::timeout(Duration::from_secs(5), async {
         while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
             tokio::task::yield_now().await;
