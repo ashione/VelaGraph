@@ -34,7 +34,9 @@ Implementation boundary: [public managed service design](PUBLIC_SERVICE_DESIGN.m
 (shared handlers, protocol parity, delivery ownership and readiness gates).
 The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed public gRPC](PUBLIC_GRPC_SERVICE.md)
 and [service host](PUBLIC_SERVICE_CLI.md) are staged implementations, not proof of completed clean-startup or release
-gates. The finite preview feature/compatibility matrix must be explicit.
+gates. The finite preview feature/compatibility matrix must be explicit; the current
+[candidate inventory](V0_0_1_CAPABILITY_MATRIX.md) records that surface and its
+remaining risk dispositions, without declaring this acceptance complete.
 
 Deliver a small usable service before promising elastic operation:
 

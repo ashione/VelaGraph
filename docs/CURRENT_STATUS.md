@@ -8,6 +8,10 @@ library network paths are typed gRPC; public HTTP is intentional. This is not
 completion of the #218 service/interoperability gates or production readiness.
 See the [current communication and evidence audit](RPC_MIGRATION_STATUS.md).
 
+For the consolidated service surface through #295, use the
+[v0.0.1 candidate capability/compatibility matrix](V0_0_1_CAPABILITY_MATRIX.md).
+It distinguishes implemented methods, verified scenarios and open release risks.
+
 ## Fresh-service startup delivery (2026-11-15)
 
 [PR #284](https://github.com/ashione/VelaGraph/pull/284) is merged as
