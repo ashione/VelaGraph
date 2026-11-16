@@ -133,3 +133,35 @@ budgets. No causal overhead estimate or speedup is claimed. Remote authoritative
 verification/reducer/persistence subphases, controlled overhead measurements and
 an evidence-backed duplicate-work optimization remain follow-up work. #127 stays
 open; this is attribution support, not a performance or HA milestone.
+
+## Opt-in controlled lifecycle comparison
+
+The v0.0.3 measurement prerequisite can proceed independently of v0.0.1 release
+integration. `python3 scripts/managed_timing_compare.py --output /new/evidence/dir`
+builds the locked optimized `managed_process` test, selects its exact Cargo
+artifact and runs only the ignored `managed_diagnostics_controlled_comparison`.
+It does not change normal CI selection or add a long comparison to each PR.
+
+The experiment reuses **all** small-lifecycle correctness checks above, including
+original IDs, rejected changed requests, old views, lost ACK, reopen and three
+roles' snapshot restore. Two unmeasured warmups exercise disabled/enabled modes.
+Eight fresh sequential lifecycles then follow disabled/enabled/enabled/disabled,
+followed by the reverse block. Every lifecycle keeps its existing 240-second
+budget. A failure stops the comparison; no successful comparison record is
+emitted. The runner has a 2,500-second outer bound and refuses an existing output
+directory. It records complete source manifests and the test binary hash before
+and after the run; changed identity, wrong/skipped test, incomplete samples or
+failed assertions cannot produce a complete comparison.
+
+`comparison.json` retains each raw lifecycle duration, mode medians and the two
+balanced blocks' enabled-minus-disabled means/ratios. The measurement includes
+startup, writes, verification, shutdown/reopen and restore. It is **not** a pure
+instrumentation-cost estimate, a per-Submit latency, remote subphase attribution
+or an optimization result. Sequential order balancing reduces but cannot remove
+cache/scheduler/host contention effects; two blocks/four samples per mode provide
+no statistically certified threshold. Negative differences remain raw evidence,
+not a claim that diagnostics improve performance. Missing reports remain unknown.
+No timing threshold makes correctness pass or fail, and this comparison does not
+replace full CoreHR/1025 release acceptance. #127 remains open for remote
+subphases and evidence-backed optimization; #223 still requires its own concurrency
+design, independent tests and review.
