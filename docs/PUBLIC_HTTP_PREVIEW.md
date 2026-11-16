@@ -79,6 +79,9 @@ Mutation tags cover the existing managed `create_vertex`, `create_edge`,
 vertex deletion, temporal editing or Gremlin update scripts. Missing property
 and `{"type":"null"}` are distinct. Integer values are strings, Real values
 are finite JSON numbers, Text and Boolean have their corresponding JSON types.
+The [Real precision correction and upgrade boundary](HTTP_REAL_PRECISION.md)
+explains non-transparent parser changes, original-ID compatibility and retained
+stored bits; identical old decimal text is not always the same recovery command.
 
 Example query body for a gateway configured with data-local graph routes:
 
