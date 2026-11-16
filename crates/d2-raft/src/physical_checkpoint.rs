@@ -153,8 +153,28 @@ pub fn restore_physical_checkpoint(
     group_id: u64,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    let backup = backup.as_ref();
+    // Components removes trailing separators / `.` so a root symlink cannot
+    // evade symlink_metadata through a spelling such as "backup-link/".
+    // This does not resolve ancestors or `..`, or prevent concurrent changes.
+    let backup_path: std::path::PathBuf = backup.as_ref().components().collect();
+    let backup = backup_path.as_path();
     let destination = destination.as_ref();
+    for directory in [
+        backup.to_path_buf(),
+        backup.join("raft.db"),
+        backup.join("state.db"),
+    ] {
+        anyhow::ensure!(
+            fs::symlink_metadata(&directory)?.file_type().is_dir(),
+            "checkpoint root and database entries must be real directories"
+        );
+    }
+    anyhow::ensure!(
+        fs::symlink_metadata(backup.join("checkpoint.json"))?
+            .file_type()
+            .is_file(),
+        "checkpoint manifest must be a regular file"
+    );
     let manifest: Manifest = serde_json::from_slice(&fs::read(backup.join("checkpoint.json"))?)?;
     anyhow::ensure!(manifest.format == 1, "unsupported checkpoint format");
     anyhow::ensure!(
@@ -280,3 +300,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "physical_checkpoint_input_tests.rs"]
+mod input_tests;

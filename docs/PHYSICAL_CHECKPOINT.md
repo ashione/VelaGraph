@@ -44,6 +44,16 @@ synced before writing the completion manifest last. Cancellation or interruption
 before a valid complete manifest leaves an unusable attempt, never an overwritten
 previous backup. Output directories are never automatically deleted or reused.
 
+Before reading backup contents or creating a destination, restore requires the
+backup root and its `raft.db` / `state.db` entries to be actual directories and
+`checkpoint.json` to be a regular file. These component checks do not follow
+symlinks; trailing separators and `.` components in the supplied root path are
+normalized before both checking and reading. Symlinks and special manifest files
+(such as FIFOs) are rejected without opening their contents. This is a narrow
+input-type check, not a filesystem sandbox: ancestor symlinks, `..` resolution,
+and concurrent path replacement are not secured. The caller must still supply
+an immutable, trusted backup tree throughout restore.
+
 Restore verifies identity, exact inventory, checksums and Raft boundaries before
 creating a new destination, streams copies rather than linking mutable DB files,
 then uses the existing full state-machine loader to validate applied state,
