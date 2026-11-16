@@ -82,15 +82,16 @@ pub(super) async fn handle(
     state: Arc<StateMachine>,
     shard: u64,
     request: Request,
+    end: Instant,
 ) -> Result<Output, RemoteError> {
     if request.validate()?.0 != shard {
         return Err(RemoteError::InvalidArgument);
     }
     let command = match request {
         Request::Inspect { shard, epoch } => {
-            raft.ensure_linearizable()
+            read_barrier::confirm(&raft, end, "managed_read_barrier")
                 .await
-                .map_err(|_| RemoteError::Unavailable)?;
+                .map_err(read_barrier::without_leader_hint)?;
             return state
                 .d1_managed_mode(shard, epoch)
                 .await
@@ -103,9 +104,9 @@ pub(super) async fn handle(
             mode_id,
             request_id,
         } => {
-            raft.ensure_linearizable()
+            read_barrier::confirm(&raft, end, "managed_read_barrier")
                 .await
-                .map_err(|_| RemoteError::Unavailable)?;
+                .map_err(read_barrier::without_leader_hint)?;
             return state
                 .d1_managed_status(shard, epoch, mode_id, request_id)
                 .await
@@ -165,7 +166,9 @@ pub(super) async fn handle(
     }
 }
 
-/// No retry/fallback. Enable is irreversible for a running shard. A timed-out
+/// No request retry/fallback. Inspect/Status may repeat only fresh quorum
+/// confirmation under the original deadline; graph mutations are never replayed.
+/// Enable is irreversible for a running shard. A timed-out
 /// write remains unknown until checked/retried with the exact identity and body.
 pub async fn request(
     endpoint: SocketAddr,

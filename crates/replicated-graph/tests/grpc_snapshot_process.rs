@@ -813,3 +813,149 @@ async fn investigate_read_confirmation_scheduling_window() -> anyhow::Result<()>
     }
     Ok(())
 }
+
+/// Managed inspect/status need the same bounded fresh-confirmation recovery as snapshot reads.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled managed read-confirmation regression"]
+async fn managed_inspect_status_recover_transient_quorum_without_replaying_write(
+) -> anyhow::Result<()> {
+    use d2_raft::{D1ManagedStatus, D1WriteRequest, WriteOp};
+    use replicated_graph::remote::managed::{request, Output, Request};
+    struct Resume(Vec<u32>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                let _ = Command::new("kill")
+                    .args(["-CONT", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let cluster = Cluster::start().await?;
+    let identity = cluster.identity();
+    let endpoint = cluster.grpc();
+    let mode = [43; 16];
+    let id = [44; 16];
+    let enabled = request(
+        endpoint,
+        identity,
+        Request::Enable {
+            shard: SHARD,
+            epoch: 3,
+            expected_sequence: 0,
+            mode_id: mode,
+        },
+        BUDGET,
+    )
+    .await?;
+    ensure!(matches!(
+        enabled,
+        Output::Enabled {
+            activated_sequence: 0,
+            ..
+        }
+    ));
+    let written = request(
+        endpoint,
+        identity,
+        Request::Write {
+            mode_id: mode,
+            request: D1WriteRequest {
+                shard: SHARD,
+                epoch: 3,
+                request_id: id,
+                expected_sequence: Some(0),
+                operations: vec![WriteOp::put(b"managed-recovery-key", b"original")],
+            },
+        },
+        BUDGET,
+    )
+    .await?;
+    ensure!(matches!(written, Output::Written { sequence: 1, .. }));
+    let operations = [
+        Request::Inspect {
+            shard: SHARD,
+            epoch: 3,
+        },
+        Request::Status {
+            shard: SHARD,
+            epoch: 3,
+            mode_id: mode,
+            request_id: id,
+        },
+    ];
+    for operation in operations {
+        let expected = request(endpoint, identity, operation.clone(), BUDGET).await?;
+        for budget in [10000, 50] {
+            sleep(Duration::from_millis(100)).await;
+            let mut paused = Resume(Vec::new());
+            for (i, process) in cluster._processes.iter().enumerate() {
+                if i != cluster.leader {
+                    let pid = process.0.id();
+                    ensure!(Command::new("kill")
+                        .args(["-STOP", &pid.to_string()])
+                        .status()?
+                        .success());
+                    paused.0.push(pid);
+                }
+            }
+            let resume = tokio::spawn(async move {
+                sleep(Duration::from_millis(180)).await;
+                drop(paused);
+            });
+            let started = std::time::Instant::now();
+            let result = request(
+                endpoint,
+                identity,
+                operation.clone(),
+                Duration::from_millis(budget),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            resume.await?;
+            eprintln!(
+                "MANAGED_BARRIER budget_ms={budget} elapsed_us={} result={}",
+                elapsed.as_micros(),
+                if result.is_ok() { "ok" } else { "error" }
+            );
+            if budget == 50 {
+                ensure!(
+                    matches!(result, Err(RemoteError::Timeout { request_id: None })),
+                    "short read budget: {result:?}"
+                );
+            } else {
+                ensure!(
+                    matches!(&result, Ok(output) if output == &expected),
+                    "read must recover before original budget: {result:?}"
+                );
+            }
+            ensure!(request(endpoint, identity, operation.clone(), BUDGET).await? == expected);
+            let status = request(
+                endpoint,
+                identity,
+                Request::Status {
+                    shard: SHARD,
+                    epoch: 3,
+                    mode_id: mode,
+                    request_id: id,
+                },
+                BUDGET,
+            )
+            .await?;
+            ensure!(
+                status == Output::Status(D1ManagedStatus::Committed { sequence: 1 }),
+                "read recovery must not replay/mutate write"
+            );
+        }
+    }
+    let client = SnapshotClient::connect(endpoint, identity, BUDGET).await?;
+    let descriptor = client.open(SHARD, BUDGET).await?;
+    ensure!(descriptor.sequence == 1);
+    let page = client.page(descriptor.clone(), None, BUDGET).await?;
+    ensure!(page.entries == vec![(b"managed-recovery-key".to_vec(), b"original".to_vec())]);
+    ensure!(page.next.is_none());
+    client.close(descriptor, BUDGET).await?;
+
+    Ok(())
+}
