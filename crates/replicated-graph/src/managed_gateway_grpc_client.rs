@@ -84,10 +84,19 @@ impl AsyncWrite for CloseableIo {
         Pin::new(self.stream.as_mut().expect("checked open")).poll_shutdown(cx)
     }
 }
+// Test-only barrier at actual cold connection initialization, before Channel
+// construction can enqueue any body. Each client pauses at most one connection.
+#[cfg(test)]
+struct ColdConnectPause {
+    entered: Arc<tokio::sync::Notify>,
+    used: AtomicBool,
+}
 #[derive(Clone)]
 struct ClientConnector {
     address: SocketAddr,
     stop: CancellationToken,
+    #[cfg(test)]
+    cold_pause: Option<Arc<ColdConnectPause>>,
 }
 impl Service<http::Uri> for ClientConnector {
     type Response = hyper_util::rt::TokioIo<CloseableIo>;
@@ -107,6 +116,8 @@ impl Service<http::Uri> for ClientConnector {
     fn call(&mut self, _uri: http::Uri) -> Self::Future {
         let address = self.address;
         let stop = self.stop.clone();
+        #[cfg(test)]
+        let cold_pause = self.cold_pause.clone();
         Box::pin(async move {
             let stream = tokio::select! {
                 biased;
@@ -114,6 +125,15 @@ impl Service<http::Uri> for ClientConnector {
                 stream = tokio::net::TcpStream::connect(address) => stream?,
             };
             stream.set_nodelay(true)?;
+            #[cfg(test)]
+            if let Some(pause) = cold_pause {
+                if !pause.used.swap(true, AtomicOrdering::AcqRel) {
+                    pause.entered.notify_one();
+                    // Only cancellation exits this first initialization; the
+                    // next explicit request may initialize normally.
+                    std::future::pending::<()>().await;
+                }
+            }
             if stop.is_cancelled() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
@@ -292,6 +312,8 @@ struct ClientState {
     binding: Binding,
     channel: tokio::sync::OnceCell<Channel>,
     closed: CancellationToken,
+    #[cfg(test)]
+    cold_pause: Option<Arc<ColdConnectPause>>,
 }
 impl GatewayClient {
     /// Construct a client without network I/O. A Tokio runtime is needed only
@@ -304,8 +326,22 @@ impl GatewayClient {
                 binding,
                 channel: tokio::sync::OnceCell::new(),
                 closed: CancellationToken::new(),
+                #[cfg(test)]
+                cold_pause: None,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_first_connect(&mut self) -> Arc<tokio::sync::Notify> {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        Arc::get_mut(&mut self.inner)
+            .expect("install cold-connect barrier before cloning")
+            .cold_pause = Some(Arc::new(ColdConnectPause {
+            entered: entered.clone(),
+            used: AtomicBool::new(false),
+        }));
+        entered
     }
 
     /// Permanently stop this client and all its clones. Socket/queue cleanup
@@ -382,7 +418,12 @@ async fn request(
                     .connect_timeout(MAX_DEADLINE)
                     .buffer_size(MAX_CONNECTIONS)
                     .concurrency_limit(MAX_CONNECTIONS);
-                Box::pin(endpoint.connect_with_connector(ClientConnector { address: client.inner.address, stop: client.inner.closed.clone() }))
+                Box::pin(endpoint.connect_with_connector(ClientConnector {
+                    address: client.inner.address,
+                    stop: client.inner.closed.clone(),
+                    #[cfg(test)]
+                    cold_pause: client.inner.cold_pause.clone(),
+                }))
                     .await
                     .map_err(|_| Error::Unknown)
             })
@@ -1132,6 +1173,9 @@ mod tests {
     fn outbound_body_pending_then_owner_future_dropped_rejects_frame() {
         use http_body::Body;
         let (mut body, owner, pending) = guarded_test_body(true);
+        // Observe this exact lease rather than a shared count used by parallel tests.
+        let lease = Arc::downgrade(&owner.permit);
+        assert_eq!(lease.strong_count(), 2);
         let mut cx = TaskContext::from_waker(std::task::Waker::noop());
         let mut request = Box::pin(async move {
             let _owner = owner;
@@ -1140,11 +1184,26 @@ mod tests {
         assert!(std::future::Future::poll(request.as_mut(), &mut cx).is_pending());
         assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
         drop(request);
+        assert_eq!(
+            lease.strong_count(),
+            1,
+            "transport body must retain admission"
+        );
         pending.store(false, AtomicOrdering::Release);
         assert!(matches!(
             Pin::new(&mut body).poll_frame(&mut cx),
             Poll::Ready(Some(Err(_)))
         ));
+        assert_eq!(
+            lease.strong_count(),
+            1,
+            "error polling is not body disposal"
+        );
+        drop(body);
+        assert!(
+            lease.upgrade().is_none(),
+            "body disposal must release its lease"
+        );
     }
 
     fn identity() -> pb::CallIdentity {
