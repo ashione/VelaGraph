@@ -117,6 +117,16 @@ impl StateMachine {
         self.verify_member_archive(state, event_ledger::verify_member_apply)
     }
 
+    pub(super) fn verified_member_prefix(
+        &self,
+        state: &StateMachineData,
+        version: u64,
+    ) -> Result<Option<crate::terminal_prefix::TerminalPrefix>, D1Error> {
+        self.verify_member_archive(state, |db, cut| {
+            event_ledger::verify_member_prefix(db, cut, version)
+        })
+    }
+
     fn verify_member_archive<'db, 'cut, T>(
         &'db self,
         state: &'cut StateMachineData,
