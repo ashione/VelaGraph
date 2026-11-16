@@ -384,8 +384,100 @@ struct CloseDto {
     session: SessionDto,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobDto {
+    incarnation: String,
+    token: String,
+}
+impl JobDto {
+    fn domain(self) -> Result<JobHandle> {
+        Ok(JobHandle {
+            incarnation: unhex(&self.incarnation)?,
+            token: unhex(&self.token)?,
+        })
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartJobDto {
+    operation_id: String,
+    read: ReadSelector,
+    query: QueryDto,
+    page_size: u16,
+    policy: JobPolicy,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobRequestDto {
+    job: JobDto,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenewJobDto {
+    job: JobDto,
+    expected_generation: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FetchJobDto {
+    job: JobDto,
+    query: QueryDto,
+    cursor: Option<String>,
+    page_size: u16,
+}
+
 pub(super) fn decode(path: &str, input: &[u8]) -> Result<Operation> {
     Ok(match path {
+        "/preview1/jobs:start" => {
+            let r: StartJobDto = dto(input)?;
+            let version = match r.read {
+                ReadSelector::Latest {} => None,
+                ReadSelector::Exact { version } => Some(uint(&version)?),
+                ReadSelector::Minimum { .. } => {
+                    return Err(Error::Query(QueryFailure::Unsupported))
+                }
+            };
+            let operation_id = unhex(&r.operation_id)?;
+            if operation_id == [0; 16] || !(1..=MAX_PAGE_SIZE).contains(&r.page_size) {
+                return Err(Error::Protocol);
+            }
+            Operation::StartLocalQueryJob {
+                operation_id,
+                version,
+                query: r.query.domain()?,
+                page_size: r.page_size,
+                policy: r.policy,
+            }
+        }
+        "/preview1/jobs:get" => Operation::GetLocalQueryJob {
+            job: dto::<JobRequestDto>(input)?.job.domain()?,
+        },
+        "/preview1/jobs:cancel" => Operation::CancelLocalQueryJob {
+            job: dto::<JobRequestDto>(input)?.job.domain()?,
+        },
+        "/preview1/jobs:renew" => {
+            let r: RenewJobDto = dto(input)?;
+            Operation::RenewLocalQueryJob {
+                job: r.job.domain()?,
+                expected_generation: uint(&r.expected_generation)?,
+            }
+        }
+        "/preview1/jobs:fetch" => {
+            let r: FetchJobDto = dto(input)?;
+            if !(1..=MAX_PAGE_SIZE).contains(&r.page_size) {
+                return Err(Error::Protocol);
+            }
+            Operation::FetchLocalQueryJob {
+                job: r.job.domain()?,
+                query: r.query.domain()?,
+                cursor: r
+                    .cursor
+                    .map(|s| Ok::<_, Error>(PageCursor { token: unhex(&s)? }))
+                    .transpose()?,
+                page_size: r.page_size,
+            }
+        }
         "/preview1/writes:submit" => Operation::Submit(dto::<WriteDto>(input)?.domain()?),
         "/preview1/writes:status" => Operation::Status(dto::<WriteDto>(input)?.domain()?),
         "/preview1/writes:abort" => Operation::Abort(dto::<WriteDto>(input)?.domain()?),
@@ -490,8 +582,49 @@ fn page(p: &QueryPage) -> Result<Json> {
         json!({"rows":p.data.rows.iter().map(row).collect::<Result<Vec<_>>>()?,"completeness":match p.data.completeness{QueryCompleteness::SinglePartition=>"single_partition",QueryCompleteness::Unverified=>"unverified"},"next":p.next.as_ref().map(|c|hex(&c.token)),"offset":p.offset,"total":p.total}),
     )
 }
+fn job(j: &JobHandle) -> Json {
+    json!({"incarnation":hex(&j.incarnation),"token":hex(&j.token)})
+}
+fn job_status(s: &JobStatus) -> Json {
+    let phase = match s.phase {
+        JobPhase::Capturing => "capturing",
+        JobPhase::Running => "running",
+        JobPhase::Sealing => "sealing",
+        JobPhase::Ready => "ready",
+        JobPhase::Cancelled => "cancelled",
+        JobPhase::Expired => "expired",
+        JobPhase::Failed => "failed",
+    };
+    json!({"phase":phase,"version":s.version.map(|v|v.to_string()),"total":s.total,
+        "failure":s.failure.as_ref().map(|e|json!({"code":error_code(e).1}))})
+}
 fn reply(r: &Reply) -> Result<Json> {
     Ok(match r {
+        Reply::StartLocalQueryJob {
+            operation_id,
+            job: j,
+        } => {
+            json!({"type":"job_started","operation_id":hex(operation_id),"job":job(j)})
+        }
+        Reply::GetLocalQueryJob { job: j, status } => {
+            json!({"type":"job_status","job":job(j),"status":job_status(status)})
+        }
+        Reply::CancelLocalQueryJob { job: j, status } => {
+            json!({"type":"job_cancelled","job":job(j),"status":job_status(status)})
+        }
+        Reply::RenewLocalQueryJob { job: j, grant } => {
+            json!({"type":"job_renewed","job":job(j),"grant":{"generation":grant.generation.to_string(),"remaining_millis":grant.remaining_millis}})
+        }
+        Reply::FetchLocalQueryJob {
+            job: j,
+            query: q,
+            cursor,
+            page_size,
+            version,
+            page: p,
+        } => {
+            json!({"type":"job_page","job":job(j),"query":query(q),"cursor":cursor.as_ref().map(|c|hex(&c.token)),"page_size":page_size,"version":version.to_string(),"page":page(p)?})
+        }
         Reply::Write {
             external_id,
             transaction_id,
@@ -589,6 +722,143 @@ pub(super) fn encode(result: &Result<Reply>) -> Result<(u16, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn job_requests_preserve_identity_presence_and_strict_shape() {
+        let start = json!({
+            "operation_id": "01010101010101010101010101010101",
+            "read": {"type":"exact", "version":"0"},
+            "query": {"partition":7, "text":"g.V(1)"},
+            "page_size":1,
+            "policy":{"idle_millis":1000,"execution_millis":1000,"lifetime_millis":2000}
+        });
+        let parse = |v: &Json| decode("/preview1/jobs:start", &serde_json::to_vec(v).unwrap());
+        assert!(
+            matches!(parse(&start).unwrap(), Operation::StartLocalQueryJob { version:Some(0), operation_id, .. } if operation_id == [1; 16])
+        );
+        let mut latest = start.clone();
+        latest["read"] = json!({"type":"latest"});
+        assert!(matches!(
+            parse(&latest).unwrap(),
+            Operation::StartLocalQueryJob { version: None, .. }
+        ));
+        let mut minimum = start.clone();
+        minimum["read"]["type"] = json!("minimum");
+        assert_eq!(
+            parse(&minimum).unwrap_err(),
+            Error::Query(QueryFailure::Unsupported)
+        );
+        for path in ["/preview1/jobs:get", "/preview1/jobs:cancel"] {
+            let body = json!({"job":{"incarnation":"01010101010101010101010101010101","token":"02".repeat(32)}});
+            assert!(decode(path, &serde_json::to_vec(&body).unwrap()).is_ok());
+            let mut extra = body;
+            extra["job"]["unexpected"] = json!(true);
+            assert_eq!(
+                decode(path, &serde_json::to_vec(&extra).unwrap()).unwrap_err(),
+                Error::Protocol
+            );
+        }
+        let renewal = json!({"job":{"incarnation":"01".repeat(16),"token":"02".repeat(32)},"expected_generation":u64::MAX.to_string()});
+        assert!(matches!(
+            decode(
+                "/preview1/jobs:renew",
+                &serde_json::to_vec(&renewal).unwrap()
+            )
+            .unwrap(),
+            Operation::RenewLocalQueryJob {
+                expected_generation: u64::MAX,
+                ..
+            }
+        ));
+        let bytes = serde_json::to_vec(&start).unwrap();
+        let duplicate = String::from_utf8(bytes)
+            .unwrap()
+            .replace("\"page_size\":1", "\"page_size\":1,\"page_size\":2");
+        assert_eq!(
+            decode("/preview1/jobs:start", duplicate.as_bytes()).unwrap_err(),
+            Error::Protocol
+        );
+        let mut bad_policy = start.clone();
+        bad_policy["policy"]["surprise"] = json!(1);
+        assert_eq!(parse(&bad_policy).unwrap_err(), Error::Protocol);
+        let mut zero = start;
+        zero["operation_id"] = json!("00".repeat(16));
+        assert_eq!(parse(&zero).unwrap_err(), Error::Protocol);
+    }
+    #[test]
+    fn job_status_and_page_keep_failure_and_large_versions() {
+        let status = JobStatus {
+            phase: JobPhase::Failed,
+            version: None,
+            total: None,
+            failure: Some(Error::Query(QueryFailure::Timeout)),
+        };
+        let j = JobHandle {
+            incarnation: [1; 16],
+            token: [2; 32],
+        };
+        let (_, bytes) = encode(&Ok(Reply::GetLocalQueryJob {
+            job: j.clone(),
+            status,
+        }))
+        .unwrap();
+        let output: Json = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(output["result"]["status"]["phase"], "failed");
+        assert_eq!(
+            output["result"]["status"]["failure"]["code"],
+            "query_deadline"
+        );
+        assert!(output["result"]["status"]["version"].is_null());
+        let reply = Reply::FetchLocalQueryJob {
+            job: j,
+            query: Query {
+                partition: 7,
+                text: "g.V(1)".into(),
+            },
+            cursor: None,
+            page_size: 1,
+            version: u64::MAX,
+            page: QueryPage {
+                data: QueryData {
+                    rows: vec![],
+                    completeness: QueryCompleteness::Unverified,
+                },
+                next: None,
+                offset: 0,
+                total: 0,
+            },
+        };
+        let (_, bytes) = encode(&Ok(reply.clone())).unwrap();
+        let output: Json = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(output["result"]["version"], u64::MAX.to_string());
+        let Reply::FetchLocalQueryJob {
+            mut page,
+            job,
+            query,
+            cursor,
+            page_size,
+            version,
+        } = reply
+        else {
+            unreachable!()
+        };
+        page.data.rows.push(QueryRow::Value {
+            source: None,
+            value: Value::Text("\0".repeat(MAX_RESPONSE_BYTES / 2)),
+        });
+        page.total = 1;
+        assert_eq!(
+            encode(&Ok(Reply::FetchLocalQueryJob {
+                job,
+                query,
+                cursor,
+                page_size,
+                version,
+                page
+            }))
+            .unwrap_err(),
+            Error::Capacity
+        );
+    }
     const OPEN: &str = r#"{"read":{"type":"exact","version":"0"},"ttl_millis":1000,"query":{"partition":1,"text":"g.V().count()"},"page_size":5}"#;
     #[test]
     fn exact_zero_and_latest_are_distinct() {
