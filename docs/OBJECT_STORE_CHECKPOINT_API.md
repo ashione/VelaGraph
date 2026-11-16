@@ -12,6 +12,7 @@ It does not alter or bypass the unresolved #124 purge fence.
 - `CheckpointStore::new(Arc<dyn ObjectStore>, prefix, Limits, capability)`
 - `upload(completed_checkpoint_directory, checkpoint_id) -> Receipt`
 - `download(&Receipt, new_directory)`
+- `verify(&Receipt) -> Verification` (read-only complete byte verification)
 
 The operator supplies a backend (locked Apache `object_store` 0.14.2), endpoint,
 region, **existing** bucket and nonempty prefix. Credentials stay in the backend's
@@ -128,3 +129,28 @@ were reconstructed from the recorded implementation, not claimed byte-identical
 to its old local commits. Only results from the reconstructed revision count as
 current verification. The prior environment denied AF_UNIX service sockets;
 that earlier SeaweedFS startup failure was not a passing real-service test.
+
+## Read-only backup verification
+
+`CheckpointStore::verify(&receipt) -> Verification` reads and verifies the
+receipt-bound envelope, physical inventory, every referenced chunk and the
+reconstructed SHA-256 of each file, without creating a local directory or
+writing remote objects. It shares the download validator and chunk reader;
+it is not a second, weaker metadata-only check. Operators can check backup
+integrity before spending local disk space on staging a download.
+
+The returned `files`, `bytes` and `chunks` count logical file contents and chunk
+references (not unique objects or network overhead). Empty files are hashed;
+repeated chunks are checked for each reference. No report is returned until all
+files pass. The same manifest, file-count, total-byte, chunk-size and absolute
+operation deadline limits apply. Memory retains bounded manifest metadata and
+one chunk, not all checkpoint bytes. Missing objects, changed bytes, malformed
+inventory and timeout are errors, not partial verification success.
+
+This is evidence of the bytes observed during that call only. It does not pin
+remote objects against later lifecycle deletion or mutation, certify a global
+checkpoint cut, open RocksDB, restore a node, prove live rejoin or permit READY.
+A subsequent download revalidates all bytes, and offline physical restore still
+requires the separate authoritative validator and guard. No existing storage
+format, remote-ACK or retention contract changes. This independent #191 backup
+transport slice does not complete #191/#193 or the v0.0.2 recovery milestone.

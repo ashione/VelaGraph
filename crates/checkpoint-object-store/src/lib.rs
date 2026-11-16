@@ -102,6 +102,15 @@ pub struct Receipt {
     pub manifest_sha256: String,
 }
 
+/// Evidence of bytes read and verified during one call, not restore readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verification {
+    pub files: usize,
+    /// Logical file bytes, including repeated content-addressed chunks.
+    pub bytes: u64,
+    pub chunks: usize,
+}
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -348,7 +357,34 @@ impl CheckpointStore {
         .await
         .map_err(|_| Error::Deadline)?
     }
-    async fn download_inner(&self, receipt: &Receipt, destination: &Path) -> Result<()> {
+    /// Verify all backup bytes without local staging or object mutations.
+    /// This does not pin objects, prove a global cut or make a node query-ready.
+    pub async fn verify(&self, receipt: &Receipt) -> Result<Verification> {
+        tokio::time::timeout(self.limits.timeout, async {
+            let remote = self.read_manifest(receipt).await?;
+            let mut report = Verification {
+                files: remote.files.len(),
+                bytes: 0,
+                chunks: 0,
+            };
+            for file in &remote.files {
+                self.verify_file(file, None).await?;
+                report.bytes = report.bytes.checked_add(file.size).ok_or(Error::Limit)?;
+                report.chunks = report
+                    .chunks
+                    .checked_add(file.chunks.len())
+                    .ok_or(Error::Limit)?;
+            }
+            Ok(report)
+        })
+        .await
+        .map_err(|_| Error::Deadline)?
+    }
+    async fn read_manifest(&self, receipt: &Receipt) -> Result<RemoteManifest> {
+        safe_id(&receipt.checkpoint_id)?;
+        if !valid_hash(&receipt.manifest_sha256) {
+            return Err(Error::Invalid("receipt digest".into()));
+        }
         let bytes = self
             .read_bounded(
                 &self.manifest_key(&receipt.checkpoint_id),
@@ -387,6 +423,33 @@ impl CheckpointStore {
                 return Err(Error::Invalid("chunk length".into()));
             }
         }
+        Ok(remote)
+    }
+    async fn verify_file(
+        &self,
+        f: &RemoteFile,
+        mut output: Option<&mut tokio::fs::File>,
+    ) -> Result<()> {
+        let mut hasher = Sha256::new();
+        for chunk in &f.chunks {
+            let data = self
+                .read_bounded(&self.chunk_key(&chunk.sha256), chunk.size as usize)
+                .await?;
+            if data.len() as u64 != chunk.size || hash(&data) != chunk.sha256 {
+                return Err(Error::Integrity(f.name.clone()));
+            }
+            hasher.update(&data);
+            if let Some(output) = output.as_mut() {
+                output.write_all(&data).await?;
+            }
+        }
+        if format!("{:x}", hasher.finalize()) != f.sha256 {
+            return Err(Error::Integrity(f.name.clone()));
+        }
+        Ok(())
+    }
+    async fn download_inner(&self, receipt: &Receipt, destination: &Path) -> Result<()> {
+        let remote = self.read_manifest(receipt).await?;
         tokio::fs::create_dir(destination).await?;
         for dir in ["raft.db", "state.db"] {
             tokio::fs::create_dir(destination.join(dir)).await?;
@@ -397,20 +460,7 @@ impl CheckpointStore {
                 .create_new(true)
                 .open(destination.join(&f.name))
                 .await?;
-            let mut hasher = Sha256::new();
-            for chunk in f.chunks {
-                let data = self
-                    .read_bounded(&self.chunk_key(&chunk.sha256), chunk.size as usize)
-                    .await?;
-                if data.len() as u64 != chunk.size || hash(&data) != chunk.sha256 {
-                    return Err(Error::Integrity(f.name));
-                }
-                hasher.update(&data);
-                output.write_all(&data).await?;
-            }
-            if format!("{:x}", hasher.finalize()) != f.sha256 {
-                return Err(Error::Integrity(f.name));
-            }
+            self.verify_file(&f, Some(&mut output)).await?;
             output.sync_all().await?;
         }
         for dir in ["raft.db", "state.db"] {

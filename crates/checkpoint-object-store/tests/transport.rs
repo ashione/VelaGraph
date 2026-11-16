@@ -217,5 +217,162 @@ async fn matching_digest_malformed_envelope_is_rejected_before_directory_creatio
             "case {case}"
         );
         assert!(!target.exists(), "case {case}");
+        assert!(remote.verify(&receipt).await.is_err(), "case {case}");
     }
+}
+
+#[tokio::test]
+async fn verification_reads_complete_bytes_without_local_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    common::fixture(&source, b"abcdabcd");
+    let remote = store(Arc::new(InMemory::new()));
+    let receipt = remote.upload(&source, "verify").await.unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+    let report = remote.verify(&receipt).await.unwrap();
+    assert_eq!(report.files, 2);
+    assert_eq!(report.bytes, 11);
+    assert_eq!(report.chunks, 3);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(report, remote.verify(&receipt).await.unwrap());
+}
+
+#[tokio::test]
+async fn verification_rechecks_objects_and_rejects_bad_receipt() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    common::fixture(&source, b"data");
+    let inner = Arc::new(InMemory::new());
+    let remote = store(inner.clone());
+    let receipt = remote.upload(&source, "verify").await.unwrap();
+    remote.verify(&receipt).await.unwrap();
+    let key = Path::from(format!("tests/blobs/{:x}", Sha256::digest(b"data")));
+    inner.put(&key, "oops".into()).await.unwrap();
+    assert!(matches!(
+        remote.verify(&receipt).await,
+        Err(checkpoint_object_store::Error::Integrity(_))
+    ));
+    inner.delete(&key).await.unwrap();
+    assert!(remote.verify(&receipt).await.is_err());
+    let mut bad = receipt.clone();
+    bad.checkpoint_id = "../escape".into();
+    assert!(matches!(
+        remote.verify(&bad).await,
+        Err(checkpoint_object_store::Error::Invalid(_))
+    ));
+    bad = receipt;
+    bad.manifest_sha256 = "0".repeat(64);
+    assert!(matches!(
+        remote.verify(&bad).await,
+        Err(checkpoint_object_store::Error::Integrity(_))
+    ));
+}
+
+#[tokio::test]
+async fn verification_validates_file_digest_not_just_chunk_hashes_and_limits() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    common::fixture(&source, b"");
+    let inner = Arc::new(InMemory::new());
+    let remote = store(inner.clone());
+    let receipt = remote.upload(&source, "empty").await.unwrap();
+    let report = remote.verify(&receipt).await.unwrap();
+    assert_eq!((report.files, report.bytes, report.chunks), (2, 3, 1));
+    let limited = CheckpointStore::new(
+        inner.clone(),
+        "tests".into(),
+        Limits {
+            total_bytes: 2,
+            ..Limits::default()
+        },
+        CreateCapability::AtomicCreateVerified,
+    )
+    .unwrap();
+    assert!(matches!(
+        limited.verify(&receipt).await,
+        Err(checkpoint_object_store::Error::Limit)
+    ));
+    let key = Path::from("tests/checkpoints/empty/checkpoint.json");
+    let bytes = inner.get(&key).await.unwrap().bytes().await.unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut physical: serde_json::Value =
+        serde_json::from_str(manifest["physical_manifest"].as_str().unwrap()).unwrap();
+    // Coherent metadata with authentic chunks still must fail file reassembly hash.
+    physical["files"][0]["sha256"] = "0".repeat(64).into();
+    manifest["files"][0]["sha256"] = "0".repeat(64).into();
+    manifest["physical_manifest"] = serde_json::to_string(&physical).unwrap().into();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let bad = checkpoint_object_store::Receipt {
+        checkpoint_id: "empty".into(),
+        manifest_sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    inner.put(&key, bytes.into()).await.unwrap();
+    assert!(matches!(
+        remote.verify(&bad).await,
+        Err(checkpoint_object_store::Error::Integrity(_))
+    ));
+}
+
+#[tokio::test]
+async fn verification_enforces_reader_limits_and_get_deadline() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    common::fixture(&source, b"data");
+    let inner = Arc::new(InMemory::new());
+    let receipt = store(inner.clone())
+        .upload(&source, "bounded")
+        .await
+        .unwrap();
+    for limits in [
+        Limits {
+            manifest_bytes: 1,
+            ..Limits::default()
+        },
+        Limits {
+            files: 1,
+            ..Limits::default()
+        },
+        Limits {
+            total_bytes: 1,
+            ..Limits::default()
+        },
+        Limits {
+            chunk_bytes: 1,
+            ..Limits::default()
+        },
+    ] {
+        let reader = CheckpointStore::new(
+            inner.clone(),
+            "tests".into(),
+            limits,
+            CreateCapability::AtomicCreateVerified,
+        )
+        .unwrap();
+        assert!(reader.verify(&receipt).await.is_err());
+    }
+    let slow = ThrottledStore::new(
+        inner,
+        ThrottleConfig {
+            wait_get_per_call: Duration::from_secs(1),
+            ..ThrottleConfig::default()
+        },
+    );
+    let reader = CheckpointStore::new(
+        Arc::new(slow),
+        "tests".into(),
+        Limits {
+            timeout: Duration::from_millis(10),
+            ..Limits::default()
+        },
+        CreateCapability::AtomicCreateVerified,
+    )
+    .unwrap();
+    assert!(matches!(
+        reader.verify(&receipt).await,
+        Err(checkpoint_object_store::Error::Deadline)
+    ));
 }
