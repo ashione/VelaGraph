@@ -107,12 +107,28 @@ struct Ready {
 }
 
 fn launch(binary: &Path, data: &Path, output: &Path, error: &Path) -> anyhow::Result<Demo> {
+    launch_service(
+        binary,
+        data,
+        output,
+        error,
+        Path::new(env!("CARGO_BIN_EXE_graph-service")),
+    )
+}
+
+fn launch_service(
+    binary: &Path,
+    data: &Path,
+    output: &Path,
+    error: &Path,
+    service: &Path,
+) -> anyhow::Result<Demo> {
     Ok(Demo {
         child: Command::new(binary)
             .arg("--data-dir")
             .arg(data)
             .arg("--service-bin")
-            .arg(env!("CARGO_BIN_EXE_graph-service"))
+            .arg(service)
             .args([
                 "--http",
                 "127.0.0.1:0",
@@ -357,5 +373,184 @@ async fn fresh_demo_write_query_reject_existing_and_stop_children() -> anyhow::R
     assert_eq!(fs::read(&sentinel)?, b"original data directory");
     rejected_existing(&binary, &data, logs.path(), "stopped").await?;
     assert_eq!(fs::read(&sentinel)?, b"original data directory");
+    failure_cleanup_cases(&binary, logs.path()).await?;
+    Ok(())
+}
+
+// Best-effort cleanup checks process incarnation, not just PID. This is not
+// atomic pidfd fencing or a production process supervisor.
+fn process_incarnation(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .to_owned(),
+    )
+}
+struct OwnedChildren(Vec<(u32, String)>);
+impl OwnedChildren {
+    fn new(pids: &[u32]) -> Self {
+        Self(
+            pids.iter()
+                .filter_map(|&pid| process_incarnation(pid).map(|start| (pid, start)))
+                .collect(),
+        )
+    }
+}
+impl Drop for OwnedChildren {
+    fn drop(&mut self) {
+        for (pid, start) in &self.0 {
+            if process_incarnation(*pid).as_ref() == Some(start) {
+                if let Some(pid) = rustix::process::Pid::from_raw(*pid as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+        }
+    }
+}
+async fn failed_and_reaped(demo: &mut Demo, children: &[u32]) -> anyhow::Result<()> {
+    let status = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = demo.child.try_wait()? {
+                return Ok::<_, std::io::Error>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("failed demo must exit within bounded cleanup")??;
+    anyhow::ensure!(
+        !status.success(),
+        "failed child/startup must not report success"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while children
+            .iter()
+            .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("failed demo left child alive or unreaped")?;
+    Ok(())
+}
+fn ready_node_pids(data: &Path) -> anyhow::Result<Vec<u32>> {
+    [7, 8, 9]
+        .into_iter()
+        .map(|shard| {
+            let value: Value =
+                serde_json::from_slice(&fs::read(data.join(format!("node-{shard}/ready.json")))?)?;
+            u32::try_from(value["pid"].as_u64().context("node ready PID")?)
+                .context("node PID range")
+        })
+        .collect()
+}
+async fn failure_cleanup_cases(binary: &Path, logs: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Test-only service executables, never an alternate product bootstrap.
+    let failed_service = logs.join("failed-service.sh");
+    fs::write(
+        &failed_service,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexit 1\n",
+    )?;
+    fs::set_permissions(&failed_service, fs::Permissions::from_mode(0o700))?;
+    let stalled_service = logs.join("stalled-service.sh");
+    // PID file is adjacent to this controlled fixture, independent of argv.
+    fs::write(
+        &stalled_service,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexec /bin/sleep 60\n",
+    )?;
+    fs::set_permissions(&stalled_service, fs::Permissions::from_mode(0o700))?;
+    for case in ["startup-exit", "startup-cancel", "participant-exit"] {
+        let data = logs.join(format!("{case}-data"));
+        let output = logs.join(format!("{case}.stdout"));
+        let error = logs.join(format!("{case}.stderr"));
+        let service = match case {
+            "startup-exit" => failed_service.as_path(),
+            "startup-cancel" => stalled_service.as_path(),
+            _ => Path::new(env!("CARGO_BIN_EXE_graph-service")),
+        };
+        let mut demo = launch_service(binary, &data, &output, &error, service)?;
+        let (children, ready) = if case == "participant-exit" {
+            let ready = await_ready(&mut demo, &output, &error).await?;
+            anyhow::ensure!(ready.node_pids.len() == 3, "expected three owned nodes");
+            let children: Vec<_> = ready
+                .node_pids
+                .iter()
+                .copied()
+                .chain([ready.service_pid])
+                .collect();
+            (children, Some(ready))
+        } else {
+            // Wait until all three nodes are ready and service launch is reached.
+            let pid_path = logs.join(if case == "startup-cancel" {
+                "stalled-service.sh.pid"
+            } else {
+                "failed-service.sh.pid"
+            });
+            tokio::time::timeout(BUDGET, async {
+                loop {
+                    let reached = fs::read_to_string(&pid_path).ok().is_some_and(|text| {
+                        text.ends_with('\n') && text.trim().parse::<u32>().is_ok()
+                    });
+                    if reached {
+                        break;
+                    }
+                    anyhow::ensure!(
+                        demo.child.try_wait()?.is_none(),
+                        "demo exited before service fixture"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("service fault fixture startup")??;
+            let mut children = ready_node_pids(&data)?;
+            children.push(fs::read_to_string(pid_path)?.trim().parse()?);
+            (children, None)
+        };
+        let _owned_children = OwnedChildren::new(&children);
+        if let Some(ready) = &ready {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(ready.node_pids[0] as i32)
+                    .context("participant PID")?,
+                rustix::process::Signal::KILL,
+            )?;
+        } else if case == "startup-cancel" {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(demo.child.id() as i32).context("demo PID")?,
+                rustix::process::Signal::TERM,
+            )?;
+        }
+        failed_and_reaped(&mut demo, &children)
+            .await
+            .with_context(|| {
+                format!("{case}: {}", fs::read_to_string(&error).unwrap_or_default())
+            })?;
+        if let Some(ready) = ready {
+            for endpoint in [ready.http, ready.grpc] {
+                let connected = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::net::TcpStream::connect(endpoint),
+                )
+                .await;
+                anyhow::ensure!(
+                    matches!(connected, Ok(Err(_))),
+                    "{case}: public listener not confirmed closed"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                fs::read(&output)?.is_empty(),
+                "failed startup announced public readiness"
+            );
+        }
+        anyhow::ensure!(data.is_dir(), "failure cleanup removed retained data");
+        rejected_existing(binary, &data, logs, &format!("{case}-existing")).await?;
+    }
     Ok(())
 }
