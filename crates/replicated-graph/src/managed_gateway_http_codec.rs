@@ -972,6 +972,47 @@ mod tests {
         );
     }
     #[test]
+    fn finite_real_http_commands_preserve_binary64_vectors() {
+        // Decimal literals and IEEE-754 bits are fixed independently of this
+        // codec. Include values whose default serde_json parse changed by ULPs.
+        let vectors = [
+            ("-3.4847638523912474e139", 0xdce7_6903_a462_a0d4_u64),
+            ("8648971181991391.0", 0x433e_ba31_86f9_a5df),
+            ("5e-324", 1),
+            ("2.2250738585072014e-308", 0x0010_0000_0000_0000),
+            ("1.7976931348623157e308", 0x7fef_ffff_ffff_ffff),
+            ("-0.0", 0x8000_0000_0000_0000),
+        ];
+        for (text, bits) in vectors {
+            assert_eq!(text.parse::<f64>().unwrap().to_bits(), bits);
+            // Raw literal insertion must not run through json! before decode.
+            let body = format!(
+                r#"{{"external_id":"01010101010101010101010101010101","mutation":{{"type":"create_vertex","partition":1,"vertex":{{"id":"2","labels":[],"properties":{{"x":{{"type":"real","value":{text}}}}}}}}}}}"#
+            );
+            for action in ["submit", "status", "abort"] {
+                let op = decode(&format!("/preview1/writes:{action}"), body.as_bytes()).unwrap();
+                let write = match op {
+                    Operation::Submit(w) | Operation::Status(w) | Operation::Abort(w) => w,
+                    _ => panic!("wrong write operation"),
+                };
+                let Mutation::CreateVertex { vertex, .. } = write.mutation else {
+                    panic!("wrong mutation")
+                };
+                let Value::Real(actual) = vertex.properties["x"] else {
+                    panic!("wrong scalar")
+                };
+                assert_eq!(actual.to_bits(), bits, "{action} {text}");
+                let output = serde_json::to_string(&scalar(&Value::Real(actual)).unwrap()).unwrap();
+                let roundtrip: Scalar = dto(output.as_bytes()).unwrap();
+                let Value::Real(decoded) = roundtrip.domain().unwrap() else {
+                    panic!("wrong output scalar")
+                };
+                assert_eq!(decoded.to_bits(), bits, "response roundtrip {text}");
+            }
+        }
+    }
+
+    #[test]
     fn size_and_nonfinite_fail_closed() {
         assert_eq!(
             decode("/preview1/queries:open", &vec![b' '; MAX_REQUEST_BYTES + 1]).unwrap_err(),
