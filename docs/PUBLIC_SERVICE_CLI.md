@@ -1,6 +1,6 @@
 # Managed service process preview
 
-`graph-service` is a standalone loopback host for the
+`graph-service` is a standalone default-loopback host for the
 [managed HTTP preview](PUBLIC_HTTP_PREVIEW.md) and typed public managed gRPC,
 using the same existing managed cohort execution and recovery identity. It is not a cluster bootstrap tool,
 public production gateway, global restore controller or the final
@@ -28,10 +28,15 @@ cargo run --locked -p replicated-graph --bin graph-service -- \
   --allow-insecure-development
 ```
 
-All configuration endpoints and both public listeners must be loopback.
+All configuration endpoints and the gRPC listener must be loopback. HTTP is
+loopback-only unless the separate `--allow-insecure-network` flag is supplied
+with an explicit `--http ADDRESS:PORT` and `--allow-insecure-development`.
+This is plaintext, unauthenticated trusted-network access, not production
+exposure; use an authenticated TLS reverse proxy or a controlled private network.
+No network/firewall settings or deployment are changed by these options.
 `--http` is required; `--grpc` is optional and explicit (omit it for the
 HTTP-only preview). The two flags bind separate ports; neither protocol silently
-falls back to the other. The port is explicit; port 0 requests an ephemeral loopback port. An optional
+falls back to the other. The port is explicit; port 0 requests an ephemeral port on the selected interface. An optional
 `--timeout-ms` (1..60000, default 15000) supplies the maximum request budget;
 method limits, caller timeouts and session expiry can shorten it. Unknown or
 repeated command flags fail before startup. No credentials or telemetry payloads
