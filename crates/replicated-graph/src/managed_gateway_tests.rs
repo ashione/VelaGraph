@@ -2831,3 +2831,242 @@ async fn reusable_gateway_client_expired_queued_mutation_body_is_not_dispatched(
     gateway.shutdown().await;
     fixture.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_close_reclaims_permits_without_peer_quota_recovery() {
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready, queued) = tokio::sync::oneshot::channel();
+    let (disconnected, closed) = tokio::sync::oneshot::channel();
+    let mut peer = RpcDriver(tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake::<_, tonic::codegen::Bytes>(socket)
+            .await
+            .unwrap();
+        // The first unanswered Status occupies the only acknowledged slot.
+        // Never release it or raise SETTINGS: client close must tear down IO.
+        let first = connection.accept().await.unwrap().unwrap();
+        assert!(first.0.uri().path().ends_with("/Status"));
+        std::future::poll_fn(|cx| {
+            assert!(connection.poll_accept(cx).is_pending());
+            if connection.max_concurrent_recv_streams() == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        ready.send(()).unwrap();
+        match connection.accept().await {
+            None | Some(Err(_)) => {}
+            Some(Ok(call)) => panic!(
+                "unexpected request while quota occupied: {:?}",
+                call.0.uri()
+            ),
+        }
+        drop(first);
+        disconnected.send(()).unwrap();
+        // The listener stays available: a closed client must not reconnect.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }));
+    let client = GatewayClient::new(address, bound());
+    let cloned = client.clone();
+    let first_client = client.clone();
+    let first = tokio::spawn(async move {
+        first_client
+            .request(
+                Operation::Status(create(201, 7, 1)),
+                Duration::from_secs(15),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in 202..202 + MAX_CONNECTIONS as u8 - 1 {
+        assert_eq!(
+            client
+                .request(
+                    Operation::Submit(create(id, 7, 1)),
+                    Duration::from_millis(30)
+                )
+                .await,
+            Err(Error::Unknown)
+        );
+    }
+    assert_eq!(CLIENT_ADMISSION.available_permits(), 0);
+    assert_eq!(
+        client
+            .request(Operation::Status(create(229, 7, 1)), Duration::from_secs(1))
+            .await,
+        Err(Error::Capacity)
+    );
+    cloned.close();
+    client.close();
+    assert!(client.is_closed() && cloned.is_closed());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::Unknown)
+    );
+    tokio::time::timeout(Duration::from_secs(3), closed)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for owner in [&client, &cloned] {
+        assert_eq!(
+            owner
+                .request(Operation::Submit(create(229, 7, 1)), Duration::from_secs(1))
+                .await,
+            Err(Error::Unknown)
+        );
+    }
+    // Await the absence check rather than aborting the peer before it runs.
+    (&mut peer.0).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_close_during_cold_call_and_before_first_use() {
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = GatewayClient::new(listener.local_addr().unwrap(), bound());
+    let cloned = client.clone();
+    let pending = tokio::spawn(async move {
+        cloned
+            .request(
+                Operation::Status(create(231, 7, 1)),
+                Duration::from_secs(15),
+            )
+            .await
+    });
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    client.close();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::Unknown)
+    );
+    // Drain already-written handshake bytes until EOF. Merely aborting the
+    // request would not establish that background transport had closed.
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::io::AsyncReadExt::read_to_end(&mut socket, &mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while CLIENT_ADMISSION.available_permits() != MAX_CONNECTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let never_connected = GatewayClient::new(listener.local_addr().unwrap(), bound());
+    never_connected.close();
+    never_connected.clone().close();
+    assert!(never_connected.is_closed());
+    assert_eq!(
+        never_connected
+            .request(Operation::Status(create(232, 7, 1)), Duration::from_secs(1))
+            .await,
+        Err(Error::Unknown)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reusable_gateway_client_close_after_submit_dispatch_is_unknown() {
+    use prost::Message;
+    let _test = TEST_GATE.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sent, dispatched) = tokio::sync::oneshot::channel();
+    let mut peer = RpcDriver(tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .handshake::<_, tonic::codegen::Bytes>(socket)
+            .await
+            .unwrap();
+        let (request, response) = connection.accept().await.unwrap().unwrap();
+        assert!(request.uri().path().ends_with("/Submit"));
+        let read = async move {
+            let mut body = request.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+            assert!(bytes.len() > 5);
+            assert_eq!(bytes[0], 0);
+            assert_eq!(
+                u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize,
+                bytes.len() - 5
+            );
+            public_proto::WriteRequest::decode(&bytes[5..]).unwrap();
+            // Full mutation DATA crossed the wire; intentionally withhold ACK.
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(response);
+        };
+        tokio::pin!(read);
+        tokio::select! {
+            _ = &mut read => unreachable!(),
+            result = connection.accept() => assert!(result.is_none() || result.unwrap().is_err()),
+        }
+    }));
+    let client = GatewayClient::new(address, bound());
+    let pending_client = client.clone();
+    let pending = tokio::spawn(async move {
+        pending_client
+            .request(
+                Operation::Submit(create(233, 7, 1)),
+                Duration::from_secs(15),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), dispatched)
+        .await
+        .unwrap()
+        .unwrap();
+    client.close();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(Error::Unknown)
+    );
+    tokio::time::timeout(Duration::from_secs(3), &mut peer.0)
+        .await
+        .unwrap()
+        .unwrap();
+    // The controlled peer received the command. Unknown must not be interpreted
+    // as proof of non-execution; this test does not simulate a durable commit.
+}
