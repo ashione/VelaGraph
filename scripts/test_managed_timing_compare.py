@@ -5,8 +5,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
-from managed_timing_compare import ORDER, PREFIX, TEST, analyze, bounded_run
+from managed_timing_compare import ORDER, PREFIX, TEST, analyze, bounded_run, run
 
 
 class ComparisonTest(unittest.TestCase):
@@ -75,6 +76,44 @@ class ComparisonTest(unittest.TestCase):
             record['format'] = version
             with self.assertRaises(ValueError):
                 self.parse(record)
+
+    def test_runner_identity_and_failure_records(self):
+        # A synthetic executable validates the evidence collector, not graph behavior.
+        for failure in (None, 'source', 'binary', 'test'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = pathlib.Path(temp)
+                output = root / 'evidence'
+                binary = root / 'synthetic-test'
+                binary.write_bytes(b'synthetic binary')
+                snapshots = [{'sha256': 'same'}, {'sha256': 'changed' if failure == 'source' else 'same'}]
+
+                def execute(command, cwd, stdout, stderr, timeout):
+                    if command[0] == 'cargo':
+                        stdout.write('{}\n')
+                        return 0
+                    stdout.write(self.stdout)
+                    stderr.write(PREFIX + json.dumps(self.record))
+                    if failure == 'binary':
+                        binary.write_bytes(b'changed')
+                    return 1 if failure == 'test' else 0
+
+                with patch('managed_timing_compare.source_snapshot', side_effect=snapshots), \
+                     patch('managed_timing_compare.subprocess.check_output', return_value='synthetic'), \
+                     patch('managed_timing_compare.select_artifact', return_value={'executable': str(binary)}), \
+                     patch('managed_timing_compare.bounded_run', side_effect=execute):
+                    if failure:
+                        with self.assertRaises(ValueError):
+                            run(root, output)
+                        self.assertFalse((output / 'comparison.json').exists())
+                        self.assertFalse(json.loads((output / 'execution.json').read_text())['complete'])
+                    else:
+                        result = run(root, output)
+                        self.assertTrue(result['complete'])
+                        self.assertTrue(json.loads((output / 'execution.json').read_text())['complete'])
+                        self.assertTrue((output / 'source-before.json').exists())
+                        self.assertTrue((output / 'source-after.json').exists())
+                    with self.assertRaises(FileExistsError):
+                        run(root, output)
 
     def test_bounded_process_success_failure_and_timeout(self):
         with tempfile.TemporaryFile() as output:

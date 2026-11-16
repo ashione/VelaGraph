@@ -140,7 +140,8 @@ The v0.0.3 measurement prerequisite can proceed independently of v0.0.1 release
 integration. `python3 scripts/managed_timing_compare.py --output /new/evidence/dir`
 builds the locked optimized `managed_process` test, selects its exact Cargo
 artifact and runs only the ignored `managed_diagnostics_controlled_comparison`.
-It does not change normal CI selection or add a long comparison to each PR.
+Only the fast Python evidence-validator tests run in ordinary CI; the long
+comparison remains opt-in and is not added to each PR.
 
 The experiment reuses **all** small-lifecycle correctness checks above, including
 original IDs, rejected changed requests, old views, lost ACK, reopen and three
