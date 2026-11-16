@@ -115,14 +115,15 @@ retired the Gateway/GraphService legacy wires. Merged #283 adds standard rich
 gRPC errors and a bounded generated-Go real-process interoperability slice; see
 [compatibility](PUBLIC_GRPC_ERROR_COMPATIBILITY.md). Old clients and servers must
 upgrade together; mixed-version rolling upgrade is not supported for that change.
-HTTP job parity, complete cross-language API coverage and other #218 service gates
-remain separate; jobs do not
-resume after gateway restart.
+The [HTTP preview job lifecycle](PUBLIC_HTTP_PREVIEW.md#managed-asynchronous-jobs)
+shares these Start/Get/Renew/Fetch/Cancel handlers. FixedSession HTTP parity,
+a stable HTTP v1 contract, complete cross-language API coverage and other #218
+service gates remain separate; jobs do not resume after gateway restart.
 [Lost public write replies](SERVICE_WRITE_RECOVERY.md) use the durable original
 ID/command Status contract, including from another same-cohort gateway; this is
 separate from process-local query/job ownership and does not add automatic retry.
-This is a loopback development preview requiring an already
-activated fixed cohort, not cluster bootstrap, production serving or global
+This is a default-loopback development preview with an explicit trusted-network
+HTTP opt-in, requiring an already activated fixed cohort, not cluster bootstrap, production serving or global
 restore. Graph channel connection is not typed-service readiness; an incompatible
 graph endpoint can fail its first query even after a startup announcement.
 

@@ -1,4 +1,4 @@
-//! Fixed-topology loopback managed HTTP/gRPC service preview. This process attaches
+//! Fixed-topology managed HTTP/gRPC preview, defaulting to loopback. This attaches
 //! to already activated live managed nodes; it never bootstraps or restores them.
 use anyhow::{bail, Context};
 use d2_raft::managed_rpc::{Client, Identity};
@@ -22,14 +22,17 @@ struct Options {
     grpc: Option<SocketAddr>,
     timeout_ms: u64,
     drain_timeout_ms: u64,
+    allow_insecure_network: bool,
 }
 fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
     let (mut config, mut http, mut grpc, mut timeout_ms) = (None, None, None, None);
     let mut drain_timeout_ms = None;
     let mut trusted = false;
+    let mut allow_insecure_network = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-insecure-development" if !trusted => trusted = true,
+            "--allow-insecure-network" if !allow_insecure_network => allow_insecure_network = true,
             "--config" if config.is_none() => {
                 config = Some(args.next().context("--config needs a file")?)
             }
@@ -69,7 +72,10 @@ fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
         "loopback plaintext service requires --allow-insecure-development"
     );
     let http = http.context("--http is required; no default public listener")?;
-    anyhow::ensure!(http.ip().is_loopback(), "--http must be loopback");
+    anyhow::ensure!(
+        http.ip().is_loopback() || allow_insecure_network,
+        "non-loopback --http requires --allow-insecure-network"
+    );
     anyhow::ensure!(
         grpc.is_none_or(|address| address.ip().is_loopback()),
         "--grpc must be loopback"
@@ -90,6 +96,7 @@ fn options(mut args: impl Iterator<Item = String>) -> anyhow::Result<Options> {
         grpc,
         timeout_ms,
         drain_timeout_ms,
+        allow_insecure_network,
     })
 }
 #[derive(Deserialize)]
@@ -182,7 +189,14 @@ async fn main() -> anyhow::Result<()> {
     let gateway = Service::remote_local_queries_grpc(config, routes, deadline, 3, 1)
         .await
         .context("managed cohort validation failed; not serving")?;
-    let http = match gateway.bind_http(options.http, deadline).await {
+    let bound_http = if options.allow_insecure_network {
+        gateway
+            .bind_http_trusted_network(options.http, deadline)
+            .await
+    } else {
+        gateway.bind_http(options.http, deadline).await
+    };
+    let http = match bound_http {
         Ok(http) => http,
         Err(error) => {
             gateway.shutdown().await;
@@ -257,6 +271,37 @@ mod tests {
             .timeout_ms,
             15000
         );
+    }
+    #[test]
+    fn external_http_requires_separate_explicit_opt_in() {
+        let base = [
+            "--allow-insecure-development",
+            "--allow-insecure-network",
+            "--config",
+            "x",
+            "--http",
+            "192.0.2.2:8080",
+        ];
+        let selected = parse(&base).unwrap();
+        assert!(selected.allow_insecure_network);
+        assert_eq!(
+            selected.http,
+            "192.0.2.2:8080".parse::<SocketAddr>().unwrap()
+        );
+        let mut duplicate = base.to_vec();
+        duplicate.push("--allow-insecure-network");
+        assert!(parse(&duplicate).is_err());
+        let mut public_grpc = base.to_vec();
+        public_grpc.extend(["--grpc", "0.0.0.0:8081"]);
+        assert!(parse(&public_grpc).is_err());
+        assert!(parse(&[
+            "--allow-insecure-network",
+            "--config",
+            "x",
+            "--http",
+            "192.0.2.2:8080"
+        ])
+        .is_err());
     }
     #[test]
     fn grpc_is_optional_explicit_and_loopback_only() {
