@@ -4,7 +4,7 @@ This is an **experimental library entrypoint**, not the v0.0.1 release or the
 final protobuf/HTTP contract. It uses the existing certified managed gateway
 business implementation. A [typed public gRPC adapter](PUBLIC_GRPC_SERVICE.md) and
 [standalone service host](PUBLIC_SERVICE_CLI.md) are separate slices sharing this
-managed business path. A final stable dual-protocol contract and clean cluster
+managed business path. A final stable dual-protocol contract and production cluster
 startup packaging remain work under [#218](https://github.com/ashione/VelaGraph/issues/218). See the separate
 [shared service design](PUBLIC_SERVICE_DESIGN.md).
 
@@ -26,7 +26,7 @@ restore READY certificate, availability promise or proof that the next request
 can obtain a certified view. Every business operation retains its existing
 identity/certification checks. A stopping gateway rejects new work.
 
-Both HTTP and legacy managed TCP share the same eight admission slots, retained
+Both HTTP and public gRPC share the same eight admission slots, retained
 query budgets and submit serialization. The first HTTP implementation accepts
 one request per connection (`Connection: close` behavior); persistent HTTP client
 connections are not advertised. The separate typed public gRPC adapter is now
@@ -93,7 +93,7 @@ query, page size and page. The page contains typed rows, original completeness,
 next cursor, offset and total. Use the returned session/query unchanged for
 fetch, with cursor null to replay the first page or the prior `next` cursor to
 advance. Every page is preflighted against the HTTP wire budget before the first
-HTTP page is delivered, including sessions originally opened via managed TCP.
+HTTP page is delivered, including sessions originally opened via public gRPC.
 The successful whole-result HTTP preflight is cached on that immutable retained
 session; later fetches still check liveness and their own response encoding,
 but do not re-encode the entire result. Pages cannot exceed the full result or
@@ -126,10 +126,10 @@ writes or imply a distributed transaction abort.
 
 ## Verification boundary
 
-Focused tests exercise real loopback HTTP with the same managed gateway as TCP,
+Focused tests exercise real loopback HTTP with the same managed gateway as public gRPC,
 strict codecs and delivery/admission ownership. These are not multi-machine
 benchmarks, global restore tests or release-gate evidence. The separate [dual-protocol process test](PUBLIC_SERVICE_CLI.md) adds actual
-independent processes and cross-protocol semantics. Clean startup packaging and exact CI/release checks remain required before
+independent processes and cross-protocol semantics. The fresh-only [development launcher](MANAGED_SERVICE_DEMO.md) is implemented; exact CI/release checks remain required before
 v0.0.1; the finite preview feature/compatibility matrix must be explicit. Test results must be read from
 the exact submitted commit rather than inferred from this document.
 

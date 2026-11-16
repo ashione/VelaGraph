@@ -58,7 +58,8 @@ still apply, with no re-open-at-latest fallback.
 The public server may close a whole HTTP/2 connection when a response stalls at
 its deadline. Sharing a channel therefore shares that failure domain: other
 multiplexed calls can fail. The client does not convert that failure into success
-or retry. A failed write can have an unknown outcome; recover the original
+or retry. A failed write can have an unknown outcome; follow the
+[public write recovery procedure](SERVICE_WRITE_RECOVERY.md) and recover the original
 external ID and exact command through the existing Status contract. Dropping a
 client or timing out an RPC is not a write rollback.
 
