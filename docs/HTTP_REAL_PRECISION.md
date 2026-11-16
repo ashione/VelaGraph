@@ -53,6 +53,44 @@ vertex. The coordinator/shards were started by the corrected test build and rema
 running throughout; no legacy node was cold-reopened. This is service replacement
 and identity evidence, not a whole-cohort crash/reopen or live restore test.
 
+## Rollback and mixed-parser identity boundary
+
+The risk is bidirectional. A corrected gateway can accept a decimal as NEW_BITS,
+then a rolled-back old HTTP parser can interpret the same raw text as OLD_BITS.
+For that already committed external ID, Submit, Status and Abort can therefore
+reject `identity_mismatch` after rollback too. Keeping the old executable is not
+by itself a transparent rollback plan.
+
+A separate controlled gateway-cycle experiment verified this reverse direction.
+After the old-service vertex1 and corrected-service vertex2 decisions described
+above, only the gateway was rolled back. All three raw same-text vertex2 actions
+rejected with HTTP409/identity_mismatch. After each rejection, typed Status with
+the originally accepted NEW_BITS preserved vertex2's exact external ID,
+transaction and ordinal2; typed OLD_BITS Status rejected. Old vertex1 raw Status
+still recovered its original decision, providing a healthy old-parser control.
+Switching the gateway back to corrected restored raw vertex2 Status success and
+kept raw vertex1 Status rejection; both exact typed identities and the known
+fixture's two rows/bits at V2 remained unchanged. No additional write, repair,
+new-ID retry or mutation-budget change was used.
+
+The corrected experiment ran once successfully. Its first version had failed
+before rollback because a new test assertion expected `SinglePartition` instead
+of the documented FixedSession Traverse `Unverified` completeness value. That
+first failure was retained and classified as an overstrong test oracle, not a
+product rollback failure. The corrected test asserts `Unverified` explicitly;
+its exact finite fixture row comparison is not a certificate of arbitrary-writer
+adjacency completeness. The evidence received independent source/result review,
+not an independent dynamic rerun.
+
+Nodes were started by the corrected test build and remained running throughout.
+This does not validate old-node disk reopen, old/cohort binary downgrade,
+arbitrarily concurrent mixed-parser gateways, rolling availability or recovery
+from a crash during migration. No mixed-parser routing mode is supported by this
+change. An upgrade plan must cover forward migration AND rollback, including
+which exact accepted typed commands/build features remain available for recovery
+and how incompatible HTTP clients/gateways are kept from serving the same IDs.
+Do not automatically try both parsers or silently substitute a new external ID.
+
 ## Feature unification and scope
 
 Cargo features are additive within the selected build. Selecting the service
