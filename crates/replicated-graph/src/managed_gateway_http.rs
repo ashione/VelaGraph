@@ -1,4 +1,4 @@
-//! Bounded loopback HTTP/1 preview. One request per connection deliberately
+//! Bounded HTTP/1 preview; loopback by default, explicit trusted-network opt-in. One request per connection deliberately
 //! keeps response-delivery ownership coupled to the actual connection outcome.
 use super::*;
 use axum::{
@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 
-/// Loopback-only HTTP adapter sharing the managed gateway's admission and state.
+/// HTTP adapter sharing the managed gateway's admission and state.
 /// It is not an authentication boundary or a global-restore implementation.
 pub struct HttpService {
     address: SocketAddr,
@@ -56,8 +56,9 @@ pub(super) async fn bind(
     mut gateway_stop: watch::Receiver<bool>,
     bind: SocketAddr,
     deadline: Duration,
+    allow_non_loopback: bool,
 ) -> Result<HttpService> {
-    if !bind.ip().is_loopback() || *gateway_stop.borrow() {
+    if (!allow_non_loopback && !bind.ip().is_loopback()) || *gateway_stop.borrow() {
         return Err(Error::Rejected);
     }
     check_deadline(deadline)?;

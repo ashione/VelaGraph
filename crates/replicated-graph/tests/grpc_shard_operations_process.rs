@@ -13,12 +13,17 @@ use replicated_graph::remote::{
 use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
+    pin::Pin,
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{watch, Notify},
     task::{JoinHandle, JoinSet},
@@ -722,10 +727,47 @@ async fn run_cli(mut command: Command) -> anyhow::Result<bool> {
     .await?
 }
 
+// Counts and transport terminal states only: never request/response payloads.
+#[derive(Debug, Default)]
+struct ProxyEvidence {
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
+    request_eof: AtomicBool,
+    response_eof: AtomicBool,
+    tasks_finished: AtomicU64,
+    tasks_failed: AtomicU64,
+}
+struct CountedRequest<R> {
+    inner: R,
+    evidence: Arc<ProxyEvidence>,
+}
+impl<R: AsyncRead + Unpin> AsyncRead for CountedRequest<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let capacity = buf.remaining();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            let count = buf.filled().len() - before;
+            self.evidence
+                .request_bytes
+                .fetch_add(count as u64, Ordering::Relaxed);
+            if count == 0 && capacity > 0 {
+                self.evidence.request_eof.store(true, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+}
+
 struct Proxy {
     address: SocketAddr,
     paused: watch::Sender<bool>,
     blocked: Arc<Notify>,
+    evidence: Arc<ProxyEvidence>,
     task: JoinHandle<()>,
 }
 impl Drop for Proxy {
@@ -740,6 +782,8 @@ impl Proxy {
         let (paused, pause) = watch::channel(false);
         let blocked = Arc::new(Notify::new());
         let signal = blocked.clone();
+        let evidence = Arc::new(ProxyEvidence::default());
+        let task_evidence = evidence.clone();
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
             loop {
@@ -747,14 +791,18 @@ impl Proxy {
                     accepted = listener.accept() => {
                         let Ok((client,_)) = accepted else { break };
                         let mut pause = pause.clone(); let signal=signal.clone();
+                        let evidence = task_evidence.clone();
                         tasks.spawn(async move {
                             let server=TcpStream::connect(upstream).await?;
-                            let (mut cr,mut cw)=client.into_split(); let (mut sr,mut sw)=server.into_split();
+                            let (cr,mut cw)=client.into_split(); let (mut sr,mut sw)=server.into_split();
+                            let mut cr = CountedRequest { inner: cr, evidence: evidence.clone() };
                             let requests=tokio::io::copy(&mut cr,&mut sw);
                             let responses=async {
                                 let mut buf=[0;16384];
                                 loop {
-                                    let n=sr.read(&mut buf).await?; if n==0 { break; }
+                                    let n=sr.read(&mut buf).await?;
+                                    evidence.response_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                    if n==0 { evidence.response_eof.store(true, Ordering::Relaxed); break; }
                                     while *pause.borrow_and_update() { signal.notify_one(); if pause.changed().await.is_err() { return Ok::<(),std::io::Error>(()); } }
                                     cw.write_all(&buf[..n]).await?;
                                 }
@@ -764,7 +812,12 @@ impl Proxy {
                             Ok::<(),std::io::Error>(())
                         });
                     },
-                    _=tasks.join_next(),if !tasks.is_empty()=>{}
+                    finished=tasks.join_next(),if !tasks.is_empty()=>{
+                        task_evidence.tasks_finished.fetch_add(1, Ordering::Relaxed);
+                        if !matches!(finished, Some(Ok(Ok(())))) {
+                            task_evidence.tasks_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         });
@@ -772,6 +825,7 @@ impl Proxy {
             address,
             paused,
             blocked,
+            evidence,
             task,
         })
     }
@@ -786,11 +840,25 @@ async fn unknown_outcome(endpoint: SocketAddr, identity: RemoteIdentity) -> anyh
     let before = direct.metadata(SHARD).await?.2;
     let request = write(10, Some(before));
     proxy.paused.send(true)?;
+    let before_gate = format!("{:?}", proxy.evidence);
     let pending_request = request.clone();
     let pending = tokio::spawn(async move { slow.write(pending_request).await });
-    timeout(BUDGET, proxy.blocked.notified())
-        .await
-        .context("write response reached gate")?;
+    if let Err(error) = timeout(BUDGET, proxy.blocked.notified()).await {
+        eprintln!(
+            "reply_gate_failure phase=unknown_outcome before={before_gate} after={:?}",
+            proxy.evidence
+        );
+        if pending.is_finished() {
+            eprintln!(
+                "reply_gate_failure phase=unknown_outcome pending={:?}",
+                pending.await
+            );
+        } else {
+            eprintln!("reply_gate_failure phase=unknown_outcome pending=not_finished");
+            pending.abort();
+        }
+        return Err(error).context("write response reached gate");
+    }
     let result = timeout(Duration::from_secs(2), pending).await??;
     assert!(
         matches!(result,Err(RemoteError::Timeout {request_id:Some(id)}) if id==request.request_id),
@@ -842,12 +910,26 @@ async fn cached_adapter_unknown_outcome(
     let pending_adapter = adapter.clone();
     let pending_request = request(12);
     proxy.paused.send(true)?;
+    let before_gate = format!("{:?}", proxy.evidence);
     let pending = tokio::spawn(run_blocking(move || {
         pending_adapter.batch_write(pending_request)
     }));
-    timeout(BUDGET, proxy.blocked.notified())
-        .await
-        .context("cached write reply gate")?;
+    if let Err(error) = timeout(BUDGET, proxy.blocked.notified()).await {
+        eprintln!(
+            "reply_gate_failure phase=cached_adapter before={before_gate} after={:?}",
+            proxy.evidence
+        );
+        if pending.is_finished() {
+            eprintln!(
+                "reply_gate_failure phase=cached_adapter pending={:?}",
+                pending.await
+            );
+        } else {
+            eprintln!("reply_gate_failure phase=cached_adapter pending=not_finished");
+            pending.abort();
+        }
+        return Err(error).context("cached write reply gate");
+    }
     let result = timeout(Duration::from_secs(2), pending).await???;
     assert!(
         matches!(result, Err(StorageNodeError::Timeout {request_id:Some(id)}) if id == [12;16]),
@@ -1101,5 +1183,74 @@ fn diagnostic_tail_is_bounded_and_does_not_move_writer_offset() -> anyhow::Resul
     let tail = log_tail(file.path())?;
     assert_eq!(tail.len(), 16 * 1024);
     assert!(tail.ends_with(b"end"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_records_request_eof_without_a_response_gate() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let received = Arc::new(Notify::new());
+    let signal = received.clone();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).await?;
+        ensure!(&request == b"test", "fixture request");
+        signal.notify_one();
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let proxy = Proxy::start(address).await?;
+    proxy.paused.send(true)?;
+    let mut client = TcpStream::connect(proxy.address).await?;
+    client.write_all(b"test").await?;
+    timeout(BUDGET, received.notified()).await?;
+    client.shutdown().await?;
+    timeout(BUDGET, async {
+        while proxy.evidence.tasks_finished.load(Ordering::Relaxed) == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await?;
+    timeout(BUDGET, upstream).await???;
+    assert_eq!(proxy.evidence.request_bytes.load(Ordering::Relaxed), 4);
+    assert_eq!(proxy.evidence.response_bytes.load(Ordering::Relaxed), 0);
+    assert!(proxy.evidence.request_eof.load(Ordering::Relaxed));
+    assert_eq!(proxy.evidence.tasks_failed.load(Ordering::Relaxed), 0);
+    assert!(timeout(Duration::from_millis(10), proxy.blocked.notified())
+        .await
+        .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_records_held_response_without_changing_gate() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).await?;
+        ensure!(&request == b"test", "fixture request");
+        stream.write_all(b"ok").await?;
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let proxy = Proxy::start(address).await?;
+    proxy.paused.send(true)?;
+    let mut client = TcpStream::connect(proxy.address).await?;
+    client.write_all(b"test").await?;
+    timeout(BUDGET, proxy.blocked.notified()).await?;
+    assert_eq!(proxy.evidence.request_bytes.load(Ordering::Relaxed), 4);
+    assert_eq!(proxy.evidence.response_bytes.load(Ordering::Relaxed), 2);
+    proxy.paused.send(false)?;
+    let mut response = [0; 2];
+    timeout(BUDGET, client.read_exact(&mut response)).await??;
+    assert_eq!(&response, b"ok");
+    client.shutdown().await?;
+    timeout(BUDGET, upstream).await???;
     Ok(())
 }

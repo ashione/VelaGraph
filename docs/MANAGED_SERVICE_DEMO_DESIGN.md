@@ -121,12 +121,30 @@ The test contains these acceptance assertions:
 - SIGINT exits successfully and all announced child PIDs disappear.
 - A later launch against the stopped directory still rejects and preserves
   the sentinel.
+- A service child that exits before readiness causes a failed parent exit, no
+  public readiness announcement, and all previously started nodes to be reaped.
+- Cancellation while a test service is blocked before readiness fails startup
+  and reaps all four children without a public readiness announcement.
+- Loss of one participant after readiness fails the parent, reaps all remaining
+  children, and closes both public listeners. This is not parent-SIGKILL recovery.
+- After real service readiness, a parent announcement write to Linux `/dev/full`
+  fails with ENOSPC. A failed parent exit must still reap all four children and
+  close both public listeners. The test checks the device error independently,
+  not a specific panic message or exit code (#317).
+- Each failure preserves its fresh data directory and a subsequent launch still
+  rejects that existing directory; fault injection never permits restore/reuse.
 - Bounded stdout/stderr evidence is retained on CI failure when configured;
   graph data is not copied as diagnostic output.
 
-Non-loopback rejection and startup-cancellation cleanup are implementation
-contracts, not claims that the listed end-to-end test exercises every failure
-interleaving. SIGKILL recovery is explicitly outside the supported contract.
+Non-loopback rejection remains an implementation contract, not a claim that
+this end-to-end test exercises it or every failure interleaving. Fault cases use
+test-only shell service fixtures and bounded waits; production budgets and
+launcher behavior are unchanged. Best-effort PID-incarnation guards limit
+cleanup to recorded child identities if a regression interrupts the test; the
+check and signal are not atomic pidfd fencing. Parent SIGKILL recovery remains
+explicitly outside the supported contract. Announcement-output evidence uses
+the normal unwind build; it does not establish panic=abort cleanup, graceful
+drain on panic or filesystem-wide disk-exhaustion recovery.
 The HTTP assertion plus subsequent gRPC read proves the tested write became
 visible; it is not a general guarantee that every HTTP 200 means a final
 committed decision.
@@ -147,3 +165,19 @@ this example only with its fresh-only and loopback limitations.
 Production bootstrap, coordinated checkpoint restore, recovery-before-serving,
 membership management and operational supervision remain separate designs and
 milestone work. They must not be inferred as delivered from this demo gate.
+
+## Concurrent fresh-directory claim regression
+
+The clean-startup gate also releases two real launchers from a test-only stdin
+barrier toward the same nonexistent data directory. Both wrappers must write
+matching PID markers before either is released. Exactly one launcher reaches
+readiness; the other must fail with the existing-directory error and no serving
+announcement. The winner performs the original HTTP write and gRPC query/Close,
+then stops successfully on SIGINT with all four announced children reaped. Its
+sentinel survives shutdown and a rejected subsequent launch. Each contender has
+separate retained stdout/stderr.
+
+This is one bounded concurrent interleaving, not a deterministic scheduler at
+`create_dir`, a proof of every TOCTOU race, cross-host locking, or protection
+against malicious filesystem mutation. It changes no product behavior or gate
+budgets and retains all preceding fault cases.

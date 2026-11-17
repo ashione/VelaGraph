@@ -2186,3 +2186,6 @@ async fn member_apply_tail_fusion_discards_partially_invalid_page() {
 
 #[path = "member_projection_tests.rs"]
 mod projection_tests;
+
+#[path = "compact_member_prefix_tests.rs"]
+mod compact_prefix_tests;

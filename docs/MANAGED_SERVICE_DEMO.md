@@ -52,8 +52,11 @@ The dedicated managed-service-demo CI job builds this exact example plus
 `graph-service`, then runs the real-process
 `fresh_demo_write_query_reject_existing_and_stop_children` test. It verifies
 fresh startup, HTTP write / gRPC query, original data after rejected duplicate
-startup, and child cleanup on interruption. Ordinary `cargo test` does not run
-this explicitly ignored release gate.
+startup, child cleanup on interruption, failed service startup, cancellation
+before service readiness, participant loss while serving, and parent announcement
+output failure after real service readiness. The output-failure check uses Linux
+`/dev/full` with an unwind build, not panic=abort or filesystem-wide disk exhaustion. Ordinary
+`cargo test` does not run this explicitly ignored release gate.
 
 ```sh
 cargo build --locked -p replicated-graph --example managed_service_demo --bin graph-service
