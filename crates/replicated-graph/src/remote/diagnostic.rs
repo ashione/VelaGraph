@@ -17,7 +17,7 @@ const MAX_BYTES: usize = 768;
 fn enabled_value(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|value| value == "1")
 }
-fn enabled() -> bool {
+pub(super) fn enabled() -> bool {
     *ENABLED.get_or_init(|| enabled_value(std::env::var_os("VELAGRAPH_REMOTE_DIAGNOSTICS")))
 }
 

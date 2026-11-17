@@ -106,13 +106,17 @@ impl QueryService for Handler {
         &self,
         request: tonic::Request<wire::FragmentRequest>,
     ) -> Result<tonic::Response<wire::FragmentResponse>, Status> {
+        let call =
+            fragment_trace::incoming(crate::remote::diagnostic::enabled(), request.metadata());
         let mut request = request.into_inner();
         let context = context(request.context.take())?;
         let request: FragmentRequest = request.try_into().map_err(status)?;
         request.fragment.validate().map_err(status)?;
-        match self
-            .execute(Some(context), Operation::QueryFragment(request))
-            .await?
+        match fragment_trace::scope(
+            call,
+            self.execute(Some(context), Operation::QueryFragment(request)),
+        )
+        .await?
         {
             (Reply::QueryFragment(result), end) => {
                 let result = match result {
@@ -263,10 +267,38 @@ impl QueryClient {
             usize::try_from(result.max_row_bytes).map_err(|_| RemoteError::Protocol)?;
         Ok((descriptor, max_row_bytes))
     }
+    #[cfg(test)]
     pub(super) async fn fragment(
         &self,
         request: FragmentRequest,
         deadline: Duration,
+    ) -> Result<Result<FragmentOutput, QueryFailure>, RemoteError> {
+        self.fragment_inner(request, deadline, || None).await
+    }
+    pub(super) async fn fragment_observed(
+        &self,
+        request: FragmentRequest,
+        deadline: Duration,
+    ) -> Result<Result<FragmentOutput, QueryFailure>, RemoteError> {
+        self.fragment_inner(request, deadline, || {
+            fragment_trace::CallId::generate(crate::remote::diagnostic::enabled())
+        })
+        .await
+    }
+    #[cfg(test)]
+    pub(super) async fn fragment_with_call(
+        &self,
+        request: FragmentRequest,
+        deadline: Duration,
+        call: fragment_trace::CallId,
+    ) -> Result<Result<FragmentOutput, QueryFailure>, RemoteError> {
+        self.fragment_inner(request, deadline, || Some(call)).await
+    }
+    async fn fragment_inner(
+        &self,
+        request: FragmentRequest,
+        deadline: Duration,
+        make_call: impl FnOnce() -> Option<fragment_trace::CallId>,
     ) -> Result<Result<FragmentOutput, QueryFailure>, RemoteError> {
         let end = checked_deadline(deadline, None)?;
         let _permit = CLIENT_ADMISSION
@@ -276,14 +308,20 @@ impl QueryClient {
         let descriptor = request.descriptor.clone();
         let mut request: wire::FragmentRequest = request.into();
         request.context = Some(self.context(end)?);
-        let response = tokio::time::timeout_at(
-            end,
-            self.client.clone().fragment(Self::request(request, end)),
-        )
-        .await
-        .map_err(|_| RemoteError::Timeout { request_id: None })?
-        .map_err(remote_status)?
-        .into_inner();
+        // Deadline was fixed before random generation or metadata allocation.
+        let call = make_call();
+        let mut request = Self::request(request, end);
+        if let Some(call) = call {
+            call.insert(request.metadata_mut());
+        }
+        let response = tokio::time::timeout_at(end, self.client.clone().fragment(request))
+            .await
+            .map_err(|_| {
+                fragment_trace::elapsed(call);
+                RemoteError::Timeout { request_id: None }
+            })?
+            .map_err(|status| fragment_trace::map_status(call, status))?
+            .into_inner();
         match response.result.ok_or(RemoteError::Protocol)? {
             wire::fragment_response::Result::Output(output) => {
                 let output: FragmentOutput =

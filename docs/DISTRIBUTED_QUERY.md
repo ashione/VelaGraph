@@ -175,6 +175,33 @@ identity/stamp, corrupt observation, timeout or resource exhaustion aborts the
 whole query. No partial rows or partial count are returned. Sessions are closed
 on completion or failure on a best-effort basis, with server expiry as fallback.
 
+Ordinary observed sessions have a fixed retention deadline starting at data-node
+operation dispatch, using the caller's remaining timeout (at most 5 seconds).
+Snapshot acquisition and each fragment still obey the data node's shorter
+per-RPC processing cap. In particular, a 3-second RPC cap no longer truncates a
+requested 5-second retention lease to 3 seconds. Acquisition consumes the lease;
+completion, subsequent fragments and reconnects never restart it. This changes
+maximum residence time, not the existing session-count or byte limits.
+
+Wire messages are unchanged, but mixed versions can retain sessions for different
+lifetimes. Older data nodes still bind retention to their RPC cap (3 seconds in
+`graph-node`). The descriptor carries no granted deadline or lease capability,
+so a new coordinator cannot negotiate the longer lifetime with an older node;
+mixed-shard queries can still expire early and fail closed. Update every
+participating data node before relying on this change. Updated nodes accept the
+same OpenQuery request but may retain its session longer, up to 5 seconds.
+Rolling-upgrade and rollback behavior have not been validated.
+
+This local relative lease is not a synchronized global deadline: network and
+pre-dispatch queue time are not exactly deducted by the data node. The
+coordinator independently retains its original end-to-end deadline and can stop
+earlier. Cancellation or a lost Open response can leave an unreachable session
+until expiry cleanup. The server schedules cleanup every 100 ms, not a hard
+reclamation SLA. Removing a registry entry does not forcibly terminate native
+work or release resources still held by an active worker; those resources remain
+charged until their last owner exits.
+
+
 ## Resource boundary
 
 Query text is limited to 16 KiB and retains the official parser's existing
