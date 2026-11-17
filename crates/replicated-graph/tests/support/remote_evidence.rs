@@ -100,9 +100,23 @@ impl Evidence {
             })
             .filter(|name| !self.root.join(name).is_file())
             .collect();
+        // File presence establishes capture completeness, not successful reaping.
+        // Keep those claims separate: wait/try_wait errors are retained evidence,
+        // but must not turn into a verified cleanup merely because JSON exists.
+        let cleanup_unconfirmed: Vec<_> = (1..=3)
+            .filter(|index| {
+                let path = self.root.join(format!("node-{index}-post-cleanup.json"));
+                let observation = File::open(path)
+                    .ok()
+                    .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
+                !observation.as_ref().is_some_and(exit_confirmed)
+            })
+            .collect();
         save(
             &self.root.join("capture-status.json"),
-            json!({"complete":missing.is_empty(),"missing":missing}),
+            json!({"complete":missing.is_empty(),"missing":missing,
+                "cleanup_verified":cleanup_unconfirmed.is_empty(),
+                "cleanup_unconfirmed_nodes":cleanup_unconfirmed}),
         )?;
 
         save(
@@ -113,10 +127,23 @@ impl Evidence {
             missing.is_empty(),
             "child evidence files missing; see capture-status.json"
         );
+        anyhow::ensure!(
+            cleanup_unconfirmed.is_empty(),
+            "child exit not confirmed; see capture-status.json"
+        );
         anyhow::ensure!(same, "executed binaries changed during process test");
         Ok(())
     }
 }
+// A signal termination confirms reaping, not graceful shutdown. Never require
+// code == 0 here: this fixture intentionally kills its nodes during teardown.
+fn exit_confirmed(value: &serde_json::Value) -> bool {
+    value.get("running").and_then(serde_json::Value::as_bool) == Some(false)
+        && value.get("status_error_kind").is_none()
+        && (value.get("code").is_some_and(serde_json::Value::is_i64)
+            || value.get("signal").is_some_and(serde_json::Value::is_i64))
+}
+
 // Only exit code/signal or error category; no arbitrary error Debug/string.
 pub fn status(value: &io::Result<Option<ExitStatus>>) -> serde_json::Value {
     match value {
@@ -234,6 +261,113 @@ mod tests {
                 .unwrap();
         assert_eq!(capture["complete"], false);
         assert_eq!(capture["missing"].as_array().unwrap().len(), 15);
+        assert_eq!(capture["cleanup_verified"], false);
+        assert_eq!(capture["cleanup_unconfirmed_nodes"], json!([1, 2, 3]));
         assert!(dir.path().join("provenance-after.json").is_file());
+    }
+    #[test]
+    fn retained_files_do_not_certify_unconfirmed_cleanup() {
+        for (post, expected) in [
+            (json!({"running": true}), false),
+            (json!({"running": false, "code": 0, "signal": null}), true),
+            (json!({"running": false, "code": null, "signal": 9}), true),
+            (json!({"status_error_kind": "Other", "os": null}), false),
+            (json!({"running": false}), false),
+            (json!({"running": false, "code": "0"}), false),
+            (
+                json!({"running": false, "code": 0, "status_error_kind": "Other"}),
+                false,
+            ),
+            (json!(null), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let executable = dir.path().join("binary");
+            fs::write(&executable, b"unchanged").unwrap();
+            let evidence = Evidence {
+                root: dir.path().to_path_buf(),
+                test: executable.clone(),
+                node: executable.clone(),
+                test_hash: hash(&executable).unwrap(),
+                node_hash: hash(&executable).unwrap(),
+            };
+            for index in 1..=3 {
+                evidence.streams(index).unwrap();
+                evidence.record(&format!("node-{index}-launch.json"), json!({}));
+                evidence.record(
+                    &format!("node-{index}-pre-cleanup.json"),
+                    json!({"running":true}),
+                );
+                evidence.record(
+                    &format!("node-{index}-post-cleanup.json"),
+                    if index == 2 {
+                        post.clone()
+                    } else {
+                        json!({"running":false,"code":0})
+                    },
+                );
+            }
+            assert_eq!(evidence.verify().is_ok(), expected, "{post}");
+            let capture: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.path().join("capture-status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(capture["complete"], true);
+            assert_eq!(capture["cleanup_verified"], expected);
+            assert_eq!(
+                capture["cleanup_unconfirmed_nodes"],
+                if expected { json!([]) } else { json!([2]) }
+            );
+            assert!(dir.path().join("provenance-after.json").is_file());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn actual_exit_status_serialization_confirms_reaping() {
+        use std::os::unix::process::ExitStatusExt;
+        for raw in [0, 7 << 8, 9] {
+            assert!(exit_confirmed(&status(&Ok(Some(ExitStatus::from_raw(
+                raw
+            ))))));
+        }
+    }
+
+    #[test]
+    fn malformed_cleanup_json_is_retained_but_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("binary");
+        fs::write(&executable, b"unchanged").unwrap();
+        let evidence = Evidence {
+            root: dir.path().to_path_buf(),
+            test: executable.clone(),
+            node: executable.clone(),
+            test_hash: hash(&executable).unwrap(),
+            node_hash: hash(&executable).unwrap(),
+        };
+        for index in 1..=3 {
+            evidence.streams(index).unwrap();
+            evidence.record(&format!("node-{index}-launch.json"), json!({}));
+            evidence.record(
+                &format!("node-{index}-pre-cleanup.json"),
+                json!({"running":true}),
+            );
+            if index == 2 {
+                fs::write(dir.path().join("node-2-post-cleanup.json"), b"{").unwrap();
+            } else {
+                evidence.record(
+                    &format!("node-{index}-post-cleanup.json"),
+                    json!({"running":false,"code":0}),
+                );
+            }
+        }
+        assert!(evidence.verify().is_err());
+        let capture: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("capture-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(capture["complete"], true);
+        assert_eq!(capture["cleanup_verified"], false);
+        assert_eq!(capture["cleanup_unconfirmed_nodes"], json!([2]));
+        assert_eq!(
+            fs::read(dir.path().join("node-2-post-cleanup.json")).unwrap(),
+            b"{"
+        );
     }
 }
