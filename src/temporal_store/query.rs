@@ -1,17 +1,74 @@
 //! Indexed temporal Gremlin. No global scan fallback.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
+use super::query_memo::RecordMemo;
 use super::*;
 use crate::gremlin::QueryReadBackend;
-use crate::query_memory::{Accounted, AccountedVec, Budget};
-use crate::{Error, GremlinQuery, GremlinResult, GremlinStart};
+use crate::query_memory::{Accounted, AccountedVec, Budget, Reclaim};
+use crate::{
+    Error, GremlinBindings, GremlinQuery, GremlinResult, GremlinStart, PreparedGremlinQuery,
+};
 
 impl TemporalStoreView<'_> {
     /// Execute official Gremlin point queries and out/in/both at this V/T.
     /// Global starts reject before reads; adjacency uses a persistent candidate index.
     pub fn execute_gremlin(&self, text: &str) -> crate::Result<GremlinResult> {
-        let query = GremlinQuery::parse(text)?;
+        #[cfg(feature = "query-profiling")]
+        let _api = crate::query_profile::Timer::start(crate::query_profile::Phase::Api);
+        // Only immutable syntax plans are reused. No result, view or budget is cached.
+        // A poisoned optimization cache is treated as a miss; query/storage errors
+        // still propagate through the unchanged execution path below.
+        let cached = self
+            .plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(text));
+        let query = match cached {
+            Some(query) => {
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::cache_hit();
+                query
+            }
+            None => {
+                let query = {
+                    #[cfg(feature = "query-profiling")]
+                    let _parse =
+                        crate::query_profile::Timer::start(crate::query_profile::Phase::Parse);
+                    Arc::new(GremlinQuery::parse(text)?)
+                };
+                // Parsing and all execution happen outside the cache lock.
+                if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.insert(text, Arc::clone(&query));
+                }
+                query
+            }
+        };
+        self.execute_query_inner(&query)
+    }
+
+    /// Execute an immutable parsed plan with fresh mode checks and budgets at this view's V/T.
+    pub fn execute_query(&self, query: &GremlinQuery) -> crate::Result<GremlinResult> {
+        #[cfg(feature = "query-profiling")]
+        let _api = crate::query_profile::Timer::start(crate::query_profile::Phase::Api);
+        self.execute_query_inner(query)
+    }
+
+    /// Bind typed arguments without reparsing, then execute with a fresh budget.
+    pub fn execute_prepared(
+        &self,
+        query: &PreparedGremlinQuery,
+        bindings: GremlinBindings<'_>,
+    ) -> crate::Result<GremlinResult> {
+        #[cfg(feature = "query-profiling")]
+        let _api = crate::query_profile::Timer::start(crate::query_profile::Phase::Api);
+        let bound = query.bind(bindings)?;
+        self.execute_query_inner(&bound)
+    }
+
+    fn execute_query_inner(&self, query: &GremlinQuery) -> crate::Result<GremlinResult> {
         match query.start() {
             GremlinStart::Vertices(ids) | GremlinStart::Edges(ids) if ids.is_empty() => {
                 return Err(Error::UnsupportedGremlinArgument(
@@ -20,17 +77,13 @@ impl TemporalStoreView<'_> {
             }
             _ => {}
         }
-        let backend = Backend {
-            view: self,
-            deadline: Instant::now() + crate::GREMLIN_DEADLINE,
-            rows: Cell::new(0),
-            bytes: Cell::new(0),
-        };
-        query.execute_on_read_budget(
-            &backend,
-            &|| backend.check(),
-            &Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES),
-        )
+        let budget = Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES);
+        let backend = Backend::new(self, &budget);
+        {
+            #[cfg(feature = "query-profiling")]
+            let _execute = crate::query_profile::Timer::start(crate::query_profile::Phase::Execute);
+            query.execute_on_read_budget(&backend, &|| backend.check(), &budget)
+        }
     }
 }
 struct Backend<'a, 'db> {
@@ -38,11 +91,27 @@ struct Backend<'a, 'db> {
     deadline: Instant,
     rows: Cell<usize>,
     bytes: Cell<usize>,
+    memo: Rc<RecordMemo>,
+    // Separate from adjacency iteration, whose visitor resolves records.
+    record_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
 }
 fn error(error: TemporalStoreError) -> Error {
     Error::TemporalStore(Box::new(error))
 }
-impl Backend<'_, '_> {
+impl<'a, 'db> Backend<'a, 'db> {
+    fn new(view: &'a TemporalStoreView<'db>, budget: &Budget) -> Self {
+        let memo = Rc::new(RecordMemo::default());
+        let reclaim: Rc<dyn Reclaim> = memo.clone();
+        budget.set_reclaimer(Rc::downgrade(&reclaim));
+        Self {
+            view,
+            deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            rows: Cell::new(0),
+            bytes: Cell::new(0),
+            memo,
+            record_cursor: RefCell::new(None),
+        }
+    }
     fn check(&self) -> crate::Result<()> {
         if Instant::now() >= self.deadline {
             return Err(Error::TraversalLimitExceeded(
@@ -76,46 +145,85 @@ impl Backend<'_, '_> {
         decode: fn(&[u8], &Budget) -> crate::Result<Accounted<T>>,
     ) -> crate::Result<Option<Accounted<T>>> {
         self.check()?;
+        #[cfg(feature = "query-profiling")]
+        {
+            use crate::query_profile::{read_event, ReadEvent};
+            read_event(ReadEvent::Read);
+        }
         let prefix = identity_prefix(identity);
         let start = revision_key(identity, self.view.version, 0);
-        for row in self
-            .view
-            .snapshot
-            .iterator(IteratorMode::From(&start, Direction::Forward))
-        {
+        let view: &'a TemporalStoreView<'db> = self.view;
+        let mut slot = self.record_cursor.borrow_mut();
+        let cursor = slot.get_or_insert_with(|| {
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::Iterator);
+            view.snapshot.raw_iterator()
+        });
+        cursor.seek(&start);
+        loop {
             self.check()?;
-            let (key, value) = row?;
+            // Check status before treating an invalid cursor as absence.
+            cursor.status()?;
+            let Some((key, value)) = cursor.item() else {
+                break;
+            };
             if !key.starts_with(&prefix) {
                 break;
             }
             self.charge(key.len() + value.len())?;
             let _raw = budget.reserve(key.len() + value.len())?;
-            let (valid, payload) =
-                decode_revision(&key, &value, self.view.version).map_err(error)?;
+            let (valid, payload) = decode_revision(key, value, self.view.version).map_err(error)?;
             if valid.from <= self.view.valid_time
                 && valid.to.is_none_or(|to| self.view.valid_time < to)
             {
                 self.check()?;
-                return payload.map(|bytes| decode(bytes, budget)).transpose();
+                return payload
+                    .map(|bytes| {
+                        #[cfg(feature = "query-profiling")]
+                        crate::query_profile::read_event(crate::query_profile::ReadEvent::Decode);
+                        decode(bytes, budget)
+                    })
+                    .transpose();
             }
+            cursor.next();
         }
         Ok(None)
     }
 }
 impl QueryReadBackend for Backend<'_, '_> {
     fn get_vertex(&self, id: u64, budget: &Budget) -> crate::Result<Option<Accounted<Vertex>>> {
+        self.check()?;
+        let cached = self.memo.vertices.borrow_mut().take(id);
+        if let Some(vertex) = cached {
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::CacheHit);
+            self.memo.vertices.borrow_mut().retain(id, &vertex, budget);
+            return Ok(vertex);
+        }
         let Some(vertex) = self.record(Key::Vertex(id), budget, codec::decode_vertex_accounted)?
         else {
+            self.memo.vertices.borrow_mut().retain(id, &None, budget);
             return Ok(None);
         };
         if vertex.id != id {
             return Err(error(TemporalStoreError::Corrupt));
         }
         validate_vertex(&vertex)?;
-        Ok(Some(vertex))
+        let vertex = Some(vertex);
+        self.memo.vertices.borrow_mut().retain(id, &vertex, budget);
+        Ok(vertex)
     }
     fn get_edge(&self, id: u64, budget: &Budget) -> crate::Result<Option<Accounted<Edge>>> {
+        self.check()?;
+        let cached = self.memo.edges.borrow_mut().take(id);
+        if let Some(edge) = cached {
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::CacheHit);
+            self.memo.edges.borrow_mut().retain(id, &edge, budget);
+            return Ok(edge);
+        }
         let Some(edge) = self.record(Key::Edge(id), budget, codec::decode_edge_accounted)? else {
+            self.memo.edges.borrow_mut().retain(id, &None, budget);
             return Ok(None);
         };
         if edge.id != id {
@@ -125,9 +233,12 @@ impl QueryReadBackend for Backend<'_, '_> {
         if self.get_vertex(edge.from, budget)?.is_none()
             || self.get_vertex(edge.to, budget)?.is_none()
         {
+            self.memo.edges.borrow_mut().retain(id, &None, budget);
             return Ok(None);
         }
-        Ok(Some(edge))
+        let edge = Some(edge);
+        self.memo.edges.borrow_mut().retain(id, &edge, budget);
+        Ok(edge)
     }
     fn scan_vertices_checked(
         &self,
@@ -331,6 +442,57 @@ mod tests {
         );
     }
     #[test]
+    fn leading_limit_leaves_later_corrupt_record_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        store
+            .commit(&[vertex(1, 0, None, "n"), vertex(2, 0, None, "n")])
+            .unwrap();
+        store
+            .db
+            .put(revision_key(Key::Vertex(2), 1, 0), b"invalid assertion")
+            .unwrap();
+        let view = store.view(None, 0).unwrap();
+        assert_eq!(
+            view.execute_gremlin("g.V(1,2).limit(1).id()").unwrap().rows,
+            vec![GremlinRow::Value(Value::Integer(1))]
+        );
+        assert!(view.execute_gremlin("g.V(1,2).limit(2).id()").is_err());
+    }
+    #[test]
+    fn optional_memo_yields_to_live_results_and_never_retains_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        store.commit(&[vertex(1, 0, None, "n")]).unwrap();
+        let view = store.view(None, 0).unwrap();
+        let budget = Budget::new(2048);
+        let backend = Backend::new(&view, &budget);
+        let first = backend.get_vertex(1, &budget).unwrap().unwrap();
+        let bytes = first.accounted_bytes();
+        let second = backend.get_vertex(1, &budget).unwrap().unwrap();
+        assert_eq!(first.value, second.value);
+        assert!(budget.used() >= bytes * 3); // two caller records plus memo
+        drop(first);
+        drop(second);
+        assert!(budget.used() > 0);
+        let full = budget.reserve(2048).unwrap(); // optional records are evicted
+        assert_eq!(budget.used(), 2048);
+        assert!(backend.get_vertex(1, &budget).is_err());
+        drop(full);
+        assert!(backend.get_vertex(1, &budget).unwrap().is_some());
+        // Even a retained hit checks the original deadline.
+        let expired = Backend {
+            deadline: Instant::now(),
+            ..backend
+        };
+        assert!(matches!(
+            expired.get_vertex(1, &budget),
+            Err(Error::TraversalLimitExceeded(_))
+        ));
+        drop(expired);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
     fn memory_deadline_and_cumulative_history_limits_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let store = TemporalStore::open(dir.path()).unwrap();
@@ -341,6 +503,8 @@ mod tests {
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
             rows: Cell::new(0),
             bytes: Cell::new(0),
+            memo: Default::default(),
+            record_cursor: RefCell::new(None),
         };
         let budget = Budget::new(1);
         assert!(backend.get_vertex(1, &budget).is_err());
@@ -356,6 +520,8 @@ mod tests {
             deadline: Instant::now(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
+            memo: Default::default(),
+            record_cursor: RefCell::new(None),
         };
         assert!(matches!(
             expired.get_vertex(999, &budget),
@@ -403,12 +569,15 @@ mod tests {
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
             rows: Cell::new(0),
             bytes: Cell::new(0),
+            memo: Default::default(),
+            record_cursor: RefCell::new(None),
         };
         let result = GremlinQuery::parse("g.V(1,2).count()")
             .unwrap()
             .execute_on_read_budget(&backend, &|| backend.check(), &budget)
             .unwrap();
         assert_eq!(result.rows, vec![GremlinRow::Count(2)]);
+        drop(backend);
         assert_eq!(budget.used(), 0);
     }
 
@@ -668,6 +837,8 @@ mod adjacency_limits {
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
             rows: Cell::new(MAX_READ_REVISIONS),
             bytes: Cell::new(0),
+            memo: Default::default(),
+            record_cursor: RefCell::new(None),
         };
         let result = backend.visit_adjacent_edges(
             1,
@@ -777,6 +948,8 @@ mod adjacency_atomicity {
                 deadline: Instant::now() + crate::GREMLIN_DEADLINE,
                 rows: Cell::new(0),
                 bytes: Cell::new(0),
+                memo: Default::default(),
+                record_cursor: RefCell::new(None),
             };
             let start = Instant::now();
             assert_eq!(

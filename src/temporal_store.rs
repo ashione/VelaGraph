@@ -3,6 +3,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+mod plan_cache;
+mod query_memo;
+
 use rocksdb::{Direction, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
 
 use crate::graph::{codec, validate_edge, validate_vertex};
@@ -85,6 +88,7 @@ impl TemporalMutation {
 pub struct TemporalStore {
     db: DB,
     write: Mutex<()>,
+    plan_cache: Mutex<plan_cache::PlanCache>,
 }
 impl TemporalStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -112,6 +116,7 @@ impl TemporalStore {
         Ok(Self {
             db,
             write: Mutex::new(()),
+            plan_cache: Mutex::new(plan_cache::PlanCache::default()),
         })
     }
 
@@ -157,6 +162,7 @@ impl TemporalStore {
             snapshot,
             version,
             valid_time,
+            plan_cache: &self.plan_cache,
         })
     }
 }
@@ -208,6 +214,7 @@ pub struct TemporalStoreView<'a> {
     snapshot: Snapshot<'a>,
     version: u64,
     valid_time: i64,
+    plan_cache: &'a Mutex<plan_cache::PlanCache>,
 }
 impl TemporalStoreView<'_> {
     pub fn version(&self) -> u64 {

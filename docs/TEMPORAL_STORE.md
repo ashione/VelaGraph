@@ -128,6 +128,62 @@ fixture, not a storage label or optimization rule.
 
 ## Official Gremlin point-query integration
 
+### Query reuse and typed bindings
+
+Related performance work: [#336](https://github.com/ashione/VelaGraph/issues/336).
+Bound start IDs retain the text parser's nonnegative `i64` integer domain;
+accepting `u64` Rust input does not admit IDs above `i64::MAX`.
+
+`TemporalStoreView::execute_query(&GremlinQuery)` executes an already validated
+query at the view's V/T. `GremlinQuery::prepare(GremlinParameters)` declares which
+start IDs and existing `Has` literal-value steps are variable. The declaration
+uses step indices, not literal matching: equal constants in undeclared positions
+remain unchanged. No placeholder syntax or alternate grammar is introduced.
+
+`PreparedGremlinQuery::bind(GremlinBindings)` checks declaration/count agreement,
+preserves the V/E start kind, and requires each value to have the same `Value`
+variant as the template literal. Reals must be finite. Empty variable starts
+are rejected rather than becoming a global scan. Duplicate start IDs and their
+order are retained. Keys, labels, limits and operators are not bindable in this
+initial API.
+
+Before execution, bound arguments pass the original text/structural limits using
+a canonical standard-Gremlin representation. Caller values are bounded before
+cloning/rendering. Rendering is for admission accounting only; the official
+parser is not invoked again. This retains the conservative structural-mark
+limit even for marks inside literal strings.
+
+`execute_prepared` binds and calls the same checked executor as textual queries.
+The global-start restriction, fresh deadline and fresh read/memory budgets are
+preserved. A multi-root binding is one query and shares its cumulative budget;
+it does not obtain one independent allowance per root. Budget errors return no
+partial successful result. Subsequent executions create fresh budgets.
+
+These APIs are additive and local. They do not add managed/distributed temporal
+traversals, change stored records, or change the existing text-query contract.
+
+### Parsed-plan reuse
+
+`TemporalStoreView::execute_gremlin` caches successfully parsed `GremlinQuery`
+plans by exact query text in the owning `TemporalStore`. Plans contain syntax
+only: no read snapshot, V/T, result, deadline, or execution budget is retained.
+The temporal global-start guard is checked on every call, including cache hits.
+Every admitted execution creates a fresh backend and budget. Parse errors are
+not cached.
+
+The cache uses least-recently-used eviction, at most 1,024 entries and 1 MiB of
+retained key text. Text above 4 KiB is parsed and executed normally without cache
+admission. Parsed plans remain subject to the original parser's text and
+structural limits; these key-text bounds are not a process RSS limit. The cache
+is in-memory only and starts empty on reopen. It does not change the on-disk
+format or the managed temporal slice.
+
+Cache lookup/admission uses a short store-local mutex; parsing and execution are
+outside it. Concurrent misses can parse the same text independently. A poisoned
+cache is treated as unavailable and falls back to parsing; storage and execution
+errors are never suppressed. Optional `query-profiling` counters distinguish
+actual parse calls from cache hits.
+
 `TemporalStoreView::execute_gremlin(text)` uses the existing official parser and
 shared `GremlinQuery` executor through a lazy `QueryReadBackend`. Explicit
 `g.V(ids...)` and `g.E(ids...)` support the existing local steps: has,
@@ -155,6 +211,59 @@ Ordinary tests exercise reopen-to-Gremlin corrections/future views, fixed old
 views after writes, edge endpoint absence, duplicate/order/path projection,
 empty-input rejection, malformed syntax, memory/deadline/cumulative-work limits
 and corruption before filters. Format 2 adds the candidate index below. Distributed session/page coordinates remain open.
+
+### Query-local record reuse
+
+Each Gremlin execution owns separate vertex and edge memos at its immutable
+snapshot and V/T. They retain validated records and genuine absence, never
+errors. Edge entries include successful endpoint validation. IDs, root order,
+duplicate traversers and parallel paths are unchanged. Hits still check the
+deadline; misses retain the cumulative actual revision/byte read limits.
+
+Each memo admits at most 512 entries and 512 KiB of logical charges, for at most
+1,024 entries / 1 MiB total. Every slot costs 128 bytes plus the full original
+decoded-record charge. Returned copies are independently charged. A hit moves
+the cached record to the caller and only best-effort retains a new copy.
+The same query budget reclaims optional memo entries before rejecting required
+allocations; no query retry, limit increase or partial success is introduced.
+Reservations are released on eviction or execution drop. These are logical
+accounting limits, not an allocator/RSS guarantee.
+### Reusable version cursor
+
+One execution lazily opens at most one snapshot raw iterator for vertex and edge
+record misses. Each requested identity seeks to its version bound and tests the
+valid interval, with unchanged cumulative work limits and conservative raw-byte
+accounting. Decode borrows the selected key/value; it does not first copy them
+into owned boxes. Iterator errors propagate before absence can be returned.
+The record cursor is separate from adjacency iterators to allow their visitors
+to resolve edges and endpoints safely. Native iterator memory remains excluded
+from logical accounting under the existing RocksDB memory boundary.
+
+Start rows retain their original order, duplicates, missing-ID handling and
+leading-limit short circuit. There is no eager decode of later roots, no new
+query syntax, no multi-key I/O batching, and no asynchronous prefetch. Temporal
+version selection already consumes the candidate value, so a subsequent MultiGet
+would repeat reads rather than remove them.
+
+### Reproducing query-reuse checks
+
+Run the portable synthetic regressions, including opt-in reuse counters:
+
+```sh
+cargo test --locked -p velagraph --features query-profiling
+cargo run --locked --release -p velagraph --example temporal_query_reuse_bench
+```
+
+The example creates 1,280 roots pointing to a shared vertex and compares explicit
+parse-per-call, cached text and typed prepared execution. Each of three trials
+rotates lane order, warms each lane once and measures three rounds, checking every
+result. It reports per-trial latency for one repeated ID and 1,280 changing IDs.
+Input formatting, graph construction, one-time preparation and result validation
+are outside timing; the parse-per-call lane includes parsing. All lanes use the
+same current record/cursor backend, so this isolates plan-reuse behavior rather
+than measuring a before/after read-layer speedup. Use release builds without
+`query-profiling` for timing. This is a warm, single-process synthetic comparison,
+not an allocation/RSS, cold-cache or distributed-service throughput benchmark.
 
 ## Format 2 indexed adjacency and upgrade boundary
 

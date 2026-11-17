@@ -110,6 +110,9 @@ const RULE_INTEGER_LITERAL: usize = 292;
 const RULE_METHOD_VALUE_MAP: usize = 160;
 const RULE_METHOD_VALUES: usize = 161;
 
+mod prepared;
+pub use prepared::{GremlinBindings, GremlinParameters, PreparedGremlinQuery};
+
 /// Where a traversal starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GremlinStart {
@@ -206,7 +209,7 @@ impl ObservedGremlinQuery {
     }
 }
 
-fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQuery> {
+fn validate_query_text(input: &str) -> Result<()> {
     if input.len() > MAX_GREMLIN_QUERY_BYTES {
         return Err(Error::GremlinParse(format!(
             "query text is {} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}",
@@ -233,6 +236,11 @@ fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQ
             "multiple Gremlin traversals are not supported".into(),
         ));
     }
+    Ok(())
+}
+
+fn parse_validated_query(input: &str, observed: bool) -> Result<ObservedGremlinQuery> {
+    validate_query_text(input)?;
     let tree = parse_query(input).map_err(|error| Error::GremlinParse(error.to_string()))?;
     // `parse_query` can recover by stopping before invalid trailing input
     // instead of reporting a syntax error. Verify that the returned tree
