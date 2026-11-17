@@ -50,12 +50,23 @@ impl Sessions {
         })
     }
     pub(in crate::remote) fn expire(&self) {
+        self.expire_observing(None);
+    }
+    fn expire_observing(&self, descriptor: Option<&Descriptor>) -> Option<u128> {
         let now = std::time::Instant::now();
-        self.values.lock().unwrap().retain(|_, s| now < s.node.end);
+        let mut removed = None;
+        self.values.lock().unwrap().retain(|_, s| {
+            let keep = now < s.node.end;
+            if !keep && descriptor.is_some_and(|d| d == &s.descriptor) {
+                removed = Some(now.saturating_duration_since(s.node.end).as_micros());
+            }
+            keep
+        });
         self.fixed_values
             .lock()
             .unwrap()
             .retain(|_, s| s.live_at(Instant::from_std(now)));
+        removed
     }
     pub(in crate::remote) async fn open(
         &self,
@@ -164,20 +175,34 @@ impl Sessions {
         shard: u64,
         descriptor: &Descriptor,
     ) -> Result<Arc<Session>, RemoteError> {
-        self.expire();
+        self.lookup_observing(identity, shard, descriptor, false)
+    }
+    fn lookup_observing(
+        &self,
+        identity: RemoteIdentity,
+        shard: u64,
+        descriptor: &Descriptor,
+        observe: bool,
+    ) -> Result<Arc<Session>, RemoteError> {
+        let matching = observe
+            && descriptor.stamp.identity == identity
+            && descriptor.stamp.shard == shard
+            && descriptor.incarnation == self.incarnation;
+        let removed = self.expire_observing(matching.then_some(descriptor));
         if descriptor.stamp.identity != identity || descriptor.stamp.shard != shard {
             return Err(RemoteError::InvalidArgument);
         }
         if descriptor.incarnation != self.incarnation {
             return Err(RemoteError::SessionUnavailable);
         }
-        let session = self
-            .values
-            .lock()
-            .unwrap()
-            .get(&descriptor.token)
-            .cloned()
-            .ok_or(RemoteError::SessionUnavailable)?;
+        let session = { self.values.lock().unwrap().get(&descriptor.token).cloned() };
+        let Some(session) = session else {
+            // Both map guards are gone; only this invocation's actual removal is evidence.
+            if let Some(age) = removed {
+                super::fragment_trace::removed(age);
+            }
+            return Err(RemoteError::SessionUnavailable);
+        };
         if &session.descriptor != descriptor {
             return Err(RemoteError::InvalidArgument);
         }
@@ -205,8 +230,13 @@ impl Sessions {
         end: Instant,
     ) -> Result<Reply, RemoteError> {
         request.fragment.validate()?;
-        let session = self.lookup(identity, shard, &request.descriptor)?;
         let is_batch = matches!(request.fragment, Fragment::HierarchyBatch { .. });
+        let session = self.lookup_observing(
+            identity,
+            shard,
+            &request.descriptor,
+            !is_batch && super::fragment_trace::current().is_some(),
+        )?;
         if session.hierarchy != is_batch {
             return Err(RemoteError::InvalidArgument);
         }
@@ -2060,3 +2090,11 @@ mod typed_hierarchy_session_tests {
         sessions.close(IDENTITY, SHARD, &descriptor).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "sessions/fragment_trace_tests.rs"]
+mod fragment_trace_tests;
+
+#[cfg(test)]
+#[path = "sessions/handler_sink_control.rs"]
+mod handler_sink_control;

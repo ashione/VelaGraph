@@ -15,6 +15,7 @@ mod fixed_parallel;
 mod typed_test_peer;
 use adjacency::Direction;
 pub mod consistency;
+mod fragment_trace;
 pub mod grpc;
 mod hierarchy;
 pub mod jobs;
@@ -506,7 +507,7 @@ impl Execution<'_> {
             ..request
         };
         let reply = observed_client(self.grpc_clients, &route, self.end)?
-            .fragment(request, self.end.saturating_duration_since(Instant::now()))
+            .fragment_observed(request, self.end.saturating_duration_since(Instant::now()))
             .await
             .map(Reply::QueryFragment)
             .map_err(remote_failure)?;
