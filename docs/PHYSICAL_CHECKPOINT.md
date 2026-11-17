@@ -86,6 +86,14 @@ paths, wrong identity, corrupted files, incomplete manifest/restore and uncovere
 purge boundaries. These are correctness tests, not representative backup-size or
 latency benchmarks, remote upload tests or a multi-shard recovery proof.
 
+Input-type regressions substitute root/database/manifest symlinks and wrong file
+types into a real checkpoint, assert the destination remains absent, and restore
+the genuine checkpoint as a positive control, including trailing slash/dot root
+paths. Missing and malformed manifests are tested with both genuine DB directories
+present. A FIFO manifest runs in a killable child with an independent ten-second
+parent watchdog and a completion sentinel; its ignored child entrypoint is
+executed by the ordinary parent test.
+
 The separate transport CI also exercises a real two-DB physical checkpoint
 roundtrip through a temporary SeaweedFS S3-compatible service, followed by offline
 restore validation. This is not certification against AWS S3, OSS or TOS, live

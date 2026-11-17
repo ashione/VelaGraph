@@ -11,7 +11,30 @@ async fn backup_at(root: &Path) -> anyhow::Result<()> {
 
 fn rejected_before_destination(backup: &Path, destination: &Path) {
     assert!(restore_physical_checkpoint(backup, destination, 0, 1).is_err());
-    assert!(!destination.exists(), "invalid input created a destination");
+    assert_eq!(
+        fs::symlink_metadata(destination).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "invalid input created a destination"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_missing_and_malformed_manifest_with_valid_databases() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    backup_at(dir.path()).await?;
+    let backup = dir.path().join("backup");
+    let manifest = backup.join("checkpoint.json");
+    let original = fs::read(&manifest)?;
+    let destination = dir.path().join("rejected");
+    // Keep both genuine DB directories so the new type checks cannot mask
+    // missing-manifest or JSON-decode failures with an earlier directory error.
+    fs::remove_file(&manifest)?;
+    rejected_before_destination(&backup, &destination);
+    fs::write(&manifest, b"{\"format\":1")?;
+    rejected_before_destination(&backup, &destination);
+    fs::write(&manifest, original)?;
+    restore_physical_checkpoint(&backup, dir.path().join("healthy"), 0, 1)?;
+    Ok(())
 }
 
 #[cfg(unix)]
