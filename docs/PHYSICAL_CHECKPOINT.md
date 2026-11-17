@@ -99,6 +99,22 @@ checkpoint unit/integration and memory-transport tests, and checks all targets
 with Clippy. It does not rerun the full ordinary suite or provision S3 on macOS;
 the explicit SeaweedFS service roundtrip remains in the transport workflow.
 
+The ignored `physical_checkpoint::scale_tests` additionally writes 2,048 values
+of 16 KiB through Raft (32 MiB of logical value bytes), flushing 32 batches into
+real state DB files. It requires at least 32 SSTs; a separate fixture enables
+blob files and requires at least 16 blobs. Compaction is disabled only in these
+fixtures to retain multiple files. Production does not enable blob files.
+Both fixtures upload to disposable loopback S3, remove the original source and
+backup, download and restore, then compare every value and verify the offline
+guard and no-overwrite behavior. They print actual file counts and checkpoint
+bytes, including metadata. This is multi-file correctness coverage, not a
+production-scale, latency or throughput benchmark. Run explicitly against the
+disposable SeaweedFS fixture with:
+
+```sh
+cargo test --locked -p d2-raft --lib physical_checkpoint::scale_tests -- --ignored --nocapture --test-threads=1
+```
+
 The separate transport CI also exercises a real two-DB physical checkpoint
 roundtrip through a temporary SeaweedFS S3-compatible service, followed by offline
 restore validation. This is not certification against AWS S3, OSS or TOS, live

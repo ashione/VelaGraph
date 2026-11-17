@@ -304,3 +304,7 @@ mod tests {
 #[cfg(test)]
 #[path = "physical_checkpoint_input_tests.rs"]
 mod input_tests;
+
+#[cfg(test)]
+#[path = "physical_checkpoint_scale_tests.rs"]
+mod scale_tests;
