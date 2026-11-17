@@ -165,3 +165,19 @@ this example only with its fresh-only and loopback limitations.
 Production bootstrap, coordinated checkpoint restore, recovery-before-serving,
 membership management and operational supervision remain separate designs and
 milestone work. They must not be inferred as delivered from this demo gate.
+
+## Concurrent fresh-directory claim regression
+
+The clean-startup gate also releases two real launchers from a test-only stdin
+barrier toward the same nonexistent data directory. Both wrappers must write
+matching PID markers before either is released. Exactly one launcher reaches
+readiness; the other must fail with the existing-directory error and no serving
+announcement. The winner performs the original HTTP write and gRPC query/Close,
+then stops successfully on SIGINT with all four announced children reaped. Its
+sentinel survives shutdown and a rejected subsequent launch. Each contender has
+separate retained stdout/stderr.
+
+This is one bounded concurrent interleaving, not a deterministic scheduler at
+`create_dir`, a proof of every TOCTOU race, cross-host locking, or protection
+against malicious filesystem mutation. It changes no product behavior or gate
+budgets and retains all preceding fault cases.

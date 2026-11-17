@@ -385,6 +385,7 @@ async fn fresh_demo_write_query_reject_existing_and_stop_children() -> anyhow::R
     assert_eq!(fs::read(&sentinel)?, b"original data directory");
     failure_cleanup_cases(&binary, logs.path()).await?;
     announcement_failure(&binary, logs.path()).await?;
+    concurrent_directory_claim(&binary, logs.path()).await?;
     Ok(())
 }
 
@@ -641,5 +642,131 @@ async fn announcement_failure(binary: &Path, logs: &Path) -> anyhow::Result<()> 
     }
     anyhow::ensure!(data.is_dir(), "output fault removed diagnostic data");
     rejected_existing(binary, &data, logs, "announcement-failure-existing").await?;
+    Ok(())
+}
+
+// Two real launchers released from an input barrier, not an exhaustive scheduler
+// or an assertion about which contender must win the filesystem create operation.
+async fn concurrent_directory_claim(binary: &Path, logs: &Path) -> anyhow::Result<()> {
+    let data = logs.join("concurrent-data");
+    let outputs = [logs.join("claim-0.stdout"), logs.join("claim-1.stdout")];
+    let errors = [logs.join("claim-0.stderr"), logs.join("claim-1.stderr")];
+    let markers = [logs.join("claim-0.ready"), logs.join("claim-1.ready")];
+    let mut demos = Vec::new();
+    for index in 0..2 {
+        // The wrapper writes its own PID before waiting. exec preserves that PID
+        // and introduces no replacement service or alternate product bootstrap.
+        demos.push(Demo {
+            child: Command::new("/bin/sh")
+                .args(["-c", "printf '%s\\n' \"$$\" > \"$1\"; shift; read -r release; test \"$release\" = start || exit 90; exec \"$@\"", "claim-barrier"])
+                .arg(&markers[index])
+                .arg(binary)
+                .arg("--data-dir").arg(&data)
+                .arg("--service-bin").arg(env!("CARGO_BIN_EXE_graph-service"))
+                .args(["--http", "127.0.0.1:0", "--grpc", "127.0.0.1:0", "--allow-insecure-development"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(fs::File::create(&outputs[index])?))
+                .stderr(Stdio::from(fs::File::create(&errors[index])?))
+                .spawn()?,
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut waiting = 0;
+            for index in 0..2 {
+                anyhow::ensure!(
+                    demos[index].child.try_wait()?.is_none(),
+                    "claim wrapper exited"
+                );
+                if fs::read_to_string(&markers[index]).ok().as_deref()
+                    == Some(format!("{}\n", demos[index].child.id()).as_str())
+                {
+                    waiting += 1;
+                }
+            }
+            if waiting == 2 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("claim wrappers must reach input barrier")??;
+    anyhow::ensure!(!data.exists(), "launcher ran before release");
+    for demo in &mut demos {
+        demo.child
+            .stdin
+            .take()
+            .context("claim barrier input")?
+            .write_all(b"start\n")?;
+    }
+    let loser = tokio::time::timeout(BUDGET, async {
+        loop {
+            for (index, demo) in demos.iter_mut().enumerate() {
+                if let Some(status) = demo.child.try_wait()? {
+                    anyhow::ensure!(
+                        !status.success(),
+                        "contender exited successfully before shutdown"
+                    );
+                    return Ok::<_, anyhow::Error>(index);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("one directory claimant must reject")??;
+    anyhow::ensure!(
+        fs::read(&outputs[loser])?.is_empty(),
+        "loser announced serving"
+    );
+    anyhow::ensure!(
+        fs::read_to_string(&errors[loser])?.contains("data directory must not exist"),
+        "loser failed for a reason other than exclusive directory ownership"
+    );
+    let winner = 1 - loser;
+    let ready = await_ready(&mut demos[winner], &outputs[winner], &errors[winner]).await?;
+    anyhow::ensure!(ready.node_pids.len() == 3, "winner must own three nodes");
+    let children: Vec<_> = ready
+        .node_pids
+        .into_iter()
+        .chain([ready.service_pid])
+        .collect();
+    let _owned_children = OwnedChildren::new(&children);
+    let sentinel = data.join("claim-sentinel");
+    fs::write(&sentinel, b"winner data")?;
+    write_http(ready.http).await?;
+    anyhow::ensure!(
+        query_vertex(ready.grpc).await? > 0,
+        "winner write not visible"
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(demos[winner].child.id() as i32).context("winner PID")?,
+        rustix::process::Signal::INT,
+    )?;
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Some(status) = demos[winner].child.try_wait()? {
+                anyhow::ensure!(status.success(), "winner shutdown failed");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("winner shutdown deadline")??;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while children
+            .iter()
+            .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("winner left child alive or unreaped")?;
+    assert_eq!(fs::read(&sentinel)?, b"winner data");
+    rejected_existing(binary, &data, logs, "claim-existing").await?;
+    assert_eq!(fs::read(&sentinel)?, b"winner data");
     Ok(())
 }
