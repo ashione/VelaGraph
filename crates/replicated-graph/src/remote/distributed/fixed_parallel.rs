@@ -403,6 +403,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn limit_does_not_hide_upstream_resource_or_corrupt_fragment_errors() {
+        let _sessions = fixed_execution::lock_session_fixtures().await;
+        for (fault, expected) in [
+            (3, QueryFailure::ResourceExhausted),
+            (4, QueryFailure::IncompleteOrCorrupt),
+        ] {
+            for text in ["g.V(2).out()", "g.V(2).out().limit(1)"] {
+                let (mut nodes, mut listeners) = fixture_with_members(1).await;
+                let listener = listeners.remove(0);
+                let server = tokio::spawn(async move {
+                    for (index, failure) in [0, fault].into_iter().enumerate() {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let request = request(&mut socket).await;
+                        assert_eq!(request.request_sequence, index as u64);
+                        assert!(if index == 0 {
+                            matches!(request.fragment, Fragment::Exists(_))
+                        } else {
+                            matches!(request.fragment, Fragment::Out(_))
+                        });
+                        reply(&mut socket, request, failure).await;
+                    }
+                });
+                let result = fixed_execution::execute(
+                    &mut nodes,
+                    &DistributedRequest {
+                        start_partition: 1,
+                        text: text.into(),
+                        timeout_millis: 5000,
+                    },
+                    2,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await;
+                assert_eq!(result.unwrap_err(), expected, "{text}");
+                server.await.unwrap();
+                assert_eq!(nodes[&1].sequence, 2, "no retry or credit refill");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn configured_widths_bound_eight_lanes_and_preserve_duplicate_order() {
         // These fake peers still use the process-wide bounded RPC client.
         let _sessions = fixed_execution::lock_session_fixtures().await;

@@ -677,3 +677,13 @@ edges and endpoints at the same V/T; no distributed query is implied. Order, bag
 unchanged. One query shares cumulative temporal revision/byte work bounds,
 logical allocation accounting and a cooperative deadline. See the precise
 [temporal query contract](TEMPORAL_STORE.md#official-gremlin-point-query-integration).
+
+### Certified data-local synchronous limit admission
+
+The separate [managed data-local gateway](MANAGED_LOCAL_GATEWAY.md) admits
+`limit(n)` between its supported explicit-ID `out`/`in` steps, before terminal
+`path` or `count`, using this same official AST and the shared distributed
+executor. Limits operate on the global ordered bag at their original position,
+not on independent shard prefixes. Existing 1..=1000 validation, hop, work,
+result and deadline bounds remain unchanged. This does not extend renewable
+jobs, global starts, filters or other currently unsupported local syntax.
