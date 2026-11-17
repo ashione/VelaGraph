@@ -210,6 +210,18 @@ pub(in crate::remote) struct Handler {
     deadline: Duration,
 }
 impl Handler {
+    #[cfg(test)]
+    pub(in crate::remote) fn diagnostic_fixture(source: &super::super::GraphState) -> Self {
+        Self {
+            raft: source.raft.clone(),
+            state: source.state.clone(),
+            identity: source.identity,
+            shard: source.shard,
+            sessions: source.sessions.clone(),
+            query_sessions: source.query_sessions.clone(),
+            deadline: source.deadline,
+        }
+    }
     pub(in crate::remote) async fn execute(
         &self,
         context: Option<wire::Context>,
