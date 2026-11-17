@@ -376,3 +376,20 @@ async fn verification_enforces_reader_limits_and_get_deadline() {
         Err(checkpoint_object_store::Error::Deadline)
     ));
 }
+
+#[tokio::test]
+async fn read_only_reader_reuses_verification_without_write_capability() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    common::fixture(&source, b"read-only");
+    let inner = Arc::new(InMemory::new());
+    let writer = store(inner.clone());
+    let receipt = writer.upload(&source, "reader").await.unwrap();
+    let reader =
+        checkpoint_object_store::CheckpointReader::new(inner, "tests".into(), Limits::default())
+            .unwrap();
+    assert_eq!(
+        reader.verify(&receipt).await.unwrap(),
+        writer.verify(&receipt).await.unwrap()
+    );
+}

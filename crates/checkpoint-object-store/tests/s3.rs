@@ -24,7 +24,7 @@ async fn actual_s3_checkpoint_transport() {
             .with_access_key_id("velagraph-ci-only")
             .with_secret_access_key("velagraph-ci-only-secret")
             .with_region("us-east-1")
-            .with_endpoint(endpoint)
+            .with_endpoint(endpoint.clone())
             .with_bucket_name(bucket)
             .with_allow_http(true)
             .with_virtual_hosted_style_request(false)
@@ -70,6 +70,48 @@ async fn actual_s3_checkpoint_transport() {
         (verified.files, verified.bytes, verified.chunks),
         (2, 16394, 18)
     );
+    // Actual operator process, using only synthetic test credentials. The CLI
+    // invokes the shared reader and never creates/downloads local backup files.
+    let config_path = dir.path().join("verify-config.json");
+    let receipt_path = dir.path().join("verify-receipt.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "endpoint":endpoint, "bucket":"velagraph-ci", "region":"us-east-1",
+            "prefix":"contract/checkpoint", "limits": {"chunk_bytes":1024,
+            "manifest_bytes":1048576, "files":10, "total_bytes":1048576,
+            "timeout_millis":10000}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let verify_cli = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_checkpoint-verify"))
+            .env_clear()
+            .env("AWS_ACCESS_KEY_ID", "velagraph-ci-only")
+            .env("AWS_SECRET_ACCESS_KEY", "velagraph-ci-only-secret")
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "--receipt",
+                receipt_path.to_str().unwrap(),
+                "--allow-http-loopback",
+            ])
+            .output()
+            .unwrap()
+    };
+    let output = verify_cli();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"status":"verified","files":2,"bytes":16394,"chunks":18})
+    );
     let destination = dir.path().join("download");
     remote.download(&receipt, &destination).await.unwrap();
     for name in [
@@ -92,10 +134,24 @@ async fn actual_s3_checkpoint_transport() {
     assert!(remote.download(&receipt, &missing).await.is_err());
     assert!(!missing.join("checkpoint.json").exists());
     assert!(remote.verify(&receipt).await.is_err());
+    let output = verify_cli();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stderr).unwrap()["status"],
+        "failed"
+    );
     inner.put(&blob, "corrupt".into()).await.unwrap();
     let corrupt = dir.path().join("corrupt");
     assert!(remote.download(&receipt, &corrupt).await.is_err());
     assert!(!corrupt.join("checkpoint.json").exists());
     assert!(remote.verify(&receipt).await.is_err());
+    let output = verify_cli();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stderr).unwrap()["status"],
+        "failed"
+    );
     println!("real S3 race, chunk transfer, retry and corruption rejection passed; synthetic bytes, not RocksDB restore");
 }
