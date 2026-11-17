@@ -44,6 +44,16 @@ synced before writing the completion manifest last. Cancellation or interruption
 before a valid complete manifest leaves an unusable attempt, never an overwritten
 previous backup. Output directories are never automatically deleted or reused.
 
+Before reading backup contents or creating a destination, restore requires the
+backup root and its `raft.db` / `state.db` entries to be actual directories and
+`checkpoint.json` to be a regular file. These component checks do not follow
+symlinks; trailing separators and `.` components in the supplied root path are
+normalized before both checking and reading. Symlinks and special manifest files
+(such as FIFOs) are rejected without opening their contents. This is a narrow
+input-type check, not a filesystem sandbox: ancestor symlinks, `..` resolution,
+and concurrent path replacement are not secured. The caller must still supply
+an immutable, trusted backup tree throughout restore.
+
 Restore verifies identity, exact inventory, checksums and Raft boundaries before
 creating a new destination, streams copies rather than linking mutable DB files,
 then uses the existing full state-machine loader to validate applied state,
@@ -75,6 +85,35 @@ continued writes and duplicate request results in a wholly isolated test registr
 paths, wrong identity, corrupted files, incomplete manifest/restore and uncovered
 purge boundaries. These are correctness tests, not representative backup-size or
 latency benchmarks, remote upload tests or a multi-shard recovery proof.
+
+Input-type regressions substitute root/database/manifest symlinks and wrong file
+types into a real checkpoint, assert the destination remains absent, and restore
+the genuine checkpoint as a positive control, including trailing slash/dot root
+paths. Missing and malformed manifests are tested with both genuine DB directories
+present. A FIFO manifest runs in a killable child with an independent ten-second
+parent watchdog and a completion sentinel; its ignored child entrypoint is
+executed by the ordinary parent test.
+
+The macOS CI lane compiles ordinary test targets, runs the focused physical
+checkpoint unit/integration and memory-transport tests, and checks all targets
+with Clippy. It does not rerun the full ordinary suite or provision S3 on macOS;
+the explicit SeaweedFS service roundtrip remains in the transport workflow.
+
+The ignored `physical_checkpoint::scale_tests` additionally writes 2,048 values
+of 16 KiB through Raft (32 MiB of logical value bytes), flushing 32 batches into
+real state DB files. It requires at least 32 SSTs; a separate fixture enables
+blob files and requires at least 16 blobs. Compaction is disabled only in these
+fixtures to retain multiple files. Production does not enable blob files.
+Both fixtures upload to disposable loopback S3, remove the original source and
+backup, download and restore, then compare every value and verify the offline
+guard and no-overwrite behavior. They print actual file counts and checkpoint
+bytes, including metadata. This is multi-file correctness coverage, not a
+production-scale, latency or throughput benchmark. Run explicitly against the
+disposable SeaweedFS fixture with:
+
+```sh
+cargo test --locked -p d2-raft --lib physical_checkpoint::scale_tests -- --ignored --nocapture --test-threads=1
+```
 
 The separate transport CI also exercises a real two-DB physical checkpoint
 roundtrip through a temporary SeaweedFS S3-compatible service, followed by offline
