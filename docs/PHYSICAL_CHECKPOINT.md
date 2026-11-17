@@ -94,6 +94,11 @@ present. A FIFO manifest runs in a killable child with an independent ten-second
 parent watchdog and a completion sentinel; its ignored child entrypoint is
 executed by the ordinary parent test.
 
+The macOS CI lane compiles ordinary test targets, runs the focused physical
+checkpoint unit/integration and memory-transport tests, and checks all targets
+with Clippy. It does not rerun the full ordinary suite or provision S3 on macOS;
+the explicit SeaweedFS service roundtrip remains in the transport workflow.
+
 The separate transport CI also exercises a real two-DB physical checkpoint
 roundtrip through a temporary SeaweedFS S3-compatible service, followed by offline
 restore validation. This is not certification against AWS S3, OSS or TOS, live
