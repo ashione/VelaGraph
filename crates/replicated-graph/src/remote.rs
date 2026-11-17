@@ -395,12 +395,16 @@ async fn execute(
             if requested != shard || !(1..=5000).contains(&timeout_millis) {
                 return Err(RemoteError::InvalidArgument);
             }
-            let end = end.min(Instant::now() + Duration::from_millis(timeout_millis));
+            // Dispatch-relative retention, not a refreshed acquisition deadline.
+            // The caller's remaining budget is relative: this does not claim a
+            // synchronized absolute deadline with the coordinator.
+            let lease_end = Instant::now() + Duration::from_millis(timeout_millis);
+            let end = end.min(lease_end);
             read_barrier::confirm(&raft, end, "read_barrier")
                 .await
                 .map_err(read_barrier::without_leader_hint)?;
             query_sessions
-                .open(&state, identity, shard, end)
+                .open_observed(&state, identity, shard, end, lease_end)
                 .await
                 .map(Reply::OpenQuery)
         }

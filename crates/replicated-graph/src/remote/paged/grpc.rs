@@ -251,11 +251,11 @@ impl Handler {
         if context.timeout_millis == 0 || context.timeout_millis > 60_000 {
             return Err(RemoteError::InvalidArgument);
         }
-        let end = admitted_end.min(
-            Instant::now()
-                + self
-                    .deadline
-                    .min(Duration::from_millis(context.timeout_millis)),
+        let end = operation_end(
+            admitted_end,
+            Instant::now(),
+            self.deadline,
+            Duration::from_millis(context.timeout_millis),
         );
         if Instant::now() >= end {
             return Err(RemoteError::Timeout { request_id: None });
@@ -942,5 +942,41 @@ mod tests {
         };
         assert!(page.encoded_len() <= RESPONSE_LIMIT);
         const { assert!(RESPONSE_LIMIT <= MAX_FRAME_BYTES) };
+    }
+}
+
+// Keep the original sampling site and the subsequent real-time expiry check.
+fn operation_end(admitted: Instant, now: Instant, server: Duration, caller: Duration) -> Instant {
+    admitted.min(now + server.min(caller))
+}
+
+#[cfg(test)]
+mod lease_deadline_contract_tests {
+    use super::*;
+    #[test]
+    fn lease_deadline_contract_uses_each_independent_cap() {
+        let start = Instant::now();
+        let seconds = Duration::from_secs;
+        assert_eq!(
+            operation_end(start + seconds(9), start, seconds(3), seconds(5)),
+            start + seconds(3)
+        );
+        assert_eq!(
+            operation_end(start + seconds(9), start, seconds(8), seconds(2)),
+            start + seconds(2)
+        );
+        assert_eq!(
+            operation_end(start + seconds(1), start, seconds(3), seconds(5)),
+            start + seconds(1)
+        );
+        assert_eq!(
+            operation_end(
+                start + seconds(3),
+                start + seconds(1),
+                seconds(3),
+                seconds(5)
+            ),
+            start + seconds(3)
+        );
     }
 }

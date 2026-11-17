@@ -10,6 +10,15 @@ use velagraph::{
 };
 mod fixed_sessions;
 mod node_lease;
+#[cfg(test)]
+mod wire_lease_tests;
+
+#[cfg(test)]
+struct FragmentTestGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    exited: tokio::sync::oneshot::Sender<()>,
+}
 
 static SESSION_SLOTS: Semaphore = Semaphore::const_new(8);
 static SESSION_BYTES: Semaphore = Semaphore::const_new(128 * 1024 * 1024);
@@ -33,6 +42,8 @@ struct Session {
 }
 pub(in crate::remote) struct Sessions {
     incarnation: [u8; 16],
+    #[cfg(test)]
+    fragment_test_gate: Mutex<Option<FragmentTestGate>>,
     values: Mutex<BTreeMap<[u8; 16], Arc<Session>>>,
     fixed_values: Mutex<BTreeMap<[u8; 16], Arc<fixed_sessions::FixedSession>>>,
 }
@@ -45,15 +56,20 @@ impl Sessions {
     pub(in crate::remote) fn new() -> Result<Self, RemoteError> {
         Ok(Self {
             incarnation: token()?,
+            #[cfg(test)]
+            fragment_test_gate: Mutex::new(None),
             values: Mutex::new(BTreeMap::new()),
             fixed_values: Mutex::new(BTreeMap::new()),
         })
     }
     pub(in crate::remote) fn expire(&self) {
-        self.expire_observing(None);
+        self.expire_observing_at(None, std::time::Instant::now());
     }
-    fn expire_observing(&self, descriptor: Option<&Descriptor>) -> Option<u128> {
-        let now = std::time::Instant::now();
+    fn expire_observing_at(
+        &self,
+        descriptor: Option<&Descriptor>,
+        now: std::time::Instant,
+    ) -> Option<u128> {
         let mut removed = None;
         self.values.lock().unwrap().retain(|_, s| {
             let keep = now < s.node.end;
@@ -68,6 +84,28 @@ impl Sessions {
             .retain(|_, s| s.live_at(Instant::from_std(now)));
         removed
     }
+    /// Ordinary observed-query retention is independent of acquisition work.
+    /// Both deadlines are fixed by dispatch; opening never restarts the lease.
+    pub(in crate::remote) async fn open_observed(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        acquire_end: Instant,
+        lease_end: Instant,
+    ) -> Result<Descriptor, RemoteError> {
+        self.open_with_lease(
+            state,
+            identity,
+            shard,
+            (acquire_end.min(lease_end), lease_end),
+            false,
+        )
+        .await
+        .map(|(descriptor, _)| descriptor)
+    }
+    // Existing fixtures explicitly exercise equal acquisition/retention deadlines.
+    #[cfg(test)]
     pub(in crate::remote) async fn open(
         &self,
         state: &StateMachine,
@@ -175,20 +213,31 @@ impl Sessions {
         shard: u64,
         descriptor: &Descriptor,
     ) -> Result<Arc<Session>, RemoteError> {
-        self.lookup_observing(identity, shard, descriptor, false)
+        self.lookup_observing_with_clock(
+            identity,
+            shard,
+            descriptor,
+            false,
+            std::time::Instant::now,
+        )
     }
-    fn lookup_observing(
+    fn lookup_observing_with_clock<F>(
         &self,
         identity: RemoteIdentity,
         shard: u64,
         descriptor: &Descriptor,
         observe: bool,
-    ) -> Result<Arc<Session>, RemoteError> {
+        clock: F,
+    ) -> Result<Arc<Session>, RemoteError>
+    where
+        F: FnOnce() -> std::time::Instant,
+    {
         let matching = observe
             && descriptor.stamp.identity == identity
             && descriptor.stamp.shard == shard
             && descriptor.incarnation == self.incarnation;
-        let removed = self.expire_observing(matching.then_some(descriptor));
+        // Sample once at the original expiry site, after diagnostic matching.
+        let removed = self.expire_observing_at(matching.then_some(descriptor), clock());
         if descriptor.stamp.identity != identity || descriptor.stamp.shard != shard {
             return Err(RemoteError::InvalidArgument);
         }
@@ -229,13 +278,36 @@ impl Sessions {
         request: FragmentRequest,
         end: Instant,
     ) -> Result<Reply, RemoteError> {
+        self.fragment_with_clock(
+            state,
+            identity,
+            shard,
+            request,
+            end,
+            std::time::Instant::now,
+        )
+        .await
+    }
+    async fn fragment_with_clock<F>(
+        &self,
+        state: &StateMachine,
+        identity: RemoteIdentity,
+        shard: u64,
+        request: FragmentRequest,
+        end: Instant,
+        clock: F,
+    ) -> Result<Reply, RemoteError>
+    where
+        F: FnOnce() -> std::time::Instant + Send,
+    {
         request.fragment.validate()?;
         let is_batch = matches!(request.fragment, Fragment::HierarchyBatch { .. });
-        let session = self.lookup_observing(
+        let session = self.lookup_observing_with_clock(
             identity,
             shard,
             &request.descriptor,
             !is_batch && super::fragment_trace::current().is_some(),
+            clock,
         )?;
         if session.hierarchy != is_batch {
             return Err(RemoteError::InvalidArgument);
@@ -277,8 +349,20 @@ impl Sessions {
         } else {
             end
         };
+        #[cfg(test)]
+        let gate = self.fragment_test_gate.lock().unwrap().take();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Test-only, per-instance and one-shot. This is after ownership of
+            // both the real worker permit and snapshot, before deadline/check.
+            #[cfg(test)]
+            let exited = gate.map(|gate| {
+                let _ = gate.entered.send(());
+                gate.release
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("bounded test worker gate");
+                gate.exited
+            });
             // Try-lock prevents a forged concurrent client from blocking a worker indefinitely.
             // Retain the ordinary counter lock as the session-wide execution
             // gate even when charging the independent scan ledger. Splitting
@@ -344,6 +428,15 @@ impl Sessions {
             let cost = *node.cost.lock().unwrap();
             used.bytes = used.bytes.saturating_add(cost.bytes);
             used.work = used.work.saturating_add(cost.work);
+            #[cfg(test)]
+            if let Some(exited) = exited {
+                drop(used);
+                drop(_traversal_gate);
+                drop(node);
+                drop(session);
+                drop(_permit);
+                let _ = exited.send(());
+            }
             result
         })
         .await
@@ -1348,6 +1441,214 @@ mod epoch_tests {
         ));
         sessions.close(identity, 7, &ordinary).unwrap();
     }
+    #[tokio::test]
+    async fn lease_deadline_contract_expiry_precedes_zero_budget_in_real_fragment() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for offset in [2, 3, 4] {
+                let mut state = Arc::new(StateMachine::default());
+                apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
+                let identity = RemoteIdentity { group: 2, node: 1 };
+                let sessions = Sessions::new().unwrap();
+                // Only registry expiry uses the injected logical clock. A future
+                // origin keeps the real worker deadline live throughout this
+                // bounded test; this is not a virtual full-RPC clock or lease grant.
+                let start = Instant::now() + Duration::from_secs(30);
+                let lease_end = start + Duration::from_secs(3);
+                let query_end = start + Duration::from_secs(5);
+                let descriptor = sessions.open(&state, identity, 7, lease_end).await.unwrap();
+                let held = sessions.lookup(identity, 7, &descriptor).unwrap();
+                let before_used = *held.used.lock().unwrap();
+                let before_scan = *held.scan_used.lock().unwrap();
+                let request = FragmentRequest {
+                    descriptor: descriptor.clone(),
+                    fragment: Fragment::Exists(VertexId {
+                        partition: 0,
+                        id: 1,
+                    }),
+                    // Production fragment charges (512, 1) before reading any row.
+                    remaining: Cost { bytes: 0, work: 0 },
+                };
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let observed = (start + Duration::from_secs(offset)).into_std();
+                let result = sessions
+                    .fragment_with_clock(&state, identity, 7, request, query_end, || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        observed
+                    })
+                    .await;
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                if offset == 2 {
+                    assert!(matches!(
+                        result,
+                        Ok(Reply::QueryFragment(Err(QueryFailure::ResourceExhausted)))
+                    ));
+                    assert!(sessions
+                        .values
+                        .lock()
+                        .unwrap()
+                        .contains_key(&descriptor.token));
+                    sessions.close(identity, 7, &descriptor).unwrap();
+                } else {
+                    assert!(matches!(result, Err(RemoteError::SessionUnavailable)));
+                    assert!(!sessions
+                        .values
+                        .lock()
+                        .unwrap()
+                        .contains_key(&descriptor.token));
+                    let after_used = *held.used.lock().unwrap();
+                    assert_eq!(
+                        (after_used.bytes, after_used.work),
+                        (before_used.bytes, before_used.work)
+                    );
+                    let after_scan = *held.scan_used.lock().unwrap();
+                    assert_eq!(
+                        (after_scan.bytes, after_scan.work),
+                        (before_scan.bytes, before_scan.work)
+                    );
+                    assert_eq!(held.node.end, lease_end.into_std());
+                }
+            }
+        })
+        .await
+        .expect("bounded lease contract fixture");
+    }
+
+    #[tokio::test]
+    async fn lease_deadline_contract_separated_retention_remains_bounded() {
+        let _fixture = TEST_SESSION_FIXTURES.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for offset in [4, 5] {
+                let mut state = Arc::new(StateMachine::default());
+                apply(&mut state, 1, D1Command::Activate { shard: 7, epoch: 1 }).await;
+                apply(
+                    &mut state,
+                    2,
+                    D1Command::Write(d2_raft::D1WriteRequest {
+                        shard: 7,
+                        epoch: 1,
+                        request_id: [42; 16],
+                        expected_sequence: None,
+                        operations: vec![d2_raft::WriteOp::put(b"retention-payload", b"bounded")],
+                    }),
+                )
+                .await;
+                let identity = RemoteIdentity { group: 2, node: 1 };
+                let sessions = Sessions::new().unwrap();
+                // Only registry expiry uses the injected logical clock. A future
+                // origin keeps the real worker deadline live throughout this
+                // bounded test; this is not a virtual full-RPC clock or lease grant.
+                let start = Instant::now() + Duration::from_secs(30);
+                let acquire_end = start + Duration::from_secs(3);
+                let lease_end = start + Duration::from_secs(5);
+                let query_end = start + Duration::from_secs(5);
+                let bytes_before = SESSION_BYTES.available_permits();
+                let slots_before = SESSION_SLOTS.available_permits();
+                assert!(matches!(
+                    sessions
+                        .open_observed(
+                            &state,
+                            identity,
+                            7,
+                            Instant::now() - Duration::from_secs(1),
+                            lease_end
+                        )
+                        .await,
+                    Err(RemoteError::Timeout { .. })
+                ));
+                assert!(sessions.values.lock().unwrap().is_empty());
+                assert_eq!(SESSION_BYTES.available_permits(), bytes_before);
+                assert_eq!(SESSION_SLOTS.available_permits(), slots_before);
+                let descriptor = sessions
+                    .open_observed(&state, identity, 7, acquire_end, lease_end)
+                    .await
+                    .unwrap();
+                let held = sessions.lookup(identity, 7, &descriptor).unwrap();
+                assert_eq!(held.node.end, lease_end.into_std());
+                let weak = Arc::downgrade(&held);
+                let slots_held = SESSION_SLOTS.available_permits();
+                let bytes_held = SESSION_BYTES.available_permits();
+                assert!(bytes_held < bytes_before);
+                let before_used = *held.used.lock().unwrap();
+                let before_scan = *held.scan_used.lock().unwrap();
+                let request = FragmentRequest {
+                    descriptor: descriptor.clone(),
+                    fragment: Fragment::Exists(VertexId {
+                        partition: 0,
+                        id: 1,
+                    }),
+                    // Production fragment charges (512, 1) before reading any row.
+                    remaining: Cost { bytes: 0, work: 0 },
+                };
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let observed = (start + Duration::from_secs(offset)).into_std();
+                let result = sessions
+                    .fragment_with_clock(&state, identity, 7, request, query_end, || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        observed
+                    })
+                    .await;
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                if offset == 4 {
+                    assert!(matches!(
+                        result,
+                        Ok(Reply::QueryFragment(Err(QueryFailure::ResourceExhausted)))
+                    ));
+                    assert!(sessions
+                        .values
+                        .lock()
+                        .unwrap()
+                        .contains_key(&descriptor.token));
+                    sessions.close(identity, 7, &descriptor).unwrap();
+                } else {
+                    assert!(matches!(result, Err(RemoteError::SessionUnavailable)));
+                    assert!(!sessions
+                        .values
+                        .lock()
+                        .unwrap()
+                        .contains_key(&descriptor.token));
+                    let after_used = *held.used.lock().unwrap();
+                    assert_eq!(
+                        (after_used.bytes, after_used.work),
+                        (before_used.bytes, before_used.work)
+                    );
+                    let after_scan = *held.scan_used.lock().unwrap();
+                    assert_eq!(
+                        (after_scan.bytes, after_scan.work),
+                        (before_scan.bytes, before_scan.work)
+                    );
+                    assert_eq!(held.node.end, lease_end.into_std());
+                }
+                assert_eq!(held.node.end, lease_end.into_std());
+                assert_eq!(held.descriptor, descriptor);
+                let after_used = *held.used.lock().unwrap();
+                let after_scan = *held.scan_used.lock().unwrap();
+                // Failed work is still charged; expiry before dispatch is not.
+                let expected_used = if offset == 4 {
+                    (before_used.bytes + 512, before_used.work + 1)
+                } else {
+                    (before_used.bytes, before_used.work)
+                };
+                assert_eq!((after_used.bytes, after_used.work), expected_used);
+                assert_eq!(
+                    (after_scan.bytes, after_scan.work),
+                    (before_scan.bytes, before_scan.work)
+                );
+                // Removing discoverability (close or expiry) does not revoke an
+                // in-flight owner's snapshot or release its admission early.
+                assert!(weak.upgrade().is_some());
+                assert_eq!(SESSION_SLOTS.available_permits(), slots_held);
+                assert_eq!(SESSION_BYTES.available_permits(), bytes_held);
+                drop(held);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(SESSION_SLOTS.available_permits(), slots_held + 1);
+                assert_eq!(SESSION_BYTES.available_permits(), bytes_before);
+            }
+        })
+        .await
+        .expect("bounded lease contract fixture");
+    }
+
     #[tokio::test]
     async fn fragment_lease_fencing_and_previous_incarnation_fail_closed() {
         let _fixture = TEST_SESSION_FIXTURES.lock().await;
