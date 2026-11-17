@@ -127,6 +127,10 @@ The test contains these acceptance assertions:
   and reaps all four children without a public readiness announcement.
 - Loss of one participant after readiness fails the parent, reaps all remaining
   children, and closes both public listeners. This is not parent-SIGKILL recovery.
+- After real service readiness, a parent announcement write to Linux `/dev/full`
+  fails with ENOSPC. A failed parent exit must still reap all four children and
+  close both public listeners. The test checks the device error independently,
+  not a specific panic message or exit code (#317).
 - Each failure preserves its fresh data directory and a subsequent launch still
   rejects that existing directory; fault injection never permits restore/reuse.
 - Bounded stdout/stderr evidence is retained on CI failure when configured;
@@ -138,7 +142,9 @@ test-only shell service fixtures and bounded waits; production budgets and
 launcher behavior are unchanged. Best-effort PID-incarnation guards limit
 cleanup to recorded child identities if a regression interrupts the test; the
 check and signal are not atomic pidfd fencing. Parent SIGKILL recovery remains
-explicitly outside the supported contract.
+explicitly outside the supported contract. Announcement-output evidence uses
+the normal unwind build; it does not establish panic=abort cleanup, graceful
+drain on panic or filesystem-wide disk-exhaustion recovery.
 The HTTP assertion plus subsequent gRPC read proves the tested write became
 visible; it is not a general guarantee that every HTTP 200 means a final
 committed decision.

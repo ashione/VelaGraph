@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -123,6 +123,16 @@ fn launch_service(
     error: &Path,
     service: &Path,
 ) -> anyhow::Result<Demo> {
+    launch_output(binary, data, fs::File::create(output)?, error, service)
+}
+
+fn launch_output(
+    binary: &Path,
+    data: &Path,
+    output: fs::File,
+    error: &Path,
+    service: &Path,
+) -> anyhow::Result<Demo> {
     Ok(Demo {
         child: Command::new(binary)
             .arg("--data-dir")
@@ -137,7 +147,7 @@ fn launch_service(
                 "--allow-insecure-development",
             ])
             .stdin(Stdio::null())
-            .stdout(Stdio::from(fs::File::create(output)?))
+            .stdout(Stdio::from(output))
             .stderr(Stdio::from(fs::File::create(error)?))
             .spawn()?,
     })
@@ -374,6 +384,7 @@ async fn fresh_demo_write_query_reject_existing_and_stop_children() -> anyhow::R
     rejected_existing(&binary, &data, logs.path(), "stopped").await?;
     assert_eq!(fs::read(&sentinel)?, b"original data directory");
     failure_cleanup_cases(&binary, logs.path()).await?;
+    announcement_failure(&binary, logs.path()).await?;
     Ok(())
 }
 
@@ -552,5 +563,83 @@ async fn failure_cleanup_cases(binary: &Path, logs: &Path) -> anyhow::Result<()>
         anyhow::ensure!(data.is_dir(), "failure cleanup removed retained data");
         rejected_existing(binary, &data, logs, &format!("{case}-existing")).await?;
     }
+    Ok(())
+}
+
+// A failed parent announcement is later than service readiness. Exercise the
+// actual output device failure, without replacing any product child executable.
+async fn announcement_failure(binary: &Path, logs: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut full = fs::OpenOptions::new().write(true).open("/dev/full")?;
+    anyhow::ensure!(
+        full.metadata()?.file_type().is_char_device(),
+        "expected /dev/full device"
+    );
+    let error = full
+        .write_all(b"probe")
+        .expect_err("/dev/full must reject output");
+    anyhow::ensure!(
+        error.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()),
+        "expected ENOSPC"
+    );
+    let data = logs.join("announcement-failure-data");
+    let error = logs.join("announcement-failure.stderr");
+    let mut demo = launch_output(
+        binary,
+        &data,
+        full,
+        &error,
+        Path::new(env!("CARGO_BIN_EXE_graph-service")),
+    )?;
+    let service_path = data.join("service.jsonl");
+    let service: Value = tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Ok(bytes) = log_tail(&service_path) {
+                if bytes.ends_with(b"\n") {
+                    return Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?);
+                }
+            }
+            anyhow::ensure!(
+                demo.child.try_wait()?.is_none(),
+                "parent exited before real service announcement"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("real service announcement before output fault")??;
+    // Service readiness, not a file merely created before spawn, proves this
+    // fault occurs after all four real children have reached startup.
+    anyhow::ensure!(
+        service["state"] == "serving_live_managed_cohort",
+        "service never ready"
+    );
+    fs::write(
+        logs.join("announcement-failure-service.stdout"),
+        serde_json::to_vec(&service)?,
+    )?;
+    let mut children = ready_node_pids(&data)?;
+    children.push(u32::try_from(
+        service["pid"].as_u64().context("service PID")?,
+    )?);
+    let _owned_children = OwnedChildren::new(&children);
+    failed_and_reaped(&mut demo, &children).await?;
+    for field in ["http", "grpc"] {
+        let endpoint: SocketAddr = service[field]
+            .as_str()
+            .context("service listener")?
+            .parse()?;
+        let connected = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(endpoint),
+        )
+        .await;
+        anyhow::ensure!(
+            matches!(connected, Ok(Err(_))),
+            "announcement failure left public listener open"
+        );
+    }
+    anyhow::ensure!(data.is_dir(), "output fault removed diagnostic data");
+    rejected_existing(binary, &data, logs, "announcement-failure-existing").await?;
     Ok(())
 }
