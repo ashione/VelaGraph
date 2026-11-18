@@ -21,10 +21,10 @@ pub use graph_records::{
     MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS,
 };
 pub use gremlin::{
-    GremlinQuery, GremlinResult, GremlinRow, GremlinStart, GremlinStep, ObservedGremlinQuery,
-    ObservedGremlinStep, PathElement, DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE,
-    MAX_GREMLIN_ACCOUNTED_BYTES, MAX_GREMLIN_EDGE_STEPS, MAX_GREMLIN_LIMIT,
-    MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS, MAX_GREMLIN_STRUCTURAL_MARKS,
+    GremlinBindings, GremlinParameters, GremlinQuery, GremlinResult, GremlinRow, GremlinStart,
+    GremlinStep, ObservedGremlinQuery, ObservedGremlinStep, PathElement, PreparedGremlinQuery,
+    DEFAULT_GREMLIN_LIMIT, GREMLIN_DEADLINE, MAX_GREMLIN_ACCOUNTED_BYTES, MAX_GREMLIN_EDGE_STEPS,
+    MAX_GREMLIN_LIMIT, MAX_GREMLIN_QUERY_BYTES, MAX_GREMLIN_ROWS, MAX_GREMLIN_STRUCTURAL_MARKS,
     MAX_OBSERVED_GREMLIN_REPEAT_TIMES,
 };
 pub use storage_node::{
@@ -45,3 +45,7 @@ pub mod temporal_reference;
 
 /// Experimental durable local temporal assertions; no distributed certification.
 pub mod temporal_store;
+
+/// Optional local phase counters; no storage or query semantic changes.
+#[cfg(feature = "query-profiling")]
+pub mod query_profile;

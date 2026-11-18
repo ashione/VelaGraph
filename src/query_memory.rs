@@ -1,7 +1,12 @@
 //! Query-local logical accounting, not an allocator or process memory limit.
 use crate::{Error, Result};
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
+
+/// Optional query-owned storage that can be discarded before admission fails.
+pub(crate) trait Reclaim: std::fmt::Debug {
+    fn reclaim(&self);
+}
 
 pub(crate) const RECORD_BASE: usize = 128;
 pub(crate) const MAP_ENTRY: usize = 128;
@@ -22,6 +27,7 @@ struct State {
     limit: usize,
     used: Cell<usize>,
     peak: Cell<usize>,
+    reclaimer: RefCell<Option<Weak<dyn Reclaim>>>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Budget(Rc<State>);
@@ -31,12 +37,19 @@ impl Budget {
             limit,
             used: Cell::new(0),
             peak: Cell::new(0),
+            reclaimer: RefCell::new(None),
         }))
     }
     pub(crate) fn available(&self) -> usize {
         self.0.limit - self.0.used.get()
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Result<Reservation> {
+        if bytes > self.available() {
+            let reclaim = self.0.reclaimer.borrow().as_ref().and_then(Weak::upgrade);
+            if let Some(reclaim) = reclaim {
+                reclaim.reclaim();
+            }
+        }
         let used = add(self.0.used.get(), bytes)?;
         if used > self.0.limit {
             return Err(Error::TraversalLimitExceeded(format!(
@@ -51,6 +64,9 @@ impl Budget {
             budget: self.clone(),
             bytes,
         })
+    }
+    pub(crate) fn set_reclaimer(&self, reclaim: Weak<dyn Reclaim>) {
+        *self.0.reclaimer.borrow_mut() = Some(reclaim);
     }
     #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
@@ -105,6 +121,9 @@ pub(crate) struct Accounted<T> {
     pub(crate) charge: Reservation,
 }
 impl<T> Accounted<T> {
+    pub(crate) fn accounted_bytes(&self) -> usize {
+        self.charge.bytes
+    }
     pub(crate) fn new(value: T, charge: Reservation) -> Self {
         Self { value, charge }
     }
@@ -113,6 +132,12 @@ impl<T> Accounted<T> {
             value: f(self.value),
             charge: self.charge,
         }
+    }
+}
+impl<T: Clone> Accounted<T> {
+    pub(crate) fn try_clone(&self, budget: &Budget) -> Result<Self> {
+        let charge = budget.reserve(self.accounted_bytes())?;
+        Ok(Self::new(self.value.clone(), charge))
     }
 }
 impl<T> std::ops::Deref for Accounted<T> {

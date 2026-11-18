@@ -1,0 +1,172 @@
+# Go managed API interoperability check
+
+This SDK test program exercises the [Go client](../../README.md) against a
+fresh managed cohort and a loopback Rust gRPC gateway.
+
+## Generate and build
+
+Use Go 1.23.6, protoc 29.3, protoc-gen-go v1.36.5 and
+protoc-gen-go-grpc v1.5.1. Install generators from their official Go modules at
+those exact versions. The generation script checks tool versions and never
+downloads tools.
+
+From the repository root:
+
+```sh
+bash scripts/generate-go-managed.sh
+cd sdk/go
+go mod download
+go build -mod=readonly -o interop ./internal/interop
+```
+
+Bindings come directly from
+`crates/replicated-graph/proto/public_managed.proto`; there is no separately
+maintained Go schema. Generated files live in the SDK at `sdk/go/gen/managedv1`.
+Runtime dependencies are pinned in go.mod; go.sum locks their checksums.
+CI regenerates bindings before building and runs the Rust fixture with
+`VELAGRAPH_GO_INTEROP_BIN` set to the absolute binary path.
+
+## Chainable Graph API coverage
+
+The real-process fixture creates two parallel cross-shard edges and compares
+the results before and after the second write. A 128-walk input returns
+100 element rows or a count of 128, and an oversized raw protobuf request
+fails at the gateway. The fixture also sends a future oneof step and an empty
+step between a valid hop and count. Both requests and a request with an unknown
+capacity-profile enum must return INVALID_ARGUMENT with no result. The same
+fixed-version query with only the recognized steps must return one. Set `VELAGRAPH_GRAPH_BENCH=1`
+on the Rust interoperability test to time 40 paired requests per query shape.
+Each shape counts walks from repeated copies of one vertex ID. The fixture
+checks both APIs against the expected count, including parallel-edge multiplicity.
+It uses four warmup pairs, then alternates GraphService.Execute with QueryService.Open at the same exact V
+on the same warm channel and prints p50/p95. Text Close is timed separately.
+The text API retains a session and the typed API returns rows directly. These
+timings therefore measure the public endpoints, including capture, validation
+and network calls. They do not isolate parser time.
+
+### Reproduce the measurements
+
+From the repository root, with the Go and Rust build prerequisites installed:
+
+```sh
+bench_dir=$(mktemp -d)
+(cd sdk/go && go build -mod=readonly -o "$bench_dir/interop" ./internal/interop)
+cargo test --release --locked -p replicated-graph --lib graph_plan_benchmark_v1 -- --ignored --nocapture
+VELAGRAPH_GO_INTEROP_BIN="$bench_dir/interop" VELAGRAPH_GRAPH_BENCH=1 \
+  cargo test --release --locked -p replicated-graph --test public_service_go_process \
+  go_client_against_real_managed_service -- --ignored --exact --nocapture
+```
+
+One local macOS arm64 release run (rustc 1.95.0, Go 1.23.2, same-host loopback)
+measured the following times. The Rust microbenchmark used 50 warmups and
+2,000 iterations of a two-hop path on repeated IDs. It averaged **658.2 µs**
+for the official text parser and fixed-plan admission, and **0.207 µs** for
+cloning and validating the typed input. Neither timed loop performs network
+I/O, protobuf decoding, capture or execution.
+
+The following release run used the standalone Go SDK on a two-shard loopback
+fixture. Times are milliseconds. Each row compares the same query and exact V.
+
+| Starts | Hops | Expected count | SDK Execute p50 | Text Open p50 | SDK Execute p95 | Text Open p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0 | 1 | 6.74 | 7.38 | 7.16 | 7.60 |
+| 2 | 0 | 2 | 6.85 | 7.46 | 6.99 | 7.69 |
+| 16 | 0 | 16 | 8.41 | 9.20 | 8.73 | 9.65 |
+| 2 | 1 | 4 | 7.56 | 8.83 | 7.78 | 9.23 |
+| 2 | 2 | 8 | 8.93 | 10.42 | 9.34 | 10.86 |
+
+Text Open returns the count in the first page and retains a session. The
+separately measured Close p50 ranged from 0.145 to 0.156 ms across shapes.
+These samples include snapshot capture and shard reads. They compare public
+endpoints and are opt-in benchmark observations, without a CI latency threshold.
+
+### Distinct vertex IDs
+
+Use `VELAGRAPH_MULTI_ID_BENCH=1` in place of `VELAGRAPH_GRAPH_BENCH=1` in
+the command above. This fixture writes 32 additional vertices in one partition
+before timing. For 2, 8, 16 and 32 distinct IDs it compares a single SDK
+`V(partition, ids...).Execute(ctx)`, a single text `Open` returning all elements
+in its first page, and a serial SDK loop issuing one Execute per ID. Clients
+use the same warm connection and exact certified version. Every returned
+qualified vertex is checked against the requested descending ID order.
+
+Each method runs two warmups and 20 measured trials per batch size, with
+rotating method order. Latency covers the time until the entire batch returns,
+including all RPCs for the serial loop. Setup writes and text Close are untimed.
+
+In a local macOS arm64 release run, the full-batch latencies in milliseconds
+were as follows. The distinct-ID fixture has a longer committed history than
+the repeated-ID fixture above, so compare methods within the same fixture.
+
+| Distinct IDs | SDK batch p50 / p95 | Text Open p50 / p95 | SDK serial p50 / p95 |
+| ---: | ---: | ---: | ---: |
+| 2 | 28.39 / 29.41 | 28.93 / 32.43 | 55.76 / 59.37 |
+| 8 | 28.97 / 93.65 | 30.27 / 40.28 | 226.71 / 353.06 |
+| 16 | 29.99 / 31.19 | 30.59 / 31.36 | 444.78 / 451.32 |
+| 32 | 31.79 / 32.70 | 33.02 / 34.31 | 893.60 / 905.58 |
+
+At 32 IDs the SDK batch saved 1.23 ms at p50 versus text Open. At 8 IDs
+the SDK batch had a higher p95 than text Open in this 20-trial sample.
+
+## Run against a fresh fixture
+
+```sh
+./interop -endpoint 127.0.0.1:PORT -binding-proto /path/to/binding.pb \
+  -partition 7 -first-id 9007199254740993
+```
+
+`binding.pb` is a serialized public protobuf Binding supplied by the Rust fixture.
+It contains placement identity, not credentials. Every version-2 RPC supplies a
+fresh 16-byte correlation nonce and verifies the echoed identity. Endpoints are
+unauthenticated plaintext development endpoints; do not expose them publicly.
+
+The candidate contains the following acceptance checks. Passing remains subject
+to the exact candidate's CI; this document does not claim an unrun test passed.
+
+The test checks:
+
+- Unsupported envelope version and malformed Gremlin via standard
+  `status.Code` and `status.Details` decoded as `ErrorDetail`.
+  Raw custom trailer decoding is deliberately not accepted.
+- Internal ManagedService/Call, RaftService/Vote and ShardOperations/Call are absent from the public listener.
+- Three fresh typed vertices in the start partition (the third after query capture),
+  a fourth vertex on the second shard, two parallel cross-shard edges,
+  absent/committed Status, and intentional
+  same-ID/same-mutation Submit replay only after confirmed commit.
+- Exact integer properties at i64 minimum/maximum and `2^53 + 1`, vertex IDs
+  above `2^53`, plus real, UTF-8 text, boolean and explicit null property values.
+  A missing property has no value and is not confused with explicit null.
+- Open/Fetch/Close over two pages, correlated query/cursor, immutable session
+  version, completeness, exact row identities and post-close rejection.
+  A write between pages must not enter the retained two-row view; a fresh latest
+  view must observe all three rows at a later version.
+
+QueryService uses supported explicit-ID element queries for paging; it does not support valueMap. Property values are verified separately through FixedSessionService.Traverse at the same exact retained V, after the third write. Both session types use independent 32-byte tokens and 16-byte incarnations. Their completeness is explicitly Unverified, not silently promoted to certified adjacency completeness.
+
+All operations share a 90-second overall deadline; each request advertises a
+5-second server budget. gRPC automatic retry is disabled. A failed Submit is
+reported as uncertain rather than automatically retried. Bounded Status polling
+may observe a pending result. A successful run prints one PASS summary and exits
+zero; any missing assertion/error detail fails nonzero.
+
+The fixture must be fresh: existing external IDs fail rather than silently
+reusing data. This is same-host Rust/Go interoperability evidence only, not HA,
+mixed-version upgrade, multi-host performance or production security evidence.
+
+## Error-trailer upgrade
+
+The public server now sends standard `google.rpc.Status` with exactly one
+`Any` of type
+`type.googleapis.com/velagraph.public.managed.v1.ErrorDetail`.
+Go's standard `status.Details()` must decode it without a custom raw-trailer
+parser. Code, message and domain reason are checked consistently.
+
+Old preview servers emitted a bare ErrorDetail trailer. Upgrade Rust clients and
+servers together: replace direct `ErrorDetail::decode(status.details())` with
+`managed_gateway::decode_grpc_error_detail(&status)`. No legacy fallback or
+mixed-version guarantee is provided. Total rich-status bytes retain the 1 MiB
+limit; structural/identity checks occur before allocation, and the domain client
+correlates the complete binding and nonce.
+
+See [public error compatibility](../../../../docs/PUBLIC_GRPC_ERROR_COMPATIBILITY.md)
+for the exact bounds, uncertain-write semantics and acceptance limits.

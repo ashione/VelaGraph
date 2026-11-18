@@ -183,3 +183,39 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  temporal-query-reuse:
+    name: Temporal query reuse (profiling)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install libclang and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          if [ -z "$libclang_path" ] || [ "$libclang_path" = "." ]; then
+            echo "libclang not found" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-no-debug-rust
+          cache-on-failure: false
+
+      - name: Test temporal query reuse with profiling enabled
+        run: cargo test --locked -p velagraph --features query-profiling
+
+      - name: Check temporal query reuse with profiling enabled
+        run: cargo clippy --locked -p velagraph --all-targets --features query-profiling -- -D warnings

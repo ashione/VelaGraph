@@ -21,9 +21,8 @@ that every release requirement is satisfied.
 - Rust reusable domain client: [GatewayClient](GATEWAY_CLIENT_CHANNEL.md).
   One fixed endpoint/binding per client; clones reuse a channel. No discovery,
   endpoint replacement, automatic mutation retry or session failover.
-- Generated Go client and real Rust-service example:
-  [Go interoperability](../examples/go/managed/README.md). This is a finite
-  integration example, not a production SDK or all-method interoperability claim.
+- The Go SDK exercises a real Rust gateway for the operations listed in its
+  [interoperability coverage](../sdk/go/internal/interop/README.md).
 
 ## Implemented public method matrix
 
