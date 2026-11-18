@@ -13,6 +13,8 @@ It does not alter or bypass the unresolved #124 purge fence.
 - `upload(completed_checkpoint_directory, checkpoint_id) -> Receipt`
 - `download(&Receipt, new_directory)`
 - `verify(&Receipt) -> Verification` (read-only complete byte verification)
+- `CheckpointReader::new(store, prefix, limits)` exposes only `verify`, without
+  asserting conditional-create support.
 
 The operator supplies a backend (locked Apache `object_store` 0.14.2), endpoint,
 region, **existing** bucket and nonempty prefix. Credentials stay in the backend's
@@ -154,3 +156,60 @@ A subsequent download revalidates all bytes, and offline physical restore still
 requires the separate authoritative validator and guard. No existing storage
 format, remote-ACK or retention contract changes. This independent #191 backup
 transport slice does not complete #191/#193 or the v0.0.2 recovery milestone.
+
+## Operator verification command
+
+The `checkpoint-verify` binary uses the same verifier through the read-only
+`CheckpointReader` API; no conditional-create assertion is needed for reading.
+It does not download, upload, delete, list, restore or mark a graph READY.
+See the [proposal and design](CHECKPOINT_VERIFY_CLI_DESIGN.md) for boundaries.
+
+Build and run against a **trusted existing backend**, using preferably read-only credentials in `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, plus optional `AWS_SESSION_TOKEN`. The command supplies
+these values to the SDK; it does not read profiles or discover role/metadata
+credentials. Do not put credentials on the command line:
+
+```sh
+cargo build --locked -p checkpoint-object-store --bin checkpoint-verify
+./target/debug/checkpoint-verify --config verify-config.json --receipt receipt.json
+```
+
+`receipt.json` is the exact retained `Receipt` from upload, not an ID guessed
+from LIST. Both JSON files must be caller-owned regular files of at most 64 KiB;
+unknown fields reject. Do not put credentials in either file or arguments.
+A config example (replace the example endpoint, bucket and prefix) is:
+
+```json
+{
+  "endpoint": "https://s3.us-east-1.amazonaws.com",
+  "bucket": "existing-checkpoint-bucket",
+  "region": "us-east-1",
+  "prefix": "graph-backup",
+  "limits": {
+    "chunk_bytes": 8388608,
+    "manifest_bytes": 16777216,
+    "files": 100000,
+    "total_bytes": 1099511627776,
+    "timeout_millis": 300000
+  }
+}
+```
+
+Choose budgets compatible with the uploaded backup and your resource policy.
+Timeout must be 1–86,400,000 ms. HTTPS certificate validation stays enabled.
+`--allow-http-loopback` permits an explicit numeric loopback HTTP endpoint only
+for disposable local compatibility testing; it is not a nonlocal insecure mode.
+Redirects and proxies are disabled. Ambient AWS endpoint/transport settings
+do not override this config. S3 Express, role discovery and custom proxy
+configuration are not supported by this command. There is no public-service
+listener or node configuration change.
+
+Success prints one JSON line containing `status: "verified"`, `files`, `bytes`
+and `chunks`. Failure prints a sanitized JSON `status: "failed"` and `code` to
+stderr, leaves stdout empty and exits nonzero. An output-stream failure can
+leave a partial line; an unwritable stderr cannot receive the error report. Missing objects/credential/network
+failures can report `object_store`; this is not a precise corruption diagnosis.
+The command intentionally does not echo endpoints, paths or backend error text.
+Do not interpret a successful byte check as global recovery or cloud-provider
+certification. Verification grants no retention lease; a later download must
+still revalidate and use the guarded physical restore path.

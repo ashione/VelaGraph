@@ -204,6 +204,8 @@ HTTP feature parity, upgrade compatibility or production-readiness gates in
 
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;
+the [read-only verification CLI](docs/OBJECT_STORE_CHECKPOINT_API.md#operator-verification-command)
+checks a retained receipt without staging a local backup.
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
 not object-store-authoritative storage, remote-durable write acknowledgement or
 live-cluster recovery. Physical restoration is guarded for offline use. See the
