@@ -12,7 +12,7 @@ has bounded cost. Physical checkpoint transport does not change these contracts.
 | `StateMachine::open` → `state_codec::load` → `event_ledger::load` | Cold open replays retained raw events into a complete Journal, validates derived checkpoints and hydrated state, then publishes active state. Legacy envelopes may embed complete history. | Reject corrupt/mismatched raw history, checkpoint/domain metadata, and applied identity. Do not substitute a trusted-looking checkpoint for cold validation. |
 | `StateMachine::load_disk_state` | Temporary complete materialization under the caller's state publication lock. Checks persisted metadata against published metadata and validates loaded state. | A cached active checkpoint alone is not the authority for these explicit full-history operations. |
 | `coordinator_journal` and managed RPC `checked_journal` / `Value::Journal` | Explicit compatibility/export operation returns a complete Journal; remote clients decode it. | Preserve full archive semantics; not an ordinary active status lookup. |
-| `coordinator_terminal_prefix` | Temporarily loads complete authority and checks requested terminal rows. | Preserve terminal index/history agreement. |
+| `coordinator_terminal_prefix` | Active coordinators project from a single complete raw witness verification; legacy representations temporarily load complete authority. | Preserve raw-first failure ordering and full comparison of intersecting terminal rows; unrelated later terminal rows remain outside the requested range. |
 | `participant_prefix_evidence`, `certified_participant_read_with_evidence` and their wrappers | Complete local retained history is compared with supplied full coordinator evidence and the decision index. The read also returns the selected graph snapshot. | Same-lock evidence and snapshot; cohort, baseline, version, shard, epoch and mode checks; no partial evidence success. |
 | Logical snapshot build/receive/install/current retention | `build_snapshot` loads complete persisted state and serializes into a buffer. `begin_receiving_snapshot` buffers received bytes; `install_snapshot` decodes full state/history, validates and reconstructs durable state; `get_current_snapshot` clones retained snapshot bytes. | Logical snapshot compatibility remains distinct from physical backup/restore. No bounded-memory snapshot claim. |
 | Legacy/general apply fallback | Loads complete state when neither active coordinator nor active member fast path handles the command. | Preserve migration, activation and legacy behavior; removing a fallback requires command-specific evidence. |
@@ -59,3 +59,14 @@ Any further removal needs a separately reviewed authority model and tests for
 corrupt raw rows, stale metadata, decision-index disagreement, reopen and legacy
 migration. In particular, #108 remains an umbrella for dependencies not removed
 here; checkpoint retirement and prefix purge/install are independent work.
+
+## Active coordinator terminal-prefix projection
+
+The proposed #108 follow-up removes full hydration from the active coordinator
+terminal-prefix read only. It retains one raw namespace walk, active projection
+state, requested output and at most one additional decoded decision segment.
+The same publication lock and pinned snapshot cover the operation. Legacy
+reads, cold open, snapshots and archive capacity are unchanged. See
+[design and validation gates](COORDINATOR_TERMINAL_PREFIX_DESIGN.md) for local
+verification evidence and remaining integration gates. This slice is not yet
+published or merged.
