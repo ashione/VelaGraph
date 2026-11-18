@@ -165,3 +165,63 @@ fn fifo_child() -> anyhow::Result<()> {
     fs::write(&result_path, b"rejected")?;
     Ok(())
 }
+
+// Inventory equality is checked before opening/copying the databases. Mutate
+// only the completion record, never SSTs that may be hard-linked to the source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_changed_inventory_before_creating_destination() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    backup_at(dir.path()).await?;
+    let backup = dir.path().join("backup");
+    let path = backup.join("checkpoint.json");
+    let original = fs::read(&path)?;
+    let pristine: serde_json::Value = serde_json::from_slice(&original)?;
+    let original_inventory = inventory(&backup)?;
+    assert!(original_inventory.len() > 1);
+    for case in ["missing", "duplicate", "reordered", "path", "size", "hash"] {
+        let mut changed = pristine.clone();
+        let files = changed["files"].as_array_mut().unwrap();
+        match case {
+            "missing" => {
+                files.remove(0);
+            }
+            "duplicate" => files.push(files[0].clone()),
+            "reordered" => files.swap(0, 1),
+            "path" => files[0]["name"] = "../outside".into(),
+            "size" => files[0]["size"] = (files[0]["size"].as_u64().unwrap() + 1).into(),
+            "hash" => {
+                let hash = files[0]["sha256"].as_str().unwrap();
+                let replacement = if hash.starts_with('0') { "1" } else { "0" };
+                files[0]["sha256"] = format!("{replacement}{}", &hash[1..]).into();
+            }
+            _ => unreachable!(),
+        }
+        let encoded = serde_json::to_vec(&changed)?;
+        fs::write(&path, &encoded)?;
+        let destination = dir.path().join(format!("rejected-{case}"));
+        let error = restore_physical_checkpoint(&backup, &destination, 0, 1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "checkpoint file inventory/checksum mismatch",
+            "{case}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&destination).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "{case}"
+        );
+        assert_eq!(
+            fs::read(&path)?,
+            encoded,
+            "restore rewrote manifest: {case}"
+        );
+        assert_eq!(
+            inventory(&backup)?,
+            original_inventory,
+            "restore changed backup files: {case}"
+        );
+    }
+    fs::write(&path, original)?;
+    restore_physical_checkpoint(&backup, dir.path().join("healthy"), 0, 1)?;
+    Ok(())
+}
