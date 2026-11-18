@@ -425,15 +425,19 @@ mod tests {
                         reply(&mut socket, request, failure).await;
                     }
                 });
-                let result = fixed_execution::execute(
+                let request = DistributedRequest {
+                    start_partition: 1,
+                    text: text.into(),
+                    timeout_millis: 5000,
+                };
+                let plan = fixed_execution::parse(&request).unwrap();
+                let result = fixed_execution::execute_plan(
                     &mut nodes,
-                    &DistributedRequest {
-                        start_partition: 1,
-                        text: text.into(),
-                        timeout_millis: 5000,
-                    },
+                    request.start_partition,
+                    &plan,
                     2,
                     Instant::now() + Duration::from_secs(5),
+                    None,
                 )
                 .await;
                 assert_eq!(result.unwrap_err(), expected, "{text}");

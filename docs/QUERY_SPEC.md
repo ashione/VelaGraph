@@ -26,6 +26,14 @@ The v0 subset is a deliberate first milestone, not a claim of full Gremlin
 compatibility. Adding a step requires updating this document and its conformance
 tests in the same change.
 
+### Managed structured transport
+
+The managed [GraphService.Execute RPC](PUBLIC_GRPC_SERVICE.md#graphserviceexecute)
+accepts a versioned protobuf encoding of a subset of explicit-ID vertex
+traversals. The server validates its ordered operations directly and enters
+the same certified data-local execution path as the text subset. All text
+entry points below continue to use the official grammar.
+
 ## 2. Accepted input
 
 - Exactly one traversal starting with `g` is accepted per request.

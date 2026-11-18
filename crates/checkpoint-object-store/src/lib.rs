@@ -61,6 +61,22 @@ pub struct CheckpointStore {
     prefix: String,
     limits: Limits,
 }
+/// Read-only byte verifier; no conditional-create capability or write methods.
+/// This is not a provider certification, retention lease or restore validator.
+#[derive(Clone)]
+pub struct CheckpointReader {
+    inner: CheckpointStore,
+}
+impl CheckpointReader {
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: String, limits: Limits) -> Result<Self> {
+        Ok(Self {
+            inner: CheckpointStore::from_backend(store, prefix, limits)?,
+        })
+    }
+    pub async fn verify(&self, receipt: &Receipt) -> Result<Verification> {
+        self.inner.verify(receipt).await
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Chunk {
@@ -183,6 +199,9 @@ impl CheckpointStore {
         limits: Limits,
         _: CreateCapability,
     ) -> Result<Self> {
+        Self::from_backend(store, prefix, limits)
+    }
+    fn from_backend(store: Arc<dyn ObjectStore>, prefix: String, limits: Limits) -> Result<Self> {
         safe_path(&prefix)?;
         if limits.chunk_bytes == 0
             || limits.chunk_bytes > 16 * 1024 * 1024

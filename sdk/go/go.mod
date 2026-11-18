@@ -1,4 +1,4 @@
-module example.com/velagraph/managed
+module github.com/ashione/VelaGraph/sdk/go
 
 go 1.23.0
 

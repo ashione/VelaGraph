@@ -17,8 +17,10 @@ Read these before changing behavior:
 
 ## Non-negotiables
 
-- Graph queries are standard Gremlin text parsed from the official TinkerPop
-  grammar. Do not invent a dialect, alias, or hand-written parser.
+- Parse Gremlin text with the official TinkerPop grammar. The versioned managed
+  GraphService.Execute RPC encodes a documented subset of those operations and
+  must share the certified query executor. Do not invent a dialect, alias, or
+  hand-written parser.
 - Unsupported Gremlin must fail explicitly; never silently ignore, rewrite, or
   return a partial success.
 - Keep the K1 key layout and deterministic record encoding; format changes need

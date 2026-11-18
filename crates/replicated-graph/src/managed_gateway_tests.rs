@@ -40,8 +40,28 @@ async fn raw_rpc(
     h2::SendStream<tonic::codegen::Bytes>,
     RpcDriver,
 ) {
+    raw_rpc_with_window(
+        address,
+        method,
+        bytes,
+        end_stream,
+        h2::client::Builder::new(),
+    )
+    .await
+}
+async fn raw_rpc_with_window(
+    address: SocketAddr,
+    method: &str,
+    bytes: Vec<u8>,
+    end_stream: bool,
+    builder: h2::client::Builder,
+) -> (
+    h2::client::ResponseFuture,
+    h2::SendStream<tonic::codegen::Bytes>,
+    RpcDriver,
+) {
     let socket = TcpStream::connect(address).await.unwrap();
-    let (mut sender, connection) = h2::client::handshake(socket).await.unwrap();
+    let (mut sender, connection) = builder.handshake(socket).await.unwrap();
     let driver = RpcDriver(tokio::spawn(async move {
         let _ = connection.await;
     }));

@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	pb "example.com/velagraph/managed/gen/managedv1"
+	pb "github.com/ashione/VelaGraph/sdk/go/gen/managedv1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -74,12 +74,16 @@ func (c *client) status(id []byte, mutation *pb.Mutation) *pb.WriteResponse {
 	return res
 }
 func (c *client) create(partition uint32, id uint64) {
-	external := make([]byte, 16)
-	copy(external, []byte("GoVela01"))
-	binary.BigEndian.PutUint64(external[8:], id)
 	mutation := &pb.Mutation{Kind: &pb.Mutation_CreateVertex{CreateVertex: &pb.CreateVertex{
 		Partition: partition, Vertex: &pb.Vertex{Id: id, Labels: []string{"GoInterop"}, Properties: scalarProps()},
 	}}}
+	c.commit("GoVela01", id, mutation)
+}
+
+func (c *client) commit(prefix string, id uint64, mutation *pb.Mutation) {
+	external := make([]byte, 16)
+	copy(external, []byte(prefix))
+	binary.BigEndian.PutUint64(external[8:], id)
 	check(c.status(external, mutation).GetAbsent() != nil, "fixture is not fresh: external ID already exists")
 	req := &pb.WriteRequest{Context: c.envelope(), ExternalId: external, Mutation: mutation}
 	res, err := c.write.Submit(c.ctx, req)
@@ -218,10 +222,10 @@ func run() {
 	endpoint := flag.String("endpoint", "", "loopback Rust public gRPC address")
 	bindingPath := flag.String("binding-proto", "", "protobuf binary Binding from Rust fixture")
 	partition := flag.Uint("partition", 7, "fixture partition")
-	first := flag.Uint64("first-id", 9007199254740993, "three fresh vertex IDs above 2^53")
+	first := flag.Uint64("first-id", 9007199254740993, "first fresh vertex ID (reserves four consecutive IDs)")
 	flag.Parse()
 	check(*endpoint != "" && *bindingPath != "", "endpoint and binding-proto are required")
-	check(*partition <= uint(^uint32(0)) && *first > 0 && *first <= 9223372036854775805, "invalid IDs")
+	check(*partition <= uint(^uint32(0)) && *first > 0 && *first <= 9223372036854775804, "invalid IDs")
 	data, err := os.ReadFile(*bindingPath)
 	check(err == nil, "binding: %v", err)
 	binding := new(pb.Binding)
@@ -254,7 +258,8 @@ func run() {
 	c.create(uint32(*partition), *first)
 	c.create(uint32(*partition), *first+1)
 	c.pages(uint32(*partition), *first)
-	fmt.Println("PASS: Go generated typed client; version/query rich errors; public/internal isolation; Submit/Status/confirmed replay; scalar/null/absence; immutable paginated Open/Fetch/Close")
+	c.graphChecks(conn, uint32(*partition), *first)
+	fmt.Println("PASS: chainable GraphService.Execute; Go generated typed client; version/query rich errors; public/internal isolation; Submit/Status/confirmed replay; scalar/null/absence; immutable paginated Open/Fetch/Close")
 }
 func main() {
 	defer func() {

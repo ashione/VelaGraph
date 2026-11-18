@@ -3,6 +3,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+mod plan_cache;
+mod query_memo;
+
 use rocksdb::{Direction, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
 
 use crate::graph::{codec, validate_edge, validate_vertex};
@@ -85,6 +88,7 @@ impl TemporalMutation {
 pub struct TemporalStore {
     db: DB,
     write: Mutex<()>,
+    plan_cache: Mutex<plan_cache::PlanCache>,
 }
 impl TemporalStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -112,6 +116,7 @@ impl TemporalStore {
         Ok(Self {
             db,
             write: Mutex::new(()),
+            plan_cache: Mutex::new(plan_cache::PlanCache::default()),
         })
     }
 
@@ -148,6 +153,8 @@ impl TemporalStore {
     /// store's latest synced prefix, not a distributed latest/linearizable read.
     pub fn view(&self, version: Option<u64>, valid_time: i64) -> Result<TemporalStoreView<'_>> {
         let snapshot = self.db.snapshot();
+        #[cfg(feature = "query-profiling")]
+        crate::query_profile::read_event(crate::query_profile::ReadEvent::Head);
         let head = decode_version(snapshot.get(HEAD_KEY)?.as_deref())?;
         let version = version.unwrap_or(head);
         if version > head {
@@ -155,8 +162,10 @@ impl TemporalStore {
         }
         Ok(TemporalStoreView {
             snapshot,
+            snapshot_head: head,
             version,
             valid_time,
+            plan_cache: &self.plan_cache,
         })
     }
 }
@@ -206,8 +215,10 @@ fn encode_batch(mutations: &[TemporalMutation]) -> Result<Vec<Vec<u8>>> {
 /// not a full graph copy. All returned endpoints share this exact V/T.
 pub struct TemporalStoreView<'a> {
     snapshot: Snapshot<'a>,
+    snapshot_head: u64,
     version: u64,
     valid_time: i64,
+    plan_cache: &'a Mutex<plan_cache::PlanCache>,
 }
 impl TemporalStoreView<'_> {
     pub fn version(&self) -> u64 {

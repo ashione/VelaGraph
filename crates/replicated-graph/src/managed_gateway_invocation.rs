@@ -21,6 +21,10 @@ impl Drop for OpenDelivery {
     }
 }
 
+pub(super) fn query_end(end: Instant) -> Instant {
+    end.min(Instant::now() + velagraph::GREMLIN_DEADLINE)
+}
+
 pub(super) fn operation_end(operation: &Operation, end: Instant) -> Instant {
     if matches!(
         operation,
@@ -41,7 +45,7 @@ pub(super) fn operation_end(operation: &Operation, end: Instant) -> Instant {
             | Operation::OpenLocalQueryAfter { .. }
             | Operation::FetchLocalQuery { .. }
     ) {
-        end.min(Instant::now() + velagraph::GREMLIN_DEADLINE)
+        query_end(end)
     } else {
         end
     }
@@ -196,5 +200,20 @@ impl Invocation {
             self.delivery.token = None;
             self.delivery.local_token = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod query_deadlines {
+    use super::*;
+    #[test]
+    fn unary_graph_and_text_queries_share_the_execution_ceiling() {
+        let before = Instant::now();
+        let long = before + Duration::from_secs(60);
+        let bounded = query_end(long);
+        assert!(bounded >= before + velagraph::GREMLIN_DEADLINE);
+        assert!(bounded <= Instant::now() + velagraph::GREMLIN_DEADLINE);
+        assert!(bounded < long);
+        assert_eq!(query_end(before), before);
     }
 }

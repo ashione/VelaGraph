@@ -80,6 +80,13 @@ concurrent executions each have their own budget, not a shared global quota.
 
 ## Compatibility and limits
 
+The local temporal executor's optional record memo uses this same ledger: each
+entry costs 128 bytes plus the full decoded-record fee, and returned payload
+copies are charged independently. Required reservations can reclaim memo entries
+before reporting exhaustion. Reclamation never discards live traversers or
+retries a query. Memo lifetime and capacity are bounded separately in
+[the temporal query contract](TEMPORAL_STORE.md#query-local-record-reuse).
+
 This is an intentional new resource restriction: a query that previously
 succeeded may now fail, including low-row-count queries with large properties
 and many parallel edges. The initial 64 MiB default is a conservative admission
