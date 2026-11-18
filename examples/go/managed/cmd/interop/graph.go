@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ashione/VelaGraph/sdk/go"
@@ -126,20 +128,43 @@ func (c *client) graphChecks(conn grpc.ClientConnInterface, partition uint32, fi
 		check(proto.Equal(r.GetElement().GetVertex(), to), "wrong capped element: %v", r)
 	}
 	if os.Getenv("VELAGRAPH_GRAPH_BENCH") == "1" {
-		c.benchmarkGraph(base(g.At(newer.Version)).In("reports").Count(), partition, first, newer.Version)
+		c.benchmarkGraphs(g.At(newer.Version), partition, starts, newer.Version)
+	}
+}
+
+// All starts refer to the same vertex. Each hop crosses one of two parallel
+// edges, doubling the independent expected count for this fixture.
+func (c *client) benchmarkGraphs(g velagraph.Client, partition uint32, starts []uint64, version uint64) {
+	for _, shape := range []struct{ starts, hops int }{{1, 0}, {2, 0}, {16, 0}, {2, 1}, {2, 2}} {
+		ids := starts[:shape.starts]
+		args := make([]string, len(ids))
+		for i, id := range ids {
+			args[i] = strconv.FormatUint(id, 10)
+		}
+		q := g.V(partition, ids...)
+		text := "g.V(" + strings.Join(args, ",") + ")"
+		if shape.hops >= 1 {
+			q = q.Out("reports")
+			text += ".out('reports')"
+		}
+		if shape.hops == 2 {
+			q = q.In("reports")
+			text += ".in('reports')"
+		}
+		name := fmt.Sprintf("starts=%d hops=%d", shape.starts, shape.hops)
+		c.benchmarkGraph(name, q.Count(), &pb.Query{Partition: partition, Text: text + ".count()"}, version, uint64(len(ids))<<shape.hops)
 	}
 }
 
 // Benchmark the public calls on the same warmed connection, certified V, graph
 // and ordered bag. Text Open returns a retained page. Measure its Close separately.
-func (c *client) benchmarkGraph(q velagraph.Traversal, partition uint32, first, version uint64) {
-	text := &pb.Query{Partition: partition, Text: fmt.Sprintf("g.V(%d,%d).out('reports').in('reports').count()", first, first)}
+func (c *client) benchmarkGraph(name string, q velagraph.Traversal, text *pb.Query, version, want uint64) {
 	read := &pb.ReadSelector{Kind: &pb.ReadSelector_Exact{Exact: version}}
 	typed := func() time.Duration {
 		start := time.Now()
 		res := execute(c, q)
 		elapsed := time.Since(start)
-		verifyCount(res, 8)
+		verifyCount(res, want)
 		return elapsed
 	}
 	open := func() (time.Duration, time.Duration) {
@@ -149,7 +174,7 @@ func (c *client) benchmarkGraph(q velagraph.Traversal, partition uint32, first, 
 		elapsed := time.Since(start)
 		check(err == nil, "benchmark text Open: %v", err)
 		identity(req.Context.Identity, res.Identity)
-		check(proto.Equal(res.Query, text) && res.Session != nil && res.Session.Version == version && res.Page != nil && res.Page.Total == 1 && res.Page.Next == nil && len(res.Page.Rows) == 1 && res.Page.Rows[0].GetCount() == 8 && res.Page.Completeness == pb.Completeness_UNVERIFIED, "benchmark text result: %v", res)
+		check(proto.Equal(res.Query, text) && res.Session != nil && res.Session.Version == version && res.Page != nil && res.Page.Total == 1 && res.Page.Next == nil && len(res.Page.Rows) == 1 && res.Page.Rows[0].GetCount() == want && res.Page.Completeness == pb.Completeness_UNVERIFIED, "benchmark text result: %v", res)
 		closeStart := time.Now()
 		_, err = c.query.Close(c.ctx, &pb.CloseRequest{Context: c.envelope(), Session: res.Session})
 		check(err == nil, "benchmark text Close: %v", err)
@@ -174,6 +199,6 @@ func (c *client) benchmarkGraph(q velagraph.Traversal, partition uint32, first, 
 	}
 	for i, data := range [][]time.Duration{graphTimes, openTimes, closeTimes} {
 		slices.Sort(data)
-		fmt.Printf("graph bench %-14s n=%d p50=%s p95=%s\n", []string{"typed Execute", "text Open", "text Close"}[i], len(data), data[(len(data)-1)/2], data[(len(data)*95+99)/100-1])
+		fmt.Printf("graph bench %s %-14s n=%d p50=%s p95=%s\n", name, []string{"typed Execute", "text Open", "text Close"}[i], len(data), data[(len(data)-1)/2], data[(len(data)*95+99)/100-1])
 	}
 }

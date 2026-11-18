@@ -36,7 +36,9 @@ fails at the gateway. The fixture also sends a future oneof step and an empty
 step between a valid hop and count. Both requests and a request with an unknown
 capacity-profile enum must return INVALID_ARGUMENT with no result. The same
 fixed-version query with only the recognized steps must return one. Set `VELAGRAPH_GRAPH_BENCH=1`
-on the Rust interoperability test to also time 40 paired requests per API.
+on the Rust interoperability test to time 40 paired requests per query shape.
+Each shape counts walks from repeated copies of one vertex ID. The fixture
+checks both APIs against the expected count, including parallel-edge multiplicity.
 It uses four warmup pairs, then alternates GraphService.Execute with QueryService.Open at the same exact V
 on the same warm channel and prints p50/p95. Text Close is timed separately.
 The text API retains a session and the typed API returns rows directly. These
@@ -63,15 +65,21 @@ for the official text parser and fixed-plan admission, and **0.207 µs** for
 cloning and validating the typed input. Neither timed loop performs network
 I/O, protobuf decoding, capture or execution.
 
-| Two-hop count on two shards, 40 warm paired requests | p50 | p95 |
-| --- | ---: | ---: |
-| GraphService.Execute | 9.68 ms | 10.91 ms |
-| QueryService.Open (text, full count in first page) | 11.16 ms | 12.19 ms |
-| QueryService.Close (measured separately) | 0.18 ms | 0.22 ms |
+The following release run used the standalone Go SDK on a two-shard loopback
+fixture. Times are milliseconds. Each row compares the same query and exact V.
 
-The end-to-end figures include the actual shard reads on a small fixed cohort.
-They are a local sample, collected while other tests were running. Plan
-construction accounts for only part of the difference between these endpoints.
+| Starts | Hops | Expected count | SDK Execute p50 | Text Open p50 | SDK Execute p95 | Text Open p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0 | 1 | 6.74 | 7.38 | 7.16 | 7.60 |
+| 2 | 0 | 2 | 6.85 | 7.46 | 6.99 | 7.69 |
+| 16 | 0 | 16 | 8.41 | 9.20 | 8.73 | 9.65 |
+| 2 | 1 | 4 | 7.56 | 8.83 | 7.78 | 9.23 |
+| 2 | 2 | 8 | 8.93 | 10.42 | 9.34 | 10.86 |
+
+Text Open returns the count in the first page and retains a session. The
+separately measured Close p50 ranged from 0.145 to 0.156 ms across shapes.
+These samples include snapshot capture and shard reads. They compare public
+endpoints and are opt-in benchmark observations, without a CI latency threshold.
 
 ## Run against a fresh fixture
 
