@@ -100,7 +100,7 @@ explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
 Temporal queries support reusable parsed plans, checked typed bindings and
-query-local record/cursor reuse at a fixed snapshot and V/T. See
+query-local record/adjacency cursor reuse at a fixed snapshot and V/T. See
 [temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
 API examples, cache bounds and validation limits.
 Existing callers migrating from `rocksdb_sql_table` should read the

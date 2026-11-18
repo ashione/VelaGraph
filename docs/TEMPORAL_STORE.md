@@ -33,6 +33,10 @@ interval; old system views are unchanged. Absent revisions mask earlier assertio
 only over the specified interval. No whole graph or full history is copied into
 a query view, and commits do not copy the graph.
 
+The view retains the snapshot head already validated at creation. This is
+distinct from an explicitly selected older V: adjacency candidates are checked
+against the snapshot head for corruption, then against V for eligibility.
+
 This experimental namespace permits edges to be asserted before endpoints exist.
 `get_edge` returns a visible edge only when both vertices are visible at the same
 V/T. This explicitly limited R4 scope exception does **not** weaken v1 edge
@@ -238,6 +242,14 @@ into owned boxes. Iterator errors propagate before absence can be returned.
 The record cursor is separate from adjacency iterators to allow their visitors
 to resolve edges and endpoints safely. Native iterator memory remains excluded
 from logical accounting under the existing RocksDB memory boundary.
+
+Adjacency scans also reuse a query-local raw cursor and borrow its key/value
+slices. The cursor is taken out of its retained slot while a visitor runs; a
+reentrant scan can use a separate temporary cursor and ordinary sequential scans
+reuse the retained one. Every seek/next checks cursor status before absence is
+returned. Candidate order, skipped-candidate work charges and raw-byte accounting
+are unchanged, and callbacks can still return errors. Neither cursor nor record
+memo is retained across executions. Snapshot HEAD is not re-read for each scan.
 
 Start rows retain their original order, duplicates, missing-ID handling and
 leading-limit short circuit. There is no eager decode of later roots, no new

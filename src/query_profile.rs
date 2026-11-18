@@ -10,6 +10,10 @@ pub struct Totals {
     pub record_decodes: u64,
     pub record_cache_hits: u64,
     pub record_iterators: u64,
+    /// HEAD reads performed while creating temporal views or scanning adjacency.
+    pub head_reads: u64,
+    pub adjacency_iterators: u64,
+    pub adjacency_candidates: u64,
     pub parse_calls: u64,
     pub cache_hits: u64,
     pub parse_ns: u64,
@@ -80,6 +84,9 @@ pub(crate) fn cache_hit() {
 }
 
 pub(crate) enum ReadEvent {
+    Head,
+    AdjacencyIterator,
+    AdjacencyCandidate,
     Read,
     Decode,
     CacheHit,
@@ -89,6 +96,9 @@ pub(crate) fn read_event(event: ReadEvent) {
     ACTIVE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
             match event {
+                ReadEvent::Head => t.head_reads += 1,
+                ReadEvent::AdjacencyIterator => t.adjacency_iterators += 1,
+                ReadEvent::AdjacencyCandidate => t.adjacency_candidates += 1,
                 ReadEvent::Read => t.record_reads += 1,
                 ReadEvent::Decode => t.record_decodes += 1,
                 ReadEvent::CacheHit => t.record_cache_hits += 1,

@@ -94,6 +94,7 @@ struct Backend<'a, 'db> {
     memo: Rc<RecordMemo>,
     // Separate from adjacency iteration, whose visitor resolves records.
     record_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
+    adjacency_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
 }
 fn error(error: TemporalStoreError) -> Error {
     Error::TemporalStore(Box::new(error))
@@ -110,6 +111,7 @@ impl<'a, 'db> Backend<'a, 'db> {
             bytes: Cell::new(0),
             memo,
             record_cursor: RefCell::new(None),
+            adjacency_cursor: RefCell::new(None),
         }
     }
     fn check(&self) -> crate::Result<()> {
@@ -190,7 +192,7 @@ impl<'a, 'db> Backend<'a, 'db> {
         Ok(None)
     }
 }
-impl QueryReadBackend for Backend<'_, '_> {
+impl<'a, 'db> QueryReadBackend for Backend<'a, 'db> {
     fn get_vertex(&self, id: u64, budget: &Budget) -> crate::Result<Option<Accounted<Vertex>>> {
         self.check()?;
         let cached = self.memo.vertices.borrow_mut().take(id);
@@ -270,45 +272,70 @@ impl QueryReadBackend for Backend<'_, '_> {
         budget: &Budget,
     ) -> crate::Result<()> {
         let prefix = adjacency_prefix(id, incoming);
-        let head = decode_version(self.view.snapshot.get(HEAD_KEY)?.as_deref()).map_err(error)?;
-        for row in self
-            .view
-            .snapshot
-            .iterator(IteratorMode::From(&prefix, Direction::Forward))
-        {
-            self.check()?;
-            check()?;
-            let (key, value) = row?;
-            if !key.starts_with(&prefix) {
-                break;
+        let head = self.view.snapshot_head;
+        let view: &'a TemporalStoreView<'db> = self.view;
+        // Take the cursor out before invoking a visitor. A nested scan can then
+        // use a separate temporary cursor instead of panicking on a RefCell borrow.
+        let mut cursor = self
+            .adjacency_cursor
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| {
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::read_event(
+                    crate::query_profile::ReadEvent::AdjacencyIterator,
+                );
+                view.snapshot.raw_iterator()
+            });
+        let result = (|| -> crate::Result<()> {
+            cursor.seek(&prefix);
+            loop {
+                self.check()?;
+                check()?;
+                cursor.status()?;
+                let Some((key, value)) = cursor.item() else {
+                    break;
+                };
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::read_event(
+                    crate::query_profile::ReadEvent::AdjacencyCandidate,
+                );
+                self.charge(key.len() + value.len())?;
+                let _raw = budget.reserve(key.len() + value.len())?;
+                if key.len() != prefix.len() + 8 || value.len() != 8 {
+                    return Err(error(TemporalStoreError::Corrupt));
+                }
+                let first = decode_version(Some(value)).map_err(error)?;
+                if first == 0 || first > head {
+                    return Err(error(TemporalStoreError::Corrupt));
+                }
+                if first > self.view.version {
+                    cursor.next();
+                    continue;
+                }
+                let edge_id = u64::from_be_bytes(
+                    key[prefix.len()..]
+                        .try_into()
+                        .map_err(|_| error(TemporalStoreError::Corrupt))?,
+                );
+                let Some(edge) = self.get_edge(edge_id, budget)? else {
+                    cursor.next();
+                    continue;
+                };
+                if (if incoming { edge.to } else { edge.from }) == id
+                    && label.is_none_or(|label| edge.label == label)
+                {
+                    visit(edge)?;
+                }
+                cursor.next();
             }
-            self.charge(key.len() + value.len())?;
-            let _raw = budget.reserve(key.len() + value.len())?;
-            if key.len() != prefix.len() + 8 || value.len() != 8 {
-                return Err(error(TemporalStoreError::Corrupt));
-            }
-            let first = decode_version(Some(&value)).map_err(error)?;
-            if first == 0 || first > head {
-                return Err(error(TemporalStoreError::Corrupt));
-            }
-            if first > self.view.version {
-                continue;
-            }
-            let edge_id = u64::from_be_bytes(
-                key[prefix.len()..]
-                    .try_into()
-                    .map_err(|_| error(TemporalStoreError::Corrupt))?,
-            );
-            let Some(edge) = self.get_edge(edge_id, budget)? else {
-                continue;
-            };
-            if (if incoming { edge.to } else { edge.from }) == id
-                && label.is_none_or(|label| edge.label == label)
-            {
-                visit(edge)?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        *self.adjacency_cursor.borrow_mut() = Some(cursor);
+        result
     }
 }
 
@@ -442,6 +469,91 @@ mod tests {
         );
     }
     #[test]
+    fn adjacency_visitor_reentry_and_error_preserve_cursor_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let valid = Interval { from: 0, to: None };
+        store
+            .commit(&[
+                vertex(1, 0, None, "one"),
+                vertex(2, 0, None, "two"),
+                vertex(3, 0, None, "three"),
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(7, 1, 3, "LINK"),
+                },
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(8, 2, 3, "LINK"),
+                },
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(9, 1, 2, "LINK"),
+                },
+            ])
+            .unwrap();
+        let view = store.view(None, 0).unwrap();
+        let budget = Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES);
+        let backend = Backend::new(&view, &budget);
+        let mut seen = Vec::new();
+        backend
+            .visit_adjacent_edges(
+                1,
+                false,
+                None,
+                &mut || Ok(()),
+                &mut |edge| {
+                    seen.push(edge.id);
+                    if edge.id != 7 {
+                        return Ok(());
+                    }
+                    backend.visit_adjacent_edges(
+                        2,
+                        false,
+                        None,
+                        &mut || Ok(()),
+                        &mut |edge| {
+                            seen.push(edge.id);
+                            Ok(())
+                        },
+                        &budget,
+                    )
+                },
+                &budget,
+            )
+            .unwrap();
+        assert_eq!(seen, vec![7, 8, 9]);
+        assert!(backend
+            .visit_adjacent_edges(
+                1,
+                false,
+                None,
+                &mut || Ok(()),
+                &mut |_| Err(Error::UnsupportedGremlinArgument(
+                    "visitor rejection".into()
+                )),
+                &budget
+            )
+            .is_err());
+        let mut after_error = Vec::new();
+        backend
+            .visit_adjacent_edges(
+                2,
+                false,
+                None,
+                &mut || Ok(()),
+                &mut |edge| {
+                    after_error.push(edge.id);
+                    Ok(())
+                },
+                &budget,
+            )
+            .unwrap();
+        assert_eq!(after_error, vec![8]);
+        drop(backend);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
     fn leading_limit_leaves_later_corrupt_record_unread() {
         let dir = tempfile::tempdir().unwrap();
         let store = TemporalStore::open(dir.path()).unwrap();
@@ -505,6 +617,7 @@ mod tests {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            adjacency_cursor: RefCell::new(None),
         };
         let budget = Budget::new(1);
         assert!(backend.get_vertex(1, &budget).is_err());
@@ -522,6 +635,7 @@ mod tests {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            adjacency_cursor: RefCell::new(None),
         };
         assert!(matches!(
             expired.get_vertex(999, &budget),
@@ -571,6 +685,7 @@ mod tests {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            adjacency_cursor: RefCell::new(None),
         };
         let result = GremlinQuery::parse("g.V(1,2).count()")
             .unwrap()
@@ -839,6 +954,7 @@ mod adjacency_limits {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            adjacency_cursor: RefCell::new(None),
         };
         let result = backend.visit_adjacent_edges(
             1,
@@ -950,6 +1066,7 @@ mod adjacency_atomicity {
                 bytes: Cell::new(0),
                 memo: Default::default(),
                 record_cursor: RefCell::new(None),
+                adjacency_cursor: RefCell::new(None),
             };
             let start = Instant::now();
             assert_eq!(
