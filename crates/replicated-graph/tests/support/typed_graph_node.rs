@@ -9,6 +9,50 @@ use d2_raft::{D1Command, D1Result, LogCommand, TcpNode, TcpNodeConfig};
 use replicated_graph::remote::GraphService;
 use std::time::Duration;
 
+// Diagnostic labels are a closed test-only vocabulary, never arbitrary env text.
+pub const SCENARIO_ENV: &str = "VELA_SNAPSHOT_DIAGNOSTIC_SCENARIO";
+fn scenario_label(value: &str) -> Option<&'static str> {
+    match value {
+        "differential" => Some("differential"),
+        "expiry" => Some("expiry"),
+        "quorum-loss" => Some("quorum-loss"),
+        "read-confirmation" => Some("read-confirmation"),
+        "managed-confirmation" => Some("managed-confirmation"),
+        _ => None,
+    }
+}
+
+pub fn child_mapping(scenario: &str, parent: u32, child: u32, node: u64) -> String {
+    let scenario = scenario_label(scenario).unwrap_or("unknown");
+    format!("snapshot_child scenario={scenario} parent_pid={parent} child_pid={child} node={node}")
+}
+
+fn startup_failure(scenario: &str, pid: u32, node: u64, stage: &'static str) -> String {
+    // stage is supplied only by the fixed startup call sites below.
+    let scenario = scenario_label(scenario).unwrap_or("unknown");
+    format!("snapshot_child_failure scenario={scenario} child_pid={pid} node={node} stage={stage}")
+}
+
+fn startup_result<T>(
+    result: anyhow::Result<T>,
+    node: u64,
+    stage: &'static str,
+) -> anyhow::Result<T> {
+    result.map_err(|error| {
+        let scenario = std::env::var(SCENARIO_ENV)
+            .ok()
+            .and_then(|value| scenario_label(&value));
+        if let Some(scenario) = scenario {
+            let label = startup_failure(scenario, std::process::id(), node, stage);
+            eprintln!("{label}");
+            error.context(label)
+        } else {
+            // Other fixture users keep their original error chain and logging.
+            error
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut id = None;
@@ -57,57 +101,80 @@ async fn main() -> anyhow::Result<()> {
     let control_addr = control_addr.context("--control is required")?;
     let data_dir = data_dir.context("--data-dir is required")?;
 
-    bind_graph_identity(std::path::Path::new(&data_dir), group, id)?;
-
-    let node = TcpNode::start(TcpNodeConfig {
+    startup_result(
+        bind_graph_identity(std::path::Path::new(&data_dir), group, id),
         id,
-        raft_addr,
-        control_addr,
-        data_dir: data_dir.into(),
-    })
-    .await?;
+        "identity",
+    )?;
+
+    let node = startup_result(
+        TcpNode::start(TcpNodeConfig {
+            id,
+            raft_addr,
+            control_addr,
+            data_dir: data_dir.into(),
+        })
+        .await,
+        id,
+        "tcp-node-start",
+    )?;
 
     if let Some(spec) = bootstrap {
         let members = parse_members(&spec)?;
-        node.bootstrap(members).await?;
+        startup_result(node.bootstrap(members).await, id, "bootstrap")?;
     }
 
     // Initial activation is an explicit startup administrator action. Existing
     // ownership is checked, never overwritten. Every node may attempt the same
     // immutable activation; only a leader can commit it.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some((actual_shard, actual_epoch, _)) = node.state_machine.d1_metadata().await {
-                anyhow::ensure!(
-                    actual_shard == shard && actual_epoch == epoch,
-                    "stored ownership differs from startup configuration"
-                );
-                return anyhow::Ok(());
-            }
-            if node.raft.ensure_linearizable().await.is_ok() {
-                if let Ok(reply) = node
-                    .raft
-                    .client_write(LogCommand::D1V1(D1Command::Activate { shard, epoch }))
-                    .await
+    startup_result(
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some((actual_shard, actual_epoch, _)) =
+                    node.state_machine.d1_metadata().await
                 {
                     anyhow::ensure!(
-                        reply.data.d1 == Some(Ok(D1Result::Activated { shard, epoch })),
-                        "D1 activation rejected"
+                        actual_shard == shard && actual_epoch == epoch,
+                        "stored ownership differs from startup configuration"
                     );
+                    return anyhow::Ok(());
                 }
+                if node.raft.ensure_linearizable().await.is_ok() {
+                    if let Ok(reply) = node
+                        .raft
+                        .client_write(LogCommand::D1V1(D1Command::Activate { shard, epoch }))
+                        .await
+                    {
+                        anyhow::ensure!(
+                            reply.data.d1 == Some(Ok(D1Result::Activated { shard, epoch })),
+                            "D1 activation rejected"
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await??;
-    let service =
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result),
+        id,
+        "activation-wait",
+    )?;
+    let service = startup_result(
         GraphService::start_identified(&node, graph_addr, group, shard, Duration::from_secs(3))
-            .await?;
+            .await
+            .map_err(anyhow::Error::from),
+        id,
+        "graph-service-start",
+    )?;
     let grpc_snapshot = if let Some(address) = grpc_snapshot_addr {
-        Some(
+        Some(startup_result(
             replicated_graph::remote::grpc::GrpcSnapshotService::start(&service, address.parse()?)
-                .await?,
-        )
+                .await
+                .map_err(anyhow::Error::from),
+            id,
+            "grpc-snapshot-start",
+        )?)
     } else {
         None
     };
@@ -192,6 +259,32 @@ fn bind_graph_identity(dir: &std::path::Path, group: u64, node: u64) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_diagnostic_labels_are_bounded_and_owned() {
+        let first = child_mapping("differential", 100, 201, 1);
+        let second = child_mapping("quorum-loss", 100, 202, 1);
+        assert_eq!(
+            first,
+            "snapshot_child scenario=differential parent_pid=100 child_pid=201 node=1"
+        );
+        assert_ne!(first, second);
+        let failure = startup_failure("differential", 201, 1, "graph-service-start");
+        assert!(failure.contains("child_pid=201 node=1"));
+        assert!(failure.contains("stage=graph-service-start"));
+        assert!(!child_mapping("untrusted\nsecret", 1, 2, 3).contains("secret"));
+        assert!(scenario_label("untrusted").is_none());
+        for label in [
+            "differential",
+            "expiry",
+            "quorum-loss",
+            "read-confirmation",
+            "managed-confirmation",
+        ] {
+            assert!(child_mapping(label, u32::MAX, u32::MAX, u64::MAX).len() < 180);
+            assert!(startup_failure(label, u32::MAX, u64::MAX, "grpc-snapshot-start").len() < 180);
+        }
+    }
 
     #[test]
     fn durable_graph_identity_fails_closed() {
