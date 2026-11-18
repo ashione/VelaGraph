@@ -36,6 +36,10 @@ Internal graph, managed, coordinator and Raft transports use typed gRPC. See
 explicit-identity API changes and validation boundaries. Public HTTP
 remains supported; old JSON/TCP clients are not a supported fallback.
 
+Go clients can build a managed traversal locally and submit its steps in one
+gRPC call. See the [Go client SDK](sdk/go/README.md)
+for supported steps and snapshot selection.
+
 ## Quick start
 
 ### Try one graph query
@@ -99,6 +103,12 @@ The Rust package and import name are both **`velagraph`**. The local
 explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
+Temporal queries support reusable parsed plans, checked typed bindings and
+query-local record/adjacency cursor reuse at a fixed snapshot and V/T.
+Already observed record-boundary lookahead can also avoid a redundant seek while
+retaining the normal visibility and validation checks. See
+[temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
+API examples, cache bounds and validation limits.
 Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
 storage engine; removing SQL did not remove it.

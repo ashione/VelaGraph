@@ -297,7 +297,7 @@ fn out_element(e: &crate::remote::query::QualifiedElement) -> pb::QualifiedEleme
         }),
     }
 }
-fn out_row(r: &QueryRow) -> Result<pb::Row> {
+pub(super) fn out_row(r: &QueryRow) -> Result<pb::Row> {
     use pb::row::Kind;
     Ok(pb::Row {
         kind: Some(match r {
