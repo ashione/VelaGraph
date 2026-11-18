@@ -366,12 +366,24 @@ impl ServiceProcess {
         output: PathBuf,
         drain_ms: u64,
     ) -> anyhow::Result<Self> {
+        Self::start_with_http(config, output, drain_ms, "127.0.0.1:0".parse()?).await
+    }
+    async fn start_with_http(
+        config: &Path,
+        output: PathBuf,
+        drain_ms: u64,
+        http: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        let http_string = http.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_graph-service"));
+        if !http.ip().is_loopback() {
+            command.arg("--allow-insecure-network");
+        }
         command.args([
             "--config",
             config.to_str().context("config path")?,
             "--http",
-            "127.0.0.1:0",
+            &http_string,
             "--grpc",
             "127.0.0.1:0",
             "--allow-insecure-development",

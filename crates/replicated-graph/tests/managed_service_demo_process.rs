@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -107,12 +107,38 @@ struct Ready {
 }
 
 fn launch(binary: &Path, data: &Path, output: &Path, error: &Path) -> anyhow::Result<Demo> {
+    launch_service(
+        binary,
+        data,
+        output,
+        error,
+        Path::new(env!("CARGO_BIN_EXE_graph-service")),
+    )
+}
+
+fn launch_service(
+    binary: &Path,
+    data: &Path,
+    output: &Path,
+    error: &Path,
+    service: &Path,
+) -> anyhow::Result<Demo> {
+    launch_output(binary, data, fs::File::create(output)?, error, service)
+}
+
+fn launch_output(
+    binary: &Path,
+    data: &Path,
+    output: fs::File,
+    error: &Path,
+    service: &Path,
+) -> anyhow::Result<Demo> {
     Ok(Demo {
         child: Command::new(binary)
             .arg("--data-dir")
             .arg(data)
             .arg("--service-bin")
-            .arg(env!("CARGO_BIN_EXE_graph-service"))
+            .arg(service)
             .args([
                 "--http",
                 "127.0.0.1:0",
@@ -121,7 +147,7 @@ fn launch(binary: &Path, data: &Path, output: &Path, error: &Path) -> anyhow::Re
                 "--allow-insecure-development",
             ])
             .stdin(Stdio::null())
-            .stdout(Stdio::from(fs::File::create(output)?))
+            .stdout(Stdio::from(output))
             .stderr(Stdio::from(fs::File::create(error)?))
             .spawn()?,
     })
@@ -357,5 +383,390 @@ async fn fresh_demo_write_query_reject_existing_and_stop_children() -> anyhow::R
     assert_eq!(fs::read(&sentinel)?, b"original data directory");
     rejected_existing(&binary, &data, logs.path(), "stopped").await?;
     assert_eq!(fs::read(&sentinel)?, b"original data directory");
+    failure_cleanup_cases(&binary, logs.path()).await?;
+    announcement_failure(&binary, logs.path()).await?;
+    concurrent_directory_claim(&binary, logs.path()).await?;
+    Ok(())
+}
+
+// Best-effort cleanup checks process incarnation, not just PID. This is not
+// atomic pidfd fencing or a production process supervisor.
+fn process_incarnation(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .to_owned(),
+    )
+}
+struct OwnedChildren(Vec<(u32, String)>);
+impl OwnedChildren {
+    fn new(pids: &[u32]) -> Self {
+        Self(
+            pids.iter()
+                .filter_map(|&pid| process_incarnation(pid).map(|start| (pid, start)))
+                .collect(),
+        )
+    }
+}
+impl Drop for OwnedChildren {
+    fn drop(&mut self) {
+        for (pid, start) in &self.0 {
+            if process_incarnation(*pid).as_ref() == Some(start) {
+                if let Some(pid) = rustix::process::Pid::from_raw(*pid as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+        }
+    }
+}
+async fn failed_and_reaped(demo: &mut Demo, children: &[u32]) -> anyhow::Result<()> {
+    let status = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = demo.child.try_wait()? {
+                return Ok::<_, std::io::Error>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("failed demo must exit within bounded cleanup")??;
+    anyhow::ensure!(
+        !status.success(),
+        "failed child/startup must not report success"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while children
+            .iter()
+            .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("failed demo left child alive or unreaped")?;
+    Ok(())
+}
+fn ready_node_pids(data: &Path) -> anyhow::Result<Vec<u32>> {
+    [7, 8, 9]
+        .into_iter()
+        .map(|shard| {
+            let value: Value =
+                serde_json::from_slice(&fs::read(data.join(format!("node-{shard}/ready.json")))?)?;
+            u32::try_from(value["pid"].as_u64().context("node ready PID")?)
+                .context("node PID range")
+        })
+        .collect()
+}
+async fn failure_cleanup_cases(binary: &Path, logs: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Test-only service executables, never an alternate product bootstrap.
+    let failed_service = logs.join("failed-service.sh");
+    fs::write(
+        &failed_service,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexit 1\n",
+    )?;
+    fs::set_permissions(&failed_service, fs::Permissions::from_mode(0o700))?;
+    let stalled_service = logs.join("stalled-service.sh");
+    // PID file is adjacent to this controlled fixture, independent of argv.
+    fs::write(
+        &stalled_service,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nexec /bin/sleep 60\n",
+    )?;
+    fs::set_permissions(&stalled_service, fs::Permissions::from_mode(0o700))?;
+    for case in ["startup-exit", "startup-cancel", "participant-exit"] {
+        let data = logs.join(format!("{case}-data"));
+        let output = logs.join(format!("{case}.stdout"));
+        let error = logs.join(format!("{case}.stderr"));
+        let service = match case {
+            "startup-exit" => failed_service.as_path(),
+            "startup-cancel" => stalled_service.as_path(),
+            _ => Path::new(env!("CARGO_BIN_EXE_graph-service")),
+        };
+        let mut demo = launch_service(binary, &data, &output, &error, service)?;
+        let (children, ready) = if case == "participant-exit" {
+            let ready = await_ready(&mut demo, &output, &error).await?;
+            anyhow::ensure!(ready.node_pids.len() == 3, "expected three owned nodes");
+            let children: Vec<_> = ready
+                .node_pids
+                .iter()
+                .copied()
+                .chain([ready.service_pid])
+                .collect();
+            (children, Some(ready))
+        } else {
+            // Wait until all three nodes are ready and service launch is reached.
+            let pid_path = logs.join(if case == "startup-cancel" {
+                "stalled-service.sh.pid"
+            } else {
+                "failed-service.sh.pid"
+            });
+            tokio::time::timeout(BUDGET, async {
+                loop {
+                    let reached = fs::read_to_string(&pid_path).ok().is_some_and(|text| {
+                        text.ends_with('\n') && text.trim().parse::<u32>().is_ok()
+                    });
+                    if reached {
+                        break;
+                    }
+                    anyhow::ensure!(
+                        demo.child.try_wait()?.is_none(),
+                        "demo exited before service fixture"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("service fault fixture startup")??;
+            let mut children = ready_node_pids(&data)?;
+            children.push(fs::read_to_string(pid_path)?.trim().parse()?);
+            (children, None)
+        };
+        let _owned_children = OwnedChildren::new(&children);
+        if let Some(ready) = &ready {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(ready.node_pids[0] as i32)
+                    .context("participant PID")?,
+                rustix::process::Signal::KILL,
+            )?;
+        } else if case == "startup-cancel" {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(demo.child.id() as i32).context("demo PID")?,
+                rustix::process::Signal::TERM,
+            )?;
+        }
+        failed_and_reaped(&mut demo, &children)
+            .await
+            .with_context(|| {
+                format!("{case}: {}", fs::read_to_string(&error).unwrap_or_default())
+            })?;
+        if let Some(ready) = ready {
+            for endpoint in [ready.http, ready.grpc] {
+                let connected = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::net::TcpStream::connect(endpoint),
+                )
+                .await;
+                anyhow::ensure!(
+                    matches!(connected, Ok(Err(_))),
+                    "{case}: public listener not confirmed closed"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                fs::read(&output)?.is_empty(),
+                "failed startup announced public readiness"
+            );
+        }
+        anyhow::ensure!(data.is_dir(), "failure cleanup removed retained data");
+        rejected_existing(binary, &data, logs, &format!("{case}-existing")).await?;
+    }
+    Ok(())
+}
+
+// A failed parent announcement is later than service readiness. Exercise the
+// actual output device failure, without replacing any product child executable.
+async fn announcement_failure(binary: &Path, logs: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut full = fs::OpenOptions::new().write(true).open("/dev/full")?;
+    anyhow::ensure!(
+        full.metadata()?.file_type().is_char_device(),
+        "expected /dev/full device"
+    );
+    let error = full
+        .write_all(b"probe")
+        .expect_err("/dev/full must reject output");
+    anyhow::ensure!(
+        error.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()),
+        "expected ENOSPC"
+    );
+    let data = logs.join("announcement-failure-data");
+    let error = logs.join("announcement-failure.stderr");
+    let mut demo = launch_output(
+        binary,
+        &data,
+        full,
+        &error,
+        Path::new(env!("CARGO_BIN_EXE_graph-service")),
+    )?;
+    let service_path = data.join("service.jsonl");
+    let service: Value = tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Ok(bytes) = log_tail(&service_path) {
+                if bytes.ends_with(b"\n") {
+                    return Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?);
+                }
+            }
+            anyhow::ensure!(
+                demo.child.try_wait()?.is_none(),
+                "parent exited before real service announcement"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("real service announcement before output fault")??;
+    // Service readiness, not a file merely created before spawn, proves this
+    // fault occurs after all four real children have reached startup.
+    anyhow::ensure!(
+        service["state"] == "serving_live_managed_cohort",
+        "service never ready"
+    );
+    fs::write(
+        logs.join("announcement-failure-service.stdout"),
+        serde_json::to_vec(&service)?,
+    )?;
+    let mut children = ready_node_pids(&data)?;
+    children.push(u32::try_from(
+        service["pid"].as_u64().context("service PID")?,
+    )?);
+    let _owned_children = OwnedChildren::new(&children);
+    failed_and_reaped(&mut demo, &children).await?;
+    for field in ["http", "grpc"] {
+        let endpoint: SocketAddr = service[field]
+            .as_str()
+            .context("service listener")?
+            .parse()?;
+        let connected = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(endpoint),
+        )
+        .await;
+        anyhow::ensure!(
+            matches!(connected, Ok(Err(_))),
+            "announcement failure left public listener open"
+        );
+    }
+    anyhow::ensure!(data.is_dir(), "output fault removed diagnostic data");
+    rejected_existing(binary, &data, logs, "announcement-failure-existing").await?;
+    Ok(())
+}
+
+// Two real launchers released from an input barrier, not an exhaustive scheduler
+// or an assertion about which contender must win the filesystem create operation.
+async fn concurrent_directory_claim(binary: &Path, logs: &Path) -> anyhow::Result<()> {
+    let data = logs.join("concurrent-data");
+    let outputs = [logs.join("claim-0.stdout"), logs.join("claim-1.stdout")];
+    let errors = [logs.join("claim-0.stderr"), logs.join("claim-1.stderr")];
+    let markers = [logs.join("claim-0.ready"), logs.join("claim-1.ready")];
+    let mut demos = Vec::new();
+    for index in 0..2 {
+        // The wrapper writes its own PID before waiting. exec preserves that PID
+        // and introduces no replacement service or alternate product bootstrap.
+        demos.push(Demo {
+            child: Command::new("/bin/sh")
+                .args(["-c", "printf '%s\\n' \"$$\" > \"$1\"; shift; read -r release; test \"$release\" = start || exit 90; exec \"$@\"", "claim-barrier"])
+                .arg(&markers[index])
+                .arg(binary)
+                .arg("--data-dir").arg(&data)
+                .arg("--service-bin").arg(env!("CARGO_BIN_EXE_graph-service"))
+                .args(["--http", "127.0.0.1:0", "--grpc", "127.0.0.1:0", "--allow-insecure-development"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(fs::File::create(&outputs[index])?))
+                .stderr(Stdio::from(fs::File::create(&errors[index])?))
+                .spawn()?,
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut waiting = 0;
+            for index in 0..2 {
+                anyhow::ensure!(
+                    demos[index].child.try_wait()?.is_none(),
+                    "claim wrapper exited"
+                );
+                if fs::read_to_string(&markers[index]).ok().as_deref()
+                    == Some(format!("{}\n", demos[index].child.id()).as_str())
+                {
+                    waiting += 1;
+                }
+            }
+            if waiting == 2 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("claim wrappers must reach input barrier")??;
+    anyhow::ensure!(!data.exists(), "launcher ran before release");
+    for demo in &mut demos {
+        demo.child
+            .stdin
+            .take()
+            .context("claim barrier input")?
+            .write_all(b"start\n")?;
+    }
+    let loser = tokio::time::timeout(BUDGET, async {
+        loop {
+            for (index, demo) in demos.iter_mut().enumerate() {
+                if let Some(status) = demo.child.try_wait()? {
+                    anyhow::ensure!(
+                        !status.success(),
+                        "contender exited successfully before shutdown"
+                    );
+                    return Ok::<_, anyhow::Error>(index);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("one directory claimant must reject")??;
+    anyhow::ensure!(
+        fs::read(&outputs[loser])?.is_empty(),
+        "loser announced serving"
+    );
+    anyhow::ensure!(
+        fs::read_to_string(&errors[loser])?.contains("data directory must not exist"),
+        "loser failed for a reason other than exclusive directory ownership"
+    );
+    let winner = 1 - loser;
+    let ready = await_ready(&mut demos[winner], &outputs[winner], &errors[winner]).await?;
+    anyhow::ensure!(ready.node_pids.len() == 3, "winner must own three nodes");
+    let children: Vec<_> = ready
+        .node_pids
+        .into_iter()
+        .chain([ready.service_pid])
+        .collect();
+    let _owned_children = OwnedChildren::new(&children);
+    let sentinel = data.join("claim-sentinel");
+    fs::write(&sentinel, b"winner data")?;
+    write_http(ready.http).await?;
+    anyhow::ensure!(
+        query_vertex(ready.grpc).await? > 0,
+        "winner write not visible"
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(demos[winner].child.id() as i32).context("winner PID")?,
+        rustix::process::Signal::INT,
+    )?;
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Some(status) = demos[winner].child.try_wait()? {
+                anyhow::ensure!(status.success(), "winner shutdown failed");
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("winner shutdown deadline")??;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while children
+            .iter()
+            .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("winner left child alive or unreaped")?;
+    assert_eq!(fs::read(&sentinel)?, b"winner data");
+    rejected_existing(binary, &data, logs, "claim-existing").await?;
+    assert_eq!(fs::read(&sentinel)?, b"winner data");
     Ok(())
 }

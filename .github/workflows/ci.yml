@@ -23,6 +23,37 @@ env:
   CARGO_BUILD_JOBS: "2"
 
 jobs:
+  macos:
+    name: macOS compile and offline restore
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Configure system libclang
+        run: |
+          libclang_path="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          if [ ! -f "$libclang_path/libclang.dylib" ]; then
+            libclang_path="$(xcode-select -p)/usr/lib"
+          fi
+          test -f "$libclang_path/libclang.dylib"
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$libclang_path" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: macos-offline-restore-v1
+      - name: Compile ordinary test targets
+        run: cargo test --locked --no-run
+      - name: Check offline restore inputs and guards
+        run: |
+          cargo test --locked -p d2-raft --lib physical_checkpoint
+          cargo test --locked -p d2-raft --test physical_checkpoint
+          cargo test --locked -p d2-raft --test physical_checkpoint_s3
+      - name: Check all targets with Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -106,6 +137,9 @@ jobs:
           VELAGRAPH_REMOTE_DIAGNOSTICS: "1"
           VELAGRAPH_REMOTE_EVIDENCE_DIR: ${{ github.workspace }}/remote-process-evidence
         run: cargo test --locked
+
+      - name: Verify explicit trusted-network HTTP listener
+        run: cargo test --locked -p replicated-graph --test http_job_process http_jobs_explicit_trusted_network_independent_process -- --ignored --exact
 
       - name: Retain ordinary remote process evidence
         if: always()

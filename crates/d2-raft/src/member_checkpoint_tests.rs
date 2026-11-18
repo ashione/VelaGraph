@@ -2187,6 +2187,9 @@ async fn member_apply_tail_fusion_discards_partially_invalid_page() {
 #[path = "member_projection_tests.rs"]
 mod projection_tests;
 
+#[path = "compact_member_prefix_tests.rs"]
+mod compact_prefix_tests;
+
 /// Explicit legacy full-evidence APIs still replay, but must not replay the
 /// same durable history twice while holding one unchanged state publication lock.
 #[tokio::test]

@@ -1,0 +1,40 @@
+name: Source package structure
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: source-package-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source-package:
+    name: Source archive structure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Validate checker and exact source archive
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p package-evidence
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD > package-evidence/source-commit.txt
+          git rev-parse HEAD^{tree} > package-evidence/source-tree.txt
+          python3 -m unittest discover -s scripts -p 'test_check_source_archive.py'
+          git archive --format=tar HEAD > "$RUNNER_TEMP/velagraph-source.tar"
+          python3 scripts/check_source_archive.py "$RUNNER_TEMP/velagraph-source.tar" > package-evidence/report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: package-evidence/
+          if-no-files-found: error
+          retention-days: 7

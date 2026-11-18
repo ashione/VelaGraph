@@ -800,6 +800,39 @@ fn verify_active_inner<'db, 'cut>(
     cut: &'cut PublishedArchiveCut,
     retain_member_tail: bool,
 ) -> Result<(VerifiedArchive<'db, 'cut>, Vec<Transaction>), D1Error> {
+    verify_active_observed(db, cut, retain_member_tail, |_| {})
+}
+
+/// Build response records during the same complete active-member verification.
+/// A private published cut, not the collected output, authorizes the result.
+pub(super) fn verify_member_prefix(
+    db: &DB,
+    cut: &PublishedArchiveCut,
+    version: u64,
+) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+    if cut.descriptor.domain.role != Role::Member {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    if version > cut.terminal_through {
+        return Err(D1Error::VisibilityNotApplied);
+    }
+    let mut collector = crate::terminal_prefix::collector::Collector::new(
+        cut.descriptor.domain.authority.mode,
+        cut.descriptor.domain.cohort.clone(),
+        version,
+    );
+    verify_active_observed(db, cut, false, |tx| collector.observe(tx))?;
+    collector
+        .finish()
+        .map_err(|_| D1Error::DecisionIndexHistory)
+}
+
+fn verify_active_observed<'db, 'cut>(
+    db: &'db DB,
+    cut: &'cut PublishedArchiveCut,
+    retain_member_tail: bool,
+    mut observe_terminal: impl FnMut(&Transaction),
+) -> Result<(VerifiedArchive<'db, 'cut>, Vec<Transaction>), D1Error> {
     let snapshot = cut.snapshot(db)?;
     let mut terminal_tail = Vec::new();
     cut.checkpoint
@@ -851,6 +884,7 @@ fn verify_active_inner<'db, 'cut>(
                     failed_decision = Some(error);
                     anyhow::anyhow!("derived decision verification failed")
                 })?;
+                observe_terminal(&tx);
                 if tail_after < tx.ordinal && tx.ordinal <= cut.terminal_through {
                     // Never change existing error precedence or retain more
                     // than one partial segment on a malformed projection.

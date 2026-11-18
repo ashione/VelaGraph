@@ -2585,7 +2585,8 @@ async fn reusable_gateway_client_cold_cancel_allows_later_explicit_request() {
     let fixture = Fixture::new().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let client = GatewayClient::new(address, bound());
+    let mut client = GatewayClient::new(address, bound());
+    let initializing = client.pause_first_connect();
     let pending_client = client.clone();
     let pending = tokio::spawn(async move {
         pending_client
@@ -2596,8 +2597,13 @@ async fn reusable_gateway_client_cold_cancel_allows_later_explicit_request() {
         .await
         .unwrap()
         .unwrap();
-    // An accepted socket proves initialization is underway; no elapsed-time
-    // guess is needed to abort the caller before any application reply.
+    // TCP accept alone cannot distinguish initialization from an already
+    // queued HTTP/2 body: the client handshake need not await server SETTINGS.
+    // This barrier holds the real connector before it returns the socket, so
+    // cancellation here must drop the only admission owner immediately.
+    tokio::time::timeout(Duration::from_secs(2), initializing.notified())
+        .await
+        .unwrap();
     pending.abort();
     assert!(pending.await.unwrap_err().is_cancelled());
     assert_eq!(CLIENT_ADMISSION.available_permits(), MAX_CONNECTIONS);
@@ -2895,7 +2901,13 @@ async fn reusable_gateway_client_close_reclaims_permits_without_peer_quota_recov
         .await
         .unwrap()
         .unwrap();
-    for id in 202..202 + MAX_CONNECTIONS as u8 - 1 {
+    // Unknown also covers expiry before a body reaches the transport. Fill
+    // admission using bounded, distinct explicit calls, not a presumed count
+    // of retained bodies. The peer never frees its occupied stream quota.
+    for id in 1..=100 {
+        if CLIENT_ADMISSION.available_permits() == 0 {
+            break;
+        }
         assert_eq!(
             client
                 .request(

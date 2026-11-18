@@ -15,6 +15,11 @@ sha2 = "=0.10.9"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
 
+# Existing locked transport, direct only to disable redirects/proxies in the CLI.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2"] }
+
 [dev-dependencies]
 tempfile = "3"
 async-trait = "=0.1.92"
+# Deterministic virtual-time deadline contracts; same existing locked Tokio.
+tokio = { version = "1", features = ["test-util", "sync"] }

@@ -330,6 +330,8 @@ pub struct StateMachine {
     complete_history_loads: AtomicU64,
     #[cfg(test)]
     history_status_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
+    #[cfg(test)]
+    terminal_read_gate: std::sync::Mutex<Option<ApplyPublishGate>>,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     storage: Option<Arc<StateMachineStorage>>,
     #[cfg(test)]
@@ -538,6 +540,8 @@ impl StateMachine {
             complete_history_loads: AtomicU64::new(0),
             #[cfg(test)]
             history_status_gate: Default::default(),
+            #[cfg(test)]
+            terminal_read_gate: Default::default(),
             current_snapshot: RwLock::new(current_snapshot),
             storage: Some(storage),
             #[cfg(test)]
@@ -854,7 +858,12 @@ impl StateMachine {
         if state.baseline_sequence != 0 {
             return Err(D1Error::VisibilityHistory);
         }
-        let retained = self.decision_prefix(published, d1, expected.version())?;
+        let retained = if state.journal.active().is_some() {
+            blocking_section(|| self.verified_member_prefix(published, expected.version()))?
+                .ok_or(D1Error::EventLedgerHistory)?
+        } else {
+            self.decision_prefix(published, d1, expected.version())?
+        };
         if &retained != expected {
             return Err(D1Error::VisibilityHistory);
         }
@@ -1314,6 +1323,13 @@ impl StateMachine {
             return Err(D1Error::ManagedModeConflict);
         }
         let retained = self.certified_decision_prefix(&state, d1, expected)?;
+        #[cfg(test)]
+        if let Some(gate) = self.terminal_read_gate.lock().unwrap().take() {
+            blocking_section(|| {
+                let _ = gate.entered.send(());
+                let _ = gate.release.recv();
+            });
+        }
         Ok((d1.read_at(expected.version(), limit)?, retained))
     }
 

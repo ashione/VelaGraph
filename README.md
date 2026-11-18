@@ -10,7 +10,7 @@ specialized for one dataset.
 > **Experimental, not production-ready.** Several APIs deliberately have different
 > consistency and capacity contracts. Choose the path below before building on it.
 > Network services are unauthenticated plaintext development endpoints; the public
-> HTTP/gRPC preview is loopback-only, not production-ready.
+> HTTP/gRPC preview defaults to loopback; HTTP has an explicit trusted-network opt-in. Neither is production-ready.
 
 [Quick start](#quick-start) · [Capabilities](#choose-your-graph-path) ·
 [Architecture](#architecture) · [Roadmap](docs/ROADMAP.md) ·
@@ -86,7 +86,7 @@ HA, and these unauthenticated listeners must stay on loopback.
 
 ### Serve an already activated managed cohort
 
-The [graph-service guide](docs/PUBLIC_SERVICE_CLI.md) documents the loopback
+The [graph-service guide](docs/PUBLIC_SERVICE_CLI.md) documents the default-loopback
 HTTP/gRPC preview, configuration and exact launch command. It requires existing
 activated managed nodes and their gRPC endpoints; it is not a one-command cluster
 bootstrap or restore workflow. HTTP `/preview1` is not the final protobuf JSON
@@ -198,6 +198,8 @@ HTTP feature parity, upgrade compatibility or production-readiness gates in
 
 Local RocksDB/Raft remains the durable authority. The object-store library can
 upload/download immutable physical checkpoints and validates content hashes;
+the [read-only verification CLI](docs/OBJECT_STORE_CHECKPOINT_API.md#operator-verification-command)
+checks a retained receipt without staging a local backup.
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
 not object-store-authoritative storage, remote-durable write acknowledgement or
 live-cluster recovery. Physical restoration is guarded for offline use. See the

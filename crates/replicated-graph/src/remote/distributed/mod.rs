@@ -15,6 +15,7 @@ mod fixed_parallel;
 mod typed_test_peer;
 use adjacency::Direction;
 pub mod consistency;
+mod fragment_trace;
 pub mod grpc;
 mod hierarchy;
 pub mod jobs;
@@ -325,7 +326,10 @@ pub(super) struct FragmentOutput {
 }
 
 fn check(end: Instant) -> Result<(), QueryFailure> {
-    if Instant::now() >= end {
+    check_at(end, Instant::now())
+}
+fn check_at(end: Instant, now: Instant) -> Result<(), QueryFailure> {
+    if now >= end {
         Err(QueryFailure::Timeout)
     } else {
         Ok(())
@@ -506,7 +510,7 @@ impl Execution<'_> {
             ..request
         };
         let reply = observed_client(self.grpc_clients, &route, self.end)?
-            .fragment(request, self.end.saturating_duration_since(Instant::now()))
+            .fragment_observed(request, self.end.saturating_duration_since(Instant::now()))
             .await
             .map(Reply::QueryFragment)
             .map_err(remote_failure)?;
@@ -1581,5 +1585,29 @@ mod tests {
             value: Value::Null,
         }];
         assert!(validate_output(&output, &request("g.V(1).values('a')")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lease_deadline_contract_tests {
+    use super::*;
+    #[test]
+    fn lease_deadline_contract_preserves_query_deadline_and_error_layers() {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(5);
+        assert_eq!(check_at(end, start + Duration::from_secs(4)), Ok(()));
+        assert_eq!(check_at(end, end), Err(QueryFailure::Timeout));
+        assert_eq!(
+            remote_failure(RemoteError::SessionUnavailable),
+            QueryFailure::Unavailable
+        );
+        assert_eq!(
+            remote_failure(RemoteError::ResourceExhausted),
+            QueryFailure::ResourceExhausted
+        );
+        assert_eq!(
+            remote_failure(RemoteError::Timeout { request_id: None }),
+            QueryFailure::Timeout
+        );
     }
 }

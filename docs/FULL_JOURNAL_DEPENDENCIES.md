@@ -32,10 +32,12 @@ active branch executes it. Conversely, successful active-path tests do not prove
 that cold open or compatibility operations are bounded.
 
 `participant_terminal_prefix` and `certified_terminal_read` return compact
-terminal proofs, but call `certified_decision_prefix` → `decision_prefix`, which
-still materializes full history for active members. A compact wire response is
-not evidence of bounded local hydration. Existing full-Journal-forbidden tests
-guard only the particular active operations they exercise, not these APIs.
+terminal proofs. Their active-member branch now uses
+`certified_decision_prefix` → `verified_member_prefix`, validating the anchored
+archive without constructing a complete Journal. The legacy/in-memory branch
+still uses `decision_prefix`. This active-path improvement does not remove the
+explicit full-evidence APIs or cold-open/snapshot materialization listed above;
+no constant-work or bounded cold-recovery claim follows from compact proofs.
 
 ## Narrow reduction: reuse within one explicit evidence operation
 

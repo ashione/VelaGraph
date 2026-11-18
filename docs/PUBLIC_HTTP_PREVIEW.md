@@ -13,9 +13,10 @@ startup packaging remain work under [#218](https://github.com/ashione/VelaGraph/
 After constructing an existing validated live `managed_gateway::Gateway`, call
 `gateway.bind_http("127.0.0.1:0".parse()?, deadline).await`. Use its `local_addr()`
 and keep both gateway and returned `HttpService` alive. Call `shutdown().await`
-for orderly cleanup. Dropping either server signals shutdown. Any non-loopback
-bind is rejected; there is no implicit public bind, TLS, authentication or
-production exposure. Loopback alone is not an authentication or browser-attack
+for orderly cleanup. Dropping either server signals shutdown. The default `bind_http` rejects non-loopback addresses. The explicit
+`bind_http_trusted_network` API and CLI `--allow-insecure-network` opt-in accept
+a caller-selected HTTP address; there is still no implicit public bind, TLS or
+authentication. Use only a trusted network or authenticated TLS reverse proxy. Loopback alone is not an authentication or browser-attack
 boundary; do not expose this preview to untrusted local clients. Host/Origin
 policy and credentials belong to the later hardened service entry. Restored/offline nodes cannot bypass their existing startup
 guards through this adapter. No public restore or readiness override is added.
@@ -60,6 +61,11 @@ layer. No stable v1 client compatibility is promised here.
 | `/preview1/queries:open` | read selector, ttl_millis, query, page_size |
 | `/preview1/queries:fetch` | session, identical query, cursor, identical page_size |
 | `/preview1/queries:close` | session |
+| `/preview1/jobs:start` | operation_id, read, query, page_size, policy |
+| `/preview1/jobs:get` | job |
+| `/preview1/jobs:renew` | job, expected_generation |
+| `/preview1/jobs:fetch` | job, identical query, cursor, identical page_size |
+| `/preview1/jobs:cancel` | job |
 
 Example vertex write body:
 
@@ -73,6 +79,9 @@ Mutation tags cover the existing managed `create_vertex`, `create_edge`,
 vertex deletion, temporal editing or Gremlin update scripts. Missing property
 and `{"type":"null"}` are distinct. Integer values are strings, Real values
 are finite JSON numbers, Text and Boolean have their corresponding JSON types.
+The [Real precision correction and upgrade boundary](HTTP_REAL_PRECISION.md)
+explains non-transparent parser changes, original-ID compatibility and retained
+stored bits; identical old decimal text is not always the same recovery command.
 
 Example query body for a gateway configured with data-local graph routes:
 
@@ -140,3 +149,82 @@ the exact submitted commit rather than inferred from this document.
 `GET /preview1/service` remains static liveness. A successful capture observation
 is not general service/restore readiness or an inexpensive load-balancer check;
 see the linked contract for profile limits, cost and cleanup behavior.
+
+
+## Managed asynchronous jobs
+
+The five `/preview1/jobs:*` actions reuse the same managed jobs as public gRPC;
+they are not a second executor. This closes the preview job lifecycle only.
+FixedSession HTTP parity and a stable HTTP v1 schema remain unfinished under
+[#218](https://github.com/ashione/VelaGraph/issues/218).
+
+Start example:
+
+```json
+{"operation_id":"01010101010101010101010101010101","read":{"type":"latest"},"query":{"partition":7,"text":"g.V(1,2)"},"page_size":1,"policy":{"idle_millis":10000,"execution_millis":10000,"lifetime_millis":30000}}
+```
+
+`read` accepts latest or exact (including exact `"0"`); minimum-version job
+admission is unsupported and returns `query_unsupported`, never downgraded to
+latest. Durations have the existing job-policy limits. Start returns
+`type=job_started`, the original operation_id and `job={incarnation,token}`
+(lowercase hex, 16/32 bytes). Accepted is not Ready and contains no rows.
+Exact repeated Start reuses the existing job; changed arguments with the same
+operation ID conflict. A lost HTTP response does not cancel an admitted job;
+recover with the same operation ID and exact arguments, never generate a new ID
+as an automatic retry. Jobs remain process-local and restart invalidates them.
+
+Get/Cancel take `{"job":{...}}` and return `job_status`/`job_cancelled` with
+`status={phase,version,total,failure}`. Phases are `capturing`, `running`,
+`sealing`, `ready`, `cancelled`, `expired`, `failed`. Version is a decimal string
+or null, total is an integer or null, and failure is null or `{"code":...}`
+using the same error table as request errors. No intermediate rows are exposed.
+Malformed HTTP hex is invalid_argument (400), while the protobuf bytes codec may
+classify malformed lengths as identity mismatch; valid-but-wrong identities
+retain the shared domain errors. Representation validation is not a promise of
+one-to-one transport status codes.
+
+Renew takes `job` and decimal-string `expected_generation`. Its `job_renewed`
+reply includes `grant={generation,remaining_millis}`; generation is a decimal
+string. Anchor remaining milliseconds at the request's send time. An exact
+renewal replay does not extend expiry. Renewal does not extend the execution or
+hard lifetime, and polling/fetching does not renew the lease.
+
+Fetch takes `job`, the identical query/page_size, and optional lowercase-hex
+cursor (null for the first page). `job_page` echoes these fields and returns
+one fixed decimal-string `version` and the existing typed `page`. HTTP and gRPC
+handles/cursors are interchangeable only at the same owning gateway. Fetch
+before Ready returns `job_busy`; cancelled/expired/restarted handles cannot
+silently obtain a new V. Cancel uses the existing idempotent cancellation rules.
+
+Every immutable page is checked against both protobuf and HTTP JSON output
+limits before Ready, including JSON escaping expansion. A result too large for
+one public representation fails with resource exhaustion rather than becoming
+Ready with undeliverable later pages. The existing retained reservation remains
+owned through HTTP encode and socket delivery. Job methods cap the remaining
+request budget at five seconds, independently of the job execution/lease budget;
+there is no fresh per-phase timeout. All shared admission and recovery restrictions remain in force; external HTTP
+requires the separate explicit trusted-network listener opt-in.
+
+## External HTTP access boundary
+
+The CLI requires both `--allow-insecure-development` and
+`--allow-insecure-network` plus an explicit `--http ADDRESS:PORT` to accept
+non-loopback HTTP. No default wildcard, firewall changes, reverse-proxy deployment,
+TLS or authentication are supplied. Internal routes and the gRPC listener remain
+loopback-only. HTTP authorization must be supplied by the trusted deployment
+boundary; do not expose this plaintext mutation/query API directly to the Internet.
+
+`http_jobs_explicit_trusted_network_independent_process` exercises the whole job
+lifecycle over an actual non-loopback host interface with separate node/service
+processes. It is same-host networking evidence, not a public-Internet or
+multi-host/TLS/security acceptance test. An environment without a routed
+non-loopback interface fails the test explicitly instead of silently substituting
+loopback. It is ignored in the default offline test suite and run explicitly by
+the CI network acceptance step:
+
+```sh
+cargo test --locked -p replicated-graph --test http_job_process http_jobs_explicit_trusted_network_independent_process -- --ignored --exact
+```
+
+Test execution status must be read from exact-source evidence.
