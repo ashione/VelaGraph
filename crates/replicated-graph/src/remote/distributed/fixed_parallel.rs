@@ -1044,6 +1044,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parallel_admission_matches_independent_wide_arithmetic() {
+        // Exercise both dimensions independently, including exact admission,
+        // one-over and native-word overflow. The oracle cannot wrap usize.
+        let values = [0, 1, 2, usize::MAX / 2, usize::MAX - 1, usize::MAX];
+        for used_bytes in values {
+            for extra_bytes in values {
+                for remaining_bytes in values {
+                    for used_work in values {
+                        for extra_work in values {
+                            for remaining_work in values {
+                                let used = Cost {
+                                    bytes: used_bytes,
+                                    work: used_work,
+                                };
+                                let extra = Cost {
+                                    bytes: extra_bytes,
+                                    work: extra_work,
+                                };
+                                let remaining = Cost {
+                                    bytes: remaining_bytes,
+                                    work: remaining_work,
+                                };
+                                let expected = (used_bytes as u128 + extra_bytes as u128)
+                                    <= remaining_bytes as u128
+                                    && (used_work as u128 + extra_work as u128)
+                                        <= remaining_work as u128;
+                                assert_eq!(fits(used, extra, remaining), expected,
+                                    "bytes=({used_bytes},{extra_bytes},{remaining_bytes}) work=({used_work},{extra_work},{remaining_work})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn overflow_is_not_a_smaller_parallel_grant() {
         // These fake peers still use the process-wide bounded RPC client.
