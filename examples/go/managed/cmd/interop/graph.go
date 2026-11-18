@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -25,6 +26,46 @@ func verifyCount(res *pb.GraphExecuteResponse, want uint64) {
 	check(len(rows) == 1, "count shape: %v", rows)
 	count, ok := rows[0].Kind.(*pb.Row_Count)
 	check(ok && count.Count == want, "got %v, want count %d", rows[0], want)
+}
+
+// Check what the v1 server receives when a newer client encodes an additional
+// oneof member. If the step were skipped, the shortened query would return 1.
+func (c *client) graphProtocolChecks(rpc pb.GraphServiceClient, partition uint32, first, version uint64) {
+	req := &pb.GraphExecuteRequest{
+		Context:   c.envelope(),
+		Read:      &pb.ReadSelector{Kind: &pb.ReadSelector_Exact{Exact: version}},
+		Traversal: &pb.GraphTraversal{Version: 1, Partition: partition, VertexIds: []uint64{first}},
+	}
+	out := &pb.GraphStep{Kind: &pb.GraphStep_Out{Out: &pb.GraphHop{}}}
+	count := &pb.GraphStep{Kind: &pb.GraphStep_Count{Count: &pb.Empty{}}}
+	req.Traversal.Steps = []*pb.GraphStep{out, count}
+	res, err := rpc.Execute(c.ctx, req)
+	check(err == nil, "protocol control query: %v", err)
+	verifyCount(res, 1)
+
+	// Field 5 is an unrecognized length-delimited operation in GraphStep v1.
+	future := &pb.GraphStep{}
+	tag := protowire.AppendTag(nil, 5, protowire.BytesType)
+	future.ProtoReflect().SetUnknown(protowire.AppendBytes(tag, nil))
+	reject := func(name string) {
+		res, err := rpc.Execute(c.ctx, req)
+		check(status.Code(err) == codes.InvalidArgument && res == nil, "%s: got result %v, error %v", name, res, err)
+	}
+	for _, tc := range []struct {
+		name string
+		step *pb.GraphStep
+	}{{"unknown step", future}, {"empty step", &pb.GraphStep{}}} {
+		req.Context = c.envelope()
+		req.Traversal.Steps = []*pb.GraphStep{out, tc.step, count}
+		reject(tc.name)
+	}
+
+	// GraphStep uses a oneof. Exercise an actual enum on the same request.
+	req.Traversal.Steps = []*pb.GraphStep{out, count}
+	req.Context = c.envelope()
+	req.Context.Identity.Binding = proto.Clone(c.binding).(*pb.Binding)
+	req.Context.Identity.Binding.CapacityProfile = pb.CapacityProfile(99)
+	reject("unknown capacity profile")
 }
 
 func (c *client) graphChecks(conn grpc.ClientConnInterface, partition uint32, first uint64) {
@@ -63,6 +104,7 @@ func (c *client) graphChecks(conn grpc.ClientConnInterface, partition uint32, fi
 		return client.V(partition, first, first).Out("reports")
 	}
 	oneEdge := execute(c, base(g).Path())
+	c.graphProtocolChecks(pb.NewGraphServiceClient(conn), partition, first, oneEdge.Version)
 	check(len(oneEdge.Data.Rows) == 2, "duplicate starts must yield two paths: %v", oneEdge)
 	for _, row := range oneEdge.Data.Rows {
 		path := row.GetPath().GetElements()

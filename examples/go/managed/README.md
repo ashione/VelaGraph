@@ -32,7 +32,10 @@ CI regenerates bindings before building and runs the Rust fixture with
 The real-process fixture creates two parallel cross-shard edges and compares
 the results before and after the second write. A 128-walk input returns
 100 element rows or a count of 128, and an oversized raw protobuf request
-fails at the gateway. Set `VELAGRAPH_GRAPH_BENCH=1`
+fails at the gateway. The fixture also sends a future oneof step and an empty
+step between a valid hop and count. Both requests and a request with an unknown
+capacity-profile enum must return INVALID_ARGUMENT with no result. The same
+fixed-version query with only the recognized steps must return one. Set `VELAGRAPH_GRAPH_BENCH=1`
 on the Rust interoperability test to also time 40 paired requests per API.
 It uses four warmup pairs, then alternates GraphService.Execute with QueryService.Open at the same exact V
 on the same warm channel and prints p50/p95. Text Close is timed separately.
