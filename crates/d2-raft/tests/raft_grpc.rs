@@ -184,7 +184,9 @@ async fn large_indivisible_legacy_batch_is_received_and_applied() -> anyhow::Res
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_http2_window_cannot_hold_raft_admission() -> anyhow::Result<()> {
+    use anyhow::Context;
     use prost::Message;
+    let started = std::time::Instant::now();
     use tonic::codegen::http;
     let dir = tempfile::tempdir()?;
     let node = node(2, dir.path()).await?;
@@ -192,7 +194,13 @@ async fn zero_http2_window_cannot_hold_raft_admission() -> anyhow::Result<()> {
     let (mut sender, connection) = h2::client::Builder::new()
         .initial_window_size(0)
         .handshake::<_, prost::bytes::Bytes>(socket)
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "phase=handshake elapsed_us={}",
+                started.elapsed().as_micros()
+            )
+        })?;
     let driver = tokio::spawn(connection);
     let message = wire::VoteRequest {
         version: 1,
@@ -209,7 +217,7 @@ async fn zero_http2_window_cannot_hold_raft_admission() -> anyhow::Result<()> {
     frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
     frame.extend_from_slice(&message);
     let mut responses = Vec::new();
-    for _ in 0..4 {
+    for index in 0..4 {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!(
@@ -220,13 +228,37 @@ async fn zero_http2_window_cannot_hold_raft_admission() -> anyhow::Result<()> {
             .header("te", "trailers")
             .header("grpc-timeout", "200m")
             .body(())?;
-        let (response, mut body) = sender.send_request(request, false)?;
-        body.send_data(frame.clone().into(), true)?;
+        let (response, mut body) = sender.send_request(request, false).with_context(|| {
+            format!(
+                "phase=send_request index={index} elapsed_us={}",
+                started.elapsed().as_micros()
+            )
+        })?;
+        body.send_data(frame.clone().into(), true)
+            .with_context(|| {
+                format!(
+                    "phase=send_data index={index} elapsed_us={}",
+                    started.elapsed().as_micros()
+                )
+            })?;
         responses.push(response);
     }
     let mut held = Vec::new();
-    for r in responses {
-        let r = timeout(Duration::from_secs(1), r).await??;
+    for (index, r) in responses.into_iter().enumerate() {
+        let r = timeout(Duration::from_secs(1), r)
+            .await
+            .with_context(|| {
+                format!(
+                    "phase=response_timeout index={index} elapsed_us={}",
+                    started.elapsed().as_micros()
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "phase=response_h2 index={index} elapsed_us={}",
+                    started.elapsed().as_micros()
+                )
+            })?;
         assert!(r.headers().get("grpc-status").is_none());
         assert!(!r.body().is_end_stream());
         held.push(r);
