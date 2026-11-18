@@ -6,14 +6,15 @@ import (
 	"slices"
 	"time"
 
-	pb "example.com/velagraph/managed/gen/managedv1"
-	"example.com/velagraph/managed/graph"
+	"github.com/ashione/VelaGraph/sdk/go"
+	pb "github.com/ashione/VelaGraph/sdk/go/gen/managedv1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
-func execute(c *client, q graph.Traversal) *pb.GraphExecuteResponse {
+func execute(c *client, q velagraph.Traversal) *pb.GraphExecuteResponse {
 	res, err := q.Execute(c.ctx)
 	check(err == nil, "graph Execute: %v", err)
 	return res
@@ -26,11 +27,12 @@ func verifyCount(res *pb.GraphExecuteResponse, want uint64) {
 	check(ok && count.Count == want, "got %v, want count %d", rows[0], want)
 }
 
-func (c *client) graphChecks(rpc pb.GraphServiceClient, partition uint32, first uint64) {
-	g := graph.New(rpc, c.binding)
+func (c *client) graphChecks(conn grpc.ClientConnInterface, partition uint32, first uint64) {
+	g, err := velagraph.NewClient(conn, c.binding)
+	check(err == nil, "graph client: %v", err)
 	// Send an oversized plan directly to test gateway admission independently of the SDK.
 	req := &pb.GraphExecuteRequest{Context: c.envelope(), Read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}, Traversal: &pb.GraphTraversal{Version: 1, Partition: partition, VertexIds: make([]uint64, 33)}}
-	_, err := rpc.Execute(c.ctx, req)
+	_, err = pb.NewGraphServiceClient(conn).Execute(c.ctx, req)
 	check(status.Code(err) == codes.ResourceExhausted, "oversized typed plan admitted or wrong status: %v", err)
 
 	ids := []uint64{first + 1, first, first + 1}
@@ -57,7 +59,9 @@ func (c *client) graphChecks(rpc pb.GraphServiceClient, partition uint32, first 
 		c.commit("GoEdge01", id, &pb.Mutation{Kind: &pb.Mutation_CreateEdge{CreateEdge: &pb.CreateEdge{Edge: &pb.Edge{Id: id, From: from, To: to, Label: "reports"}}}})
 	}
 	createEdge(first)
-	base := func(client graph.Client) graph.Traversal { return client.V(partition, first, first).Out("reports") }
+	base := func(client velagraph.Client) velagraph.Traversal {
+		return client.V(partition, first, first).Out("reports")
+	}
 	oneEdge := execute(c, base(g).Path())
 	check(len(oneEdge.Data.Rows) == 2, "duplicate starts must yield two paths: %v", oneEdge)
 	for _, row := range oneEdge.Data.Rows {
@@ -86,7 +90,7 @@ func (c *client) graphChecks(rpc pb.GraphServiceClient, partition uint32, first 
 
 // Benchmark the public calls on the same warmed connection, certified V, graph
 // and ordered bag. Text Open returns a retained page. Measure its Close separately.
-func (c *client) benchmarkGraph(q graph.Traversal, partition uint32, first, version uint64) {
+func (c *client) benchmarkGraph(q velagraph.Traversal, partition uint32, first, version uint64) {
 	text := &pb.Query{Partition: partition, Text: fmt.Sprintf("g.V(%d,%d).out('reports').in('reports').count()", first, first)}
 	read := &pb.ReadSelector{Kind: &pb.ReadSelector_Exact{Exact: version}}
 	typed := func() time.Duration {

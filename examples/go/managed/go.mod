@@ -1,8 +1,11 @@
-module example.com/velagraph/managed
+module github.com/ashione/VelaGraph/examples/go/managed
 
 go 1.23.0
 
+replace github.com/ashione/VelaGraph/sdk/go => ../../../sdk/go
+
 require (
+	github.com/ashione/VelaGraph/sdk/go v0.0.0
 	google.golang.org/grpc v1.70.0
 	google.golang.org/protobuf v1.36.5
 )

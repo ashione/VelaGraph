@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	pb "example.com/velagraph/managed/gen/managedv1"
+	pb "github.com/ashione/VelaGraph/sdk/go/gen/managedv1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -258,7 +258,7 @@ func run() {
 	c.create(uint32(*partition), *first)
 	c.create(uint32(*partition), *first+1)
 	c.pages(uint32(*partition), *first)
-	c.graphChecks(pb.NewGraphServiceClient(conn), uint32(*partition), *first)
+	c.graphChecks(conn, uint32(*partition), *first)
 	fmt.Println("PASS: chainable GraphService.Execute; Go generated typed client; version/query rich errors; public/internal isolation; Submit/Status/confirmed replay; scalar/null/absence; immutable paginated Open/Fetch/Close")
 }
 func main() {

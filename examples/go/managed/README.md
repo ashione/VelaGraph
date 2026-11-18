@@ -1,8 +1,8 @@
 # Go managed API interoperability check
 
-This is a generated-client integration example, not a production SDK or cluster
-bootstrap. The Rust harness starts a fresh real managed cohort and loopback public
-gRPC gateway, then invokes this binary. No mock server is used.
+This module exercises the [VelaGraph Go client SDK](../../../sdk/go/README.md)
+against a fresh managed cohort and loopback Rust gRPC gateway. Its go.mod
+uses the SDK in the same checkout so changes can be tested together.
 
 ## Generate and build
 
@@ -22,35 +22,12 @@ go build -mod=readonly -o interop ./cmd/interop
 
 Bindings come directly from
 `crates/replicated-graph/proto/public_managed.proto`; there is no separately
-maintained Go schema. Generated files live under `gen/managedv1`.
+maintained Go schema. Generated files live in the SDK at `sdk/go/gen/managedv1`.
 Runtime dependencies are pinned in go.mod; go.sum locks their checksums.
 CI regenerates bindings before building and runs the Rust fixture with
 `VELAGRAPH_GO_INTEROP_BIN` set to the absolute binary path.
 
-## Chainable Graph API
-
-The `graph` package builds a traversal on the caller. With the existing gRPC
-connection, cohort binding and Go context, the following code returns qualified
-vertex paths at an exact certified version. Reuse the same connection for
-subsequent requests. Configure it with `grpc.WithDisableRetry()` as in the
-interop example if a single attempt is required.
-
-```go
-g := graph.New(pb.NewGraphServiceClient(conn), binding)
-result, err := g.At(version).V(7, 42, 42).Out("reports").In("reports").Path().Execute(ctx)
-if err != nil {
-    return err
-}
-fmt.Println(result.Version, result.Data.Rows)
-```
-
-Import `example.com/velagraph/managed/graph` and alias the generated
-`example.com/velagraph/managed/gen/managedv1` package as `pb`. Omit `At`
-for latest, or use `AtLeast(version)` for a lower bound. The builder keeps
-both occurrences of 42, performs no I/O until Execute, and can be branched or
-reused. The client generates a version-2 call identity per request and verifies
-the echoed binding/nonce, version selector and completeness on success. See the [wire
-contract](../../../docs/PUBLIC_GRPC_SERVICE.md#graphserviceexecute) for bounds.
+## Chainable Graph API coverage
 
 The real-process fixture creates two parallel cross-shard edges and compares
 the results before and after the second write. A 128-walk input returns

@@ -66,7 +66,7 @@ The experimental unary Graph API submits one ordered traversal and returns
 chain locally and reuse the transport and traversal for subsequent requests.
 Each Execute performs one public RPC. The gateway still contacts the managed
 coordinator and graph shards to certify the version and execute the request.
-See the [Go example and fixture](../examples/go/managed/README.md#chainable-graph-api).
+See the [Go client SDK](../sdk/go/README.md) and the [cross-process fixture](../examples/go/managed/README.md#chainable-graph-api-coverage).
 
 | V1 operation | Contract |
 | --- | --- |

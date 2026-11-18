@@ -1,5 +1,5 @@
-// Package graph builds bounded GraphService traversals for the managed Go example.
-package graph
+// Package velagraph provides the Go client for certified graph traversals on a managed VelaGraph gateway.
+package velagraph
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"slices"
 	"time"
 
-	pb "example.com/velagraph/managed/gen/managedv1"
+	pb "github.com/ashione/VelaGraph/sdk/go/gen/managedv1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -21,13 +21,17 @@ type Client struct {
 	read    *pb.ReadSelector
 }
 
-// New defaults to the latest certified version selected once during Execute.
-func New(rpc pb.GraphServiceClient, binding *pb.Binding) Client {
-	var pinned *pb.Binding
-	if binding != nil {
-		pinned = proto.Clone(binding).(*pb.Binding)
+// NewClient uses a caller-owned gRPC connection and copies the cohort binding.
+// Reads default to the latest certified version selected during Execute.
+func NewClient(conn grpc.ClientConnInterface, binding *pb.Binding) (Client, error) {
+	if conn == nil || binding == nil {
+		return Client{}, errors.New("missing gRPC connection or cohort binding")
 	}
-	return Client{rpc: rpc, binding: pinned, read: &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}}}
+	return Client{
+		rpc:     pb.NewGraphServiceClient(conn),
+		binding: proto.Clone(binding).(*pb.Binding),
+		read:    &pb.ReadSelector{Kind: &pb.ReadSelector_Latest{Latest: &pb.Empty{}}},
+	}, nil
 }
 
 // At selects an exact certified version, including version zero.
