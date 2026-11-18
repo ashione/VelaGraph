@@ -12,8 +12,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: corehr-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only superseded PR runs share a group. A unique full-run group also avoids
+  # GitHub replacing a pending main/manual run, even with cancellation disabled.
+  group: corehr-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -86,7 +88,9 @@ jobs:
             managed-lifecycle-build-results/*.md
 
   lifecycle:
-    name: ${{ github.event_name == 'pull_request' && 'Small recovery release lifecycle' || 'Retained 1025-write release lifecycle' }}
+    # Retain the historical check context for branch-protection compatibility.
+    # The verified acceptance-tier output and summary identify PR short vs full.
+    name: Retained 1025-write release lifecycle
     needs: [lifecycle-build]
     outputs:
       acceptance-tier: ${{ steps.managed_lifecycle.outputs.acceptance-tier }}

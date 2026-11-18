@@ -937,6 +937,7 @@ class HandoffTests(unittest.TestCase):
         builder = text.split('  lifecycle-build:', 1)[1].split('  lifecycle:', 1)[0]
         runtime = text.split('  lifecycle:', 1)[1].split('  scenario:', 1)[0]
         aggregate = text.split('  full-scale:', 1)[1]
+        self.assertIn('    name: Retained 1025-write release lifecycle\n', runtime)
         self.assertIn('needs: [lifecycle-build]', runtime)
         self.assertIn('timeout-minutes: 90', runtime)
         self.assertIn('artifact-id: ${{ steps.upload_handoff.outputs.artifact-id }}', builder)
@@ -965,6 +966,18 @@ class HandoffTests(unittest.TestCase):
         self.assertIn('acceptance-tier: ${{ steps.managed_lifecycle.outputs.acceptance-tier }}', runtime)
         self.assertIn('LIFECYCLE_ACCEPTANCE_TIER: ${{ needs.lifecycle.outputs.acceptance-tier }}', aggregate)
         self.assertNotIn('continue-on-error', text)
+
+    def test_full_validation_runs_cannot_replace_running_or_pending_runs(self):
+        workflow = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()
+        concurrency = workflow.split('\nconcurrency:\n', 1)[1].split('\nenv:', 1)[0]
+        settings = [line.strip() for line in concurrency.splitlines()
+                    if line.strip() and not line.lstrip().startswith('#')]
+        # cancel-in-progress=false alone is insufficient: a shared group can
+        # still replace a pending run. Full runs must have distinct run IDs.
+        self.assertEqual(settings, [
+            "group: corehr-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}",
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+        ])
 
     def test_workflow_runtime_shell_selects_exact_mode_and_rejects_unknown_events(self):
         workflow = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()

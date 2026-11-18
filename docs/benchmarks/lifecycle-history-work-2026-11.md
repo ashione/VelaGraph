@@ -21,9 +21,27 @@ and `full-1025` for main pushes, scheduled and manual events. Missing or mismatc
 tiers, failed/cancelled/skipped jobs and unknown events fail the aggregate gate.
 This removes the full 1025-write run from PR latency, while deliberately moving
 its end-to-end boundary detection to main. It is a test scheduling choice, not
-evidence that the full lifecycle itself runs faster. Hosted verification remains
-required; the lifecycle leaf check has an event-specific display name, while
-the stable aggregate check name is unchanged.
+evidence that the full lifecycle itself runs faster. Both historical check names
+(`Retained 1025-write release lifecycle` and the aggregate above) are retained
+for branch-protection compatibility. The leaf name is a legacy check context;
+the verified tier and job summary, not that name, distinguish PR short recovery
+from full 1025-write acceptance. No protection settings are changed.
+
+Only superseded PR runs share a concurrency group and may be automatically
+cancelled. Main pushes, scheduled and manual runs use a unique run-ID group with
+cancellation disabled. This avoids replacing either running or pending full
+validation runs when another commit arrives; disabling cancellation alone in a
+shared group would still permit pending-run replacement under GitHub's default
+[concurrency behavior](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+More full runs can therefore remain queued or run concurrently during rapid
+pushes, increasing runner usage compared with cancelling older runs.
+
+Full validation remains post-merge by default; a schedule tests its selected tip,
+not every earlier commit. Unique groups remove automatic supersession, not the
+need to check that each relevant full run actually succeeded. For changes to
+retained history, recovery or the acceptance harness, require a successful manual
+full run on the exact reviewed head or merge candidate before merging. PR short
+success and static review alone do not establish that boundary acceptance.
 
 ## Runtime optimization
 
