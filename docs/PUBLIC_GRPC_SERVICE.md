@@ -66,7 +66,7 @@ The experimental unary Graph API submits one ordered traversal and returns
 chain locally and reuse the transport and traversal for subsequent requests.
 Each Execute performs one public RPC. The gateway still contacts the managed
 coordinator and graph shards to certify the version and execute the request.
-See the [Go client SDK](../sdk/go/README.md) and the [cross-process fixture](../examples/go/managed/README.md#chainable-graph-api-coverage).
+See the [Go client SDK](../sdk/go/README.md) and the [cross-process fixture](../sdk/go/internal/interop/README.md#chainable-graph-api-coverage).
 
 | V1 operation | Contract |
 | --- | --- |
@@ -76,6 +76,9 @@ See the [Go client SDK](../sdk/go/README.md) and the [cross-process fixture](../
 | Limits | Element/path results use the executor's default first 100 rows in traversal order. Count sees the entire admitted bag. Resource ceilings or deadlines fail the request. |
 | Snapshot | Select latest certified, exact (including zero), or minimum V. All hops use the selected V. The result carries that V and the existing UNVERIFIED adjacency completeness. |
 | Lifetime | The response holds the entire bounded result. No client session, cursor, page fetch or Close call is required. |
+
+The server accepts packed and unpacked occurrences of `vertex_ids` in wire
+order. The 32-ID limit applies across all occurrences, including duplicates.
 
 V1 uses the default Parity2MiBV1 data-local capture profile. It shares the public
 listener's binding rules and trusted-loopback security boundary. The server

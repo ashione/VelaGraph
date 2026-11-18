@@ -61,9 +61,11 @@ The managed gateway preview uses plaintext on trusted loopback endpoints.
 - The SDK sets a five-second timeout, shortened by the caller's deadline.
   Server and transport errors propagate through `Execute`. Successful results
   are checked against the call identity, version selector and completeness.
+  For `Count()`, the SDK also requires exactly one count row, including when
+  the count is zero.
 
 See the [RPC contract](../../docs/PUBLIC_GRPC_SERVICE.md#graphserviceexecute)
-for server limits and the [interoperability fixture](../../examples/go/managed/README.md)
+for server limits and the [interoperability fixture](internal/interop/README.md)
 for end-to-end coverage and benchmarks.
 
 ## Development

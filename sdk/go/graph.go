@@ -153,6 +153,15 @@ func (q Traversal) Execute(ctx context.Context) (*pb.GraphExecuteResponse, error
 	if !proto.Equal(result.GetIdentity(), identity) || result.GetData() == nil || result.Data.Completeness != pb.Completeness_UNVERIFIED {
 		return nil, errors.New("invalid graph response identity or query data")
 	}
+	if len(q.steps) > 0 && q.steps[len(q.steps)-1].GetCount() != nil {
+		rows := result.Data.Rows
+		if len(rows) != 1 {
+			return nil, errors.New("count response must contain exactly one row")
+		}
+		if count, ok := rows[0].GetKind().(*pb.Row_Count); !ok || count == nil {
+			return nil, errors.New("count response has an invalid row type")
+		}
+	}
 	switch read := req.Read.Kind.(type) {
 	case *pb.ReadSelector_Exact:
 		if result.Version != read.Exact {

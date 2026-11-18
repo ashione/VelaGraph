@@ -45,6 +45,21 @@ func (c *client) graphProtocolChecks(rpc pb.GraphServiceClient, partition uint32
 	check(err == nil, "protocol control query: %v", err)
 	verifyCount(res, 1)
 
+	// The generated binding emits expanded IDs. Append a packed segment for
+	// the same known field to exercise the other legal encoding on the wire.
+	mixed := proto.Clone(req).(*pb.GraphExecuteRequest)
+	mixed.Context = c.envelope()
+	mixed.Traversal.Steps = nil
+	packed := protowire.AppendVarint(nil, first+1)
+	packed = protowire.AppendVarint(packed, first)
+	tagIDs := protowire.AppendTag(nil, 3, protowire.BytesType)
+	mixed.Traversal.ProtoReflect().SetUnknown(protowire.AppendBytes(tagIDs, packed))
+	res, err = rpc.Execute(c.ctx, mixed)
+	check(err == nil, "mixed vertex ID encodings: %v", err)
+	identity(mixed.Context.Identity, res.Identity)
+	check(res.Version == version, "mixed vertex IDs returned version %d, want %d", res.Version, version)
+	verifyVertices(res.GetData().GetRows(), partition, []uint64{first, first + 1, first})
+
 	// Field 5 is an unrecognized length-delimited operation in GraphStep v1.
 	future := &pb.GraphStep{}
 	tag := protowire.AppendTag(nil, 5, protowire.BytesType)

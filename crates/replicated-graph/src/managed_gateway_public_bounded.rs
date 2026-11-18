@@ -155,6 +155,7 @@ pub enum Schema {
 #[derive(Clone, Copy)]
 enum Kind {
     Var(u64),
+    VertexIds,
     Fixed64,
     Bytes,
     Message(Schema),
@@ -193,7 +194,7 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         (S::GraphExecuteResponse, 2) => (K::Message(S::QueryData), false, false),
         (S::GraphExecuteResponse, 31) => (K::Message(S::CallIdentity), false, false),
         (S::GraphTraversal, 1 | 2) => (K::Var(u32::MAX.into()), false, false),
-        (S::GraphTraversal, 3) => (K::Var(u64::MAX), true, false),
+        (S::GraphTraversal, 3) => (K::VertexIds, true, false),
         (S::GraphTraversal, 4) => (K::Message(S::GraphStep), true, false),
         (S::GraphStep, 1 | 2) => (K::Message(S::GraphHop), false, true),
         (S::GraphStep, 3 | 4) => (K::Message(S::Empty), false, true),
@@ -399,6 +400,16 @@ fn var(bytes: &[u8], at: &mut usize) -> Result<u64, Status> {
     }
     Err(bad())
 }
+fn delimited_end(bytes: &[u8], at: &mut usize) -> Result<usize, Status> {
+    let len = usize::try_from(var(bytes, at)?).map_err(|_| bad())?;
+    at.checked_add(len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(bad)
+}
+fn scan_vertex_id(bytes: &[u8], at: &mut usize, remaining: &mut usize) -> Result<(), Status> {
+    *remaining = remaining.checked_sub(1).ok_or_else(limit)?;
+    var(bytes, at).map(|_| ())
+}
 fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Result<(), Status> {
     if depth > 16 {
         return Err(limit());
@@ -409,7 +420,7 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
     let mut oneof = false;
     let mut job_phase = 0;
     let mut members = 0usize;
-    let mut ids = 0usize;
+    let mut remaining_ids = 32;
     let mut steps = 0usize;
     while at < bytes.len() {
         budget.fields = budget.fields.checked_sub(1).ok_or_else(limit)?;
@@ -423,13 +434,9 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                 return Err(limit());
             }
         }
-        if matches!(schema, Schema::GraphTraversal) {
-            match tag {
-                3 => ids += 1,
-                4 => steps += 1,
-                _ => {}
-            }
-            if ids > 32 || steps > 4 {
+        if matches!(schema, Schema::GraphTraversal) && tag == 4 {
+            steps += 1;
+            if steps > 4 {
                 return Err(limit());
             }
         }
@@ -445,6 +452,19 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
             oneof = true;
         }
         match field.kind {
+            Kind::VertexIds => {
+                // All occurrences share one element budget, including mixed encodings.
+                match wire {
+                    0 => scan_vertex_id(bytes, &mut at, &mut remaining_ids)?,
+                    2 => {
+                        let end = delimited_end(bytes, &mut at)?;
+                        while at < end {
+                            scan_vertex_id(&bytes[..end], &mut at, &mut remaining_ids)?;
+                        }
+                    }
+                    _ => return Err(bad()),
+                }
+            }
             Kind::Var(max) => {
                 if wire != 0 {
                     return Err(bad());
@@ -472,11 +492,8 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                 if wire != 2 {
                     return Err(bad());
                 }
-                let len = usize::try_from(var(bytes, &mut at)?).map_err(|_| bad())?;
-                let end = at
-                    .checked_add(len)
-                    .filter(|n| *n <= bytes.len())
-                    .ok_or_else(bad)?;
+                let end = delimited_end(bytes, &mut at)?;
+                let len = end - at;
                 if matches!(schema, Schema::GraphHop) && len > 64 {
                     return Err(limit());
                 }
@@ -612,15 +629,38 @@ message!(JobFetchResponse, false);
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn graph_request(traversal: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x1a];
+        prost::encoding::encode_varint(traversal.len() as u64, &mut bytes);
+        bytes.extend_from_slice(traversal);
+        bytes
+    }
+    #[test]
+    fn graph_prescan_preserves_mixed_vertex_ids_and_accepts_exact_limit() {
+        // Empty packed segment, packed [300, 0], unpacked 7, packed [300].
+        let mixed = [0x1a, 0, 0x1a, 3, 0xac, 2, 0, 0x18, 7, 0x1a, 2, 0xac, 2];
+        let mut full = vec![0x1a, 31];
+        full.extend(0u8..31);
+        full.extend([0x18, 31]);
+        for (wire, ids) in [
+            (mixed.as_slice(), vec![300, 0, 7, 300]),
+            (&full, (0..32).collect()),
+        ] {
+            let bytes = graph_request(wire);
+            let decoded =
+                decode_checked::<pb::GraphExecuteRequest, _>(&mut bytes.as_slice()).unwrap();
+            assert_eq!(decoded.traversal.unwrap().vertex_ids, ids);
+        }
+    }
     #[test]
     fn graph_prescan_bounds_collections_and_closed_instruction_schema() {
-        // Each example is a GraphTraversal nested in field 3 of Execute.
-        let wrap = |traversal: &[u8]| {
-            let mut bytes = vec![0x1a, traversal.len() as u8];
-            bytes.extend_from_slice(traversal);
-            bytes
-        };
+        let packed_33 = [vec![0x1a, 33], vec![0; 33]].concat();
+        let mixed_33 = [vec![0x1a, 32], vec![0; 32], vec![0x18, 0]].concat();
         for (traversal, expected) in [
+            (packed_33, tonic::Code::ResourceExhausted),
+            (mixed_33, tonic::Code::ResourceExhausted),
+            (vec![0x1a, 3, 1], tonic::Code::InvalidArgument),
+            (vec![0x1a, 1, 0x80, 0x18, 1], tonic::Code::InvalidArgument),
             ([0x18, 0].repeat(33), tonic::Code::ResourceExhausted),
             ([0x22, 0].repeat(5), tonic::Code::ResourceExhausted),
             (vec![0x22, 2, 0x2a, 0], tonic::Code::InvalidArgument),
@@ -629,7 +669,7 @@ mod tests {
                 tonic::Code::InvalidArgument,
             ),
         ] {
-            let bytes = wrap(&traversal);
+            let bytes = graph_request(&traversal);
             let before = DECODES.with(|n| n.get());
             let error =
                 decode_checked::<pb::GraphExecuteRequest, _>(&mut bytes.as_slice()).unwrap_err();

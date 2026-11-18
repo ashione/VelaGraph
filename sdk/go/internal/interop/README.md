@@ -1,8 +1,7 @@
 # Go managed API interoperability check
 
-This module exercises the [VelaGraph Go client SDK](../../../sdk/go/README.md)
-against a fresh managed cohort and loopback Rust gRPC gateway. Its go.mod
-uses the SDK in the same checkout so changes can be tested together.
+This SDK test program exercises the [Go client](../../README.md) against a
+fresh managed cohort and a loopback Rust gRPC gateway.
 
 ## Generate and build
 
@@ -15,9 +14,9 @@ From the repository root:
 
 ```sh
 bash scripts/generate-go-managed.sh
-cd examples/go/managed
+cd sdk/go
 go mod download
-go build -mod=readonly -o interop ./cmd/interop
+go build -mod=readonly -o interop ./internal/interop
 ```
 
 Bindings come directly from
@@ -51,7 +50,7 @@ From the repository root, with the Go and Rust build prerequisites installed:
 
 ```sh
 bench_dir=$(mktemp -d)
-(cd examples/go/managed && go build -mod=readonly -o "$bench_dir/interop" ./cmd/interop)
+(cd sdk/go && go build -mod=readonly -o "$bench_dir/interop" ./internal/interop)
 cargo test --release --locked -p replicated-graph --lib graph_plan_benchmark_v1 -- --ignored --nocapture
 VELAGRAPH_GO_INTEROP_BIN="$bench_dir/interop" VELAGRAPH_GRAPH_BENCH=1 \
   cargo test --release --locked -p replicated-graph --test public_service_go_process \
@@ -101,10 +100,13 @@ the repeated-ID fixture above, so compare methods within the same fixture.
 
 | Distinct IDs | SDK batch p50 / p95 | Text Open p50 / p95 | SDK serial p50 / p95 |
 | ---: | ---: | ---: | ---: |
-| 2 | 28.04 / 28.73 | 28.81 / 29.55 | 55.48 / 57.24 |
-| 8 | 29.19 / 29.38 | 29.78 / 30.02 | 223.47 / 226.91 |
-| 16 | 29.49 / 30.34 | 30.66 / 31.24 | 446.07 / 449.74 |
-| 32 | 31.57 / 32.01 | 32.26 / 33.69 | 896.33 / 902.83 |
+| 2 | 28.39 / 29.41 | 28.93 / 32.43 | 55.76 / 59.37 |
+| 8 | 28.97 / 93.65 | 30.27 / 40.28 | 226.71 / 353.06 |
+| 16 | 29.99 / 31.19 | 30.59 / 31.36 | 444.78 / 451.32 |
+| 32 | 31.79 / 32.70 | 33.02 / 34.31 | 893.60 / 905.58 |
+
+At 32 IDs the SDK batch saved 1.23 ms at p50 versus text Open. At 8 IDs
+the SDK batch had a higher p95 than text Open in this 20-trial sample.
 
 ## Run against a fresh fixture
 
@@ -166,5 +168,5 @@ mixed-version guarantee is provided. Total rich-status bytes retain the 1 MiB
 limit; structural/identity checks occur before allocation, and the domain client
 correlates the complete binding and nonce.
 
-See [public error compatibility](../../../docs/PUBLIC_GRPC_ERROR_COMPATIBILITY.md)
+See [public error compatibility](../../../../docs/PUBLIC_GRPC_ERROR_COMPATIBILITY.md)
 for the exact bounds, uncertain-write semantics and acceptance limits.

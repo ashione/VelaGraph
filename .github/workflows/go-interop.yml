@@ -30,9 +30,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23.6"
-          cache-dependency-path: |
-            sdk/go/go.sum
-            examples/go/managed/go.sum
+          cache-dependency-path: sdk/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - name: Install native build prerequisites
         run: |
@@ -64,10 +62,8 @@ jobs:
         working-directory: sdk/go
         run: go test -race -mod=readonly ./...
       - name: Build SDK interoperability client
-        working-directory: examples/go/managed
-        run: |
-          go test -mod=readonly ./...
-          go build -mod=readonly -o "$RUNNER_TEMP/velagraph-go-interop" ./cmd/interop
+        working-directory: sdk/go
+        run: go build -mod=readonly -o "$RUNNER_TEMP/velagraph-go-interop" ./internal/interop
       - name: Record exact source and tool versions
         run: |
           mkdir -p go-interop-evidence
@@ -93,8 +89,8 @@ jobs:
       - name: Verify Go source formatting
         if: ${{ !cancelled() }}
         run: |
-          gofmt -d sdk/go examples/go/managed/cmd/interop | tee go-interop-evidence/gofmt.diff
-          test -z "$(gofmt -l sdk/go examples/go/managed/cmd/interop)"
+          gofmt -d sdk/go | tee go-interop-evidence/gofmt.diff
+          test -z "$(gofmt -l sdk/go)"
       - name: Retain interoperability evidence
         if: always()
         uses: actions/upload-artifact@v4
