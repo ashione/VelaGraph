@@ -130,6 +130,9 @@ func (c *client) graphChecks(conn grpc.ClientConnInterface, partition uint32, fi
 	if os.Getenv("VELAGRAPH_GRAPH_BENCH") == "1" {
 		c.benchmarkGraphs(g.At(newer.Version), partition, starts, newer.Version)
 	}
+	if os.Getenv("VELAGRAPH_MULTI_ID_BENCH") == "1" {
+		c.benchmarkDistinctIDs(g, partition, first)
+	}
 }
 
 // All starts refer to the same vertex. Each hop crosses one of two parallel

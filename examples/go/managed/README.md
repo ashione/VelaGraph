@@ -81,6 +81,31 @@ separately measured Close p50 ranged from 0.145 to 0.156 ms across shapes.
 These samples include snapshot capture and shard reads. They compare public
 endpoints and are opt-in benchmark observations, without a CI latency threshold.
 
+### Distinct vertex IDs
+
+Use `VELAGRAPH_MULTI_ID_BENCH=1` in place of `VELAGRAPH_GRAPH_BENCH=1` in
+the command above. This fixture writes 32 additional vertices in one partition
+before timing. For 2, 8, 16 and 32 distinct IDs it compares a single SDK
+`V(partition, ids...).Execute(ctx)`, a single text `Open` returning all elements
+in its first page, and a serial SDK loop issuing one Execute per ID. Clients
+use the same warm connection and exact certified version. Every returned
+qualified vertex is checked against the requested descending ID order.
+
+Each method runs two warmups and 20 measured trials per batch size, with
+rotating method order. Latency covers the time until the entire batch returns,
+including all RPCs for the serial loop. Setup writes and text Close are untimed.
+
+In a local macOS arm64 release run, the full-batch latencies in milliseconds
+were as follows. The distinct-ID fixture has a longer committed history than
+the repeated-ID fixture above, so compare methods within the same fixture.
+
+| Distinct IDs | SDK batch p50 / p95 | Text Open p50 / p95 | SDK serial p50 / p95 |
+| ---: | ---: | ---: | ---: |
+| 2 | 28.04 / 28.73 | 28.81 / 29.55 | 55.48 / 57.24 |
+| 8 | 29.19 / 29.38 | 29.78 / 30.02 | 223.47 / 226.91 |
+| 16 | 29.49 / 30.34 | 30.66 / 31.24 | 446.07 / 449.74 |
+| 32 | 31.57 / 32.01 | 32.26 / 33.69 | 896.33 / 902.83 |
+
 ## Run against a fresh fixture
 
 ```sh
