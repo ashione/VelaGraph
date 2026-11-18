@@ -27,6 +27,72 @@ Runtime dependencies are pinned in go.mod; go.sum locks their checksums.
 CI regenerates bindings before building and runs the Rust fixture with
 `VELAGRAPH_GO_INTEROP_BIN` set to the absolute binary path.
 
+## Chainable Graph API
+
+The `graph` package builds a traversal on the caller. With the existing gRPC
+connection, cohort binding and Go context, the following code returns qualified
+vertex paths at an exact certified version. Reuse the same connection for
+subsequent requests. Configure it with `grpc.WithDisableRetry()` as in the
+interop example if a single attempt is required.
+
+```go
+g := graph.New(pb.NewGraphServiceClient(conn), binding)
+result, err := g.At(version).V(7, 42, 42).Out("reports").In("reports").Path().Execute(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(result.Version, result.Data.Rows)
+```
+
+Import `example.com/velagraph/managed/graph` and alias the generated
+`example.com/velagraph/managed/gen/managedv1` package as `pb`. Omit `At`
+for latest, or use `AtLeast(version)` for a lower bound. The builder keeps
+both occurrences of 42, performs no I/O until Execute, and can be branched or
+reused. The client generates a version-2 call identity per request and verifies
+the echoed binding/nonce, version selector and completeness on success. See the [wire
+contract](../../../docs/PUBLIC_GRPC_SERVICE.md#graphserviceexecute) for bounds.
+
+The real-process fixture creates two parallel cross-shard edges and compares
+the results before and after the second write. A 128-walk input returns
+100 element rows or a count of 128, and an oversized raw protobuf request
+fails at the gateway. Set `VELAGRAPH_GRAPH_BENCH=1`
+on the Rust interoperability test to also time 40 paired requests per API.
+It uses four warmup pairs, then alternates GraphService.Execute with QueryService.Open at the same exact V
+on the same warm channel and prints p50/p95. Text Close is timed separately.
+The text API retains a session and the typed API returns rows directly. These
+timings therefore measure the public endpoints, including capture, validation
+and network calls. They do not isolate parser time.
+
+### Reproduce the measurements
+
+From the repository root, with the Go and Rust build prerequisites installed:
+
+```sh
+bench_dir=$(mktemp -d)
+(cd examples/go/managed && go build -mod=readonly -o "$bench_dir/interop" ./cmd/interop)
+cargo test --release --locked -p replicated-graph --lib graph_plan_benchmark_v1 -- --ignored --nocapture
+VELAGRAPH_GO_INTEROP_BIN="$bench_dir/interop" VELAGRAPH_GRAPH_BENCH=1 \
+  cargo test --release --locked -p replicated-graph --test public_service_go_process \
+  go_client_against_real_managed_service -- --ignored --exact --nocapture
+```
+
+One local macOS arm64 release run (rustc 1.95.0, Go 1.23.2, same-host loopback)
+measured the following times. The Rust microbenchmark used 50 warmups and
+2,000 iterations of a two-hop path on repeated IDs. It averaged **658.2 µs**
+for the official text parser and fixed-plan admission, and **0.207 µs** for
+cloning and validating the typed input. Neither timed loop performs network
+I/O, protobuf decoding, capture or execution.
+
+| Two-hop count on two shards, 40 warm paired requests | p50 | p95 |
+| --- | ---: | ---: |
+| GraphService.Execute | 9.68 ms | 10.91 ms |
+| QueryService.Open (text, full count in first page) | 11.16 ms | 12.19 ms |
+| QueryService.Close (measured separately) | 0.18 ms | 0.22 ms |
+
+The end-to-end figures include the actual shard reads on a small fixed cohort.
+They are a local sample, collected while other tests were running. Plan
+construction accounts for only part of the difference between these endpoints.
+
 ## Run against a fresh fixture
 
 ```sh
@@ -48,7 +114,8 @@ The test checks:
   `status.Code` and `status.Details` decoded as `ErrorDetail`.
   Raw custom trailer decoding is deliberately not accepted.
 - Internal ManagedService/Call, RaftService/Vote and ShardOperations/Call are absent from the public listener.
-- Three fresh typed vertex writes (the third after query capture),
+- Three fresh typed vertices in the start partition (the third after query capture),
+  a fourth vertex on the second shard, two parallel cross-shard edges,
   absent/committed Status, and intentional
   same-ID/same-mutation Submit replay only after confirmed commit.
 - Exact integer properties at i64 minimum/maximum and `2^53 + 1`, vertex IDs

@@ -177,3 +177,21 @@ service ReadinessService {
 }
 message ReadinessRequest { Context context = 1; }
 message ReadinessResponse { uint64 version = 1; CallIdentity identity = 2; }
+
+// Unary certified data-local traversal. V1 admits explicit vertex IDs (bag),
+// up to three out/in hops and an optional terminal path/count.
+service GraphService {
+  rpc Execute(GraphExecuteRequest) returns (GraphExecuteResponse);
+}
+message GraphHop { optional string label = 1; }
+message GraphStep {
+  oneof kind { GraphHop out = 1; GraphHop in = 2; Empty path = 3; Empty count = 4; }
+}
+message GraphTraversal {
+  uint32 version = 1;
+  uint32 partition = 2;
+  repeated uint64 vertex_ids = 3 [packed=false];
+  repeated GraphStep steps = 4;
+}
+message GraphExecuteRequest { Context context = 1; ReadSelector read = 2; GraphTraversal traversal = 3; }
+message GraphExecuteResponse { uint64 version = 1; QueryData data = 2; CallIdentity identity = 31; }

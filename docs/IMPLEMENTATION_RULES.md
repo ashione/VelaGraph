@@ -12,7 +12,10 @@ same PR.
 - Do not translate unsupported Gremlin into a different language or silently
   approximate it. Reject it with the documented error.
 - The public surface is standard Gremlin; Rust builders are internal execution
-  plumbing, not a second dialect.
+  plumbing, not a second dialect. The managed GraphService.Execute RPC may
+  encode the explicitly documented subset in typed protobuf fields. Both
+  representations must pass the same execution admission and preserve identical
+  results. Keep internal fragment commands private.
 - A new supported step requires a `QUERY_SPEC.md` update and conformance tests
   in the same change.
 

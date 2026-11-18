@@ -1,8 +1,8 @@
 # Typed public managed gRPC slice
 
 The loopback service exposes `velagraph.public.managed.v1.WriteService`
-(Submit, Status, Abort), `QueryService` (Open, Fetch, Close), and
-`FixedSessionService` (Open, Read, Traverse, Page, Close), and
+(Submit, Status, Abort), `QueryService` (Open, Fetch, Close),
+`GraphService` (Execute), `FixedSessionService` (Open, Read, Traverse, Page, Close), and
 `ManagedQueryJobService` (Start, Get, Renew, Fetch, Cancel). The schema is
 [`public_managed.proto`](../crates/replicated-graph/proto/public_managed.proto);
 generated Rust clients and messages are exported at
@@ -58,6 +58,41 @@ distinct. Properties/conditions reject duplicate keys, and semantic validation
 still uses the existing domain rules. In particular, an empty conditional patch
 is invalid rather than an unconditional write. The canonical durable command is
 computed from the domain mutation, never from protobuf field order/bytes.
+
+## GraphService.Execute
+
+The experimental unary Graph API submits one ordered traversal and returns
+`GraphExecuteResponse { version, data, identity }`. A Go caller can build the
+chain locally and reuse the transport and traversal for subsequent requests.
+Each Execute performs one public RPC. The gateway still contacts the managed
+coordinator and graph shards to certify the version and execute the request.
+See the [Go example and fixture](../examples/go/managed/README.md#chainable-graph-api).
+
+| V1 operation | Contract |
+| --- | --- |
+| Start | Supply the start partition and 1–32 explicit vertex IDs in the range 0 through 2^63−1. Missing vertices contribute no traverser. Repeated IDs are significant. |
+| Hops | Zero to three `out` or `in` steps, each optionally filtered by one label matching `[A-Za-z_][A-Za-z_0-9]{0,63}`. Omitting the label selects all labels. |
+| Result | Return vertex elements, or append one terminal `path` or `count`. Each hop in a path records the traversed edge and the next vertex, with qualified identities. Parallel edges, converging walks and repeated starts retain multiplicity. |
+| Limits | Element/path results use the executor's default first 100 rows in traversal order. Count sees the entire admitted bag. Resource ceilings or deadlines fail the request. |
+| Snapshot | Select latest certified, exact (including zero), or minimum V. All hops use the selected V. The result carries that V and the existing UNVERIFIED adjacency completeness. |
+| Lifetime | The response holds the entire bounded result. No client session, cursor, page fetch or Close call is required. |
+
+V1 uses the default Parity2MiBV1 data-local capture profile. It shares the public
+listener's binding rules and trusted-loopback security boundary. The server
+clamps execution to five seconds or the shorter call deadline. Requests are
+bounded at 64 KiB and replies at 1 MiB. Specify traversal version 1 separately from the RPC Context
+version. An older server returns gRPC UNIMPLEMENTED for the method. Unknown
+operations, invalid sequences, missing selectors and unsupported traversal
+versions fail explicitly. There is no text fallback.
+
+The protobuf message represents a small, closed set of logical Gremlin operations.
+TinkerPop 3.x Bytecode also preserves instruction order. VelaGraph uses its own
+protobuf schema and has no TinkerPop Bytecode, GraphSON or GraphBinary compatibility.
+See the [TinkerPop 3.5.6 Bytecode API](https://tinkerpop.apache.org/javadocs/3.5.6/core/org/apache/tinkerpop/gremlin/process/traversal/Bytecode.html).
+The wire format carries neither text nor internal shard fragments.
+Scans, edge starts, property projections (including `values`), `repeat`,
+`limit`, pagination and writes are outside V1. A caller can spell a fixed
+length walk of up to three hops by appending those hops directly.
 
 ## Fixed-snapshot sessions: separate from data-local query sessions
 

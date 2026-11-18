@@ -93,7 +93,7 @@ pub(crate) async fn lock_session_fixtures() -> tokio::sync::MutexGuard<'static, 
 pub(crate) fn validate(request: &DistributedRequest) -> Result<(), QueryFailure> {
     parse(request).map(|_| ())
 }
-fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
+pub(crate) fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     if request.text.len() > query::MAX_QUERY_TEXT_BYTES {
         return Err(QueryFailure::ResourceExhausted);
     }
@@ -212,15 +212,6 @@ pub(super) async fn fragment(
     Ok(output.value)
 }
 
-pub(crate) async fn execute(
-    sessions: &mut BTreeMap<u64, NodeSession>,
-    request: &DistributedRequest,
-    parallelism: usize,
-    end: Instant,
-) -> Result<Vec<QueryRow>, QueryFailure> {
-    execute_inner(sessions, request, parallelism, end, None).await
-}
-
 pub(crate) async fn execute_controlled(
     sessions: &mut BTreeMap<u64, NodeSession>,
     request: &DistributedRequest,
@@ -243,8 +234,27 @@ async fn execute_inner(
     end: Instant,
     control: Option<ExecutionControl>,
 ) -> Result<Vec<QueryRow>, QueryFailure> {
-    fixed_parallel::validate_width(parallelism)?;
     let query = parse(request)?;
+    execute_plan(
+        sessions,
+        request.start_partition,
+        &query,
+        parallelism,
+        end,
+        control,
+    )
+    .await
+}
+
+pub(crate) async fn execute_plan(
+    sessions: &mut BTreeMap<u64, NodeSession>,
+    partition: u32,
+    query: &GremlinQuery,
+    parallelism: usize,
+    end: Instant,
+    control: Option<ExecutionControl>,
+) -> Result<Vec<QueryRow>, QueryFailure> {
+    fixed_parallel::validate_width(parallelism)?;
     let catalog = StaticCatalog {
         partitions: sessions.values().map(|s| s.route.clone()).collect(),
     };
@@ -266,8 +276,9 @@ async fn execute_inner(
         scan_cost: Cost::default(),
         ceiling: CEILING,
     };
-    let output = execution.run(request, &query).await?;
-    validate_output_bounded(&output, request, fixed::MAX_MEMBERS).map_err(remote_failure)?;
+    let output = execution.run(partition, query).await?;
+    validate_planned_output(&output, partition, query, fixed::MAX_MEMBERS)
+        .map_err(remote_failure)?;
     execution.check()?;
     Ok(output.rows)
 }

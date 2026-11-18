@@ -197,6 +197,45 @@ impl ObservedGremlinQuery {
         parse_validated_query(input, true)
     }
 
+    /// Build the bounded explicit-vertex subset used by certified data-local RPCs.
+    pub fn fixed_vertex_traversal(ids: Vec<u64>, steps: Vec<GremlinStep>) -> Result<Self> {
+        if ids.is_empty() || ids.len() > 32 || ids.iter().any(|id| *id > i64::MAX as u64) {
+            return Err(Error::UnsupportedGremlinArgument(
+                "expected 1..32 signed-range vertex IDs".into(),
+            ));
+        }
+        let mut hops = 0;
+        for (index, step) in steps.iter().enumerate() {
+            match step {
+                GremlinStep::In(label) | GremlinStep::Out(label) => {
+                    hops += 1;
+                    if hops > MAX_GREMLIN_EDGE_STEPS {
+                        return Err(Error::TraversalLimitExceeded(
+                            "too many fixed traversal hops".into(),
+                        ));
+                    }
+                    if let Some(label) = label {
+                        validate_label(label)?;
+                    }
+                }
+                GremlinStep::Count | GremlinStep::Path if index + 1 == steps.len() => {}
+                _ => {
+                    return Err(Error::UnsupportedGremlinArgument(
+                        "unsupported fixed traversal step or ordering".into(),
+                    ))
+                }
+            }
+        }
+        Ok(Self {
+            start: GremlinStart::Vertices(ids),
+            steps: steps
+                .into_iter()
+                .map(ObservedGremlinStep::Existing)
+                .collect(),
+            explicit_limit: false,
+        })
+    }
+
     pub fn start(&self) -> &GremlinStart {
         &self.start
     }

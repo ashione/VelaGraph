@@ -643,6 +643,16 @@ async fn fixed_local_qualified_bags_match_input_model() {
     let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
     let f = Fixture::new().await;
     let (g, servers, graphs) = local_gateway(&f).await;
+    let grpc = g
+        .bind_grpc("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+        .await
+        .unwrap();
+    let mut graph = public_proto::graph_service_client::GraphServiceClient::connect(format!(
+        "http://{}",
+        grpc.local_addr()
+    ))
+    .await
+    .unwrap();
     let mut external = 1u8;
     for (partition, id) in [(7, 1), (7, 2), (8, 1)] {
         committed(
@@ -685,22 +695,26 @@ async fn fixed_local_qualified_bags_match_input_model() {
     }
     use crate::remote::query::QualifiedElement as E;
     let v = |p: u32, id: u64| E::Vertex { partition: p, id };
-    for (text, directions, label) in [
-        ("g.V(1,1).out().path()", vec![false], None),
-        ("g.V(1,1).in().path()", vec![true], None),
+    let many = format!("g.V({}).out('x').in('x').path()", ["1"; 20].join(","));
+    for (text, directions, label, starts) in [
+        ("g.V(1,1).out().path()", vec![false], None, 2),
+        ("g.V(1,1).in().path()", vec![true], None, 2),
         (
             "g.V(1,1).out('x').in('x').path()",
             vec![false, true],
             Some("x"),
+            2,
         ),
         (
             "g.V(1,1).out().out().out().path()",
             vec![false, false, false],
             None,
+            2,
         ),
+        (many.as_str(), vec![false, true], Some("x"), 20),
     ] {
-        let mut model = vec![((7, 1), vec![v(7, 1)]); 2];
-        for incoming in directions {
+        let mut model = vec![((7, 1), vec![v(7, 1)]); starts];
+        for &incoming in &directions {
             let mut next = Vec::new();
             for (vertex, path) in model {
                 for (id, from, to, edge_label) in inputs {
@@ -720,6 +734,7 @@ async fn fixed_local_qualified_bags_match_input_model() {
             }
             model = next;
         }
+        let bag_size = model.len();
         model.truncate(100);
         let expected: Vec<_> = model
             .into_iter()
@@ -728,6 +743,78 @@ async fn fixed_local_qualified_bags_match_input_model() {
         let (session, query, page) =
             ready(call(&g, local_open(Some(8), text, 1000)).await.unwrap());
         assert_eq!(page.data.rows, expected, "{text}");
+        use public_proto::{
+            graph_step::Kind, Empty, GraphExecuteRequest, GraphHop, GraphStep, GraphTraversal,
+        };
+        let mut steps: Vec<_> = directions
+            .iter()
+            .map(|incoming| {
+                let hop = GraphHop {
+                    label: label.map(str::to_owned),
+                };
+                GraphStep {
+                    kind: Some(if *incoming {
+                        Kind::In(hop)
+                    } else {
+                        Kind::Out(hop)
+                    }),
+                }
+            })
+            .collect();
+        steps.push(GraphStep {
+            kind: Some(Kind::Path(Empty {})),
+        });
+        let request = GraphExecuteRequest {
+            context: Some(public_proto::Context {
+                version: 1,
+                timeout_millis: 15000,
+                identity: None,
+            }),
+            read: Some(public_proto::ReadSelector {
+                kind: Some(public_proto::read_selector::Kind::Exact(8)),
+            }),
+            traversal: Some(GraphTraversal {
+                version: 1,
+                partition: 7,
+                vertex_ids: vec![1; starts],
+                steps,
+            }),
+        };
+        if starts == 20 {
+            assert_eq!(bag_size, 120);
+            assert_eq!(expected.len(), 100);
+            let mut counted = request.clone();
+            counted
+                .traversal
+                .as_mut()
+                .unwrap()
+                .steps
+                .last_mut()
+                .unwrap()
+                .kind = Some(Kind::Count(Empty {}));
+            let count = graph.execute(counted).await.unwrap().into_inner();
+            assert_eq!(
+                count.data.unwrap().rows,
+                vec![grpc_codec::out_row(&QueryRow::Count(bag_size as u64)).unwrap()]
+            );
+        }
+        let result = graph.execute(request).await.unwrap().into_inner();
+        assert_eq!(result.version, 8);
+        let data = result.data.unwrap();
+        assert_eq!(
+            data.completeness,
+            public_proto::Completeness::Unverified as i32
+        );
+        assert_eq!(
+            data.rows,
+            expected
+                .iter()
+                .map(grpc_codec::out_row)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            "{text}"
+        );
+
         for profile in [
             LocalReadProfile::Parity2MiBV1,
             LocalReadProfile::LocalRead8MiBV1,
@@ -786,6 +873,7 @@ async fn fixed_local_qualified_bags_match_input_model() {
             .await
             .unwrap();
     }
+    grpc.shutdown().await;
     g.shutdown().await;
     for graph in graphs {
         graph.shutdown().await;

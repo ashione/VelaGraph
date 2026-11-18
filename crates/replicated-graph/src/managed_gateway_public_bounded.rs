@@ -84,6 +84,11 @@ pub enum Schema {
     RpcStatus,
     RpcAny,
     Context,
+    GraphExecuteRequest,
+    GraphExecuteResponse,
+    GraphTraversal,
+    GraphStep,
+    GraphHop,
     ReadinessRequest,
     ReadinessResponse,
     CallIdentity,
@@ -181,6 +186,18 @@ fn field(s: Schema, t: u32) -> Option<Field> {
         (S::RpcAny, 2) => (K::Message(S::ErrorDetail), false, false),
         (S::ErrorDetail, 1) => (K::Var(16), false, false),
         (S::ErrorDetail, 2) => (K::Message(S::CallIdentity), false, false),
+        (S::GraphExecuteRequest, 1) => (K::Message(S::Context), false, false),
+        (S::GraphExecuteRequest, 2) => (K::Message(S::ReadSelector), false, false),
+        (S::GraphExecuteRequest, 3) => (K::Message(S::GraphTraversal), false, false),
+        (S::GraphExecuteResponse, 1) => (K::Var(u64::MAX), false, false),
+        (S::GraphExecuteResponse, 2) => (K::Message(S::QueryData), false, false),
+        (S::GraphExecuteResponse, 31) => (K::Message(S::CallIdentity), false, false),
+        (S::GraphTraversal, 1 | 2) => (K::Var(u32::MAX.into()), false, false),
+        (S::GraphTraversal, 3) => (K::Var(u64::MAX), true, false),
+        (S::GraphTraversal, 4) => (K::Message(S::GraphStep), true, false),
+        (S::GraphStep, 1 | 2) => (K::Message(S::GraphHop), false, true),
+        (S::GraphStep, 3 | 4) => (K::Message(S::Empty), false, true),
+        (S::GraphHop, 1) => (K::Bytes, false, false),
         (S::ReadinessRequest, 1) => (K::Message(S::Context), false, false),
         (S::ReadinessResponse, 1) => (K::Var(u64::MAX), false, false),
         (S::ReadinessResponse, 2) => (K::Message(S::CallIdentity), false, false),
@@ -392,6 +409,8 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
     let mut oneof = false;
     let mut job_phase = 0;
     let mut members = 0usize;
+    let mut ids = 0usize;
+    let mut steps = 0usize;
     while at < bytes.len() {
         budget.fields = budget.fields.checked_sub(1).ok_or_else(limit)?;
         let key = var(bytes, &mut at)?;
@@ -401,6 +420,16 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
         if matches!(schema, Schema::Binding) && tag == 5 {
             members += 1;
             if members > d2_raft::transaction_decisions::MAX_PARTICIPANTS {
+                return Err(limit());
+            }
+        }
+        if matches!(schema, Schema::GraphTraversal) {
+            match tag {
+                3 => ids += 1,
+                4 => steps += 1,
+                _ => {}
+            }
+            if ids > 32 || steps > 4 {
                 return Err(limit());
             }
         }
@@ -448,6 +477,9 @@ fn scan(schema: Schema, bytes: &[u8], depth: usize, budget: &mut Budget) -> Resu
                     .checked_add(len)
                     .filter(|n| *n <= bytes.len())
                     .ok_or_else(bad)?;
+                if matches!(schema, Schema::GraphHop) && len > 64 {
+                    return Err(limit());
+                }
                 let exact_width = match (schema, tag) {
                     (Schema::CallIdentity, 1)
                     | (Schema::Binding, 2)
@@ -563,6 +595,8 @@ message!(FixedOpenResponse, false);
 message!(FixedQueryResponse, false);
 message!(FixedPageResponse, false);
 message!(FixedCloseResponse, false);
+message!(GraphExecuteRequest, true);
+message!(GraphExecuteResponse, false);
 message!(ReadinessRequest, true);
 message!(ReadinessResponse, false);
 message!(JobStartRequest, true);
@@ -578,6 +612,31 @@ message!(JobFetchResponse, false);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graph_prescan_bounds_collections_and_closed_instruction_schema() {
+        // Each example is a GraphTraversal nested in field 3 of Execute.
+        let wrap = |traversal: &[u8]| {
+            let mut bytes = vec![0x1a, traversal.len() as u8];
+            bytes.extend_from_slice(traversal);
+            bytes
+        };
+        for (traversal, expected) in [
+            ([0x18, 0].repeat(33), tonic::Code::ResourceExhausted),
+            ([0x22, 0].repeat(5), tonic::Code::ResourceExhausted),
+            (vec![0x22, 2, 0x2a, 0], tonic::Code::InvalidArgument),
+            (
+                vec![0x22, 4, 0x0a, 0, 0x12, 0],
+                tonic::Code::InvalidArgument,
+            ),
+        ] {
+            let bytes = wrap(&traversal);
+            let before = DECODES.with(|n| n.get());
+            let error =
+                decode_checked::<pb::GraphExecuteRequest, _>(&mut bytes.as_slice()).unwrap_err();
+            assert_eq!(error.code(), expected);
+            assert_eq!(DECODES.with(|n| n.get()), before);
+        }
+    }
     #[test]
     fn readiness_prescan_rejects_unknown_and_duplicate_fields() {
         let request = pb::ReadinessRequest {
