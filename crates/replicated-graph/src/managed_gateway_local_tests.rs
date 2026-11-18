@@ -643,6 +643,16 @@ async fn fixed_local_qualified_bags_match_input_model() {
     let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
     let f = Fixture::new().await;
     let (g, servers, graphs) = local_gateway(&f).await;
+    let grpc = g
+        .bind_grpc("127.0.0.1:0".parse().unwrap(), Duration::from_secs(15))
+        .await
+        .unwrap();
+    let mut graph = public_proto::graph_service_client::GraphServiceClient::connect(format!(
+        "http://{}",
+        grpc.local_addr()
+    ))
+    .await
+    .unwrap();
     let mut external = 1u8;
     for (partition, id) in [(7, 1), (7, 2), (8, 1)] {
         committed(
@@ -685,22 +695,26 @@ async fn fixed_local_qualified_bags_match_input_model() {
     }
     use crate::remote::query::QualifiedElement as E;
     let v = |p: u32, id: u64| E::Vertex { partition: p, id };
-    for (text, directions, label) in [
-        ("g.V(1,1).out().path()", vec![false], None),
-        ("g.V(1,1).in().path()", vec![true], None),
+    let many = format!("g.V({}).out('x').in('x').path()", ["1"; 20].join(","));
+    for (text, directions, label, starts) in [
+        ("g.V(1,1).out().path()", vec![false], None, 2),
+        ("g.V(1,1).in().path()", vec![true], None, 2),
         (
             "g.V(1,1).out('x').in('x').path()",
             vec![false, true],
             Some("x"),
+            2,
         ),
         (
             "g.V(1,1).out().out().out().path()",
             vec![false, false, false],
             None,
+            2,
         ),
+        (many.as_str(), vec![false, true], Some("x"), 20),
     ] {
-        let mut model = vec![((7, 1), vec![v(7, 1)]); 2];
-        for incoming in directions {
+        let mut model = vec![((7, 1), vec![v(7, 1)]); starts];
+        for &incoming in &directions {
             let mut next = Vec::new();
             for (vertex, path) in model {
                 for (id, from, to, edge_label) in inputs {
@@ -720,6 +734,7 @@ async fn fixed_local_qualified_bags_match_input_model() {
             }
             model = next;
         }
+        let bag_size = model.len();
         model.truncate(100);
         let expected: Vec<_> = model
             .into_iter()
@@ -728,6 +743,78 @@ async fn fixed_local_qualified_bags_match_input_model() {
         let (session, query, page) =
             ready(call(&g, local_open(Some(8), text, 1000)).await.unwrap());
         assert_eq!(page.data.rows, expected, "{text}");
+        use public_proto::{
+            graph_step::Kind, Empty, GraphExecuteRequest, GraphHop, GraphStep, GraphTraversal,
+        };
+        let mut steps: Vec<_> = directions
+            .iter()
+            .map(|incoming| {
+                let hop = GraphHop {
+                    label: label.map(str::to_owned),
+                };
+                GraphStep {
+                    kind: Some(if *incoming {
+                        Kind::In(hop)
+                    } else {
+                        Kind::Out(hop)
+                    }),
+                }
+            })
+            .collect();
+        steps.push(GraphStep {
+            kind: Some(Kind::Path(Empty {})),
+        });
+        let request = GraphExecuteRequest {
+            context: Some(public_proto::Context {
+                version: 1,
+                timeout_millis: 15000,
+                identity: None,
+            }),
+            read: Some(public_proto::ReadSelector {
+                kind: Some(public_proto::read_selector::Kind::Exact(8)),
+            }),
+            traversal: Some(GraphTraversal {
+                version: 1,
+                partition: 7,
+                vertex_ids: vec![1; starts],
+                steps,
+            }),
+        };
+        if starts == 20 {
+            assert_eq!(bag_size, 120);
+            assert_eq!(expected.len(), 100);
+            let mut counted = request.clone();
+            counted
+                .traversal
+                .as_mut()
+                .unwrap()
+                .steps
+                .last_mut()
+                .unwrap()
+                .kind = Some(Kind::Count(Empty {}));
+            let count = graph.execute(counted).await.unwrap().into_inner();
+            assert_eq!(
+                count.data.unwrap().rows,
+                vec![grpc_codec::out_row(&QueryRow::Count(bag_size as u64)).unwrap()]
+            );
+        }
+        let result = graph.execute(request).await.unwrap().into_inner();
+        assert_eq!(result.version, 8);
+        let data = result.data.unwrap();
+        assert_eq!(
+            data.completeness,
+            public_proto::Completeness::Unverified as i32
+        );
+        assert_eq!(
+            data.rows,
+            expected
+                .iter()
+                .map(grpc_codec::out_row)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            "{text}"
+        );
+
         for profile in [
             LocalReadProfile::Parity2MiBV1,
             LocalReadProfile::LocalRead8MiBV1,
@@ -786,6 +873,7 @@ async fn fixed_local_qualified_bags_match_input_model() {
             .await
             .unwrap();
     }
+    grpc.shutdown().await;
     g.shutdown().await;
     for graph in graphs {
         graph.shutdown().await;
@@ -2087,6 +2175,174 @@ async fn public_http_shared_writes_queries_and_tcp_fixed_view() {
         200
     );
     http.shutdown().await;
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    f.stop().await;
+}
+
+const GRAPH_EXECUTE: &str = "velagraph.public.managed.v1.GraphService/Execute";
+
+fn graph_count_request(timeout_millis: u64) -> public_proto::GraphExecuteRequest {
+    use public_proto as pb;
+    pb::GraphExecuteRequest {
+        context: Some(pb::Context {
+            timeout_millis,
+            ..public_context().unwrap()
+        }),
+        read: Some(pb::ReadSelector {
+            kind: Some(pb::read_selector::Kind::Exact(0)),
+        }),
+        traversal: Some(pb::GraphTraversal {
+            version: 1,
+            partition: 7,
+            vertex_ids: vec![1],
+            steps: vec![pb::GraphStep {
+                kind: Some(pb::graph_step::Kind::Count(pb::Empty {})),
+            }],
+        }),
+    }
+}
+
+async fn await_graph_quota(g: &Gateway) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while g.retained_payload_charge() != 0
+            || g.state.connections.available_permits() != MAX_CONNECTIONS
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("graph result and call permits must both return");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_execute_cancel_during_fragment_closes_snapshot_and_releases_quota() {
+    let _test = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    let mut routes = g.state.config.local_routes.clone().unwrap();
+    let real = routes[0].endpoint;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    routes[0].endpoint = listener.local_addr().unwrap();
+    let tested = Gateway::bind_remote_local_queries(
+        remote_config(&g),
+        routes,
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(15),
+    )
+    .await
+    .unwrap();
+    let address = tested.local_addr();
+    let gateway = &tested;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_fixed_script(listener, |mut events| async move {
+            let (_response, mut stream, _driver) = raw_rpc(
+                address,
+                GRAPH_EXECUTE,
+                grpc_frame(&graph_count_request(5000)),
+                true,
+            )
+            .await;
+            let open = events.recv().await.unwrap();
+            let FixedRpcReply::Open(opened) = forward_fixed(real, open.request).await else {
+                panic!("expected OpenFixed")
+            };
+            let descriptor = opened.descriptor.clone().unwrap();
+            assert!(open.reply.send(Ok(FixedRpcReply::Open(opened))).is_ok());
+            let fragment = events.recv().await.unwrap();
+            assert!(matches!(fragment.request, FixedRpc::Fragment(_)));
+            assert_eq!(gateway.retained_payload_charge(), SESSION_CHARGE);
+            // Keep the fragment reply pending. Only the caller resets the public stream.
+            stream.send_reset(h2::Reason::CANCEL);
+            let close = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("reset must trigger cleanup before the five-second Execute deadline")
+                .unwrap();
+            let FixedRpc::Close(request) = &close.request else {
+                panic!("expected CloseFixed")
+            };
+            assert_eq!(request.descriptor.as_ref(), Some(&descriptor));
+            assert_eq!(gateway.retained_payload_charge(), SESSION_CHARGE);
+            let reply = forward_fixed(real, close.request).await;
+            assert!(close.reply.send(Ok(reply)).is_ok());
+            drop(fragment);
+            await_graph_quota(gateway).await;
+        }),
+    )
+    .await
+    .expect("graph cancellation fixture must finish");
+    tested.shutdown().await;
+    g.shutdown().await;
+    for graph in graphs {
+        graph.shutdown().await;
+    }
+    for server in servers {
+        server.shutdown().await;
+    }
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_execute_zero_window_holds_quota_until_response_deadline() {
+    let _test = TEST_GATE.lock().await;
+    let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
+    let f = Fixture::new().await;
+    let (g, servers, graphs) = local_gateway(&f).await;
+    let mut window = h2::client::Builder::new();
+    window.initial_window_size(0);
+    let (response, _stream, _driver) = raw_rpc_with_window(
+        g.local_addr(),
+        GRAPH_EXECUTE,
+        grpc_frame(&graph_count_request(1500)),
+        true,
+        window,
+    )
+    .await;
+    let response = tokio::time::timeout(Duration::from_secs(2), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "{:?}",
+        response.headers()
+    );
+    let mut unread = response.into_body();
+    assert_eq!(g.retained_payload_charge(), SESSION_CHARGE);
+    assert_eq!(g.state.connections.available_permits(), MAX_CONNECTIONS - 1);
+    await_graph_quota(&g).await;
+    assert!(!matches!(
+        tokio::time::timeout(Duration::from_secs(1), unread.data())
+            .await
+            .unwrap(),
+        Some(Ok(_))
+    ));
+    let mut client = public_proto::graph_service_client::GraphServiceClient::connect(format!(
+        "http://{}",
+        g.local_addr()
+    ))
+    .await
+    .unwrap();
+    let recovered = client
+        .execute(graph_count_request(5000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(recovered.version, 0);
+    assert_eq!(
+        recovered.data.unwrap().rows,
+        vec![grpc_codec::out_row(&QueryRow::Count(0)).unwrap()]
+    );
+    await_graph_quota(&g).await;
+    drop(client);
     g.shutdown().await;
     for graph in graphs {
         graph.shutdown().await;

@@ -17,6 +17,7 @@ use tonic::{
 };
 use wire::{
     fixed_session_service_server::{FixedSessionService, FixedSessionServiceServer},
+    graph_service_server::{GraphService, GraphServiceServer},
     managed_query_job_service_server::{ManagedQueryJobService, ManagedQueryJobServiceServer},
     query_service_server::{QueryService, QueryServiceServer},
     readiness_service_server::{ReadinessService, ReadinessServiceServer},
@@ -67,6 +68,8 @@ fn watchdog(
 }
 #[derive(Clone, Copy)]
 struct ResponseEnd(Instant);
+#[derive(Clone)]
+struct GraphMemory(Arc<OwnedSemaphorePermit>);
 #[derive(Clone)]
 struct Handler {
     state: Arc<State>,
@@ -370,10 +373,15 @@ where
                 .extensions()
                 .get::<ResponseEnd>()
                 .map_or(end, |deadline| end.min(deadline.0));
+            let graph_memory = response
+                .extensions()
+                .get::<GraphMemory>()
+                .map(|m| m.0.clone());
             Ok(response.map(|body| {
                 tonic::body::Body::new(AdmittedBody {
                     body,
                     call,
+                    _graph_memory: graph_memory,
                     deadline: Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
                         end,
                     ))),
@@ -402,6 +410,7 @@ fn grpc_timeout(value: &str) -> Option<Duration> {
     })
 }
 struct AdmittedBody {
+    _graph_memory: Option<Arc<OwnedSemaphorePermit>>,
     body: tonic::body::Body,
     call: Call,
     deadline: Pin<Box<tokio::time::Sleep>>,
@@ -596,6 +605,9 @@ pub(super) async fn bind(
         let readiness = ReadinessServiceServer::new(handler.clone())
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
+        let graph = GraphServiceServer::new(handler.clone())
+            .max_decoding_message_size(MAX_REQUEST_BYTES)
+            .max_encoding_message_size(MAX_RESPONSE_BYTES);
         let queries = QueryServiceServer::new(handler)
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(MAX_RESPONSE_BYTES);
@@ -642,6 +654,12 @@ pub(super) async fn bind(
             .add_service(Admitted {
                 drain: draining.clone(),
                 inner: readiness,
+                state: state.clone(),
+                deadline,
+            })
+            .add_service(Admitted {
+                drain: draining.clone(),
+                inner: graph,
                 state: state.clone(),
                 deadline,
             })
@@ -756,6 +774,49 @@ impl ReadinessService for Handler {
         codec::bounded::validate_bytes::<wire::ReadinessResponse>(&message.encode_to_vec())?;
         let mut response = tonic::Response::new(message);
         response.extensions_mut().insert(ResponseEnd(end));
+        Ok(response)
+    }
+}
+#[tonic::async_trait]
+impl GraphService for Handler {
+    async fn execute(
+        &self,
+        request: tonic::Request<wire::GraphExecuteRequest>,
+    ) -> std::result::Result<tonic::Response<wire::GraphExecuteResponse>, Status> {
+        let call = admitted(&request)?;
+        let (budget, identity) = self.prepare(&request.get_ref().context)?;
+        if self
+            .state
+            .jobs_stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(codec::identified_error(Error::Rejected, identity));
+        }
+        let end = invocation::query_end(call.end.min(call.started + budget));
+        call.budget.send_replace(end);
+        let result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(end),
+            self.state
+                .execute_graph(request.into_inner(), call.work.clone(), end),
+        )
+        .await;
+        let (version, data, end, memory) = match result {
+            Ok(result) => result.map_err(|e| codec::identified_error(e, identity.clone()))?,
+            Err(_) => return Err(codec::identified_error(Error::Unknown, identity)),
+        };
+        before_deadline(end).map_err(|e| codec::identified_error(e, identity.clone()))?;
+        call.budget.send_replace(end);
+        let message = wire::GraphExecuteResponse {
+            version,
+            data: Some(data),
+            identity,
+        };
+        codec::bounded::validate_bytes::<wire::GraphExecuteResponse>(&message.encode_to_vec())?;
+        let mut response = tonic::Response::new(message);
+        response.extensions_mut().insert(ResponseEnd(end));
+        response
+            .extensions_mut()
+            .insert(GraphMemory(Arc::new(memory)));
         Ok(response)
     }
 }

@@ -1010,3 +1010,111 @@ var ReadinessService_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "public_managed.proto",
 }
+
+const (
+	GraphService_Execute_FullMethodName = "/velagraph.public.managed.v1.GraphService/Execute"
+)
+
+// GraphServiceClient is the client API for GraphService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Unary certified data-local traversal. V1 admits explicit vertex IDs (bag),
+// up to three out/in hops and an optional terminal path/count.
+type GraphServiceClient interface {
+	Execute(ctx context.Context, in *GraphExecuteRequest, opts ...grpc.CallOption) (*GraphExecuteResponse, error)
+}
+
+type graphServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewGraphServiceClient(cc grpc.ClientConnInterface) GraphServiceClient {
+	return &graphServiceClient{cc}
+}
+
+func (c *graphServiceClient) Execute(ctx context.Context, in *GraphExecuteRequest, opts ...grpc.CallOption) (*GraphExecuteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GraphExecuteResponse)
+	err := c.cc.Invoke(ctx, GraphService_Execute_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GraphServiceServer is the server API for GraphService service.
+// All implementations must embed UnimplementedGraphServiceServer
+// for forward compatibility.
+//
+// Unary certified data-local traversal. V1 admits explicit vertex IDs (bag),
+// up to three out/in hops and an optional terminal path/count.
+type GraphServiceServer interface {
+	Execute(context.Context, *GraphExecuteRequest) (*GraphExecuteResponse, error)
+	mustEmbedUnimplementedGraphServiceServer()
+}
+
+// UnimplementedGraphServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedGraphServiceServer struct{}
+
+func (UnimplementedGraphServiceServer) Execute(context.Context, *GraphExecuteRequest) (*GraphExecuteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Execute not implemented")
+}
+func (UnimplementedGraphServiceServer) mustEmbedUnimplementedGraphServiceServer() {}
+func (UnimplementedGraphServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeGraphServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to GraphServiceServer will
+// result in compilation errors.
+type UnsafeGraphServiceServer interface {
+	mustEmbedUnimplementedGraphServiceServer()
+}
+
+func RegisterGraphServiceServer(s grpc.ServiceRegistrar, srv GraphServiceServer) {
+	// If the following call pancis, it indicates UnimplementedGraphServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&GraphService_ServiceDesc, srv)
+}
+
+func _GraphService_Execute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GraphExecuteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GraphServiceServer).Execute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GraphService_Execute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GraphServiceServer).Execute(ctx, req.(*GraphExecuteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// GraphService_ServiceDesc is the grpc.ServiceDesc for GraphService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var GraphService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "velagraph.public.managed.v1.GraphService",
+	HandlerType: (*GraphServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Execute",
+			Handler:    _GraphService_Execute_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "public_managed.proto",
+}

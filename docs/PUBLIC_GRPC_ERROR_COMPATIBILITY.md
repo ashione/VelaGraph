@@ -71,10 +71,10 @@ they do not become a fabricated terminal write result.
 
 ## Verification and limits
 
-The Go example and Rust harness add executable acceptance checks, not a claim
+The Go SDK fixture and Rust harness add executable acceptance checks, not a claim
 that every check has already passed. Acceptance requires the exact candidate's
 CI results, including its independently running Rust service and generated Go
-client. See [the Go example](../examples/go/managed/README.md) for commands.
+client. See [the Go SDK fixture](../sdk/go/internal/interop/README.md) for commands.
 
 The candidate checks `i64::MIN`, `i64::MAX`, and `2^53 + 1` as integer
 properties, plus vertex IDs above `2^53`, without float or JSON-number
