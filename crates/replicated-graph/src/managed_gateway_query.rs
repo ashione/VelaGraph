@@ -574,6 +574,9 @@ pub(super) fn valid_traversal_total(query: &Query, total: u32) -> bool {
     if crate::routing::experimental::validate_traversal(&parsed).is_err() {
         return false;
     }
+    valid_planned_total(&parsed, total)
+}
+fn valid_planned_total(parsed: &ObservedGremlinQuery, total: u32) -> bool {
     if matches!(
         parsed.steps().last(),
         Some(ObservedGremlinStep::Existing(GremlinStep::Count))
@@ -587,7 +590,7 @@ pub(super) fn valid_traversal_total(query: &Query, total: u32) -> bool {
                 | ObservedGremlinStep::Range { .. }
         )
     });
-    let maximum = traversal_maximum(&parsed);
+    let maximum = traversal_maximum(parsed);
     total as usize
         <= if explicit {
             maximum
@@ -614,6 +617,17 @@ impl TraversalPathShape {
 /// Checks shapes/provenance in whole results or page slices. Bag duplicates are
 /// legal; this cannot authenticate a trusted peer or prove graph completeness.
 pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &Binding) -> bool {
+    let Ok(parsed) = ObservedGremlinQuery::parse(&query.text) else {
+        return false;
+    };
+    valid_planned_output(query.partition, &parsed, data, binding)
+}
+pub(super) fn valid_planned_output(
+    start_partition: u32,
+    parsed: &ObservedGremlinQuery,
+    data: &QueryData,
+    binding: &Binding,
+) -> bool {
     use velagraph::ObservedGremlinStep as Step;
     let member = |partition: u32| {
         binding
@@ -622,13 +636,10 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
             .iter()
             .any(|m| m.shard == u64::from(partition))
     };
-    if !member(query.partition) || data.completeness != QueryCompleteness::Unverified {
+    if !member(start_partition) || data.completeness != QueryCompleteness::Unverified {
         return false;
     }
-    let Ok(parsed) = ObservedGremlinQuery::parse(&query.text) else {
-        return false;
-    };
-    if crate::routing::experimental::validate_traversal(&parsed).is_err() {
+    if crate::routing::experimental::validate_traversal(parsed).is_err() {
         return false;
     }
     let (mut edge, ids) = match parsed.start() {
@@ -715,9 +726,9 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
         }
     }
     if count {
-        return matches!(data.rows.as_slice(), [QueryRow::Count(n)] if *n <= traversal_maximum(&parsed) as u64);
+        return matches!(data.rows.as_slice(), [QueryRow::Count(n)] if *n <= traversal_maximum(parsed) as u64);
     }
-    if !valid_traversal_total(query, data.rows.len() as u32) {
+    if !valid_planned_total(parsed, data.rows.len() as u32) {
         return false;
     }
     let valid_element = |element: &QualifiedElement, expected_edge: bool| match element {
@@ -729,7 +740,7 @@ pub(super) fn valid_traversal_output(query: &Query, data: &QueryData, binding: &
             QualifiedElement::Vertex { partition, id }
             | QualifiedElement::Edge { partition, id } => (*partition, *id),
         };
-        ids.is_empty() || (partition == query.partition && ids.contains(&id))
+        ids.is_empty() || (partition == start_partition && ids.contains(&id))
     };
     let partition = |element: &QualifiedElement| match element {
         QualifiedElement::Vertex { partition, .. } | QualifiedElement::Edge { partition, .. } => {

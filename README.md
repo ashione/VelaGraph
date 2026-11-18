@@ -36,6 +36,10 @@ Internal graph, managed, coordinator and Raft transports use typed gRPC. See
 explicit-identity API changes and validation boundaries. Public HTTP
 remains supported; old JSON/TCP clients are not a supported fallback.
 
+Go clients can build a managed traversal locally and submit its steps in one
+gRPC call. See the [Go client SDK](sdk/go/README.md)
+for supported steps and snapshot selection.
+
 ## Quick start
 
 ### Try one graph query

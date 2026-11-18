@@ -35,6 +35,34 @@ pub(super) struct Retained {
     http_preflighted: std::sync::atomic::AtomicBool,
     grpc_preflighted: std::sync::atomic::AtomicBool,
 }
+fn graph_plan(traversal: public_proto::GraphTraversal) -> Result<velagraph::ObservedGremlinQuery> {
+    use public_proto::graph_step::Kind;
+    use velagraph::GremlinStep;
+    if traversal.version != 1 {
+        return Err(Error::Query(QueryFailure::Unsupported));
+    }
+    let steps = traversal
+        .steps
+        .into_iter()
+        .map(|step| {
+            Ok(match step.kind.ok_or(Error::Protocol)? {
+                Kind::In(hop) => GremlinStep::In(hop.label),
+                Kind::Out(hop) => GremlinStep::Out(hop.label),
+                Kind::Count(_) => GremlinStep::Count,
+                Kind::Path(_) => GremlinStep::Path,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    velagraph::ObservedGremlinQuery::fixed_vertex_traversal(traversal.vertex_ids, steps).map_err(
+        |cause| {
+            Error::Query(match cause {
+                velagraph::Error::TraversalLimitExceeded(_) => QueryFailure::ResourceExhausted,
+                _ => QueryFailure::InvalidArgument,
+            })
+        },
+    )
+}
+
 pub(super) fn snapshot_error(error: cohort_reads::Error) -> Error {
     managed_graph::Error::from(error).into()
 }
@@ -527,56 +555,19 @@ impl State {
             return Err(Error::Protocol);
         }
         let req = request(&query);
-        fixed_execution::validate(&req).map_err(Error::Query)?;
-        if !self
-            .config
-            .binding
-            .cohort
-            .members
-            .iter()
-            .any(|m| m.shard == u64::from(query.partition))
-        {
-            return Err(Error::Identity);
-        }
-        // Reuse the existing process-wide observed coordinator execution gate.
-        // Certification and proof preflight are part of the same admitted work.
-        let execution = fixed_execution::admit_execution().map_err(Error::Query)?;
-        self.expire();
-        let memory = self
-            .memory
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Capacity)?;
-        let mut capture = CapturedLocal::new(work, memory, execution, None);
-        let captured = self
-            .capture_local(
+        let plan = fixed_execution::parse(&req).map_err(Error::Query)?;
+        let (rows, version, expires, mut capture) = self
+            .capture_and_execute(
                 requested_profile.unwrap_or_default(),
                 version,
                 minimum_version,
                 ttl,
+                query.partition,
+                &plan,
+                work,
                 end,
-                &mut capture,
             )
-            .await;
-        let (version, expires) = match captured {
-            Ok(captured) => captured,
-            Err(error) => {
-                // Ordinary failure preserves the synchronous cleanup contract.
-                // Drop is only the fallback when this future is cancelled.
-                capture.close().await;
-                return Err(error);
-            }
-        };
-        let result = fixed_execution::execute(
-            &mut capture.sessions,
-            &req,
-            self.config.local_query_parallelism,
-            tokio::time::Instant::from_std(end.min(expires)),
-        )
-        .await
-        .map_err(Error::Query);
-        capture.close().await;
-        let rows = result?;
+            .await?;
         let descriptor = LocalSession {
             incarnation: self.incarnation,
             token: random()?,
@@ -656,6 +647,125 @@ impl State {
         sessions.insert(retained.descriptor.token, retained);
         Ok(reply)
     }
+    #[allow(clippy::too_many_arguments)]
+    async fn capture_and_execute(
+        &self,
+        profile: LocalReadProfile,
+        version: Option<u64>,
+        minimum_version: Option<u64>,
+        ttl: Duration,
+        partition: u32,
+        plan: &velagraph::ObservedGremlinQuery,
+        work: Arc<OwnedSemaphorePermit>,
+        end: Instant,
+    ) -> Result<(Vec<QueryRow>, u64, Instant, CapturedLocal)> {
+        if !self
+            .config
+            .binding
+            .cohort
+            .members
+            .iter()
+            .any(|m| m.shard == u64::from(partition))
+        {
+            return Err(Error::Identity);
+        }
+        // Reuse the existing process-wide observed coordinator execution gate.
+        // Certification and proof preflight are part of the same admitted work.
+        let execution = fixed_execution::admit_execution().map_err(Error::Query)?;
+        self.expire();
+        let memory = self
+            .memory
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Capacity)?;
+        let mut capture = CapturedLocal::new(work, memory, execution, None);
+        let captured = self
+            .capture_local(profile, version, minimum_version, ttl, end, &mut capture)
+            .await;
+        let (version, expires) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                // Ordinary failure preserves the synchronous cleanup contract.
+                // Drop is only the fallback when this future is cancelled.
+                capture.close().await;
+                return Err(error);
+            }
+        };
+        let result = fixed_execution::execute_plan(
+            &mut capture.sessions,
+            partition,
+            plan,
+            self.config.local_query_parallelism,
+            tokio::time::Instant::from_std(end.min(expires)),
+            None,
+        )
+        .await
+        .map_err(Error::Query);
+        capture.close().await;
+        let rows = result?;
+        before_deadline(end.min(expires))?;
+        Ok((rows, version, expires, capture))
+    }
+
+    pub(super) async fn execute_graph(
+        &self,
+        request: public_proto::GraphExecuteRequest,
+        work: Arc<OwnedSemaphorePermit>,
+        end: Instant,
+    ) -> Result<(u64, public_proto::QueryData, Instant, OwnedSemaphorePermit)> {
+        use public_proto::read_selector::Kind;
+        let (version, minimum) = match request
+            .read
+            .and_then(|read| read.kind)
+            .ok_or(Error::Protocol)?
+        {
+            Kind::Latest(_) => (None, None),
+            Kind::Exact(v) => (Some(v), None),
+            Kind::Minimum(v) => (None, Some(v)),
+        };
+        let traversal = request.traversal.ok_or(Error::Protocol)?;
+        let partition = traversal.partition;
+        let plan = graph_plan(traversal)?;
+        let (rows, version, expires, mut capture) = self
+            .capture_and_execute(
+                LocalReadProfile::default(),
+                version,
+                minimum,
+                MAX_TTL,
+                partition,
+                &plan,
+                work,
+                end,
+            )
+            .await?;
+        let data = QueryData {
+            rows,
+            completeness: QueryCompleteness::Unverified,
+        };
+        if !query::valid_planned_output(partition, &plan, &data, &self.config.binding) {
+            return Err(Error::Query(QueryFailure::IncompleteOrCorrupt));
+        }
+        encode(&data, pages::MAX_RESULT_BYTES)?;
+        let data = public_proto::QueryData {
+            rows: data
+                .rows
+                .iter()
+                .map(grpc_codec::out_row)
+                .collect::<Result<_>>()?,
+            completeness: public_proto::Completeness::Unverified as i32,
+        };
+        before_deadline(end.min(expires))?;
+        Ok((
+            version,
+            data,
+            end.min(expires),
+            capture
+                .memory
+                .take()
+                .expect("capture owns result reservation"),
+        ))
+    }
+
     pub(super) fn fetch_local(
         &self,
         session: LocalSession,
@@ -688,6 +798,95 @@ impl State {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    fn traversal() -> public_proto::GraphTraversal {
+        use public_proto::{graph_step::Kind, Empty, GraphHop, GraphStep};
+        public_proto::GraphTraversal {
+            version: 1,
+            partition: 7,
+            vertex_ids: vec![2, 1, 2],
+            steps: vec![
+                Kind::Out(GraphHop {
+                    label: Some("knows".into()),
+                }),
+                Kind::In(GraphHop { label: None }),
+                Kind::Path(Empty {}),
+            ]
+            .into_iter()
+            .map(|kind| GraphStep { kind: Some(kind) })
+            .collect(),
+        }
+    }
+    const TRAVERSAL_TEXT: &str = "g.V(2,1,2).out('knows').in().path()";
+
+    #[test]
+    fn graph_plan_matches_ordered_text_and_rejects_invalid_shapes() {
+        let input = traversal();
+        let expected = velagraph::ObservedGremlinQuery::parse(TRAVERSAL_TEXT).unwrap();
+        assert_eq!(graph_plan(input.clone()).unwrap(), expected);
+        let mut reordered = input.clone();
+        reordered.steps.swap(0, 1);
+        assert_ne!(graph_plan(reordered).unwrap(), expected);
+        let invalid_cases: [fn(&mut public_proto::GraphTraversal); 8] = [
+            |t: &mut public_proto::GraphTraversal| t.version = 0,
+            |t| t.vertex_ids.clear(),
+            |t| t.vertex_ids = vec![1; 33],
+            |t| t.vertex_ids[0] = u64::MAX,
+            |t| t.steps[0].kind = None,
+            |t| t.steps.swap(0, 2),
+            |t| t.steps = vec![t.steps[0].clone(); 4],
+            |t| {
+                t.steps[0].kind = Some(public_proto::graph_step::Kind::Out(
+                    public_proto::GraphHop {
+                        label: Some("bad-label".into()),
+                    },
+                ))
+            },
+        ];
+        for mutate in invalid_cases {
+            let mut invalid = input.clone();
+            mutate(&mut invalid);
+            assert!(graph_plan(invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in timing; use --release --ignored --nocapture"]
+    fn graph_plan_benchmark_v1() {
+        use std::hint::black_box;
+        let typed = traversal();
+        let text = DistributedRequest {
+            start_partition: 7,
+            text: TRAVERSAL_TEXT.into(),
+            timeout_millis: 5000,
+        };
+        assert_eq!(
+            fixed_execution::parse(&text).unwrap(),
+            graph_plan(typed.clone()).unwrap()
+        );
+        const N: usize = 2000;
+        for warmup in [true, false] {
+            let iterations = if warmup { 50 } else { N };
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(fixed_execution::parse(black_box(&text)).unwrap());
+            }
+            let text_time = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(graph_plan(black_box(typed.clone())).unwrap());
+            }
+            if !warmup {
+                println!(
+                    "graph_plan_v1 {} iterations={} text_ns/op={} typed_including_clone_ns/op={}",
+                    env!("CARGO_PKG_VERSION"),
+                    N,
+                    text_time.as_nanos() / N as u128,
+                    start.elapsed().as_nanos() / N as u128
+                );
+            }
+        }
+    }
+
     use d2_raft::transaction_decisions::Member;
     #[test]
     fn local_send_check_rejects_expiry_and_close_after_encoding() {

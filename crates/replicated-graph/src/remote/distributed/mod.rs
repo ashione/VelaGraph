@@ -602,12 +602,8 @@ impl Execution<'_> {
         }
         Ok(next)
     }
-    async fn run(
-        &mut self,
-        request: &DistributedRequest,
-        query: &GremlinQuery,
-    ) -> DistributedResponse {
-        self.route(request.start_partition)?;
+    async fn run(&mut self, start_partition: u32, query: &GremlinQuery) -> DistributedResponse {
+        self.route(start_partition)?;
         let join = scan::join_at(query)?;
         if scan::is_global(query) && join.is_none() {
             return self.run_scan(query).await;
@@ -640,7 +636,7 @@ impl Execution<'_> {
                 break;
             }
             let vertex = VertexId {
-                partition: request.start_partition,
+                partition: start_partition,
                 id: *id,
             };
             if self.boolean(Fragment::Exists(vertex)).await? {
@@ -874,7 +870,7 @@ async fn execute_transport(
                 .sessions
                 .insert(route.shard, (route.clone(), descriptor));
         }
-        execution.run(&request, &query).await
+        execution.run(request.start_partition, &query).await
     }
     .await;
     execution.close().await;
@@ -986,6 +982,15 @@ fn validate_output_bounded(
     request: &DistributedRequest,
     max_snapshots: usize,
 ) -> Result<(), RemoteError> {
+    let query = plan(request).map_err(|_| RemoteError::Protocol)?;
+    validate_planned_output(output, request.start_partition, &query, max_snapshots)
+}
+fn validate_planned_output(
+    output: &DistributedOutput,
+    start_partition: u32,
+    query: &GremlinQuery,
+    max_snapshots: usize,
+) -> Result<(), RemoteError> {
     if output.completeness != QueryCompleteness::Unverified
         || output.snapshots.is_empty()
         || output.snapshots.len() > max_snapshots
@@ -1001,7 +1006,6 @@ fn validate_output_bounded(
     {
         return Err(RemoteError::Protocol);
     }
-    let query = plan(request).map_err(|_| RemoteError::Protocol)?;
     let count = matches!(
         query.steps().last(),
         Some(Step::Existing(GremlinStep::Count))
@@ -1018,12 +1022,12 @@ fn validate_output_bounded(
         Some(Step::ValueMap(keys)) => Some(keys.as_slice()),
         _ => None,
     };
-    let directions = hierarchy::path_directions(&query);
+    let directions = hierarchy::path_directions(query);
     let hops = directions.iter().map(Vec::len).max().unwrap_or(0);
-    let joined = scan::join_at(&query)
+    let joined = scan::join_at(query)
         .map_err(|_| RemoteError::Protocol)?
         .is_some();
-    if scan::is_global(&query) && !joined && !count {
+    if scan::is_global(query) && !joined && !count {
         let keys = output
             .rows
             .iter()
@@ -1053,10 +1057,10 @@ fn validate_output_bounded(
             return Err(RemoteError::Protocol);
         }
     }
-    let out = hops != 0 || scan::is_global(&query);
-    let valid_vertex = |v: &QualifiedElement| matches!(v, QualifiedElement::Vertex { partition, .. } if out || *partition == request.start_partition);
+    let out = hops != 0 || scan::is_global(query);
+    let valid_vertex = |v: &QualifiedElement| matches!(v, QualifiedElement::Vertex { partition, .. } if out || *partition == start_partition);
     if count {
-        return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= if scan::is_global(&query) && !joined { scan::SCAN_CEILING.work as u64 } else { MAX_ROWS as u64 })
+        return if matches!(output.rows.as_slice(), [QueryRow::Count(n)] if *n <= if scan::is_global(query) && !joined { scan::SCAN_CEILING.work as u64 } else { MAX_ROWS as u64 })
         {
             Ok(())
         } else {
@@ -1072,7 +1076,7 @@ fn validate_output_bounded(
                 })
             }
             QueryRow::Path(p) if path => {
-                matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == request.start_partition)
+                matches!(p.first(), Some(QualifiedElement::Vertex { partition, .. }) if *partition == start_partition)
                     && directions.iter().any(|directions| {
                         p.len() == 1 + 2 * directions.len()
                         && p.windows(3).step_by(2).zip(directions).all(|(hop, direction)| {

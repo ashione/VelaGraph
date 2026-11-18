@@ -92,6 +92,9 @@ Gateway 已在 #276 退役旧协议，GraphService 最后调用链由 #278 完�
   使用有界typed流摊薄unary成本，但每次读仍执行原applied-epoch检查；不得以缓存epoch、
   场景特化或修改测试profile/期限掩盖回归。默认debug与release匹配对照、并发/取消/背压/
   资源饱和及原复杂用例共同验收，见 [Metadata stream](METADATA_STREAM.md)。
+- **结构化遍历 RPC**：实验性 [GraphService.Execute](PUBLIC_GRPC_SERVICE.md#graphserviceexecute)
+  接收版本化步骤，Go 客户端一次提交。首版复用 certified data-local 执行器，支持显式点 ID、
+  最多三跳 out/in 和终结 path/count；具体快照、返回上限和预算见接口契约。
 - **固定快照公共 RPC**：[#266](https://github.com/ashione/VelaGraph/issues/266) 为原 materialized
   OpenSession/Read/Traverse/TraversePage/Close 增加独立 typed `FixedSessionService`，
   与绑定单次查询结果的 data-local `QueryService` 分开；同端口、同 Invocation/admission，
