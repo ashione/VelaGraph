@@ -2189,3 +2189,167 @@ mod projection_tests;
 
 #[path = "compact_member_prefix_tests.rs"]
 mod compact_prefix_tests;
+
+/// Explicit legacy full-evidence APIs still replay, but must not replay the
+/// same durable history twice while holding one unchanged state publication lock.
+#[tokio::test]
+async fn explicit_full_evidence_reuses_one_validated_history_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+    setup(&mut sm, CapacityProfile::LegacyCountV1).await;
+    sm.forbid_coordinator_journal(false);
+    let mut journal = empty(CapacityProfile::LegacyCountV1);
+    journal.apply(begin(1)).unwrap();
+    journal.apply(abort(1)).unwrap();
+    let cut = sync_all(&mut sm, &journal).await;
+    apply(&mut sm, advance(1, &cut)).await.unwrap();
+    let before = sm.complete_history_loads.load(Ordering::Relaxed);
+    let evidence = sm
+        .participant_prefix_evidence(7, 1, [7; 16], 1, &journal)
+        .await
+        .unwrap();
+    assert_eq!(evidence, journal);
+    assert_eq!(
+        sm.complete_history_loads.load(Ordering::Relaxed) - before,
+        1
+    );
+    let before = sm.complete_history_loads.load(Ordering::Relaxed);
+    let (snapshot, evidence) = sm
+        .certified_participant_read_with_evidence(
+            7,
+            1,
+            [7; 16],
+            1,
+            crate::versioned_reads::ReadLimit {
+                rows: 20,
+                bytes: 1024,
+                operations: 1000,
+            },
+            &journal,
+        )
+        .await
+        .unwrap();
+    assert_eq!(evidence, journal);
+    assert!(snapshot.entries.is_empty());
+    assert_eq!(
+        sm.complete_history_loads.load(Ordering::Relaxed) - before,
+        1
+    );
+}
+
+#[tokio::test]
+async fn explicit_full_evidence_preserves_reopen_and_corruption_checks() {
+    for profile in [
+        CapacityProfile::LegacyCountV1,
+        CapacityProfile::ByteBound16MiBV1,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        setup(&mut sm, profile).await;
+        let journal = observed_commit(&mut sm, profile).await;
+        let cut = journal.history_cursor().unwrap();
+        apply(&mut sm, advance(1, &cut)).await.unwrap();
+        drop(sm);
+        let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        let limit = crate::versioned_reads::ReadLimit {
+            rows: 20,
+            bytes: 1024,
+            operations: 1000,
+        };
+        assert_eq!(
+            sm.participant_prefix_evidence(7, 1, [7; 16], 1, &journal)
+                .await
+                .unwrap(),
+            journal
+        );
+        assert_eq!(
+            sm.certified_participant_read_with_evidence(7, 1, [7; 16], 1, limit.clone(), &journal)
+                .await
+                .unwrap()
+                .1,
+            journal
+        );
+        for version in [0, 1] {
+            let (snapshot, evidence) = sm
+                .certified_participant_read_with_evidence(
+                    7,
+                    1,
+                    [7; 16],
+                    version,
+                    limit.clone(),
+                    &journal,
+                )
+                .await
+                .unwrap();
+            assert_eq!(evidence, journal);
+            assert_eq!(
+                snapshot.entries.get(b"x".as_slice()).map(Vec::as_slice),
+                if version == 0 {
+                    None
+                } else {
+                    Some(b"committed".as_slice())
+                }
+            );
+        }
+        for (shard, epoch, mode, version) in [
+            (8, 1, [7; 16], 1),
+            (7, 2, [7; 16], 1),
+            (7, 1, [8; 16], 1),
+            (7, 1, [7; 16], 2),
+        ] {
+            assert!(sm
+                .participant_prefix_evidence(shard, epoch, mode, version, &journal)
+                .await
+                .is_err());
+            assert!(sm
+                .certified_participant_read_with_evidence(
+                    shard,
+                    epoch,
+                    mode,
+                    version,
+                    limit.clone(),
+                    &journal
+                )
+                .await
+                .is_err());
+        }
+        let wrong = empty(profile);
+        assert!(sm
+            .participant_prefix_evidence(7, 1, [7; 16], 1, &wrong)
+            .await
+            .is_err());
+        assert!(sm
+            .certified_participant_read_with_evidence(7, 1, [7; 16], 1, limit.clone(), &wrong)
+            .await
+            .is_err());
+        let db = &sm.storage.as_ref().unwrap().db;
+        for prefix in [
+            event_ledger::PREFIX,
+            crate::decision_segments::PREFIX,
+            crate::decision_segments::MANIFEST_KEY,
+        ] {
+            let all = rows(&sm, prefix);
+            let (key, value) = all
+                .first()
+                .expect("fixture must persist raw and decision rows");
+            db.put(key, b"{}").unwrap();
+            let corrupted = disk(&sm);
+            assert!(sm
+                .participant_prefix_evidence(7, 1, [7; 16], 1, &journal)
+                .await
+                .is_err());
+            assert!(sm
+                .certified_participant_read_with_evidence(7, 1, [7; 16], 1, limit.clone(), &journal)
+                .await
+                .is_err());
+            assert_eq!(disk(&sm), corrupted);
+            db.put(key, value).unwrap();
+            assert_eq!(
+                sm.participant_prefix_evidence(7, 1, [7; 16], 1, &journal)
+                    .await
+                    .unwrap(),
+                journal
+            );
+        }
+    }
+}
