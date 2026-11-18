@@ -94,6 +94,8 @@ struct Backend<'a, 'db> {
     memo: Rc<RecordMemo>,
     // Separate from adjacency iteration, whose visitor resolves records.
     record_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
+    // True only after observing the first key beyond the previous identity.
+    record_lookahead: Cell<bool>,
     adjacency_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
 }
 fn error(error: TemporalStoreError) -> Error {
@@ -111,6 +113,7 @@ impl<'a, 'db> Backend<'a, 'db> {
             bytes: Cell::new(0),
             memo,
             record_cursor: RefCell::new(None),
+            record_lookahead: Cell::new(false),
             adjacency_cursor: RefCell::new(None),
         }
     }
@@ -161,7 +164,18 @@ impl<'a, 'db> Backend<'a, 'db> {
             crate::query_profile::read_event(crate::query_profile::ReadEvent::Iterator);
             view.snapshot.raw_iterator()
         });
-        cursor.seek(&start);
+        let reuse_lookahead = self.record_lookahead.replace(false)
+            && cursor
+                .key()
+                .is_some_and(|key| key.starts_with(&prefix) && key >= start.as_slice());
+        if reuse_lookahead {
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::LookaheadHit);
+        } else {
+            cursor.seek(&start);
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::Seek);
+        }
         loop {
             self.check()?;
             // Check status before treating an invalid cursor as absence.
@@ -170,6 +184,7 @@ impl<'a, 'db> Backend<'a, 'db> {
                 break;
             };
             if !key.starts_with(&prefix) {
+                self.record_lookahead.set(true);
                 break;
             }
             self.charge(key.len() + value.len())?;
@@ -469,6 +484,56 @@ mod tests {
         );
     }
     #[test]
+    fn corrupt_payload_reached_through_lookahead_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        store.commit(&[vertex(1, 0, Some(1), "expired")]).unwrap();
+        store
+            .db
+            .put(
+                revision_key(Key::Vertex(2), 1, 0),
+                encode_assertion(
+                    Interval { from: 0, to: None },
+                    Some(b"invalid graph payload"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(store
+            .view(None, 2)
+            .unwrap()
+            .execute_gremlin("g.V(1,2).hasLabel('missing').count()")
+            .is_err());
+    }
+    #[cfg(feature = "query-profiling")]
+    #[test]
+    fn lookahead_can_cross_record_kinds_without_skipping_endpoint_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        store
+            .commit(&[
+                vertex(1, 0, None, "one"),
+                vertex(2, 0, None, "two"),
+                TemporalMutation::Edge {
+                    valid: Interval { from: 0, to: None },
+                    edge: Edge::new(7, 1, 2, "LINK"),
+                },
+            ])
+            .unwrap();
+        let view = store.view(None, 0).unwrap();
+        let budget = Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES);
+        let backend = Backend::new(&view, &budget);
+        crate::query_profile::begin();
+        assert!(backend.get_vertex(9, &budget).unwrap().is_none());
+        assert_eq!(backend.get_edge(7, &budget).unwrap().unwrap().id, 7);
+        let stats = crate::query_profile::finish();
+        assert_eq!(stats.record_reads, 4);
+        assert_eq!(stats.record_seeks, 3);
+        assert_eq!(stats.record_lookahead_hits, 1);
+        drop(backend);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
     fn adjacency_visitor_reentry_and_error_preserve_cursor_ownership() {
         let dir = tempfile::tempdir().unwrap();
         let store = TemporalStore::open(dir.path()).unwrap();
@@ -617,6 +682,7 @@ mod tests {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            record_lookahead: Cell::new(false),
             adjacency_cursor: RefCell::new(None),
         };
         let budget = Budget::new(1);
@@ -635,6 +701,7 @@ mod tests {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            record_lookahead: Cell::new(false),
             adjacency_cursor: RefCell::new(None),
         };
         assert!(matches!(
@@ -685,6 +752,7 @@ mod tests {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            record_lookahead: Cell::new(false),
             adjacency_cursor: RefCell::new(None),
         };
         let result = GremlinQuery::parse("g.V(1,2).count()")
@@ -954,6 +1022,7 @@ mod adjacency_limits {
             bytes: Cell::new(0),
             memo: Default::default(),
             record_cursor: RefCell::new(None),
+            record_lookahead: Cell::new(false),
             adjacency_cursor: RefCell::new(None),
         };
         let result = backend.visit_adjacent_edges(
@@ -1066,6 +1135,7 @@ mod adjacency_atomicity {
                 bytes: Cell::new(0),
                 memo: Default::default(),
                 record_cursor: RefCell::new(None),
+                record_lookahead: Cell::new(false),
                 adjacency_cursor: RefCell::new(None),
             };
             let start = Instant::now();

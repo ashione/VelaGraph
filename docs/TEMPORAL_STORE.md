@@ -235,7 +235,7 @@ accounting limits, not an allocator/RSS guarantee.
 ### Reusable version cursor
 
 One execution lazily opens at most one snapshot raw iterator for vertex and edge
-record misses. Each requested identity seeks to its version bound and tests the
+record misses. Each requested identity positions at its version bound and tests the
 valid interval, with unchanged cumulative work limits and conservative raw-byte
 accounting. Decode borrows the selected key/value; it does not first copy them
 into owned boxes. Iterator errors propagate before absence can be returned.
@@ -256,6 +256,21 @@ leading-limit short circuit. There is no eager decode of later roots, no new
 query syntax, no multi-key I/O batching, and no asynchronous prefetch. Temporal
 version selection already consumes the candidate value, so a subsequent MultiGet
 would repeat reads rather than remove them.
+
+An exhausted identity scan can already be positioned at the first key of the
+next identity. A later lookup reuses this unconsumed boundary key only when it
+matches the requested identity and is at or after that identity's selected-V
+lower bound. Otherwise it seeks normally. This does not speculate forward or
+skip revision validation: status, envelope, V/T, payload, endpoint and work-budget
+checks still run. EOF and successful selected records do not create lookahead.
+The marker belongs to the execution's record cursor and never crosses views.
+
+`cargo run --locked --release -p velagraph --example temporal_record_seek_bench`
+reproduces this workload class with generated edge intervals. It creates four
+temporal edges per child, only the last visible at the fixed query time, reopens
+the store, warms ten times and checks all 200 timed results. Parsing and setup are
+outside timing. Use the same example source on compared revisions; the reported
+single-process warm latencies are not a service-throughput or cold-cache claim.
 
 ### Reproducing query-reuse checks
 

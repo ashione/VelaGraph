@@ -7,6 +7,8 @@ use std::time::Instant;
 pub struct Totals {
     pub calls: u64,
     pub record_reads: u64,
+    pub record_seeks: u64,
+    pub record_lookahead_hits: u64,
     pub record_decodes: u64,
     pub record_cache_hits: u64,
     pub record_iterators: u64,
@@ -84,6 +86,8 @@ pub(crate) fn cache_hit() {
 }
 
 pub(crate) enum ReadEvent {
+    Seek,
+    LookaheadHit,
     Head,
     AdjacencyIterator,
     AdjacencyCandidate,
@@ -96,6 +100,8 @@ pub(crate) fn read_event(event: ReadEvent) {
     ACTIVE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
             match event {
+                ReadEvent::Seek => t.record_seeks += 1,
+                ReadEvent::LookaheadHit => t.record_lookahead_hits += 1,
                 ReadEvent::Head => t.head_reads += 1,
                 ReadEvent::AdjacencyIterator => t.adjacency_iterators += 1,
                 ReadEvent::AdjacencyCandidate => t.adjacency_candidates += 1,
