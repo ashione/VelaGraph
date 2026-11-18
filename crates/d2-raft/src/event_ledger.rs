@@ -399,9 +399,14 @@ fn walk_rows(
             "ledger row header mismatch"
         );
         let mut bytes = 0usize;
-        for event in &row.events {
+        // Row::decode bounds this immutable row to MAX_HISTORY_PAGE_EVENTS.
+        // Reuse its checked canonical lengths during the event walk instead of
+        // serializing every command again just to recover the same length.
+        let mut event_sizes = [0usize; MAX_HISTORY_PAGE_EVENTS];
+        for (event, size) in row.events.iter().zip(&mut event_sizes) {
+            *size = event_size(event)?;
             bytes = bytes
-                .checked_add(event_size(event)?)
+                .checked_add(*size)
                 .filter(|bytes| *bytes <= MAX_HISTORY_PAGE_BYTES)
                 .ok_or_else(|| anyhow::anyhow!("ledger event bytes exceed row bound"))?;
         }
@@ -411,21 +416,23 @@ fn walk_rows(
             .ok_or_else(|| anyhow::anyhow!("ledger canonical bytes exceed lifetime bound"))?;
         if let Some(previous) = &tail {
             anyhow::ensure!(
-                !fits(
-                    previous.count,
-                    previous.event_bytes,
-                    event_size(&row.events[0])?
-                ),
+                !fits(previous.count, previous.event_bytes, event_sizes[0]),
                 "noncanonical ledger partition"
             );
         }
         let row_count = row.events.len();
         let before = cursor.clone();
-        let original_events = row.events.clone();
-        for event in row.events {
-            let size = event_size(&event)?;
+        // Earlier rows need only their count/byte totals for the next partition
+        // check. Only the final bounded row's events are returned to the writer;
+        // every event is still observed and included in the complete hash chain.
+        let original_events = if count + 1 == descriptor.segment_count {
+            row.events.clone()
+        } else {
+            Vec::new()
+        };
+        for (event, size) in row.events.into_iter().zip(event_sizes) {
             cursor = cursor
-                .extend(std::slice::from_ref(&event))
+                .extend_sized_event(&event, size)
                 .map_err(history_error)?;
             observe(event, &cursor, size)?;
         }
@@ -1572,19 +1579,17 @@ impl Projection {
                 payload,
                 transaction_id,
                 participants,
-            } => {
-                if matches!(&self.key, LookupKey::Request(wanted) if wanted == id)
-                    || matches!(&self.key, LookupKey::Transaction(wanted) if wanted == transaction_id)
-                {
-                    anyhow::ensure!(self.request.is_none(), "duplicate retained request");
-                    self.request = Some(RequestRecord {
-                        id: *id,
-                        request: request.clone(),
-                        payload: payload.clone(),
-                        transaction_id: *transaction_id,
-                    });
-                    self.admit(*transaction_id, participants)?;
-                }
+            } if matches!(&self.key, LookupKey::Request(wanted) if wanted == id)
+                || matches!(&self.key, LookupKey::Transaction(wanted) if wanted == transaction_id) =>
+            {
+                anyhow::ensure!(self.request.is_none(), "duplicate retained request");
+                self.request = Some(RequestRecord {
+                    id: *id,
+                    request: request.clone(),
+                    payload: payload.clone(),
+                    transaction_id: *transaction_id,
+                });
+                self.admit(*transaction_id, participants)?;
             }
             Command::Begin { id, participants } => {
                 if matches!(&self.key, LookupKey::Transaction(wanted) if wanted == id) {

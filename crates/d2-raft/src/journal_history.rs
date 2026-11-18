@@ -103,12 +103,7 @@ impl HistoryCursor {
     /// Extend the profile-bound chain once per original event. Semantic replay is
     /// the caller's responsibility; no independently invented ledger hash exists.
     pub(crate) fn extend(&self, events: &[Command]) -> Result<Self, Error> {
-        self.validate()?;
-        let event_count = self
-            .event_count
-            .checked_add(u64::try_from(events.len()).map_err(|_| Error::InvalidJournal)?)
-            .filter(|count| *count <= self.cohort.profile.max_history_events())
-            .ok_or(Error::InvalidJournal)?;
+        let event_count = self.extended_count(events.len())?;
         let mut root = self.root;
         for (offset, event) in events.iter().enumerate() {
             root = event_root(
@@ -118,6 +113,28 @@ impl HistoryCursor {
                 event,
             )?;
         }
+        Ok(Self {
+            event_count,
+            root,
+            ..self.clone()
+        })
+    }
+
+    fn extended_count(&self, additional: usize) -> Result<u64, Error> {
+        self.validate()?;
+        self.event_count
+            .checked_add(u64::try_from(additional).map_err(|_| Error::InvalidJournal)?)
+            .filter(|count| *count <= self.cohort.profile.max_history_events())
+            .ok_or(Error::InvalidJournal)
+    }
+
+    /// Reuse the raw walker's checked size for this immutable event. The size is
+    /// checked again by bounded serialization, or the operation fails. No
+    /// bytes, cursor root or semantic result are trusted from an unverified hint,
+    /// and no full-history serialization buffer is allocated.
+    pub(crate) fn extend_sized_event(&self, event: &Command, bytes: usize) -> Result<Self, Error> {
+        let event_count = self.extended_count(1)?;
+        let root = event_root_sized(self.cohort.profile, self.root, event_count, event, bytes)?;
         Ok(Self {
             event_count,
             root,
@@ -267,6 +284,7 @@ impl Write for HashWriter {
         Ok(())
     }
 }
+
 fn identity_root(authority: &Authority, cohort: &Cohort) -> Result<[u8; 32], Error> {
     #[derive(Serialize)]
     struct Identity<'a> {
@@ -293,17 +311,46 @@ fn event_root(
     event: &Command,
 ) -> Result<[u8; 32], Error> {
     let bytes = event_size(event, MAX_HISTORY_PAGE_BYTES)?;
-    let mut hash = HashWriter(Sha256::new());
-    hash.0.update(if profile.is_legacy() {
+    let mut hash = HashWriter(event_hasher(profile, previous, index, bytes));
+    serde_json::to_writer(&mut hash, event).map_err(|_| Error::InvalidJournal)?;
+    Ok(hash.0.finalize().into())
+}
+
+fn event_root_sized(
+    profile: CapacityProfile,
+    previous: [u8; 32],
+    index: u64,
+    event: &Command,
+    bytes: usize,
+) -> Result<[u8; 32], Error> {
+    if bytes > MAX_HISTORY_PAGE_BYTES {
+        return Err(Error::Capacity);
+    }
+    // Only the already-counted raw-walker path uses a bounded event buffer.
+    // A slice writer cannot grow beyond the admitted size, even on a bad hint.
+    // Both overrun and unfilled trailing bytes fail before returning a digest.
+    let mut encoded = vec![0; bytes];
+    let mut remaining = encoded.as_mut_slice();
+    serde_json::to_writer(&mut remaining, event).map_err(|_| Error::InvalidJournal)?;
+    if !remaining.is_empty() {
+        return Err(Error::InvalidJournal);
+    }
+    let mut hash = event_hasher(profile, previous, index, bytes);
+    hash.update(&encoded);
+    Ok(hash.finalize().into())
+}
+
+fn event_hasher(profile: CapacityProfile, previous: [u8; 32], index: u64, bytes: usize) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(if profile.is_legacy() {
         EVENT_DOMAIN
     } else {
         BYTE_EVENT_DOMAIN
     });
-    hash.0.update(previous);
-    hash.0.update(index.to_be_bytes());
-    hash.0.update((bytes as u64).to_be_bytes());
-    serde_json::to_writer(&mut hash, event).map_err(|_| Error::InvalidJournal)?;
-    Ok(hash.0.finalize().into())
+    hash.update(previous);
+    hash.update(index.to_be_bytes());
+    hash.update((bytes as u64).to_be_bytes());
+    hash
 }
 
 impl Journal {
@@ -999,6 +1046,172 @@ mod tests {
         }
         assert_eq!(serde_json::to_vec(&event).unwrap().len(), target);
         event
+    }
+
+    #[test]
+    fn sized_event_hash_preserves_streaming_roots_and_bounds() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            for size in [1024, 8191, 8192, 8193, 65536, MAX_HISTORY_PAGE_BYTES] {
+                let event = command_with_size(size);
+                let encoded = serde_json::to_vec(&event).unwrap();
+                let mut reference = HashWriter(Sha256::new());
+                reference.0.update(if profile.is_legacy() {
+                    EVENT_DOMAIN
+                } else {
+                    BYTE_EVENT_DOMAIN
+                });
+                reference.0.update([17; 32]);
+                reference.0.update(1234u64.to_be_bytes());
+                reference.0.update((encoded.len() as u64).to_be_bytes());
+                serde_json::to_writer(&mut reference, &event).unwrap();
+                let expected = <[u8; 32]>::from(reference.0.finalize());
+                assert_eq!(
+                    event_root_sized(profile, [17; 32], 1234, &event, size).unwrap(),
+                    expected,
+                    "profile={profile:?}, bytes={size}"
+                );
+                assert_eq!(
+                    event_root(profile, [17; 32], 1234, &event).unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(
+                event_root(
+                    profile,
+                    [17; 32],
+                    1234,
+                    &command_with_size(MAX_HISTORY_PAGE_BYTES + 1)
+                ),
+                Err(Error::Capacity)
+            );
+        }
+    }
+
+    #[test]
+    fn sized_event_rechecks_hint_identity_and_count_without_changing_cursor() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let mut domain = cohort();
+            domain.profile = profile;
+            let cursor = HistoryCursor::empty(
+                Authority {
+                    shard: domain.coordinator_shard,
+                    mode: [9; 16],
+                },
+                domain,
+            )
+            .unwrap();
+            let event = command_with_size(1024);
+            let before = cursor.clone();
+            assert_eq!(
+                cursor.extend_sized_event(&event, 1024),
+                cursor.extend(std::slice::from_ref(&event))
+            );
+            for size in [0, 1023, 1025] {
+                assert_eq!(
+                    cursor.extend_sized_event(&event, size),
+                    Err(Error::InvalidJournal)
+                );
+            }
+            assert_eq!(
+                cursor.extend_sized_event(&event, usize::MAX),
+                Err(Error::Capacity)
+            );
+            assert_eq!(cursor, before);
+            let mut full = cursor.clone();
+            full.event_count = profile.max_history_events();
+            assert_eq!(
+                full.extend_sized_event(&event, 1024),
+                Err(Error::InvalidJournal)
+            );
+            let mut malformed = cursor;
+            malformed.root[0] ^= 1;
+            assert_eq!(
+                malformed.extend_sized_event(&event, 1024),
+                Err(Error::IncompatibleHistory)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "paired retained-event serialization microbenchmark; full lifecycle is separate"]
+    fn canonical_event_hash_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let fixture =
+            Journal::decode(include_bytes!("../tests/fixtures/request-journal-v3.json")).unwrap();
+        let admitted = fixture
+            .events()
+            .iter()
+            .find(|event| matches!(event, Command::AdmitRequest { .. }))
+            .unwrap()
+            .clone();
+        let events = [
+            ("synthetic-1k", command_with_size(1024)),
+            ("synthetic-8k", command_with_size(8193)),
+            ("synthetic-64k", command_with_size(65536)),
+            ("retained-plan", admitted),
+        ];
+        for (label, event) in events {
+            let size = event_size(&event, MAX_HISTORY_PAGE_BYTES).unwrap();
+            let expected =
+                event_root(CapacityProfile::ByteBound16MiBV1, [17; 32], 1234, &event).unwrap();
+            let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+            for round in 0..15 {
+                let order = match round % 3 {
+                    0 => [0, 1, 2],
+                    1 => [2, 0, 1],
+                    _ => [1, 2, 0],
+                };
+                for implementation in order {
+                    let started = Instant::now();
+                    for _ in 0..100 {
+                        let current = black_box(&event);
+                        let digest = if implementation == 0 {
+                            // Original generic extension: size pass plus hash.
+                            event_root(CapacityProfile::ByteBound16MiBV1, [17; 32], 1234, current)
+                                .unwrap()
+                        } else if implementation == 1 {
+                            // Original raw walker: row admission, observer size,
+                            // then the generic extension's size pass and hash.
+                            for _ in 0..2 {
+                                assert_eq!(
+                                    black_box(event_size(current, MAX_HISTORY_PAGE_BYTES).unwrap()),
+                                    size
+                                );
+                            }
+                            event_root(CapacityProfile::ByteBound16MiBV1, [17; 32], 1234, current)
+                                .unwrap()
+                        } else {
+                            // New raw walker: include row admission, then hash
+                            // every byte while checking the retained length.
+                            let admitted = event_size(current, MAX_HISTORY_PAGE_BYTES).unwrap();
+                            event_root_sized(
+                                CapacityProfile::ByteBound16MiBV1,
+                                [17; 32],
+                                1234,
+                                current,
+                                admitted,
+                            )
+                            .unwrap()
+                        };
+                        assert_eq!(black_box(digest), expected);
+                    }
+                    if round >= 3 {
+                        samples[implementation].push(started.elapsed().as_micros());
+                    }
+                }
+            }
+            eprintln!(
+                "EVENT_HASH case={label} bytes={size} iterations=100 original_root_us={:?} original_walk_us={:?} sized_walk_us={:?}",
+                samples[0], samples[1], samples[2]
+            );
+        }
     }
 
     #[test]
