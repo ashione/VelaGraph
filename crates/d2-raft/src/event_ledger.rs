@@ -673,9 +673,24 @@ fn verify_coordinator_rows(
     snapshot: &Snapshot<'_>,
     cut: &PublishedArchiveCut,
 ) -> anyhow::Result<Tail> {
+    verify_coordinator_rows_observed(snapshot, cut, None)
+}
+
+type RawObserver<'a> = &'a mut dyn FnMut(&Command) -> anyhow::Result<()>;
+
+fn verify_coordinator_rows_observed(
+    snapshot: &Snapshot<'_>,
+    cut: &PublishedArchiveCut,
+    mut observe: Option<RawObserver<'_>>,
+) -> anyhow::Result<Tail> {
     #[cfg(test)]
     if ORIGINAL_COORDINATOR_VERIFY.get() {
-        return walk(snapshot, &cut.descriptor, |_, _, _| Ok(()));
+        return walk(snapshot, &cut.descriptor, |event, _, _| {
+            if let Some(observer) = observe.as_mut() {
+                observer(&event)?;
+            }
+            Ok(())
+        });
     }
     #[cfg(test)]
     RAW_WALKS.set(RAW_WALKS.get() + 1);
@@ -720,8 +735,19 @@ fn verify_coordinator_rows(
             .checked_add(witness.bytes)
             .ok_or_else(|| anyhow::anyhow!("ledger row byte overflow"))?;
         count += 1;
+        // Projection mode decodes in this same verified namespace iteration.
+        let decoded = if observe.is_some() || count == expected.len() {
+            Some(Row::decode(&value)?)
+        } else {
+            None
+        };
+        if let Some(observer) = observe.as_mut() {
+            for event in &decoded.as_ref().unwrap().events {
+                observer(event)?;
+            }
+        }
         if count == expected.len() {
-            let row = Row::decode(&value)?;
+            let row = decoded.unwrap();
             anyhow::ensure!(
                 row.domain == descriptor.domain
                     && row.first == witness.first
@@ -768,6 +794,74 @@ fn verify_coordinator_rows(
         "incomplete ledger byte inventory"
     );
     tail.ok_or_else(|| anyhow::anyhow!("missing ledger tail"))
+}
+
+/// Coordinator-only ordered projection. Unlike the general archive snapshot
+/// helper, this preserves the explicit full-history API's error ordering.
+pub(super) fn coordinator_prefix(
+    db: &DB,
+    cut: &PublishedArchiveCut,
+    version: u64,
+    validate_caller_and_manifest: impl FnOnce() -> Result<Vec<u8>, D1Error>,
+) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+    let snapshot = db.snapshot();
+    if snapshot
+        .get(super::D1_KEY)
+        .map_err(|_| D1Error::EventLedgerUnavailable)?
+        .as_deref()
+        != Some(cut.metadata.as_slice())
+    {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    let applied: Option<LogId<NodeId>> = snapshot
+        .get(super::APPLIED_KEY)
+        .map_err(|_| D1Error::EventLedgerUnavailable)?
+        .map(|bytes| serde_json::from_slice(&bytes))
+        .transpose()
+        .map_err(|_| D1Error::EventLedgerHistory)?
+        .flatten();
+    if applied != cut.descriptor.applied {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    crate::request_index::reject_retired_snapshot(&snapshot).map_err(super::ledger_read_error)?;
+    let domain = &cut.descriptor.domain;
+    let identity = crate::decision_segments::CheckpointIdentity {
+        role: crate::decision_segments::Role::Coordinator,
+        authority: domain.authority.clone(),
+        shard: domain.shard,
+        epoch: domain.epoch,
+        mode: domain.mode,
+        cohort: domain.cohort.clone(),
+    };
+    let mut rows =
+        crate::decision_segments::RequestedRows::new(&identity, cut.resolved_prefix, version);
+    let mut collector = crate::terminal_prefix::collector::Collector::new(
+        domain.authority.mode,
+        domain.cohort.clone(),
+        version,
+    );
+    let mut projection = OrderedTerminals::new(domain.cohort.profile);
+    verify_coordinator_rows_observed(
+        &snapshot,
+        cut,
+        Some(&mut |event| {
+            projection.observe(event, &mut |tx| {
+                rows.observe(&snapshot, &tx);
+                collector.observe(&tx);
+                Ok(())
+            })
+        }),
+    )
+    .map_err(super::ledger_read_error)?;
+    projection
+        .matches(&cut.checkpoint)
+        .map_err(super::ledger_read_error)?;
+    // Includes the original manifest mutex lock, after raw and caller checks.
+    let cached = validate_caller_and_manifest()?;
+    rows.finish(&snapshot, &cached)?;
+    collector
+        .finish()
+        .map_err(|_| D1Error::DecisionIndexHistory)
 }
 
 /// An operation-local snapshot verified against the private publication witness.

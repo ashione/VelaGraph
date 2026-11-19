@@ -1693,9 +1693,10 @@ impl StateMachine {
         })
     }
 
-    /// Project the requested terminal cut from a temporarily materialized full
-    /// authority. S2 retains this explicit control-read boundary; only the
-    /// requested terminal rows are checked against the complete Journal.
+    /// Project the requested terminal cut after complete raw authority checks.
+    /// Active coordinators stream a projection without a complete Journal;
+    /// legacy representations retain full materialization. Only intersecting
+    /// decision rows are checked, in full, before truncating the response.
     pub async fn coordinator_terminal_prefix(
         &self,
         shard: u64,
@@ -1704,8 +1705,36 @@ impl StateMachine {
         version: u64,
     ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
         let state = self.state.read().await;
-        // Terminal range validation deliberately retains the complete temporary
-        // authority path in S2; it never keeps that Journal in published state.
+        if let Some(d1) = state.d1.as_ref().filter(|d1| {
+            d1.coordinator
+                .as_ref()
+                .is_some_and(|journal| journal.active().is_some())
+        }) {
+            if let Some(cut) = self.archive_cut(&state)? {
+                let storage = self.storage.as_ref().ok_or(D1Error::EventLedgerHistory)?;
+                return blocking_section(|| {
+                    event_ledger::coordinator_prefix(&storage.db, cut, version, || {
+                        d1.check_shard(shard)?;
+                        d1.check_epoch(epoch)?;
+                        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                            return Err(D1Error::ManagedModeConflict);
+                        }
+                        if version > d1.coordinator.as_ref().unwrap().resolved_prefix() {
+                            return Err(D1Error::VisibilityUnresolved);
+                        }
+                        let manifest = storage
+                            .decision_manifest
+                            .lock()
+                            .map_err(|_| D1Error::DecisionIndexUnavailable)?;
+                        Ok(manifest
+                            .as_ref()
+                            .ok_or(D1Error::DecisionIndexHistory)?
+                            .clone())
+                    })
+                });
+            }
+        }
+        // Legacy representations retain complete temporary authority validation.
         let persisted =
             blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
         let d1 = persisted
