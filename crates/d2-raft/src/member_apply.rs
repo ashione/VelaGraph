@@ -110,6 +110,7 @@ impl StateMachine {
         self.verify_member_archive(state, event_ledger::verify_active)
     }
 
+    #[cfg(test)]
     pub(super) fn verified_member_apply<'db, 'cut>(
         &'db self,
         state: &'cut StateMachineData,
@@ -169,8 +170,15 @@ impl StateMachine {
             .storage
             .as_ref()
             .ok_or_else(|| fail(anyhow::anyhow!("active member lacks disk")))?;
+        let mut entries = entries.into_iter().peekable();
+        let first_command = entries.peek().and_then(|entry| match &entry.payload {
+            EntryPayload::Normal(LogCommand::D1V1(command)) => Some(command),
+            _ => None,
+        });
         let (verified, verified_tail) = self
-            .verified_member_apply(sm)
+            .verify_member_archive(sm, |db, cut| {
+                event_ledger::verify_member_command(db, cut, first_command)
+            })
             .map_err(|e| fail(anyhow::anyhow!("member archive: {e:?}")))?
             .ok_or_else(|| fail(anyhow::anyhow!("active member lacks publication cut")))?;
         let old_a = sm.d1.as_ref().unwrap().visibility.as_ref().unwrap().applied;

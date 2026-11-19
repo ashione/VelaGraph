@@ -1824,7 +1824,14 @@ impl StateMachine {
             .archive_cut(sm)
             .map_err(|e| fail(anyhow::anyhow!("active archive cut: {e:?}")))?
             .ok_or_else(|| fail(anyhow::anyhow!("active coordinator lacks publication cut")))?;
-        let verified = event_ledger::verify_active(&storage.db, cut)
+        let mut entries = entries.into_iter().peekable();
+        let first_command = entries.peek().and_then(|entry| match &entry.payload {
+            EntryPayload::Normal(LogCommand::D1V1(D1Command::Coordinator { command, .. })) => {
+                Some(command)
+            }
+            _ => None,
+        });
+        let verified = event_ledger::verify_coordinator_command(&storage.db, cut, first_command)
             .map_err(|error| fail(anyhow::anyhow!("active archive verification: {error:?}")))?;
         let current = sm
             .d1
