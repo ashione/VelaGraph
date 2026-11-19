@@ -109,6 +109,13 @@ Already observed record-boundary lookahead can also avoid a redundant seek while
 retaining the normal visibility and validation checks. See
 [temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
 API examples, cache bounds and validation limits.
+Temporal point reads build fixed-width revision keys on the stack and borrow
+their identity prefix, avoiding temporary key allocations during record lookup.
+For repeated reads at a fixed local V, `TemporalStore::materialize` builds an
+owned, bounded [temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md).
+Its covering rows preserve business-time selection and reuse the Gremlin executor
+without query-time KV access. Construction, refresh and memory costs remain
+explicit; the model never refreshes itself.
 Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
 storage engine; removing SQL did not remove it.

@@ -933,3 +933,11 @@ independent-process acceptance injects a lost public reply and checks recovery
 from a second gateway plus unchanged certified V and complete data after explicit
 original-ID replay. This adds no automatic retry or session failover; the
 remaining multi-gateway routing and availability gates keep #221 open.
+
+### Owned fixed-V temporal read model
+
+The optional standalone `TemporalReadModel` validates source revisions/candidates
+and materializes covering adjacency rows for repeated local reads. It preserves
+all business times at one V, explicit bounds and ownership; no implicit refresh,
+incremental updater, service cache or distributed certification is added. See
+[MATERIALIZED_TEMPORAL_READS.md](MATERIALIZED_TEMPORAL_READS.md).

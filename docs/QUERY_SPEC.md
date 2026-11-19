@@ -685,3 +685,13 @@ edges and endpoints at the same V/T; no distributed query is implied. Order, bag
 unchanged. One query shares cumulative temporal revision/byte work bounds,
 logical allocation accounting and a cooperative deadline. See the precise
 [temporal query contract](TEMPORAL_STORE.md#official-gremlin-point-query-integration).
+
+## Owned materialized temporal entrypoint
+
+The standalone temporal store's optional [owned read model](MATERIALIZED_TEMPORAL_READS.md)
+reuses this parser and executor at one captured local V and caller-selected T.
+It preserves explicit-ID order, multiplicity, values, properties and traversal
+semantics. Global starts stay unsupported. Its explicit 65,536-operation / 64 MiB
+logical-work maxima are separate from disk physical-revision accounting, while
+this executor's live-memory, result, hop and deadline limits remain in force.
+This is not a managed/cohort or distributed read entrypoint.

@@ -6,6 +6,11 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct Totals {
     pub calls: u64,
+    /// Covering candidates visited in an owned fixed-V read model.
+    pub materialized_candidates: u64,
+    pub materialized_vertex_checks: u64,
+    pub materialized_vertex_clones: u64,
+    pub materialized_edge_clones: u64,
     pub record_reads: u64,
     pub record_seeks: u64,
     pub record_lookahead_hits: u64,
@@ -86,6 +91,10 @@ pub(crate) fn cache_hit() {
 }
 
 pub(crate) enum ReadEvent {
+    MaterializedCandidate,
+    MaterializedVertexCheck,
+    MaterializedVertexClone,
+    MaterializedEdgeClone,
     Seek,
     LookaheadHit,
     Head,
@@ -100,6 +109,10 @@ pub(crate) fn read_event(event: ReadEvent) {
     ACTIVE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
             match event {
+                ReadEvent::MaterializedCandidate => t.materialized_candidates += 1,
+                ReadEvent::MaterializedVertexCheck => t.materialized_vertex_checks += 1,
+                ReadEvent::MaterializedVertexClone => t.materialized_vertex_clones += 1,
+                ReadEvent::MaterializedEdgeClone => t.materialized_edge_clones += 1,
                 ReadEvent::Seek => t.record_seeks += 1,
                 ReadEvent::LookaheadHit => t.record_lookahead_hits += 1,
                 ReadEvent::Head => t.head_reads += 1,

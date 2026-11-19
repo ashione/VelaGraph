@@ -155,8 +155,8 @@ impl<'a, 'db> Backend<'a, 'db> {
             use crate::query_profile::{read_event, ReadEvent};
             read_event(ReadEvent::Read);
         }
-        let prefix = identity_prefix(identity);
-        let start = revision_key(identity, self.view.version, 0);
+        let start = revision_key_bytes(identity, self.view.version, 0);
+        let prefix = &start[..IDENTITY_PREFIX_LEN];
         let view: &'a TemporalStoreView<'db> = self.view;
         let mut slot = self.record_cursor.borrow_mut();
         let cursor = slot.get_or_insert_with(|| {
@@ -167,12 +167,12 @@ impl<'a, 'db> Backend<'a, 'db> {
         let reuse_lookahead = self.record_lookahead.replace(false)
             && cursor
                 .key()
-                .is_some_and(|key| key.starts_with(&prefix) && key >= start.as_slice());
+                .is_some_and(|key| key.starts_with(prefix) && key >= start.as_slice());
         if reuse_lookahead {
             #[cfg(feature = "query-profiling")]
             crate::query_profile::read_event(crate::query_profile::ReadEvent::LookaheadHit);
         } else {
-            cursor.seek(&start);
+            cursor.seek(start.as_slice());
             #[cfg(feature = "query-profiling")]
             crate::query_profile::read_event(crate::query_profile::ReadEvent::Seek);
         }
@@ -183,7 +183,7 @@ impl<'a, 'db> Backend<'a, 'db> {
             let Some((key, value)) = cursor.item() else {
                 break;
             };
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(prefix) {
                 self.record_lookahead.set(true);
                 break;
             }
