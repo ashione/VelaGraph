@@ -898,7 +898,7 @@ pub(super) struct VerifiedArchive<'db, 'cut> {
     snapshot: Snapshot<'db>,
     cut: &'cut PublishedArchiveCut,
     tail: Tail,
-    queries: MemberQueries,
+    queries: ArchiveQueries,
 }
 
 pub(super) fn verify_active<'db, 'cut>(
@@ -928,7 +928,7 @@ fn verify_active_inner<'db, 'cut>(
         db,
         cut,
         retain_member_tail,
-        MemberQueries::default(),
+        ArchiveQueries::default(),
         |_| {},
     )
 }
@@ -951,7 +951,7 @@ pub(super) fn verify_member_prefix(
         cut.descriptor.domain.cohort.clone(),
         version,
     );
-    verify_active_observed(db, cut, false, MemberQueries::default(), |tx| {
+    verify_active_observed(db, cut, false, ArchiveQueries::default(), |tx| {
         collector.observe(tx)
     })?;
     collector
@@ -962,10 +962,54 @@ pub(super) fn verify_member_prefix(
 // Speculative, bounded to the first command in the batch. The verified
 // archive owns the projections, so they cannot outlive its immutable snapshot.
 #[derive(Default)]
-struct MemberQueries {
+struct ArchiveQueries {
     by_id: Vec<Projection>,
     ordinal: Option<u64>,
     terminal: Option<Transaction>,
+}
+
+impl ArchiveQueries {
+    fn admission(request: [u8; 16], transaction: [u8; 16]) -> Self {
+        Self {
+            by_id: vec![
+                Projection::new(LookupKey::Request(request)),
+                Projection::new(LookupKey::Transaction(transaction)),
+            ],
+            ..Self::default()
+        }
+    }
+
+    fn observe_keys(&mut self, event: &Command) {
+        // Lookup errors belong to their original command. Discard the hint
+        // so the normal lookup reproduces the error in command order.
+        self.by_id.retain_mut(|query| query.observe(event).is_ok());
+    }
+}
+
+pub(super) fn verify_coordinator_command<'db, 'cut>(
+    db: &'db DB,
+    cut: &'cut PublishedArchiveCut,
+    command: Option<&Command>,
+) -> Result<VerifiedArchive<'db, 'cut>, D1Error> {
+    if cut.descriptor.domain.role != Role::Coordinator {
+        return Err(D1Error::EventLedgerHistory);
+    }
+    // New admissions look up both namespaces during apply and again during
+    // independent suffix staging. Those answers share one immutable prefix.
+    let Some(Command::AdmitRequest {
+        id, transaction_id, ..
+    }) = command
+    else {
+        return verify_active(db, cut);
+    };
+    verify_active_observed(
+        db,
+        cut,
+        false,
+        ArchiveQueries::admission(*id, *transaction_id),
+        |_| {},
+    )
+    .map(|(archive, _)| archive)
 }
 
 pub(super) fn verify_member_command<'db, 'cut>(
@@ -977,7 +1021,7 @@ pub(super) fn verify_member_command<'db, 'cut>(
     if cut.descriptor.domain.role != Role::Member {
         return Err(D1Error::EventLedgerHistory);
     }
-    let mut queries = MemberQueries::default();
+    let mut queries = ArchiveQueries::default();
     match command {
         Some(D1Command::AdvanceRetained { ordinal, .. }) => queries.ordinal = Some(*ordinal),
         Some(D1Command::PrepareRetained(prepare)) => queries.by_id.push(Projection::new(
@@ -987,10 +1031,7 @@ pub(super) fn verify_member_command<'db, 'cut>(
             Some(Command::AdmitRequest {
                 id, transaction_id, ..
             }) => {
-                queries.by_id.push(Projection::new(LookupKey::Request(*id)));
-                queries
-                    .by_id
-                    .push(Projection::new(LookupKey::Transaction(*transaction_id)));
+                queries = ArchiveQueries::admission(*id, *transaction_id);
             }
             Some(
                 Command::Begin { id, .. }
@@ -1010,7 +1051,7 @@ fn verify_active_observed<'db, 'cut>(
     db: &'db DB,
     cut: &'cut PublishedArchiveCut,
     retain_member_tail: bool,
-    mut queries: MemberQueries,
+    mut queries: ArchiveQueries,
     mut observe_terminal: impl FnMut(&Transaction),
 ) -> Result<(VerifiedArchive<'db, 'cut>, Vec<Transaction>), D1Error> {
     let snapshot = cut.snapshot(db)?;
@@ -1059,11 +1100,7 @@ fn verify_active_observed<'db, 'cut>(
         let mut projection = OrderedTerminals::new(domain.cohort.profile);
         let mut failed_decision = None;
         let result = walk(&snapshot, &cut.descriptor, |event, _, _| {
-            // A speculative lookup error belongs to its original caller. Drop
-            // that hint so the normal lookup reproduces it in command order.
-            queries
-                .by_id
-                .retain_mut(|query| query.observe(&event).is_ok());
+            queries.observe_keys(&event);
             projection.observe(&event, &mut |tx| {
                 rows.observe(&tx).map_err(|error| {
                     failed_decision = Some(error);
@@ -1103,8 +1140,18 @@ fn verify_active_observed<'db, 'cut>(
             return Err(D1Error::EventLedgerHistory);
         }
         tail
-    } else {
+    } else if queries.by_id.is_empty() {
         verify_coordinator_rows(&snapshot, cut).map_err(super::ledger_read_error)?
+    } else {
+        verify_coordinator_rows_observed(
+            &snapshot,
+            cut,
+            Some(&mut |event| {
+                queries.observe_keys(event);
+                Ok(())
+            }),
+        )
+        .map_err(super::ledger_read_error)?
     };
     Ok((
         VerifiedArchive {
@@ -1515,9 +1562,7 @@ impl<'db, 'cut> VerifiedArchive<'db, 'cut> {
             }
             Ok(())
         };
-        walk(&self.snapshot, &self.cut.descriptor, |event, _, _| {
-            observe(&event)
-        })?;
+        observe_commands(&self.snapshot, self.cut, &mut observe)?;
         for event in overlay {
             observe(event)?;
         }
@@ -3056,6 +3101,50 @@ mod tests {
             .validate(&member)
             .unwrap();
         member
+    }
+
+    #[test]
+    fn coordinator_admission_lookups_share_only_the_verified_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open_default(dir.path()).unwrap();
+        let state = archive_state(CapacityProfile::ByteBound16MiBV1, 36);
+        let cut = persist_archive(&db, &state, marker(10));
+        let journal = state.coordinator.as_ref().unwrap().full().unwrap();
+        let mut command = journal
+            .events()
+            .iter()
+            .find(|e| matches!(e, Command::AdmitRequest { .. }))
+            .unwrap()
+            .clone();
+        let Command::AdmitRequest {
+            id: request_id,
+            transaction_id,
+            ..
+        } = &mut command
+        else {
+            unreachable!()
+        };
+        let existing_request = *request_id;
+        *transaction_id = id(3000);
+        let suffix = [begin(3000), decide(3000, Decision::Abort)];
+        let reference = verify_active(&db, &cut).unwrap();
+        let verified = verify_coordinator_command(&db, &cut, Some(&command)).unwrap();
+        for key in [
+            LookupKey::Request(existing_request),
+            LookupKey::Transaction(id(3000)),
+        ] {
+            for overlay in [&[][..], &suffix] {
+                let expected = reference.lookup(key, overlay).unwrap();
+                let walks = raw_walks();
+                assert_eq!(verified.lookup(key, overlay).unwrap(), expected);
+                assert_eq!(raw_walks(), walks);
+            }
+        }
+        db.put(cut.descriptor.domain.key(1), b"{}").unwrap();
+        assert_eq!(
+            verify_coordinator_command(&db, &cut, Some(&command)).err(),
+            Some(D1Error::EventLedgerHistory)
+        );
     }
 
     #[test]
