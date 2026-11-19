@@ -19,8 +19,15 @@ impl Backend<'_, '_> {
         }
     }
     fn charge(&self, bytes: usize) -> crate::Result<()> {
+        self.charge_many(1, bytes)
+    }
+    fn charge_many(&self, operations: usize, bytes: usize) -> crate::Result<()> {
         self.check()?;
-        let n = self.used.get() + 1;
+        let n = self
+            .used
+            .get()
+            .checked_add(operations)
+            .ok_or_else(work_error)?;
         let b = self
             .bytes
             .get()
@@ -123,23 +130,47 @@ impl Backend<'_, '_> {
         } else {
             &g.outgoing[*slot as usize]
         };
-        for index in rows {
-            #[cfg(feature = "query-profiling")]
-            crate::query_profile::read_event(
-                crate::query_profile::ReadEvent::MaterializedCandidate,
-            );
-            self.charge(ROW_WORK_BYTES)?;
-            check()?;
-            let row = g.rows[*index as usize];
-            if !row.contains(self.view.time)
-                || label.is_some_and(|l| l != g.labels[row.label as usize])
-            {
-                continue;
+        let summaries = if incoming {
+            &g.incoming_blocks[*slot as usize]
+        } else {
+            &g.outgoing_blocks[*slot as usize]
+        };
+        for (block, chunk) in rows.chunks(blocks::BLOCK_ROWS).enumerate() {
+            if let Some(summary) = summaries.get(block) {
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::read_event(
+                    crate::query_profile::ReadEvent::MaterializedBlock,
+                );
+                if !summary.may_contain(self.view.time) {
+                    // Preserve the original logical admission, even though no
+                    // candidate row or payload needs to be visited physically.
+                    self.charge_many(chunk.len(), chunk.len() * ROW_WORK_BYTES)?;
+                    check()?;
+                    #[cfg(feature = "query-profiling")]
+                    crate::query_profile::read_event(
+                        crate::query_profile::ReadEvent::MaterializedSkipped(chunk.len()),
+                    );
+                    continue;
+                }
             }
-            if !self.visible(row.from)? || !self.visible(row.to)? {
-                continue;
+            for index in chunk {
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::read_event(
+                    crate::query_profile::ReadEvent::MaterializedCandidate,
+                );
+                self.charge(ROW_WORK_BYTES)?;
+                check()?;
+                let row = g.rows[*index as usize];
+                if !row.contains(self.view.time)
+                    || label.is_some_and(|l| l != g.labels[row.label as usize])
+                {
+                    continue;
+                }
+                if !self.visible(row.from)? || !self.visible(row.to)? {
+                    continue;
+                }
+                visit(row.payload)?;
             }
-            visit(row.payload)?;
         }
         Ok(())
     }
