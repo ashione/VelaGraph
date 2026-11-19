@@ -1149,6 +1149,14 @@ impl<'operation, 'db, 'cut> MemberOverlay<'operation, 'db, 'cut> {
     }
 
     pub(super) fn merge_history_page(&self, page: &HistoryPage) -> anyhow::Result<Self> {
+        self.merge_history_page_inner(page, true)
+    }
+
+    fn merge_history_page_inner(
+        &self,
+        page: &HistoryPage,
+        reuse_verified_head: bool,
+    ) -> anyhow::Result<Self> {
         page.validate().map_err(history_error)?;
         let domain = &self.archive.cut.descriptor.domain;
         page.base
@@ -1158,6 +1166,20 @@ impl<'operation, 'db, 'cut> MemberOverlay<'operation, 'db, 'cut> {
             page.base.event_count <= self.checkpoint.event_count(),
             "history page base beyond local observation"
         );
+        // The archive owns the same immutable snapshot that passed complete raw
+        // and derived-index verification; append() minted every overlay command.
+        // Exact head equality proves there is no old-event overlap to compare.
+        // Page validation above still checks the entire new chain, and append
+        // below still checks every semantic transition and original identity.
+        // Restrict the shortcut to the member path; coordinator reads keep their
+        // existing verification policy. No witness survives this operation.
+        if reuse_verified_head
+            && domain.role == Role::Member
+            && page.base.event_count == self.checkpoint.event_count()
+            && page.base == self.head()?
+        {
+            return self.append(&page.events);
+        }
         let zero = domain.zero_cursor()?;
         let mut base_seen = page.base == zero;
         let mut end_seen = page.end == zero;
@@ -3140,6 +3162,197 @@ mod tests {
             };
             assert!(overlay.merge_history_page(&duplicate).is_err());
         });
+    }
+
+    #[test]
+    fn member_head_extension_matches_overlap_walk_at_boundaries() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            for count in [2, 31, 32, 33, 65, 1024, 1025] {
+                if count > profile.max_transactions() as u64 {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let db = DB::open_default(dir.path()).unwrap();
+                let old = tail_member_state(profile, count, count - 2);
+                let mut journal = old
+                    .visibility
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .full()
+                    .unwrap()
+                    .clone();
+                let base = journal.history_cursor().unwrap();
+                let cut = persist_archive(&db, &old, marker(10));
+                let archive = verify_active(&db, &cut).unwrap();
+                let overlay = archive.member_overlay();
+                journal
+                    .replay_event(decide(count - 1, Decision::Abort))
+                    .unwrap();
+                let page = journal.history_page(&base, None).unwrap();
+                crate::transaction_decisions::without_full_journal(|| {
+                    let walks = raw_walks();
+                    let merged = overlay.merge_history_page(&page).unwrap();
+                    assert_eq!(raw_walks(), walks, "no old overlap at the verified head");
+                    let reference = overlay.merge_history_page_inner(&page, false).unwrap();
+                    assert_eq!(raw_walks(), walks + 1);
+                    assert_eq!(merged.head().unwrap(), journal.history_cursor().unwrap());
+                    assert_eq!(merged.checkpoint_arc(), reference.checkpoint_arc());
+                    assert_eq!(merged.commands(), reference.commands());
+                    assert_eq!(merged.checkpoint_arc().resolved_prefix(), count);
+                    // Replaying the old page has overlap and must retain the old walk.
+                    let walks = raw_walks();
+                    let retry = merged.merge_history_page(&page).unwrap();
+                    assert_eq!(raw_walks(), walks + 1);
+                    assert!(Arc::ptr_eq(&retry.commands, &merged.commands));
+                    // An empty page at a head including accepted overlay events
+                    // reuses that exact head, without rebuilding any checkpoint.
+                    let head = merged.head().unwrap();
+                    let empty = journal.history_page(&head, None).unwrap();
+                    let walks = raw_walks();
+                    let retry = merged.merge_history_page(&empty).unwrap();
+                    assert_eq!(raw_walks(), walks);
+                    assert!(Arc::ptr_eq(&retry.checkpoint, &merged.checkpoint));
+                    assert!(Arc::ptr_eq(&retry.commands, &merged.commands));
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn member_head_extension_rejects_forged_and_invalid_suffixes() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let old = tail_member_state(profile, 65, 63);
+            let cut = persist_archive(&db, &old, marker(10));
+            let archive = verify_active(&db, &cut).unwrap();
+            let overlay = archive.member_overlay();
+            let base = overlay.head().unwrap();
+            let make_page = |base: HistoryCursor, events: Vec<Command>| {
+                let end = base.extend(&events).unwrap();
+                HistoryPage {
+                    version: base.version,
+                    base,
+                    end: end.clone(),
+                    cut: end,
+                    events,
+                }
+            };
+            let valid = make_page(base.clone(), vec![decide(64, Decision::Abort)]);
+            let mut forged = base.clone();
+            forged.root[0] ^= 1;
+            let mut foreign = base.clone();
+            foreign.cohort.coordinator_epoch += 1;
+            let mut bad_end = valid.clone();
+            bad_end.end.root[0] ^= 1;
+            let mut bad_cut = valid.clone();
+            bad_cut.cut.root[0] ^= 1;
+            let mut future = base.clone();
+            future.event_count += 1;
+            for page in [
+                make_page(forged, valid.events.clone()),
+                make_page(foreign, valid.events.clone()),
+                make_page(future, valid.events.clone()),
+                bad_end,
+                bad_cut,
+                // A valid hash chain is not semantic authorization. Even when
+                // the first command is valid, a bad final event rolls back all.
+                make_page(base.clone(), vec![decide(64, Decision::Abort), begin(1)]),
+                make_page(base.clone(), vec![decide(9999, Decision::Abort)]),
+                make_page(base.clone(), vec![decide(64, Decision::Commit)]),
+                make_page(base.clone(), vec![decide(65, Decision::Abort)]),
+            ] {
+                let optimized = overlay.merge_history_page(&page).err().unwrap();
+                let reference = overlay
+                    .merge_history_page_inner(&page, false)
+                    .err()
+                    .unwrap();
+                assert_eq!(optimized.to_string(), reference.to_string());
+                assert_eq!(overlay.head().unwrap(), base);
+                assert!(overlay.commands().is_empty());
+            }
+            let accepted = overlay.merge_history_page(&valid).unwrap();
+            assert_eq!(accepted.checkpoint_arc().resolved_prefix(), 65);
+            let next = make_page(
+                accepted.head().unwrap(),
+                vec![begin(66), decide(66, Decision::Abort)],
+            );
+            let reference = accepted.merge_history_page_inner(&next, false).unwrap();
+            let extended = accepted.merge_history_page(&next).unwrap();
+            assert_eq!(extended.commands(), reference.commands());
+            assert_eq!(extended.checkpoint_arc(), reference.checkpoint_arc());
+            assert_eq!(extended.head().unwrap(), next.end);
+            drop(extended);
+            drop(reference);
+            drop(accepted);
+            // This witness is bound to its pinned snapshot. A newly acquired
+            // operation must discover corruption anywhere in the old history.
+            db.put(&rows(&db)[0].0, b"{}").unwrap();
+            assert!(overlay.merge_history_page(&valid).is_ok());
+            assert_eq!(
+                verify_active(&db, &cut).err(),
+                Some(D1Error::EventLedgerHistory)
+            );
+            drop(overlay);
+            drop(archive);
+            drop(db);
+            let db = DB::open_default(dir.path()).unwrap();
+            assert!(load(&db, &cut.descriptor).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "paired member verification plus page merge; not whole-lifecycle timing"]
+    fn member_head_extension_cost() {
+        for count in [32, 256, 1025] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let old = tail_member_state(CapacityProfile::ByteBound16MiBV1, count, count - 2);
+            let cut = persist_archive(&db, &old, marker(10));
+            let journal = old.visibility.as_ref().unwrap().journal.full().unwrap();
+            let base = journal.history_cursor().unwrap();
+            let events = vec![decide(count - 1, Decision::Abort)];
+            let end = base.extend(&events).unwrap();
+            let page = HistoryPage {
+                version: base.version,
+                base,
+                end: end.clone(),
+                cut: end.clone(),
+                events,
+            };
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..14 {
+                for slot in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let started = std::time::Instant::now();
+                    // Include the unchanged complete raw/terminal verification
+                    // in both arms, not just the cheap shortcut after it.
+                    let archive = verify_active(&db, &cut).unwrap();
+                    let overlay = archive.member_overlay();
+                    let merged = overlay.merge_history_page_inner(&page, slot == 1).unwrap();
+                    let elapsed = started.elapsed().as_nanos();
+                    assert_eq!(merged.head().unwrap(), end);
+                    assert_eq!(merged.checkpoint_arc().resolved_prefix(), count);
+                    if round >= 2 {
+                        samples[slot].push(elapsed);
+                    }
+                }
+            }
+            eprintln!(
+                "MEMBER_HEAD_EXTENSION {}",
+                serde_json::json!({
+                    "transactions": count, "samples_ns": samples,
+                    "scope": "complete member verification plus one terminal page merge; no Raft write or gateway",
+                    "optimized_slot": 1, "warmups_per_slot": 2, "release": !cfg!(debug_assertions),
+                })
+            );
+        }
     }
 
     #[test]
