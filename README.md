@@ -109,6 +109,13 @@ Already observed record-boundary lookahead can also avoid a redundant seek while
 retaining the normal visibility and validation checks. See
 [temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
 API examples, cache bounds and validation limits.
+Temporal point reads build fixed-width revision keys on the stack and borrow
+their identity prefix, avoiding temporary key allocations during record lookup.
+For repeated reads at a fixed local V, `TemporalStore::materialize` builds an
+owned, bounded [temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md).
+Its covering rows preserve business-time selection and reuse the Gremlin executor
+without query-time KV access. Construction, refresh and memory costs remain
+explicit; the model never refreshes itself.
 Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
 storage engine; removing SQL did not remove it.
@@ -266,3 +273,12 @@ See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
 
+
+The optional [materialized temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md)
+borrows validated records during shared-executor traversal and copies only selected
+output values. Query results remain owned, and full logical record budgets still
+apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
+
+Prepared queries also reuse static canonical admission counts, checking each
+binding's exact textual size and complexity without rendering the entire query.
+This applies to typed prepared queries independently of the storage backend.

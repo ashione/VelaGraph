@@ -265,6 +265,13 @@ skip revision validation: status, envelope, V/T, payload, endpoint and work-budg
 checks still run. EOF and successful selected records do not create lookahead.
 The marker belongs to the execution's record cursor and never crosses views.
 
+Point reads construct the fixed-width revision key in a stack buffer and borrow
+its identity prefix from that buffer. Owned keys required by writes or storage
+adapter ranges use the same encoder. This removes temporary key allocations;
+it does not change key bytes, seek order, visited revisions, decoding, visibility
+checks, work charges or query limits. Golden vectors cover both record kinds
+and integer boundaries; existing databases remain readable without migration.
+
 `cargo run --locked --release -p velagraph --example temporal_record_seek_bench`
 reproduces this workload class with generated edge intervals. It creates four
 temporal edges per child, only the last visible at the fixed query time, reopens
@@ -392,3 +399,13 @@ purge-fence bypass is added. A locally reopened member is not proof of a complet
 restored cohort. Global checkpoint recovery remains separately blocked until all
 required members/coordinator, topology, cut and temporal data are validated before
 query admission. Do not advertise this slice as production temporal recovery.
+
+## Owned fixed-V read models
+
+`TemporalStore::materialize` validates one source snapshot and returns an owned
+`TemporalReadModel`. It compiles revision/absence selection once, retains all T
+at the chosen local V, and uses typed covering adjacency rows with the existing
+Gremlin executor. Source candidates must exactly match canonical positive history;
+construction does not repair mismatches. See [the read-model contract](MATERIALIZED_TEMPORAL_READS.md)
+for eager validation, construction/query limits, accounting, ownership and explicit
+refresh. The standalone format and disk-query defaults above are unchanged.
