@@ -133,3 +133,29 @@ budgets, schema/capacity rejection and independent models.
 uses generated data only. It separately reports construction and warmed query
 latency for disk and materialized views, and checks every result. Its timings
 are observations, not pass thresholds or a production SLA.
+
+## Conservative adjacency time blocks
+
+Directional adjacency lists with at least 64 rows carry summaries for consecutive
+32-row blocks in their original order. Each summary records the minimum start and
+maximum end, with infinity represented separately from a finite `i64::MAX` end.
+A query skips physical row visits only when its T is outside that entire range.
+Otherwise ordinary per-row time, label and endpoint checks still run. Overlapping
+or broad intervals can prevent pruning; summaries are conservative, not exact
+interval indexes. Short lists have no summaries.
+
+Skipped rows still consume their original candidate operations and 48-byte logical
+work fees, including duplicate incoming/outgoing visits. Grouped charging may
+reject earlier within an impossible block but preserves all-or-error admission;
+it does not increase the allowed work or return partial results. Deadline checks
+occur at each skipped block, whose work is bounded by 32 rows. Valid candidates
+retain their original endpoint, record and live-memory charges.
+
+Summary containers and capacity are charged during construction and included in
+retained accounting. `adjacency_block_bytes` reports that retained component,
+including the directional summary-container headers. All source records and
+candidate inventory still pass eager validation, and summaries are verified
+before publication. No source corruption can be hidden by skipping a query block.
+The optional profiling counters distinguish physical candidate visits, inspected
+blocks and skipped candidates; visited plus skipped candidates matches the original
+logical candidate count. This changes no disk data format or Gremlin syntax.

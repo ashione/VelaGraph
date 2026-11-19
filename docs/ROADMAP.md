@@ -950,3 +950,8 @@ refresh, batched sessions, temporal candidate indexes or distributed borrowing.
 Prepared binding reuses static canonical admission metadata while preserving
 parameter types and the original text/complexity limits. This is local query
 planning work, not a new language or a relaxation of parser admission.
+
+Owned temporal adjacency reads now support conservative time-block pruning.
+This preserves candidate order, endpoint visibility and original logical query
+admission. It adds bounded in-memory summaries, not a persistent interval index,
+new traversal language, wider batching contract or automatic model refresh.

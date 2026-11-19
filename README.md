@@ -282,3 +282,7 @@ apply. Disk backends retain owned reads; no storage format or Gremlin syntax cha
 Prepared queries also reuse static canonical admission counts, checking each
 binding's exact textual size and complexity without rendering the entire query.
 This applies to typed prepared queries independently of the storage backend.
+
+Materialized temporal reads use conservative time summaries on long adjacency
+lists to skip impossible historical ranges while retaining original logical work
+charges. See [time blocks and accounting](docs/MATERIALIZED_TEMPORAL_READS.md#conservative-adjacency-time-blocks).

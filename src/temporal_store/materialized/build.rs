@@ -388,12 +388,17 @@ impl TemporalStore {
                 incoming[to as usize].push(row);
             }
         }
+        let outgoing_blocks = blocks::build(&outgoing, &rows, &mut meter)?;
+        let incoming_blocks = blocks::build(&incoming, &rows, &mut meter)?;
+        let adjacency_block_bytes =
+            blocks::retained(&outgoing_blocks) + blocks::retained(&incoming_blocks);
         let segments = vertices
             .iter()
             .chain(edges.iter())
             .map(|s| s.pieces.len())
             .sum();
-        let retained = payloads.capacity() * std::mem::size_of::<Cached>()
+        let retained = adjacency_block_bytes
+            + payloads.capacity() * std::mem::size_of::<Cached>()
             + labels.capacity() * std::mem::size_of::<String>()
             + payloads.iter().map(|p| p.bytes).sum::<usize>()
             + (rows.capacity() * std::mem::size_of::<Row>())
@@ -428,6 +433,7 @@ impl TemporalStore {
             adjacency_rows: rows.len(),
             adjacency_references: outgoing.iter().chain(incoming.iter()).map(Vec::len).sum(),
             row_storage_bytes: (rows.capacity() * std::mem::size_of::<Row>()),
+            adjacency_block_bytes,
             retained_accounted_bytes: retained,
             build_accounted_bytes: meter.charged,
         };
@@ -442,6 +448,8 @@ impl TemporalStore {
             rows,
             outgoing,
             incoming,
+            outgoing_blocks,
+            incoming_blocks,
             stats,
         };
         graph.validate(&mut meter)?;
@@ -495,6 +503,8 @@ impl TemporalReadModel {
                 }
             }
         }
+        blocks::validate(&self.outgoing, &self.outgoing_blocks, &self.rows, meter)?;
+        blocks::validate(&self.incoming, &self.incoming_blocks, &self.rows, meter)?;
         Ok(())
     }
 }

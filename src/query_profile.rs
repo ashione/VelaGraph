@@ -8,6 +8,10 @@ pub struct Totals {
     pub calls: u64,
     /// Covering candidates visited in an owned fixed-V read model.
     pub materialized_candidates: u64,
+    /// Candidate ranges tested using immutable conservative time summaries.
+    pub materialized_blocks: u64,
+    /// Physically skipped candidates; their original logical work is charged.
+    pub materialized_skipped_candidates: u64,
     pub materialized_vertex_checks: u64,
     pub materialized_vertex_clones: u64,
     pub materialized_edge_clones: u64,
@@ -97,6 +101,8 @@ pub(crate) fn cache_hit() {
 pub(crate) enum ReadEvent {
     PreparedTextRender,
     MaterializedCandidate,
+    MaterializedBlock,
+    MaterializedSkipped(usize),
     MaterializedVertexCheck,
     MaterializedVertexClone,
     MaterializedEdgeClone,
@@ -118,6 +124,10 @@ pub(crate) fn read_event(event: ReadEvent) {
             match event {
                 ReadEvent::PreparedTextRender => t.prepared_text_renders += 1,
                 ReadEvent::MaterializedCandidate => t.materialized_candidates += 1,
+                ReadEvent::MaterializedBlock => t.materialized_blocks += 1,
+                ReadEvent::MaterializedSkipped(count) => {
+                    t.materialized_skipped_candidates += count as u64
+                }
                 ReadEvent::MaterializedVertexCheck => t.materialized_vertex_checks += 1,
                 ReadEvent::MaterializedVertexClone => t.materialized_vertex_clones += 1,
                 ReadEvent::MaterializedEdgeClone => t.materialized_edge_clones += 1,
