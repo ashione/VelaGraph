@@ -151,11 +151,12 @@ are rejected rather than becoming a global scan. Duplicate start IDs and their
 order are retained. Keys, labels, limits and operators are not bindable in this
 initial API.
 
-Before execution, bound arguments pass the original text/structural limits using
-a canonical standard-Gremlin representation. Caller values are bounded before
-cloning/rendering. Rendering is for admission accounting only; the official
-parser is not invoked again. This retains the conservative structural-mark
-limit even for marks inside literal strings.
+Preparation measures a canonical standard-Gremlin representation once and caches
+its static byte/structural-mark contribution. Each bind validates caller input
+before cloning, then adds exact decimal-ID and quoted-literal contributions. It
+does not render the whole bound query or invoke the official parser again. The
+original canonical byte and structural limits still apply, including marks inside
+literal strings. This is local typed-plan reuse, not a remotely retained plan.
 
 `execute_prepared` binds and calls the same checked executor as textual queries.
 The global-start restriction, fresh deadline and fresh read/memory budgets are
@@ -264,6 +265,13 @@ lower bound. Otherwise it seeks normally. This does not speculate forward or
 skip revision validation: status, envelope, V/T, payload, endpoint and work-budget
 checks still run. EOF and successful selected records do not create lookahead.
 The marker belongs to the execution's record cursor and never crosses views.
+
+Point reads construct the fixed-width revision key in a stack buffer and borrow
+its identity prefix from that buffer. Owned keys required by writes or storage
+adapter ranges use the same encoder. This removes temporary key allocations;
+it does not change key bytes, seek order, visited revisions, decoding, visibility
+checks, work charges or query limits. Golden vectors cover both record kinds
+and integer boundaries; existing databases remain readable without migration.
 
 `cargo run --locked --release -p velagraph --example temporal_record_seek_bench`
 reproduces this workload class with generated edge intervals. It creates four
@@ -392,3 +400,13 @@ purge-fence bypass is added. A locally reopened member is not proof of a complet
 restored cohort. Global checkpoint recovery remains separately blocked until all
 required members/coordinator, topology, cut and temporal data are validated before
 query admission. Do not advertise this slice as production temporal recovery.
+
+## Owned fixed-V read models
+
+`TemporalStore::materialize` validates one source snapshot and returns an owned
+`TemporalReadModel`. It compiles revision/absence selection once, retains all T
+at the chosen local V, and uses typed covering adjacency rows with the existing
+Gremlin executor. Source candidates must exactly match canonical positive history;
+construction does not repair mismatches. See [the read-model contract](MATERIALIZED_TEMPORAL_READS.md)
+for eager validation, construction/query limits, accounting, ownership and explicit
+refresh. The standalone format and disk-query defaults above are unchanged.

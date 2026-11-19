@@ -1,6 +1,6 @@
 //! Typed parameter binding over an officially parsed immutable query shape.
 use super::{
-    validate_query_text, GremlinQuery, GremlinStart, GremlinStep, MAX_GREMLIN_QUERY_BYTES,
+    GremlinQuery, GremlinStart, GremlinStep, QueryTextSize, MAX_GREMLIN_QUERY_BYTES,
     MAX_GREMLIN_STRUCTURAL_MARKS,
 };
 use crate::{Error, Result, Value};
@@ -30,6 +30,9 @@ pub struct PreparedGremlinQuery {
     template: GremlinQuery,
     bind_start_ids: bool,
     value_slots: Vec<(usize, Discriminant<Value>)>,
+    // Canonical syntax, keys and static literals, with dynamic contributions
+    // removed. The bound query need not be rendered again for admission.
+    fixed_size: QueryTextSize,
 }
 fn invalid(message: &str) -> Error {
     Error::UnsupportedGremlinArgument(format!("query bindings: {message}"))
@@ -57,7 +60,21 @@ impl GremlinQuery {
                 }
             }
         }
+        let mut fixed_size = QueryTextSize::measure(&canonical_text(&self)?);
+        if parameters.start_ids {
+            fixed_size = fixed_size.subtract(start_size(&self.start));
+        }
+        for (index, _) in &slots {
+            let GremlinStep::Has {
+                value: Some(value), ..
+            } = &self.steps[*index]
+            else {
+                unreachable!("slot validated above")
+            };
+            fixed_size = fixed_size.subtract(QueryTextSize::measure(&literal(value)?));
+        }
         Ok(PreparedGremlinQuery {
+            fixed_size,
             template: self,
             bind_start_ids: parameters.start_ids,
             value_slots: slots,
@@ -106,6 +123,17 @@ impl PreparedGremlinQuery {
                 return Err(invalid("binding values exceed query byte limit"));
             }
         }
+        let mut size = self.fixed_size;
+        if let Some(ids) = bindings.start_ids {
+            size = size.add(ids_size(ids));
+        }
+        for value in bindings.values {
+            size = size.add(QueryTextSize::measure(&literal(value)?));
+        }
+        // Canonical syntax comes from a parsed template. Dynamic IDs are decimal
+        // integers and literals use the same JSON quoting as canonical_text, so
+        // bindings cannot introduce an unquoted semicolon or a new traversal.
+        size.validate()?;
         let mut query = self.template.clone();
         if let Some(ids) = bindings.start_ids {
             query.start = match query.start {
@@ -119,10 +147,26 @@ impl PreparedGremlinQuery {
             };
             *target = Some(value.clone());
         }
-        validate_query_text(&canonical_text(&query)?)?;
         Ok(query)
     }
 }
+fn ids_size(ids: &[u64]) -> QueryTextSize {
+    let separators = ids.len().saturating_sub(1);
+    QueryTextSize {
+        bytes: separators
+            + ids
+                .iter()
+                .map(|id| id.checked_ilog10().unwrap_or(0) as usize + 1)
+                .sum::<usize>(),
+        marks: separators,
+    }
+}
+fn start_size(start: &GremlinStart) -> QueryTextSize {
+    match start {
+        GremlinStart::Vertices(ids) | GremlinStart::Edges(ids) => ids_size(ids),
+    }
+}
+
 fn quote(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization")
 }
@@ -141,6 +185,8 @@ fn literal(value: &Value) -> Result<String> {
     })
 }
 fn canonical_text(query: &GremlinQuery) -> Result<String> {
+    #[cfg(feature = "query-profiling")]
+    crate::query_profile::read_event(crate::query_profile::ReadEvent::PreparedTextRender);
     let (kind, ids) = match &query.start {
         GremlinStart::Vertices(ids) => ("V", ids),
         GremlinStart::Edges(ids) => ("E", ids),
@@ -183,4 +229,173 @@ fn canonical_text(query: &GremlinQuery) -> Result<String> {
         text.push_str(&rendered);
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reference is the pre-optimization admission path: render the complete
+    // bound query and run the ordinary source-text guard on those exact bytes.
+    fn compare(prepared: &PreparedGremlinQuery, bindings: GremlinBindings<'_>) {
+        let mut expected = prepared.template.clone();
+        if let Some(ids) = bindings.start_ids {
+            expected.start = match expected.start {
+                GremlinStart::Vertices(_) => GremlinStart::Vertices(ids.to_vec()),
+                GremlinStart::Edges(_) => GremlinStart::Edges(ids.to_vec()),
+            };
+        }
+        for (value, (index, _)) in bindings.values.iter().zip(&prepared.value_slots) {
+            let GremlinStep::Has { value: target, .. } = &mut expected.steps[*index] else {
+                unreachable!()
+            };
+            *target = Some(value.clone());
+        }
+        let text = canonical_text(&expected).unwrap();
+        let want = super::super::validate_query_text(&text);
+        let got = prepared.bind(bindings);
+        match (want, got) {
+            (Ok(()), Ok(bound)) => assert_eq!(canonical_text(&bound).unwrap(), text),
+            (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+            (a, b) => panic!("rendered admission differs: {a:?} vs {b:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_admission_matches_full_render_for_all_literal_types_and_slots() {
+        let templates = [
+            (
+                "g.V(1).has('x','a').both('LINK').limit(5).path()",
+                Value::Text("a".into()),
+            ),
+            ("g.E(1).has('x',true).label()", Value::Boolean(true)),
+            ("g.V(1).has('x',1).count()", Value::Integer(1)),
+            ("g.V(1).has('x',1.5).id()", Value::Real(1.5)),
+            ("g.V(1).has('x',null).values('y')", Value::Null),
+        ];
+        for (text, value) in templates {
+            for bind_ids in [false, true] {
+                let prepared = GremlinQuery::parse(text)
+                    .unwrap()
+                    .prepare(GremlinParameters {
+                        start_ids: bind_ids,
+                        has_value_steps: vec![0],
+                    })
+                    .unwrap();
+                for count in [1, 2, 30, 63, 64] {
+                    let ids = vec![i64::MAX as u64; count];
+                    compare(
+                        &prepared,
+                        GremlinBindings {
+                            start_ids: bind_ids.then_some(ids.as_slice()),
+                            values: std::slice::from_ref(&value),
+                        },
+                    );
+                }
+            }
+        }
+        let real = GremlinQuery::parse("g.V(1).has('x',1.5).id()")
+            .unwrap()
+            .prepare(GremlinParameters {
+                start_ids: true,
+                has_value_steps: vec![0],
+            })
+            .unwrap();
+        for value in [
+            -0.0,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+            -f64::MAX,
+            1e-300,
+            1e300,
+        ] {
+            compare(
+                &real,
+                GremlinBindings {
+                    start_ids: Some(&[0]),
+                    values: &[Value::Real(value)],
+                },
+            );
+        }
+        let prepared = GremlinQuery::parse("g.V(0).has('a','old').has('b',1).id()")
+            .unwrap()
+            .prepare(GremlinParameters {
+                start_ids: true,
+                has_value_steps: vec![1, 0],
+            })
+            .unwrap();
+        for value in [
+            "plain",
+            "汉字🙂",
+            "\"\\\n\t\u{0000}",
+            "');g.V(2);('",
+            "[]{}(),.:;",
+            "\\\";\\",
+        ] {
+            compare(
+                &prepared,
+                GremlinBindings {
+                    start_ids: Some(&[0, 9, 10, 99, 100]),
+                    values: &[Value::Integer(i64::MIN), Value::Text(value.into())],
+                },
+            );
+        }
+        for text in ["g.V().out().count()", "g.E(1).hasLabel('A','B').label()"] {
+            let prepared = GremlinQuery::parse(text)
+                .unwrap()
+                .prepare(GremlinParameters::default())
+                .unwrap();
+            compare(&prepared, GremlinBindings::default());
+        }
+    }
+
+    #[test]
+    fn cached_admission_matches_exact_canonical_byte_and_mark_boundaries() {
+        let prepared = GremlinQuery::parse("g.V(1).has('x','a').id()")
+            .unwrap()
+            .prepare(GremlinParameters {
+                start_ids: true,
+                has_value_steps: vec![0],
+            })
+            .unwrap();
+        let empty = GremlinBindings {
+            start_ids: Some(&[1]),
+            values: &[Value::Text(String::new())],
+        };
+        let overhead = canonical_text(&prepared.bind(empty).unwrap())
+            .unwrap()
+            .len();
+        for extra in [0, 1] {
+            let value = Value::Text("x".repeat(MAX_GREMLIN_QUERY_BYTES - overhead + extra));
+            let bindings = GremlinBindings {
+                start_ids: Some(&[1]),
+                values: std::slice::from_ref(&value),
+            };
+            assert_eq!(prepared.bind(bindings).is_ok(), extra == 0);
+            compare(&prepared, bindings);
+        }
+        let marks =
+            QueryTextSize::measure(&canonical_text(&prepared.bind(empty).unwrap()).unwrap()).marks;
+        for extra in [0, 1] {
+            let value = Value::Text(";".repeat(MAX_GREMLIN_STRUCTURAL_MARKS - marks + extra));
+            let bindings = GremlinBindings {
+                start_ids: Some(&[1]),
+                values: std::slice::from_ref(&value),
+            };
+            assert_eq!(prepared.bind(bindings).is_ok(), extra == 0);
+            compare(&prepared, bindings);
+        }
+        // JSON escaping expands canonical bytes without growing raw input beyond
+        // its independent admission cap.
+        for n in [2700, 2730, 2800, 8190] {
+            compare(
+                &prepared,
+                GremlinBindings {
+                    start_ids: Some(&[1]),
+                    values: &[Value::Text("\u{0000}".repeat(n))],
+                },
+            );
+        }
+    }
 }

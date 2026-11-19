@@ -12,8 +12,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: corehr-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only superseded PR runs share a group. A unique full-run group also avoids
+  # GitHub replacing a pending main/manual run, even with cancellation disabled.
+  group: corehr-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,9 +26,9 @@ env:
   # API run head is the PR head; github.sha remains the tested merge candidate.
   LIFECYCLE_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
-# Build time is outside the unchanged 90-minute lifecycle runtime budget.
-# This scheduling separation does not improve writes or promise a shorter chain.
-# Scenario remains independent; all three jobs are required by the stable gate.
+# Reuse one release handoff for the event-specific lifecycle. PRs run the existing
+# short recovery fixture; main, scheduled and manual runs keep all 1025 writes.
+# Scenario remains independent; the stable gate requires all jobs and the right tier.
 jobs:
   lifecycle-build:
     name: Build retained lifecycle release artifact
@@ -86,8 +88,12 @@ jobs:
             managed-lifecycle-build-results/*.md
 
   lifecycle:
+    # Retain the historical check context for branch-protection compatibility.
+    # The verified acceptance-tier output and summary identify PR short vs full.
     name: Retained 1025-write release lifecycle
     needs: [lifecycle-build]
+    outputs:
+      acceptance-tier: ${{ steps.managed_lifecycle.outputs.acceptance-tier }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -134,18 +140,22 @@ jobs:
           artifact-ids: ${{ needs.lifecycle-build.outputs.artifact-id }}
           merge-multiple: true
           path: ${{ runner.temp }}/managed-lifecycle-handoff
-      - name: Verify retained 1025-write lifecycle in release
+      - name: Verify event-specific lifecycle in release
         id: managed_lifecycle
-        run: >-
-          python3 scripts/managed_lifecycle_ci.py managed-lifecycle-ci-results
-          --mode runtime --handoff "$RUNNER_TEMP/managed-lifecycle-handoff/handoff.zip"
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) mode=runtime-pr ;;
+            push|schedule|workflow_dispatch) mode=runtime ;;
+            *) echo 'Unsupported lifecycle event' >&2; exit 1 ;;
+          esac
+          python3 scripts/managed_lifecycle_ci.py managed-lifecycle-ci-results --mode "$mode" --handoff "$RUNNER_TEMP/managed-lifecycle-handoff/handoff.zip"
       - name: Publish measured summary
         if: always()
         run: |
           if test '${{ steps.managed_lifecycle.outcome }}' = success && test -f managed-lifecycle-ci-results/summary.md; then
             cat managed-lifecycle-ci-results/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'Managed lifecycle INCOMPLETE. Inspect retained build/test logs and checkpoint; this is not a 1025-write acceptance pass.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Managed lifecycle INCOMPLETE. Inspect retained build/test logs; no lifecycle acceptance was established.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Retain evidence, including partial failures
         if: always()
@@ -238,11 +248,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Require build and both acceptance gates
+      - name: Require build, CoreHR and the event-specific lifecycle tier
         env:
           LIFECYCLE_BUILD_RESULT: ${{ needs.lifecycle-build.result }}
           LIFECYCLE_RESULT: ${{ needs.lifecycle.result }}
           COREHR_RESULT: ${{ needs.scenario.result }}
+          LIFECYCLE_ACCEPTANCE_TIER: ${{ needs.lifecycle.outputs.acceptance-tier }}
         run: |
-          printf 'Build: %s\nLifecycle: %s\nCoreHR: %s\n' "$LIFECYCLE_BUILD_RESULT" "$LIFECYCLE_RESULT" "$COREHR_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Build: %s\nLifecycle: %s\nTier: %s\nCoreHR: %s\n' "$LIFECYCLE_BUILD_RESULT" "$LIFECYCLE_RESULT" "$LIFECYCLE_ACCEPTANCE_TIER" "$COREHR_RESULT" >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/managed_lifecycle_ci.py --mode aggregate

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+pub mod materialized;
 mod plan_cache;
 mod query_memo;
 
@@ -15,7 +16,12 @@ use crate::{Edge, Vertex};
 const FORMAT_KEY: &[u8] = b"graph/temporal/v2/format";
 const HEAD_KEY: &[u8] = b"graph/temporal/v2/head";
 const RECORD_PREFIX: &[u8] = b"graph/temporal/v2/revision/";
+const IDENTITY_PREFIX_LEN: usize =
+    RECORD_PREFIX.len() + std::mem::size_of::<u8>() + std::mem::size_of::<u64>();
+const REVISION_VERSION_END: usize = IDENTITY_PREFIX_LEN + std::mem::size_of::<u64>();
+const REVISION_KEY_LEN: usize = REVISION_VERSION_END + std::mem::size_of::<u32>();
 const ADJACENCY_PREFIX: &[u8] = b"graph/temporal/v2/adjacency/";
+const ADJACENCY_KEY_LEN: usize = ADJACENCY_PREFIX.len() + 1 + 2 * std::mem::size_of::<u64>();
 const MAX_BATCH: usize = 256;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READ_REVISIONS: usize = 4096;
@@ -197,7 +203,7 @@ fn encode_batch(mutations: &[TemporalMutation]) -> Result<Vec<Vec<u8>>> {
                     + RECORD_PREFIX.len()
                     + 21
                     + if matches!(mutation, TemporalMutation::Edge { .. }) {
-                        2 * (ADJACENCY_PREFIX.len() + 17 + 8)
+                        2 * (ADJACENCY_KEY_LEN + std::mem::size_of::<u64>())
                     } else {
                         0
                     },
@@ -228,8 +234,8 @@ impl TemporalStoreView<'_> {
         self.valid_time
     }
     fn assertion(&self, key: Key) -> Result<Option<Vec<u8>>> {
-        let prefix = identity_prefix(key);
-        let start = revision_key(key, self.version, 0);
+        let start = revision_key_bytes(key, self.version, 0);
+        let prefix = &start[..IDENTITY_PREFIX_LEN];
         let mut bytes = 0usize;
         for (i, row) in self
             .snapshot
@@ -237,7 +243,7 @@ impl TemporalStoreView<'_> {
             .enumerate()
         {
             let (key, value) = row?;
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(prefix) {
                 break;
             }
             if i >= MAX_READ_REVISIONS {
@@ -289,16 +295,16 @@ fn decode_revision<'a>(
     value: &'a [u8],
     max_version: u64,
 ) -> Result<(Interval, Option<&'a [u8]>)> {
-    if key.len() != RECORD_PREFIX.len() + 21 || value.len() > MAX_BATCH_BYTES {
+    if key.len() != REVISION_KEY_LEN || value.len() > MAX_BATCH_BYTES {
         return Err(TemporalStoreError::Corrupt);
     }
     let version = !u64::from_be_bytes(
-        key[RECORD_PREFIX.len() + 9..RECORD_PREFIX.len() + 17]
+        key[IDENTITY_PREFIX_LEN..REVISION_VERSION_END]
             .try_into()
             .map_err(|_| TemporalStoreError::Corrupt)?,
     );
     let ordinal = u32::from_be_bytes(
-        key[RECORD_PREFIX.len() + 17..]
+        key[REVISION_VERSION_END..]
             .try_into()
             .map_err(|_| TemporalStoreError::Corrupt)?,
     );
@@ -327,19 +333,25 @@ fn adjacency_key(vertex: u64, incoming: bool, edge: u64) -> Vec<u8> {
     bytes
 }
 fn identity_prefix(key: Key) -> Vec<u8> {
-    let mut bytes = RECORD_PREFIX.to_vec();
+    revision_key_bytes(key, 0, 0)[..IDENTITY_PREFIX_LEN].to_vec()
+}
+fn revision_key(key: Key, version: u64, ordinal: u32) -> Vec<u8> {
+    revision_key_bytes(key, version, ordinal).to_vec()
+}
+// The layout is fixed. Point reads can borrow this key and its identity prefix
+// without allocating two independently grown Vec buffers for every lookup.
+fn revision_key_bytes(key: Key, version: u64, ordinal: u32) -> [u8; REVISION_KEY_LEN] {
+    let mut bytes = [0; REVISION_KEY_LEN];
+    bytes[..RECORD_PREFIX.len()].copy_from_slice(RECORD_PREFIX);
     let (kind, id) = match key {
         Key::Vertex(id) => (1, id),
         Key::Edge(id) => (2, id),
     };
-    bytes.push(kind);
-    bytes.extend_from_slice(&id.to_be_bytes());
-    bytes
-}
-fn revision_key(key: Key, version: u64, ordinal: u32) -> Vec<u8> {
-    let mut bytes = identity_prefix(key);
-    bytes.extend_from_slice(&(!version).to_be_bytes());
-    bytes.extend_from_slice(&ordinal.to_be_bytes());
+    bytes[RECORD_PREFIX.len()] = kind;
+    bytes[RECORD_PREFIX.len() + std::mem::size_of::<u8>()..IDENTITY_PREFIX_LEN]
+        .copy_from_slice(&id.to_be_bytes());
+    bytes[IDENTITY_PREFIX_LEN..REVISION_VERSION_END].copy_from_slice(&(!version).to_be_bytes());
+    bytes[REVISION_VERSION_END..].copy_from_slice(&ordinal.to_be_bytes());
     bytes
 }
 fn encode_assertion(valid: Interval, payload: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -416,6 +428,33 @@ mod tests {
                 Value::Integer(n) => n,
                 _ => panic!("wrong type"),
             })
+    }
+    #[test]
+    fn fixed_revision_keys_keep_vertex_edge_and_boundary_bytes() {
+        let cases = [
+            (Key::Vertex(0), 0, 0, 1u8, [0u8; 8], [255u8; 8], [0u8; 4]),
+            (
+                Key::Edge(u64::MAX),
+                u64::MAX,
+                u32::MAX,
+                2u8,
+                [255u8; 8],
+                [0u8; 8],
+                [255u8; 4],
+            ),
+        ];
+        for (identity, version, ordinal, kind, id, v, o) in cases {
+            let mut expected = b"graph/temporal/v2/revision/".to_vec();
+            expected.push(kind);
+            expected.extend(id);
+            expected.extend(v);
+            expected.extend(o);
+            assert_eq!(
+                revision_key_bytes(identity, version, ordinal).as_slice(),
+                expected
+            );
+            assert_eq!(revision_key(identity, version, ordinal), expected);
+        }
     }
     #[test]
     fn golden_keys_and_envelopes() {

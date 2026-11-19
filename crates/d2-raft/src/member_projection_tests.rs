@@ -214,9 +214,8 @@ async fn retained_projection_preserves_frozen_cut_and_old_retry() {
             apply(&mut sm, advance(1, &first)).await.unwrap(),
             D1Result::Visibility { applied_prefix: 1 }
         );
-        // Verification, frozen-cut proof, first point projection. Retry stages
-        // no terminal change; the generic equality check adds no fourth walk.
-        assert_eq!(event_ledger::raw_walks() - before, 3);
+        // Verification also collects the terminal. The old cut still requires replay.
+        assert_eq!(event_ledger::raw_walks() - before, 2);
         let expected = disk(&sm);
         drop(sm);
         let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
@@ -305,9 +304,9 @@ async fn retained_projection_removes_one_walk_per_command_not_per_batch() {
         .await
         .unwrap();
     assert!(result.iter().all(|r| r.d1.as_ref().unwrap().is_ok()));
-    // One initial verification + two frozen proofs + two original point
-    // projections + one new terminal projection. The old path needed eight.
-    assert_eq!(event_ledger::raw_walks() - before, 6);
+    // Verification collects the first terminal. The second ordinal and the
+    // staged multi-record interval still use separate projections.
+    assert_eq!(event_ledger::raw_walks() - before, 3);
     assert_eq!(status(&sm).await.1, 34);
 }
 

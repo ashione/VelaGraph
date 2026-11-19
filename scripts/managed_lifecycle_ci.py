@@ -19,6 +19,7 @@ import zipfile
 
 
 TEST = 'byte_bound_independent_processes_1025_writes_retain_original_lifecycle'
+PR_TEST = 'byte_bound_independent_processes_small_lifecycle_recovery'
 BUILD = ['cargo', 'test', '--release', '--locked', '-p', 'replicated-graph',
          '--test', 'managed_process', '--no-run', '--message-format=json']
 
@@ -83,12 +84,14 @@ def select_artifact(records, root):
     return artifact
 
 
-def validate_output(stdout, exit_code):
+def validate_output(stdout, exit_code, test_name=None):
+    test_name = TEST if test_name is None else test_name
+    require(test_name in (TEST, PR_TEST), 'unknown lifecycle test')
     require(exit_code == 0, f'lifecycle test exited {exit_code}')
     require(re.findall(r'^running (\d+) tests?$', stdout, re.M) == ['1'],
             'lifecycle selection did not run exactly one test')
     results = re.findall(r'^test (\S+) \.\.\. (.*)$', stdout, re.M)
-    require(results == [(TEST, 'ok')], 'wrong, ignored, skipped, or failed lifecycle test')
+    require(results == [(test_name, 'ok')], 'wrong, ignored, skipped, or failed lifecycle test')
     summaries = re.findall(r'^test result:.*$', stdout, re.M)
     require(len(summaries) == 1 and re.fullmatch(
         r'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; '
@@ -669,9 +672,13 @@ def accept_handoff(root, out, archive, source):
     return artifact, executable, manifest['files']['managed_process']['sha256']
 
 
-def validate_results(builder, lifecycle, scenario):
+def validate_results(builder, lifecycle, scenario, event_name, tier):
     require((builder, lifecycle, scenario) == ('success', 'success', 'success'),
             'build, lifecycle runtime and CoreHR scenario must all succeed')
+    expected = {'pull_request': 'pr-short', 'push': 'full-1025',
+                'schedule': 'full-1025', 'workflow_dispatch': 'full-1025'}.get(event_name)
+    require(expected is not None and tier == expected,
+            'lifecycle acceptance tier does not match the triggering event')
 
 
 def runner_metadata():
@@ -690,9 +697,12 @@ def runner_metadata():
 
 
 def run_gate(root, out, mode, handoff=None):
-    require(mode in ('build', 'runtime'), 'explicit build or runtime mode required')
+    require(mode in ('build', 'runtime', 'runtime-pr'), 'explicit build or runtime mode required')
+    require(mode != 'runtime-pr' or os.environ.get('GITHUB_EVENT_NAME') == 'pull_request',
+            'short lifecycle is restricted to pull requests')
     out.mkdir()  # A CI invocation never resumes, overwrites or accepts old evidence.
-    metadata = {'status': 'INCOMPLETE', 'test': TEST, 'build_command': BUILD,
+    metadata = {'status': 'INCOMPLETE', 'mode': mode,
+                'test': PR_TEST if mode == 'runtime-pr' else TEST, 'build_command': BUILD,
                 'executions': []}
 
     def save():
@@ -714,13 +724,14 @@ def run_gate(root, out, mode, handoff=None):
         return result.returncode
 
     try:
-        summary('Managed lifecycle INCOMPLETE: build, exact test exit and checkpoint must all pass.')
+        summary('Managed lifecycle INCOMPLETE: verified build and exact test exit are required; '
+                'the full tier also requires its retained checkpoint.')
         save()
         source = source_snapshot(root, out)
         (out / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
         metadata['source_sha256'] = source['sha256']
         env = {**os.environ, 'CARGO_TERM_COLOR': 'never'}
-        if mode == 'runtime':
+        if mode in ('runtime', 'runtime-pr'):
             artifact, executable, elf_hash = accept_handoff(root, out, handoff, source)
             metadata.update(artifact=artifact, executable=str(executable), elf_sha256=elf_hash,
                             cargo_elf_sha256=elf_hash, handoff_artifact_id=os.environ['LIFECYCLE_ARTIFACT_ID'],
@@ -755,6 +766,26 @@ def run_gate(root, out, mode, handoff=None):
                 outputs.write(f'bundle-sha256={sha256(archive)}\nbundle-length={archive.stat().st_size}\n')
             summary('Managed lifecycle BUILD_COMPLETE: same-run handoff prepared; runtime acceptance is still required.')
             return
+        if mode == 'runtime-pr':
+            metadata['runner'] = runner_metadata()
+            save()
+            command = [str(executable), PR_TEST, '--exact', '--nocapture', '--test-threads=1',
+                       '--format=pretty', '--color=never']
+            exit_code = run('test', command, env, 'stdout')
+            validate_output((out / 'test.stdout').read_text(), exit_code, PR_TEST)
+            require(source_snapshot(root, out)['sha256'] == source['sha256'],
+                    'source changed during the PR lifecycle test')
+            require(sha256(executable) == elf_hash, 'ELF changed during the PR lifecycle test')
+            metadata.update(status='PR_RECOVERY_COMPLETE', acceptance_tier='pr-short')
+            save()
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as outputs:
+                outputs.write('acceptance-tier=pr-short\n')
+            summary('PR recovery COMPLETE: exactly one existing small release lifecycle test passed, '
+                    'including both diagnostics modes, ACK-loss recovery, restart and snapshot restore.\n\n'
+                    'This is not the 1025-write boundary acceptance. Main pushes, schedules and '
+                    'manual runs require the unchanged full lifecycle.\n\n'
+                    f"Source SHA-256: {source['sha256']}\n\nELF SHA-256: {elf_hash}")
+            return
         retained = out / 'lifecycle'
         retained.mkdir()
         # Runtime diagnostics never replace the exact output/checkpoint gates.
@@ -774,8 +805,10 @@ def run_gate(root, out, mode, handoff=None):
         require(source_snapshot(root, out)['sha256'] == source['sha256'],
                 'source changed during the lifecycle test')
         require(sha256(executable) == elf_hash, 'ELF changed during the lifecycle test')
-        metadata['status'] = 'COMPLETE'
+        metadata.update(status='COMPLETE', acceptance_tier='full-1025')
         save()
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as outputs:
+            outputs.write('acceptance-tier=full-1025\n')
         summary('Managed lifecycle COMPLETE: exactly one release test passed, 1025 writes verified, '
                 'no pending request, ACK-loss recovery and full snapshot restores verified.\n\n'
                 'Synthetic same-host functional evidence, not a performance or multi-host HA claim.\n\n'
@@ -793,16 +826,18 @@ def main():
         root = pathlib.Path(__file__).resolve().parents[1]
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument('out', nargs='?', default='managed-lifecycle-ci-results')
-        parser.add_argument('--mode', choices=('build', 'runtime', 'aggregate', 'verify-provenance'), required=True)
+        parser.add_argument('--mode', choices=('build', 'runtime', 'runtime-pr', 'aggregate', 'verify-provenance'), required=True)
         parser.add_argument('--handoff', type=pathlib.Path)
         args = parser.parse_args()
         if args.mode == 'verify-provenance':
             read_provenance()
         elif args.mode == 'aggregate':
             validate_results(os.environ.get('LIFECYCLE_BUILD_RESULT'), os.environ.get('LIFECYCLE_RESULT'),
-                             os.environ.get('COREHR_RESULT'))
+                             os.environ.get('COREHR_RESULT'), os.environ.get('GITHUB_EVENT_NAME'),
+                             os.environ.get('LIFECYCLE_ACCEPTANCE_TIER'))
         else:
-            require((args.handoff is not None) == (args.mode == 'runtime'), 'runtime requires one handoff archive')
+            require((args.handoff is not None) == (args.mode in ('runtime', 'runtime-pr')),
+                    'runtime requires one handoff archive')
             run_gate(root, pathlib.Path(args.out).resolve(), args.mode, args.handoff)
     except (Exception, KeyboardInterrupt) as error:
         print(f'Managed lifecycle INCOMPLETE: {error}', file=sys.stderr)

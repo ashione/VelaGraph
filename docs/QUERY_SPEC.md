@@ -695,3 +695,27 @@ executor. Limits operate on the global ordered bag at their original position,
 not on independent shard prefixes. Existing 1..=1000 validation, hop, work,
 result and deadline bounds remain unchanged. This does not extend renewable
 jobs, global starts, filters or other currently unsupported local syntax.
+
+## Owned materialized temporal entrypoint
+
+The standalone temporal store's optional [owned read model](MATERIALIZED_TEMPORAL_READS.md)
+reuses this parser and executor at one captured local V and caller-selected T.
+It preserves explicit-ID order, multiplicity, values, properties and traversal
+semantics. Global starts stay unsupported. Its explicit 65,536-operation / 64 MiB
+logical-work maxima are separate from disk physical-revision accounting, while
+this executor's live-memory, result, hop and deadline limits remain in force.
+This is not a managed/cohort or distributed read entrypoint.
+
+The shared local executor may carry borrowed records from an immutable backend.
+Borrowing preserves full logical record reservations and query work charges;
+owned disk reads keep their validation and value-move behavior. Selected property
+and label results are owned even after the read model is dropped. This changes
+allocation behavior only, not syntax, traversal order, multiplicity or limits.
+
+Prepared query binding caches the canonical byte and raw structural-mark counts
+of static plan components. Each bind adds the exact decimal start-ID and quoted
+literal contributions and applies the same byte-before-complexity guard as text
+input. Literal types, finite-real checks, empty/nonempty start rules and parameter
+counts are unchanged. Canonical fields are quoted by the existing serializer;
+source text still passes semicolon validation and the official grammar parser.
+No complete query text is reconstructed on repeated binds.
