@@ -305,9 +305,9 @@ async fn retained_projection_removes_one_walk_per_command_not_per_batch() {
         .await
         .unwrap();
     assert!(result.iter().all(|r| r.d1.as_ref().unwrap().is_ok()));
-    // One initial verification + two frozen proofs + two original point
-    // projections + one new terminal projection. The old path needed eight.
-    assert_eq!(event_ledger::raw_walks() - before, 6);
+    // One initial verification, two original point projections and one new
+    // terminal projection. Both commands use the verified head for their proof.
+    assert_eq!(event_ledger::raw_walks() - before, 4);
     assert_eq!(status(&sm).await.1, 34);
 }
 

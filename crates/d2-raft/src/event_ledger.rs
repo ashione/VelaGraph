@@ -1202,6 +1202,19 @@ impl<'operation, 'db, 'cut> MemberOverlay<'operation, 'db, 'cut> {
         let domain = &self.archive.cut.descriptor.domain;
         cut.validate_identity(&domain.authority, &domain.cohort)
             .map_err(history_error)?;
+        // Member verification checks the contiguous resolved prefix against the
+        // raw events. Accepted overlay transitions maintain that prefix.
+        if domain.role == Role::Member
+            && cut.event_count == self.checkpoint.event_count()
+            && *cut == self.head()?
+        {
+            return Ok(target != 0 && target <= self.checkpoint.resolved_prefix());
+        }
+        self.prove_resolved_by_walk(cut, target)
+    }
+
+    fn prove_resolved_by_walk(&self, cut: &HistoryCursor, target: u64) -> anyhow::Result<bool> {
+        let domain = &self.archive.cut.descriptor.domain;
         let zero = domain.zero_cursor()?;
         let mut frozen = (cut.event_count == 0 && cut == &zero).then_some(false);
         let mut admitted = 0u64;
@@ -3288,6 +3301,18 @@ mod tests {
                     .unwrap();
                 let page = journal.history_page(&base, None).unwrap();
                 crate::transaction_decisions::without_full_journal(|| {
+                    for target in [0, count - 2, count - 1, count, count + 1] {
+                        let walks = raw_walks();
+                        let result = overlay.prove_resolved(&base, target).unwrap();
+                        assert_eq!(raw_walks(), walks);
+                        assert_eq!(
+                            result,
+                            overlay.prove_resolved_by_walk(&base, target).unwrap()
+                        );
+                    }
+                    let mut forged = base.clone();
+                    forged.root[0] ^= 1;
+                    assert!(overlay.prove_resolved(&forged, count).is_err());
                     let walks = raw_walks();
                     let merged = overlay.merge_history_page(&page).unwrap();
                     assert_eq!(raw_walks(), walks, "no old overlap at the verified head");
@@ -3302,9 +3327,14 @@ mod tests {
                     let retry = merged.merge_history_page(&page).unwrap();
                     assert_eq!(raw_walks(), walks + 1);
                     assert!(Arc::ptr_eq(&retry.commands, &merged.commands));
+                    let head = merged.head().unwrap();
+                    let walks = raw_walks();
+                    assert!(merged.prove_resolved(&head, count).unwrap());
+                    assert_eq!(raw_walks(), walks);
+                    assert!(!merged.prove_resolved(&base, count).unwrap());
+                    assert_eq!(raw_walks(), walks + 1);
                     // An empty page at a head including accepted overlay events
                     // reuses that exact head, without rebuilding any checkpoint.
-                    let head = merged.head().unwrap();
                     let empty = journal.history_page(&head, None).unwrap();
                     let walks = raw_walks();
                     let retry = merged.merge_history_page(&empty).unwrap();
