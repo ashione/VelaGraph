@@ -2323,10 +2323,19 @@ async fn explicit_full_evidence_preserves_reopen_and_corruption_checks() {
             .await
             .is_err());
         let db = &sm.storage.as_ref().unwrap().db;
-        for prefix in [
-            event_ledger::PREFIX,
-            crate::decision_segments::PREFIX,
-            crate::decision_segments::MANIFEST_KEY,
+        for (prefix, expected_error, expected_loads) in [
+            (D1_KEY, D1Error::EventLedgerHistory, 0),
+            (event_ledger::PREFIX, D1Error::EventLedgerHistory, 1),
+            (
+                crate::decision_segments::PREFIX,
+                D1Error::DecisionIndexHistory,
+                1,
+            ),
+            (
+                crate::decision_segments::MANIFEST_KEY,
+                D1Error::DecisionIndexHistory,
+                1,
+            ),
         ] {
             let all = rows(&sm, prefix);
             let (key, value) = all
@@ -2334,14 +2343,36 @@ async fn explicit_full_evidence_preserves_reopen_and_corruption_checks() {
                 .expect("fixture must persist raw and decision rows");
             db.put(key, b"{}").unwrap();
             let corrupted = disk(&sm);
-            assert!(sm
-                .participant_prefix_evidence(7, 1, [7; 16], 1, &journal)
+            let before = sm.complete_history_loads.load(Ordering::Relaxed);
+            assert_eq!(
+                sm.participant_prefix_evidence(7, 1, [7; 16], 1, &journal)
+                    .await
+                    .err(),
+                Some(expected_error.clone())
+            );
+            assert_eq!(
+                sm.complete_history_loads.load(Ordering::Relaxed) - before,
+                expected_loads
+            );
+            assert_eq!(disk(&sm), corrupted);
+            let before = sm.complete_history_loads.load(Ordering::Relaxed);
+            assert_eq!(
+                sm.certified_participant_read_with_evidence(
+                    7,
+                    1,
+                    [7; 16],
+                    1,
+                    limit.clone(),
+                    &journal
+                )
                 .await
-                .is_err());
-            assert!(sm
-                .certified_participant_read_with_evidence(7, 1, [7; 16], 1, limit.clone(), &journal)
-                .await
-                .is_err());
+                .err(),
+                Some(expected_error)
+            );
+            assert_eq!(
+                sm.complete_history_loads.load(Ordering::Relaxed) - before,
+                expected_loads
+            );
             assert_eq!(disk(&sm), corrupted);
             db.put(key, value).unwrap();
             assert_eq!(
@@ -2349,6 +2380,15 @@ async fn explicit_full_evidence_preserves_reopen_and_corruption_checks() {
                     .await
                     .unwrap(),
                 journal
+            );
+            let (snapshot, evidence) = sm
+                .certified_participant_read_with_evidence(7, 1, [7; 16], 1, limit.clone(), &journal)
+                .await
+                .unwrap();
+            assert_eq!(evidence, journal);
+            assert_eq!(
+                snapshot.entries.get(b"x".as_slice()).map(Vec::as_slice),
+                Some(b"committed".as_slice())
             );
         }
     }
