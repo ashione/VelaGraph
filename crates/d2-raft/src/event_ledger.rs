@@ -1569,8 +1569,14 @@ struct OrderedTerminals {
     admitted: u64,
     resolved: u64,
     order: std::collections::VecDeque<[u8; 16]>,
-    active: std::collections::BTreeMap<[u8; 16], Transaction>,
+    active: std::collections::BTreeMap<[u8; 16], SizedTransaction>,
 }
+struct SizedTransaction {
+    transaction: Transaction,
+    // Exact compact JSON length plus the per-record separator charge.
+    bytes: usize,
+}
+
 impl OrderedTerminals {
     // Borrow every variable-width field so admission is sized before allocating
     // resident participants/prepared bits or inserting either active index entry.
@@ -1602,15 +1608,6 @@ impl OrderedTerminals {
         .map_err(history_error)?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("active projection record byte overflow"))
-    }
-    fn tx_bytes(tx: &Transaction) -> anyhow::Result<usize> {
-        Self::record_bytes(
-            tx.id,
-            tx.ordinal,
-            &tx.participants,
-            &tx.prepared,
-            tx.decision,
-        )
     }
     fn replace_bytes(total: usize, old: usize, new: usize) -> anyhow::Result<usize> {
         total
@@ -1667,59 +1664,64 @@ impl OrderedTerminals {
                 self.admitted = next;
                 self.active.insert(
                     *id,
-                    Transaction {
-                        id: *id,
-                        ordinal: self.admitted,
-                        participants: participants.clone(),
-                        prepared: vec![false; participants.len()],
-                        decision: None,
+                    SizedTransaction {
+                        bytes,
+                        transaction: Transaction {
+                            id: *id,
+                            ordinal: self.admitted,
+                            participants: participants.clone(),
+                            prepared: vec![false; participants.len()],
+                            decision: None,
+                        },
                     },
                 );
                 self.order.push_back(*id);
             }
             Command::Prepared { id, participant } => {
-                let tx = self
+                let entry = self
                     .active
                     .get_mut(id)
                     .ok_or_else(|| anyhow::anyhow!("prepare outside active interval"))?;
-                let old = Self::tx_bytes(tx)?;
-                let mut prepared = [false; crate::transaction_decisions::MAX_PARTICIPANTS];
-                prepared[..tx.prepared.len()].copy_from_slice(&tx.prepared);
-                if let Some(index) = tx.participants.iter().position(|p| p == participant) {
-                    prepared[index] = true;
-                }
-                let new = Self::record_bytes(
-                    tx.id,
-                    tx.ordinal,
-                    &tx.participants,
-                    &prepared[..tx.prepared.len()],
-                    tx.decision,
-                )?;
-                let total = Self::replace_bytes(self.active_bytes, old, new)?;
                 anyhow::ensure!(
-                    tx.record_prepared(participant).map_err(history_error)?,
+                    entry
+                        .transaction
+                        .record_prepared(participant)
+                        .map_err(history_error)?,
                     "duplicate retained prepare"
                 );
-                self.active_bytes = total;
+                // Exactly one compact JSON boolean changed from false to true.
+                let shrink = b"false".len() - b"true".len();
+                entry.bytes -= shrink;
+                self.active_bytes -= shrink;
             }
             Command::Decide { id, decision } => {
-                let tx = self
+                let entry = self
                     .active
                     .get_mut(id)
                     .ok_or_else(|| anyhow::anyhow!("decision outside active interval"))?;
-                let old = Self::tx_bytes(tx)?;
-                let new = Self::record_bytes(
-                    tx.id,
-                    tx.ordinal,
-                    &tx.participants,
-                    &tx.prepared,
-                    Some(*decision),
+                // Only the decision token changes. Size the actual codec for
+                // both values, including duplicate or conflicting decisions.
+                let token_bytes = |value| {
+                    crate::capacity_policy::canonical_size(
+                        &value,
+                        crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES,
+                    )
+                    .map_err(history_error)
+                };
+                let new_bytes = Self::replace_bytes(
+                    entry.bytes,
+                    token_bytes(entry.transaction.decision)?,
+                    token_bytes(Some(*decision))?,
                 )?;
-                let total = Self::replace_bytes(self.active_bytes, old, new)?;
+                let total = Self::replace_bytes(self.active_bytes, entry.bytes, new_bytes)?;
                 anyhow::ensure!(
-                    tx.record_decision(*decision).map_err(history_error)?,
+                    entry
+                        .transaction
+                        .record_decision(*decision)
+                        .map_err(history_error)?,
                     "duplicate retained decision"
                 );
+                entry.bytes = new_bytes;
                 self.active_bytes = total;
             }
             _ => {}
@@ -1727,21 +1729,23 @@ impl OrderedTerminals {
         // Same contiguous-front reduction as ActiveCheckpoint::apply: never
         // jump over a hole, and release a record only after a terminal outcome.
         while let Some(id) = self.order.front().copied() {
-            let tx = self
+            let entry = self
                 .active
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("active projection index mismatch"))?;
-            let Some(next) =
-                crate::transaction_decisions::checkpoint::next_resolved(self.resolved, tx)
-                    .map_err(history_error)?
+            let Some(next) = crate::transaction_decisions::checkpoint::next_resolved(
+                self.resolved,
+                &entry.transaction,
+            )
+            .map_err(history_error)?
             else {
                 break;
             };
-            self.active_bytes = Self::replace_bytes(self.active_bytes, Self::tx_bytes(tx)?, 0)?;
+            self.active_bytes = Self::replace_bytes(self.active_bytes, entry.bytes, 0)?;
             let tx = self.active.remove(&id).unwrap();
             self.order.pop_front();
             self.resolved = next;
-            emit(tx)?;
+            emit(tx.transaction)?;
         }
         Ok(())
     }
@@ -1754,7 +1758,9 @@ impl OrderedTerminals {
                     .order
                     .iter()
                     .zip(checkpoint.active_transactions())
-                    .all(|(id, tx)| self.active.get(id) == Some(tx)),
+                    .all(
+                        |(id, tx)| self.active.get(id).map(|entry| &entry.transaction) == Some(tx)
+                    ),
             "ordered raw projection differs from published checkpoint"
         );
         Ok(())
@@ -3373,7 +3379,11 @@ mod tests {
         let expected: usize = projection
             .active
             .values()
-            .map(|tx| serde_json::to_vec(tx).unwrap().len() + 1)
+            .map(|entry| {
+                let actual = serde_json::to_vec(&entry.transaction).unwrap().len() + 1;
+                assert_eq!(entry.bytes, actual);
+                actual
+            })
             .sum();
         assert_eq!(projection.active_bytes, expected);
         projection
@@ -3388,7 +3398,11 @@ mod tests {
         let expected: usize = projection
             .active
             .values()
-            .map(|tx| serde_json::to_vec(tx).unwrap().len() + 1)
+            .map(|entry| {
+                let actual = serde_json::to_vec(&entry.transaction).unwrap().len() + 1;
+                assert_eq!(entry.bytes, actual);
+                actual
+            })
             .sum();
         assert_eq!(projection.active_bytes, expected);
         projection
@@ -3402,6 +3416,40 @@ mod tests {
         assert_eq!(projection.active_bytes, 0);
         assert!(projection.active.is_empty());
         assert!(projection.order.is_empty());
+    }
+
+    #[test]
+    fn decision_size_delta_preserves_exact_capacity_boundary() {
+        use crate::transaction_decisions::checkpoint::MAX_ACTIVE_CHECKPOINT_BYTES as LIMIT;
+        for decision in [Decision::Abort, Decision::Commit] {
+            let mut p = OrderedTerminals::new(CapacityProfile::ByteBound16MiBV1);
+            for n in 1..=2 {
+                p.observe(&begin(n), &mut |_| Ok(())).unwrap();
+            }
+            p.observe(
+                &Command::Prepared {
+                    id: id(2),
+                    participant: participant(),
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            let before = p.active[&id(2)].transaction.clone();
+            let mut after = before.clone();
+            after.record_decision(decision).unwrap();
+            let original_bytes = serde_json::to_vec(&before).unwrap().len();
+            let final_bytes = serde_json::to_vec(&after).unwrap().len();
+            let growth = final_bytes - original_bytes;
+            p.active_bytes = LIMIT - growth + 1;
+            assert!(p.observe(&decide(2, decision), &mut |_| Ok(())).is_err());
+            assert_eq!(p.active[&id(2)].transaction, before);
+            assert_eq!(p.active[&id(2)].bytes, original_bytes + 1);
+            p.active_bytes = LIMIT - growth;
+            p.observe(&decide(2, decision), &mut |_| Ok(())).unwrap();
+            assert_eq!(p.active_bytes, LIMIT);
+            assert_eq!(p.active[&id(2)].bytes, final_bytes + 1);
+            assert_eq!(p.active[&id(2)].transaction, after);
+        }
     }
 
     #[test]
