@@ -177,3 +177,14 @@ endpoints, but point reads expose an edge only when both endpoints exist at the
 same V/T. No v1/v2 write, deletion, tombstone or migration behavior changes.
 This exception provides no new Gremlin syntax, cross-partition transaction or
 purge/install permission.
+
+
+### Incremental memory read-model checkpoint scope
+
+The optional [incremental memory graph](INCREMENTAL_MEMORY_GRAPH.md) is a scoped
+R2/R4 extension for a separately versioned local read-model checkpoint file. Its
+magic, length/checksum envelope, deterministic record order, golden vector and
+restore rejection rules are specified there. It neither reinterprets existing
+graph keys nor changes disk/temporal/managed write durability. In-memory publication
+and periodic checkpoint persistence remain distinct; no distributed or upstream
+CDC consistency is implied. This exception is reviewed with the implementation PR.
