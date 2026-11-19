@@ -142,7 +142,7 @@ fn old_v_still_validates_future_endpoint_candidates() {
         .is_err());
 }
 #[test]
-fn copied_payload_bytes_have_an_exact_work_boundary() {
+fn record_payload_bytes_have_an_exact_work_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let store = TemporalStore::open(dir.path()).unwrap();
     let mut vertex = Vertex::new(1);
@@ -205,4 +205,56 @@ fn copied_payload_bytes_have_an_exact_work_boundary() {
             .rows,
         vec![crate::GremlinRow::Count(0)]
     );
+}
+
+#[test]
+fn borrowed_self_loop_charges_discarded_edge_and_selected_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TemporalStore::open(dir.path()).unwrap();
+    let valid = Interval { from: 0, to: None };
+    let mut vertex = Vertex::new(1);
+    let text = "selected".repeat(8192);
+    vertex
+        .properties
+        .insert("selected".into(), crate::Value::Text(text.clone()));
+    let mut edge = Edge::new(7, 1, 1, "LINK");
+    edge.properties
+        .insert("unused".into(), crate::Value::Text("unused".repeat(8192)));
+    store
+        .commit(&[
+            TemporalMutation::Vertex { valid, vertex },
+            TemporalMutation::Edge { valid, edge },
+        ])
+        .unwrap();
+    let model = store
+        .materialize(None, MaterializationLimits::default())
+        .unwrap();
+    let vertex_bytes = model.payloads[model.vertices[0].at(0).unwrap().payload as usize].bytes;
+    let edge_bytes = model.payloads[model.edges[0].at(0).unwrap().payload as usize].bytes;
+    // Start, four endpoint checks, and one target resolution. The in-side copy
+    // is discarded by both's self-loop dedup, but it must still consume work.
+    let bytes =
+        6 * std::mem::size_of::<Piece>() + 2 * ROW_WORK_BYTES + 2 * vertex_bytes + 2 * edge_bytes;
+    let query = GremlinQuery::parse("g.V(1).both().values('selected')").unwrap();
+    for (operations, work, succeeds) in [(8, bytes, true), (7, bytes, false), (8, bytes - 1, false)]
+    {
+        let result = model.view(0).execute_query_with_limits(
+            &query,
+            MaterializedQueryLimits {
+                max_operations: operations,
+                max_work_bytes: work,
+            },
+        );
+        if succeeds {
+            assert_eq!(
+                result.unwrap().rows,
+                vec![crate::GremlinRow::Value(crate::Value::Text(text.clone()))]
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(crate::Error::TraversalLimitExceeded(_))
+            ));
+        }
+    }
 }

@@ -941,3 +941,12 @@ and materializes covering adjacency rows for repeated local reads. It preserves
 all business times at one V, explicit bounds and ownership; no implicit refresh,
 incremental updater, service cache or distributed certification is added. See
 [MATERIALIZED_TEMPORAL_READS.md](MATERIALIZED_TEMPORAL_READS.md).
+
+The local materialized temporal path supports borrowed records in the shared
+Gremlin executor. This removes per-access whole-record clones while retaining
+conservative logical admission and owned output values. It does not add automatic
+refresh, batched sessions, temporal candidate indexes or distributed borrowing.
+
+Prepared binding reuses static canonical admission metadata while preserving
+parameter types and the original text/complexity limits. This is local query
+planning work, not a new language or a relaxation of parser admission.

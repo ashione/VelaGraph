@@ -82,15 +82,32 @@ Every materialized query starts fresh budgets. `MaterializedQueryLimits` can
 only tighten the maximum/default **65,536 operations** and **64 MiB work bytes**.
 Operations count point resolutions, endpoint visibility checks and every visited
 candidate, including invisible and label-rejected rows. Work bytes include
-metadata visits and the accounted size of every copied record, even when that
-copy is later dropped. The existing 64 MiB live query budget, result/hop/parser
+metadata visits and the full accounted size of every record handed to the
+executor, whether borrowed or copied, even when that record is later dropped.
+Borrowing does not waive repeated-access or discarded-record charges. The existing 64 MiB live query budget, result/hop/parser
 limits and cooperative 5-second deadline still apply. Exhaustion is an error,
 never a truncated success. `_with_limits` methods support tighter caller limits.
 
 Materialized work accounting differs from the disk path's 4,096 physical
 revision/candidate limit. Neither successful-query admission nor failure timing
-is claimed identical across those two APIs. Full record/output copies remain;
-this API is not an end-to-end zero-copy execution path.
+is claimed identical across those two APIs.
+
+### Borrowed records in the shared executor
+
+Query reads from the immutable model borrow complete validated vertex/edge
+records for the lifetime of the backend. The ordinary Gremlin executor carries
+borrowed or owned records through the same traversal, filtering, ordering and
+path operations. Existing disk backends default to owned reads with their
+original validation. No query-shape, label, object or tree-specific fast path is
+used, and parallel edges, multiple parents and self-loop handling are unchanged.
+
+`values` and `label` move the selected value from an owned record or copy only
+that selected value from a borrowed record. Public results own their values and
+remain valid after the model is dropped. Whole-record borrows retain the same
+conservative full-record work and live-byte reservations as copies; accounting
+is not a measurement of bytes physically copied. The optional profiling counters
+separate whole-record borrows from clones. Result strings, paths and result
+containers still allocate, so this is not end-to-end zero-copy execution.
 
 ## Lifetime and refresh
 

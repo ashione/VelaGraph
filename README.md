@@ -273,3 +273,12 @@ See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
 
+
+The optional [materialized temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md)
+borrows validated records during shared-executor traversal and copies only selected
+output values. Query results remain owned, and full logical record budgets still
+apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
+
+Prepared queries also reuse static canonical admission counts, checking each
+binding's exact textual size and complexity without rendering the entire query.
+This applies to typed prepared queries independently of the storage backend.

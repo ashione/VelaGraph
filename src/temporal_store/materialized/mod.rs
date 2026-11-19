@@ -52,7 +52,7 @@ impl Default for MaterializationLimits {
 pub struct MaterializedQueryLimits {
     /// Point resolutions, endpoint checks and visited candidates (maximum 65,536).
     pub max_operations: usize,
-    /// Metadata visits plus accounted copied-record bytes (maximum 64 MiB).
+    /// Metadata visits plus full borrowed/copied record charges (maximum 64 MiB).
     pub max_work_bytes: usize,
 }
 impl Default for MaterializedQueryLimits {
