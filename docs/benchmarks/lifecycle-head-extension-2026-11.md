@@ -53,8 +53,47 @@ cargo test --release --locked -p d2-raft --lib \
   -- --exact --ignored --nocapture
 ```
 
+## Completed hosted baseline
+
+The follow-up was integrated with main `5c7e2c3` in local candidate `879fa22b`.
+On macOS arm64 with Rust 1.95.0, `cargo test --locked` passed 1306 tests with
+zero failures and 44 explicitly ignored tests/fixtures. Strict all-target Clippy,
+formatting, diff checks and the 38 lifecycle-validator Python tests passed.
+The first restricted-sandbox Rust attempt could not bind loopback ports; the
+complete rerun with loopback permission passed without changing tests. Python
+validation used Python 3.11 and a canonical temporary directory (the system
+Python 3.9 lacks `tomllib`, and secure no-follow checks reject macOS `/var`
+symlink paths). The opt-in release benchmark is measured separately.
+
 The first optimization's manual full run
 [44444738204](https://github.com/ashione/VelaGraph/actions/runs/44444738204)
-targets `0cb6770` and cannot validate this follow-up. Full lifecycle validation
-on the new candidate and comparable before/after measurements remain required;
-a faster microbenchmark is not evidence of a full-lifecycle speedup.
+passed at `0cb677001d7ae7881dfcca71d8eb22ffe9a2fcee`, with COMPLETE evidence
+for the `full-1025` tier. The lifecycle step took 40m56s; the test executable
+took 2455.413 seconds, excluding compilation and artifact handoff.
+
+| Recorded span | Seconds |
+| --- | ---: |
+| 1025 gateway submissions | 2411.822 |
+| Three process reopens combined | 1.143 |
+| Three snapshot export/install operations | 2.672 |
+| Three complete recovery verifications | 26.689 |
+
+Submissions account for 98.22% of test wall time. These rows are selected spans,
+not an additive partition of the entire test; nested diagnostic phases must not
+be summed. This supports optimizing the submission path rather than reducing
+recovery checks. The historical PR #340 test took 2478.179 seconds, but that is
+an uncontrolled single-run comparison and does not establish a speedup.
+
+This run used Linux x86_64 with four visible logical CPUs. Sampled cumulative
+CPU across process incarnations was at least 3094.08 CPU-seconds; maximum sampled
+aggregate process RSS was 476.21 MiB. Sampling misses work after the final sample
+and between samples, so these are not exact CPU cost or peak-memory measurements.
+The actual runner CPU quota and competing load were not established.
+
+The artifact `managed-lifecycle-44444738204-1` records source manifest SHA-256
+`a81d456c7725f594dcaceb59c0de052a58c3392ede1045c87d9f792d5988cb08`
+and executable SHA-256
+`8caa80beaf72db9e018d0a55bcd3b9549fbd1613f83e7f95505fb88aea7f08cc`.
+It excludes this follow-up and the later main integration. Full lifecycle
+validation on the new candidate and comparable before/after measurements remain
+required; a faster microbenchmark is not evidence of a full-lifecycle speedup.

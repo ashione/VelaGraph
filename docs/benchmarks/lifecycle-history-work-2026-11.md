@@ -147,5 +147,11 @@ explicitly run and passed.
 The baseline full-lifecycle run was intentionally interrupted at the user's
 request to prioritize implementation, after the last reported 800 writes.
 Its evidence remains INCOMPLETE. There is no complete local 1025-write A/B
-comparison or measured Linux CI reduction for this candidate yet. Do not infer
-either from this table, the interrupted prefix, or the historical PR 340 run.
+comparison. The later hosted manual run
+[44444738204](https://github.com/ashione/VelaGraph/actions/runs/44444738204)
+passed the full 1025-write acceptance at `0cb6770`: 2455.413 seconds of test
+execution, or 40m56s for the workflow step. This is not a controlled Linux
+before/after comparison. See [the follow-up measurements](lifecycle-head-extension-2026-11.md)
+for phase attribution and the separate member-head optimization, which this
+completed run does not validate. Do not infer an overall speedup from the
+microbenchmark table, interrupted prefix, or historical PR #340 run.
