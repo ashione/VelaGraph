@@ -204,11 +204,15 @@ struct Row {
     events: Vec<Command>,
 }
 impl Row {
-    fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+    fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         #[cfg(all(test, debug_assertions))]
         ROW_DECODES.set(ROW_DECODES.get() + 1);
         anyhow::ensure!(bytes.len() <= MAX_ROW_BYTES, "ledger row exceeds bound");
-        let row: Self = serde_json::from_slice(bytes)?;
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        let row = Self::parse(bytes)?;
         anyhow::ensure!(
             row.version == row.domain.cohort.profile.storage_format()
                 && !row.events.is_empty()
@@ -744,7 +748,8 @@ fn verify_coordinator_rows_observed(
         count += 1;
         // Projection mode decodes in this same verified namespace iteration.
         let decoded = if observe.is_some() || count == expected.len() {
-            Some(Row::decode(&value)?)
+            // matches() above proves these exact bytes were canonical at publication.
+            Some(Row::parse(&value)?)
         } else {
             None
         };
@@ -801,6 +806,22 @@ fn verify_coordinator_rows_observed(
         "incomplete ledger byte inventory"
     );
     tail.ok_or_else(|| anyhow::anyhow!("missing ledger tail"))
+}
+
+/// Read commands with no per-event cursor requirement. Published coordinator
+/// rows have a private digest of their canonical bytes. Other cuts must still
+/// reconstruct the raw chain before returning a projection.
+fn observe_commands(
+    snapshot: &Snapshot<'_>,
+    cut: &PublishedArchiveCut,
+    mut observe: impl FnMut(&Command) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if cut.row_witnesses.is_some() {
+        verify_coordinator_rows_observed(snapshot, cut, Some(&mut observe))?;
+    } else {
+        walk(snapshot, &cut.descriptor, |event, _, _| observe(&event))?;
+    }
+    Ok(())
 }
 
 /// Coordinator-only ordered projection. Unlike the general archive snapshot
@@ -1519,9 +1540,7 @@ impl<'db, 'cut> VerifiedArchive<'db, 'cut> {
             p.clone()
         } else {
             let mut p = Projection::new(key);
-            walk(&self.snapshot, &self.cut.descriptor, |event, _, _| {
-                p.observe(&event)
-            })?;
+            observe_commands(&self.snapshot, self.cut, |event| p.observe(event))?;
             p
         };
         self.check_overlay(overlay)?;
@@ -2359,10 +2378,8 @@ pub(super) fn lookup_target(
         return Err(D1Error::EventLedgerHistory);
     }
     let mut projection = Projection::new(LookupKey::Transaction(id));
-    walk(&snapshot, &cut.descriptor, |event, _, _| {
-        projection.observe(&event)
-    })
-    .map_err(super::ledger_read_error)?;
+    observe_commands(&snapshot, cut, |event| projection.observe(event))
+        .map_err(super::ledger_read_error)?;
     if projection.ordinal != cut.checkpoint.transaction_count() as u64
         || cut.resolved_prefix > projection.ordinal
     {
@@ -2392,10 +2409,8 @@ pub(super) fn lookup_request(
 ) -> Result<RequestLookup, D1Error> {
     let snapshot = cut.snapshot(db)?;
     let mut projection = Projection::new(LookupKey::Request(id));
-    walk(&snapshot, &cut.descriptor, |event, _, _| {
-        projection.observe(&event)
-    })
-    .map_err(super::ledger_read_error)?;
+    observe_commands(&snapshot, cut, |event| projection.observe(event))
+        .map_err(super::ledger_read_error)?;
     let record = match projection
         .finish_target()
         .map_err(super::ledger_read_error)?
@@ -2445,6 +2460,36 @@ pub(super) fn history_page(
         != Some(published.decision_manifest.as_slice())
     {
         return Err(D1Error::DecisionIndexHistory);
+    }
+    // If both endpoints lie in the last bounded row, the entire page fits.
+    // Verify every stored row against the published cut before using that row.
+    if published
+        .row_witnesses
+        .as_deref()
+        .and_then(|rows| rows.last())
+        .is_some_and(|last| base.event_count >= last.first - 1)
+    {
+        let tail =
+            verify_coordinator_rows(&snapshot, published).map_err(super::ledger_read_error)?;
+        let start = (base.event_count - tail.before.event_count) as usize;
+        let end = (cut.event_count - tail.before.event_count) as usize;
+        let actual_base = tail
+            .before
+            .extend(&tail.events[..start])
+            .map_err(|_| D1Error::EventLedgerHistory)?;
+        if &actual_base != base {
+            return Err(D1Error::VisibilityHistory);
+        }
+        let page = HistoryPage {
+            version: base.version,
+            base: actual_base,
+            end: cut.clone(),
+            cut,
+            events: tail.events.into_iter().take(end).skip(start).collect(),
+        };
+        // This recomputes the supplied end root from the original commands.
+        page.validate().map_err(|_| D1Error::VisibilityHistory)?;
+        return Ok(page);
     }
     let mut base_seen = base.event_count == 0;
     let mut cut_seen = cut.event_count == 0;
@@ -4255,6 +4300,52 @@ mod tests {
                     Err(D1Error::VisibilityHistory)
                 );
             });
+        }
+    }
+
+    #[test]
+    fn coordinator_tail_pages_bind_both_roots_and_still_check_sealed_rows() {
+        for profile in [
+            CapacityProfile::LegacyCountV1,
+            CapacityProfile::ByteBound16MiBV1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open_default(dir.path()).unwrap();
+            let state = archive_state(profile, 36);
+            let journal = state.coordinator.as_ref().unwrap().full().unwrap();
+            let published = persist_archive(&db, &state, marker(8));
+            let rows = published.row_witnesses.as_ref().unwrap();
+            assert!(rows.len() > 1);
+            let start = rows.last().unwrap().first - 1;
+            let head = published.head();
+            for n in [start, start + 1, head.event_count] {
+                let base = journal.history_cursor_at(n).unwrap();
+                for end in [n, head.event_count] {
+                    let cut = journal.history_cursor_at(end).unwrap();
+                    let expected = journal.history_page(&base, Some(&cut)).unwrap();
+                    assert_eq!(
+                        history_page(&db, &published, &base, Some(&cut)).unwrap(),
+                        expected
+                    );
+                    let mut bad = cut.clone();
+                    bad.root[0] ^= 1;
+                    assert_eq!(
+                        history_page(&db, &published, &base, Some(&bad)),
+                        Err(D1Error::VisibilityHistory)
+                    );
+                    let mut bad = base.clone();
+                    bad.root[0] ^= 1;
+                    assert_eq!(
+                        history_page(&db, &published, &bad, Some(&cut)),
+                        Err(D1Error::VisibilityHistory)
+                    );
+                }
+            }
+            db.put(published.descriptor.domain.key(1), b"{}").unwrap();
+            assert_eq!(
+                history_page(&db, &published, &head, None),
+                Err(D1Error::EventLedgerHistory)
+            );
         }
     }
 
