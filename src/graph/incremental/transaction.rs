@@ -42,23 +42,36 @@ impl IncrementalTransaction<'_> {
     pub fn metadata(&self) -> &[u8] {
         &self.metadata
     }
-    fn note(&mut self, bytes: usize) -> Result<()> {
-        self.stats.work_operations = self
+    fn projected_work(&self, bytes: usize) -> Result<(usize, usize)> {
+        let operations = self
             .stats
             .work_operations
             .checked_add(1)
             .ok_or_else(|| limit("work overflow"))?;
-        self.stats.work_bytes = self
+        let total = self
             .stats
             .work_bytes
             .checked_add(bytes)
             .ok_or_else(|| limit("work overflow"))?;
         if Instant::now() >= self.deadline
-            || self.stats.work_operations > self.graph.limits.max_batch_operations
-            || self.stats.work_bytes > self.graph.limits.max_batch_bytes
+            || operations > self.graph.limits.max_batch_operations
+            || total > self.graph.limits.max_batch_bytes
         {
             return Err(limit("batch work budget"));
         }
+        Ok((operations, total))
+    }
+    pub(super) fn preflight_record_copy(&mut self, bytes: usize) -> Result<()> {
+        let result = self.projected_work(bytes).map(|_| ());
+        if result.is_err() {
+            self.poisoned = true
+        }
+        result
+    }
+    fn note(&mut self, bytes: usize) -> Result<()> {
+        let (operations, total) = self.projected_work(bytes)?;
+        self.stats.work_operations = operations;
+        self.stats.work_bytes = total;
         Ok(())
     }
     fn entry(&self, id: u64) -> Option<&VEntry> {
@@ -96,16 +109,21 @@ impl IncrementalTransaction<'_> {
         incoming: bool,
         insert: bool,
     ) -> Result<()> {
+        let fee = {
+            let v = self.touch(vertex)?;
+            let a = if incoming { &v.incoming } else { &v.outgoing };
+            a.header_bytes().saturating_mul(3) + adjacency::CHUNK * 4 * 8
+        };
+        self.note(fee)?;
         let v = self.touch(vertex)?;
         let a = if incoming {
             &mut v.incoming
         } else {
             &mut v.outgoing
         };
-        let header = a.header_bytes().saturating_mul(3);
         let copied = Arc::make_mut(a).change(edge, insert);
         self.stats.copied_adjacency_ids += copied;
-        self.note(header + adjacency::CHUNK * 4 * 8)
+        Ok(())
     }
     /// Copy ordered incident records under the transaction work budget.
     pub fn adjacent(&mut self, id: u64, incoming: bool) -> Result<Vec<Edge>> {
@@ -131,14 +149,24 @@ impl IncrementalTransaction<'_> {
         {
             return Err(limit("adjacency read budget"));
         };
-        let mut out = Vec::with_capacity(adj.len());
+        // Admit the complete copy before allocating its vector or any payload.
         for id in adj.ids() {
-            let edge = self
+            let bytes = self
                 .get_edge(id)
                 .ok_or_else(|| bad("missing staged edge"))?
-                .clone();
-            self.note(edge.accounted_bytes() + INDEX_FEE)?;
-            out.push(edge);
+                .accounted_bytes();
+            self.note(bytes + INDEX_FEE)?;
+        }
+        let mut out = Vec::with_capacity(adj.len());
+        for id in adj.ids() {
+            if Instant::now() >= self.deadline {
+                return Err(limit("batch work budget"));
+            }
+            out.push(
+                self.get_edge(id)
+                    .ok_or_else(|| bad("missing staged edge"))?
+                    .clone(),
+            );
         }
         Ok(out)
     }

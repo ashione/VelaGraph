@@ -284,9 +284,17 @@ impl IncrementalGraph {
         };
         for m in mutations {
             match m {
-                IncrementalMutation::PutVertex(v) => tx.put_vertex(v.clone())?,
+                IncrementalMutation::PutVertex(v) => {
+                    validate_vertex(v)?;
+                    tx.preflight_record_copy(v.accounted_bytes() + INDEX_FEE)?;
+                    tx.put_vertex(v.clone())?;
+                }
                 IncrementalMutation::DeleteVertex(id) => tx.delete_vertex(*id)?,
-                IncrementalMutation::PutEdge(e) => tx.put_edge(e.clone())?,
+                IncrementalMutation::PutEdge(e) => {
+                    validate_edge(e)?;
+                    tx.preflight_record_copy(e.accounted_bytes() + INDEX_FEE)?;
+                    tx.put_edge(e.clone())?;
+                }
                 IncrementalMutation::DeleteEdge(id) => tx.delete_edge(*id)?,
             }
         }

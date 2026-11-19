@@ -108,3 +108,48 @@ fn restore_rejects_non_files_and_other_format_versions() {
         .is_err());
     }
 }
+
+#[test]
+fn checkpoint_preserves_finite_real_bits_in_standalone_core() {
+    let values = [
+        51.248178375505404,
+        -51.248178375505404,
+        1.0000000000000002,
+        f64::from_bits(1),
+        f64::MAX,
+        -0.0,
+    ];
+    let mut vertex = Vertex::new(1);
+    for (i, value) in values.iter().enumerate() {
+        vertex
+            .properties
+            .insert(format!("real_{i}"), Value::Real(*value));
+    }
+    let graph = IncrementalGraph::from_records(
+        "real-bits",
+        IncrementalMode::Cow,
+        IncrementalLimits::default(),
+        vec![vertex],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("reals.bin");
+    graph.checkpoint(&p).unwrap();
+    let restored = IncrementalGraph::restore(
+        &p,
+        "real-bits",
+        IncrementalMode::Locked,
+        IncrementalLimits::default(),
+    )
+    .unwrap();
+    let view = restored.read().unwrap();
+    for (i, expected) in values.iter().enumerate() {
+        let Value::Real(actual) = view.get_vertex(1).unwrap().properties[&format!("real_{i}")]
+        else {
+            panic!("wrong property type")
+        };
+        assert_eq!(actual.to_bits(), expected.to_bits(), "real_{i}");
+    }
+}

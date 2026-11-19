@@ -4,7 +4,7 @@ Status: implemented as an optional local library backend in this proposal;
 upstream integration, remote CI and production qualification are separate.
 This follows the fixed-version read-model work without changing its API.
 Tracking: [#370](https://github.com/ashione/VelaGraph/issues/370), milestone
-[v0.0.3](https://github.com/ashione/VelaGraph/milestone/3). Implementation PR is linked below before publication.
+[v0.0.3](https://github.com/ashione/VelaGraph/milestone/3). Implementation: [PR #371](https://github.com/ashione/VelaGraph/pull/371).
 
 ## Problem and scope
 
@@ -162,7 +162,9 @@ A version-one file is at most 64 MiB and consists of:
 4. UTF-8 JSON with ordered fields `identity`, `sequence`, `metadata`, `vertices`,
    `edges`. Metadata is an array of bytes; vertex and edge arrays are sorted by
    ID. Record fields use existing serde `Vertex` / `Edge` / `Value` representations;
-   property names are canonical. Unknown top-level payload fields are rejected.
+   property names are canonical. The core enables serde_json `float_roundtrip` so
+   finite Real values preserve their binary64 bits even in standalone core builds.
+   Unknown top-level payload fields are rejected.
 
 The golden vector is `tests/fixtures/incremental_checkpoint_v1.bin`. A format
 change requires a new magic/version, migration/refusal note and updated vectors;
@@ -216,5 +218,5 @@ recovery or safe CDC publication. Those remain separate integration work.
 
 ## Delivery
 
-Tracking: #370, v0.0.3; the implementation PR link is added on publication. This is
+Tracking: [#370](https://github.com/ashione/VelaGraph/issues/370), [PR #371](https://github.com/ashione/VelaGraph/pull/371), v0.0.3. This is
 not completion of the broader managed recovery or CDC milestones.
