@@ -36,7 +36,10 @@ Implementation boundary: [public managed service design](PUBLIC_SERVICE_DESIGN.m
 (shared handlers, protocol parity, delivery ownership and readiness gates).
 The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed public gRPC](PUBLIC_GRPC_SERVICE.md)
 and [service host](PUBLIC_SERVICE_CLI.md) provide the finite experimental surface
-described in the published release notes and [capability matrix](V0_0_1_CAPABILITY_MATRIX.md).
+described in the [published v0.0.1 release notes](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1),
+which are authoritative for shipped scope and acceptance. The
+[tag-pinned capability matrix](https://github.com/ashione/VelaGraph/blob/v0.0.1/docs/V0_0_1_CAPABILITY_MATRIX.md)
+is dated candidate context (2026-11-16), not the final release acceptance record.
 The release is source-only, with explicit unresolved risk dispositions; it does
 not close every umbrella issue or certify production readiness. The acceptance
 criteria below retain their scoped meaning. Development main may add later slices.
@@ -115,8 +118,9 @@ unsupported recovery states. This phase expands the supported recovery capabilit
 ## v0.0.3 — elastic routing and bounded concurrency
 
 Planned [#354](https://github.com/ashione/VelaGraph/issues/354) adds graph building
-from an initially tested MySQL-compatible/InnoDB source with CDC and periodic
-online rebuild. The planned serving generation retains its full baseline plus
+with CDC and periodic online rebuild. Its first target is one explicitly
+validated MySQL-compatible/InnoDB source; that validation is planned, not shipped.
+The planned serving generation retains its full baseline plus
 deltas while the next full generation builds, catches up, and is published by an
 atomic versioned switch. A source offset is not graph V. This belongs to v0.0.3
 and is not a currently supported import/rebuild service.

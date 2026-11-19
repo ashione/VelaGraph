@@ -14,8 +14,9 @@ source-only 实验预发布；不是预编译发行包或生产就绪承诺。�
 固定 V 捕获证据、[#350](https://github.com/ashione/VelaGraph/issues/350) 全局 manifest、
 [#351](https://github.com/ashione/VelaGraph/issues/351) 隔离整组恢复/READY 门禁、
 [#352](https://github.com/ashione/VelaGraph/issues/352) 真实恢复演练；v0.0.3 的
-[#354](https://github.com/ashione/VelaGraph/issues/354) 首个经过验证的 MySQL-compatible/InnoDB
-来源的 CDC/周期在线重建：规划由旧全量+增量继续服务，新全量后台构建并追平，
+[#354](https://github.com/ashione/VelaGraph/issues/354) CDC/周期在线重建的首个目标是一个需要明确
+验证的 MySQL-compatible/InnoDB 来源，该验证尚属规划而非已交付：
+由旧全量+增量继续服务，新全量后台构建并追平，
 再原子切换版本；来源 offset 不等于 graph V。v0.0.5 的 [#353](https://github.com/ashione/VelaGraph/issues/353) 远程持久 ACK 与完整日志恢复闭包。
 保留 #124/#193 前置约束，不改变 offline-only、同版本及生产安全限制。
 
