@@ -67,6 +67,14 @@ new original Begin/Admit/Prepared/Decide IDs check every matching resident local
 record, with compact cohort/grant checks always applied. No cross-operation
 lookup cache skips raw closure.
 
+When a page starts at the exact current head of this verified member overlay,
+there are no old overlapping events. SyncHistory reuses the operation's complete
+snapshot verification instead of walking the old prefix a second time. It still
+validates the incoming page's full identity/hash chain and every appended
+transition. Complete cursor equality is required; old or overlapping pages keep
+the original comparison walk. New operations verify their own snapshot again.
+See [implementation bounds and measurement](benchmarks/lifecycle-head-extension-2026-11.md).
+
 AdvanceRetained first proves the target resolved at the **exact requested cut**,
 before even an already-applied retry. The bounded target-only proof counts
 admissions and tracks unresolved IDs only among the first target ordinal. At
