@@ -1,6 +1,8 @@
 # Release milestones and acceptance
 
-Status: planned, not released. Initial owner direction recorded 2026-11-12;
+Status as of 2026-11-19: [v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1)
+is a published source-only experimental prerelease. Later milestones remain
+planned acceptance, not delivered capabilities. Initial owner direction recorded 2026-11-12;
 v0.0.5–v0.0.8 and GitHub Pages approved 2026-11-14.
 Tracking: [#224](https://github.com/ashione/VelaGraph/issues/224).
 
@@ -14,7 +16,7 @@ can proceed in parallel; an umbrella issue is not closed by shipping one slice.
 Titles and repository milestone numbers below were checked against the live
 [GitHub milestones](https://github.com/ashione/VelaGraph/milestones) on 2026-11-15.
 These are existing planning objects, not delivered features or release acceptance.
-All eight were open with no due date; v0.0.5–v0.0.8 had no assigned issues at this
+At that historical check, all eight were open with no due date; v0.0.5–v0.0.8 had no assigned issues at this
 check. Implementation slices still need explicit tracking and acceptance evidence.
 
 | Milestone title | Repository milestone number |
@@ -33,10 +35,13 @@ check. Implementation slices still need explicit tracking and acceptance evidenc
 Implementation boundary: [public managed service design](PUBLIC_SERVICE_DESIGN.md)
 (shared handlers, protocol parity, delivery ownership and readiness gates).
 The [HTTP preview](PUBLIC_HTTP_PREVIEW.md), [typed public gRPC](PUBLIC_GRPC_SERVICE.md)
-and [service host](PUBLIC_SERVICE_CLI.md) are staged implementations, not proof of completed clean-startup or release
-gates. The finite preview feature/compatibility matrix must be explicit; the current
-[candidate inventory](V0_0_1_CAPABILITY_MATRIX.md) records that surface and its
-remaining risk dispositions, without declaring this acceptance complete.
+and [service host](PUBLIC_SERVICE_CLI.md) provide the finite experimental surface
+described in the published release notes and [capability matrix](V0_0_1_CAPABILITY_MATRIX.md).
+The release is source-only, with explicit unresolved risk dispositions; it does
+not close every umbrella issue or certify production readiness. The acceptance
+criteria below retain their scoped meaning. Development main may add later slices.
+HTTP preview job lifecycle is implemented through shared handlers; stable HTTP v1
+and complete protocol parity remain separate acceptance, not implied by preview support.
 
 Deliver a small usable service before promising elastic operation:
 
@@ -70,7 +75,13 @@ open until its complete acceptance is met.
 
 ## v0.0.2 — sustainable consistent graph and verified recovery
 
-The next core gate is sustained operation, not a larger constant:
+The next core gate is sustained operation, not a larger constant. Planned recovery
+slices are [#349](https://github.com/ashione/VelaGraph/issues/349) (fixed-V capture
+evidence and retention), [#350](https://github.com/ashione/VelaGraph/issues/350)
+(global manifest closure), [#351](https://github.com/ashione/VelaGraph/issues/351)
+(isolated whole-cohort restore and READY gate), and
+[#352](https://github.com/ashione/VelaGraph/issues/352) (real coordinator/two-shard
+failure drill). Their assignment to v0.0.2 is not implementation or acceptance.
 
 - [#108](https://github.com/ashione/VelaGraph/issues/108),
   [#109](https://github.com/ashione/VelaGraph/issues/109) and
@@ -102,6 +113,13 @@ Recovery correctness is not deferred from v0.0.1: that version must safely rejec
 unsupported recovery states. This phase expands the supported recovery capability.
 
 ## v0.0.3 — elastic routing and bounded concurrency
+
+Planned [#354](https://github.com/ashione/VelaGraph/issues/354) adds graph building
+from an initially tested MySQL-compatible/InnoDB source with CDC and periodic
+online rebuild. The planned serving generation retains its full baseline plus
+deltas while the next full generation builds, catches up, and is published by an
+atomic versioned switch. A source offset is not graph V. This belongs to v0.0.3
+and is not a currently supported import/rebuild service.
 
 Three linked missing-capability issues:
 
@@ -146,7 +164,8 @@ Planned acceptance under [milestone 5](https://github.com/ashione/VelaGraph/mile
 extending [#191](https://github.com/ashione/VelaGraph/issues/191) beyond v0.0.2
 checkpoint backup:
 
-- Define remote-durable write ACK and the required commit/log closure; validate
+- Planned [#353](https://github.com/ashione/VelaGraph/issues/353): define and prove
+  remote-durable write ACK and the required complete commit/log closure; validate
   immutable manifest/CAS publication, writer fencing and bounded cache and
   index-plus-delta reads.
 - Recover every acknowledged write after total local-cache loss. Missing or

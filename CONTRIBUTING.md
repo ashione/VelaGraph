@@ -69,11 +69,14 @@ cargo clippy --locked -p checkpoint-object-store --all-targets -- -D warnings
 | Layer | Purpose | What it does not prove |
 | --- | --- | --- |
 | [Ordinary CI](.github/workflows/ci.yml) | Format, default-member tests and Clippy on separate jobs | Ignored long tests and all workspace members are not implicitly covered |
-| [CoreHR](.github/workflows/corehr.yml) | Full observed scenario plus release 1,025-write managed lifecycle and recovery | Full-scale managed CoreHR or multi-machine HA |
+| [CoreHR](.github/workflows/corehr.yml) | Full observed scenario on every event; short lifecycle/recovery on PRs, full release 1,025-write acceptance on main pushes, schedules and manual runs | Full-scale managed CoreHR or multi-machine HA |
 | [Object-store checkpoint](.github/workflows/object-store-checkpoint.yml) | Native transport tests and explicit SeaweedFS S3-compatible integration | Production AWS/OSS/TOS bucket conformance |
 
 The long lifecycle is deliberately ignored by ordinary debug tests. Its release
 build and execution are separate CI jobs; the scenario is independently run.
+PR lifecycle summaries report `pr-short`, not full boundary acceptance. Full
+main/scheduled/manual runs report `full-1025`. Only superseded PR CoreHR runs
+are cancelled; each full run has a unique concurrency group and is retained.
 This guide describes existing workflows, not new path-based skip rules or a
 relaxation of required checks. Do not disable a gate to obtain a green PR.
 For local reproduction and evidence formats see [CoreHR CI](docs/COREHR_CI.md)

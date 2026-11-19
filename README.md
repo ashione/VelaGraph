@@ -37,8 +37,18 @@ explicit-identity API changes and validation boundaries. Public HTTP
 remains supported; old JSON/TCP clients are not a supported fallback.
 
 Go clients can build a managed traversal locally and submit its steps in one
-gRPC call. See the [Go client SDK](sdk/go/README.md)
-for supported steps and snapshot selection.
+typed `GraphService.Execute` gRPC call without sending Gremlin text for parsing.
+This is not a server-side prepared-plan handle or reuse of the local Rust
+prepared-query API. See the [Go client SDK](sdk/go/README.md) for supported steps
+and snapshot selection.
+
+## Source prerelease and development main
+
+[v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1) is a published
+source-only experimental prerelease, not a prebuilt binary or production release.
+This README describes development `main`, which includes later changes. For the
+released scope and limitations, use the tagged source and its release notes; keep
+clients and services on the same source version.
 
 ## Quick start
 
@@ -103,8 +113,8 @@ The Rust package and import name are both **`velagraph`**. The local
 explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
-Temporal queries support reusable parsed plans, checked typed bindings and
-query-local record/adjacency cursor reuse at a fixed snapshot and V/T.
+Local Rust temporal queries support reusable parsed plans, checked typed bindings
+and query-local record/adjacency cursor reuse at a fixed snapshot and V/T.
 Already observed record-boundary lookahead can also avoid a redundant seek while
 retaining the normal visibility and validation checks. See
 [temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
@@ -115,7 +125,15 @@ For repeated reads at a fixed local V, `TemporalStore::materialize` builds an
 owned, bounded [temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md).
 Its covering rows preserve business-time selection and reuse the Gremlin executor
 without query-time KV access. Construction, refresh and memory costs remain
-explicit; the model never refreshes itself.
+explicit; the model never refreshes itself. It borrows validated records during
+shared-executor traversal and copies only selected
+output values. Query results remain owned, and full logical record budgets still
+apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
+
+Prepared queries also reuse static canonical admission counts, checking each
+binding's exact textual size and complexity without rendering the entire query.
+This applies to typed prepared queries independently of the storage backend.
+
 Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
 storage engine; removing SQL did not remove it.
@@ -257,7 +275,9 @@ and implementation of scoped roadmap items. Start with
 
 [Ordinary CI](.github/workflows/ci.yml) runs formatting, tests and Clippy.
 [CoreHR CI](docs/COREHR_CI.md) separately exercises the full observed scenario and
-retained 1,025-write managed lifecycle/recovery. Object-store tests have their
+event-specific managed lifecycle/recovery: PRs use a short recovery check; main
+pushes, scheduled and manual runs retain the full 1,025-write acceptance. A green
+PR lifecycle gate is not full 1,025-write acceptance. Object-store tests have their
 [own workflow](.github/workflows/object-store-checkpoint.yml).
 `cargo test --locked` does not run every ignored long test or every workspace
 member. Passing same-host tests is not proof of multi-machine performance or HA.
@@ -272,13 +292,3 @@ crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserve
 See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
-
-
-The optional [materialized temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md)
-borrows validated records during shared-executor traversal and copies only selected
-output values. Query results remain owned, and full logical record budgets still
-apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
-
-Prepared queries also reuse static canonical admission counts, checking each
-binding's exact textual size and complexity without rendering the entire query.
-This applies to typed prepared queries independently of the storage backend.
