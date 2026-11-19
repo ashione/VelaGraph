@@ -4,7 +4,23 @@
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
-## 当前状态核对（2026-11-15，main `ab94394`）
+## 发布与规划更新（2026-11-19）
+
+[v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1) 已发布为
+source-only 实验预发布；不是预编译发行包或生产就绪承诺。开发 main 已包含后续切片，
+不能把 main 的能力全部归入该标签。发布范围、历史风险和验证证据以 release notes 为准。
+
+后续均为规划而非已交付：v0.0.2 的 [#349](https://github.com/ashione/VelaGraph/issues/349)
+固定 V 捕获证据、[#350](https://github.com/ashione/VelaGraph/issues/350) 全局 manifest、
+[#351](https://github.com/ashione/VelaGraph/issues/351) 隔离整组恢复/READY 门禁、
+[#352](https://github.com/ashione/VelaGraph/issues/352) 真实恢复演练；v0.0.3 的
+[#354](https://github.com/ashione/VelaGraph/issues/354) CDC/周期在线重建的首个目标是一个需要明确
+验证的 MySQL-compatible/InnoDB 来源，该验证尚属规划而非已交付：
+由旧全量+增量继续服务，新全量后台构建并追平，
+再原子切换版本；来源 offset 不等于 graph V。v0.0.5 的 [#353](https://github.com/ashione/VelaGraph/issues/353) 远程持久 ACK 与完整日志恢复闭包。
+保留 #124/#193 前置约束，不改变 offline-only、同版本及生产安全限制。
+
+## 历史状态核对（2026-11-15，main `ab94394`）
 
 本次纠偏跟踪 [#285](https://github.com/ashione/VelaGraph/issues/285)，承接已完成的
 #147 和 #280 文档审计；不是新建实现总目标。下表只列已合入基线的能力，不把待合并 PR 当成交付。
@@ -27,7 +43,8 @@
 正常中断回收子进程。准确合并树已通过独立审查、CI、Go、真实启动写查/退出及
 CoreHR 1025 门禁；[验证索引](CURRENT_STATUS.md#fresh-service-startup-delivery-2026-11-15)。
 仅限 loopback、明文无认证、single-voter 开发演示；不支持 restart/restore/HA，
-父进程 SIGKILL 不保证回收。#224 仍开放，尚未完成 v0.0.1 全部验收或发布。
+父进程 SIGKILL 不保证回收。在该历史检查时，#224 仍开放，v0.0.1 尚未发布；
+后续发布状态见本文顶部，原切片证据不追溯改写。
 后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
 相当规模的设计须保留完整 proposal/design doc，关联 issue、实现 PR、milestone/Project；
 按 [贡献规范](../CONTRIBUTING.md#proposals-and-design-records) 区分提议、接受、实现与验证，
@@ -897,7 +914,9 @@ reuses fixed-V workers and shared admission rather than introducing an executor.
 The exact contract, evidence matrix and non-goals remain in
 [MANAGED_QUERY_JOBS.md](MANAGED_QUERY_JOBS.md). #268 acceptance is complete;
 future changes still require their own exact-head review and applicable checks.
-Jobs do not resume after gateway restart, and HTTP job parity remains open.
+Jobs do not resume after gateway restart. HTTP `/preview1/jobs:*` now provides
+the preview lifecycle through the shared executor; stable HTTP v1 and complete
+HTTP/gRPC parity remain separate acceptance. See [HTTP preview](PUBLIC_HTTP_PREVIEW.md#managed-asynchronous-jobs).
 The later #277/#279 retired legacy wires, not the remaining #218 service gates.
 
 ### #276 — managed Gateway library transport retirement (merged #277)

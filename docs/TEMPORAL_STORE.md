@@ -151,11 +151,12 @@ are rejected rather than becoming a global scan. Duplicate start IDs and their
 order are retained. Keys, labels, limits and operators are not bindable in this
 initial API.
 
-Before execution, bound arguments pass the original text/structural limits using
-a canonical standard-Gremlin representation. Caller values are bounded before
-cloning/rendering. Rendering is for admission accounting only; the official
-parser is not invoked again. This retains the conservative structural-mark
-limit even for marks inside literal strings.
+Preparation measures a canonical standard-Gremlin representation once and caches
+its static byte/structural-mark contribution. Each bind validates caller input
+before cloning, then adds exact decimal-ID and quoted-literal contributions. It
+does not render the whole bound query or invoke the official parser again. The
+original canonical byte and structural limits still apply, including marks inside
+literal strings. This is local typed-plan reuse, not a remotely retained plan.
 
 `execute_prepared` binds and calls the same checked executor as textual queries.
 The global-start restriction, fresh deadline and fresh read/memory budgets are
