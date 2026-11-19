@@ -92,6 +92,17 @@ Materialized work accounting differs from the disk path's 4,096 physical
 revision/candidate limit. Neither successful-query admission nor failure timing
 is claimed identical across those two APIs.
 
+### Query deadline checkpoints
+
+Work accounting does not sample the clock for each counter update. The private
+materialized backend enters the shared executor with the same cooperative
+5-second deadline: point-read execution boundaries, operators and final result
+return remain checked. Adjacency checks the supplied callback at entry, for
+every candidate, and on completion, including missing/empty starts and a final
+visitor that triggers cancellation. No periodic-check interval or larger work,
+record-byte, live-memory or result budget is introduced. Disk/replicated read
+fencing and I/O checks are unchanged.
+
 ### Borrowed records in the shared executor
 
 Query reads from the immutable model borrow complete validated vertex/edge

@@ -19,7 +19,9 @@ impl Backend<'_, '_> {
         }
     }
     fn charge(&self, bytes: usize) -> crate::Result<()> {
-        self.check()?;
+        // The only execution entrypoint passes this backend's deadline to the
+        // shared executor. Keep exact work accounting separate from its clock
+        // checks around point reads, operators and successful return.
         let n = self.used.get() + 1;
         let b = self
             .bytes
@@ -34,7 +36,6 @@ impl Backend<'_, '_> {
         Ok(())
     }
     fn record_work(&self, bytes: usize) -> crate::Result<()> {
-        self.check()?;
         let total = self.bytes.get().checked_add(bytes).ok_or_else(work_error)?;
         if total > self.limits.max_work_bytes {
             return Err(work_error());
@@ -113,10 +114,10 @@ impl Backend<'_, '_> {
         check: &mut impl FnMut() -> crate::Result<()>,
         visit: &mut impl FnMut(u32) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        self.check()?;
+        check()?;
         let g = self.view.graph;
         let Some(slot) = g.vertex_index.get(&id) else {
-            return Ok(());
+            return check();
         };
         let rows = if incoming {
             &g.incoming[*slot as usize]
@@ -128,8 +129,8 @@ impl Backend<'_, '_> {
             crate::query_profile::read_event(
                 crate::query_profile::ReadEvent::MaterializedCandidate,
             );
-            self.charge(ROW_WORK_BYTES)?;
             check()?;
+            self.charge(ROW_WORK_BYTES)?;
             let row = g.rows[*index as usize];
             if !row.contains(self.view.time)
                 || label.is_some_and(|l| l != g.labels[row.label as usize])
@@ -141,7 +142,7 @@ impl Backend<'_, '_> {
             }
             visit(row.payload)?;
         }
-        Ok(())
+        check()
     }
     fn borrow_vertex(&self, p: u32, budget: &Budget) -> crate::Result<Accounted<Cow<'_, Vertex>>> {
         let cached = &self.view.graph.payloads[p as usize];
@@ -434,3 +435,6 @@ mod tests {
         assert_eq!(enough.used(), 0);
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;
