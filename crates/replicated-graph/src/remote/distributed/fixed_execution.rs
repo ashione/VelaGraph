@@ -93,6 +93,19 @@ pub(crate) async fn lock_session_fixtures() -> tokio::sync::MutexGuard<'static, 
 pub(crate) fn validate(request: &DistributedRequest) -> Result<(), QueryFailure> {
     parse(request).map(|_| ())
 }
+/// Keep renewable jobs on their existing admission contract. Synchronous limit
+/// support does not implicitly extend another public lifecycle.
+pub(crate) fn validate_job(request: &DistributedRequest) -> Result<(), QueryFailure> {
+    let query = parse(request)?;
+    if query
+        .steps()
+        .iter()
+        .any(|step| matches!(step, Step::Existing(GremlinStep::Limit(_))))
+    {
+        return Err(QueryFailure::Unsupported);
+    }
+    Ok(())
+}
 pub(crate) fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryFailure> {
     if request.text.len() > query::MAX_QUERY_TEXT_BYTES {
         return Err(QueryFailure::ResourceExhausted);
@@ -103,7 +116,7 @@ pub(crate) fn parse(request: &DistributedRequest) -> Result<GremlinQuery, QueryF
     }
     for (index, step) in query.steps().iter().enumerate() {
         match step {
-            Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_)) => {}
+            Step::Existing(GremlinStep::Out(_) | GremlinStep::In(_) | GremlinStep::Limit(_)) => {}
             Step::Existing(GremlinStep::Path | GremlinStep::Count)
                 if index + 1 == query.steps().len() => {}
             _ => return Err(QueryFailure::Unsupported),
@@ -309,14 +322,30 @@ mod tests {
             text: text.into(),
             timeout_millis: 5000,
         };
-        for text in ["g.V(1)", "g.V(1,1).out().in('x').path()", "g.V(9).count()"] {
+        for text in [
+            "g.V(1)",
+            "g.V(1,1).out().in('x').path()",
+            "g.V(9).count()",
+            "g.V(1,1).limit(1).out().limit(1000).path()",
+            "g.V(1).out().limit(2).in().count()",
+        ] {
             validate(&request(text)).unwrap();
         }
+        validate_job(&request("g.V(1).out().path()")).unwrap();
+        assert_eq!(
+            validate_job(&request("g.V(1).out().limit(2).path()")),
+            Err(QueryFailure::Unsupported)
+        );
         for text in [
             "g.V()",
             "g.E(1)",
             "g.V(1).both()",
-            "g.V(1).limit(1)",
+            "g.V(1).limit(0)",
+            "g.V(1).limit(1001)",
+            "g.V(1).limit(-1)",
+            "g.V(1).limit(1.5)",
+            "g.V(1).count().limit(1)",
+            "g.V(1).path().limit(1)",
             "g.V(1).values('x')",
             "g.V(1).repeat(out()).times(2)",
         ] {

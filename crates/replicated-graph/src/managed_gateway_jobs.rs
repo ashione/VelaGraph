@@ -317,7 +317,7 @@ impl State {
         if operation_id == [0; 16] || !(1..=MAX_PAGE_SIZE).contains(&page_size) {
             return Err(Error::Protocol);
         }
-        fixed_execution::validate(&local::request(&query)).map_err(Error::Query)?;
+        fixed_execution::validate_job(&local::request(&query)).map_err(Error::Query)?;
         if !self
             .config
             .binding

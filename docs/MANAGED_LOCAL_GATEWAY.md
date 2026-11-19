@@ -33,11 +33,21 @@ The additive operations are:
   separately from old materialized sessions and observed node descriptors.
 
 The official Gremlin AST admits explicit nonempty `g.V(ids)`, up to three `out`
-or `in` hops, and optional terminal `path` or `count`. Other syntax fails before
+or `in` hops, interleaved `limit(n)` with `1 <= n <= 1000`, and optional
+terminal `path` or `count`. Other syntax fails before
 any node session allocation. The existing shared executor preserves argument
 order, duplicate roots, edge order, qualified paths, canonical/reverse/endpoint
 validation and default first-100 non-count semantics. This is a narrower entrypoint
-than old managed Traverse, not a silent substitute. Rows retain `Unverified`
+than old managed Traverse, not a silent substitute. Each explicit limit keeps
+the first n traversers at its exact position in the global ordered sequence,
+including duplicate roots and parallel-edge occurrences. It is not pushed down
+independently to shards. A leading limit can stop root acquisition; a limit after
+a traversal does not bypass preceding adjacency validation or resource limits.
+Any explicit limit suppresses the default first-100 output cap; later expansion
+may therefore produce more than n rows, still under the unchanged full-result
+and cumulative work/byte ceilings. `limit(0)` remains rejected by the shared
+parser. This addition applies to synchronous local Open operations only;
+renewable query jobs retain their separately documented grammar. Rows retain `Unverified`
 adjacency completeness, separately from their certified V.
 
 ## Admission, execution and results

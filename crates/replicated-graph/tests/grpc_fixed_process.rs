@@ -269,6 +269,42 @@ async fn fixed_scenario() -> anyhow::Result<()> {
         "parallel fixed fragments preserve edge order and bag multiplicity"
     );
 
+    limit_oracles(&tcp, &grpc, version, &expected).await?;
+
+    // Retain a limited result across writes just like an unlimited result.
+    let limited_query = Query {
+        partition: 7,
+        text: "g.V(1).out('knows').limit(2).path()".into(),
+    };
+    let (limited, limited_first) = local_open(&grpc, version, &limited_query).await?;
+    let limited_fetch = Operation::FetchLocalQuery {
+        session: limited.clone(),
+        query: limited_query.clone(),
+        cursor: limited_first.next.clone(),
+        page_size: 1,
+    };
+    let limited_before = call(&grpc, limited_fetch.clone()).await?;
+    assert_eq!(
+        call(
+            &grpc,
+            Operation::StartLocalQueryJob {
+                operation_id: [56; 16],
+                version: Some(version),
+                query: limited_query.clone(),
+                page_size: 1,
+                policy: gateway::JobPolicy {
+                    idle_millis: 60_000,
+                    execution_millis: 120_000,
+                    lifetime_millis: 180_000
+                },
+            }
+        )
+        .await,
+        Err(gateway::Error::Query(
+            replicated_graph::remote::query::QueryFailure::Unsupported
+        ))
+    );
+
     let (old, first) = local_open(&grpc, version, &query).await?;
     let fetch = Operation::FetchLocalQuery {
         session: old.clone(),
@@ -308,11 +344,211 @@ async fn fixed_scenario() -> anyhow::Result<()> {
         local_rows(&grpc, later, &added).await?,
         vec![QueryRow::Count(1)]
     );
+    let changed = submit(
+        &grpc,
+        8,
+        Mutation::CreateEdge {
+            edge: EdgeData {
+                id: 5,
+                from: Entity {
+                    partition: 7,
+                    id: 1,
+                },
+                to: Entity {
+                    partition: 7,
+                    id: 1,
+                },
+                label: "knows".into(),
+                properties: BTreeMap::new(),
+            },
+        },
+    )
+    .await?;
+    // A lower-ID self-loop introduces a second target shard in the same
+    // ordered bag. One global limit still selects exactly two rows, and never
+    // changes either a retained result or a newly captured old fixed cut.
+    assert_eq!(
+        local_rows(&grpc, version, &limited_query).await?,
+        expected[..2]
+    );
+    let mut new_first = expected[1].clone();
+    if let QueryRow::Path(path) = &mut new_first {
+        path[2] = replicated_graph::remote::query::QualifiedElement::Vertex {
+            partition: 7,
+            id: 1,
+        };
+        path[1] = replicated_graph::remote::query::QualifiedElement::Edge {
+            partition: 7,
+            id: 5,
+        };
+    } else {
+        unreachable!("path oracle");
+    }
+    assert_eq!(
+        local_rows(&grpc, changed, &limited_query).await?,
+        vec![new_first.clone(), expected[0].clone()]
+    );
+    let cross_window = Query {
+        partition: 7,
+        text: "g.V(1).out().limit(2).in().limit(1).path()".into(),
+    };
+    let QueryRow::Path(mut mixed_path) = new_first else {
+        unreachable!("path oracle")
+    };
+    mixed_path.push(replicated_graph::remote::query::QualifiedElement::Edge {
+        partition: 7,
+        id: 5,
+    });
+    mixed_path.push(replicated_graph::remote::query::QualifiedElement::Vertex {
+        partition: 7,
+        id: 1,
+    });
+    // Both incoming lists are nonempty, on different owners in one window.
+    // The first global row comes from the self-loop, not the faster shard.
+    for gateway in [&tcp, &grpc] {
+        assert_eq!(
+            local_rows(gateway, changed, &cross_window).await?,
+            vec![QueryRow::Path(mixed_path.clone())]
+        );
+    }
+    assert_eq!(call(&grpc, limited_fetch).await?, limited_before);
+    call(&grpc, Operation::CloseLocalQuery { session: limited }).await?;
     call(&grpc, Operation::CloseLocalQuery { session: old }).await?;
     job_roundtrip(&grpc, version, &query, expected).await?;
     raw_fixed_checks(&c, &a, later).await?;
     grpc.shutdown().await;
     tcp.shutdown().await;
+    Ok(())
+}
+
+// Independent ordered oracle: edges 10 -> (8,2), 20/30 -> (8,3).
+// Duplicate roots and parallel edges remain separate traversers. Limits are
+// applied to the globally merged sequence, never separately to each shard.
+async fn limit_oracles(
+    tcp: &Gateway,
+    grpc: &Gateway,
+    version: u64,
+    paths: &[QueryRow],
+) -> anyhow::Result<()> {
+    let root = QueryRow::Element(replicated_graph::remote::query::QualifiedElement::Vertex {
+        partition: 7,
+        id: 1,
+    });
+    let cases = vec![
+        ("g.V(1,1).limit(1).out().path()", paths.to_vec()),
+        ("g.V(1,1).out().limit(2).path()", paths[..2].to_vec()),
+        (
+            "g.V(1,1).out().limit(4).path()",
+            vec![
+                paths[0].clone(),
+                paths[1].clone(),
+                paths[2].clone(),
+                paths[0].clone(),
+            ],
+        ),
+        (
+            "g.V(1,1).limit(1).out().limit(2).path()",
+            paths[..2].to_vec(),
+        ),
+        ("g.V(999,1,1).limit(1).out().path()", paths.to_vec()),
+        ("g.V(999).limit(1000).count()", vec![QueryRow::Count(0)]),
+        (
+            "g.V(1,1).out().limit(1000).count()",
+            vec![QueryRow::Count(6)],
+        ),
+        ("g.V(1,1).limit(1).out().count()", vec![QueryRow::Count(3)]),
+        ("g.V(1,1).out().limit(1).count()", vec![QueryRow::Count(1)]),
+        // The two parallel incoming edges at (8,3) make a cycle-shaped walk.
+        (
+            "g.V(1).out().limit(2).in().count()",
+            vec![QueryRow::Count(3)],
+        ),
+        ("g.V(1).out().in().limit(2)", vec![root.clone(), root]),
+        (
+            "g.V(1).out().limit(1).in().out().count()",
+            vec![QueryRow::Count(3)],
+        ),
+    ];
+    for (text, expected) in cases {
+        let query = Query {
+            partition: 7,
+            text: text.into(),
+        };
+        for gateway in [tcp, grpc] {
+            assert_eq!(
+                local_rows(gateway, version, &query).await?,
+                expected,
+                "ordered limit oracle: {text}"
+            );
+        }
+    }
+    // An explicit limit before expansion does not reinstate a final cap of 100.
+    let roots = std::iter::repeat_n("1", 21).collect::<Vec<_>>().join(",");
+    let query = Query {
+        partition: 7,
+        text: format!("g.V({roots}).limit(21).out().in().path()"),
+    };
+    let mut one_root = Vec::new();
+    for (out_index, incoming) in [(0, vec![10]), (1, vec![20, 30]), (2, vec![20, 30])] {
+        for edge in incoming {
+            let QueryRow::Path(mut path) = paths[out_index].clone() else {
+                unreachable!("path oracle")
+            };
+            path.push(replicated_graph::remote::query::QualifiedElement::Edge {
+                partition: 7,
+                id: edge,
+            });
+            path.push(replicated_graph::remote::query::QualifiedElement::Vertex {
+                partition: 7,
+                id: 1,
+            });
+            one_root.push(QueryRow::Path(path));
+        }
+    }
+    let expected = (0..21).flat_map(|_| one_root.clone()).collect::<Vec<_>>();
+    assert_eq!(expected.len(), 105);
+    for gateway in [tcp, grpc] {
+        assert_eq!(local_rows(gateway, version, &query).await?, expected);
+    }
+    for text in ["g.V(1).limit(0)", "g.V(1).limit(1001)"] {
+        for gateway in [tcp, grpc] {
+            assert_eq!(
+                call(
+                    gateway,
+                    Operation::OpenLocalQuery {
+                        version: Some(version),
+                        ttl_millis: 60_000,
+                        query: Query {
+                            partition: 7,
+                            text: text.into()
+                        },
+                        page_size: 1,
+                    }
+                )
+                .await,
+                Err(gateway::Error::Query(
+                    replicated_graph::remote::query::QueryFailure::InvalidArgument
+                ))
+            );
+        }
+    }
+    for text in [
+        "g.V(1).limit(0)",
+        "g.V(1).limit(1001)",
+        "g.V(1).limit(-1)",
+        "g.V(1).limit(1.5)",
+    ] {
+        let query = Query {
+            partition: 7,
+            text: text.into(),
+        };
+        for gateway in [tcp, grpc] {
+            assert!(
+                local_open(gateway, version, &query).await.is_err(),
+                "invalid limit accepted: {text}"
+            );
+        }
+    }
     Ok(())
 }
 
