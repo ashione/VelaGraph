@@ -5,7 +5,9 @@
 The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
 in-process access to ordinary incremental memory and temporal RocksDB stores.
 They share existing Gremlin, mutation, V/T and checkpoint contracts. Packed
-results support owned Go materialization and explicitly closed native-memory views. Cancellation
+results support owned Go materialization and explicitly closed native-memory views.
+The Go native package bundles its ABI header; isolated module/vendor consumers
+are covered by native CI. Cancellation
 is cooperative; no distributed capability or storage format is added. JSON
 encoding/copy costs, explicit lifecycle and shared-process native failure remain
 part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)

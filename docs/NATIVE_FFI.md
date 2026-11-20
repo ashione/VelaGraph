@@ -28,7 +28,9 @@ The [Go example](../sdk/go/native/example/main.go) generates a small graph,
 executes and validates point, batch and adjacency queries, and releases stores
 and prepared plans. Without both `cgo` and `velagraph_native`, the package builds
 but returns `ErrUnavailable`; existing pure-Go gRPC clients remain usable.
-The header is [include/velagraph.h](../include/velagraph.h). The standalone
+The canonical C header is [include/velagraph.h](../include/velagraph.h). An identical
+copy is shipped inside [the Go native package](../sdk/go/native/velagraph.h), so
+module-cache and vendor builds do not need repository-level include paths. The standalone
 [C consumer](../crates/velagraph-ffi/tests/smoke.c) demonstrates calls and ownership.
 Default linkage selects the shared library. A static-link application must also
 supply platform/C++ dependencies; no portable static-link flags are promised.
@@ -41,6 +43,37 @@ if err != nil { return err }
 defer store.Close()
 result, err := store.Query(ctx, []native.Query{{Text: "g.V(1)"}}, native.QueryOptions{})
 ```
+
+## Downstream Go modules and vendor
+
+The Go package carries its own ABI header. A downstream application can depend
+on `github.com/ashione/VelaGraph/sdk/go/native` at the matching SDK version/commit,
+without checking out the rest of this repository or adding `CGO_CFLAGS`/`-I` paths.
+It must still build or obtain the matching native library for its platform; the
+Go module does not bundle a Rust toolchain or native binaries.
+
+After adding that dependency, run from the downstream application directory:
+
+```sh
+# /path/to/native/lib contains libvelagraph_ffi.so or libvelagraph_ffi.dylib.
+export CGO_ENABLED=1
+export CGO_LDFLAGS="-L/path/to/native/lib"
+export LD_LIBRARY_PATH="/path/to/native/lib"    # Linux runtime loader
+export DYLD_LIBRARY_PATH="/path/to/native/lib"  # macOS runtime loader
+go test -tags velagraph_native ./...
+# Optional vendoring; the header is retained with the native package.
+go mod vendor
+go test -mod=vendor -tags velagraph_native ./...
+```
+
+For header changes, update the canonical header and copy it with
+`cp include/velagraph.h sdk/go/native/velagraph.h`. Native CI rejects byte drift
+between the two copies. `scripts/test_native_ffi_downstream.py --lib-dir ...`
+builds a local Go module proxy from only the SDK subtree, tests an independent
+consumer with clean module/build caches and no external include paths, then tests
+its vendor tree with proxy access disabled and a new empty module cache. Both
+cases execute a native query/lease release, not just a compile-only stub. This
+check is part of `scripts/test_native_ffi.py` on Linux and macOS.
 
 ## Direct result access
 

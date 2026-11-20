@@ -3,7 +3,6 @@
 package native
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../include
 #cgo LDFLAGS: -lvelagraph_ffi
 #include "velagraph.h"
 */

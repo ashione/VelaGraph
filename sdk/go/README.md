@@ -87,3 +87,27 @@ and [executable example](native/example/main.go).
 text comparison; Close the view explicitly. `Text`, `Metadata` and `Materialize`
 copy only when Go-owned output is requested. Input JSON and native kernel result
 construction remain; this is zero-copy access across the result boundary.
+
+### Native dependency distribution
+
+The `native` package includes `velagraph.h`; normal module-cache and vendor builds
+need no checkout of the Rust repository and no external header include path.
+Use an SDK version/commit matching the separately built native library. Native
+binaries are not distributed in this Go module.
+
+From a downstream module that imports `github.com/ashione/VelaGraph/sdk/go/native`:
+
+```sh
+export CGO_ENABLED=1
+export CGO_LDFLAGS="-L/path/to/native/lib"
+export LD_LIBRARY_PATH="/path/to/native/lib"    # Linux
+export DYLD_LIBRARY_PATH="/path/to/native/lib"  # macOS
+go test -tags velagraph_native ./...
+go mod vendor
+go test -mod=vendor -tags velagraph_native ./...
+```
+
+Maintainers keep `native/velagraph.h` identical to the canonical repository
+`include/velagraph.h`. Native CI verifies the copies and runs a separate consumer
+through both an isolated module proxy and an offline vendor tree, supplying only
+the native library directory.

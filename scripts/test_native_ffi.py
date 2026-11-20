@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a C consumer, then check native cgo and portable Go SDK builds.
+"""Build C, isolated module/vendor consumers, native cgo and portable SDK checks.
 
 Build velagraph-ffi first and pass the target debug/release library directory.
 """
@@ -18,6 +18,10 @@ def main():
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
     lib = pathlib.Path(args.lib_dir).resolve()
+    subprocess.run([
+        sys.executable, str(root / "scripts/test_native_ffi_downstream.py"),
+        "--lib-dir", str(lib),
+    ], check=True)
     env = os.environ.copy()
     env["CGO_LDFLAGS"] = "-L" + str(lib)
     loader = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"

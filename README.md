@@ -46,7 +46,9 @@ Go applications can also embed the local engine through the optional
 [`sdk/go/native`](docs/NATIVE_FFI.md) cgo package and versioned C ABI. It supports
 ordinary memory graphs, temporal RocksDB, prepared queries and controlled batches
 without a server. Packed results support owned Go objects or explicitly closed
-views with zero-copy result access. This path has local consistency and shared-process failure
+views with zero-copy result access. Its Go package includes the ABI header for
+module/vendor consumers; the matching native library is supplied separately.
+This path has local consistency and shared-process failure
 semantics; enable it explicitly with `velagraph_native` and a matching native library.
 
 ## Source prerelease and development main

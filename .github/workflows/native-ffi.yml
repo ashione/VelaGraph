@@ -57,7 +57,7 @@ jobs:
           cargo test --locked -p velagraph-ffi
           cargo clippy --locked -p velagraph-ffi --all-targets -- -D warnings
           cargo build --locked -p velagraph-ffi
-      - name: Real C consumer, Go race tests and portable SDK
+      - name: C, module/vendor consumers, Go race and portable SDK
         run: python3 scripts/test_native_ffi.py --lib-dir target/debug
       - name: Go native example (correctness only)
         working-directory: sdk/go
