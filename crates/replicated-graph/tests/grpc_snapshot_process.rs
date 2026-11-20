@@ -215,17 +215,21 @@ impl Cluster {
                 Err(_) => (3, "diagnostic_task_failed".to_string()),
             });
         }
-        summaries.sort_by_key(|(i, _)| *i);
-        format!(
-            "snapshot fixture failure observation (after error, selected_leader={}): {}",
-            self.leader + 1,
-            summaries
-                .into_iter()
-                .map(|(_, s)| s)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
+        format_failure_status(self.leader, summaries)
     }
+}
+
+fn format_failure_status(leader: usize, mut summaries: Vec<(usize, String)>) -> String {
+    summaries.sort_by_key(|(i, _)| *i);
+    format!(
+        "snapshot fixture failure observation (after error, selected_leader={}): {}",
+        leader + 1,
+        summaries
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 // A transparent loopback proxy counts physical connections. Pausing only its
@@ -849,6 +853,44 @@ async fn failure_status_collection_is_bounded_when_control_peers_do_not_reply() 
     }
     drop(listeners);
     Ok(())
+}
+
+/// Exhaust every completion order without relying on socket scheduling.
+#[test]
+fn failure_status_formats_mixed_evidence_in_node_order() {
+    let summaries = [
+        "node=1 status_unavailable",
+        "node=2 status_timeout",
+        "node=3 leader=Some(3) applied=7 last_log=9",
+    ];
+    let expected = "snapshot fixture failure observation (after error, selected_leader=2): \
+                    node=1 status_unavailable; node=2 status_timeout; \
+                    node=3 leader=Some(3) applied=7 last_log=9";
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let input = order
+            .into_iter()
+            .map(|i| (i, summaries[i].to_string()))
+            .collect();
+        assert_eq!(format_failure_status(1, input), expected);
+    }
+    assert_eq!(
+        format_failure_status(
+            0,
+            vec![
+                (3, "diagnostic_task_failed".into()),
+                (1, summaries[1].into())
+            ]
+        ),
+        "snapshot fixture failure observation (after error, selected_leader=1): \
+         node=2 status_timeout; diagnostic_task_failed"
+    );
 }
 
 /// Investigation only: process scheduling pause, not a production timeout fix.
