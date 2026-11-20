@@ -214,8 +214,8 @@ jobs:
           prefix-key: v2-no-debug-rust
           cache-on-failure: false
 
-      - name: Test temporal query reuse with profiling enabled
-        run: cargo test --locked -p velagraph --features query-profiling
+      - name: Test optional query features
+        run: cargo test --locked -p velagraph --features query-profiling,async-read
 
-      - name: Check temporal query reuse with profiling enabled
-        run: cargo clippy --locked -p velagraph --all-targets --features query-profiling -- -D warnings
+      - name: Check optional query features
+        run: cargo clippy --locked -p velagraph --all-targets --features query-profiling,async-read -- -D warnings
