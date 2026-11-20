@@ -6,6 +6,14 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct Totals {
     pub calls: u64,
+    /// Executions using the optional incremental memory backend.
+    pub incremental_queries: u64,
+    /// Successful vertex point resolutions in that backend.
+    pub incremental_vertex_reads: u64,
+    /// Successful edge point resolutions in that backend.
+    pub incremental_edge_reads: u64,
+    /// Adjacency candidates visited, including rejected labels.
+    pub incremental_candidates: u64,
     /// Covering candidates visited in an owned fixed-V read model.
     pub materialized_candidates: u64,
     pub materialized_vertex_checks: u64,
@@ -95,6 +103,10 @@ pub(crate) fn cache_hit() {
 }
 
 pub(crate) enum ReadEvent {
+    IncrementalQuery,
+    IncrementalVertex,
+    IncrementalEdge,
+    IncrementalCandidate,
     PreparedTextRender,
     MaterializedCandidate,
     MaterializedVertexCheck,
@@ -116,6 +128,10 @@ pub(crate) fn read_event(event: ReadEvent) {
     ACTIVE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
             match event {
+                ReadEvent::IncrementalQuery => t.incremental_queries += 1,
+                ReadEvent::IncrementalVertex => t.incremental_vertex_reads += 1,
+                ReadEvent::IncrementalEdge => t.incremental_edge_reads += 1,
+                ReadEvent::IncrementalCandidate => t.incremental_candidates += 1,
                 ReadEvent::PreparedTextRender => t.prepared_text_renders += 1,
                 ReadEvent::MaterializedCandidate => t.materialized_candidates += 1,
                 ReadEvent::MaterializedVertexCheck => t.materialized_vertex_checks += 1,

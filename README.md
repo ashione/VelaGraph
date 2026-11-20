@@ -138,6 +138,34 @@ Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
 storage engine; removing SQL did not remove it.
 
+## Optional incremental memory graph
+
+`IncrementalGraph` is an experimental local read-model backend for ordinary
+vertices and edges. It stages bounded changes and publishes records, bidirectional
+indexes, a local sequence and opaque caller progress atomically. Locked readers
+retain a read lock; COW readers retain an immutable version while updates copy
+only touched index shards and adjacency chunks. Gremlin uses the existing executor.
+
+This API does not replace `GraphEngine`, temporal assertions or managed storage.
+Memory commits are not individually durable. A separate versioned local checkpoint
+supports model recovery, but the caller still owns source identity, replayability,
+reader lifetimes and aggregate memory policy. See the [design and limits](docs/INCREMENTAL_MEMORY_GRAPH.md).
+
+```sh
+cargo run --release --locked -p velagraph --example incremental_memory
+cargo run --release --locked -p velagraph --example incremental_publication
+```
+
+COW prepares changed index shards outside the reader publication lock and releases
+retired data after unlocking. Its version budget includes the candidate construction
+peak. Checkpoint publication prevents older or conflicting snapshots from replacing
+an existing target and coordinates through a persistent directory lock sidecar.
+The `incremental_publication` example measures version acquisition during writes.
+
+The `incremental_memory` example uses generated data, compares rebuilding with incremental publication,
+checks each version and restores a checkpoint before continuing. Its timings are
+local observations, not a disk-durability comparison or service capacity claim.
+
 ## Choose your graph path
 
 Support in one row does **not** imply support in the others.

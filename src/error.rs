@@ -3,6 +3,10 @@ use thiserror::Error;
 /// Errors returned by the graph kernel.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Failure specific to the optional in-memory graph/checkpoint backend.
+    #[error("incremental memory graph: {0}")]
+    IncrementalMemory(#[source] Box<crate::IncrementalMemoryError>),
+
     #[error("temporal store error: {0}")]
     TemporalStore(Box<crate::temporal_store::TemporalStoreError>),
 

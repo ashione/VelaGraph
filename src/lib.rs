@@ -49,3 +49,11 @@ pub mod temporal_store;
 /// Optional local phase counters; no storage or query semantic changes.
 #[cfg(feature = "query-profiling")]
 pub mod query_profile;
+
+/// Experimental bounded incremental memory graph types. Existing disk-backed
+/// engines and temporal APIs retain their separate contracts.
+pub use graph::incremental::{
+    IncrementalCommitStats, IncrementalGraph, IncrementalLimits, IncrementalMemoryError,
+    IncrementalMode, IncrementalMutation, IncrementalQueryLimits, IncrementalReadView,
+    IncrementalToken, IncrementalTransaction,
+};
