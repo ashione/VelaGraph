@@ -127,7 +127,11 @@ execution run on the blocking pool, retaining a slot until work stops even
 when the caller disconnects. The 2 ms budget covers admission only. Separately
 constructed readers have independent budgets. Direct engine calls, including
 writes, use their existing APIs. The `AsyncGraphReader` rustdoc includes a
-runnable example.
+runnable example. The host Tokio runtime must have its time driver enabled.
+When building a runtime manually, call `Builder::enable_time()` or
+`Builder::enable_all()`. An immediately admitted read can succeed without a
+timer, but a read entering the wait queue on that runtime panics when it sets
+the admission deadline.
 
 ### Single-node read consistency
 

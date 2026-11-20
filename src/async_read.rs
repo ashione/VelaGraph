@@ -13,6 +13,11 @@ const WAIT_BUDGET: Duration = Duration::from_millis(2);
 
 /// A shareable read-only entry point for a local graph on a Tokio runtime.
 ///
+/// Poll queries on a Tokio runtime with its time driver enabled. When building
+/// the runtime manually, call [`tokio::runtime::Builder::enable_time`] or
+/// [`tokio::runtime::Builder::enable_all`]. Reads that acquire a slot
+/// immediately do not use the timer; queued reads use it for the 2 ms deadline.
+///
 /// Construct one reader per admission domain and clone it into request handlers.
 /// Clones share 32 execution slots and four waiting slots. A fifth waiter or a
 /// wait of 2 ms returns [`StorageNodeError::ResourceExhausted`] through
@@ -33,12 +38,15 @@ const WAIT_BUDGET: Duration = Duration::from_millis(2);
 /// let graph = Arc::new(GraphEngine::open(directory.path())?);
 /// graph.create_vertex(&Vertex::new(7))?;
 /// let reader = AsyncGraphReader::new(graph);
-/// # tokio::runtime::Builder::new_current_thread().enable_time().build()?.block_on(async {
-/// let client = reader.clone();
-/// let result = client.gremlin("g.V(7).count()").await?;
-/// assert_eq!(result.rows, [GremlinRow::Count(1)]);
-/// # Ok::<_, velagraph::Error>(())
-/// # })?;
+/// let runtime = tokio::runtime::Builder::new_current_thread()
+///     .enable_time()
+///     .build()?;
+/// runtime.block_on(async {
+///     let client = reader.clone();
+///     let result = client.gremlin("g.V(7).count()").await?;
+///     assert_eq!(result.rows, [GremlinRow::Count(1)]);
+///     Ok::<_, velagraph::Error>(())
+/// })?;
 /// # Ok(())
 /// # }
 /// ```
@@ -60,6 +68,12 @@ impl AsyncGraphReader {
     }
 
     /// Run a standard local Gremlin query on the Tokio blocking pool.
+    ///
+    /// # Panics
+    ///
+    /// Can panic if polled outside a Tokio runtime. If a query enters the
+    /// wait queue on a runtime without a time driver, [`tokio::time::timeout_at`]
+    /// panics while setting the deadline.
     pub async fn gremlin(&self, text: &str) -> Result<GremlinResult> {
         crate::gremlin::validate_query_bytes(text.len())?;
         let permit = self.reserve().await?;
