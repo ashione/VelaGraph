@@ -130,12 +130,39 @@ impl TemporalStore {
     /// An empty batch advances the local prefix without changing any assertion.
     /// An uncertain RocksDB error has no idempotent retry guarantee in this slice.
     pub fn commit(&self, mutations: &[TemporalMutation]) -> Result<u64> {
-        let encoded = encode_batch(mutations)?;
+        self.commit_checked(None, mutations, &|| Ok(()))
+    }
+    /// Conditional, controlled WAL-synced batch. Expected version is checked
+    /// under the writer mutex. Cancellation cannot interrupt write_opt or
+    /// replace its acknowledged/uncertain result after the final check.
+    pub fn commit_with_control(
+        &self,
+        expected: u64,
+        mutations: &[TemporalMutation],
+        control: &crate::ExecutionControl,
+    ) -> Result<u64> {
+        self.commit_checked(Some(expected), mutations, &|| {
+            control.check().map_err(TemporalStoreError::Graph)
+        })
+    }
+    fn commit_checked(
+        &self,
+        expected: Option<u64>,
+        mutations: &[TemporalMutation],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<u64> {
+        check()?;
+        let encoded = encode_batch_checked(mutations, check)?;
         let _guard = self.write.lock().map_err(|_| TemporalStoreError::Corrupt)?;
+        check()?;
         let head = decode_version(self.db.get(HEAD_KEY)?.as_deref())?;
+        if expected.is_some_and(|v| v != head) {
+            return Err(TemporalStoreError::Graph(crate::Error::TransactionConflict));
+        }
         let version = head.checked_add(1).ok_or(TemporalStoreError::Limit)?;
         let mut batch = WriteBatch::default();
         for (i, (mutation, value)) in mutations.iter().zip(encoded).enumerate() {
+            check()?;
             batch.put(revision_key(mutation.key(), version, i as u32), value);
             if let TemporalMutation::Edge { edge, .. } = mutation {
                 for (incoming, vertex) in [(false, edge.from), (true, edge.to)] {
@@ -151,6 +178,7 @@ impl TemporalStore {
         batch.put(HEAD_KEY, version.to_be_bytes());
         let mut write = WriteOptions::default();
         write.set_sync(true);
+        check()?;
         self.db.write_opt(batch, &write)?;
         Ok(version)
     }
@@ -177,12 +205,19 @@ impl TemporalStore {
 }
 
 fn encode_batch(mutations: &[TemporalMutation]) -> Result<Vec<Vec<u8>>> {
+    encode_batch_checked(mutations, &|| Ok(()))
+}
+fn encode_batch_checked(
+    mutations: &[TemporalMutation],
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<Vec<u8>>> {
     if mutations.len() > MAX_BATCH {
         return Err(TemporalStoreError::Limit);
     }
     let mut encoded = Vec::with_capacity(mutations.len());
     let mut bytes = 0usize;
     for (i, mutation) in mutations.iter().enumerate() {
+        check()?;
         let interval = mutation.interval();
         if interval.to.is_some_and(|to| to <= interval.from) {
             return Err(TemporalStoreError::InvalidInterval);
@@ -863,3 +898,146 @@ mod query;
 
 /// Temporal records inside the existing D1/managed state-machine database.
 pub mod managed;
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use std::cell::Cell;
+    fn mutation(id: u64) -> TemporalMutation {
+        TemporalMutation::Vertex {
+            valid: Interval { from: 0, to: None },
+            vertex: Vertex::new(id),
+        }
+    }
+    #[test]
+    fn every_pre_write_cancel_preserves_reopened_data() {
+        let d = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(d.path()).unwrap();
+        let changes = [
+            mutation(1),
+            mutation(2),
+            TemporalMutation::Edge {
+                valid: Interval { from: 0, to: None },
+                edge: Edge::new(7, 1, 2, "link"),
+            },
+        ];
+        let count = Cell::new(0);
+        store
+            .commit_checked(Some(0), &changes, &|| {
+                count.set(count.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        for stop in 1..=count.get() + 1 {
+            let d = tempfile::tempdir().unwrap();
+            let store = TemporalStore::open(d.path()).unwrap();
+            let calls = Cell::new(0);
+            let result = store.commit_checked(Some(0), &changes, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == stop {
+                    Err(TemporalStoreError::Graph(crate::Error::ExecutionCancelled))
+                } else {
+                    Ok(())
+                }
+            });
+            let published = stop > count.get();
+            if published {
+                assert_eq!(result.unwrap(), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TemporalStoreError::Graph(crate::Error::ExecutionCancelled))
+                ));
+            }
+            drop(store);
+            let store = TemporalStore::open(d.path()).unwrap();
+            let view = store.view(None, 0).unwrap();
+            assert_eq!(view.version(), u64::from(published));
+            let q = crate::GremlinQuery::parse("g.V(1).out('link')").unwrap();
+            assert_eq!(
+                view.execute_query(&q).unwrap().rows.len(),
+                usize::from(published)
+            );
+            store.commit(&[mutation(2)]).unwrap();
+        }
+    }
+    #[test]
+    fn concurrent_conditional_writers_have_one_winner() {
+        let d = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(d.path()).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let run = |id| {
+                barrier.wait();
+                store.commit_checked(Some(0), &[mutation(id)], &|| Ok(()))
+            };
+            let a = scope.spawn(move || run(1));
+            let b = scope.spawn(move || run(2));
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|r| matches!(r, Ok(1))).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(
+                    r,
+                    Err(TemporalStoreError::Graph(crate::Error::TransactionConflict))
+                ))
+                .count(),
+            1
+        );
+        let winner = if outcomes[0].is_ok() { 1 } else { 2 };
+        drop(store);
+        let store = TemporalStore::open(d.path()).unwrap();
+        let view = store.view(None, 0).unwrap();
+        assert_eq!(view.version(), 1);
+        assert_eq!(
+            view.execute_query(&crate::GremlinQuery::parse("g.V(1,2)").unwrap())
+                .unwrap()
+                .rows,
+            vec![crate::GremlinRow::Vertex(winner)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod writer_wait_control_tests {
+    use super::*;
+    #[test]
+    fn cancellation_after_temporal_writer_wait_does_not_advance_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let held = store.write.lock().unwrap();
+        let token = crate::CancellationToken::default();
+        let control =
+            crate::ExecutionControl::new(token.clone(), std::time::Duration::from_secs(30))
+                .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let store = &store;
+            let control = &control;
+            let join = scope.spawn(move || {
+                let calls = std::cell::Cell::new(0);
+                store.commit_checked(Some(0), &[], &|| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        tx.send(()).unwrap();
+                        Ok(())
+                    } else {
+                        control.check().map_err(TemporalStoreError::Graph)
+                    }
+                })
+            });
+            rx.recv().unwrap();
+            token.cancel();
+            drop(held);
+            assert!(matches!(
+                join.join().unwrap(),
+                Err(TemporalStoreError::Graph(crate::Error::ExecutionCancelled))
+            ));
+        });
+        assert_eq!(store.view(None, 0).unwrap().version(), 0);
+        assert_eq!(store.commit(&[]).unwrap(), 1);
+    }
+}

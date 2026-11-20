@@ -288,7 +288,22 @@ impl IncrementalTransaction<'_> {
     /// Every successful commit advances sequence, including metadata-only commits.
     /// Preparation has a cooperative deadline; waiting for a Locked reader
     /// is not preempted. Release same-thread read handles before calling this.
-    pub fn commit(mut self) -> Result<IncrementalCommitStats> {
+    pub fn commit(self) -> Result<IncrementalCommitStats> {
+        self.commit_checked(&|| Ok(()))
+    }
+    /// Commit with caller control; cancellation after the final check may lose
+    /// to atomic publication. Locked installation is never interrupted halfway.
+    pub fn commit_with_control(
+        self,
+        control: &crate::ExecutionControl,
+    ) -> Result<IncrementalCommitStats> {
+        self.commit_checked(&|| control.check())
+    }
+    pub(super) fn commit_checked(
+        mut self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<IncrementalCommitStats> {
+        check()?;
         if self.poisoned {
             return Err(limit("poisoned transaction"));
         }
@@ -305,6 +320,7 @@ impl IncrementalTransaction<'_> {
         let mut nv = base.vertex_count;
         let mut ne = base.edge_count;
         for (id, v) in &self.vertices {
+            check()?;
             let old = base.vertices.get(*id);
             let old_bytes = old.map_or(0, VEntry::bytes);
             let new_bytes = v.as_ref().map_or(0, VEntry::bytes);
@@ -325,6 +341,7 @@ impl IncrementalTransaction<'_> {
             }
         }
         for (id, e) in &self.edges {
+            check()?;
             let old = base.edges.get(*id);
             let old_bytes = old.map_or(0, |e| e.bytes + INDEX_FEE);
             let new_bytes = e.as_ref().map_or(0, |e| e.bytes + INDEX_FEE);
@@ -399,6 +416,7 @@ impl IncrementalTransaction<'_> {
                     stats,
                 },
                 deadline,
+                check,
             );
         }
         drop(base);
@@ -406,6 +424,7 @@ impl IncrementalTransaction<'_> {
         if guard.current.sequence != token.sequence || guard.current.identity != token.identity {
             return Err(Error::TransactionConflict);
         }
+        check()?;
         let s = Arc::get_mut(&mut guard.current)
             .ok_or_else(|| bad("locked state unexpectedly shared"))?;
         for (id, v) in vertices {
@@ -420,5 +439,179 @@ impl IncrementalTransaction<'_> {
         s.vertex_count = nv;
         s.edge_count = ne;
         Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn every_commit_checkpoint_is_atomic_and_late_cancel_preserves_success() {
+        for mode in [IncrementalMode::Cow, IncrementalMode::Locked] {
+            let make = || {
+                IncrementalGraph::from_records(
+                    "control",
+                    mode,
+                    IncrementalLimits::default(),
+                    vec![Vertex::new(1), Vertex::new(3)],
+                    vec![Edge::new(1, 1, 3, "link")],
+                    b"old".to_vec(),
+                )
+                .unwrap()
+            };
+            fn stage(g: &IncrementalGraph) -> IncrementalTransaction<'_> {
+                let mut tx = begin(g).unwrap();
+                tx.delete_vertex(1).unwrap();
+                tx.put_vertex(Vertex::new(2)).unwrap();
+                tx.put_edge(Edge::new(2, 2, 3, "link")).unwrap();
+                tx.set_metadata(b"new").unwrap();
+                tx
+            }
+            let graph = make();
+            let count = Cell::new(0);
+            stage(&graph)
+                .commit_checked(&|| {
+                    count.set(count.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(count.get() >= 4);
+            let late_graph = make();
+            let late_calls = Cell::new(0);
+            let late_token = crate::CancellationToken::default();
+            let late_control =
+                crate::ExecutionControl::new(late_token.clone(), Duration::from_secs(30)).unwrap();
+            stage(&late_graph)
+                .commit_checked(&|| {
+                    late_control.check()?;
+                    late_calls.set(late_calls.get() + 1);
+                    if late_calls.get() == count.get() {
+                        late_token.cancel();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(late_token.is_cancelled());
+            assert_eq!(late_graph.token().unwrap().sequence, 1);
+
+            for stop in 1..=count.get() + 1 {
+                let graph = make();
+                let before = graph.token().unwrap();
+                let calls = Cell::new(0);
+                let result = stage(&graph).commit_checked(&|| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == stop {
+                        Err(Error::ExecutionCancelled)
+                    } else {
+                        Ok(())
+                    }
+                });
+                let view = graph.read().unwrap();
+                if stop <= count.get() {
+                    assert!(matches!(result, Err(Error::ExecutionCancelled)));
+                    assert_eq!(view.token(), before);
+                    assert!(view.get_vertex(1).is_some());
+                    assert!(view.get_vertex(2).is_none());
+                    assert_eq!(view.metadata(), b"old");
+                    assert!(view.get_edge(1).is_some());
+                    assert!(view.get_edge(2).is_none());
+                    assert_eq!(
+                        view.execute_gremlin("g.V(3).in('link')").unwrap().rows,
+                        vec![crate::GremlinRow::Vertex(1)]
+                    );
+                } else {
+                    assert_eq!(result.unwrap().sequence, 1);
+                    assert!(view.get_vertex(1).is_none());
+                    assert!(view.get_vertex(2).is_some());
+                    assert_eq!(view.metadata(), b"new");
+                    assert!(view.get_edge(1).is_none());
+                    assert!(view.get_edge(2).is_some());
+                    assert_eq!(
+                        view.execute_gremlin("g.V(3).in('link')").unwrap().rows,
+                        vec![crate::GremlinRow::Vertex(2)]
+                    );
+                }
+                drop(view);
+                // Every rejection must release writer serialization and its source view.
+                graph.apply(&graph.token().unwrap(), &[], b"next").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_observed_after_cow_serialization_wait() {
+        let graph =
+            IncrementalGraph::new("wait", IncrementalMode::Cow, IncrementalLimits::default())
+                .unwrap();
+        let held = graph.cow_prepare.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let token = crate::CancellationToken::default();
+        let control = crate::ExecutionControl::new(token.clone(), Duration::from_secs(30)).unwrap();
+        std::thread::scope(|scope| {
+            let graph = &graph;
+            let control = &control;
+            let join = scope.spawn(move || {
+                let staged = begin(graph).unwrap();
+                staged.commit_checked(&|| {
+                    tx.send(()).unwrap();
+                    control.check()
+                })
+            });
+            // First check has run. Publication is blocked by the held prepare lock.
+            rx.recv().unwrap();
+            token.cancel();
+            drop(held);
+            assert!(matches!(
+                join.join().unwrap(),
+                Err(Error::ExecutionCancelled)
+            ));
+        });
+        assert_eq!(graph.token().unwrap().sequence, 0);
+        graph.apply(&graph.token().unwrap(), &[], b"next").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod locked_control_tests {
+    use super::*;
+    #[test]
+    fn cancellation_after_locked_reader_wait_leaves_state_unchanged() {
+        let graph = IncrementalGraph::new(
+            "locked-wait",
+            IncrementalMode::Locked,
+            IncrementalLimits::default(),
+        )
+        .unwrap();
+        let held = graph.read().unwrap();
+        let token = crate::CancellationToken::default();
+        let control = crate::ExecutionControl::new(token.clone(), Duration::from_secs(30)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let graph = &graph;
+            let control = &control;
+            let join = scope.spawn(move || {
+                let calls = std::cell::Cell::new(0);
+                begin(graph).unwrap().commit_checked(&|| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        tx.send(()).unwrap();
+                        Ok(())
+                    } else {
+                        control.check()
+                    }
+                })
+            });
+            rx.recv().unwrap();
+            token.cancel();
+            drop(held);
+            assert!(matches!(
+                join.join().unwrap(),
+                Err(Error::ExecutionCancelled)
+            ));
+        });
+        assert_eq!(graph.token().unwrap().sequence, 0);
+        graph.apply(&graph.token().unwrap(), &[], b"next").unwrap();
     }
 }

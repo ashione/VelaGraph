@@ -195,6 +195,37 @@ impl QueryReadBackend for Backend<'_, '_> {
     }
 }
 impl IncrementalReadView<'_> {
+    /// Execute against one view with cumulative work/result limits and cancellation.
+    pub fn execute_query_batch(
+        &self,
+        queries: &[GremlinQuery],
+        control: &crate::ExecutionControl,
+        limits: crate::QueryBatchLimits,
+    ) -> Result<Vec<GremlinResult>> {
+        control.check()?;
+        limits.validate(queries.len())?;
+        let backend = Backend {
+            view: self,
+            deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            operations: Cell::new(0),
+            bytes: Cell::new(0),
+            limits: IncrementalQueryLimits {
+                max_operations: limits.max_work_operations,
+                max_work_bytes: limits.max_work_bytes,
+            },
+        };
+        let budget = Budget::new(limits.max_live_bytes);
+        crate::execution::execute_batch(
+            queries,
+            &backend,
+            &|| {
+                control.check()?;
+                backend.check()
+            },
+            limits,
+            &budget,
+        )
+    }
     /// Parse official Gremlin and execute it against this fixed view.
     pub fn execute_gremlin(&self, text: &str) -> Result<GremlinResult> {
         self.execute_query(&GremlinQuery::parse(text)?)
@@ -338,5 +369,61 @@ mod deadline_tests {
             &Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES),
         );
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod batch_control_tests {
+    use super::*;
+    #[test]
+    fn cancel_during_second_query_discards_first_result_and_releases_budget() {
+        let graph = IncrementalGraph::from_records(
+            "batch-cancel",
+            IncrementalMode::Cow,
+            IncrementalLimits::default(),
+            vec![Vertex::new(1), Vertex::new(2)],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let view = graph.read().unwrap();
+        let backend = Backend {
+            view: &view,
+            deadline: Instant::now() + Duration::from_secs(30),
+            operations: Cell::new(0),
+            bytes: Cell::new(0),
+            limits: IncrementalQueryLimits::default(),
+        };
+        let budget = Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES);
+        let queries = [
+            GremlinQuery::parse("g.V(1)").unwrap(),
+            GremlinQuery::parse("g.V(2)").unwrap(),
+        ];
+        let result = crate::execution::execute_batch(
+            &queries,
+            &backend,
+            &|| {
+                if backend.operations.get() >= 2 {
+                    Err(Error::ExecutionCancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            crate::QueryBatchLimits::default(),
+            &budget,
+        );
+        assert!(matches!(result, Err(Error::ExecutionCancelled)));
+        assert_eq!(backend.operations.get(), 2);
+        assert_eq!(budget.used(), 0);
+        let control = crate::ExecutionControl::new(
+            crate::CancellationToken::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let result = view
+            .execute_query_batch(&queries, &control, crate::QueryBatchLimits::default())
+            .unwrap();
+        assert_eq!(result[0].rows, vec![crate::GremlinRow::Vertex(1)]);
+        assert_eq!(result[1].rows, vec![crate::GremlinRow::Vertex(2)]);
     }
 }
