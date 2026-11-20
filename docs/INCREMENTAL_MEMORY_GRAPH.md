@@ -105,8 +105,11 @@ metadata-only commits. Sequence overflow rejects rather than wrapping.
 
 Locked publication installs the validated changes in place. COW serializes commit
 preparation with a per-graph writer mutex that readers never acquire. It validates
-the base token and admits current + candidate + pinned version fees before cloning
-the candidate. Index copies, updates and compaction run outside the publication
+the base token and admits current + candidate preparation peak + pinned version
+fees before cloning the candidate. The peak starts at the complete base fee and
+adds positive metadata, vertex-entry (including adjacency), and edge deltas before
+crediting any decreases. This covers shrinking batches and arbitrary hash-map
+installation order. Index copies, updates and compaction run outside the publication
 lock. It then takes a short write lock, rechecks the token, deadline and pinned
 limits, and swaps the complete state. Retired strong references and discarded
 candidates are released outside the publication lock. Old readers retain old
@@ -146,13 +149,18 @@ transaction errors. Poisoned locks fail closed.
 | Cooperative transaction preparation | 5 seconds |
 
 Work units include reads, internal index changes and control work, not just public
-method calls. Work bytes cover metadata copying, complete records, and conservative
+method calls. Record work admission precedes semantic validation, including validation that
+constructs an error containing a label or property name. This applies to borrowed
+`apply` and owned transaction puts. Bulk construction/restore checks each record
+using allocation-free compacted-size accounting before shrinking capacities or
+validating it; this preserves exact-retention restore with overallocated inputs.
+Work bytes cover metadata copying, complete records, and conservative
 bounds for structural table changes and adjacency cloning/movement. Immutable
 record fees are cached and recalculated for replacements. Retained fees include
 record/container capacity and coarse table-entry charges. COW version fees count
 whole versions conservatively, even when they share allocations. COW admission
-now includes both current and candidate during preparation even without old
-readers. A tightened `max_pinned_accounted_bytes` that fits only the final state
+includes current plus the conservative candidate construction peak during
+preparation even without old readers; the final candidate size alone is not enough. A tightened `max_pinned_accounted_bytes` that fits only the final state
 may therefore reject a commit accepted by the earlier implementation. Leave room
 for both versions and retained readers; limits and defaults are not raised.
 `copied_index_entries` and `copied_adjacency_ids` count Arc COW copies only; they
@@ -201,6 +209,34 @@ unique same-directory temporary file, syncs it, renames it and syncs the parent
 directory. An error after rename can leave a complete new file visible. This is
 not a promise of rollback after filesystem failure. Locked checkpoint readers
 block publication for their lifetime; COW readers can retain the captured version.
+
+Checkpoint serialization captures one coherent graph version, then releases the
+read view before disk I/O. It writes and syncs a private temporary file first.
+Publication uses an independently opened, advisory-locked empty
+`.velagraph-checkpoint.lock` in the canonical parent directory. Under that lock
+it validates an existing target's bounded framing/checksum and token envelope,
+then conditionally renames and syncs the directory. The directory-level lock also
+covers path aliases and case-insensitive target names; different directories are
+independent. Encoding and temporary-file writes can run concurrently.
+
+An older sequence, different identity, or equal sequence with different payload
+bytes returns `TransactionConflict` without replacing the target. Equal-version,
+identical bytes are permitted and still complete file and directory sync, including
+retries after a prior post-rename error. Existing framing/checksum/token-envelope
+corruption and non-regular targets fail closed; they are not treated as missing.
+The token-envelope check is not a full
+record/index reconstruction; restore performs that validation separately.
+
+All cooperating threads/processes must use this protocol. The lock sidecar stays
+on disk and must not be removed/replaced while writers run; locks release when
+the handle/process closes. Checkpoint target names with case-insensitive prefixes
+`.velagraph-checkpoint.lock` or `.incremental-` are reserved for protocol files.
+An occupied nonempty lockfile fails without truncation. Cleanup only removes a
+temporary file successfully created by that call. These stricter overwrite and
+reserved-name rules do not change checkpoint payload bytes or the format version.
+Old writers that ignore the lock and hostile filesystem replacement are outside
+this coordination guarantee. Checkpoint calls have no preemptible disk-lock/I/O
+deadline. Publication of different files in one directory is serialized.
 
 `restore` accepts a regular local file and expected identity. It validates format
 and contents and rebuilds a private graph before returning it. Record strings,
@@ -252,7 +288,9 @@ opaque metadata. These are direct record reads, not Gremlin or RPC timings.
 
 Three alternating-order comparisons against `aa39ed2`, using identical source and
 dependency versions, ran on macOS arm64 Mac14,10 (12 logical CPUs, 32 GiB), Rust
-1.100.0 release. The table gives the median of the three per-run quantiles:
+1.100.0 release. The candidate measured here was `28968a5`, before the subsequent
+checkpoint/admission correctness fixes. These are historical measurements of the
+short-publication change. The table gives the median of three per-run quantiles:
 
 | Metric | `aa39ed2` COW | Short-publication COW |
 |---|---:|---:|

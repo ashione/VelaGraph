@@ -373,3 +373,182 @@ fn reader_pinned_during_preparation_rejects_publication_and_reclaims_outside_loc
     assert_eq!(oldest.metadata(), b"before");
     assert_eq!(g.token().unwrap(), before);
 }
+
+#[test]
+fn slower_old_checkpoint_cannot_replace_new_snapshot() {
+    let mut v = Vertex::new(1);
+    v.properties
+        .insert("payload".into(), Value::Text("x".repeat(LARGE_PAYLOAD)));
+    let g = graph(vec![v]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.bin");
+    let (captured_tx, captured_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let acknowledged = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let (g, path, acknowledged) = (&g, &path, acknowledged.clone());
+        let old = scope.spawn(move || {
+            PROBE.with(|p| {
+                *p.borrow_mut() = Some(Probe {
+                    operation: Operation::Allocate,
+                    minimum: LARGE_PAYLOAD,
+                    ready: captured_tx,
+                    reader_done: release_rx,
+                    reader_completed: acknowledged,
+                    next: None,
+                })
+            });
+            let result = g.checkpoint(path);
+            PROBE.with(|p| *p.borrow_mut() = None);
+            result
+        });
+        captured_rx.recv_timeout(PROBE_TIMEOUT * 2).unwrap();
+        g.apply(
+            &g.token().unwrap(),
+            &[velagraph::IncrementalMutation::PutVertex(Vertex::new(1))],
+            b"new",
+        )
+        .unwrap();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let newer = scope.spawn(move || {
+            let r = g.checkpoint(path);
+            let _ = done_tx.send(());
+            r
+        });
+        // Old code lets the new snapshot finish first; serialized code waits.
+        // Release the paused writer before its allocator rendezvous expires.
+        let _ = done_rx.recv_timeout(PROBE_TIMEOUT / 2);
+        release_tx.send(()).unwrap();
+        let old_result = old.join().unwrap();
+        assert!(
+            old_result.is_ok() || matches!(old_result, Err(velagraph::Error::TransactionConflict))
+        );
+        newer.join().unwrap().unwrap();
+    });
+    assert!(acknowledged.load(Ordering::Acquire));
+    let restored = IncrementalGraph::restore(
+        &path,
+        "publication",
+        IncrementalMode::Cow,
+        IncrementalLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(restored.token().unwrap(), g.token().unwrap());
+    assert_eq!(restored.read().unwrap().metadata(), b"new");
+}
+
+#[test]
+fn shrinking_metadata_and_records_need_preparation_peak_budget() {
+    for metadata_only in [true, false] {
+        let mut vertex = Vertex::new(1);
+        if !metadata_only {
+            vertex
+                .properties
+                .insert("payload".into(), Value::Text("x".repeat(64 * 1024)));
+        }
+        let metadata = if metadata_only {
+            vec![1; 64 * 1024]
+        } else {
+            vec![]
+        };
+        let vertices = if metadata_only { vec![] } else { vec![vertex] };
+        let empty =
+            IncrementalGraph::new("peak", IncrementalMode::Cow, IncrementalLimits::default())
+                .unwrap()
+                .read()
+                .unwrap()
+                .accounted_bytes();
+        let probe = IncrementalGraph::from_records(
+            "peak",
+            IncrementalMode::Cow,
+            IncrementalLimits::default(),
+            vertices.clone(),
+            vec![],
+            metadata.clone(),
+        )
+        .unwrap();
+        let current = probe.read().unwrap().accounted_bytes();
+        let limits = IncrementalLimits {
+            max_accounted_bytes: current,
+            max_pinned_accounted_bytes: current + empty,
+            ..IncrementalLimits::default()
+        };
+        let g = IncrementalGraph::from_records(
+            "peak",
+            IncrementalMode::Cow,
+            limits,
+            vertices,
+            vec![],
+            metadata,
+        )
+        .unwrap();
+        let before = g.token().unwrap();
+        let changes = if metadata_only {
+            vec![]
+        } else {
+            vec![velagraph::IncrementalMutation::DeleteVertex(1)]
+        };
+        assert!(g.apply(&before, &changes, &[]).is_err());
+        assert_eq!(g.token().unwrap(), before);
+    }
+}
+
+#[test]
+fn mixed_growth_and_removal_reserve_positive_deltas_before_shrinks() {
+    let make = |id| {
+        let mut v = Vertex::new(id);
+        v.properties
+            .insert("payload".into(), Value::Text("x".repeat(64 * 1024)));
+        v
+    };
+    let empty = IncrementalGraph::new("mixed", IncrementalMode::Cow, IncrementalLimits::default())
+        .unwrap()
+        .read()
+        .unwrap()
+        .accounted_bytes();
+    let probe = IncrementalGraph::from_records(
+        "mixed",
+        IncrementalMode::Cow,
+        IncrementalLimits::default(),
+        vec![make(1)],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let current = probe.read().unwrap().accounted_bytes();
+    let required = 2 * current + current - empty;
+    for maximum in [2 * current, required - 1, required] {
+        let g = IncrementalGraph::from_records(
+            "mixed",
+            IncrementalMode::Cow,
+            IncrementalLimits {
+                max_accounted_bytes: current,
+                max_pinned_accounted_bytes: maximum,
+                ..IncrementalLimits::default()
+            },
+            vec![make(1)],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let before = g.token().unwrap();
+        let result = g.apply(
+            &before,
+            &[
+                velagraph::IncrementalMutation::PutVertex(make(2)),
+                velagraph::IncrementalMutation::DeleteVertex(1),
+            ],
+            &[],
+        );
+        if maximum == required {
+            result.unwrap();
+            let view = g.read().unwrap();
+            assert!(view.get_vertex(1).is_none());
+            assert!(view.get_vertex(2).is_some());
+            assert_eq!(view.accounted_bytes(), current);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(g.token().unwrap(), before);
+        }
+    }
+}

@@ -981,4 +981,6 @@ recovery, source snapshot/offset certification or distributed temporal updates.
 
 The optional incremental COW path prepares changed shards under a writer-only
 mutex, publishes under a short lock and reclaims outside it. Candidate version
-fees are included in admission; this does not establish a service latency SLA.
+construction peaks are included in admission, and record budgets precede
+validation/compaction. Checkpoint writes use conditional, directory-locked publication
+to prevent stale overwrite; this does not establish a service latency SLA.

@@ -84,7 +84,7 @@ pub struct IncrementalLimits {
     pub max_batch_bytes: usize,
     /// Maximum retained old COW versions (default eight).
     pub max_pinned_versions: usize,
-    /// Conservative current, pinned and preparing COW version fees (512 MiB).
+    /// Conservative current, pinned and COW construction-peak fees (512 MiB).
     pub max_pinned_accounted_bytes: usize,
 }
 impl Default for IncrementalLimits {
@@ -289,14 +289,14 @@ impl IncrementalGraph {
         for m in mutations {
             match m {
                 IncrementalMutation::PutVertex(v) => {
-                    validate_vertex(v)?;
                     tx.preflight_record_copy(v.accounted_bytes() + INDEX_FEE)?;
+                    validate_vertex(v)?;
                     tx.put_vertex(v.clone())?;
                 }
                 IncrementalMutation::DeleteVertex(id) => tx.delete_vertex(*id)?,
                 IncrementalMutation::PutEdge(e) => {
-                    validate_edge(e)?;
                     tx.preflight_record_copy(e.accounted_bytes() + INDEX_FEE)?;
+                    validate_edge(e)?;
                     tx.put_edge(e.clone())?;
                 }
                 IncrementalMutation::DeleteEdge(id) => tx.delete_edge(*id)?,

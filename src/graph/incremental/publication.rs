@@ -8,6 +8,7 @@ pub(super) struct Changes {
     pub metadata: Vec<u8>,
     pub vertex_count: usize,
     pub edge_count: usize,
+    pub preparation_bytes: usize,
     pub stats: IncrementalCommitStats,
 }
 
@@ -63,7 +64,9 @@ pub(super) fn commit(
     };
     // Both versions coexist while preparing, even without an external reader.
     // The writer mutex admits only one such candidate per graph.
-    if version_bytes(bytes, base.state().bytes, &alive)? > graph.limits.max_pinned_accounted_bytes {
+    if version_bytes(changes.preparation_bytes, base.state().bytes, &alive)?
+        > graph.limits.max_pinned_accounted_bytes
+    {
         return Err(limit("COW preparation version budget"));
     }
     drop(alive);
@@ -77,6 +80,7 @@ pub(super) fn commit(
         vertex_count,
         edge_count,
         mut stats,
+        preparation_bytes: _,
     } = changes;
     for (id, vertex) in vertices {
         check_deadline(deadline)?;
@@ -138,6 +142,7 @@ mod tests {
             metadata: b"unpublished".to_vec(),
             vertex_count: 0,
             edge_count: 0,
+            preparation_bytes: source.accounted_bytes() + b"unpublished".len(),
             stats: IncrementalCommitStats {
                 sequence: before.sequence + 1,
                 retained_accounted_bytes: source.accounted_bytes() + b"unpublished".len(),

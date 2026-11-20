@@ -157,7 +157,9 @@ cargo run --release --locked -p velagraph --example incremental_publication
 ```
 
 COW prepares changed index shards outside the reader publication lock and releases
-retired data after unlocking. Its version budget includes the preparing candidate.
+retired data after unlocking. Its version budget includes the candidate construction
+peak. Checkpoint publication prevents older or conflicting snapshots from replacing
+an existing target and coordinates through a persistent directory lock sidecar.
 The `incremental_publication` example measures version acquisition during writes.
 
 The `incremental_memory` example uses generated data, compares rebuilding with incremental publication,

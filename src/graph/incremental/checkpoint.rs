@@ -1,10 +1,12 @@
 use super::*;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+mod destination;
 const MAGIC: &[u8; 8] = b"VGIM0001";
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 const HEADER_BYTES: usize = 24;
 const RESTORE_DEADLINE: Duration = Duration::from_secs(10);
+const TEMP_PREFIX: &str = ".incremental-";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Payload {
@@ -68,13 +70,92 @@ fn compact_edge(mut edge: Edge) -> Edge {
     edge.properties = compact_properties(edge.properties);
     edge
 }
+fn compacted_properties_bytes(properties: &BTreeMap<String, crate::Value>) -> usize {
+    properties.iter().fold(0usize, |sum, (key, value)| {
+        sum.saturating_add(crate::query_memory::MAP_ENTRY)
+            .saturating_add(key.len())
+            .saturating_add(match value {
+                crate::Value::Text(s) => s.len(),
+                _ => 0,
+            })
+    })
+}
+fn compacted_vertex_bytes(vertex: &Vertex) -> usize {
+    crate::query_memory::RECORD_BASE
+        .saturating_add(
+            vertex
+                .labels
+                .len()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(
+            vertex
+                .labels
+                .iter()
+                .fold(0usize, |sum, s| sum.saturating_add(s.len())),
+        )
+        .saturating_add(compacted_properties_bytes(&vertex.properties))
+        .saturating_add(INDEX_FEE)
+}
+fn compacted_edge_bytes(edge: &Edge) -> usize {
+    crate::query_memory::RECORD_BASE
+        .saturating_add(edge.label.len())
+        .saturating_add(compacted_properties_bytes(&edge.properties))
+        .saturating_add(INDEX_FEE)
+}
+fn admit_bulk_bytes(current: usize, additional: usize, maximum: usize) -> Result<usize> {
+    let next = current
+        .checked_add(additional)
+        .ok_or_else(|| limit("restore accounting"))?;
+    if next > maximum {
+        return Err(limit("restore retained bytes"));
+    }
+    Ok(next)
+}
+fn read_checkpoint(path: &std::path::Path) -> Result<Vec<u8>> {
+    if !fs::symlink_metadata(path)
+        .map_err(io)?
+        .file_type()
+        .is_file()
+    {
+        return Err(bad("checkpoint must be a regular file"));
+    }
+    let mut f = fs::File::open(path).map_err(io)?;
+    let metadata = f.metadata().map_err(io)?;
+    if !metadata.file_type().is_file() {
+        return Err(bad("checkpoint must be a regular file"));
+    }
+    if metadata.len() > MAX_FILE_BYTES as u64 {
+        return Err(limit("checkpoint file size"));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut f)
+        .take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() < HEADER_BYTES || bytes.len() > MAX_FILE_BYTES || &bytes[..8] != MAGIC {
+        return Err(bad("checkpoint header"));
+    }
+    let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let digest = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    if n != (bytes.len() - HEADER_BYTES) as u64 || hash(&bytes[HEADER_BYTES..]) != digest {
+        return Err(bad("checkpoint length/checksum"));
+    }
+    Ok(bytes)
+}
 impl IncrementalGraph {
     /// Write a versioned local checkpoint of one fixed view (maximum 64 MiB).
     /// Sync a same-directory temporary file, rename it, then sync the directory.
+    /// A persistent directory lock coordinates cooperating writers. An older
+    /// sequence, different identity or conflicting equal sequence is rejected.
+    /// The captured graph view is released before disk I/O. Protocol lock/temp
+    /// filename prefixes are reserved; invalid existing framing/checksums reject.
     /// An I/O failure after rename may leave a complete new file visible; this
     /// does not provide per-update durability or remote recovery certification.
     pub fn checkpoint(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = destination::resolve(path.as_ref())?;
         let view = self.read()?;
+        let token = view.token();
         let s = view.state();
         #[derive(Serialize)]
         struct Borrowed<'a> {
@@ -97,7 +178,8 @@ impl IncrementalGraph {
         };
         let mut bytes = Limited(Vec::new());
         serde_json::to_writer(&mut bytes, &payload)?;
-        let path = path.as_ref();
+        drop(payload);
+        drop(view);
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -105,9 +187,10 @@ impl IncrementalGraph {
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).map_err(|_| bad("checkpoint nonce"))?;
         let tmp = parent.join(format!(
-            ".incremental-{:016x}.tmp",
+            "{TEMP_PREFIX}{:016x}.tmp",
             u64::from_le_bytes(nonce)
         ));
+        let mut created = false;
         let result = (|| {
             let mut opts = OpenOptions::new();
             opts.create_new(true).write(true);
@@ -117,6 +200,7 @@ impl IncrementalGraph {
                 opts.mode(0o600);
             }
             let mut f = opts.open(&tmp).map_err(io)?;
+            created = true;
             f.write_all(MAGIC).map_err(io)?;
             f.write_all(&(bytes.0.len() as u64).to_le_bytes())
                 .map_err(io)?;
@@ -124,13 +208,15 @@ impl IncrementalGraph {
             f.write_all(&bytes.0).map_err(io)?;
             f.sync_all().map_err(io)?;
             drop(f);
-            fs::rename(&tmp, path).map_err(io)?;
+            let _publication = destination::lock(parent)?;
+            destination::check_previous(&path, &token, &bytes.0)?;
+            fs::rename(&tmp, &path).map_err(io)?;
             fs::File::open(parent)
                 .and_then(|f| f.sync_all())
                 .map_err(io)?;
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && created {
             let _ = fs::remove_file(&tmp);
         }
         result
@@ -144,35 +230,7 @@ impl IncrementalGraph {
         mode: IncrementalMode,
         limits: IncrementalLimits,
     ) -> Result<Self> {
-        let path = path.as_ref();
-        if !fs::symlink_metadata(path)
-            .map_err(io)?
-            .file_type()
-            .is_file()
-        {
-            return Err(bad("checkpoint must be a regular file"));
-        }
-        let mut f = fs::File::open(path).map_err(io)?;
-        let metadata = f.metadata().map_err(io)?;
-        if !metadata.file_type().is_file() {
-            return Err(bad("checkpoint must be a regular file"));
-        }
-        if metadata.len() > MAX_FILE_BYTES as u64 {
-            return Err(limit("checkpoint file size"));
-        }
-        let mut bytes = Vec::new();
-        Read::by_ref(&mut f)
-            .take((MAX_FILE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(io)?;
-        if bytes.len() < HEADER_BYTES || bytes.len() > MAX_FILE_BYTES || &bytes[..8] != MAGIC {
-            return Err(bad("checkpoint header"));
-        }
-        let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let digest = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        if n as usize != bytes.len() - HEADER_BYTES || hash(&bytes[HEADER_BYTES..]) != digest {
-            return Err(bad("checkpoint length/checksum"));
-        }
+        let bytes = read_checkpoint(path.as_ref())?;
         let p: Payload = serde_json::from_slice(&bytes[HEADER_BYTES..])?;
         if p.identity != identity
             || p.metadata.len() > MAX_METADATA
@@ -217,16 +275,18 @@ impl IncrementalGraph {
             let mut guard = graph.inner.write().map_err(|_| bad("poisoned lock"))?;
             let s = Arc::get_mut(&mut guard.current).ok_or_else(|| bad("restore state shared"))?;
             let deadline = Instant::now() + RESTORE_DEADLINE;
+            s.bytes = admit_bulk_bytes(s.bytes, metadata.len(), graph.limits.max_accounted_bytes)?;
             s.metadata = metadata.into_boxed_slice().into_vec();
             edges.sort_unstable_by_key(|edge| edge.id);
-            s.bytes = s
-                .bytes
-                .checked_add(s.metadata.len())
-                .ok_or_else(|| limit("restore metadata accounting"))?;
-            if s.bytes > graph.limits.max_accounted_bytes {
-                return Err(limit("restore metadata budget"));
-            }
             for v in vertices {
+                if Instant::now() >= deadline {
+                    return Err(limit("restore deadline"));
+                }
+                let admitted = admit_bulk_bytes(
+                    s.bytes,
+                    compacted_vertex_bytes(&v),
+                    graph.limits.max_accounted_bytes,
+                )?;
                 let v = compact_vertex(v);
                 if Instant::now() >= deadline {
                     return Err(limit("restore deadline"));
@@ -241,17 +301,19 @@ impl IncrementalGraph {
                     incoming: Arc::new(Adj::default()),
                     outgoing: Arc::new(Adj::default()),
                 };
-                s.bytes = s
-                    .bytes
-                    .checked_add(entry.bytes())
-                    .ok_or_else(|| limit("restore accounting"))?;
-                if s.bytes > graph.limits.max_accounted_bytes {
-                    return Err(limit("restore retained bytes"));
-                }
+                s.bytes = admitted;
                 s.vertices.set(id, Some(entry));
                 s.vertex_count += 1;
             }
             for e in edges {
+                if Instant::now() >= deadline {
+                    return Err(limit("restore deadline"));
+                }
+                let admitted = admit_bulk_bytes(
+                    s.bytes,
+                    compacted_edge_bytes(&e),
+                    graph.limits.max_accounted_bytes,
+                )?;
                 let e = compact_edge(e);
                 if Instant::now() >= deadline {
                     return Err(limit("restore deadline"));
@@ -263,10 +325,7 @@ impl IncrementalGraph {
                 if s.vertices.get(e.from).is_none() || s.vertices.get(e.to).is_none() {
                     return Err(bad("restore missing endpoint"));
                 }
-                s.bytes = s
-                    .bytes
-                    .checked_add(e.accounted_bytes() + INDEX_FEE)
-                    .ok_or_else(|| limit("restore accounting"))?;
+                s.bytes = admitted;
                 for (id, incoming) in [(e.from, false), (e.to, true)] {
                     let v = s
                         .vertices

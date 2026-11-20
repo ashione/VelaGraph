@@ -179,10 +179,10 @@ impl IncrementalTransaction<'_> {
         r
     }
     fn put_vertex_inner(&mut self, v: Vertex) -> Result<()> {
+        self.note(v.accounted_bytes() + INDEX_FEE)?;
         validate_vertex(&v)?;
         let id = v.id;
         let record = Cached::new(v);
-        self.note(record.bytes + INDEX_FEE)?;
         let record = Arc::new(record);
         let entry = if let Some(old) = self.entry(id) {
             VEntry {
@@ -209,8 +209,8 @@ impl IncrementalTransaction<'_> {
         r
     }
     fn put_edge_inner(&mut self, e: Edge) -> Result<()> {
-        validate_edge(&e)?;
         self.note(e.accounted_bytes() + INDEX_FEE)?;
+        validate_edge(&e)?;
         if self.get_vertex(e.from).is_none() {
             return Err(Error::EdgeEndpointNotFound(e.from));
         }
@@ -296,32 +296,50 @@ impl IncrementalTransaction<'_> {
         let token = self.token();
         let base = self.base.state();
         let mut bytes = base.bytes - base.metadata.len() + self.metadata.len();
+        // A candidate starts as the full base. Changes are installed in hash
+        // order, so reserve every positive delta before crediting any shrink.
+        let mut preparation_bytes = base
+            .bytes
+            .checked_add(self.metadata.len().saturating_sub(base.metadata.len()))
+            .ok_or_else(|| limit("preparation accounting"))?;
         let mut nv = base.vertex_count;
         let mut ne = base.edge_count;
         for (id, v) in &self.vertices {
-            if let Some(old) = base.vertices.get(*id) {
+            let old = base.vertices.get(*id);
+            let old_bytes = old.map_or(0, VEntry::bytes);
+            let new_bytes = v.as_ref().map_or(0, VEntry::bytes);
+            preparation_bytes = preparation_bytes
+                .checked_add(new_bytes.saturating_sub(old_bytes))
+                .ok_or_else(|| limit("preparation accounting"))?;
+            if old.is_some() {
                 bytes = bytes
-                    .checked_sub(old.bytes())
+                    .checked_sub(old_bytes)
                     .ok_or_else(|| bad("accounting"))?;
                 nv -= 1
             }
-            if let Some(v) = v {
+            if v.is_some() {
                 bytes = bytes
-                    .checked_add(v.bytes())
+                    .checked_add(new_bytes)
                     .ok_or_else(|| limit("accounting"))?;
                 nv += 1
             }
         }
         for (id, e) in &self.edges {
-            if let Some(old) = base.edges.get(*id) {
+            let old = base.edges.get(*id);
+            let old_bytes = old.map_or(0, |e| e.bytes + INDEX_FEE);
+            let new_bytes = e.as_ref().map_or(0, |e| e.bytes + INDEX_FEE);
+            preparation_bytes = preparation_bytes
+                .checked_add(new_bytes.saturating_sub(old_bytes))
+                .ok_or_else(|| limit("preparation accounting"))?;
+            if old.is_some() {
                 bytes = bytes
-                    .checked_sub(old.accounted_bytes() + INDEX_FEE)
+                    .checked_sub(old_bytes)
                     .ok_or_else(|| bad("accounting"))?;
                 ne -= 1
             }
-            if let Some(e) = e {
+            if e.is_some() {
                 bytes = bytes
-                    .checked_add(e.accounted_bytes() + INDEX_FEE)
+                    .checked_add(new_bytes)
                     .ok_or_else(|| limit("accounting"))?;
                 ne += 1
             }
@@ -377,6 +395,7 @@ impl IncrementalTransaction<'_> {
                     metadata,
                     vertex_count: nv,
                     edge_count: ne,
+                    preparation_bytes,
                     stats,
                 },
                 deadline,

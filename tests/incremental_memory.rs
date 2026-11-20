@@ -313,12 +313,33 @@ fn valid_checkpoint_restores_under_small_transaction_limits() {
 }
 #[test]
 fn checkpoint_accepts_bare_relative_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "bare_relative_checkpoint_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .current_dir(directory.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+#[test]
+#[ignore = "child-process entrypoint, exercised by bare-relative-path test"]
+fn bare_relative_checkpoint_child() {
     let g = graph(IncrementalMode::Cow);
     seed(&g);
-    let p = format!("incremental-bare-{}.bin", std::process::id());
-    let result = g.checkpoint(&p);
-    let _ = std::fs::remove_file(&p);
-    assert!(result.is_ok(), "{result:?}");
+    g.checkpoint("model.bin").unwrap();
+    let restored = IncrementalGraph::restore(
+        "model.bin",
+        "test",
+        IncrementalMode::Cow,
+        IncrementalLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(restored.token().unwrap(), g.token().unwrap());
 }
 #[test]
 fn empty_checkpoint_metadata_cannot_exceed_restore_budget() {
