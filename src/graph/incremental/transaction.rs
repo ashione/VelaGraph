@@ -121,7 +121,7 @@ impl IncrementalTransaction<'_> {
         } else {
             &mut v.outgoing
         };
-        let copied = Arc::make_mut(a).change(edge, insert);
+        let copied = a.change(edge, insert);
         self.stats.copied_adjacency_ids += copied;
         Ok(())
     }
@@ -193,8 +193,8 @@ impl IncrementalTransaction<'_> {
         } else {
             VEntry {
                 record,
-                incoming: Arc::new(Adj::default()),
-                outgoing: Arc::new(Adj::default()),
+                incoming: Adj::default(),
+                outgoing: Adj::default(),
             }
         };
         self.vertices.insert(id, Some(entry));

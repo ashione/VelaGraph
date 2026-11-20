@@ -395,8 +395,8 @@ impl IncrementalGraph {
                 let id = v.id;
                 let entry = VEntry {
                     record: Arc::new(Cached::new(v)),
-                    incoming: Arc::new(Adj::default()),
-                    outgoing: Arc::new(Adj::default()),
+                    incoming: Adj::default(),
+                    outgoing: Adj::default(),
                 };
                 s.bytes = admitted;
                 s.vertices.set(id, Some(entry));
@@ -435,7 +435,7 @@ impl IncrementalGraph {
                     } else {
                         &mut v.outgoing
                     };
-                    Arc::make_mut(adj).append_sorted(e.id);
+                    adj.append_sorted(e.id);
                     s.bytes = s
                         .bytes
                         .checked_sub(before)

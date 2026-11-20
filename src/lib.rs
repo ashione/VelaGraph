@@ -3,6 +3,11 @@
 //! Provides typed vertices and edges, deterministic graph records, bounded
 //! traversals, snapshot reads, and single-partition write transactions.
 
+#[cfg(feature = "async-read")]
+mod async_read;
+#[cfg(feature = "async-read")]
+pub use async_read::AsyncGraphReader;
+
 mod error;
 mod execution;
 pub use execution::{CancellationToken, ExecutionControl, QueryBatchLimits};

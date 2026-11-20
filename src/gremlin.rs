@@ -306,12 +306,7 @@ impl QueryTextSize {
         }
     }
     fn validate(self) -> Result<()> {
-        if self.bytes > MAX_GREMLIN_QUERY_BYTES {
-            return Err(Error::GremlinParse(format!(
-                "query text is {} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}",
-                self.bytes
-            )));
-        }
+        validate_query_bytes(self.bytes)?;
         if self.marks > MAX_GREMLIN_STRUCTURAL_MARKS {
             return Err(Error::GremlinComplexityLimit {
                 marks: self.marks,
@@ -321,16 +316,19 @@ impl QueryTextSize {
         Ok(())
     }
 }
+pub(crate) fn validate_query_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_GREMLIN_QUERY_BYTES {
+        return Err(Error::GremlinParse(format!(
+            "query text is {bytes} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_query_text(input: &str) -> Result<()> {
     // Reject oversized input before scanning. Raw marks inside quoted/commented
     // input still count, so lexer recovery cannot hide parser recursion.
-    if input.len() > MAX_GREMLIN_QUERY_BYTES {
-        return QueryTextSize {
-            bytes: input.len(),
-            marks: 0,
-        }
-        .validate();
-    }
+    validate_query_bytes(input.len())?;
     QueryTextSize::measure(input).validate()?;
     if contains_unquoted_semicolon(input) {
         return Err(Error::GremlinParse(
