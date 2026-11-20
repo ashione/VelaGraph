@@ -7,7 +7,7 @@ pub mod materialized;
 mod plan_cache;
 mod query_memo;
 
-use rocksdb::{Direction, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
+use rocksdb::{DBRawIterator, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
 
 use crate::graph::{codec, validate_edge, validate_vertex};
 use crate::temporal_reference::{Interval, Key};
@@ -233,23 +233,26 @@ impl TemporalStoreView<'_> {
     pub fn valid_time(&self) -> i64 {
         self.valid_time
     }
-    fn assertion(&self, key: Key) -> Result<Option<Vec<u8>>> {
+    fn read_assertion<T>(
+        &self,
+        cursor: &mut DBRawIterator<'_>,
+        key: Key,
+        decode: fn(&[u8]) -> crate::Result<T>,
+    ) -> Result<Option<T>> {
         let start = revision_key_bytes(key, self.version, 0);
         let prefix = &start[..IDENTITY_PREFIX_LEN];
+        let mut rows = 0;
         let mut bytes = 0usize;
-        for (i, row) in self
-            .snapshot
-            .iterator(IteratorMode::From(&start, Direction::Forward))
-            .enumerate()
-        {
-            let (key, value) = row?;
+        cursor.seek(start);
+        while let Some((key, value)) = cursor.item() {
             if !key.starts_with(prefix) {
                 break;
             }
-            if i >= MAX_READ_REVISIONS {
+            if rows >= MAX_READ_REVISIONS {
                 return Err(TemporalStoreError::Limit);
             }
-            let (valid, payload) = decode_revision(&key, &value, self.version)?;
+            rows += 1;
+            let (valid, payload) = decode_revision(key, value, self.version)?;
             bytes = bytes
                 .checked_add(key.len() + value.len())
                 .ok_or(TemporalStoreError::Limit)?;
@@ -257,16 +260,21 @@ impl TemporalStoreView<'_> {
                 return Err(TemporalStoreError::Limit);
             }
             if valid.from <= self.valid_time && valid.to.is_none_or(|to| self.valid_time < to) {
-                return Ok(payload.map(|p| p.to_vec()));
+                return Ok(payload.map(decode).transpose()?);
             }
+            cursor.next();
         }
+        cursor.status()?;
         Ok(None)
     }
     pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        let Some(payload) = self.assertion(Key::Vertex(id))? else {
+        self.read_vertex(&mut self.snapshot.raw_iterator(), id)
+    }
+    fn read_vertex(&self, cursor: &mut DBRawIterator<'_>, id: u64) -> Result<Option<Vertex>> {
+        let Some(vertex) = self.read_assertion(cursor, Key::Vertex(id), codec::decode_vertex)?
+        else {
             return Ok(None);
         };
-        let vertex = codec::decode_vertex(&payload)?;
         if vertex.id != id {
             return Err(TemporalStoreError::Corrupt);
         }
@@ -276,15 +284,18 @@ impl TemporalStoreView<'_> {
     /// Assertions may be recorded before endpoints. Visibility requires both
     /// endpoints at V/T; this never weakens v1 create-edge validation.
     pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
-        let Some(payload) = self.assertion(Key::Edge(id))? else {
+        let mut cursor = self.snapshot.raw_iterator();
+        let Some(edge) = self.read_assertion(&mut cursor, Key::Edge(id), codec::decode_edge)?
+        else {
             return Ok(None);
         };
-        let edge = codec::decode_edge(&payload)?;
         if edge.id != id {
             return Err(TemporalStoreError::Corrupt);
         }
         validate_edge(&edge)?;
-        if self.get_vertex(edge.from)?.is_none() || self.get_vertex(edge.to)?.is_none() {
+        if self.read_vertex(&mut cursor, edge.from)?.is_none()
+            || (edge.from != edge.to && self.read_vertex(&mut cursor, edge.to)?.is_none())
+        {
             return Ok(None);
         }
         Ok(Some(edge))
@@ -756,6 +767,58 @@ mod tests {
             TemporalStore::open(dir.path()),
             Err(TemporalStoreError::Corrupt)
         ));
+    }
+    #[test]
+    fn direct_edge_reseeks_endpoints_and_checks_self_loop_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let valid = interval(0, None);
+        store
+            .commit(&[
+                vertex(1, 0, None, 1),
+                vertex(2, 0, None, 2),
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(1, 2, 1, "link"),
+                },
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(2, 1, 1, "loop"),
+                },
+            ])
+            .unwrap();
+        let pinned = store.view(None, 7).unwrap();
+        store
+            .commit(&[TemporalMutation::Absent {
+                valid: interval(5, Some(10)),
+                key: Key::Vertex(1),
+            }])
+            .unwrap();
+        for id in [1, 2] {
+            assert_eq!(pinned.get_edge(id).unwrap().unwrap().id, id);
+            assert!(store.view(None, 7).unwrap().get_edge(id).unwrap().is_none());
+            assert_eq!(
+                store
+                    .view(None, 10)
+                    .unwrap()
+                    .get_edge(id)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
+        // Both a destination and a self-loop endpoint must propagate bad records.
+        store
+            .db
+            .put(revision_key(Key::Vertex(1), 1, 0), b"damaged")
+            .unwrap();
+        for id in [1, 2] {
+            assert!(matches!(
+                store.view(None, 10).unwrap().get_edge(id),
+                Err(TemporalStoreError::Corrupt)
+            ));
+        }
     }
     #[test]
     fn corruption_and_history_work_limits_fail_not_missing() {
