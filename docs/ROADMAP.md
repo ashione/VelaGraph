@@ -969,3 +969,18 @@ refresh, batched sessions, temporal candidate indexes or distributed borrowing.
 Prepared binding reuses static canonical admission metadata while preserving
 parameter types and the original text/complexity limits. This is local query
 planning work, not a new language or a relaxation of parser admission.
+
+
+### Optional incremental ordinary-graph read model (#370)
+
+This PR implements a bounded local `IncrementalGraph` candidate with Locked/COW
+read ownership, staged vertex/edge changes, atomic metadata publication and a
+separate versioned checkpoint. See [the proposal and acceptance boundary](INCREMENTAL_MEMORY_GRAPH.md).
+It is not wired into an existing service route and does not complete #354, managed
+recovery, source snapshot/offset certification or distributed temporal updates.
+
+The optional incremental COW path prepares changed shards under a writer-only
+mutex, publishes under a short lock and reclaims outside it. Candidate version
+construction peaks are included in admission, and record budgets precede
+validation/compaction. Checkpoint writes use conditional, directory-locked publication
+to prevent stale overwrite; this does not establish a service latency SLA.

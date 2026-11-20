@@ -3,6 +3,11 @@
 //! Provides typed vertices and edges, deterministic graph records, bounded
 //! traversals, snapshot reads, and single-partition write transactions.
 
+#[cfg(feature = "async-read")]
+mod async_read;
+#[cfg(feature = "async-read")]
+pub use async_read::AsyncGraphReader;
+
 mod error;
 mod global_scan;
 mod graph;
@@ -49,3 +54,11 @@ pub mod temporal_store;
 /// Optional local phase counters; no storage or query semantic changes.
 #[cfg(feature = "query-profiling")]
 pub mod query_profile;
+
+/// Experimental bounded incremental memory graph types. Existing disk-backed
+/// engines and temporal APIs retain their separate contracts.
+pub use graph::incremental::{
+    IncrementalCommitStats, IncrementalGraph, IncrementalLimits, IncrementalMemoryError,
+    IncrementalMode, IncrementalMutation, IncrementalQueryLimits, IncrementalReadView,
+    IncrementalToken, IncrementalTransaction,
+};

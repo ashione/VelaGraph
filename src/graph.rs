@@ -22,6 +22,7 @@
 //! `WriteBatch`.
 
 pub(crate) mod codec;
+pub(crate) mod incremental;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
