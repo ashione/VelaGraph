@@ -129,6 +129,9 @@ explicit; the model never refreshes itself. It borrows validated records during
 shared-executor traversal and copies only selected
 output values. Query results remain owned, and full logical record budgets still
 apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
+Materialized reads keep exact per-access accounting while the shared executor
+and adjacency boundaries enforce the same cooperative deadline, avoiding
+redundant clock polling for individual counters.
 
 Prepared queries also reuse static canonical admission counts, checking each
 binding's exact textual size and complexity without rendering the entire query.
