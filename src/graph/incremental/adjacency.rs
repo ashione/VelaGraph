@@ -1,50 +1,115 @@
 use super::*;
 pub(super) const CHUNK: usize = 256;
 #[derive(Clone, Default)]
-pub(super) struct Adj(Option<Arc<AdjChunks>>);
+pub(super) struct Adj(Option<Arc<AdjStorage>>);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
+enum AdjStorage {
+    One(u64),
+    Many(AdjChunks),
+}
+
+#[derive(Clone)]
 struct AdjChunks {
     chunks: Vec<Arc<Vec<u64>>>,
     len: usize,
 }
+
 impl Adj {
     pub fn header_bytes(&self) -> usize {
-        self.0.as_ref().map_or(0, |a| {
-            a.chunks.capacity() * std::mem::size_of::<Arc<Vec<u64>>>()
-        })
+        match self.0.as_deref() {
+            Some(AdjStorage::Many(a)) => a.chunks.capacity() * std::mem::size_of::<Arc<Vec<u64>>>(),
+            _ => 0,
+        }
     }
     pub fn len(&self) -> usize {
-        self.0.as_ref().map_or(0, |a| a.len)
-    }
-    fn chunks(&self) -> &[Arc<Vec<u64>>] {
-        self.0.as_ref().map_or(&[], |a| a.chunks.as_slice())
+        match self.0.as_deref() {
+            None => 0,
+            Some(AdjStorage::One(_)) => 1,
+            Some(AdjStorage::Many(a)) => a.len,
+        }
     }
     pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.chunks().iter().flat_map(|c| c.iter().copied())
+        let (single, chunks): (&[u64], &[Arc<Vec<u64>>]) = match self.0.as_deref() {
+            None => (&[], &[]),
+            Some(AdjStorage::One(id)) => (std::slice::from_ref(id), &[]),
+            Some(AdjStorage::Many(a)) => (&[], &a.chunks),
+        };
+        let mut ids = single.iter();
+        let mut chunks = chunks.iter();
+        std::iter::from_fn(move || loop {
+            if let Some(&id) = ids.next() {
+                return Some(id);
+            }
+            ids = chunks.next()?.iter();
+        })
     }
     pub fn bytes(&self) -> usize {
-        self.header_bytes()
-            + self
-                .chunks()
-                .iter()
-                .map(|c| c.capacity() * 8 + 64)
-                .sum::<usize>()
+        match self.0.as_deref() {
+            Some(AdjStorage::Many(a)) => {
+                self.header_bytes()
+                    + a.chunks
+                        .iter()
+                        .map(|c| c.capacity() * 8 + 64)
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
     }
     pub fn append_sorted(&mut self, id: u64) {
-        Arc::make_mut(self.0.get_or_insert_with(Arc::default)).append_sorted(id);
+        let Some(storage) = &mut self.0 else {
+            self.0 = Some(Arc::new(AdjStorage::One(id)));
+            return;
+        };
+        let data = Arc::make_mut(storage);
+        match data {
+            AdjStorage::One(first) => {
+                debug_assert!(*first < id);
+                *data = AdjStorage::pair(*first, id);
+            }
+            AdjStorage::Many(a) => a.append_sorted(id),
+        }
     }
     pub fn change(&mut self, id: u64, insert: bool) -> usize {
-        if insert {
-            return Arc::make_mut(self.0.get_or_insert_with(Arc::default)).change(id, true);
-        }
-        let Some(adj) = &mut self.0 else { return 0 };
-        // Dropping the last reference from this version needs no chunk copy.
-        if adj.len == 1 && adj.chunks[0][0] == id {
-            self.0 = None;
+        let Some(storage) = &mut self.0 else {
+            if insert {
+                self.0 = Some(Arc::new(AdjStorage::One(id)));
+            }
             return 0;
+        };
+        if let AdjStorage::One(old) = storage.as_ref() {
+            if !insert {
+                if *old == id {
+                    self.0 = None;
+                }
+                return 0;
+            }
+            if *old == id {
+                return 0;
+            }
         }
-        Arc::make_mut(adj).change(id, false)
+        let data = Arc::make_mut(storage);
+        match data {
+            AdjStorage::One(old) => *data = AdjStorage::pair((*old).min(id), (*old).max(id)),
+            AdjStorage::Many(a) if !insert && a.len == 2 => {
+                // The remaining two IDs can lie in different chunks after removals.
+                let first = a.chunks[0][0];
+                let last = *a.chunks.last().unwrap().last().unwrap();
+                if id == first || id == last {
+                    *data = AdjStorage::One(if id == first { last } else { first });
+                }
+            }
+            AdjStorage::Many(a) => return a.change(id, insert),
+        }
+        0
+    }
+}
+impl AdjStorage {
+    fn pair(first: u64, second: u64) -> Self {
+        Self::Many(AdjChunks {
+            chunks: vec![Arc::new(vec![first, second])],
+            len: 2,
+        })
     }
 }
 
@@ -61,13 +126,6 @@ impl AdjChunks {
         self.len += 1;
     }
     fn change(&mut self, id: u64, insert: bool) -> usize {
-        if self.chunks.is_empty() {
-            if insert {
-                self.chunks.push(Arc::new(vec![id]));
-                self.len = 1
-            }
-            return 0;
-        }
         let mut i = self
             .chunks
             .partition_point(|c| c.last().is_some_and(|last| *last < id));
@@ -128,5 +186,33 @@ mod tests {
         current.change(9, true);
         assert_eq!(current.ids().collect::<Vec<_>>(), [9]);
         assert_eq!(pinned.ids().collect::<Vec<_>>(), [5, 7]);
+    }
+    #[test]
+    fn promotion_and_demotion_preserve_sorted_ids_and_pinned_chunks() {
+        let mut current = Adj::default();
+        current.change(u64::MAX, true);
+        let single = current.clone();
+        current.change(u64::MAX, true);
+        current.change(0, false);
+        assert!(Arc::ptr_eq(
+            current.0.as_ref().unwrap(),
+            single.0.as_ref().unwrap()
+        ));
+        current.change(0, true);
+        for id in 1..=CHUNK as u64 {
+            current.change(id, true);
+        }
+        let full = current.clone();
+        for id in 1..=CHUNK as u64 {
+            current.change(id, false);
+        }
+        assert_eq!(current.ids().collect::<Vec<_>>(), [0, u64::MAX]);
+        current.change(42, false);
+        current.change(u64::MAX, false);
+        assert!(matches!(current.0.as_deref(), Some(AdjStorage::One(0))));
+        current.change(0, false);
+        assert!(current.0.is_none());
+        assert_eq!(single.ids().collect::<Vec<_>>(), [u64::MAX]);
+        assert!(full.ids().eq((0..=CHUNK as u64).chain([u64::MAX])));
     }
 }
