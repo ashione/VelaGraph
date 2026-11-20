@@ -168,8 +168,8 @@ impl<T> RecordBytes for Cached<T> {
 #[derive(Clone)]
 struct VEntry {
     record: Arc<Cached<Vertex>>,
-    incoming: Arc<Adj>,
-    outgoing: Arc<Adj>,
+    incoming: Adj,
+    outgoing: Adj,
 }
 impl VEntry {
     fn bytes(&self) -> usize {
