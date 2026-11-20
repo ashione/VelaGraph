@@ -978,3 +978,7 @@ read ownership, staged vertex/edge changes, atomic metadata publication and a
 separate versioned checkpoint. See [the proposal and acceptance boundary](INCREMENTAL_MEMORY_GRAPH.md).
 It is not wired into an existing service route and does not complete #354, managed
 recovery, source snapshot/offset certification or distributed temporal updates.
+
+The optional incremental COW path prepares changed shards under a writer-only
+mutex, publishes under a short lock and reclaims outside it. Candidate version
+fees are included in admission; this does not establish a service latency SLA.

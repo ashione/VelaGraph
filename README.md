@@ -153,9 +153,14 @@ reader lifetimes and aggregate memory policy. See the [design and limits](docs/I
 
 ```sh
 cargo run --release --locked -p velagraph --example incremental_memory
+cargo run --release --locked -p velagraph --example incremental_publication
 ```
 
-The example uses generated data, compares rebuilding with incremental publication,
+COW prepares changed index shards outside the reader publication lock and releases
+retired data after unlocking. Its version budget includes the preparing candidate.
+The `incremental_publication` example measures version acquisition during writes.
+
+The `incremental_memory` example uses generated data, compares rebuilding with incremental publication,
 checks each version and restores a checkpoint before continuing. Its timings are
 local observations, not a disk-durability comparison or service capacity claim.
 

@@ -95,17 +95,38 @@ Deletion of a vertex removes every incident edge and both directional entries;
 a self-loop is processed once. Missing deletes are charged no-ops.
 
 A mutation/read-budget error poisons the transaction. It cannot subsequently
-commit a partially failed overlay. `commit` releases its original read handle,
-acquires the write lock and validates the complete identity/sequence token.
+commit a partially failed overlay. Locked `commit` releases its original read
+handle, acquires the write lock and validates the complete identity/sequence token.
 Any intervening publication causes `TransactionConflict`; no implicit retry is
 performed. All validation, retained/copy budgets and COW backpressure checks
 precede installation. A successful commit publishes records, indexes, metadata
 and sequence together. Every success increments sequence, including empty or
 metadata-only commits. Sequence overflow rejects rather than wrapping.
 
-Locked publication installs the validated changes in place. COW constructs a new
-state from shared tables and then replaces the current state. Old readers retain
-old records and old metadata. Resource errors never turn into partial results.
+Locked publication installs the validated changes in place. COW serializes commit
+preparation with a per-graph writer mutex that readers never acquire. It validates
+the base token and admits current + candidate + pinned version fees before cloning
+the candidate. Index copies, updates and compaction run outside the publication
+lock. It then takes a short write lock, rechecks the token, deadline and pinned
+limits, and swaps the complete state. Retired strong references and discarded
+candidates are released outside the publication lock. Old readers retain old
+records and old metadata.
+
+Only one COW commit candidate is prepared at a time, including its reclamation.
+Concurrent transactions can still stage independently, each under its existing
+transaction limits; this is not a global quota for all staged transaction memory.
+A writer whose base became stale returns `TransactionConflict` before copying;
+there is no automatic retry. COW checks its cooperative deadline after waiting
+for writer serialization and publication, and around candidate table mutations.
+The locks themselves are not cancellable. A single allocation, table mutation or
+destructor is not preemptible.
+
+This uses two logical versions during preparation, with shared unchanged records
+and index shards. It does not maintain two independent full graph buffers or
+replay updates into a standby graph. Slow readers can retain additional versions
+under the existing limits. This shortens version-acquisition stalls; it does not
+reduce traversal or response construction work, guarantee reader fairness, or
+remove allocation and memory-bandwidth contention. Resource errors never turn into partial results.
 Rust allocation failures and arbitrary process termination are not recoverable
 transaction errors. Poisoned locks fail closed.
 
@@ -120,7 +141,7 @@ transaction errors. Poisoned locks fail closed.
 | Transaction work units | 10,000 |
 | Transaction logical work bytes | 16 MiB |
 | Retained old COW versions | 8 |
-| Conservative current + pinned version fees | 512 MiB |
+| Conservative current + candidate + pinned version fees | 512 MiB |
 | Opaque caller metadata | 64 KiB |
 | Cooperative transaction preparation | 5 seconds |
 
@@ -129,7 +150,11 @@ method calls. Work bytes cover metadata copying, complete records, and conservat
 bounds for structural table changes and adjacency cloning/movement. Immutable
 record fees are cached and recalculated for replacements. Retained fees include
 record/container capacity and coarse table-entry charges. COW version fees count
-whole retained versions conservatively, even when they share allocations.
+whole versions conservatively, even when they share allocations. COW admission
+now includes both current and candidate during preparation even without old
+readers. A tightened `max_pinned_accounted_bytes` that fits only the final state
+may therefore reject a commit accepted by the earlier implementation. Leave room
+for both versions and retained readers; limits and defaults are not raised.
 `copied_index_entries` and `copied_adjacency_ids` count Arc COW copies only; they
 are not total allocation counts, CPU work or bytes copied by every container.
 
@@ -215,6 +240,33 @@ with rebuilding the same logical graph and checks results at every version.
 
 Local proof does not establish multi-machine HA, production CPU/QPS, power-loss
 recovery or safe CDC publication. Those remain separate integration work.
+
+### Local COW publication comparison
+
+`cargo run --release --locked -p velagraph --example incremental_publication`
+uses 65,536 generated vertices, four readers and 120 batches of 32 vertex updates
+scheduled 1 ms apart. Reader warmup finishes before the barrier. Active samples
+start within the writer start/end window, including paced gaps; idle acquisitions
+are reported separately. Each read verifies 32 properties against the version's
+opaque metadata. These are direct record reads, not Gremlin or RPC timings.
+
+Three alternating-order comparisons against `aa39ed2`, using identical source and
+dependency versions, ran on macOS arm64 Mac14,10 (12 logical CPUs, 32 GiB), Rust
+1.100.0 release. The table gives the median of the three per-run quantiles:
+
+| Metric | `aa39ed2` COW | Short-publication COW |
+|---|---:|---:|
+| Active version acquisition p95 | 358.500 us | 0.334 us |
+| Active version acquisition p99 | 1,406.583 us | 0.500 us |
+| Active 32-property read including acquisition p99 | 1,411.666 us | 25.458 us |
+| Update p50 | 229.541 us | 253.708 us |
+| Update p95 | 1,495.042 us | 1,321.375 us |
+
+Acquisition p95 ranged from 262.042 to 417.667 us before and was 0.334 us in all
+three candidate runs. Active sample counts differ because blocked readers finish
+fewer paced iterations within the writer window. Scheduler, allocator and final
+reader reclamation still affect latency. This is contention evidence, not a
+throughput ceiling or a guarantee of faster uncontended queries or updates.
 
 ## Delivery
 

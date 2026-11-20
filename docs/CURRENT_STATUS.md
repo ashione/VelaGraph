@@ -272,5 +272,7 @@ live-rejoin, retention or remote-authority claim follows from this slice.
 
 The [incremental memory graph](INCREMENTAL_MEMORY_GRAPH.md) is an experimental
 library backend tracked by #370. It preserves bounded ordinary Gremlin reads
-while publishing staged records/indexes and caller metadata. Existing disk,
-temporal and managed APIs remain distinct; memory publication is not durable ACK.
+while publishing staged records/indexes and caller metadata.
+COW prepares one candidate outside the publication lock and reclaims retired
+data after unlocking; preparation includes current/candidate/pinned byte admission.
+Existing disk, temporal and managed APIs remain distinct; memory publication is not durable ACK.

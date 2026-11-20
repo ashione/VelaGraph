@@ -4,10 +4,11 @@
 use super::*;
 use crate::{GremlinBindings, GremlinQuery, GremlinResult, PreparedGremlinQuery};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock, RwLockReadGuard, Weak};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 mod adjacency;
 mod checkpoint;
+mod publication;
 mod query;
 mod table;
 mod transaction;
@@ -83,7 +84,7 @@ pub struct IncrementalLimits {
     pub max_batch_bytes: usize,
     /// Maximum retained old COW versions (default eight).
     pub max_pinned_versions: usize,
-    /// Conservative sum of current and pinned-version fees (512 MiB).
+    /// Conservative current, pinned and preparing COW version fees (512 MiB).
     pub max_pinned_accounted_bytes: usize,
 }
 impl Default for IncrementalLimits {
@@ -196,6 +197,8 @@ pub struct IncrementalGraph {
     mode: IncrementalMode,
     limits: IncrementalLimits,
     inner: RwLock<Inner>,
+    // Readers never acquire this lock. Only one COW candidate is prepared at a time.
+    cow_prepare: Mutex<()>,
 }
 enum Handle<'a> {
     Locked(RwLockReadGuard<'a, Inner>),
@@ -237,6 +240,7 @@ impl IncrementalGraph {
         Ok(Self {
             mode,
             limits,
+            cow_prepare: Mutex::new(()),
             inner: RwLock::new(Inner {
                 current: Arc::new(State {
                     identity,

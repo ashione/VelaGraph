@@ -353,6 +353,10 @@ impl IncrementalTransaction<'_> {
                 .ok_or_else(|| limit("copy accounting"))?,
         )?;
 
+        self.stats.changed_vertices = self.vertices.len();
+        self.stats.changed_edges = self.edges.len();
+        self.stats.retained_accounted_bytes = bytes;
+        self.stats.sequence = sequence;
         let Self {
             graph,
             base,
@@ -360,48 +364,31 @@ impl IncrementalTransaction<'_> {
             edges,
             metadata,
             mut stats,
+            deadline,
             ..
         } = self;
+        if graph.mode == IncrementalMode::Cow {
+            return publication::commit(
+                graph,
+                base,
+                publication::Changes {
+                    vertices,
+                    edges,
+                    metadata,
+                    vertex_count: nv,
+                    edge_count: ne,
+                    stats,
+                },
+                deadline,
+            );
+        }
         drop(base);
         let mut guard = graph.inner.write().map_err(|_| bad("poisoned lock"))?;
         if guard.current.sequence != token.sequence || guard.current.identity != token.identity {
             return Err(Error::TransactionConflict);
         }
-        guard.retired.retain(|w| w.strong_count() > 0);
-        if graph.mode == IncrementalMode::Cow {
-            let alive: Vec<_> = guard.retired.iter().filter_map(Weak::upgrade).collect();
-            let pinned = Arc::strong_count(&guard.current) > 1;
-            let charged = alive
-                .iter()
-                .try_fold(bytes, |n, s| n.checked_add(s.bytes))
-                .and_then(|n| {
-                    if pinned {
-                        n.checked_add(guard.current.bytes)
-                    } else {
-                        Some(n)
-                    }
-                })
-                .ok_or_else(|| limit("pinned accounting"))?;
-            if alive.len() + usize::from(pinned) > graph.limits.max_pinned_versions
-                || charged > graph.limits.max_pinned_accounted_bytes
-            {
-                return Err(limit("pinned version backpressure"));
-            }
-        }
-        stats.changed_vertices = vertices.len();
-        stats.changed_edges = edges.len();
-        stats.retained_accounted_bytes = bytes;
-        stats.sequence = sequence;
-        let mut next = if graph.mode == IncrementalMode::Cow {
-            Some((*guard.current).clone())
-        } else {
-            None
-        };
-        let s = match next.as_mut() {
-            Some(s) => s,
-            None => Arc::get_mut(&mut guard.current)
-                .ok_or_else(|| bad("locked state unexpectedly shared"))?,
-        };
+        let s = Arc::get_mut(&mut guard.current)
+            .ok_or_else(|| bad("locked state unexpectedly shared"))?;
         for (id, v) in vertices {
             stats.copied_index_entries += s.vertices.set(id, v)
         }
@@ -413,10 +400,6 @@ impl IncrementalTransaction<'_> {
         s.bytes = bytes;
         s.vertex_count = nv;
         s.edge_count = ne;
-        if let Some(next) = next {
-            let old = std::mem::replace(&mut guard.current, Arc::new(next));
-            guard.retired.push(Arc::downgrade(&old));
-        }
         Ok(stats)
     }
 }
