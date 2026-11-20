@@ -42,6 +42,12 @@ This is not a server-side prepared-plan handle or reuse of the local Rust
 prepared-query API. See the [Go client SDK](sdk/go/README.md) for supported steps
 and snapshot selection.
 
+Go applications can also embed the local engine through the optional
+[`sdk/go/native`](docs/NATIVE_FFI.md) cgo package and versioned C ABI. It supports
+ordinary memory graphs, temporal RocksDB, prepared queries and controlled batches
+without a server. This path has local consistency and shared-process failure
+semantics; enable it explicitly with `velagraph_native` and a matching native library.
+
 ## Source prerelease and development main
 
 [v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1) is a published

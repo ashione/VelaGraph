@@ -699,13 +699,13 @@ impl GremlinQuery {
 }
 
 /// Query result: ordered rows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GremlinResult {
     pub rows: Vec<GremlinRow>,
 }
 
 /// One result row. These are the row shapes allowed by `QUERY_SPEC.md`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum GremlinRow {
     Vertex(u64),
     Edge(u64),
@@ -715,7 +715,7 @@ pub enum GremlinRow {
 }
 
 /// A vertex or edge id in a traversal path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PathElement {
     Vertex(u64),
     Edge(u64),

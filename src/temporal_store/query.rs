@@ -68,6 +68,31 @@ impl TemporalStoreView<'_> {
         self.execute_query_inner(&bound)
     }
 
+    /// Execute one fixed-V/T batch, sharing revision work, memo and live budgets.
+    /// Existing temporal revision ceilings remain stricter than caller limits.
+    pub fn execute_query_batch(
+        &self,
+        queries: &[GremlinQuery],
+        control: &crate::ExecutionControl,
+        limits: crate::QueryBatchLimits,
+    ) -> crate::Result<Vec<GremlinResult>> {
+        control.check()?;
+        limits.validate(queries.len())?;
+        for query in queries {
+            if matches!(query.start(), GremlinStart::Vertices(ids)|GremlinStart::Edges(ids) if ids.is_empty())
+            {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "temporal global start requires an index".into(),
+                ));
+            }
+        }
+        let budget = Budget::new(limits.max_live_bytes);
+        let mut backend = Backend::new(self, &budget);
+        backend.control = Some(control.clone());
+        backend.limits = limits;
+        crate::execution::execute_batch(queries, &backend, &|| backend.check(), limits, &budget)
+    }
+
     fn execute_query_inner(&self, query: &GremlinQuery) -> crate::Result<GremlinResult> {
         match query.start() {
             GremlinStart::Vertices(ids) | GremlinStart::Edges(ids) if ids.is_empty() => {
@@ -89,6 +114,8 @@ impl TemporalStoreView<'_> {
 struct Backend<'a, 'db> {
     view: &'a TemporalStoreView<'db>,
     deadline: Instant,
+    control: Option<crate::ExecutionControl>,
+    limits: crate::QueryBatchLimits,
     rows: Cell<usize>,
     bytes: Cell<usize>,
     memo: Rc<RecordMemo>,
@@ -109,6 +136,8 @@ impl<'a, 'db> Backend<'a, 'db> {
         Self {
             view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo,
@@ -118,6 +147,9 @@ impl<'a, 'db> Backend<'a, 'db> {
         }
     }
     fn check(&self) -> crate::Result<()> {
+        if let Some(control) = &self.control {
+            control.check()?;
+        }
         if Instant::now() >= self.deadline {
             return Err(Error::TraversalLimitExceeded(
                 "temporal query deadline".into(),
@@ -136,7 +168,9 @@ impl<'a, 'db> Backend<'a, 'db> {
             .get()
             .checked_add(bytes)
             .ok_or_else(|| error(TemporalStoreError::Limit))?;
-        if rows > MAX_READ_REVISIONS || bytes > MAX_READ_BYTES {
+        if rows > MAX_READ_REVISIONS.min(self.limits.max_work_operations)
+            || bytes > MAX_READ_BYTES.min(self.limits.max_work_bytes)
+        {
             return Err(error(TemporalStoreError::Limit));
         }
         self.rows.set(rows);
@@ -678,6 +712,8 @@ mod tests {
         let backend = Backend {
             view: &view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -697,6 +733,8 @@ mod tests {
         let expired = Backend {
             view: &view,
             deadline: Instant::now(),
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -748,6 +786,8 @@ mod tests {
         let backend = Backend {
             view: &view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -1018,6 +1058,8 @@ mod adjacency_limits {
         let backend = Backend {
             view: &view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(MAX_READ_REVISIONS),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -1131,6 +1173,8 @@ mod adjacency_atomicity {
             let backend = Backend {
                 view: &view,
                 deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+                control: None,
+                limits: crate::QueryBatchLimits::default(),
                 rows: Cell::new(0),
                 bytes: Cell::new(0),
                 memo: Default::default(),

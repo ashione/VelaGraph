@@ -4,6 +4,8 @@
 //! traversals, snapshot reads, and single-partition write transactions.
 
 mod error;
+mod execution;
+pub use execution::{CancellationToken, ExecutionControl, QueryBatchLimits};
 mod global_scan;
 mod graph;
 mod graph_records;

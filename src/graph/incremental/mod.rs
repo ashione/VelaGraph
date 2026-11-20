@@ -282,11 +282,22 @@ impl IncrementalGraph {
         mutations: &[IncrementalMutation],
         metadata: &[u8],
     ) -> Result<IncrementalCommitStats> {
+        self.apply_checked(expected, mutations, metadata, &|| Ok(()))
+    }
+    fn apply_checked(
+        &self,
+        expected: &IncrementalToken,
+        mutations: &[IncrementalMutation],
+        metadata: &[u8],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<IncrementalCommitStats> {
+        check()?;
         let mut tx = self.begin()?;
         if &tx.token() != expected {
             return Err(Error::TransactionConflict);
         };
         for m in mutations {
+            check()?;
             match m {
                 IncrementalMutation::PutVertex(v) => {
                     tx.preflight_record_copy(v.accounted_bytes() + INDEX_FEE)?;
@@ -302,8 +313,19 @@ impl IncrementalGraph {
                 IncrementalMutation::DeleteEdge(id) => tx.delete_edge(*id)?,
             }
         }
+        check()?;
         tx.set_metadata(metadata)?;
-        tx.commit()
+        tx.commit_checked(check)
+    }
+    /// Apply a batch with caller cancellation checked before publication.
+    pub fn apply_with_control(
+        &self,
+        expected: &IncrementalToken,
+        mutations: &[IncrementalMutation],
+        metadata: &[u8],
+        control: &crate::ExecutionControl,
+    ) -> Result<IncrementalCommitStats> {
+        self.apply_checked(expected, mutations, metadata, &|| control.check())
     }
 }
 impl IncrementalReadView<'_> {

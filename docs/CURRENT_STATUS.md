@@ -1,5 +1,16 @@
 # Current capability and work index
 
+## Optional native embedding
+
+The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
+in-process access to ordinary incremental memory and temporal RocksDB stores.
+They share existing Gremlin, mutation, V/T and checkpoint contracts. Cancellation
+is cooperative; no distributed capability or storage format is added. JSON
+encoding/copy costs, explicit lifecycle and shared-process native failure remain
+part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)
+and [issue #376](https://github.com/ashione/VelaGraph/issues/376).
+
+
 Reviewed on **2026-11-14** against main
 [`40e2b9a`](https://github.com/ashione/VelaGraph/commit/40e2b9a419ff941a58761f784c9c7fd500a6bf08).
 GraphService retirement #278 / #279 is merged after exact-head CI and full CoreHR,

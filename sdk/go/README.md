@@ -73,3 +73,11 @@ for end-to-end coverage and benchmarks.
 Run `go test -race ./...` from this directory. After changing the public
 protobuf schema, regenerate the checked-in bindings from the repository root
 with `bash scripts/generate-go-managed.sh`.
+
+## Optional in-process native engine
+
+`native` is a separate cgo package for embedding local memory/temporal stores.
+Enable `cgo` and `velagraph_native`, and link the matching ABI1 library. Default
+pure-Go builds retain the existing gRPC SDK and get `ErrUnavailable` from native
+operations. See [native build, ownership and limits](../../docs/NATIVE_FFI.md)
+and [executable example](native/example/main.go).

@@ -1,5 +1,16 @@
 # VelaGraph Roadmap（实验阶段）
 
+## Optional native embedding
+
+The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
+in-process access to ordinary incremental memory and temporal RocksDB stores.
+They share existing Gremlin, mutation, V/T and checkpoint contracts. Cancellation
+is cooperative; no distributed capability or storage format is added. JSON
+encoding/copy costs, explicit lifecycle and shared-process native failure remain
+part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)
+and [issue #376](https://github.com/ashione/VelaGraph/issues/376).
+
+
 > 当前阶段：已有单机图内核、Raft 存储节点、静态路由、有界 observed 跨分片查询及 restricted managed 事务/同版本读取。继续以真实写入、查询和恢复路径补齐功能与容量证据，以 CoreHR 持续验收；容错、在线迁移与生产安全分别推进，实验切片可用不代表 D3、D4、D5 已全部完成。
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
