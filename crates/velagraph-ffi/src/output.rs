@@ -97,3 +97,31 @@ impl Output {
         }))
     }
 }
+
+pub(super) fn allocate(size: usize) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    if FAIL_ALLOCATION.with(|flag| flag.replace(false)) {
+        return Err(status::limit("native result allocation failed"));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| status::limit("native result allocation failed"))?;
+    Ok(bytes)
+}
+impl Output {
+    pub fn encode_packed(
+        mut self,
+        version: u64,
+        metadata: Option<&[u8]>,
+        results: &[velagraph::GremlinResult],
+        control: &ExecutionControl,
+    ) -> Result<u64> {
+        let bytes = crate::packed::encode(version, metadata, results, self.limit, control)?;
+        self.permit.shrink(bytes.capacity());
+        self.slot.publish(Resource::Buffer(Buffer {
+            bytes,
+            _permit: self.permit,
+        }))
+    }
+}

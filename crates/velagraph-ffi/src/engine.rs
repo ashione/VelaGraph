@@ -223,7 +223,13 @@ impl Engine {
             }
         }
     }
-    pub fn query(&self, q: wire::Queries, c: &ExecutionControl, out: Output) -> Result<(u64, u64)> {
+    pub fn query(
+        &self,
+        q: wire::Queries,
+        c: &ExecutionControl,
+        out: Output,
+        packed: bool,
+    ) -> Result<(u64, u64)> {
         if q.queries.is_empty() || q.queries.len() > 64 {
             return Err(status::limit("query batch must contain 1..64 queries"));
         }
@@ -277,14 +283,18 @@ impl Engine {
                     return Err(velagraph::Error::TransactionConflict.into());
                 }
                 let results = view.execute_query_batch(&queries, c, limits)?;
-                let buffer = out.encode(
-                    &Batch {
-                        version,
-                        metadata: Some(view.metadata()),
-                        results,
-                    },
-                    c,
-                )?;
+                let buffer = if packed {
+                    out.encode_packed(version, Some(view.metadata()), &results, c)?
+                } else {
+                    out.encode(
+                        &Batch {
+                            version,
+                            metadata: Some(view.metadata()),
+                            results,
+                        },
+                        c,
+                    )?
+                };
                 Ok((version, buffer))
             }
             Self::Temporal(g) => {
@@ -295,14 +305,18 @@ impl Engine {
                 c.check()?;
                 let version = view.version();
                 let results = view.execute_query_batch(&queries, c, limits)?;
-                let buffer = out.encode(
-                    &Batch {
-                        version,
-                        metadata: None,
-                        results,
-                    },
-                    c,
-                )?;
+                let buffer = if packed {
+                    out.encode_packed(version, None, &results, c)?
+                } else {
+                    out.encode(
+                        &Batch {
+                            version,
+                            metadata: None,
+                            results,
+                        },
+                        c,
+                    )?
+                };
                 Ok((version, buffer))
             }
         }

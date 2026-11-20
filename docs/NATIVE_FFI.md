@@ -10,7 +10,8 @@ adapters. Keep header, library and SDK on the same source revision.
 
 ## Build and run
 
-Requires stable Rust, a C/C++ compiler, Clang/libclang and Go 1.23 or newer. See
+Native targets are 64-bit Linux/macOS. Requires stable Rust, a C/C++ compiler,
+Clang/libclang and Go 1.23 or newer. See
 [CONTRIBUTING](../CONTRIBUTING.md#development-environment) for RocksDB dependencies.
 
 ```sh
@@ -39,6 +40,31 @@ store, err := native.OpenMemory(ctx, native.MemoryOptions{
 if err != nil { return err }
 defer store.Close()
 result, err := store.Query(ctx, []native.Query{{Text: "g.V(1)"}}, native.QueryOptions{})
+```
+
+## Direct result access
+
+`Store.Query` keeps its owned `BatchResult` contract and automatically releases
+native result memory. It now uses operation 7, so `MaxOutputBytes` applies to the
+packed representation. Operations 1–6 retain their original C ABI/JSON behavior.
+
+For bounded result processing, `Store.QueryView` returns an explicit `BatchView`
+owner. Use `ResultCount`, `RowCount` and `Row` to select a `RowView`; scalar getters,
+`PathElement` and `TextEquals` read native data without allocating Go row payloads.
+`Text`, `Metadata` and `Materialize` return owned copies. Close the view after use;
+copying a wrapper shares its owner, and closing any copy invalidates all accesses.
+The owner remains valid after Store.Close and does not pin a live graph snapshot.
+Validation of the complete layout/payload is eager; Go row creation is lazy.
+See the [packed contract](NATIVE_FFI_PACKED.md) and
+[allocation/performance comparison](NATIVE_FFI_ZERO_COPY_VALIDATION.md).
+
+```go
+view, err := store.QueryView(ctx, queries, native.QueryOptions{})
+if err != nil { return err }
+defer view.Close()
+row, err := view.Row(0, 0)
+if err != nil { return err }
+id, err := row.ID() // owned scalar; no full-buffer/row-payload copy
 ```
 
 ## Backend contracts
@@ -75,6 +101,7 @@ An unsupported ABI returns `UNSUPPORTED` without touching the output layout.
 | `INFO=4` | Store | Empty byte range | `buffer`: JSON capabilities/state |
 | `CHECKPOINT=5` | Memory store | `{"path":"..."}` | No result buffer |
 | `PREPARE=6` | 0 | `text`; optional `bind_start_ids`, `value_steps` | `value`: plan handle |
+| `QUERY_PACKED=7` | Store | Same request as query batch | `value`: read version; `buffer`: packed result |
 
 Input objects reject unknown fields. JSON numbers preserve `uint64` IDs and `int64`
 properties; clients must not route integers through floating-point decoders.
@@ -130,9 +157,15 @@ store's path can remain locked until its last admitted operation exits.
 
 Results own their bytes independently of store lifetime. Use `vg_buffer_size`,
 `vg_buffer_copy`, then `vg_release`. Undersized copies return `BUFFER_TOO_SMALL`
-and leave the destination unchanged. There is no borrowed result pointer.
+and leave the destination unchanged. Optional `vg_buffer_acquire` returns an
+independent lease and immutable pointer/length, valid until that lease is released.
+C callers synchronize pointer access with release. The Go SDK hides this pointer
+behind a shared owner; accessors synchronize with Close and return `ErrClosed`
+afterwards. See [packed format and ownership](NATIVE_FFI_PACKED.md).
 Retained buffer/plan capacity remains charged until the final admitted owner exits,
-including an operation racing handle retirement. Pending handles are reserved
+including an operation racing handle retirement. Acquiring a lease temporarily
+requires another handle slot but does not charge the buffer capacity twice. Pending handles
+are reserved
 before open/prepare, so handle exhaustion cannot discard an acknowledged write.
 
 Controls are monotonic: `vg_control_new`, `vg_cancel`, `vg_release`. Go context
@@ -186,8 +219,12 @@ encoding and applies conservative preflight estimates before JSON allocation.
 These are logical/work/wire bounds, **not process RSS**. Decoded object overhead,
 allocator overhead, RocksDB caches and caller-owned data add memory. Multiple
 stores have separate kernel retention budgets: applications must bound aggregate
-store memory and lifecycle. JSON ABI1 copies and decodes results; it is not a
-zero-copy interface. Panic unwinding is contained at the C boundary, but OOM,
+store memory and lifecycle. JSON query operation 3 remains compatible. Operation 7
+supplies packed results;
+Go `Query` materializes owned rows from a leased buffer, and `QueryView` exposes
+zero-copy result access without a whole-buffer copy or per-row JSON decoding.
+Input JSON and the kernel result construction remain; text/metadata requested as
+owned Go values deliberately copy. Panic unwinding is contained at the C boundary, but OOM,
 abort, segmentation faults and native crashes share the host process failure domain.
 C callers must supply valid, aligned, disjoint readable/writable ranges. The ABI
 validates null, alignment and length; it cannot validate arbitrary native pointers.
@@ -201,7 +238,8 @@ python3 scripts/test_native_ffi.py --lib-dir target/debug
 cargo clippy --locked -p velagraph-ffi --all-targets -- -D warnings
 ```
 
-The native workflow runs C interop, Go race tests and non-cgo SDK checks on Linux
+The native workflow runs C interop (including independent leases), Go race tests
+and non-cgo SDK checks on Linux
 and macOS. Default/core profiling CI remains enabled separately. Core tests inject
 cancellation before publication and during a later batch query; ABI tests exercise
 exhaustion, retired ownership, uncertain initialization and allocation failure.
@@ -217,4 +255,5 @@ includes request encoding, cgo, native execution/serialization, copying, release
 and typed Go decoding. Setup,
 prepare and correctness checks are outside timing. These generated warm local
 measurements isolate embedding overhead; they are not RPC, production or hierarchy
-comparisons. See [native validation](NATIVE_FFI_VALIDATION.md) for recorded results.
+comparisons. See [initial JSON validation](NATIVE_FFI_VALIDATION.md) and the subsequent
+[packed/view comparison](NATIVE_FFI_ZERO_COPY_VALIDATION.md) for recorded results.

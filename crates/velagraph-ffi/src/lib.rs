@@ -2,6 +2,7 @@
 mod bounds;
 mod engine;
 mod output;
+mod packed;
 mod registry;
 mod status;
 mod wire;
@@ -159,7 +160,7 @@ pub unsafe extern "C" fn vg_call(
     let out = unsafe { &mut *out };
     let may_write = std::cell::Cell::new(op == 2 || op == 5);
     boundary(out, &may_write, || {
-        if !(1..=6).contains(&op) {
+        if !(1..=7).contains(&op) {
             return Err(status::unsupported("unknown native operation"));
         }
         if len > bounds::MAX_INPUT as u64 || len > isize::MAX as u64 {
@@ -234,7 +235,7 @@ pub unsafe extern "C" fn vg_call(
                         engine.checkpoint(&q.path, &c)?;
                         Ok((0, 0))
                     }
-                    3 | 4 => {
+                    3 | 4 | 7 => {
                         let max = if max_output == 0 {
                             bounds::DEFAULT_OUTPUT
                         } else {
@@ -245,9 +246,9 @@ pub unsafe extern "C" fn vg_call(
                             return Err(status::limit("output limit"));
                         }
                         let output = output::Output::reserve(max)?;
-                        if op == 3 {
+                        if op == 3 || op == 7 {
                             let q = serde_json::from_slice(data)?;
-                            engine.query(q, &c, output)
+                            engine.query(q, &c, output, op == 7)
                         } else {
                             if !data.is_empty() {
                                 return Err(status::invalid("info takes no payload"));
@@ -352,3 +353,51 @@ pub unsafe extern "C" fn vg_buffer_copy(id: u64, out: *mut u8, capacity: u64) ->
 }
 #[cfg(test)]
 mod tests;
+
+/// Independent owner for immutable result bytes. Release `lease` after all reads.
+#[repr(C)]
+pub struct BufferView {
+    pub lease: u64,
+    pub data: *const u8,
+    pub len: u64,
+}
+impl Default for BufferView {
+    fn default() -> Self {
+        Self {
+            lease: 0,
+            data: std::ptr::null(),
+            len: 0,
+        }
+    }
+}
+/// Acquire a separate lease so the original buffer can be retired independently.
+/// # Safety
+/// `out` points to an aligned writable BufferView. Borrowed bytes are read-only;
+/// synchronize their use with release of the returned lease.
+#[no_mangle]
+pub unsafe extern "C" fn vg_buffer_acquire(id: u64, out: *mut BufferView) -> u32 {
+    if out.is_null() || !(out as usize).is_multiple_of(std::mem::align_of::<BufferView>()) {
+        return status::INVALID;
+    }
+    unsafe {
+        out.write(BufferView::default());
+    }
+    let mut view = BufferView::default();
+    let status = simple(|| {
+        let resource = registry::get(id)?;
+        let Resource::Buffer(buffer) = resource.as_ref() else {
+            return Err(Failure::Simple(status::HANDLE, "handle is not a result"));
+        };
+        let data = buffer.bytes.as_ptr();
+        let len = buffer.bytes.len() as u64;
+        let lease = Slot::reserve()?.publish(Resource::Lease { _buffer: resource })?;
+        view = BufferView { lease, data, len };
+        Ok(())
+    });
+    if status == status::OK {
+        unsafe {
+            out.write(view);
+        }
+    }
+    status
+}

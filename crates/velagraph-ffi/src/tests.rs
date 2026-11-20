@@ -471,3 +471,140 @@ fn malformed_checkpoint_payload_is_corruption_not_request_syntax() {
     // Malformed request JSON itself is still INVALID.
     assert_eq!(call_bytes(1, 0, b"not json", 0, 1024).0, status::INVALID);
 }
+
+#[test]
+fn packed_query_has_fixed_numeric_rows_and_exact_output_admission() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let base = registry::count();
+    let (s, r) = call(
+        1,
+        0,
+        json!({"backend":"memory","identity":"packed","vertices":[{"id":u64::MAX}]}),
+    );
+    assert_eq!(s, 0);
+    let store = r.value;
+    let data = br#"{"queries":[{"text":"g.V()"}]}"#;
+    let (s, r) = call_bytes(7, store, data, 0, 104);
+    assert_eq!(s, 0);
+    let mut size = 0;
+    assert_eq!(unsafe { vg_buffer_size(r.buffer, &mut size) }, 0);
+    assert_eq!(size, 104);
+    let mut bytes = vec![0u8; 104];
+    assert_eq!(
+        unsafe { vg_buffer_copy(r.buffer, bytes.as_mut_ptr(), size) },
+        0
+    );
+    assert_eq!(&bytes[..8], b"VGQR0001");
+    assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(bytes[80..88].try_into().unwrap()), 1);
+    assert_eq!(
+        u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
+        u64::MAX
+    );
+    vg_release(r.buffer);
+    assert_eq!(call_bytes(7, store, data, 0, 103).0, status::LIMIT);
+    vg_release(store);
+    assert_eq!(registry::count(), base);
+}
+
+#[test]
+fn buffer_lease_outlives_original_handle_without_double_charging() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let count = registry::count();
+    let usage = bounds::usage();
+    let (s, r) = call(1, 0, json!({"backend":"memory","identity":"lease"}));
+    assert_eq!(s, 0);
+    let store = r.value;
+    let (s, r) = call_bytes(4, store, &[], 0, 1024);
+    assert_eq!(s, 0);
+    let charged = bounds::usage();
+    let mut view = BufferView::default();
+    assert_eq!(unsafe { vg_buffer_acquire(r.buffer, &mut view) }, 0);
+    assert!(!view.data.is_null());
+    assert!(view.len > 0);
+    assert_eq!(bounds::usage(), charged);
+    assert_eq!(vg_release(r.buffer), 0);
+    assert_eq!(vg_release(store), 0);
+    let bytes = unsafe { std::slice::from_raw_parts(view.data, view.len as usize) };
+    assert_eq!(
+        serde_json::from_slice::<Value>(bytes).unwrap()["identity"],
+        "lease"
+    );
+    assert_eq!(bounds::usage(), charged);
+    assert_eq!(vg_release(view.lease), 0);
+    assert_eq!(bounds::usage(), usage);
+    assert_eq!(registry::count(), count);
+}
+
+#[test]
+fn packed_errors_and_lease_exhaustion_release_reservations() {
+    use std::time::Duration;
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let count = registry::count();
+    let usage = bounds::usage();
+    let results = [velagraph::GremlinResult {
+        rows: vec![velagraph::GremlinRow::Vertex(1)],
+    }];
+    for expired in [false, true] {
+        let token = CancellationToken::default();
+        let c = ExecutionControl::new(
+            token.clone(),
+            if expired {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(30)
+            },
+        )
+        .unwrap();
+        if !expired {
+            token.cancel();
+        }
+        let e = output::Output::reserve(1024)
+            .unwrap()
+            .encode_packed(0, None, &results, &c)
+            .unwrap_err();
+        assert_eq!(
+            e.code(false),
+            if expired {
+                status::DEADLINE
+            } else {
+                status::CANCELLED
+            }
+        );
+        assert_eq!(bounds::usage(), usage);
+        assert_eq!(registry::count(), count);
+    }
+    let c = ExecutionControl::new(CancellationToken::default(), Duration::from_secs(30)).unwrap();
+    output::FAIL_ALLOCATION.with(|f| f.set(true));
+    let e = output::Output::reserve(1024)
+        .unwrap()
+        .encode_packed(0, None, &results, &c)
+        .unwrap_err();
+    assert_eq!(e.code(false), status::LIMIT);
+    assert_eq!(bounds::usage(), usage);
+    assert_eq!(registry::count(), count);
+    let buffer = output::Output::reserve(1024)
+        .unwrap()
+        .encode_packed(0, None, &results, &c)
+        .unwrap();
+    let slots: Vec<_> = (registry::count()..bounds::MAX_HANDLES)
+        .map(|_| Slot::reserve().unwrap())
+        .collect();
+    let mut view = BufferView {
+        lease: 42,
+        data: std::ptr::dangling(),
+        len: 42,
+    };
+    assert_eq!(
+        unsafe { vg_buffer_acquire(buffer, &mut view) },
+        status::LIMIT
+    );
+    assert_eq!((view.lease, view.len), (0, 0));
+    assert!(view.data.is_null());
+    drop(slots);
+    assert_eq!(unsafe { vg_buffer_acquire(buffer, &mut view) }, 0);
+    assert_eq!(vg_release(buffer), 0);
+    assert_eq!(vg_release(view.lease), 0);
+    assert_eq!(bounds::usage(), usage);
+    assert_eq!(registry::count(), count);
+}

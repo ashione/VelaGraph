@@ -81,3 +81,9 @@ Enable `cgo` and `velagraph_native`, and link the matching ABI1 library. Default
 pure-Go builds retain the existing gRPC SDK and get `ErrUnavailable` from native
 operations. See [native build, ownership and limits](../../docs/NATIVE_FFI.md)
 and [executable example](native/example/main.go).
+
+`native.Store.Query` returns owned Go rows through the packed result path.
+`QueryView` retains immutable native bytes for direct ID/scalar/path access and
+text comparison; Close the view explicitly. `Text`, `Metadata` and `Materialize`
+copy only when Go-owned output is requested. Input JSON and native kernel result
+construction remain; this is zero-copy access across the result boundary.

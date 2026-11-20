@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	opOpen       = 1
-	opApply      = 2
-	opQuery      = 3
-	opInfo       = 4
-	opCheckpoint = 5
-	opPrepare    = 6
+	opOpen        = 1
+	opApply       = 2
+	opQuery       = 3
+	opInfo        = 4
+	opCheckpoint  = 5
+	opPrepare     = 6
+	opQueryPacked = 7
 )
 
 var admission = make(chan struct{}, 16)
@@ -35,21 +36,21 @@ func statusError(s C.uint32_t, msg string) error {
 	}
 	return &Error{Code: Code(s), Message: msg}
 }
-func invoke(ctx context.Context, op uint32, handle uint64, payload any, timeout time.Duration, maxOutput uint64) (uint64, []byte, error) {
+func invokeRaw(ctx context.Context, op uint32, handle uint64, payload any, timeout time.Duration, maxOutput uint64) (uint64, uint64, error) {
 	if e := ctx.Err(); e != nil {
-		return 0, nil, e
+		return 0, 0, e
 	}
 	if !Available() {
-		return 0, nil, ErrUnavailable
+		return 0, 0, ErrUnavailable
 	}
 	select {
 	case admission <- struct{}{}:
 		defer func() { <-admission }()
 	default:
-		return 0, nil, &Error{Code: CodeBusy, Message: "Go native work admission exceeded"}
+		return 0, 0, &Error{Code: CodeBusy, Message: "Go native work admission exceeded"}
 	}
 	if timeout < 0 {
-		return 0, nil, &Error{Code: CodeInvalidArgument, Message: "negative timeout"}
+		return 0, 0, &Error{Code: CodeInvalidArgument, Message: "negative timeout"}
 	}
 	var deadline time.Time
 	if timeout > 0 {
@@ -63,20 +64,20 @@ func invoke(ctx context.Context, op uint32, handle uint64, payload any, timeout 
 	if payload != nil {
 		encoded, e = json.Marshal(payload)
 		if e != nil {
-			return 0, nil, fmt.Errorf("encode native request: %w", e)
+			return 0, 0, fmt.Errorf("encode native request: %w", e)
 		}
 	}
 	if len(encoded) > MaxInputBytes {
-		return 0, nil, &Error{Code: CodeLimit, Message: "encoded request exceeds input ceiling"}
+		return 0, 0, &Error{Code: CodeLimit, Message: "encoded request exceeds input ceiling"}
 	}
 	if e = ctx.Err(); e != nil {
-		return 0, nil, e
+		return 0, 0, e
 	}
 	var millis uint64
 	if !deadline.IsZero() {
 		left := time.Until(deadline)
 		if left <= 0 {
-			return 0, nil, context.DeadlineExceeded
+			return 0, 0, context.DeadlineExceeded
 		}
 		if left > time.Minute {
 			left = time.Minute
@@ -86,7 +87,7 @@ func invoke(ctx context.Context, op uint32, handle uint64, payload any, timeout 
 	var token C.uint64_t
 	if ctx.Done() != nil {
 		if s := C.vg_control_new(&token); s != 0 {
-			return 0, nil, statusError(s, "create cancellation control")
+			return 0, 0, statusError(s, "create cancellation control")
 		}
 		stop := make(chan struct{})
 		done := make(chan struct{})
@@ -105,22 +106,28 @@ func invoke(ctx context.Context, op uint32, handle uint64, payload any, timeout 
 	runtime.KeepAlive(encoded)
 	// Do not overwrite a commit acknowledgment/outcome-unknown with ctx.Err().
 	if status != 0 {
-		return 0, nil, executionError(Code(status), C.GoString(&reply.error[0]), ctx.Err())
+		return 0, 0, executionError(Code(status), C.GoString(&reply.error[0]), ctx.Err())
 	}
-	value := uint64(reply.value)
-	if reply.buffer == 0 {
+	return uint64(reply.value), uint64(reply.buffer), nil
+}
+func invoke(ctx context.Context, op uint32, handle uint64, payload any, timeout time.Duration, maxOutput uint64) (uint64, []byte, error) {
+	value, buffer, e := invokeRaw(ctx, op, handle, payload, timeout, maxOutput)
+	if e != nil {
+		return 0, nil, e
+	}
+	if buffer == 0 {
 		return value, nil, nil
 	}
-	defer C.vg_release(reply.buffer)
+	defer C.vg_release(C.uint64_t(buffer))
 	var size C.uint64_t
-	if s := C.vg_buffer_size(reply.buffer, &size); s != 0 {
+	if s := C.vg_buffer_size(C.uint64_t(buffer), &size); s != 0 {
 		return value, nil, statusError(s, "read native result size")
 	}
 	if uint64(size) > MaxOutputBytes {
 		return value, nil, &Error{Code: CodeCorrupt, Message: "invalid native result length"}
 	}
 	out := make([]byte, int(size))
-	if s := C.vg_buffer_copy(reply.buffer, (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(out))), size); s != 0 {
+	if s := C.vg_buffer_copy(C.uint64_t(buffer), (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(out))), size); s != 0 {
 		return value, nil, statusError(s, "copy native result")
 	}
 	runtime.KeepAlive(out)
@@ -278,13 +285,13 @@ func (s *Store) Checkpoint(ctx context.Context, path string) error {
 	}{path}, 0, 0)
 	return e
 }
-func (s *Store) Query(ctx context.Context, queries []Query, o QueryOptions) (BatchResult, error) {
+func (s *Store) QueryView(ctx context.Context, queries []Query, o QueryOptions) (*BatchView, error) {
 	id, e := s.handle()
 	if e != nil {
-		return BatchResult{}, e
+		return nil, e
 	}
 	if e = checkQueries(queries); e != nil {
-		return BatchResult{}, e
+		return nil, e
 	}
 	type wireQuery struct {
 		Text     *string   `json:"text,omitempty"`
@@ -301,7 +308,7 @@ func (s *Store) Query(ctx context.Context, queries []Query, o QueryOptions) (Bat
 		if q.Prepared != nil {
 			p := q.Prepared.id.Load()
 			if p == 0 {
-				return BatchResult{}, ErrClosed
+				return nil, ErrClosed
 			}
 			w.Prepared = &p
 		} else {
@@ -315,18 +322,40 @@ func (s *Store) Query(ctx context.Context, queries []Query, o QueryOptions) (Bat
 		Time    *int64       `json:"valid_time_micros,omitempty"`
 		Limits  *QueryLimits `json:"limits,omitempty"`
 	}{qs, o.Version, o.ValidTimeMicros, o.Limits}
-	v, out, e := invoke(ctx, opQuery, id, request, o.Timeout, o.MaxOutputBytes)
+	version, buffer, e := invokeRaw(ctx, opQueryPacked, id, request, o.Timeout, o.MaxOutputBytes)
+	if e != nil {
+		return nil, e
+	}
+	defer C.vg_release(C.uint64_t(buffer))
+	var lease C.vg_buffer_view
+	if code := C.vg_buffer_acquire(C.uint64_t(buffer), &lease); code != 0 {
+		return nil, statusError(code, "acquire result lease")
+	}
+	release := func() error { return statusError(C.vg_release(lease.lease), "close result lease") }
+	if uint64(lease.len) > MaxOutputBytes || lease.data == nil {
+		release()
+		return nil, corruptPacked()
+	}
+	data := unsafe.Slice((*byte)(unsafe.Pointer(lease.data)), int(lease.len))
+	view, e := newBatchView(data, release)
+	if e != nil {
+		release()
+		return nil, e
+	}
+	if packedWord(data, 8) != version {
+		view.Close()
+		return nil, corruptPacked()
+	}
+	return view, nil
+}
+
+func (s *Store) Query(ctx context.Context, queries []Query, o QueryOptions) (BatchResult, error) {
+	view, e := s.QueryView(ctx, queries, o)
 	if e != nil {
 		return BatchResult{}, e
 	}
-	var result BatchResult
-	if e = json.Unmarshal(out, &result); e != nil {
-		return BatchResult{}, e
-	}
-	if result.Version != v {
-		return BatchResult{}, &Error{Code: CodeCorrupt, Message: "native result version mismatch"}
-	}
-	return result, nil
+	defer view.Close()
+	return view.Materialize()
 }
 func Stats() (RuntimeStats, error) {
 	var s C.vg_stats

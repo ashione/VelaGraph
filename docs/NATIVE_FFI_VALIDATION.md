@@ -1,7 +1,10 @@
-# Native ABI1 validation
+# Native ABI1 validation: initial JSON path
 
-Source build: this change against `b4ce038`, associated with
+Historical source build: `dba65bf` against `b4ce038`, associated with
 [issue #376](https://github.com/ashione/VelaGraph/issues/376).
+Packed results and current Go Query performance are covered in
+[the follow-up comparison](NATIVE_FFI_ZERO_COPY_VALIDATION.md).
+
 Local platform: Apple M2 Pro, macOS arm64, Rust 1.100.0, Go 1.23.2.
 Only generated/public data is used. This report does not establish production,
 RPC or hierarchy-service performance.

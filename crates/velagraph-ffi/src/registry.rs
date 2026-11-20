@@ -22,6 +22,7 @@ pub enum Resource {
     Control(CancellationToken),
     Plan(Plan),
     Buffer(Buffer),
+    Lease { _buffer: Arc<Resource> },
 }
 struct Registry {
     next: u64,

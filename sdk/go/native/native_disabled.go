@@ -17,3 +17,7 @@ func (*Store) Query(context.Context, []Query, QueryOptions) (BatchResult, error)
 }
 func (*Store) Checkpoint(context.Context, string) error { return ErrUnavailable }
 func Stats() (RuntimeStats, error)                      { return RuntimeStats{}, ErrUnavailable }
+
+func (*Store) QueryView(context.Context, []Query, QueryOptions) (*BatchView, error) {
+	return nil, ErrUnavailable
+}

@@ -4,7 +4,8 @@
 
 The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
 in-process access to ordinary incremental memory and temporal RocksDB stores.
-They share existing Gremlin, mutation, V/T and checkpoint contracts. Cancellation
+They share existing Gremlin, mutation, V/T and checkpoint contracts. Packed
+results support owned Go materialization and explicitly closed native-memory views. Cancellation
 is cooperative; no distributed capability or storage format is added. JSON
 encoding/copy costs, explicit lifecycle and shared-process native failure remain
 part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)
