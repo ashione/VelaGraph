@@ -114,6 +114,21 @@ Rules:
   `UnsupportedGremlinValue` because v0 does not add a separate id row type.
 - A missing vertex/edge id yields no row, not an error.
 
+### Bounded asynchronous local reads
+
+With the optional `async-read` Cargo feature, an embedding host can create one
+`AsyncGraphReader::new(Arc<GraphEngine>)` and clone that reader into its Tokio
+request handlers. Its `gremlin(&str)` method accepts the same text as
+`GraphEngine::gremlin`. Each reader and its clones share 32 execution slots.
+When all are occupied, up to four additional calls can wait for a slot for
+2 ms. A full queue or expired wait returns
+`Error::StorageNode(StorageNodeError::ResourceExhausted(_))`. Parsing and
+execution run on the blocking pool, retaining a slot until work stops even
+when the caller disconnects. The 2 ms budget covers admission only. Separately
+constructed readers have independent budgets. Direct engine calls, including
+writes, use their existing APIs. The `AsyncGraphReader` rustdoc includes a
+runnable example.
+
 ### Single-node read consistency
 
 Each execution of a parsed query pins one RocksDB snapshot before its first
