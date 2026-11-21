@@ -16,6 +16,10 @@ pub struct Totals {
     pub incremental_candidates: u64,
     /// Covering candidates visited in an owned fixed-V read model.
     pub materialized_candidates: u64,
+    /// Candidate blocks inspected for conservative temporal pruning.
+    pub materialized_blocks: u64,
+    /// Skipped physical candidates; full original logical fees still apply.
+    pub materialized_skipped_candidates: u64,
     pub materialized_vertex_checks: u64,
     pub materialized_vertex_clones: u64,
     pub materialized_edge_clones: u64,
@@ -109,6 +113,8 @@ pub(crate) enum ReadEvent {
     IncrementalCandidate,
     PreparedTextRender,
     MaterializedCandidate,
+    MaterializedBlock,
+    MaterializedSkipped(usize),
     MaterializedVertexCheck,
     MaterializedVertexClone,
     MaterializedEdgeClone,
@@ -134,6 +140,10 @@ pub(crate) fn read_event(event: ReadEvent) {
                 ReadEvent::IncrementalCandidate => t.incremental_candidates += 1,
                 ReadEvent::PreparedTextRender => t.prepared_text_renders += 1,
                 ReadEvent::MaterializedCandidate => t.materialized_candidates += 1,
+                ReadEvent::MaterializedBlock => t.materialized_blocks += 1,
+                ReadEvent::MaterializedSkipped(count) => {
+                    t.materialized_skipped_candidates += count as u64
+                }
                 ReadEvent::MaterializedVertexCheck => t.materialized_vertex_checks += 1,
                 ReadEvent::MaterializedVertexClone => t.materialized_vertex_clones += 1,
                 ReadEvent::MaterializedEdgeClone => t.materialized_edge_clones += 1,
