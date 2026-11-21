@@ -251,3 +251,67 @@ fn empty_paths_check_cancellation_after_initial_admission() {
     ));
     assert_eq!(checks.get(), 3);
 }
+
+#[test]
+fn pruned_blocks_observe_cancellation_and_preserve_partial_logical_charges() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TemporalStore::open(dir.path()).unwrap();
+    let mut mutations = vec![
+        TemporalMutation::Vertex {
+            valid: Interval { from: 0, to: None },
+            vertex: Vertex::new(1),
+        },
+        TemporalMutation::Vertex {
+            valid: Interval { from: 0, to: None },
+            vertex: Vertex::new(2),
+        },
+    ];
+    mutations.extend((0..65).map(|id| TemporalMutation::Edge {
+        valid: Interval { from: 100, to: Some(200) },
+        edge: Edge::new(1000 + id, 1, 2, "FUTURE"),
+    }));
+    store.commit(&mutations).unwrap();
+    let model = store.materialize(None, MaterializationLimits::default()).unwrap();
+    let view = model.view(0);
+
+    // Entry, first pruned block (32 rows), then cancellation before block 2.
+    // No skipped candidate may reach a visitor, but all skipped logical fees
+    // must be charged before the next checkpoint.
+    let backend = backend(&view, Instant::now() + crate::GREMLIN_DEADLINE);
+    let checks = Cell::new(0);
+    let result = backend.visit_query_edges(
+        1,
+        false,
+        None,
+        &mut || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 3 { Err(work_error()) } else { Ok(()) }
+        },
+        &mut |_| panic!("pruned candidate reached visitor"),
+        &Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES),
+    );
+    assert!(matches!(result, Err(crate::Error::TraversalLimitExceeded(_))));
+    assert_eq!(checks.get(), 3);
+    assert_eq!(backend.used.get(), 32);
+    assert_eq!(backend.bytes.get(), 32 * ROW_WORK_BYTES);
+
+    // Cancellation at the final checkpoint must not turn an empty pruned
+    // traversal into a successful response.
+    let backend = backend(&view, Instant::now() + crate::GREMLIN_DEADLINE);
+    let checks = Cell::new(0);
+    let result = backend.visit_query_edges(
+        1,
+        false,
+        None,
+        &mut || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 5 { Err(work_error()) } else { Ok(()) }
+        },
+        &mut |_| panic!("pruned candidate reached visitor"),
+        &Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES),
+    );
+    assert!(matches!(result, Err(crate::Error::TraversalLimitExceeded(_))));
+    assert_eq!(checks.get(), 5);
+    assert_eq!(backend.used.get(), 65);
+    assert_eq!(backend.bytes.get(), 65 * ROW_WORK_BYTES);
+}
