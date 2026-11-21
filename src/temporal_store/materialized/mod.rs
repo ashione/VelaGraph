@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+mod blocks;
 mod build;
 mod query;
 #[cfg(test)]
@@ -92,6 +93,8 @@ pub struct MaterializationStats {
     pub adjacency_references: usize,
     /// Allocated covering-row capacity in bytes.
     pub row_storage_bytes: usize,
+    /// Retained temporal block summaries and their container capacity.
+    pub adjacency_block_bytes: usize,
     /// Conservative retained payload, container-capacity and map-entry charges.
     pub retained_accounted_bytes: usize,
     /// Cumulative construction admission charges, including released scratch.
@@ -218,6 +221,8 @@ pub struct TemporalReadModel {
     rows: Vec<Row>,
     outgoing: Vec<Vec<u32>>,
     incoming: Vec<Vec<u32>>,
+    outgoing_blocks: Vec<Vec<blocks::AdjacencyBlock>>,
+    incoming_blocks: Vec<Vec<blocks::AdjacencyBlock>>,
     stats: MaterializationStats,
 }
 /// A borrowed business-time selection on an owned fixed-V model.
