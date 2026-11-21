@@ -267,19 +267,24 @@ fn pruned_blocks_observe_cancellation_and_preserve_partial_logical_charges() {
         },
     ];
     mutations.extend((0..65).map(|id| TemporalMutation::Edge {
-        valid: Interval { from: 100, to: Some(200) },
+        valid: Interval {
+            from: 100,
+            to: Some(200),
+        },
         edge: Edge::new(1000 + id, 1, 2, "FUTURE"),
     }));
     store.commit(&mutations).unwrap();
-    let model = store.materialize(None, MaterializationLimits::default()).unwrap();
+    let model = store
+        .materialize(None, MaterializationLimits::default())
+        .unwrap();
     let view = model.view(0);
 
     // Entry, first pruned block (32 rows), then cancellation before block 2.
     // No skipped candidate may reach a visitor, but all skipped logical fees
     // must be charged before the next checkpoint.
-    let backend = backend(&view, Instant::now() + crate::GREMLIN_DEADLINE);
+    let cancel_backend = backend(&view, Instant::now() + crate::GREMLIN_DEADLINE);
     let checks = Cell::new(0);
-    let result = backend.visit_query_edges(
+    let result = cancel_backend.visit_query_edges(
         1,
         false,
         None,
@@ -299,8 +304,8 @@ fn pruned_blocks_observe_cancellation_and_preserve_partial_logical_charges() {
         Err(crate::Error::TraversalLimitExceeded(_))
     ));
     assert_eq!(checks.get(), 3);
-    assert_eq!(backend.used.get(), 32);
-    assert_eq!(backend.bytes.get(), 32 * ROW_WORK_BYTES);
+    assert_eq!(cancel_backend.used.get(), 32);
+    assert_eq!(cancel_backend.bytes.get(), 32 * ROW_WORK_BYTES);
 
     // Cancellation at the final checkpoint must not turn an empty pruned
     // traversal into a successful response.
