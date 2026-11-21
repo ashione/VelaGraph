@@ -285,12 +285,19 @@ fn pruned_blocks_observe_cancellation_and_preserve_partial_logical_charges() {
         None,
         &mut || {
             checks.set(checks.get() + 1);
-            if checks.get() == 3 { Err(work_error()) } else { Ok(()) }
+            if checks.get() == 3 {
+                Err(work_error())
+            } else {
+                Ok(())
+            }
         },
         &mut |_| panic!("pruned candidate reached visitor"),
         &Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES),
     );
-    assert!(matches!(result, Err(crate::Error::TraversalLimitExceeded(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::TraversalLimitExceeded(_))
+    ));
     assert_eq!(checks.get(), 3);
     assert_eq!(backend.used.get(), 32);
     assert_eq!(backend.bytes.get(), 32 * ROW_WORK_BYTES);
@@ -305,12 +312,19 @@ fn pruned_blocks_observe_cancellation_and_preserve_partial_logical_charges() {
         None,
         &mut || {
             checks.set(checks.get() + 1);
-            if checks.get() == 5 { Err(work_error()) } else { Ok(()) }
+            if checks.get() == 5 {
+                Err(work_error())
+            } else {
+                Ok(())
+            }
         },
         &mut |_| panic!("pruned candidate reached visitor"),
         &Budget::new(crate::MAX_GREMLIN_ACCOUNTED_BYTES),
     );
-    assert!(matches!(result, Err(crate::Error::TraversalLimitExceeded(_))));
+    assert!(matches!(
+        result,
+        Err(crate::Error::TraversalLimitExceeded(_))
+    ));
     assert_eq!(checks.get(), 5);
     assert_eq!(backend.used.get(), 65);
     assert_eq!(backend.bytes.get(), 65 * ROW_WORK_BYTES);
