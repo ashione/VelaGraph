@@ -258,3 +258,162 @@ fn borrowed_self_loop_charges_discarded_edge_and_selected_text() {
         }
     }
 }
+
+#[test]
+fn skipped_block_preserves_exact_byte_charges_and_summary_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TemporalStore::open(dir.path()).unwrap();
+    let mut changes = vec![TemporalMutation::Vertex {
+        valid: Interval {
+            from: i64::MIN,
+            to: None,
+        },
+        vertex: Vertex::new(1),
+    }];
+    for id in 0..65 {
+        changes.push(TemporalMutation::Edge {
+            valid: Interval {
+                from: 10,
+                to: Some(20),
+            },
+            edge: Edge::new(1000 + id, 1, 1, "LOOP"),
+        });
+    }
+    store.commit(&changes).unwrap();
+    let mut model = store
+        .materialize(None, MaterializationLimits::default())
+        .unwrap();
+    let payload = model.vertices[0].at(0).unwrap().payload as usize;
+    let bytes = std::mem::size_of::<Piece>() + model.payloads[payload].bytes + 130 * ROW_WORK_BYTES;
+    let query = GremlinQuery::parse("g.V(1).both().count()").unwrap();
+    for max_work_bytes in [bytes - 1, bytes] {
+        let result = model.view(0).execute_query_with_limits(
+            &query,
+            MaterializedQueryLimits {
+                max_operations: 131,
+                max_work_bytes,
+            },
+        );
+        assert_eq!(result.is_ok(), max_work_bytes == bytes);
+    }
+    assert!(model.stats().adjacency_block_bytes > 0);
+    let build_charge = model.stats().build_accounted_bytes;
+    assert!(store
+        .materialize(
+            None,
+            MaterializationLimits {
+                max_accounted_bytes: build_charge - 1,
+                ..Default::default()
+            }
+        )
+        .is_err());
+    assert!(store
+        .materialize(
+            None,
+            MaterializationLimits {
+                max_accounted_bytes: build_charge,
+                ..Default::default()
+            }
+        )
+        .is_ok());
+    model.outgoing_blocks[0].pop();
+    let mut meter = Meter {
+        limits: MaterializationLimits::default(),
+        charged: 0,
+        rows: 0,
+        revisions: 0,
+        candidates: 0,
+        raw: 0,
+        deadline: Instant::now() + BUILD_DEADLINE,
+    };
+    assert!(matches!(
+        blocks::validate(
+            &model.outgoing,
+            &model.outgoing_blocks,
+            &model.rows,
+            &mut meter
+        ),
+        Err(TemporalStoreError::Corrupt)
+    ));
+}
+
+#[test]
+fn mixed_skips_and_visible_edges_have_identical_admission_to_linear_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TemporalStore::open(dir.path()).unwrap();
+    let mut vertex = Vertex::new(1);
+    vertex
+        .properties
+        .insert("value".into(), crate::Value::Text("ok".into()));
+    let mut changes = vec![TemporalMutation::Vertex {
+        valid: Interval {
+            from: i64::MIN,
+            to: None,
+        },
+        vertex,
+    }];
+    for id in 0..65 {
+        changes.push(TemporalMutation::Edge {
+            valid: if id == 64 {
+                Interval { from: 0, to: None }
+            } else {
+                Interval {
+                    from: 10,
+                    to: Some(20),
+                }
+            },
+            edge: Edge::new(1000 + id, 1, 1, "LOOP"),
+        });
+    }
+    store.commit(&changes).unwrap();
+    let mut model = store
+        .materialize(None, MaterializationLimits::default())
+        .unwrap();
+    let v = model.payloads[model.vertices[0].at(0).unwrap().payload as usize].bytes;
+    let e = model.payloads[model.edges[64].at(0).unwrap().payload as usize].bytes;
+    // Both directions charge 65 candidates; the one visible self-loop charges
+    // two endpoints/edge borrows in each direction, but only one target borrow.
+    let bytes = 6 * std::mem::size_of::<Piece>() + 2 * v + 2 * e + 130 * ROW_WORK_BYTES;
+    let q = GremlinQuery::parse("g.V(1).both().values('value')").unwrap();
+    let mut expected = Vec::new();
+    for indexed in [true, false] {
+        if !indexed {
+            model.outgoing_blocks[0].clear();
+            model.incoming_blocks[0].clear();
+        }
+        let mut actual = Vec::new();
+        for operations in [135, 136, 137] {
+            for work in [bytes - 1, bytes, bytes + 1] {
+                let result = model.view(0).execute_query_with_limits(
+                    &q,
+                    MaterializedQueryLimits {
+                        max_operations: operations,
+                        max_work_bytes: work,
+                    },
+                );
+                let succeeds = operations >= 136 && work >= bytes;
+                assert_eq!(
+                    result.is_ok(),
+                    succeeds,
+                    "indexed={indexed},ops={operations},bytes={work}"
+                );
+                if let Ok(r) = &result {
+                    assert_eq!(
+                        r.rows,
+                        vec![crate::GremlinRow::Value(crate::Value::Text("ok".into()))]
+                    );
+                }
+                actual.push(
+                    result
+                        .map(|r| r.rows)
+                        .map_err(|e| std::mem::discriminant(&e)),
+                );
+            }
+        }
+        if indexed {
+            expected = actual;
+        } else {
+            assert_eq!(actual, expected);
+        }
+    }
+}
