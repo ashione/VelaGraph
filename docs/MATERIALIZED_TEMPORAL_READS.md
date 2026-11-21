@@ -133,3 +133,38 @@ budgets, schema/capacity rejection and independent models.
 uses generated data only. It separately reports construction and warmed query
 latency for disk and materialized views, and checks every result. Its timings
 are observations, not pass thresholds or a production SLA.
+
+### Query deadline checkpoints
+Work accounting does not sample the clock for each counter update. The private
+materialized backend enters the shared executor with the same cooperative
+5-second deadline: point-read execution boundaries, operators and final result
+return remain checked. Adjacency checks the supplied callback at entry, for
+every candidate, and on completion, including missing/empty starts and a final
+visitor that triggers cancellation. No periodic-check interval or larger work,
+record-byte, live-memory or result budget is introduced. Disk/replicated read
+fencing and I/O checks are unchanged.
+
+## Conservative adjacency time blocks
+Directional adjacency lists with at least 64 rows carry summaries for consecutive
+32-row blocks in their original order. Each summary records the minimum start and
+maximum end, with infinity represented separately from a finite `i64::MAX` end.
+A query skips physical row visits only when its T is outside that entire range.
+Otherwise ordinary per-row time, label and endpoint checks still run. Overlapping
+or broad intervals can prevent pruning; summaries are conservative, not exact
+interval indexes. Short lists have no summaries.
+
+Skipped rows still consume their original candidate operations and 48-byte logical
+work fees, including duplicate incoming/outgoing visits. Grouped charging may
+reject earlier within an impossible block but preserves all-or-error admission;
+it does not increase the allowed work or return partial results. Deadline checks
+occur at each skipped block, whose work is bounded by 32 rows. Valid candidates
+retain their original endpoint, record and live-memory charges.
+
+Summary containers and capacity are charged during construction and included in
+retained accounting. `adjacency_block_bytes` reports that retained component,
+including the directional summary-container headers. All source records and
+candidate inventory still pass eager validation, and summaries are verified
+before publication. No source corruption can be hidden by skipping a query block.
+The optional profiling counters distinguish physical candidate visits, inspected
+blocks and skipped candidates; visited plus skipped candidates matches the original
+logical candidate count. This changes no disk data format or Gremlin syntax.

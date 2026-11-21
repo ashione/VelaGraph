@@ -738,3 +738,9 @@ input. Literal types, finite-real checks, empty/nonempty start rules and paramet
 counts are unchanged. Canonical fields are quoted by the existing serializer;
 source text still passes semicolon validation and the official grammar parser.
 No complete query text is reconstructed on repeated binds.
+
+Immutable temporal backends may skip a whole adjacency block proved impossible
+at T by conservative interval bounds. Skipped candidates retain their full logical
+operation/byte fees; possible candidates retain normal label and endpoint checks.
+This preserves order, duplicate semantics and resource admission. Cooperative
+checks cover each bounded skipped block; see MATERIALIZED_TEMPORAL_READS.md.
