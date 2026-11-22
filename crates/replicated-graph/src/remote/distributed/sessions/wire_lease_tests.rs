@@ -54,9 +54,7 @@ impl Drop for Release {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lease_deadline_wire_crosses_rpc_cap_and_cancelled_caller_keeps_resources_charged() {
-    let _fixtures = TEST_SESSION_FIXTURES.lock().await;
+async fn start_service() -> (tempfile::TempDir, d2_raft::TcpNode, GraphService) {
     let directory = tempfile::tempdir().unwrap();
     let node = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
         id: 1,
@@ -102,6 +100,13 @@ async fn lease_deadline_wire_crosses_rpc_cap_and_cancelled_caller_keeps_resource
     )
     .await
     .unwrap();
+    (directory, node, service)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_deadline_wire_crosses_rpc_cap_and_cancelled_caller_keeps_resources_charged() {
+    let _fixtures = TEST_SESSION_FIXTURES.lock().await;
+    let (_directory, node, service) = start_service().await;
     let address = service.local_addr();
     let sessions = service.query_sessions.clone();
     let mut scenario = tokio::spawn(async move {
@@ -250,4 +255,102 @@ async fn lease_deadline_wire_crosses_rpc_cap_and_cancelled_caller_keeps_resource
     outcome
         .expect("bounded wire scenario")
         .expect("wire assertions");
+}
+
+const OPEN_PATH: &str = "/velagraph.internal.query.v1.QueryService/Open";
+
+#[tokio::test]
+async fn queued_observed_open_expires_while_the_only_stream_is_occupied() {
+    use tonic::codegen::Bytes;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client =
+        grpc::QueryClient::connect_lazy(address, IDENTITY, Duration::from_secs(5)).unwrap();
+    let first = client.open(7, Duration::from_secs(5));
+    tokio::pin!(first);
+    let peer = async {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake::<_, Bytes>(socket)
+            .await
+            .unwrap();
+        let (first_request, _held_response) = connection.accept().await.unwrap().unwrap();
+        assert_eq!(first_request.uri().path(), OPEN_PATH);
+        // Drive the peer while its only response stream is occupied.
+        tokio::select! {
+            result = client.open(7, Duration::from_millis(250)) => {
+                assert!(matches!(result, Err(RemoteError::Timeout { request_id: None })));
+            }
+            extra = connection.accept() => panic!("unexpected stream before release: {}", extra.is_some()),
+        }
+    };
+    tokio::select! {
+        _ = &mut first => panic!("first Open completed before the queued deadline"),
+        result = tokio::time::timeout(Duration::from_secs(3), peer) => result.unwrap(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undelivered_open_descriptor_releases_snapshot_on_background_expiry() {
+    use prost::Message;
+    use tonic::codegen::{http, Bytes};
+    let _fixtures = TEST_SESSION_FIXTURES.lock().await;
+    let (_directory, node, service) = start_service().await;
+    let address = service.local_addr();
+    let sessions = service.query_sessions.clone();
+    let slots = SESSION_SLOTS.available_permits();
+    let bytes = SESSION_BYTES.available_permits();
+    let scenario = tokio::spawn(async move {
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (sender, connection) = h2::client::Builder::new()
+            .initial_window_size(0)
+            .handshake::<_, Bytes>(socket)
+            .await
+            .unwrap();
+        let _driver = AbortOnDrop(tokio::spawn(connection));
+        let mut sender = sender.ready().await.unwrap();
+        let message = wire::OpenRequest {
+            context: Some(wire::Context {
+                version: VERSION,
+                identity: Some(wire::Identity { group: 10, node: 1 }),
+                timeout_millis: 2000,
+            }),
+            shard: 7,
+        }
+        .encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        frame.extend(message);
+        let request = http::Request::post(format!("http://{address}{OPEN_PATH}"))
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = sender.send_request(request, false).unwrap();
+        stream.send_data(frame.into(), true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().get("grpc-status").is_none());
+        assert_eq!(sessions.values.lock().unwrap().len(), 1);
+        assert_eq!(SESSION_SLOTS.available_permits(), slots - 1);
+        assert!(SESSION_BYTES.available_permits() < bytes);
+        // HEADERS arrived, but a zero window prevents delivery of descriptor DATA.
+        // No Close, lookup or manual expiry after the caller abandons the stream.
+        stream.send_reset(h2::Reason::CANCEL);
+        drop(response);
+        while !sessions.values.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(SESSION_SLOTS.available_permits(), slots);
+        assert_eq!(SESSION_BYTES.available_permits(), bytes);
+    });
+    let mut scenario = AbortOnDrop(scenario);
+    let result = tokio::time::timeout(Duration::from_secs(8), &mut scenario.0).await;
+    if result.is_err() {
+        scenario.0.abort();
+        let _ = (&mut scenario.0).await;
+    }
+    service.shutdown().await;
+    node.shutdown().await;
+    result.unwrap().unwrap();
 }

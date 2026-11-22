@@ -28,12 +28,19 @@ fn page(d: &SnapshotDescriptor, key: u8, more: bool) -> SnapshotPage {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnavailableAt {
+    Open,
+    Page(usize),
+}
+
 #[derive(Clone)]
 struct ScriptedPeer {
     descriptor: SnapshotDescriptor,
     state: std::sync::Arc<std::sync::Mutex<ScriptState>>,
     delay: Duration,
     expect_close: bool,
+    unavailable: Option<UnavailableAt>,
 }
 struct ScriptState {
     opened: bool,
@@ -68,6 +75,10 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
         let mut state = self.state.lock().unwrap();
         assert!(!state.opened, "downloader must not reopen or retry");
         state.opened = true;
+        if self.unavailable == Some(UnavailableAt::Open) {
+            state.finished.take().unwrap().send(()).unwrap();
+            return Err(tonic::Status::unavailable("unavailable"));
+        }
         Ok(tonic::Response::new(self.descriptor.clone().into()))
     }
     async fn page(
@@ -94,6 +105,9 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
                 .pages
                 .pop_front()
                 .expect("unexpected fetch or retry after invalid page");
+            if self.unavailable == Some(UnavailableAt::Page(state.page_index)) {
+                return Err(tonic::Status::unavailable("unavailable"));
+            }
             let finished = if state.pages.is_empty() && !self.expect_close {
                 state.finished.take()
             } else {
@@ -153,9 +167,9 @@ async fn peer(
     delay: Duration,
     expect_close: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    peer_with_gate(d, pages, delay, expect_close, None).await
+    scripted_peer(d, pages, delay, expect_close, None, None).await
 }
-async fn peer_with_gate(
+async fn scripted_peer(
     d: SnapshotDescriptor,
     pages: Vec<SnapshotPage>,
     delay: Duration,
@@ -164,6 +178,7 @@ async fn peer_with_gate(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    unavailable: Option<UnavailableAt>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
@@ -181,6 +196,7 @@ async fn peer_with_gate(
         state: state.clone(),
         delay,
         expect_close,
+        unavailable,
     };
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -255,6 +271,29 @@ async fn malformed_downloads_fail_and_close_without_partial_results() {
 }
 
 #[tokio::test]
+async fn unavailable_at_open_or_second_page_never_returns_a_partial_snapshot() {
+    for fault in [UnavailableAt::Open, UnavailableAt::Page(2)] {
+        let d = descriptor();
+        let opened = fault != UnavailableAt::Open;
+        let pages = if opened {
+            vec![page(&d, 1, true), page(&d, 2, false)]
+        } else {
+            vec![]
+        };
+        let (address, server) =
+            scripted_peer(d.clone(), pages, Duration::ZERO, opened, None, Some(fault)).await;
+        let result = paged_snapshot_identified(address, d.identity, d.shard, Duration::from_secs(3))
+            .await;
+        assert!(matches!(result, Err(RemoteError::Unavailable)));
+        // Joining checks every cursor, absence of retries and Close on an opened session.
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn successive_pages_share_one_deadline() {
     let d = descriptor();
     let pages = vec![page(&d, 1, true), page(&d, 2, false)];
@@ -294,12 +333,13 @@ async fn completed_download_retains_admission_until_close_finishes() {
         entries,
         next: None,
     };
-    let (endpoint, server) = peer_with_gate(
+    let (endpoint, server) = scripted_peer(
         d,
         vec![page],
         Duration::ZERO,
         true,
         Some((closing, released)),
+        None,
     )
     .await;
     let download = tokio::spawn(paged_snapshot_identified(
