@@ -19,8 +19,14 @@ impl Backend<'_, '_> {
         }
     }
     fn charge(&self, bytes: usize) -> crate::Result<()> {
-        self.check()?;
-        let n = self.used.get() + 1;
+        self.charge_many(1, bytes)
+    }
+    fn charge_many(&self, operations: usize, bytes: usize) -> crate::Result<()> {
+        let n = self
+            .used
+            .get()
+            .checked_add(operations)
+            .ok_or_else(work_error)?;
         let b = self
             .bytes
             .get()
@@ -34,7 +40,6 @@ impl Backend<'_, '_> {
         Ok(())
     }
     fn record_work(&self, bytes: usize) -> crate::Result<()> {
-        self.check()?;
         let total = self.bytes.get().checked_add(bytes).ok_or_else(work_error)?;
         if total > self.limits.max_work_bytes {
             return Err(work_error());
@@ -113,35 +118,59 @@ impl Backend<'_, '_> {
         check: &mut impl FnMut() -> crate::Result<()>,
         visit: &mut impl FnMut(u32) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        self.check()?;
+        check()?;
         let g = self.view.graph;
         let Some(slot) = g.vertex_index.get(&id) else {
-            return Ok(());
+            return check();
         };
         let rows = if incoming {
             &g.incoming[*slot as usize]
         } else {
             &g.outgoing[*slot as usize]
         };
-        for index in rows {
-            #[cfg(feature = "query-profiling")]
-            crate::query_profile::read_event(
-                crate::query_profile::ReadEvent::MaterializedCandidate,
-            );
-            self.charge(ROW_WORK_BYTES)?;
-            check()?;
-            let row = g.rows[*index as usize];
-            if !row.contains(self.view.time)
-                || label.is_some_and(|l| l != g.labels[row.label as usize])
-            {
-                continue;
+        let summaries = if incoming {
+            &g.incoming_blocks[*slot as usize]
+        } else {
+            &g.outgoing_blocks[*slot as usize]
+        };
+        for (block, chunk) in rows.chunks(blocks::BLOCK_ROWS).enumerate() {
+            if let Some(summary) = summaries.get(block) {
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::read_event(
+                    crate::query_profile::ReadEvent::MaterializedBlock,
+                );
+                if !summary.may_contain(self.view.time) {
+                    // Preserve the original logical admission, even though no
+                    // candidate row or payload needs to be visited physically.
+                    check()?;
+                    self.charge_many(chunk.len(), chunk.len() * ROW_WORK_BYTES)?;
+                    #[cfg(feature = "query-profiling")]
+                    crate::query_profile::read_event(
+                        crate::query_profile::ReadEvent::MaterializedSkipped(chunk.len()),
+                    );
+                    continue;
+                }
             }
-            if !self.visible(row.from)? || !self.visible(row.to)? {
-                continue;
+            for index in chunk {
+                #[cfg(feature = "query-profiling")]
+                crate::query_profile::read_event(
+                    crate::query_profile::ReadEvent::MaterializedCandidate,
+                );
+                check()?;
+                self.charge(ROW_WORK_BYTES)?;
+                let row = g.rows[*index as usize];
+                if !row.contains(self.view.time)
+                    || label.is_some_and(|l| l != g.labels[row.label as usize])
+                {
+                    continue;
+                }
+                if !self.visible(row.from)? || !self.visible(row.to)? {
+                    continue;
+                }
+                visit(row.payload)?;
             }
-            visit(row.payload)?;
         }
-        Ok(())
+        check()
     }
     fn borrow_vertex(&self, p: u32, budget: &Budget) -> crate::Result<Accounted<Cow<'_, Vertex>>> {
         let cached = &self.view.graph.payloads[p as usize];
@@ -434,3 +463,6 @@ mod tests {
         assert_eq!(enough.used(), 0);
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;

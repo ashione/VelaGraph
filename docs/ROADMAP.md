@@ -998,3 +998,8 @@ mutex, publishes under a short lock and reclaims outside it. Candidate version
 construction peaks are included in admission, and record budgets precede
 validation/compaction. Checkpoint writes use conditional, directory-locked publication
 to prevent stale overwrite; this does not establish a service latency SLA.
+
+Owned temporal adjacency reads now support conservative time-block pruning.
+This preserves candidate order, endpoint visibility and original logical query
+admission. It adds bounded in-memory summaries, not a persistent interval index,
+new traversal language, wider batching contract or automatic model refresh.
