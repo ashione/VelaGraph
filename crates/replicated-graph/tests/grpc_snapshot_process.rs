@@ -210,7 +210,9 @@ impl Cluster {
                     "control_after_error": status,
                 });
                 let write = std::fs::File::create_new(dir.join("snapshot-seed-failure.json"))
-                    .and_then(|file| serde_json::to_writer(file, &observation).map_err(std::io::Error::from));
+                    .and_then(|file| {
+                        serde_json::to_writer(file, &observation).map_err(std::io::Error::from)
+                    });
                 if let Err(capture) = write {
                     eprintln!("snapshot seed evidence unavailable: {}", capture.kind());
                 }
@@ -846,11 +848,17 @@ async fn seed_quorum_loss_preserves_stage_and_bounded_status_evidence() -> anyho
         )?)?;
         ensure!(record["phase"] == "snapshot_seed" && record["vertex"] == 1);
         ensure!(record["selected_leader"] == cluster.leader + 1);
-        let children = record["children_after_error"].as_array().context("missing children")?;
+        let children = record["children_after_error"]
+            .as_array()
+            .context("missing children")?;
         ensure!(children.len() == 3);
         for (i, child) in children.iter().enumerate() {
             ensure!(child["node"] == i + 1 && child["pid"] == cluster._processes[i].0.id());
-            let state = if i == cluster.leader { "running" } else { "exited" };
+            let state = if i == cluster.leader {
+                "running"
+            } else {
+                "exited"
+            };
             ensure!(child["state"] == state);
         }
         let evidence = format!("{error:#}");

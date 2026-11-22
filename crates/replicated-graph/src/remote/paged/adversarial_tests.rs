@@ -282,8 +282,8 @@ async fn unavailable_at_open_or_second_page_never_returns_a_partial_snapshot() {
         };
         let (address, server) =
             scripted_peer(d.clone(), pages, Duration::ZERO, opened, None, Some(fault)).await;
-        let result = paged_snapshot_identified(address, d.identity, d.shard, Duration::from_secs(3))
-            .await;
+        let result =
+            paged_snapshot_identified(address, d.identity, d.shard, Duration::from_secs(3)).await;
         assert!(matches!(result, Err(RemoteError::Unavailable)));
         // Joining checks every cursor, absence of retries and Close on an opened session.
         tokio::time::timeout(Duration::from_secs(3), server)
