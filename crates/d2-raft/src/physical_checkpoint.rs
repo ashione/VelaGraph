@@ -81,7 +81,7 @@ impl StateMachine {
         root: &Path,
         group_id: u64,
         node_id: NodeId,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<[u8; 32]> {
         let storage = self
             .storage
             .as_ref()
@@ -130,13 +130,11 @@ impl StateMachine {
                 File::open(root.join(dir))?.sync_all()?;
             }
             // Completion record is published LAST. A partial manifest is invalid.
-            write_new(
-                &root.join("checkpoint.json"),
-                &serde_json::to_vec(&manifest)?,
-            )?;
+            let bytes = serde_json::to_vec(&manifest)?;
+            write_new(&root.join("checkpoint.json"), &bytes)?;
             File::open(root)?.sync_all()?;
             sync_parent(root)?;
-            Ok(())
+            Ok(Sha256::digest(&bytes).into())
         })
     }
 }
@@ -145,7 +143,7 @@ fn checked_manifest(
     backup: &Path,
     group_id: u64,
     node_id: NodeId,
-) -> anyhow::Result<(std::path::PathBuf, Manifest)> {
+) -> anyhow::Result<(std::path::PathBuf, Manifest, [u8; 32])> {
     // Components removes trailing separators / `.` so a root symlink cannot
     // evade symlink_metadata through a spelling such as "backup-link/".
     // This does not resolve ancestors or `..`, or prevent concurrent changes.
@@ -167,7 +165,8 @@ fn checked_manifest(
             .is_file(),
         "checkpoint manifest must be a regular file"
     );
-    let manifest: Manifest = serde_json::from_slice(&fs::read(backup.join("checkpoint.json"))?)?;
+    let bytes = fs::read(backup.join("checkpoint.json"))?;
+    let manifest: Manifest = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(manifest.format == 1, "unsupported checkpoint format");
     anyhow::ensure!(
         manifest.group_id == group_id && manifest.node_id == node_id,
@@ -188,7 +187,7 @@ fn checked_manifest(
         manifest.log.as_ref() == Some(&log),
         "checkpoint log metadata mismatch"
     );
-    Ok((backup_path, manifest))
+    Ok((backup_path, manifest, Sha256::digest(&bytes).into()))
 }
 
 fn validate_state_cut(state: &StateMachine, manifest: &Manifest) -> anyhow::Result<()> {
@@ -224,12 +223,12 @@ fn open_verified_state(
     backup: &Path,
     group_id: u64,
     node_id: NodeId,
-) -> anyhow::Result<StateMachine> {
-    let (backup, manifest) = checked_manifest(backup, group_id, node_id)?;
+) -> anyhow::Result<(StateMachine, [u8; 32])> {
+    let (backup, manifest, digest) = checked_manifest(backup, group_id, node_id)?;
     let db = DB::open_for_read_only(&Options::default(), backup.join("state.db"), false)?;
     let state = StateMachine::load_from_db(db)?;
     validate_state_cut(&state, &manifest)?;
-    Ok(state)
+    Ok((state, digest))
 }
 
 #[path = "cohort_checkpoint_inputs.rs"]
@@ -247,7 +246,7 @@ pub fn restore_physical_checkpoint(
     group_id: u64,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    let (backup, manifest) = checked_manifest(backup.as_ref(), group_id, node_id)?;
+    let (backup, manifest, _) = checked_manifest(backup.as_ref(), group_id, node_id)?;
     let destination = destination.as_ref();
     fs::create_dir(destination)?;
     write_new(&destination.join("RESTORE_INCOMPLETE"), b"1")?;

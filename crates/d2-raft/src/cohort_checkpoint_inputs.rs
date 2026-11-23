@@ -44,6 +44,24 @@ pub async fn capture(
     coordinator: &NodeHandle,
     members: &[&NodeHandle],
 ) -> anyhow::Result<()> {
+    let captured = capture_replicas(root, authority, cohort, version, coordinator, members).await?;
+    let node_ids: Vec<_> = members.iter().map(|node| node.id).collect();
+    let verified = inspect(root, authority, cohort, version, coordinator.id, &node_ids).await?;
+    ensure!(
+        captured == verified,
+        "physical checkpoint generation mismatch"
+    );
+    Ok(())
+}
+
+async fn capture_replicas(
+    root: &Path,
+    authority: &Authority,
+    cohort: &Cohort,
+    version: u64,
+    coordinator: &NodeHandle,
+    members: &[&NodeHandle],
+) -> anyhow::Result<Vec<[u8; 32]>> {
     check_request(authority, cohort, version, members.len())?;
     ensure!(
         coordinator.group_id() == authority.shard,
@@ -54,18 +72,20 @@ pub async fn capture(
     }
     fs::create_dir(root).context("create fresh recovery input directory")?;
     sync_parent(root)?;
+    let mut digests = Vec::with_capacity(members.len() + 1);
     for node in std::iter::once(coordinator).chain(members.iter().copied()) {
         // Uncontended storage locks may never yield. Let the caller abandon
         // the operation before starting another synchronous replica capture.
         tokio::task::yield_now().await;
-        node.physical_checkpoint(root.join(node.group_id().to_string()))
+        let digest = node
+            .checkpoint_digest(&root.join(node.group_id().to_string()))
             .await
             .with_context(|| {
                 format!("capture physical checkpoint for group {}", node.group_id())
             })?;
+        digests.push(digest);
     }
-    let node_ids: Vec<_> = members.iter().map(|node| node.id).collect();
-    verify(root, authority, cohort, version, coordinator.id, &node_ids).await
+    Ok(digests)
 }
 
 /// Reopen and validate the local inputs from disk. Supply the expected node
@@ -80,6 +100,28 @@ pub async fn verify(
     coordinator_node: NodeId,
     member_nodes: &[NodeId],
 ) -> anyhow::Result<()> {
+    inspect(
+        root,
+        authority,
+        cohort,
+        version,
+        coordinator_node,
+        member_nodes,
+    )
+    .await
+    .map(drop)
+}
+
+// Return hashes of the exact physical manifests consumed by the prefix check,
+// coordinator first and then members in canonical cohort order.
+async fn inspect(
+    root: &Path,
+    authority: &Authority,
+    cohort: &Cohort,
+    version: u64,
+    coordinator_node: NodeId,
+    member_nodes: &[NodeId],
+) -> anyhow::Result<Vec<[u8; 32]>> {
     check_request(authority, cohort, version, member_nodes.len())?;
     let root: std::path::PathBuf = root.components().collect();
     ensure!(
@@ -93,8 +135,10 @@ pub async fn verify(
         })
     };
     tokio::task::yield_now().await;
+    let mut digests = Vec::with_capacity(1 + member_nodes.len());
     let proof = {
-        let coordinator = open(authority.shard, coordinator_node)?;
+        let (coordinator, digest) = open(authority.shard, coordinator_node)?;
+        digests.push(digest);
         coordinator
             .coordinator_terminal_prefix(
                 authority.shard,
@@ -113,7 +157,8 @@ pub async fn verify(
     );
     for (member, node) in cohort.members.iter().zip(member_nodes) {
         tokio::task::yield_now().await;
-        let state = open(member.shard, *node)?;
+        let (state, digest) = open(member.shard, *node)?;
+        digests.push(digest);
         let info = state
             .participant_visibility_info(member.shard, member.epoch, member.mode)
             .await
@@ -133,5 +178,8 @@ pub async fn verify(
                 anyhow::anyhow!("group {} terminal prefix: {error:?}", member.shard)
             })?;
     }
-    Ok(())
+    Ok(digests)
 }
+
+#[path = "local_prefix_generation.rs"]
+pub mod generation;

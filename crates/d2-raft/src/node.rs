@@ -37,6 +37,10 @@ impl NodeHandle {
     /// Create a local two-DB backup of this replica, preserving node/group identity.
     /// Writes briefly pause; this does not alter Raft acknowledgement durability.
     pub async fn physical_checkpoint(&self, destination: impl AsRef<Path>) -> anyhow::Result<()> {
+        self.checkpoint_digest(destination.as_ref()).await.map(drop)
+    }
+
+    pub(crate) async fn checkpoint_digest(&self, destination: &Path) -> anyhow::Result<[u8; 32]> {
         let source = self
             .checkpoint_source
             .as_ref()
@@ -46,13 +50,12 @@ impl NodeHandle {
             "checkpoint handle differs from its durable startup binding"
         );
         self.state_machine
-            .physical_checkpoint(
-                &source.logs,
-                destination.as_ref(),
-                self.group_id(),
-                source.id,
-            )
+            .physical_checkpoint(&source.logs, destination, self.group_id(), source.id)
             .await
+    }
+
+    pub(crate) fn shares_transport(&self, other: &Self) -> bool {
+        self.registry.shares_transport(&other.registry)
     }
 
     /// Immutable in-process consensus group associated with this replica.

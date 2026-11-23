@@ -44,6 +44,10 @@ impl Registry {
         self.group_id
     }
 
+    pub(crate) fn shares_transport(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.nodes, &other.nodes)
+    }
+
     /// Register a replica without replacing an existing registration.
     pub async fn insert(&self, id: NodeId, raft: Raft) -> anyhow::Result<()> {
         let _startup = self.reserve_startup(id).await?;
