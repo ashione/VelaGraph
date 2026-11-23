@@ -1004,3 +1004,12 @@ Owned temporal adjacency reads now support conservative time-block pruning.
 This preserves candidate order, endpoint visibility and original logical query
 admission. It adds bounded in-memory summaries, not a persistent interval index,
 new traversal language, wider batching contract or automatic model refresh.
+
+## Local temporal revision reuse
+
+The local `TemporalStore` now uses [bounded revision-prefix blocks](TEMPORAL_REVISION_CACHE.md)
+for point and Gremlin reads. Reuse across unchanged commits is guarded by logical
+version and physical snapshot sequence; interval indexing preserves revision
+precedence and query budgets. This adds no distributed, storage-format or public
+protocol capability. Synthetic benchmark evidence and cold/write tradeoffs are
+recorded with the cache contract.

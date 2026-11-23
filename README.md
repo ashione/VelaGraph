@@ -337,3 +337,7 @@ crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserve
 See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
+
+Local temporal reads include [bounded revision-prefix caching](docs/TEMPORAL_REVISION_CACHE.md)
+for arbitrary vertex and edge histories, with safe reuse across unchanged commits
+and interval lookup. This optimization retains the existing storage and query budgets.
