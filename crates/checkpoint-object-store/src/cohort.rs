@@ -149,6 +149,7 @@ impl CheckpointStore {
             .verify_components(scratch.path())
             .await
             .map_err(invalid_prefix)?;
+        scratch.close()?;
         Ok(())
     }
 }

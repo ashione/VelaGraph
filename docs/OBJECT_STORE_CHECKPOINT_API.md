@@ -257,8 +257,10 @@ outer envelope is capped at the smaller of 256 KiB and that limit, and its
 embedded local record at 64 KiB. Allow scratch space for all replica payloads,
 their physical manifests and filesystem overhead, and memory for opening one
 replica's state. Synchronous local RocksDB verification or filesystem cleanup
-can finish after cancellation or deadline. Partial remote objects survive.
-A crash can leave a temporary scratch directory on the caller's filesystem.
+can finish after cancellation or deadline. Publication and verification require
+successful removal of the scratch directory before reporting success. A failed
+or cancelled operation, a filesystem cleanup error, or a process crash can
+leave temporary data under the scratch parent. Partial remote objects survive.
 
 The caller must ensure the backend retains every object during publication,
 verification and later use. Reads attest the bytes observed on that invocation.

@@ -184,6 +184,7 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
             let retained = local.path().join("retained-blob");
             fs::rename(&blob, &retained)?;
             assert!(staged.publish(scratch.path()).await.is_err());
+            assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
             assert!(!outer(base, &receipt).exists());
             fs::rename(&retained, &blob)?;
             assert!(matches!(
