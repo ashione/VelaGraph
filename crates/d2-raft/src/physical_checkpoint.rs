@@ -141,24 +141,16 @@ impl StateMachine {
     }
 }
 
-/// Restore a local backup into a newly created directory. Never overwrites an
-/// existing path, joins a cluster, or changes identity. The original replica
-/// cannot be safely replaced in a live cluster from an old vote state. Normal
-/// startup rejects the restored offline-only marker. This is NOT an
-/// acknowledged-write zero-loss guarantee: writes after the cut are absent.
-/// Interrupted destinations are retained for inspection and rejected on retry.
-pub fn restore_physical_checkpoint(
-    backup: impl AsRef<Path>,
-    destination: impl AsRef<Path>,
+fn checked_manifest(
+    backup: &Path,
     group_id: u64,
     node_id: NodeId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(std::path::PathBuf, Manifest)> {
     // Components removes trailing separators / `.` so a root symlink cannot
     // evade symlink_metadata through a spelling such as "backup-link/".
     // This does not resolve ancestors or `..`, or prevent concurrent changes.
-    let backup_path: std::path::PathBuf = backup.as_ref().components().collect();
+    let backup_path: std::path::PathBuf = backup.components().collect();
     let backup = backup_path.as_path();
-    let destination = destination.as_ref();
     for directory in [
         backup.to_path_buf(),
         backup.join("raft.db"),
@@ -196,13 +188,62 @@ pub fn restore_physical_checkpoint(
         manifest.log.as_ref() == Some(&log),
         "checkpoint log metadata mismatch"
     );
+    Ok((backup_path, manifest))
+}
+
+fn validate_state_cut(state: &StateMachine, manifest: &Manifest) -> anyhow::Result<()> {
+    let actual = state.state.try_read().expect("new state has no readers");
+    anyhow::ensure!(
+        actual.last_applied_log == manifest.applied
+            && actual.last_membership == manifest.membership,
+        "checkpoint state metadata mismatch"
+    );
+    let snapshot = state
+        .current_snapshot
+        .try_read()
+        .expect("new snapshot has no readers");
+    anyhow::ensure!(
+        snapshot.as_ref().map(|s| &s.meta) == manifest.snapshot.as_ref(),
+        "checkpoint snapshot metadata mismatch"
+    );
+    Ok(())
+}
+
+/// Verify a trusted, immutable local physical checkpoint without restoring it.
+/// Both RocksDB handles are read-only. This checks a single replica's local
+/// cut and does not grant managed cohort certification or permission to rejoin.
+pub fn verify_physical_checkpoint(
+    backup: impl AsRef<Path>,
+    group_id: u64,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    let (backup, manifest) = checked_manifest(backup.as_ref(), group_id, node_id)?;
+    let db = DB::open_for_read_only(&Options::default(), backup.join("state.db"), false)?;
+    let state = StateMachine::load_from_db(db)?;
+    validate_state_cut(&state, &manifest)
+}
+
+/// Restore a local backup into a newly created directory. Never overwrites an
+/// existing path, joins a cluster, or changes identity. The original replica
+/// cannot be safely replaced in a live cluster from an old vote state. Normal
+/// startup rejects the restored offline-only marker. This is NOT an
+/// acknowledged-write zero-loss guarantee: writes after the cut are absent.
+/// Interrupted destinations are retained for inspection and rejected on retry.
+pub fn restore_physical_checkpoint(
+    backup: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    group_id: u64,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    let (backup, manifest) = checked_manifest(backup.as_ref(), group_id, node_id)?;
+    let destination = destination.as_ref();
     fs::create_dir(destination)?;
     write_new(&destination.join("RESTORE_INCOMPLETE"), b"1")?;
     File::open(destination)?.sync_all()?;
     for directory in ["raft.db", "state.db"] {
         fs::create_dir(destination.join(directory))?;
     }
-    for file in files {
+    for file in &manifest.files {
         // Copy rather than hard link: the restored DB must not mutate the backup.
         let mut source = File::open(backup.join(&file.name))?;
         let mut target = OpenOptions::new()
@@ -227,26 +268,10 @@ pub fn restore_physical_checkpoint(
         );
         target.sync_all()?;
     }
-    // Opening performs the existing full state/ledger validation, not a weakened
-    // replacement loader. Verify the applied cut and membership before startup.
-    let state = StateMachine::open(destination.join("state.db"))?;
-    let actual = state.state.try_read().expect("new state has no readers");
-    anyhow::ensure!(
-        actual.last_applied_log == manifest.applied
-            && actual.last_membership == manifest.membership,
-        "checkpoint state metadata mismatch"
-    );
-    let snapshot = state
-        .current_snapshot
-        .try_read()
-        .expect("new snapshot has no readers");
-    anyhow::ensure!(
-        snapshot.as_ref().map(|s| &s.meta) == manifest.snapshot.as_ref(),
-        "checkpoint snapshot metadata mismatch"
-    );
-    drop(snapshot);
-    drop(actual);
-    drop(state);
+    validate_state_cut(
+        &StateMachine::open(destination.join("state.db"))?,
+        &manifest,
+    )?;
     let identity = serde_json::json!({"version":1,"group_id":group_id,"node_id":node_id});
     write_new(
         &destination.join("raft-group.json"),

@@ -375,7 +375,10 @@ impl StateMachine {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.set_compression_type(DBCompressionType::None);
-        let db = DB::open(&options, path.as_ref())?;
+        Self::load_from_db(DB::open(&options, path.as_ref())?)
+    }
+
+    fn load_from_db(db: DB) -> anyhow::Result<Self> {
         let storage = Arc::new(StateMachineStorage {
             db,
             legacy_d1: AtomicBool::new(false),

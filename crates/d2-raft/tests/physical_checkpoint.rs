@@ -1,6 +1,6 @@
 use d2_raft::{
-    restore_physical_checkpoint, Cluster, D1Command, D1Result, D1WriteRequest, D1WriteStatus,
-    LogCommand, StateMachine, WriteOp,
+    restore_physical_checkpoint, verify_physical_checkpoint, Cluster, D1Command, D1Result,
+    D1WriteRequest, D1WriteStatus, LogCommand, StateMachine, WriteOp,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use std::collections::BTreeMap;
@@ -51,6 +51,18 @@ async fn checkpoint_concurrent_writes_restore_membership_and_dedup() -> anyhow::
         node.physical_checkpoint(&backup).await.is_err(),
         "no overwrite on retry"
     );
+    verify_physical_checkpoint(&backup, 0, 1)?;
+    // A real snapshot with a different ID can share all log boundaries and
+    // file checksums. The verifier must compare the loaded state to the claim.
+    let manifest_path = backup.join("checkpoint.json");
+    let original = std::fs::read(&manifest_path)?;
+    let mut altered: serde_json::Value = serde_json::from_slice(&original)?;
+    altered["snapshot"]["snapshot_id"] = "different-snapshot".into();
+    std::fs::write(&manifest_path, serde_json::to_vec(&altered)?)?;
+    let error = verify_physical_checkpoint(&backup, 0, 1).unwrap_err();
+    assert_eq!(error.to_string(), "checkpoint snapshot metadata mismatch");
+    std::fs::write(&manifest_path, original)?;
+    assert!(verify_physical_checkpoint(&backup, 0, 2).is_err());
     let restored = dirs.path().join("restored");
     assert!(restore_physical_checkpoint(&backup, &restored, 0, 2).is_err());
     assert!(!restored.exists());
