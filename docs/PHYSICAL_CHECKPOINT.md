@@ -204,6 +204,32 @@ synchronous filesystem step. Partial roots and orphan temporary files can remain
 The producer or operator must retain the files through every use. This API
 performs no reclamation or provider-side pinning.
 
+## Restoring a selected local cohort offline
+
+Call `d2_raft::cohort_inputs::generation::restore_offline(source, destination,
+digest, authority, cohort, version).await` with a published generation and its
+independently retained selection. Keep the source immutable. Use a fresh
+destination outside the source tree on a trusted filesystem with exclusive
+access and space for a full second copy.
+
+The operation durably guards the root, then restores the coordinator followed
+by each data member. It checks each physical manifest against the selected
+digest, copies both databases into the corresponding group directory, and
+preserves the original node identity. Each group has a startup guard before
+any database files are written. The restore reopens the copied databases
+read-only, checks every inventory and validates their common terminal decision
+history through V. It then publishes the exact producer record in the new root
+and syncs the directory. After loss of the source, use `generation::verify`
+with the same selection on the destination to repeat the physical and prefix
+checks.
+
+An interrupted attempt can retain complete individual groups. A missing final
+record means whole-cohort completion has not been established. Use a fresh path
+for a retry. The guard on the root and every restored group remains in place
+after success. The restored files can include decisions after V. Serving
+queries, fencing restored votes and recovering an external graph catalog or
+temporal store require additional recovery work.
+
 ## Verification
 
 The focused suite exercises a real durable single-node Raft lifecycle, concurrent

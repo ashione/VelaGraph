@@ -390,7 +390,8 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 
 **已实现**：#194 的本地双 DB 一致物理 checkpoint、manifest/完整性校验和新目录
 离线恢复；另有 `checkpoint-object-store` 不可变上传/下载、最后发布 manifest 和
-S3-compatible 集成验收。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
+S3-compatible 集成验收。固定 cohort 现可按指定本地 generation 将协调节点和所有成员恢复到新目录，
+并从副本文件核验指定 V 的决策前缀。目标保持离线。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
 [对象运输契约](OBJECT_STORE_CHECKPOINT_API.md)。这不是“尚无 checkpoint/上传工具”。
 
 **仍待实现**：#193 安全 live restart/rejoin，#191 跨组认证恢复集/全局 READY 屏障、

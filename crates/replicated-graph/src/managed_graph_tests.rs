@@ -2270,3 +2270,6 @@ mod remote_prefix_cleanup_tests;
 
 #[path = "remote_prefix_generation_tests.rs"]
 mod remote_prefix_generation_tests;
+
+#[path = "offline_cohort_restore_tests.rs"]
+mod offline_cohort_restore_tests;

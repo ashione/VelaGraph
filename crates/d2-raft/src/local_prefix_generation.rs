@@ -1,4 +1,5 @@
 //! Explicitly selected local generations of fixed-cohort D2 decision-prefix inputs.
+use super::super::{blocking_section, create_offline_input, restore_replica, sync_parent};
 use super::{capture_replicas, inspect, Authority, Cohort, NodeHandle, NodeId};
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
@@ -45,26 +46,23 @@ impl Prepared {
         let manifest: Manifest = serde_json::from_slice(&self.bytes)?;
         verify_components(&self.root, &manifest).await?;
         tokio::task::yield_now().await;
-        crate::blocking::blocking_section(|| self.publish_record())
+        blocking_section(|| publish_record(&self.root, &self.bytes))
     }
+}
 
-    fn publish_record(&self) -> anyhow::Result<()> {
-        let mut staged = tempfile::NamedTempFile::new_in(&self.root)?;
-        staged.write_all(&self.bytes)?;
-        staged.as_file().sync_all()?;
-        match staged.persist_noclobber(self.root.join(FILE)) {
-            Ok(_) => {}
-            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
-                ensure!(
-                    read_manifest(&self.root)? == self.bytes,
-                    "conflicting generation"
-                );
-            }
-            Err(error) => return Err(error.error.into()),
+fn publish_record(root: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut staged = tempfile::NamedTempFile::new_in(root)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(root.join(FILE)) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+            ensure!(read_manifest(root)? == bytes, "conflicting generation");
         }
-        File::open(&self.root)?.sync_all()?;
-        Ok(())
+        Err(error) => return Err(error.error.into()),
     }
+    File::open(root)?.sync_all()?;
+    Ok(())
 }
 
 /// Capture the durable D2 Raft/state pair for each group from one in-process
@@ -138,6 +136,54 @@ pub async fn verify(
     SelectedManifest::read(root, digest, authority, cohort, version)?
         .verify_components(root)
         .await
+}
+
+/// Restore one published D2 generation into a fresh, exclusively owned directory
+/// outside the immutable source tree. Copies preserve the original replica IDs
+/// and remain offline. On error or cancellation keep the attempt offline and
+/// retry with a new destination. Success certifies the decision prefix through
+/// `version`; the copied databases may also contain later decisions.
+pub async fn restore_offline(
+    source: &Path,
+    destination: &Path,
+    digest: [u8; 32],
+    authority: &Authority,
+    cohort: &Cohort,
+    version: u64,
+) -> anyhow::Result<()> {
+    let selected = blocking_section(|| -> anyhow::Result<_> {
+        let selected = SelectedManifest::read(source, digest, authority, cohort, version)?;
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        ensure!(
+            !parent.canonicalize()?.starts_with(source.canonicalize()?),
+            "restore destination overlaps the selected source"
+        );
+        create_offline_input(destination).context("create fresh offline cohort destination")?;
+        sync_parent(destination)?;
+        Ok(selected)
+    })?;
+    let nodes = std::iter::once(selected.manifest.coordinator_node)
+        .chain(selected.manifest.member_nodes.iter().copied());
+    for ((group, expected), node) in selected.replicas().zip(nodes) {
+        tokio::task::yield_now().await;
+        blocking_section(|| {
+            let directory = group.to_string();
+            restore_replica(
+                &source.join(&directory),
+                &destination.join(directory),
+                group,
+                node,
+                Some(expected),
+            )
+        })
+        .with_context(|| format!("restore group {group}"))?;
+    }
+    selected.verify_components(destination).await?;
+    tokio::task::yield_now().await;
+    blocking_section(|| publish_record(destination, selected.as_bytes()))
 }
 
 /// A local producer's record selected by an independently retained digest and

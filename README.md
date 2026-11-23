@@ -280,7 +280,8 @@ the [read-only verification CLI](docs/OBJECT_STORE_CHECKPOINT_API.md#operator-ve
 checks a retained receipt without staging a local backup.
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
 not object-store-authoritative storage, remote-durable write acknowledgement or
-live-cluster recovery. Physical restoration is guarded for offline use. See the
+live-cluster recovery. Offline recovery can restore a selected local D2 coordinator and all fixed-cohort members,
+then verify the copied decision history through the requested version. See the
 [physical checkpoint](docs/PHYSICAL_CHECKPOINT.md) and
 [object-store API](docs/OBJECT_STORE_CHECKPOINT_API.md) contracts.
 
