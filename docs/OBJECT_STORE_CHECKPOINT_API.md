@@ -265,6 +265,10 @@ leave temporary data under the scratch parent. Partial remote objects survive.
 The caller must ensure the backend retains every object during publication,
 verification and later use. Reads attest the bytes observed on that invocation.
 The feature adds no retention lease, live restore, or query readiness guarantee.
-The cross-process fixture uses real D2 replicas and a filesystem-backed object
-store with injected response loss. Cloud provider behavior requires independent
-testing against the actual backend and bucket settings.
+The cross-process fixture runs against a filesystem-backed object store in
+ordinary tests and against a disposable SeaweedFS service in the S3 CI job.
+Both runs capture one coordinator and two data shards, exercise the same
+lost-ACK, missing-chunk and mixed-generation cases, and verify the selected
+receipt after source shutdown in a fresh process. The fault wrapper drops the final
+PUT response after the backend commits it and fails the first reconciliation GET.
+Cloud provider behavior requires independent testing against the actual backend and bucket settings.

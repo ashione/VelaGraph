@@ -5,7 +5,13 @@ use checkpoint_object_store::{
 };
 use d2_raft::cohort_inputs::generation;
 use futures::stream::BoxStream;
-use object_store::{local::LocalFileSystem, path::Path as Key, *};
+use object_store::{
+    aws::{AmazonS3Builder, S3ConditionalPut},
+    local::LocalFileSystem,
+    path::Path as Key,
+    prefix::PrefixStore,
+    *,
+};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
@@ -18,10 +24,9 @@ use std::{
 };
 
 /// Lose the committed final PUT response, then lose its reconciliation GET.
-/// The same backend persists across verifier processes through LocalFileSystem.
 #[derive(Debug)]
 struct LoseFinalAck {
-    inner: Arc<LocalFileSystem>,
+    inner: Arc<dyn ObjectStore>,
     phase: AtomicU8,
 }
 impl std::fmt::Display for LoseFinalAck {
@@ -90,35 +95,75 @@ impl ObjectStore for LoseFinalAck {
     }
 }
 
-fn backend(base: &Path) -> anyhow::Result<Arc<LocalFileSystem>> {
-    Ok(Arc::new(LocalFileSystem::new_with_prefix(base)?))
-}
-fn reader(base: &Path, limits: Limits) -> anyhow::Result<CheckpointReader> {
-    Ok(CheckpointReader::new(
-        backend(base)?,
-        "backup".into(),
-        limits,
-    )?)
-}
-fn outer(base: &Path, receipt: &PrefixReceipt) -> std::path::PathBuf {
+fn outer(receipt: &PrefixReceipt) -> Key {
     let digest = sha2::digest::Output::<Sha256>::from(receipt.local_sha256);
-    base.join(format!("backup/d2-prefixes/{digest:x}/generation.json"))
+    Key::from(format!("backup/d2-prefixes/{digest:x}/generation.json"))
 }
-fn component(base: &Path, receipt: &PrefixReceipt, group: u64) -> std::path::PathBuf {
+fn component(receipt: &PrefixReceipt, group: u64) -> Key {
     let digest = sha2::digest::Output::<Sha256>::from(receipt.local_sha256);
-    base.join(format!(
+    Key::from(format!(
         "backup/checkpoints/d2-{digest:x}-{group}/checkpoint.json"
     ))
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Result<()> {
+    let objects = tempfile::tempdir()?;
+    let base = env::var_os("VELA_TEST_REMOTE_PREFIX_BACKEND")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| objects.path().to_owned());
+    scenario(
+        Arc::new(LocalFileSystem::new_with_prefix(&base)?),
+        Some(&base),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable loopback SeaweedFS S3 endpoint"]
+async fn two_shard_prefix_through_seaweedfs() -> anyhow::Result<()> {
+    let endpoint = env::var("VELAGRAPH_TEST_S3_ENDPOINT")?;
+    let port = endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(|| anyhow::anyhow!("expected loopback HTTP endpoint"))?
+        .parse::<u16>()?;
+    let bucket = env::var("VELAGRAPH_TEST_S3_BUCKET")?;
+    anyhow::ensure!(
+        port != 0 && bucket == "velagraph-ci",
+        "expected disposable CI bucket"
+    );
+    let store = AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_region("us-east-1")
+        .with_access_key_id("velagraph-ci-only")
+        .with_secret_access_key("velagraph-ci-only-secret")
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(false)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?;
+    scenario(Arc::new(store), None).await
+}
+
+async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> anyhow::Result<()> {
     let auth = authority();
     let cohort = binding();
     let scratch = tempfile::tempdir()?;
-    if let Some(base) = env::var_os("VELA_TEST_REMOTE_PREFIX_BACKEND") {
+    // Isolate the destructive negative fixtures even on concurrent runs.
+    let namespace = env::var("VELA_TEST_REMOTE_PREFIX_NAMESPACE").unwrap_or_else(|_| {
+        scratch
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let objects = Arc::new(PrefixStore::new(store, Key::from(namespace.as_str())));
+    let reader = |limits| CheckpointReader::new(objects.clone(), "backup".into(), limits);
+    if env::var_os("VELA_TEST_REMOTE_PREFIX_RECEIPT").is_some() {
         let receipt: PrefixReceipt =
             serde_json::from_str(&env::var("VELA_TEST_REMOTE_PREFIX_RECEIPT")?)?;
-        reader(Path::new(&base), Limits::default())?
+        reader(Limits::default())?
             .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
             .await?;
         println!("verified remote prefix in child");
@@ -126,8 +171,6 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
     }
     let local = tempfile::tempdir()?;
     let live = tempfile::tempdir()?;
-    let objects = tempfile::tempdir()?;
-    let base = objects.path();
     let cluster = Cluster::new();
     let durable = |shard: u64| {
         let group = cluster.in_group(shard);
@@ -140,7 +183,7 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
     let graph = graph(&c, &a, &b);
     let nodes = [&a, &b];
     let faulty = Arc::new(LoseFinalAck {
-        inner: backend(base)?,
+        inner: objects.clone(),
         phase: AtomicU8::new(0),
     });
     let store = CheckpointStore::new(
@@ -167,11 +210,15 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
             .stage_prefix(&capture, prepared.digest(), &auth, &cohort, 1)
             .await?;
         let receipt = staged.receipt().clone();
-        assert!(!outer(base, &receipt).exists());
+        assert!(matches!(
+            objects.head(&outer(&receipt)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
         if shard == 7 {
             // Remove an actual physical file chunk, not the child manifest.
-            let remote: serde_json::Value =
-                serde_json::from_slice(&fs::read(component(base, &receipt, 8))?)?;
+            let remote: serde_json::Value = serde_json::from_slice(
+                &objects.get(&component(&receipt, 8)).await?.bytes().await?,
+            )?;
             let digest = remote["files"]
                 .as_array()
                 .unwrap()
@@ -180,32 +227,40 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
                 .unwrap()["chunks"][0]["sha256"]
                 .as_str()
                 .unwrap();
-            let blob = base.join("backup/blobs").join(digest);
-            let retained = local.path().join("retained-blob");
-            fs::rename(&blob, &retained)?;
+            let blob = Key::from(format!("backup/blobs/{digest}"));
+            let retained = objects.get(&blob).await?.bytes().await?;
+            objects.delete(&blob).await?;
             assert!(staged.publish(scratch.path()).await.is_err());
             assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
-            assert!(!outer(base, &receipt).exists());
-            fs::rename(&retained, &blob)?;
+            assert!(matches!(
+                objects.head(&outer(&receipt)).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+            objects.put(&blob, retained.clone().into()).await?;
             assert!(matches!(
                 staged.publish(scratch.path()).await,
                 Err(StoreError::OutcomeUnknown(_))
             ));
             assert_eq!(faulty.phase.load(Ordering::SeqCst), 2);
-            reader(base, Limits::default())?
+            reader(Limits::default())?
                 .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
                 .await?;
-            fs::rename(&blob, &retained)?;
-            assert!(reader(base, Limits::default())?
+            objects.delete(&blob).await?;
+            assert!(reader(Limits::default())?
                 .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
                 .await
                 .is_err());
-            fs::rename(retained, blob)?;
+            objects.put(&blob, retained.into()).await?;
             // Each child fits this budget in isolation. The sum cannot fit.
             let mut largest = 0;
             for group in [9, 7, 8] {
-                let child: serde_json::Value =
-                    serde_json::from_slice(&fs::read(component(base, &receipt, group))?)?;
+                let child: serde_json::Value = serde_json::from_slice(
+                    &objects
+                        .get(&component(&receipt, group))
+                        .await?
+                        .bytes()
+                        .await?,
+                )?;
                 largest = largest.max(child["files"].as_array().unwrap().len());
             }
             let limits = Limits {
@@ -213,7 +268,7 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
                 ..Limits::default()
             };
             let bounded = CheckpointStore::new(
-                backend(base)?,
+                objects.clone(),
                 "backup".into(),
                 limits.clone(),
                 CreateCapability::AtomicCreateVerified,
@@ -225,7 +280,7 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
                 Err(StoreError::Limit)
             ));
             assert!(matches!(
-                reader(base, limits)?
+                reader(limits)?
                     .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
                     .await,
                 Err(StoreError::Limit)
@@ -242,13 +297,19 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
     live.close()?;
     local.close()?;
     let first = &receipts[0];
-    let output = process::Command::new(env::current_exe()?)
+    let mut child = process::Command::new(env::current_exe()?);
+    if let Some(base) = local_backend {
+        child.env("VELA_TEST_REMOTE_PREFIX_BACKEND", base);
+    } else {
+        child.arg("--ignored");
+    }
+    let output = child
         .args([
             "--exact",
             std::thread::current().name().unwrap(),
             "--nocapture",
         ])
-        .env("VELA_TEST_REMOTE_PREFIX_BACKEND", base)
+        .env("VELA_TEST_REMOTE_PREFIX_NAMESPACE", namespace)
         .env(
             "VELA_TEST_REMOTE_PREFIX_RECEIPT",
             serde_json::to_string(first)?,
@@ -262,7 +323,7 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let read = reader(base, Limits::default())?;
+    let read = reader(Limits::default())?;
     assert!(read
         .verify_prefix(first, &auth, &cohort, 2, scratch.path())
         .await
@@ -270,11 +331,15 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
     // Substitute a valid physical shard from another generation, preserving the
     // expected object ID and authenticating the altered transport envelope.
     // The independently selected local producer record remains unchanged.
-    let root_key = outer(base, first);
-    let original_outer = fs::read(&root_key)?;
-    let member_key = component(base, first, 8);
-    let original_member = fs::read(&member_key)?;
-    let foreign = fs::read(component(base, &receipts[1], 8))?;
+    let root_key = outer(first);
+    let original_outer = objects.get(&root_key).await?.bytes().await?;
+    let member_key = component(first, 8);
+    let original_member = objects.get(&member_key).await?.bytes().await?;
+    let foreign = objects
+        .get(&component(&receipts[1], 8))
+        .await?
+        .bytes()
+        .await?;
     let mut envelope: serde_json::Value = serde_json::from_slice(&original_outer)?;
     // Authenticate altered outer bytes too, so these failures exercise the
     // required replica set independently of the transport envelope digest.
@@ -291,7 +356,7 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
             local_sha256: first.local_sha256,
             envelope_sha256: format!("{:x}", Sha256::digest(&bytes)),
         };
-        fs::write(&root_key, bytes)?;
+        objects.put(&root_key, bytes.into()).await?;
         assert!(
             matches!(read.verify_prefix(&selection, &auth, &cohort, 1, scratch.path()).await, Err(StoreError::Invalid(reason)) if reason == "generation replica set")
         );
@@ -302,8 +367,8 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
         local_sha256: first.local_sha256,
         envelope_sha256: format!("{:x}", Sha256::digest(&mixed)),
     };
-    fs::write(&member_key, foreign)?;
-    fs::write(&root_key, mixed)?;
+    objects.put(&member_key, foreign.into()).await?;
+    objects.put(&root_key, mixed.into()).await?;
     let error = read
         .verify_prefix(&mixed_receipt, &auth, &cohort, 1, scratch.path())
         .await
@@ -312,8 +377,8 @@ async fn remote_prefix_verified_after_sources_and_publisher_exit() -> anyhow::Re
         matches!(error, StoreError::Integrity(ref field) if field == "group 8 physical manifest"),
         "{error}"
     );
-    fs::write(member_key, original_member)?;
-    fs::write(root_key, original_outer)?;
+    objects.put(&member_key, original_member.into()).await?;
+    objects.put(&root_key, original_outer.into()).await?;
     read.verify_prefix(first, &auth, &cohort, 1, scratch.path())
         .await?;
     assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
