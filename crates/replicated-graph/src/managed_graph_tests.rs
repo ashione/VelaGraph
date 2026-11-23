@@ -2070,6 +2070,9 @@ async fn retained_cohort_inputs_verify_decisions_after_all_sources_stop() -> any
     })
     .await;
     drop(attempt);
+    assert!(cancelled.join("RESTORED_OFFLINE_ONLY").is_file());
+    assert!(Cluster::new().start_durable(1, &cancelled).await.is_err());
+    assert!(!cancelled.join("raft-group.json").exists());
     assert!(!cancelled.join("7").exists() && !cancelled.join("8").exists());
     d2_raft::verify_physical_checkpoint(cancelled.join("9"), 9, 1)?;
     assert!(verify(&cancelled, &auth, &cohort, 2, 1, &[1, 1])

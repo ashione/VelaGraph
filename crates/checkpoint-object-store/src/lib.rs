@@ -470,6 +470,15 @@ impl CheckpointStore {
     async fn download_inner(&self, receipt: &Receipt, destination: &Path) -> Result<()> {
         let remote = self.read_manifest(receipt).await?;
         tokio::fs::create_dir(destination).await?;
+        // Normal D2 startup recognizes this marker even before checkpoint.json
+        // exists. Persist it before creating either database directory.
+        let guard = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination.join("RESTORED_OFFLINE_ONLY"))
+            .await?;
+        guard.sync_all().await?;
+        tokio::fs::File::open(destination).await?.sync_all().await?;
         for dir in ["raft.db", "state.db"] {
             tokio::fs::create_dir(destination.join(dir)).await?;
         }

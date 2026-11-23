@@ -52,6 +52,16 @@ async fn checkpoint_concurrent_writes_restore_membership_and_dedup() -> anyhow::
         "no overwrite on retry"
     );
     verify_physical_checkpoint(&backup, 0, 1)?;
+    // Use a separate registry so duplicate registration cannot mask the guard.
+    assert!(backup.join("RESTORED_OFFLINE_ONLY").is_file());
+    let error = Cluster::new()
+        .start_durable(1, &backup)
+        .await
+        .err()
+        .expect("backup is offline-only");
+    assert!(error.to_string().contains("offline-only"), "{error:#}");
+    assert!(!backup.join("raft-group.json").exists());
+    verify_physical_checkpoint(&backup, 0, 1)?;
     // A real snapshot with a different ID can share all log boundaries and
     // file checksums. The verifier must compare the loaded state to the claim.
     let manifest_path = backup.join("checkpoint.json");
@@ -186,5 +196,52 @@ async fn checkpoint_refuses_relabelled_node_and_substituted_state() -> anyhow::R
     verify_physical_checkpoint(&backup, 7, 1)?;
     first.raft.shutdown().await?;
     other.raft.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_checkpoint_records_reject_both_node_entrypoints() -> anyhow::Result<()> {
+    for name in [
+        "checkpoint.json",
+        ".checkpoint-pending",
+        "prefix-generation.json",
+    ] {
+        let dir = tempfile::tempdir()?;
+        // The final record can be partial. Presence reserves this directory.
+        std::fs::write(dir.path().join(name), b"{")?;
+        let inproc = Cluster::new()
+            .start_durable(1, dir.path())
+            .await
+            .err()
+            .expect("checkpoint input");
+        let tcp = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
+            id: 1,
+            raft_addr: "127.0.0.1:0".into(),
+            control_addr: "127.0.0.1:0".into(),
+            data_dir: dir.path().to_owned(),
+        })
+        .await
+        .err()
+        .expect("checkpoint input");
+        for error in [inproc, tcp] {
+            assert!(error.to_string().contains("checkpoint"), "{error:#}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_offline_guard_still_blocks_startup() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::os::unix::fs::symlink("absent", dir.path().join("RESTORED_OFFLINE_ONLY"))?;
+    let error = Cluster::new()
+        .start_durable(1, dir.path())
+        .await
+        .err()
+        .expect("offline-only");
+    assert!(error.to_string().contains("offline-only"), "{error:#}");
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
     Ok(())
 }

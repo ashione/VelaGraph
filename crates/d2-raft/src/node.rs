@@ -284,12 +284,32 @@ pub(crate) fn bind_durable_identity(
     group_id: GroupId,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !dir.join("RESTORE_INCOMPLETE").exists(),
-        "incomplete checkpoint restore"
-    );
-    anyhow::ensure!(!dir.join("RESTORED_OFFLINE_ONLY").exists(),
-        "restored backup is offline-only; live consensus rejoin requires a separate recovery protocol");
+    // The presence of a reserved entry is enough. Do not follow a symlink or
+    // interpret a metadata I/O error as permission to open old vote state.
+    for (name, reason) in [
+        ("RESTORE_INCOMPLETE", "incomplete checkpoint restore"),
+        (
+            "RESTORED_OFFLINE_ONLY",
+            "checkpoint directory is offline-only",
+        ),
+        (
+            "checkpoint.json",
+            "physical checkpoint input is offline-only",
+        ),
+        (".checkpoint-pending", "incomplete checkpoint download"),
+        (
+            "prefix-generation.json",
+            "cohort checkpoint input is offline-only",
+        ),
+    ] {
+        match std::fs::symlink_metadata(dir.join(name)) {
+            Ok(_) => anyhow::bail!("{reason}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect startup guard {name}"))
+            }
+        }
+    }
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     #[serde(deny_unknown_fields)]
     struct Identity {

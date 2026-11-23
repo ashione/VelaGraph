@@ -254,6 +254,7 @@ async fn read_faults(fault: Fault) {
                     std::fs::read(destination.join("raft.db/000001.sst")).unwrap(),
                     b"log"
                 );
+                assert!(destination.join("RESTORED_OFFLINE_ONLY").is_file());
                 // The unfinished file has no durability guarantee: Tokio may
                 // still have an earlier write queued when the read fails and
                 // the file is dropped. Only completed/synced files above and

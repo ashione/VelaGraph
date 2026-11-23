@@ -13,6 +13,32 @@ membership. There is not yet a TCP control endpoint. The separate
 an immutable completed checkpoint and download it to a new directory. The
 physical validator and offline-only recovery guard still apply after download.
 
+## Startup admission for recovery inputs
+
+Local physical capture, cohort capture and object download reserve their fresh
+output directory with `RESTORED_OFFLINE_ONLY`. The producer syncs the entry and
+its directory before writing replica data or starting the first cohort member.
+The caller must own that path exclusively, including during creation. Both
+in-process and TCP Raft startup check reserved entries before binding a node
+identity or opening RocksDB. An existing entry of any type blocks startup. A
+metadata lookup error also stops startup unless the entry is absent.
+
+| On-disk state | Available operation |
+| --- | --- |
+| Guard present, no final manifest | Inspect the attempt. Retry capture or download in a fresh directory. |
+| Physical manifest present | Verify the inventory, log and state cut, then restore to a fresh offline destination. |
+| Cohort generation published | Verify every selected replica and its decision prefix at the requested V. |
+| Restore incomplete | Inspect the failed destination. Retry in a fresh directory. |
+| Restore complete, offline guard present | Inspect restored state offline. Query activation still requires a separate recovery protocol. |
+
+The guard stays outside the physical manifest and object receipts. Existing
+completed backups remain verifiable. Updated nodes also recognize legacy
+`checkpoint.json`, `.checkpoint-pending` and `prefix-generation.json` entries
+without parsing them. An old interrupted attempt without a guard or any
+recognizable record may be indistinguishable from legacy group-zero node data;
+keep such attempts isolated from service data directories. This change provides
+the offline admission boundary for [#351](https://github.com/ashione/VelaGraph/issues/351).
+
 ## Consistent cut
 
 The state publication write lock, snapshot publication read lock, and log-store
