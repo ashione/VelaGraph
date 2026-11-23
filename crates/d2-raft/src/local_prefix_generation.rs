@@ -186,6 +186,78 @@ pub async fn restore_offline(
     blocking_section(|| publish_record(destination, selected.as_bytes()))
 }
 
+/// Materialize the exact managed decision version from one published, immutable
+/// local generation (including a completed offline restore). Supply the producer
+/// digest and cut independently. Every selected Raft/state pair is verified and
+/// every data member must match the coordinator proof before a session exists.
+/// The limits bound returned KV and replay. Physical hashing and cold loading
+/// still visit a whole replica at a time. The acquisition clock includes this
+/// work; synchronous filesystem calls can finish after the deadline.
+pub async fn read_snapshot(
+    root: &Path,
+    digest: [u8; 32],
+    authority: &Authority,
+    cohort: &Cohort,
+    version: u64,
+    limit: crate::versioned_reads::ReadLimit,
+    lifetime: std::time::Duration,
+) -> anyhow::Result<crate::cohort_reads::SnapshotSession> {
+    use crate::cohort_reads::{validate_read_limit, AcquisitionWindow, SessionCapture};
+
+    validate_read_limit(&limit)?;
+    let window = AcquisitionWindow::new(lifetime)?;
+    let selected =
+        blocking_section(|| SelectedManifest::read(root, digest, authority, cohort, version))?;
+    let manifest = &selected.manifest;
+    let open = |group: u64, node, index: usize| {
+        window.check()?;
+        let (state, actual) = blocking_section(|| {
+            super::open_verified_state(&root.join(group.to_string()), group, node)
+        })
+        .with_context(|| format!("open selected group {group}"))?;
+        ensure!(
+            actual == manifest.checkpoint_sha256[index],
+            "group {group} checkpoint digest mismatch"
+        );
+        window.check()?;
+        Ok::<_, anyhow::Error>(state)
+    };
+    tokio::task::yield_now().await;
+    let proof = open(authority.shard, manifest.coordinator_node, 0)?
+        .coordinator_terminal_prefix(
+            authority.shard,
+            cohort.coordinator_epoch,
+            authority.mode,
+            version,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("coordinator terminal prefix: {err:?}"))?;
+    ensure!(
+        proof.authority() == authority.mode
+            && proof.cohort() == cohort
+            && proof.version() == version,
+        "coordinator recovery identity mismatch"
+    );
+    let mut capture =
+        SessionCapture::new(authority.clone(), cohort.clone(), version, window, limit);
+    for (index, member) in cohort.members.iter().enumerate() {
+        tokio::task::yield_now().await;
+        let remaining = capture.remaining()?;
+        let state = open(member.shard, manifest.member_nodes[index], index + 1)?;
+        let (snapshot, retained) = state
+            .certified_terminal_read(member.shard, member.epoch, member.mode, remaining, &proof)
+            .await
+            .map_err(|err| anyhow::anyhow!("group {} historical read: {err:?}", member.shard))?;
+        ensure!(
+            retained == proof,
+            "group {} terminal prefix mismatch",
+            member.shard
+        );
+        capture.push(snapshot)?;
+    }
+    Ok(capture.finish()?)
+}
+
 /// A local producer's record selected by an independently retained digest and
 /// cut. Selecting metadata alone establishes no claim about available data.
 /// Use `verify_components` on the actual captured or transferred directories.

@@ -230,6 +230,32 @@ after success. The restored files can include decisions after V. Serving
 queries, fencing restored votes and recovering an external graph catalog or
 temporal store require additional recovery work.
 
+### Inspecting graph data at the selected version
+
+Use `generation::read_snapshot` on the published local generation or completed
+offline restore. Pass the digest, authority, cohort and V saved independently by
+the producer, plus a `versioned_reads::ReadLimit` and session lifetime. The call
+reopens the coordinator and every advertised member with read-only RocksDB
+handles, compares each physical manifest to the selected digest and reconstructs
+the coordinator's decision prefix. For each member it reads the rows at V and
+the corresponding proof under the same state lock. A missing or mismatched last
+member fails the entire call.
+
+Pass the returned `SnapshotSession` to
+`replicated_graph::managed_graph::GraphSnapshot::from_session`. Its existing
+vertex, edge and adjacency methods use the fixed shard-to-partition mapping.
+For example, an edge committed at V and deleted before physical capture appears
+in both endpoint indexes at V. The source can be absent and all offline guards
+stay in place.
+
+The row, byte and replay budgets apply across all members. Session lifetime and
+the acquisition deadline start before manifest I/O. Checking files and loading a
+single replica can exceed those read budgets in memory, disk I/O and wall time.
+Expiry discards an unfinished acquisition. The returned view owns its captured
+rows until dropped and queries enforce the original expiry. This inspection
+covers managed records stored inside the selected D2 cohort. External catalogs,
+separate temporal stores and service routing/READY require their own validation.
+
 ## Verification
 
 The focused suite exercises a real durable single-node Raft lifecycle, concurrent
