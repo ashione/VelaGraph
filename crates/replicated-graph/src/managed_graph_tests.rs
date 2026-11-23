@@ -2050,6 +2050,32 @@ async fn retained_cohort_inputs_verify_decisions_after_all_sources_stop() -> any
     let divergent = path.join("divergent");
     ob.physical_checkpoint(&divergent).await?;
 
+    // Drive the real future until the coordinator is durable, then cancel it
+    // at that poll boundary. No timer race or detached capture task.
+    let cancelled = path.join("cancelled");
+    let members = [&a, &b];
+    let mut attempt = Box::pin(capture(&cancelled, &auth, &cohort, 2, &c, &members));
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        use std::task::Poll;
+        assert!(
+            attempt.as_mut().poll(cx).is_pending(),
+            "capture ran past cancellation"
+        );
+        if cancelled.join("9/checkpoint.json").is_file() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    drop(attempt);
+    assert!(!cancelled.join("7").exists() && !cancelled.join("8").exists());
+    d2_raft::verify_physical_checkpoint(cancelled.join("9"), 9, 1)?;
+    assert!(verify(&cancelled, &auth, &cohort, 2, 1, &[1, 1])
+        .await
+        .is_err());
+
     // In-memory member 7 cannot be captured. Earlier physical roots survive.
     let partial = path.join("partial");
     let failure = capture(&partial, &auth, &cohort, 2, &c, &[&oa, &b])

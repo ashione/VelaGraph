@@ -99,6 +99,10 @@ coordinator replica, and one durable local replica per member in cohort order.
 This local layout maps each shard to the Raft group of the same numeric ID.
 The directory is caller-owned on a trusted, persistent filesystem.
 
+Physical capture checks that each handle still refers to the node ID and state
+machine paired with its log store at durable startup. A relabelled handle or
+substituted state machine fails before that replica's backup is created.
+
 The call creates one physical checkpoint per group under `<root>/<group-id>`.
 The existing physical capture locks establish each replica's own immutable
 Raft/state cut. Captures run serially and may have different LogIds or include
@@ -118,8 +122,10 @@ and node IDs to check the files again. Directory existence alone cannot establis
 completion. Use a fresh root for another capture and budget disk for all retained
 attempts. There is no automatic deletion. Bounds are the existing cohort/profile
 limits and one replica load per invocation; startup validation still eagerly
-loads one replica's state. A synchronous RocksDB step can finish after cancellation
-is requested.
+loads one replica's state. Explicit yield points between replicas and before
+verification let the caller cancel without starting another replica. An
+in-progress replica's synchronous RocksDB work can finish before cancellation
+takes effect.
 
 This operation establishes a common **prefix** across immutable inputs. It
 cannot start a restored cohort, roll the individual databases back to V, or

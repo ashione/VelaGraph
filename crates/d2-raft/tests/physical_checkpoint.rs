@@ -150,3 +150,41 @@ async fn tcp_start_rejects_restored_identity_mismatch() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_refuses_relabelled_node_and_substituted_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::new();
+    let mut first = cluster
+        .in_group(7)
+        .start_durable(1, dir.path().join("first"))
+        .await?;
+    let mut other = cluster
+        .in_group(8)
+        .start_durable(1, dir.path().join("other"))
+        .await?;
+    let backup = dir.path().join("backup");
+    first.id = 99;
+    assert!(first
+        .physical_checkpoint(&backup)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("startup binding"));
+    assert!(!backup.exists());
+    first.id = 1;
+    std::mem::swap(&mut first.state_machine, &mut other.state_machine);
+    assert!(first
+        .physical_checkpoint(&backup)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("startup binding"));
+    assert!(!backup.exists());
+    std::mem::swap(&mut first.state_machine, &mut other.state_machine);
+    first.physical_checkpoint(&backup).await?;
+    verify_physical_checkpoint(&backup, 7, 1)?;
+    first.raft.shutdown().await?;
+    other.raft.shutdown().await?;
+    Ok(())
+}

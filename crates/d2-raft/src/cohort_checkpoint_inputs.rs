@@ -55,6 +55,9 @@ pub async fn capture(
     fs::create_dir(root).context("create fresh recovery input directory")?;
     sync_parent(root)?;
     for node in std::iter::once(coordinator).chain(members.iter().copied()) {
+        // Uncontended storage locks may never yield. Let the caller abandon
+        // the operation before starting another synchronous replica capture.
+        tokio::task::yield_now().await;
         node.physical_checkpoint(root.join(node.group_id().to_string()))
             .await
             .with_context(|| {
@@ -89,6 +92,7 @@ pub async fn verify(
                 .with_context(|| format!("inspect physical checkpoint for group {shard}"))
         })
     };
+    tokio::task::yield_now().await;
     let proof = {
         let coordinator = open(authority.shard, coordinator_node)?;
         coordinator
@@ -108,6 +112,7 @@ pub async fn verify(
         "coordinator recovery identity mismatch"
     );
     for (member, node) in cohort.members.iter().zip(member_nodes) {
+        tokio::task::yield_now().await;
         let state = open(member.shard, *node)?;
         let info = state
             .participant_visibility_info(member.shard, member.epoch, member.mode)
