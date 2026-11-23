@@ -76,6 +76,23 @@ fencing, retention/GC, cross-shard restore and rolling upgrades remain separate
 work. Restoring one old replica is not proof of safe whole-cluster disaster
 recovery; operators must follow the existing consensus membership constraints.
 
+## Read-only local verification
+
+Call `d2_raft::verify_physical_checkpoint(backup, group_id, node_id)` on a
+trusted, immutable local backup. It checks the manifest and exact file
+inventory, validates the Raft log boundary, opens the state database read-only
+and runs the same eager loader as node startup. It compares the resulting
+applied LogId, membership and snapshot metadata to the manifest. Success
+requires no restore destination. Plan for the memory and I/O of a full local
+load. The caller must retain the immutable input throughout verification.
+
+This is the single-replica inspection prerequisite for
+[#349](https://github.com/ashione/VelaGraph/issues/349). A Raft LogId refers to
+one replica group's log. Certifying a managed decision version V additionally
+requires the coordinator's replay-validated decisions and the terminal evidence
+from every required member at that version. Whole-cohort recovery, retention
+through publication, and the READY decision remain open.
+
 ## Verification
 
 The focused suite exercises a real durable single-node Raft lifecycle, concurrent

@@ -10,6 +10,7 @@ async fn backup_at(root: &Path) -> anyhow::Result<()> {
 }
 
 fn rejected_before_destination(backup: &Path, destination: &Path) {
+    assert!(verify_physical_checkpoint(backup, 0, 1).is_err());
     assert!(restore_physical_checkpoint(backup, destination, 0, 1).is_err());
     assert_eq!(
         fs::symlink_metadata(destination).unwrap_err().kind(),
@@ -223,5 +224,41 @@ async fn rejects_changed_inventory_before_creating_destination() -> anyhow::Resu
     }
     fs::write(&path, original)?;
     restore_physical_checkpoint(&backup, dir.path().join("healthy"), 0, 1)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_verification_preserves_files_and_rejects_rehashed_invalid_state(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    backup_at(dir.path()).await?;
+    let backup = dir.path().join("backup");
+    let manifest_path = backup.join("checkpoint.json");
+    let original = fs::read(&manifest_path)?;
+    let mut manifest: Manifest = serde_json::from_slice(&original)?;
+    verify_physical_checkpoint(&backup, 0, 1)?;
+    assert_eq!(inventory(&backup)?, manifest.files);
+    assert_eq!(fs::read(&manifest_path)?, original);
+    assert_eq!(fs::read_dir(&backup)?.count(), 3);
+
+    // Substitute a separate DB whose bytes and checksums agree with the
+    // manifest but whose retry record has no owning D1 state.
+    let path = backup.join("state.db");
+    fs::rename(&path, dir.path().join("original-state"))?;
+    {
+        let invalid = DB::open_default(&path)?;
+        invalid.put(dedup_key(1), b"{}")?;
+        invalid.flush()?;
+    }
+    manifest.files = inventory(&backup)?;
+    let changed = serde_json::to_vec(&manifest)?;
+    fs::write(&manifest_path, &changed)?;
+    let error = verify_physical_checkpoint(&backup, 0, 1).unwrap_err();
+    assert!(
+        error.to_string().contains("orphan D1 retry record"),
+        "{error:#}"
+    );
+    assert_eq!(inventory(&backup)?, manifest.files);
+    assert_eq!(fs::read(&manifest_path)?, changed);
     Ok(())
 }
