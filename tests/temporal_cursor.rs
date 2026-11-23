@@ -46,7 +46,9 @@ fn batched_ids_share_one_cursor_and_preserve_order_duplicates_and_time() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(stats.record_reads, 4);
-        assert_eq!(stats.record_iterators, 1);
+        // Cross-query revision hits may avoid storage altogether; any misses
+        // still share at most one cursor across the entire ID batch.
+        assert!(stats.record_iterators <= 1);
     }
 }
 #[test]

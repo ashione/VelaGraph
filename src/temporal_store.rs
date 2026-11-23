@@ -6,6 +6,7 @@ use std::sync::Mutex;
 pub mod materialized;
 mod plan_cache;
 mod query_memo;
+mod revision_cache;
 
 use rocksdb::{DBRawIterator, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
 
@@ -95,6 +96,7 @@ pub struct TemporalStore {
     db: DB,
     write: Mutex<()>,
     plan_cache: Mutex<plan_cache::PlanCache>,
+    revision_cache: revision_cache::RevisionCache,
 }
 impl TemporalStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -123,6 +125,7 @@ impl TemporalStore {
             db,
             write: Mutex::new(()),
             plan_cache: Mutex::new(plan_cache::PlanCache::default()),
+            revision_cache: revision_cache::RevisionCache::default(),
         })
     }
 
@@ -179,7 +182,15 @@ impl TemporalStore {
         let mut write = WriteOptions::default();
         write.set_sync(true);
         check()?;
+        let base_sequence = self.db.latest_sequence_number();
         self.db.write_opt(batch, &write)?;
+        self.revision_cache.committed(
+            head,
+            version,
+            base_sequence,
+            self.db.latest_sequence_number(),
+            mutations,
+        );
         Ok(version)
     }
 
@@ -200,6 +211,7 @@ impl TemporalStore {
             version,
             valid_time,
             plan_cache: &self.plan_cache,
+            revision_cache: &self.revision_cache,
         })
     }
 }
@@ -260,6 +272,7 @@ pub struct TemporalStoreView<'a> {
     version: u64,
     valid_time: i64,
     plan_cache: &'a Mutex<plan_cache::PlanCache>,
+    revision_cache: &'a revision_cache::RevisionCache,
 }
 impl TemporalStoreView<'_> {
     pub fn version(&self) -> u64 {
@@ -268,44 +281,78 @@ impl TemporalStoreView<'_> {
     pub fn valid_time(&self) -> i64 {
         self.valid_time
     }
-    fn read_assertion<T>(
-        &self,
-        cursor: &mut DBRawIterator<'_>,
+    fn read_assertion<'a, T>(
+        &'a self,
+        cursor: &mut Option<DBRawIterator<'a>>,
         key: Key,
         decode: fn(&[u8]) -> crate::Result<T>,
     ) -> Result<Option<T>> {
+        if let Some(block) =
+            self.revision_cache
+                .get(key, self.version, self.snapshot.sequence_number())
+        {
+            if let Some(hit) = block.lookup(self.valid_time) {
+                return hit.payload.map(decode).transpose().map_err(Into::into);
+            }
+        }
+        let mut builder = self.revision_cache.builder();
+        let cursor = cursor.get_or_insert_with(|| self.snapshot.raw_iterator());
         let start = revision_key_bytes(key, self.version, 0);
         let prefix = &start[..IDENTITY_PREFIX_LEN];
         let mut rows = 0;
         let mut bytes = 0usize;
         cursor.seek(start);
-        while let Some((key, value)) = cursor.item() {
-            if !key.starts_with(prefix) {
+        while let Some((row_key, value)) = cursor.item() {
+            if !row_key.starts_with(prefix) {
                 break;
             }
             if rows >= MAX_READ_REVISIONS {
                 return Err(TemporalStoreError::Limit);
             }
             rows += 1;
-            let (valid, payload) = decode_revision(key, value, self.version)?;
+            let (valid, payload) = decode_revision(row_key, value, self.version)?;
             bytes = bytes
-                .checked_add(key.len() + value.len())
+                .checked_add(row_key.len() + value.len())
                 .ok_or(TemporalStoreError::Limit)?;
             if bytes > MAX_READ_BYTES {
                 return Err(TemporalStoreError::Limit);
             }
+            revision_cache::capture(&mut builder, valid, value);
             if valid.from <= self.valid_time && valid.to.is_none_or(|to| self.valid_time < to) {
-                return Ok(payload.map(decode).transpose()?);
+                let result = payload.map(decode).transpose()?;
+                if let Some(builder) = builder {
+                    self.revision_cache.insert(
+                        key,
+                        self.version,
+                        self.snapshot.sequence_number(),
+                        builder,
+                        false,
+                    );
+                }
+                return Ok(result);
             }
             cursor.next();
         }
         cursor.status()?;
+        if let Some(builder) = builder {
+            self.revision_cache.insert(
+                key,
+                self.version,
+                self.snapshot.sequence_number(),
+                builder,
+                true,
+            );
+        }
         Ok(None)
     }
     pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        self.read_vertex(&mut self.snapshot.raw_iterator(), id)
+        self.read_vertex(&mut None, id)
     }
-    fn read_vertex(&self, cursor: &mut DBRawIterator<'_>, id: u64) -> Result<Option<Vertex>> {
+    fn read_vertex<'a>(
+        &'a self,
+        cursor: &mut Option<DBRawIterator<'a>>,
+        id: u64,
+    ) -> Result<Option<Vertex>> {
         let Some(vertex) = self.read_assertion(cursor, Key::Vertex(id), codec::decode_vertex)?
         else {
             return Ok(None);
@@ -319,7 +366,7 @@ impl TemporalStoreView<'_> {
     /// Assertions may be recorded before endpoints. Visibility requires both
     /// endpoints at V/T; this never weakens v1 create-edge validation.
     pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
-        let mut cursor = self.snapshot.raw_iterator();
+        let mut cursor = None;
         let Some(edge) = self.read_assertion(&mut cursor, Key::Edge(id), codec::decode_edge)?
         else {
             return Ok(None);

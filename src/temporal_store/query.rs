@@ -18,7 +18,8 @@ impl TemporalStoreView<'_> {
     pub fn execute_gremlin(&self, text: &str) -> crate::Result<GremlinResult> {
         #[cfg(feature = "query-profiling")]
         let _api = crate::query_profile::Timer::start(crate::query_profile::Phase::Api);
-        // Only immutable syntax plans are reused. No result, view or budget is cached.
+        // Syntax plans and revision prefixes are reused; each execution has fresh
+        // V/T checks, endpoint validation, work limits and live-memory charges.
         // A poisoned optimization cache is treated as a miss; query/storage errors
         // still propagate through the unchanged execution path below.
         let cached = self
@@ -158,10 +159,13 @@ impl<'a, 'db> Backend<'a, 'db> {
         Ok(())
     }
     fn charge(&self, bytes: usize) -> crate::Result<()> {
+        self.charge_many(1, bytes)
+    }
+    fn charge_many(&self, count: usize, bytes: usize) -> crate::Result<()> {
         let rows = self
             .rows
             .get()
-            .checked_add(1)
+            .checked_add(count)
             .ok_or_else(|| error(TemporalStoreError::Limit))?;
         let bytes = self
             .bytes
@@ -189,6 +193,43 @@ impl<'a, 'db> Backend<'a, 'db> {
             use crate::query_profile::{read_event, ReadEvent};
             read_event(ReadEvent::Read);
         }
+        if let Some(block) = self.view.revision_cache.get(
+            identity,
+            self.view.version,
+            self.view.snapshot.sequence_number(),
+        ) {
+            if let Some(hit) = block.lookup(self.view.valid_time) {
+                // If any prefix admission might fail, replay storage in original
+                // row order so competing memory/work errors keep their precedence.
+                let fits = self.rows.get().checked_add(hit.rows).is_some_and(|rows| {
+                    rows <= MAX_READ_REVISIONS.min(self.limits.max_work_operations)
+                }) && self
+                    .bytes
+                    .get()
+                    .checked_add(hit.bytes)
+                    .is_some_and(|bytes| bytes <= MAX_READ_BYTES.min(self.limits.max_work_bytes))
+                    && hit.peak_bytes <= budget.available();
+                if fits {
+                    self.charge_many(hit.rows, hit.bytes)?;
+                    // Reproduce the largest transient raw-row reservation before
+                    // decoding the selected payload under its original raw charge.
+                    drop(budget.reserve(hit.peak_bytes)?);
+                    let _raw = budget.reserve(hit.selected_bytes)?;
+                    self.check()?;
+                    return hit
+                        .payload
+                        .map(|bytes| {
+                            #[cfg(feature = "query-profiling")]
+                            crate::query_profile::read_event(
+                                crate::query_profile::ReadEvent::Decode,
+                            );
+                            decode(bytes, budget)
+                        })
+                        .transpose();
+                }
+            }
+        }
+        let mut builder = self.view.revision_cache.builder();
         let start = revision_key_bytes(identity, self.view.version, 0);
         let prefix = &start[..IDENTITY_PREFIX_LEN];
         let view: &'a TemporalStoreView<'db> = self.view;
@@ -224,19 +265,39 @@ impl<'a, 'db> Backend<'a, 'db> {
             self.charge(key.len() + value.len())?;
             let _raw = budget.reserve(key.len() + value.len())?;
             let (valid, payload) = decode_revision(key, value, self.view.version).map_err(error)?;
+            revision_cache::capture(&mut builder, valid, value);
             if valid.from <= self.view.valid_time
                 && valid.to.is_none_or(|to| self.view.valid_time < to)
             {
                 self.check()?;
-                return payload
+                let result = payload
                     .map(|bytes| {
                         #[cfg(feature = "query-profiling")]
                         crate::query_profile::read_event(crate::query_profile::ReadEvent::Decode);
                         decode(bytes, budget)
                     })
-                    .transpose();
+                    .transpose()?;
+                if let Some(builder) = builder {
+                    self.view.revision_cache.insert(
+                        identity,
+                        self.view.version,
+                        self.view.snapshot.sequence_number(),
+                        builder,
+                        false,
+                    );
+                }
+                return Ok(result);
             }
             cursor.next();
+        }
+        if let Some(builder) = builder {
+            self.view.revision_cache.insert(
+                identity,
+                self.view.version,
+                self.view.snapshot.sequence_number(),
+                builder,
+                true,
+            );
         }
         Ok(None)
     }

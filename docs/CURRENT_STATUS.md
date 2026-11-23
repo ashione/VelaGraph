@@ -292,3 +292,12 @@ data after unlocking; admission includes the candidate construction peak. Record
 budgets precede validation and bulk compaction. Checkpoint publication serializes
 through a directory file lock and rejects stale/conflicting target versions.
 Existing disk, temporal and managed APIs remain distinct; memory publication is not durable ACK.
+
+## Local temporal revision reuse
+
+The local `TemporalStore` now uses [bounded revision-prefix blocks](TEMPORAL_REVISION_CACHE.md)
+for point and Gremlin reads. Reuse across unchanged commits is guarded by logical
+version and physical snapshot sequence; interval indexing preserves revision
+precedence and query budgets. This adds no distributed, storage-format or public
+protocol capability. Synthetic benchmark evidence and cold/write tradeoffs are
+recorded with the cache contract.
