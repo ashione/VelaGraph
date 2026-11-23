@@ -217,11 +217,23 @@ pub fn verify_physical_checkpoint(
     group_id: u64,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    let (backup, manifest) = checked_manifest(backup.as_ref(), group_id, node_id)?;
+    open_verified_state(backup.as_ref(), group_id, node_id).map(drop)
+}
+
+fn open_verified_state(
+    backup: &Path,
+    group_id: u64,
+    node_id: NodeId,
+) -> anyhow::Result<StateMachine> {
+    let (backup, manifest) = checked_manifest(backup, group_id, node_id)?;
     let db = DB::open_for_read_only(&Options::default(), backup.join("state.db"), false)?;
     let state = StateMachine::load_from_db(db)?;
-    validate_state_cut(&state, &manifest)
+    validate_state_cut(&state, &manifest)?;
+    Ok(state)
 }
+
+#[path = "cohort_checkpoint_inputs.rs"]
+pub mod cohort_inputs;
 
 /// Restore a local backup into a newly created directory. Never overwrites an
 /// existing path, joins a cluster, or changes identity. The original replica

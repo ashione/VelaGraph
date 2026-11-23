@@ -88,10 +88,51 @@ load. The caller must retain the immutable input throughout verification.
 
 This is the single-replica inspection prerequisite for
 [#349](https://github.com/ashione/VelaGraph/issues/349). A Raft LogId refers to
-one replica group's log. Certifying a managed decision version V additionally
-requires the coordinator's replay-validated decisions and the terminal evidence
-from every required member at that version. Whole-cohort recovery, retention
-through publication, and the READY decision remain open.
+one replica group's log. The cohort check below also compares managed decision evidence from every
+required replica at an explicitly selected V.
+
+## Local fixed-cohort recovery inputs
+
+`d2_raft::cohort_inputs::capture` takes a fresh directory, an expected
+authority and cohort, an explicit managed decision ordinal V, one durable local
+coordinator replica, and one durable local replica per member in cohort order.
+This local layout maps each shard to the Raft group of the same numeric ID.
+The directory is caller-owned on a trusted, persistent filesystem.
+
+Physical capture checks that each handle still refers to the node ID and state
+machine paired with its log store at durable startup. A relabelled handle or
+substituted state machine fails before that replica's backup is created.
+
+The call creates one physical checkpoint per group under `<root>/<group-id>`.
+The existing physical capture locks establish each replica's own immutable
+Raft/state cut. Captures run serially and may have different LogIds or include
+later decisions. Verification reopens the captured coordinator read-only,
+reconstructs its replay-validated terminal prefix through V and releases that
+database before opening each member. Every member must match the complete cohort
+and authority, have an empty baseline, have applied through V, and match the
+coordinator's terminal history, including Abort and nonparticipating decisions.
+The caller supplies no proof bytes. A hole at or before V or a lagging member
+fails the operation. A hole after V leaves earlier complete prefixes available.
+
+Keep all these local directories immutable through publication and subsequent
+recovery. Their files survive source shutdown, timeout and verifier drop.
+Capture refuses to reuse an existing root and leaves partial attempts on disk.
+After interruption, invoke `cohort_inputs::verify` with the intended V, identities
+and node IDs to check the files again. Directory existence alone cannot establish
+completion. Use a fresh root for another capture and budget disk for all retained
+attempts. There is no automatic deletion. Bounds are the existing cohort/profile
+limits and one replica load per invocation; startup validation still eagerly
+loads one replica's state. Explicit yield points between replicas and before
+verification let the caller cancel without starting another replica. An
+in-progress replica's synchronous RocksDB work can finish before cancellation
+takes effect.
+
+This operation establishes a common **prefix** across immutable inputs. It
+cannot start a restored cohort, roll the individual databases back to V, or
+recover writes newer than a checkpoint. Global manifest publication and
+durable binding of a generation to its V are tracked in
+[#350](https://github.com/ashione/VelaGraph/issues/350). The offline-only
+restore guard continues to apply.
 
 ## Verification
 
