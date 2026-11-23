@@ -28,18 +28,25 @@ fn page(d: &SnapshotDescriptor, key: u8, more: bool) -> SnapshotPage {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnavailableAt {
+    Open,
+    Page(usize),
+}
+
 #[derive(Clone)]
 struct ScriptedPeer {
     descriptor: SnapshotDescriptor,
     state: std::sync::Arc<std::sync::Mutex<ScriptState>>,
     delay: Duration,
     expect_close: bool,
+    unavailable: Option<UnavailableAt>,
 }
 struct ScriptState {
-    opened: bool,
+    open_calls: usize,
     pages: std::collections::VecDeque<SnapshotPage>,
     page_index: usize,
-    closed: bool,
+    close_calls: usize,
     finished: Option<tokio::sync::oneshot::Sender<()>>,
     close_gate: Option<(
         tokio::sync::oneshot::Sender<()>,
@@ -66,8 +73,10 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
         self.check_context(request.context);
         assert_eq!(request.shard, 7);
         let mut state = self.state.lock().unwrap();
-        assert!(!state.opened, "downloader must not reopen or retry");
-        state.opened = true;
+        state.open_calls += 1;
+        if self.unavailable == Some(UnavailableAt::Open) {
+            return Err(tonic::Status::unavailable("unavailable"));
+        }
         Ok(tonic::Response::new(self.descriptor.clone().into()))
     }
     async fn page(
@@ -84,7 +93,7 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
         assert_eq!(descriptor, self.descriptor);
         let (page, finished) = {
             let mut state = self.state.lock().unwrap();
-            assert!(state.opened && !state.closed);
+            assert!(state.open_calls == 1 && state.close_calls == 0);
             assert_eq!(
                 request.cursor.map(|c| c.position),
                 (state.page_index != 0).then_some(state.page_index as u64)
@@ -94,6 +103,9 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
                 .pages
                 .pop_front()
                 .expect("unexpected fetch or retry after invalid page");
+            if self.unavailable == Some(UnavailableAt::Page(state.page_index)) {
+                return Err(tonic::Status::unavailable("unavailable"));
+            }
             let finished = if state.pages.is_empty() && !self.expect_close {
                 state.finished.take()
             } else {
@@ -131,19 +143,21 @@ impl grpc::wire::snapshot_service_server::SnapshotService for ScriptedPeer {
         assert_eq!(descriptor, self.descriptor);
         let (gate, finished) = {
             let mut state = self.state.lock().unwrap();
-            assert!(self.expect_close && state.opened && !state.closed);
+            assert!(self.expect_close && state.open_calls == 1 && state.close_calls == 0);
             assert!(
                 state.pages.is_empty(),
                 "must stop fetching at the scripted boundary"
             );
-            state.closed = true;
+            state.close_calls += 1;
             (state.close_gate.take(), state.finished.take())
         };
         if let Some((closing, released)) = gate {
             closing.send(()).unwrap();
             released.await.unwrap();
         }
-        finished.expect("one close only").send(()).unwrap();
+        if let Some(finished) = finished {
+            finished.send(()).unwrap();
+        }
         Ok(tonic::Response::new(grpc::wire::Empty {}))
     }
 }
@@ -153,9 +167,9 @@ async fn peer(
     delay: Duration,
     expect_close: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    peer_with_gate(d, pages, delay, expect_close, None).await
+    scripted_peer(d, pages, delay, expect_close, None, None).await
 }
-async fn peer_with_gate(
+async fn scripted_peer(
     d: SnapshotDescriptor,
     pages: Vec<SnapshotPage>,
     delay: Duration,
@@ -164,16 +178,25 @@ async fn peer_with_gate(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    fault: Option<(UnavailableAt, tokio::sync::oneshot::Receiver<()>)>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
-    let (finished, shutdown) = tokio::sync::oneshot::channel();
+    // Fault tests own shutdown so a retry can still reach the peer after an error.
+    let (unavailable, finished, shutdown) = match fault {
+        Some((fault, shutdown)) => (Some(fault), None, shutdown),
+        None => {
+            let (finished, shutdown) = tokio::sync::oneshot::channel();
+            (None, Some(finished), shutdown)
+        }
+    };
+    let expected_pages = pages.len();
     let state = std::sync::Arc::new(std::sync::Mutex::new(ScriptState {
-        opened: false,
+        open_calls: 0,
         pages: pages.into(),
         page_index: 0,
-        closed: false,
-        finished: Some(finished),
+        close_calls: 0,
+        finished,
         close_gate,
     }));
     let service = ScriptedPeer {
@@ -181,6 +204,7 @@ async fn peer_with_gate(
         state: state.clone(),
         delay,
         expect_close,
+        unavailable,
     };
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -194,8 +218,14 @@ async fn peer_with_gate(
             .await
             .unwrap();
         let state = state.lock().unwrap();
-        assert!(state.opened && state.pages.is_empty());
-        assert_eq!(state.closed, expect_close);
+        assert_eq!(state.open_calls, 1, "unexpected Open count");
+        assert_eq!(state.page_index, expected_pages, "unexpected Page count");
+        assert_eq!(
+            state.close_calls,
+            usize::from(expect_close),
+            "unexpected Close count"
+        );
+        assert!(state.pages.is_empty());
     });
     (endpoint, task)
 }
@@ -255,6 +285,38 @@ async fn malformed_downloads_fail_and_close_without_partial_results() {
 }
 
 #[tokio::test]
+async fn unavailable_at_open_or_second_page_never_returns_a_partial_snapshot() {
+    for fault in [UnavailableAt::Open, UnavailableAt::Page(2)] {
+        let d = descriptor();
+        let opened = fault != UnavailableAt::Open;
+        let pages = if opened {
+            vec![page(&d, 1, true), page(&d, 2, false)]
+        } else {
+            vec![]
+        };
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let (address, server) = scripted_peer(
+            d.clone(),
+            pages,
+            Duration::ZERO,
+            opened,
+            None,
+            Some((fault, shutdown)),
+        )
+        .await;
+        let result =
+            paged_snapshot_identified(address, d.identity, d.shard, Duration::from_secs(3)).await;
+        assert!(matches!(result, Err(RemoteError::Unavailable)));
+        // Stop only once the caller has returned, then check all RPC counts.
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn successive_pages_share_one_deadline() {
     let d = descriptor();
     let pages = vec![page(&d, 1, true), page(&d, 2, false)];
@@ -294,12 +356,13 @@ async fn completed_download_retains_admission_until_close_finishes() {
         entries,
         next: None,
     };
-    let (endpoint, server) = peer_with_gate(
+    let (endpoint, server) = scripted_peer(
         d,
         vec![page],
         Duration::ZERO,
         true,
         Some((closing, released)),
+        None,
     )
     .await;
     let download = tokio::spawn(paged_snapshot_identified(

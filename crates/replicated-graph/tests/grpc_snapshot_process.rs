@@ -10,6 +10,7 @@ use replicated_graph::{
 };
 use std::{
     net::SocketAddr,
+    path::Path,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,6 +29,10 @@ use velagraph::{GraphRecordStore, Value, Vertex};
 
 const SHARD: u64 = 7;
 const BUDGET: Duration = Duration::from_secs(10);
+#[derive(Debug, thiserror::Error)]
+#[error("snapshot fixture seed vertex {0}/36")]
+struct SeedVertex(u64);
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -153,7 +158,7 @@ impl Cluster {
     fn grpc(&self) -> SocketAddr {
         self.addresses[4 * self.leader + 3]
     }
-    async fn seed(&self) -> anyhow::Result<()> {
+    async fn seed(&mut self, evidence_dir: Option<&Path>) -> anyhow::Result<()> {
         let node = RemoteStorageNode::new_identified(
             self.grpc(),
             self.identity().group,
@@ -172,7 +177,7 @@ impl Cluster {
                     .insert("payload".into(), Value::Text("x".repeat(64 * 1024)));
                 graph
                     .create_vertex(&vertex)
-                    .with_context(|| format!("snapshot fixture seed vertex {id}/36"))?;
+                    .with_context(|| SeedVertex(id))?;
             }
             Ok(())
         })
@@ -182,7 +187,37 @@ impl Cluster {
         if let Err(error) = result {
             // Observation only, after failure: never retry a mutation or treat
             // a later healthy status as proof that the failed barrier succeeded.
-            return Err(error.context(self.failure_status().await));
+            let children: Vec<_> = self
+                ._processes
+                .iter_mut()
+                .enumerate()
+                .map(|(i, child)| {
+                    let state = match child.0.try_wait() {
+                        Ok(None) => "running",
+                        Ok(Some(_)) => "exited",
+                        Err(_) => "unknown",
+                    };
+                    serde_json::json!({"node": i + 1, "pid": child.0.id(), "state": state})
+                })
+                .collect();
+            let status = self.failure_status().await;
+            if let Some(dir) = evidence_dir {
+                let observation = serde_json::json!({
+                    "phase": "snapshot_seed",
+                    "vertex": error.downcast_ref::<SeedVertex>().map(|step| step.0),
+                    "selected_leader": self.leader + 1,
+                    "children_after_error": children,
+                    "control_after_error": status,
+                });
+                let write = std::fs::File::create_new(dir.join("snapshot-seed-failure.json"))
+                    .and_then(|file| {
+                        serde_json::to_writer(file, &observation).map_err(std::io::Error::from)
+                    });
+                if let Err(capture) = write {
+                    eprintln!("snapshot seed evidence unavailable: {}", capture.kind());
+                }
+            }
+            return Err(error.context(status));
         }
         Ok(())
     }
@@ -314,8 +349,9 @@ async fn differential() -> anyhow::Result<()> {
     let mut cluster = Cluster::start("differential")
         .await
         .with_context(|| "snapshot differential: cluster-start")?;
+    let evidence = std::env::var_os("VELAGRAPH_REMOTE_EVIDENCE_DIR");
     cluster
-        .seed()
+        .seed(evidence.as_deref().map(Path::new))
         .await
         .with_context(|| "snapshot differential: seed")?;
     let proxy = Proxy::start(cluster.grpc())
@@ -803,10 +839,30 @@ async fn seed_quorum_loss_preserves_stage_and_bounded_status_evidence() -> anyho
                 process.0.wait()?;
             }
         }
-        let error = timeout(Duration::from_secs(12), cluster.seed())
+        let dir = tempfile::tempdir()?;
+        let error = timeout(Duration::from_secs(12), cluster.seed(Some(dir.path())))
             .await?
             .expect_err("seed must not succeed without a quorum");
+        let record: serde_json::Value = serde_json::from_reader(std::fs::File::open(
+            dir.path().join("snapshot-seed-failure.json"),
+        )?)?;
+        ensure!(record["phase"] == "snapshot_seed" && record["vertex"] == 1);
+        ensure!(record["selected_leader"] == cluster.leader + 1);
+        let children = record["children_after_error"]
+            .as_array()
+            .context("missing children")?;
+        ensure!(children.len() == 3);
+        for (i, child) in children.iter().enumerate() {
+            ensure!(child["node"] == i + 1 && child["pid"] == cluster._processes[i].0.id());
+            let state = if i == cluster.leader {
+                "running"
+            } else {
+                "exited"
+            };
+            ensure!(child["state"] == state);
+        }
         let evidence = format!("{error:#}");
+        ensure!(record["control_after_error"] == error.to_string());
         ensure!(
             evidence.contains("seed vertex 1/36"),
             "missing seed stage: {evidence}"
