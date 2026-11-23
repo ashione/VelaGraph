@@ -154,7 +154,7 @@ fn checked_manifest(
     backup: &Path,
     group_id: u64,
     node_id: NodeId,
-) -> anyhow::Result<(std::path::PathBuf, Manifest, [u8; 32])> {
+) -> anyhow::Result<(std::path::PathBuf, Manifest, Vec<u8>)> {
     // Components removes trailing separators / `.` so a root symlink cannot
     // evade symlink_metadata through a spelling such as "backup-link/".
     // This does not resolve ancestors or `..`, or prevent concurrent changes.
@@ -198,7 +198,7 @@ fn checked_manifest(
         manifest.log.as_ref() == Some(&log),
         "checkpoint log metadata mismatch"
     );
-    Ok((backup_path, manifest, Sha256::digest(&bytes).into()))
+    Ok((backup_path, manifest, bytes))
 }
 
 fn validate_state_cut(state: &StateMachine, manifest: &Manifest) -> anyhow::Result<()> {
@@ -235,11 +235,11 @@ fn open_verified_state(
     group_id: u64,
     node_id: NodeId,
 ) -> anyhow::Result<(StateMachine, [u8; 32])> {
-    let (backup, manifest, digest) = checked_manifest(backup, group_id, node_id)?;
+    let (backup, manifest, bytes) = checked_manifest(backup, group_id, node_id)?;
     let db = DB::open_for_read_only(&Options::default(), backup.join("state.db"), false)?;
     let state = StateMachine::load_from_db(db)?;
     validate_state_cut(&state, &manifest)?;
-    Ok((state, digest))
+    Ok((state, Sha256::digest(&bytes).into()))
 }
 
 #[path = "cohort_checkpoint_inputs.rs"]
@@ -257,8 +257,31 @@ pub fn restore_physical_checkpoint(
     group_id: u64,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    let (backup, manifest, _) = checked_manifest(backup.as_ref(), group_id, node_id)?;
-    let destination = destination.as_ref();
+    restore_replica(
+        backup.as_ref(),
+        destination.as_ref(),
+        group_id,
+        node_id,
+        None,
+    )
+}
+
+// A cohort restore preserves the producer's exact inventory for the final
+// read-only prefix check. Standalone restores retain their existing layout.
+fn restore_replica(
+    backup: &Path,
+    destination: &Path,
+    group_id: u64,
+    node_id: NodeId,
+    selected_digest: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    let (backup, manifest, bytes) = checked_manifest(backup, group_id, node_id)?;
+    if let Some(expected) = selected_digest {
+        anyhow::ensure!(
+            <[u8; 32]>::from(Sha256::digest(&bytes)) == expected,
+            "physical checkpoint generation mismatch"
+        );
+    }
     fs::create_dir(destination)?;
     write_new(&destination.join("RESTORE_INCOMPLETE"), b"1")?;
     File::open(destination)?.sync_all()?;
@@ -290,10 +313,16 @@ pub fn restore_physical_checkpoint(
         );
         target.sync_all()?;
     }
-    validate_state_cut(
-        &StateMachine::open(destination.join("state.db"))?,
-        &manifest,
-    )?;
+    if selected_digest.is_some() {
+        // A writable open could change the files covered by the inventory.
+        // The cohort verifier opens the copied databases before publication.
+        write_new(&destination.join("checkpoint.json"), &bytes)?;
+    } else {
+        validate_state_cut(
+            &StateMachine::open(destination.join("state.db"))?,
+            &manifest,
+        )?;
+    }
     let identity = serde_json::json!({"version":1,"group_id":group_id,"node_id":node_id});
     write_new(
         &destination.join("raft-group.json"),
