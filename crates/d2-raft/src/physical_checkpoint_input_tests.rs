@@ -7,6 +7,7 @@ async fn backup_at(root: &Path) -> anyhow::Result<()> {
     state
         .physical_checkpoint(&logs, &root.join("backup"), 0, 1)
         .await
+        .map(drop)
 }
 
 fn rejected_before_destination(backup: &Path, destination: &Path) {

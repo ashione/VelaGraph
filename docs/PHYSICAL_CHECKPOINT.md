@@ -134,6 +134,50 @@ durable binding of a generation to its V are tracked in
 [#350](https://github.com/ashione/VelaGraph/issues/350). The offline-only
 restore guard continues to apply.
 
+## Publishing one local decision-prefix generation
+
+`d2_raft::cohort_inputs::generation` supports the D2 decision-prefix input
+profile on a trusted local filesystem. It covers the producer's coordinator
+and each ordered member's `raft.db` and `state.db`. A deployment that needs a
+separate application catalog or temporal database still needs a graph-level
+backup protocol. This record cannot establish graph data coverage or query READY.
+
+1. Call `prepare` with a fresh directory and the trusted live handles from one
+   in-process registry. The producer captures each replica and hashes the exact
+   physical manifest bytes it writes. Retain the directory and all its files
+   with exclusive control of the path and its ancestors.
+2. Save `Prepared::digest()` with the intended path, authority, cohort and V
+   in independent trusted storage. Then call `Prepared::publish().await`.
+   Publication reopens every replica and verifies its identity, file inventory,
+   log boundary, managed prefix and original producer digest. It fsyncs a
+   same-directory temporary record, installs the final name create-only, and
+   fsyncs the directory. A retry verifies the components again and accepts
+   only byte-identical existing contents.
+3. On restart, pass that saved selection to `generation::verify`. It checks
+   the entire closure again. If acknowledgement was lost, a successful reopen
+   establishes that the selected bytes are present; sync the directory before
+   acknowledging durability if the original directory sync was uncertain.
+   A missing final record requires a fresh attempt. A digest obtained from
+   the backup itself cannot establish its provenance.
+
+The final file is `prefix-generation.json`, a JSON object bounded to 64 KiB.
+The `format` tag is `d2-local-decision-prefix-v1`. It contains a random
+16-byte generation ID, authority, full cohort (including epochs and capacity
+profile), V (`version`), coordinator node ID, ordered member node IDs and
+`checkpoint_sha256`. Each 32-byte entry hashes the raw bytes of the physical
+`checkpoint.json` in the directory named for that group. The coordinator
+comes first, followed by members in cohort order. The selection digest is
+SHA-256 of the exact final file bytes. Older raw checkpoint directories remain
+usable through the prefix verifier; only a new capture produces this format.
+
+Prepare, publish and verify visit at most one coordinator and 64 members
+serially. Each physical verifier reads the full inventory and eagerly opens one
+replica state at a time. Provision storage and memory for those inputs.
+Cancellation can interrupt between replicas or before publication enters its
+synchronous filesystem step. Partial roots and orphan temporary files can remain.
+The producer or operator must retain the files through every use. This API
+performs no reclamation or provider-side pinning.
+
 ## Verification
 
 The focused suite exercises a real durable single-node Raft lifecycle, concurrent
