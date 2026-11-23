@@ -44,7 +44,13 @@ No error is replaced with an assumed successful write.
   admission bounds; they do not lower the existing query history limits.
 - Retention is reserved before copying bytes. An evicted/replaced block stays
   charged until its final `Arc` reader releases it. Building a replacement also
-  needs budget; saturation can prevent new admissions, which safely use storage.
+  needs budget. On allocation pressure, a builder tries nonblocking round-robin
+  eviction, inspecting at most 512 slots in total across its header and row
+  reservations. Resident blocks can therefore make room for a new working set.
+  Contended slots are skipped and evicted blocks are dropped outside the slot
+  lock. Readers/in-progress builders still holding all bytes can prevent
+  admission; that read safely uses storage. Per-block oversize rejects before
+  attempting eviction.
 - Warm Gremlin lookups charge the same logical rows and bytes as the original
   scan, including nonmatching revisions before the winner. Raw-row peak memory
   and selected-payload memory reservations remain enforced. If aggregate
@@ -67,6 +73,9 @@ history/payload fallback and cold/warm budget and cancellation behavior. The
 profiling test verifies that an unchanged identity can avoid both seek and
 iterator creation after an unrelated commit. Unit tests cover overlap precedence,
 incomplete-prefix misses, contiguous acknowledgements and last-reader charging.
+Deterministic saturation tests fill the byte budget across distinct real slots,
+switch/update cached identities, exercise row-growth pressure and held/contended
+readers, and prove that a new real query warms without another storage seek.
 The existing corruption and dense temporal-oracle tests remain applicable.
 
 Run:
@@ -88,7 +97,7 @@ throughput, total-memory or concurrent-write claim.
 
 ### Local synthetic measurement
 
-Baseline `dd03bd5`, candidate implementation in this PR; Apple M2 Pro, macOS
+Baseline `dd03bd5`, candidate `ec01b2c` (before pressure eviction); Apple M2 Pro, macOS
 arm64, Rust 1.100.0 release, RocksDB linked with optimization. Both binaries were
 built before timing. Three serial paired runs (baseline/candidate,
 candidate/baseline, baseline/candidate), 10,000 verified warm queries per shape

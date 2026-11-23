@@ -113,6 +113,7 @@ pub(super) struct RevisionCache {
     slots: Box<[Mutex<Option<Entry>>]>,
     hash: RandomState,
     used: Arc<AtomicUsize>,
+    next_victim: AtomicUsize,
 }
 impl Default for RevisionCache {
     fn default() -> Self {
@@ -120,6 +121,7 @@ impl Default for RevisionCache {
             slots: (0..SLOTS).map(|_| Mutex::new(None)).collect(),
             hash: RandomState::new(),
             used: Arc::new(AtomicUsize::new(0)),
+            next_victim: AtomicUsize::new(0),
         }
     }
 }
@@ -144,20 +146,53 @@ impl RevisionCache {
             })
             .map(|e| e.block.clone())
     }
-    pub fn builder(&self) -> Option<Builder> {
+    // One builder can inspect at most SLOTS victims across all reservations.
+    // Dropping a slot only releases residency: live readers retain the charge.
+    fn reserve(&self, charge: &mut Charge, bytes: usize, remaining: &mut usize) -> bool {
+        if bytes > BLOCK_BYTES.saturating_sub(charge.bytes) {
+            return false;
+        }
+        if charge.grow(bytes) {
+            return true;
+        }
+        while *remaining > 0 {
+            *remaining -= 1;
+            let index = self.next_victim.fetch_add(1, Ordering::Relaxed) % SLOTS;
+            let old = self.slots[index]
+                .try_lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            drop(old);
+            if charge.grow(bytes) {
+                return true;
+            }
+        }
+        false
+    }
+    pub fn builder(&self) -> Option<Builder<'_>> {
         let mut charge = Charge {
             used: self.used.clone(),
             bytes: 0,
         };
-        if !charge.grow(BLOCK_OVERHEAD) {
+        let mut remaining = SLOTS;
+        if !self.reserve(&mut charge, BLOCK_OVERHEAD, &mut remaining) {
             return None;
         }
         Some(Builder {
+            cache: self,
+            remaining,
             rows: Vec::new(),
             charge,
         })
     }
-    pub fn insert(&self, key: Key, version: u64, sequence: u64, builder: Builder, complete: bool) {
+    pub fn insert(
+        &self,
+        key: Key,
+        version: u64,
+        sequence: u64,
+        builder: Builder<'_>,
+        complete: bool,
+    ) {
         let mut guard = match self.slot(key).try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -218,18 +253,22 @@ impl RevisionCache {
         }
     }
 }
-pub(super) struct Builder {
+pub(super) struct Builder<'a> {
+    cache: &'a RevisionCache,
+    remaining: usize,
     rows: Vec<Row>,
     charge: Charge,
 }
-impl Builder {
+impl Builder<'_> {
     /// Reserve before allocating. Two row widths cover geometric Vec capacity;
     /// one index width covers the immutable index built at publication.
     pub fn push(&mut self, valid: Interval, value: &[u8]) -> bool {
         if self.rows.len() == MAX_ROWS
-            || !self
-                .charge
-                .grow(2 * size_of::<Row>() + size_of::<Index>() + value.len())
+            || !self.cache.reserve(
+                &mut self.charge,
+                2 * size_of::<Row>() + size_of::<Index>() + value.len(),
+                &mut self.remaining,
+            )
         {
             return false;
         }
@@ -276,7 +315,7 @@ impl Builder {
     }
 }
 
-pub(super) fn capture(builder: &mut Option<Builder>, valid: Interval, value: &[u8]) {
+pub(super) fn capture(builder: &mut Option<Builder<'_>>, valid: Interval, value: &[u8]) {
     if builder.as_mut().is_some_and(|b| !b.push(valid, value)) {
         *builder = None;
     }
@@ -285,7 +324,7 @@ pub(super) fn capture(builder: &mut Option<Builder>, valid: Interval, value: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn row(builder: &mut Builder, from: i64, to: Option<i64>) {
+    fn row(builder: &mut Builder<'_>, from: i64, to: Option<i64>) {
         let valid = Interval { from, to };
         let value = super::super::encode_assertion(valid, Some(&[42])).unwrap();
         assert!(builder.push(valid, &value));
@@ -410,6 +449,149 @@ mod tests {
             .unwrap()
             .payload
             .is_none());
+    }
+    // Fill distinct real cache slots exactly, independent of RandomState.
+    fn fill_budget(cache: &RevisionCache) -> Vec<Key> {
+        let mut keys = Vec::new();
+        let mut slots = std::collections::HashSet::new();
+        for id in 0.. {
+            let key = Key::Vertex(id);
+            if slots.insert(cache.slot(key) as *const _ as usize) {
+                keys.push(key);
+                if keys.len() == CACHE_BYTES / BLOCK_BYTES {
+                    break;
+                }
+            }
+        }
+        for &key in &keys {
+            let block_bytes = BLOCK_BYTES.min(CACHE_BYTES - cache.used.load(Ordering::Acquire));
+            let mut builder = cache.builder().unwrap();
+            let payload_len =
+                block_bytes - BLOCK_OVERHEAD - 2 * size_of::<Row>() - size_of::<Index>() - 19;
+            let valid = Interval { from: 0, to: None };
+            let value =
+                super::super::encode_assertion(valid, Some(&vec![42; payload_len])).unwrap();
+            assert!(builder.push(valid, &value));
+            cache.insert(key, 1, 1, builder, true);
+        }
+        assert_eq!(cache.used.load(Ordering::Acquire), CACHE_BYTES);
+        keys
+    }
+    #[test]
+    fn saturated_cache_admits_new_hot_identity_and_changed_identity() {
+        for changed in [false, true] {
+            let cache = RevisionCache::default();
+            let keys = fill_budget(&cache);
+            let key = if changed { keys[0] } else { Key::Edge(99) };
+            if changed {
+                cache.committed(
+                    1,
+                    2,
+                    1,
+                    2,
+                    &[TemporalMutation::Absent {
+                        key,
+                        valid: Interval { from: 0, to: None },
+                    }],
+                );
+            }
+            assert!(cache.get(key, 2, 2).is_none());
+            let mut builder = cache
+                .builder()
+                .expect("resident blocks must yield to a new working set");
+            row(&mut builder, 10, None);
+            cache.insert(key, 2, 2, builder, true);
+            for _ in 0..2 {
+                assert!(cache
+                    .get(key, 2, 2)
+                    .unwrap()
+                    .lookup(10)
+                    .unwrap()
+                    .payload
+                    .is_some());
+            }
+            assert!(cache.used.load(Ordering::Acquire) <= CACHE_BYTES);
+        }
+    }
+    #[test]
+    fn an_in_progress_builder_can_reclaim_for_row_growth() {
+        let cache = RevisionCache::default();
+        let mut builder = cache.builder().unwrap();
+        fill_budget(&cache);
+        row(&mut builder, 0, None);
+        cache.insert(Key::Edge(99), 1, 1, builder, true);
+        assert!(cache.get(Key::Edge(99), 1, 1).is_some());
+        assert!(cache.used.load(Ordering::Acquire) <= CACHE_BYTES);
+    }
+    #[test]
+    fn pressure_does_not_uncharge_blocks_held_by_readers() {
+        let cache = RevisionCache::default();
+        let keys = fill_budget(&cache);
+        let held: Vec<_> = keys
+            .iter()
+            .map(|&key| cache.get(key, 1, 1).unwrap())
+            .collect();
+        assert!(cache.builder().is_none());
+        assert_eq!(cache.used.load(Ordering::Acquire), CACHE_BYTES);
+        for block in &held {
+            assert!(block.lookup(0).unwrap().payload.is_some());
+        }
+        drop(held);
+        let mut builder = cache
+            .builder()
+            .expect("evicted reader charges must be released");
+        row(&mut builder, 0, None);
+        cache.insert(Key::Edge(99), 2, 2, builder, true);
+        assert!(cache.get(Key::Edge(99), 2, 2).is_some());
+    }
+    #[test]
+    fn pressure_skips_contended_slots_and_oversized_rows_do_not_evict() {
+        let cache = RevisionCache::default();
+        let keys = fill_budget(&cache);
+        let guards: Vec<_> = keys
+            .iter()
+            .map(|&key| cache.slot(key).lock().unwrap())
+            .collect();
+        assert!(cache.builder().is_none());
+        assert_eq!(cache.used.load(Ordering::Acquire), CACHE_BYTES);
+        drop(guards);
+        assert!(cache.builder().is_some());
+
+        let cache = RevisionCache::default();
+        let mut builder = cache.builder().unwrap();
+        let keys = fill_budget(&cache);
+        assert!(!builder.push(Interval { from: 0, to: None }, &vec![0; BLOCK_BYTES]));
+        for key in keys {
+            assert!(cache.get(key, 1, 1).is_some());
+        }
+    }
+    #[cfg(feature = "query-profiling")]
+    #[test]
+    fn real_query_warms_after_saturated_resident_set_turnover() {
+        use crate::{GremlinRow, Value, Vertex};
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::TemporalStore::open(dir.path()).unwrap();
+        let mut vertex = Vertex::new(999);
+        vertex.properties.insert("value".into(), Value::Integer(42));
+        store
+            .commit(&[TemporalMutation::Vertex {
+                vertex,
+                valid: Interval { from: 0, to: None },
+            }])
+            .unwrap();
+        fill_budget(&store.revision_cache);
+        for expected_seeks in [1, 0, 0] {
+            crate::query_profile::begin();
+            let result = store
+                .view(None, 0)
+                .unwrap()
+                .execute_gremlin("g.V(999).values('value')")
+                .unwrap();
+            let profile = crate::query_profile::finish();
+            assert_eq!(result.rows, vec![GremlinRow::Value(Value::Integer(42))]);
+            assert_eq!(profile.record_seeks, expected_seeks);
+            assert!(store.revision_cache.used.load(Ordering::Acquire) <= CACHE_BYTES);
+        }
     }
     #[test]
     fn row_cap_and_global_byte_cap_are_admission_limits() {
