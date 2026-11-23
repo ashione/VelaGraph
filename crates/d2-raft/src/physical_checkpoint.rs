@@ -74,6 +74,17 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Use the existing startup guard so older nodes also reject new inputs.
+fn create_offline_input(root: &Path) -> anyhow::Result<()> {
+    fs::create_dir(root)?;
+    write_new(
+        &root.join("RESTORED_OFFLINE_ONLY"),
+        b"Checkpoint input only\n",
+    )?;
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
 impl StateMachine {
     pub(crate) async fn physical_checkpoint(
         &self,
@@ -87,7 +98,7 @@ impl StateMachine {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("physical checkpoint requires durable state"))?;
         // Existing destinations, including interrupted attempts, are never overwritten.
-        fs::create_dir(root)?;
+        create_offline_input(root)?;
         // Matches snapshot installation/builder ordering. All state, snapshot and
         // log writes are excluded until BOTH DB checkpoint handles have finished.
         let state = self.state.write().await;
@@ -320,6 +331,7 @@ mod tests {
             .physical_checkpoint(&logs, &backup, 0, 1)
             .await
             .is_err());
+        assert!(backup.join("RESTORED_OFFLINE_ONLY").is_file());
         assert!(!backup.join("checkpoint.json").exists());
         assert!(restore_physical_checkpoint(&backup, dirs.path().join("restored"), 0, 1).is_err());
         Ok(())

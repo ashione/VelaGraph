@@ -5,6 +5,11 @@ zero-RPO, object-store-authoritative graph storage, automatic live rejoin or GC.
 The separate local two-DB physical checkpoint validator remains authoritative.
 It does not alter or bypass the unresolved #124 purge fence.
 
+Downloaded physical inputs carry the D2 `RESTORED_OFFLINE_ONLY` guard from
+before the first database directory is created. It is local startup metadata.
+Only the final `checkpoint.json` and its validated files establish a complete
+download. See [startup admission](PHYSICAL_CHECKPOINT.md#startup-admission-for-recovery-inputs).
+
 ## Implemented boundary
 
 `crates/checkpoint-object-store` exposes:

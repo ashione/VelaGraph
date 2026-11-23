@@ -240,7 +240,8 @@ async fn read_only_verification_preserves_files_and_rejects_rehashed_invalid_sta
     verify_physical_checkpoint(&backup, 0, 1)?;
     assert_eq!(inventory(&backup)?, manifest.files);
     assert_eq!(fs::read(&manifest_path)?, original);
-    assert_eq!(fs::read_dir(&backup)?.count(), 3);
+    assert!(backup.join("RESTORED_OFFLINE_ONLY").is_file());
+    assert_eq!(fs::read_dir(&backup)?.count(), 4);
 
     // Substitute a separate DB whose bytes and checksums agree with the
     // manifest but whose retry record has no owning D1 state.

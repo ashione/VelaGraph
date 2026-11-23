@@ -1,6 +1,6 @@
 //! Retained local physical inputs for verifying a fixed managed decision prefix.
 //! This is an offline prefix check, not a global restore manifest or READY gate.
-use super::{blocking_section, open_verified_state, sync_parent};
+use super::{blocking_section, create_offline_input, open_verified_state, sync_parent};
 use crate::participant_writes::Authority;
 use crate::transaction_decisions::Cohort;
 use crate::{NodeHandle, NodeId};
@@ -70,7 +70,7 @@ async fn capture_replicas(
     for (node, member) in members.iter().zip(&cohort.members) {
         ensure!(node.group_id() == member.shard, "member group mismatch");
     }
-    fs::create_dir(root).context("create fresh recovery input directory")?;
+    create_offline_input(root).context("create fresh recovery input directory")?;
     sync_parent(root)?;
     let mut digests = Vec::with_capacity(members.len() + 1);
     for node in std::iter::once(coordinator).chain(members.iter().copied()) {
