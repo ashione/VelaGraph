@@ -4,6 +4,7 @@ on:
     paths:
       - 'crates/checkpoint-object-store/**'
       - 'crates/d2-raft/**'
+      - 'crates/replicated-graph/src/remote_prefix_generation_tests.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/seaweedfs-ci.sh'
@@ -13,6 +14,7 @@ on:
     paths:
       - 'crates/checkpoint-object-store/**'
       - 'crates/d2-raft/**'
+      - 'crates/replicated-graph/src/remote_prefix_generation_tests.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/seaweedfs-ci.sh'
@@ -100,8 +102,14 @@ jobs:
           cache-on-failure: false
       - name: Real DB in-memory transport test and compile S3 variant
         run: cargo test --locked -p d2-raft --test physical_checkpoint_s3
-      - name: Real DB checkpoint through S3 and guarded offline restore
-        run: scripts/seaweedfs-ci.sh cargo test --locked -p d2-raft --test physical_checkpoint_s3 -- --ignored --nocapture
+      - name: Real S3 single-replica restore and two-shard generation verification
+        run: |
+          scripts/seaweedfs-ci.sh bash -euo pipefail -c '
+            cargo test --locked -p d2-raft --test physical_checkpoint_s3 -- --ignored --nocapture
+            test_name=managed_graph::tests::remote_prefix_generation_tests::two_shard_prefix_through_seaweedfs
+            cargo test --locked -p replicated-graph --lib "$test_name" -- --ignored --exact --nocapture | tee "$RUNNER_TEMP/cohort-s3.log"
+            grep -Fq "1 passed; 0 failed" "$RUNNER_TEMP/cohort-s3.log"
+          '
       - name: Service diagnostics
         if: always()
         uses: actions/upload-artifact@v4

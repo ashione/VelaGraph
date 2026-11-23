@@ -2260,3 +2260,10 @@ async fn published_prefix_generation_survives_restart() -> anyhow::Result<()> {
     assert!(verify(&root, receipt, &auth, &cohort, 1).await.is_err());
     Ok(())
 }
+
+#[cfg(unix)]
+#[path = "remote_prefix_cleanup_tests.rs"]
+mod remote_prefix_cleanup_tests;
+
+#[path = "remote_prefix_generation_tests.rs"]
+mod remote_prefix_generation_tests;

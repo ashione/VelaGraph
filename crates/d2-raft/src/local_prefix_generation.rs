@@ -135,23 +135,87 @@ pub async fn verify(
     cohort: &Cohort,
     version: u64,
 ) -> anyhow::Result<()> {
-    let bytes = read_manifest(root).context("read published prefix generation")?;
-    ensure!(
-        <[u8; 32]>::from(Sha256::digest(&bytes)) == digest,
-        "generation digest mismatch"
-    );
-    let manifest: Manifest = serde_json::from_slice(&bytes)?;
-    ensure!(
-        manifest.format == FORMAT,
-        "unsupported prefix generation format"
-    );
-    ensure!(
-        manifest.authority == *authority
-            && manifest.cohort == *cohort
-            && manifest.version == version,
-        "generation cut mismatch"
-    );
-    verify_components(root, &manifest).await
+    SelectedManifest::read(root, digest, authority, cohort, version)?
+        .verify_components(root)
+        .await
+}
+
+/// A local producer's record selected by an independently retained digest and
+/// cut. Selecting metadata alone establishes no claim about available data.
+/// Use `verify_components` on the actual captured or transferred directories.
+pub struct SelectedManifest {
+    bytes: Vec<u8>,
+    manifest: Manifest,
+}
+
+impl SelectedManifest {
+    /// Read the bounded final record from a trusted immutable root.
+    pub fn read(
+        root: &Path,
+        digest: [u8; 32],
+        authority: &Authority,
+        cohort: &Cohort,
+        version: u64,
+    ) -> anyhow::Result<Self> {
+        let bytes = read_manifest(root).context("read published prefix generation")?;
+        Self::decode(bytes, digest, authority, cohort, version)
+    }
+
+    /// Select transported record bytes using the same independent selection.
+    pub fn decode(
+        bytes: Vec<u8>,
+        digest: [u8; 32],
+        authority: &Authority,
+        cohort: &Cohort,
+        version: u64,
+    ) -> anyhow::Result<Self> {
+        ensure!(bytes.len() <= MAX_BYTES, "generation manifest too large");
+        ensure!(
+            <[u8; 32]>::from(Sha256::digest(&bytes)) == digest,
+            "generation digest mismatch"
+        );
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        ensure!(
+            manifest.format == FORMAT,
+            "unsupported prefix generation format"
+        );
+        ensure!(
+            manifest.authority == *authority
+                && manifest.cohort == *cohort
+                && manifest.version == version,
+            "generation cut mismatch"
+        );
+        super::check_request(authority, cohort, version, manifest.member_nodes.len())?;
+        ensure!(
+            manifest.checkpoint_sha256.len() == cohort.members.len() + 1,
+            "incomplete generation"
+        );
+        Ok(Self { bytes, manifest })
+    }
+
+    /// Exact producer bytes, including its generation identity.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Coordinator followed by each cohort member, with the producer's physical
+    /// checkpoint.json SHA-256 for that replica.
+    pub fn replicas(&self) -> impl Iterator<Item = (u64, [u8; 32])> + '_ {
+        std::iter::once(self.manifest.authority.shard)
+            .chain(
+                self.manifest
+                    .cohort
+                    .members
+                    .iter()
+                    .map(|member| member.shard),
+            )
+            .zip(self.manifest.checkpoint_sha256.iter().copied())
+    }
+
+    /// Verify all local physical bytes, identities and the actual decision cut.
+    pub async fn verify_components(&self, root: &Path) -> anyhow::Result<()> {
+        verify_components(root, &self.manifest).await
+    }
 }
 
 async fn verify_components(root: &Path, manifest: &Manifest) -> anyhow::Result<()> {

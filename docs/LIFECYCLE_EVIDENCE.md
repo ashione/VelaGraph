@@ -214,8 +214,8 @@ The trust route is GitHub Actions, not a manifest's claim:
    Linux x86_64 `managed_process` ELF becomes executable.
 
 The version-1 handoff contains exactly `handoff.json`, `source.json`, full
-`build.jsonl`, `dependencies.json`, `managed_process`, `Cargo.lock`, and three
-workspace manifests (`cargo-root.toml`, `cargo-d2-raft.toml`,
+`build.jsonl`, `dependencies.json`, `managed_process`, `Cargo.lock`, and four
+workspace manifests (`cargo-root.toml`, `cargo-d2-raft.toml`, `cargo-checkpoint-object-store.toml`,
 `cargo-replicated-graph.toml`). It binds repository/run/attempt/event/PR head,
 checkout SHA/tree, source digest, exact build command and compiler artifact.
 Every payload has an exact byte length and SHA-256. The dependency manifest
