@@ -119,6 +119,24 @@ impl CheckpointStore {
         digest: [u8; 32],
         scratch_parent: &Path,
     ) -> Result<()> {
+        let scratch = self
+            .download_replicas(selection, replicas, digest, scratch_parent)
+            .await?;
+        selection
+            .verify_components(scratch.path())
+            .await
+            .map_err(invalid_prefix)?;
+        scratch.close()?;
+        Ok(())
+    }
+
+    async fn download_replicas(
+        &self,
+        selection: &SelectedManifest,
+        replicas: &[Receipt],
+        digest: [u8; 32],
+        scratch_parent: &Path,
+    ) -> Result<tempfile::TempDir> {
         let local = digest_hex(digest);
         if selection.replicas().count() != replicas.len()
             || selection
@@ -136,6 +154,7 @@ impl CheckpointStore {
             directory.permissions(std::fs::Permissions::from_mode(0o700));
         }
         let scratch = directory.tempdir_in(scratch_parent)?;
+        super::guard_offline_directory(scratch.path()).await?;
         let mut budget = InventoryBudget::new(&self.limits);
         for ((shard, physical_digest), receipt) in selection.replicas().zip(replicas) {
             let remote = self.read_manifest(receipt, &mut budget).await?;
@@ -145,12 +164,7 @@ impl CheckpointStore {
             self.write_download(remote, &scratch.path().join(shard.to_string()))
                 .await?;
         }
-        selection
-            .verify_components(scratch.path())
-            .await
-            .map_err(invalid_prefix)?;
-        scratch.close()?;
-        Ok(())
+        Ok(scratch)
     }
 }
 
@@ -201,38 +215,11 @@ impl CheckpointReader {
     ) -> Result<()> {
         let start = tokio::time::Instant::now();
         tokio::time::timeout(self.inner.limits.timeout, async {
-            if !super::valid_hash(&receipt.envelope_sha256) {
-                return Err(Error::Invalid("generation receipt digest".into()));
-            }
-            let bytes = self
-                .inner
-                .read_bounded(
-                    &self.inner.prefix_key(receipt.local_sha256),
-                    MAX_ENVELOPE.min(self.inner.limits.manifest_bytes),
-                )
+            let (selection, replicas) = self
+                .read_prefix(receipt, authority, cohort, version)
                 .await?;
-            if hash(&bytes) != receipt.envelope_sha256 {
-                return Err(Error::Integrity("generation envelope".into()));
-            }
-            let envelope: Envelope = serde_json::from_slice(&bytes)?;
-            if envelope.format != FORMAT {
-                return Err(Error::Invalid("generation envelope format".into()));
-            }
-            let selection = SelectedManifest::decode(
-                envelope.local_record.into_bytes(),
-                receipt.local_sha256,
-                authority,
-                cohort,
-                version,
-            )
-            .map_err(invalid_prefix)?;
             self.inner
-                .verify_replicas(
-                    &selection,
-                    &envelope.replicas,
-                    receipt.local_sha256,
-                    scratch_parent,
-                )
+                .verify_replicas(&selection, &replicas, receipt.local_sha256, scratch_parent)
                 .await?;
             if start.elapsed() >= self.inner.limits.timeout {
                 return Err(Error::Deadline);
@@ -241,5 +228,92 @@ impl CheckpointReader {
         })
         .await
         .map_err(|_| Error::Deadline)?
+    }
+
+    /// Restore a retained remote generation through a read-only backend. Download
+    /// into private scratch, then restore to a fresh caller-owned offline path.
+    /// Budget disk for both copies. On an uncertain result, verify the destination
+    /// using the producer digest and cut; retry only in a fresh directory.
+    pub async fn restore_prefix(
+        &self,
+        receipt: &PrefixReceipt,
+        authority: &Authority,
+        cohort: &Cohort,
+        version: u64,
+        scratch_parent: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(self.inner.limits.timeout, async {
+            // Avoid downloading the cohort for an already occupied path. The
+            // local restore still reserves it atomically after transfer.
+            match tokio::fs::symlink_metadata(destination).await {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "restore destination exists",
+                    )
+                    .into())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let (selection, replicas) = self
+                .read_prefix(receipt, authority, cohort, version)
+                .await?;
+            let scratch = self
+                .inner
+                .download_replicas(&selection, &replicas, receipt.local_sha256, scratch_parent)
+                .await?;
+            selection
+                .restore_components_offline(scratch.path(), destination)
+                .await
+                .map_err(|error| match error.downcast::<std::io::Error>() {
+                    Ok(io) => Error::Io(io),
+                    Err(error) => invalid_prefix(error),
+                })?;
+            scratch.close()?;
+            if start.elapsed() >= self.inner.limits.timeout {
+                return Err(Error::Deadline);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Deadline)?
+    }
+
+    async fn read_prefix(
+        &self,
+        receipt: &PrefixReceipt,
+        authority: &Authority,
+        cohort: &Cohort,
+        version: u64,
+    ) -> Result<(SelectedManifest, Vec<Receipt>)> {
+        if !super::valid_hash(&receipt.envelope_sha256) {
+            return Err(Error::Invalid("generation receipt digest".into()));
+        }
+        let bytes = self
+            .inner
+            .read_bounded(
+                &self.inner.prefix_key(receipt.local_sha256),
+                MAX_ENVELOPE.min(self.inner.limits.manifest_bytes),
+            )
+            .await?;
+        if hash(&bytes) != receipt.envelope_sha256 {
+            return Err(Error::Integrity("generation envelope".into()));
+        }
+        let envelope: Envelope = serde_json::from_slice(&bytes)?;
+        if envelope.format != FORMAT {
+            return Err(Error::Invalid("generation envelope format".into()));
+        }
+        let selection = SelectedManifest::decode(
+            envelope.local_record.into_bytes(),
+            receipt.local_sha256,
+            authority,
+            cohort,
+            version,
+        )
+        .map_err(invalid_prefix)?;
+        Ok((selection, envelope.replicas))
     }
 }

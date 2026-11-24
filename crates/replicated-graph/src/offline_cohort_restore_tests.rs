@@ -2,7 +2,7 @@ use super::*;
 use d2_raft::cohort_inputs::generation::{prepare, read_snapshot, restore_offline, verify};
 use std::{env, fs, future::Future, path::Path, process, task::Poll};
 
-async fn assert_offline(path: &Path, group: u64) {
+pub(super) async fn assert_offline(path: &Path, group: u64) {
     assert!(path.join("RESTORED_OFFLINE_ONLY").is_file());
     let result = Cluster::new().in_group(group).start_durable(1, path).await;
     assert!(result

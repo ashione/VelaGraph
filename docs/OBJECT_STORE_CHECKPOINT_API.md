@@ -247,6 +247,17 @@ Application catalogs and separate temporal stores require additional coverage.
    write. An unreadable or missing object fails the call. A retry of staging
    and publication from retained immutable input requires the same chunk size.
 
+4. To recover from the backend after loss of the source and local backup, call
+   `CheckpointReader::restore_prefix(receipt, authority, cohort, version,
+   scratch_parent, destination)`. Give it a fresh, exclusively owned destination
+   and a trusted scratch parent. The reader fetches the selected coordinator
+   and every member into private scratch, then performs the local offline restore.
+   It verifies the copied databases and their common decision history before
+   publishing the producer record at the destination. Use
+   `generation::read_snapshot` on that directory with the saved local digest and
+   cut to inspect historical graph records. The root and replica startup guards
+   stay in place.
+
 The envelope at `<prefix>/d2-prefixes/<local-sha256>/generation.json` contains
 the format tag `d2-prefix-transport-v1`, the exact UTF-8 local record in
 `local_record`, and the ordered `replicas` list of physical transport receipts.
@@ -254,7 +265,7 @@ Checkpoint IDs are `d2-<local-sha256>-<decimal-group>`, coordinator first and
 then members in cohort order. The outer digest is SHA-256 of the exact envelope
 bytes. Existing single-replica objects and local generation formats are unchanged.
 
-Each stage, publication or verification call gets one configured timeout. Each
+Each stage, publication, verification or restore call gets one configured timeout. Each
 uses at most 65 groups (the coordinator and up to 64 members), one transfer at a
 time. File count and logical payload bytes are charged across the whole cohort.
 Each physical envelope is subject to the ordinary manifest limit. The published
@@ -262,10 +273,20 @@ outer envelope is capped at the smaller of 256 KiB and that limit, and its
 embedded local record at 64 KiB. Allow scratch space for all replica payloads,
 their physical manifests and filesystem overhead, and memory for opening one
 replica's state. Synchronous local RocksDB verification or filesystem cleanup
-can finish after cancellation or deadline. Publication and verification require
+can finish after cancellation or deadline. Publication, verification and restore require
 successful removal of the scratch directory before reporting success. A failed
 or cancelled operation, a filesystem cleanup error, or a process crash can
 leave temporary data under the scratch parent. Partial remote objects survive.
+
+During restore, budget space for both the scratch generation and the restored
+databases. A missing chunk during transfer leaves the destination untouched.
+Local filesystem errors during the copy retain their `io::ErrorKind` in
+`Error::Io`, including `AlreadyExists` if another restore claims the destination
+during transfer. An interrupted local copy can leave a guarded partial
+destination. A deadline or cleanup error after local publication can leave a
+complete destination.
+After an uncertain result, use `generation::verify` on the destination with the
+independently retained digest and cut. Use a fresh path for a retry.
 
 The caller must ensure the backend retains every object during publication,
 verification and later use. Reads attest the bytes observed on that invocation.
@@ -273,7 +294,9 @@ The feature adds no retention lease, live restore, or query readiness guarantee.
 The cross-process fixture runs against a filesystem-backed object store in
 ordinary tests and against a disposable SeaweedFS service in the S3 CI job.
 Both runs capture one coordinator and two data shards, exercise the same
-lost-ACK, missing-chunk and mixed-generation cases, and verify the selected
-receipt after source shutdown in a fresh process. The fault wrapper drops the final
+lost-ACK, missing-chunk and mixed-generation cases, and restore from the selected
+receipt in a fresh process after removing the source and local backup. The
+restored historical view must contain both endpoints and both directions of a
+cross-shard edge deleted before physical capture. The fault wrapper drops the final
 PUT response after the backend commits it and fails the first reconciliation GET.
 Cloud provider behavior requires independent testing against the actual backend and bucket settings.
