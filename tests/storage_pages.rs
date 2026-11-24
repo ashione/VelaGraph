@@ -252,6 +252,18 @@ fn legacy_adapter_defaults_to_unsupported_and_invalid_ranges_are_rejected() {
     }
     let dir = tempfile::tempdir().unwrap();
     let legacy = Legacy(LocalStorageNode::open(dir.path(), 7).unwrap());
+    assert!(matches!(
+        legacy.begin_v1(velagraph::TransactionOptions {
+            shard: 7,
+            epoch: 0,
+            request_id: [0; 16],
+            deadline: std::time::Instant::now(),
+            cancellation: Default::default(),
+        }),
+        Err(velagraph::TransactionError::Node(
+            StorageNodeError::Unsupported(_)
+        ))
+    ));
     let view = legacy.read_view().unwrap();
     assert!(matches!(
         legacy.scan_page(KeyRange::all(), ScanLimit::default(), &view, None),

@@ -311,7 +311,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 | 接口 | 图 API / 标准 Gremlin 子集 / C ABI | 只依赖存储节点接口，不感知图内部 |
 | 验收 | 单机数据正确、崩溃恢复、基准达标 | 副本一致、故障切换、无数据丢失 |
 
-**存储接口边界**：当前 D1 已提供不透明字节 `get`/`scan`/条件 `batch_write`、稳定读视图及 export/import。完整 `begin` 事务接口、在线 `split/transfer` 仍是目标，不是已冻结且可用的能力；以 [STORAGE_NODE_INTERFACE.md](STORAGE_NODE_INTERFACE.md) 为准。查询层负责图语义，复制层不解释图记录。
+**存储接口边界**：当前 D1 已提供不透明字节 `get`/`scan`/条件 `batch_write`、稳定读视图及 export/import。本地 `begin_v1` 已支持单分片暂存、条件提交和中止；复制事务接口与在线 `split/transfer` 仍是目标，不是已冻结且可用的能力；以 [STORAGE_NODE_INTERFACE.md](STORAGE_NODE_INTERFACE.md) 为准。查询层负责图语义，复制层不解释图记录。
 
 ## 3. 内核线工作包
 
@@ -348,7 +348,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 - **交付物**：`get`/`scan`/`batch_write`/`snapshot`/`transaction` 的窄接口；按点 ID 或范围分片；分片切分与迁移的最小协议。
 - **完成定义**：单机实现通过接口测试；分片路由可解释；迁移过程可回滚，不丢数据。
 - **依赖**：与内核线在 P0 共同冻结接口 v0。
-- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine` 接线、`begin` 事务接口与拆分/迁移仍未实现；静态远程路由见 `REMOTE_ROUTING.md`。
+- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine` 接线、D2 多步事务接口与拆分/迁移仍未实现；静态远程路由见 `REMOTE_ROUTING.md`。
 
 ### D2 复制与共识
 
