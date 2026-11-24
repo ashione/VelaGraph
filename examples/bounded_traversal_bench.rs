@@ -26,6 +26,7 @@ fn main() {
         ("isolated", 0, 1, 16, 0, false, 50_000),
         ("cycle", 1, 3, 16, 2, false, 20_000),
         ("fan-out", 4, 1, 256, 256, false, 500),
+        ("fan-out with leaf expansion", 4, 2, 256, 256, false, 500),
         ("limited fan-out", 4, 1, 8, 8, true, 500),
     ] {
         let opts = TraversalOptions {
