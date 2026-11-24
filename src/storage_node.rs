@@ -28,6 +28,9 @@ use rocksdb::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod transaction;
+pub use transaction::{StorageTransaction, TransactionError, TransactionOptions};
+
 pub const INTERFACE_VERSION: u32 = 0;
 
 pub type ShardId = u64;
@@ -331,9 +334,10 @@ impl WriteOp {
         Self::Delete { key: key.into() }
     }
 
-    fn key(&self) -> &[u8] {
+    fn payload_bytes(&self) -> usize {
         match self {
-            Self::Put { key, .. } | Self::Delete { key } => key,
+            Self::Put { key, value } => key.len().saturating_add(value.len()),
+            Self::Delete { key } => key.len(),
         }
     }
 }
@@ -469,6 +473,14 @@ pub trait StorageNode: Send + Sync {
         _cursor: Option<&ScanCursor>,
     ) -> Result<ScanPage> {
         Err(StorageNodeError::Unsupported("paged scans".into()))
+    }
+
+    /// Begin an optional v1, single-shard transaction at the current sequence.
+    fn begin_v1(
+        &self,
+        _options: TransactionOptions,
+    ) -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError> {
+        Err(StorageNodeError::Unsupported("single-shard transaction v1".into()).into())
     }
 
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult>;
@@ -703,10 +715,7 @@ impl LocalStorageNode {
         }
         let mut bytes = 0_usize;
         for operation in &request.operations {
-            bytes = bytes.saturating_add(operation.key().len());
-            if let WriteOp::Put { value, .. } = operation {
-                bytes = bytes.saturating_add(value.len());
-            }
+            bytes = bytes.saturating_add(operation.payload_bytes());
         }
         if bytes > MAX_BATCH_BYTES {
             return Err(StorageNodeError::ResourceExhausted(format!(
@@ -715,6 +724,78 @@ impl LocalStorageNode {
         }
         serde_json::to_vec(&request.operations)
             .map_err(|error| StorageNodeError::Corrupt(error.to_string()))
+    }
+
+    fn prepare_write(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        request: &WriteRequest,
+        expected_sequence: Option<Sequence>,
+        canonical: Vec<u8>,
+    ) -> Result<(Option<WriteBatch>, WriteResult)> {
+        let current_epoch = self.epoch()?;
+        if request.epoch != current_epoch {
+            return Err(StorageNodeError::Fenced {
+                shard: self.shard,
+                epoch: request.epoch,
+                current: current_epoch,
+            });
+        }
+        let dedup_key = Self::dedup_key(&request.request_id);
+        if let Some(bytes) = self.db.get_cf(self.meta_cf(), &dedup_key)? {
+            let record = Self::decode_dedup(&bytes)?;
+            if record.operations != canonical || record.expected_sequence != expected_sequence {
+                return Err(StorageNodeError::IdempotencyConflict(request.request_id));
+            }
+            return Ok((
+                None,
+                WriteResult {
+                    sequence: record.sequence,
+                    status: WriteStatus::Duplicate,
+                    applied_operations: record.applied_operations,
+                },
+            ));
+        }
+
+        let current = self.sequence()?;
+        if let Some(expected) = expected_sequence {
+            if expected != current {
+                return Err(StorageNodeError::Conflict { expected, current });
+            }
+        }
+        let sequence = current
+            .checked_add(1)
+            .ok_or_else(|| StorageNodeError::ResourceExhausted("sequence overflow".into()))?;
+        let dedup = DedupRecord {
+            expected_sequence,
+            operations: canonical,
+            sequence,
+            applied_operations: request.operations.len(),
+        };
+        let dedup_bytes = serde_json::to_vec(&dedup)
+            .map_err(|error| StorageNodeError::Corrupt(error.to_string()))?;
+        let mut batch = WriteBatch::default();
+        for operation in &request.operations {
+            match operation {
+                WriteOp::Put { key, value } => {
+                    batch.put_cf(self.data_cf(), key, value);
+                }
+                WriteOp::Delete { key } => {
+                    batch.delete_cf(self.data_cf(), key);
+                }
+            }
+        }
+        batch.put_cf(self.meta_cf(), META_SEQUENCE, sequence.to_be_bytes());
+        batch.put_cf(self.meta_cf(), &dedup_key, dedup_bytes);
+
+        Ok((
+            Some(batch),
+            WriteResult {
+                sequence,
+                status: WriteStatus::Committed,
+                applied_operations: request.operations.len(),
+            },
+        ))
     }
 
     fn dedup_key(request_id: &RequestId) -> Vec<u8> {
@@ -731,6 +812,13 @@ impl LocalStorageNode {
 }
 
 impl StorageNode for LocalStorageNode {
+    fn begin_v1(
+        &self,
+        options: TransactionOptions,
+    ) -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError> {
+        transaction::begin(self, options)
+    }
+
     fn read_view(&self) -> Result<ReadView> {
         let _guard = self.lock()?;
         self.load_view()
@@ -794,65 +882,12 @@ impl StorageNode for LocalStorageNode {
         expected_sequence: Option<Sequence>,
     ) -> Result<WriteResult> {
         let canonical = self.validate_write(&request)?;
-        let _guard = self.lock()?;
-        let current_epoch = self.epoch()?;
-        if request.epoch != current_epoch {
-            return Err(StorageNodeError::Fenced {
-                shard: self.shard,
-                epoch: request.epoch,
-                current: current_epoch,
-            });
+        let guard = self.lock()?;
+        let (batch, result) = self.prepare_write(&guard, &request, expected_sequence, canonical)?;
+        if let Some(batch) = batch {
+            self.write_batch(batch)?;
         }
-        let dedup_key = Self::dedup_key(&request.request_id);
-        if let Some(bytes) = self.db.get_cf(self.meta_cf(), &dedup_key)? {
-            let record = Self::decode_dedup(&bytes)?;
-            if record.operations != canonical || record.expected_sequence != expected_sequence {
-                return Err(StorageNodeError::IdempotencyConflict(request.request_id));
-            }
-            return Ok(WriteResult {
-                sequence: record.sequence,
-                status: WriteStatus::Duplicate,
-                applied_operations: record.applied_operations,
-            });
-        }
-
-        let current = self.sequence()?;
-        if let Some(expected) = expected_sequence {
-            if expected != current {
-                return Err(StorageNodeError::Conflict { expected, current });
-            }
-        }
-        let sequence = current
-            .checked_add(1)
-            .ok_or_else(|| StorageNodeError::ResourceExhausted("sequence overflow".into()))?;
-        let dedup = DedupRecord {
-            expected_sequence,
-            operations: canonical,
-            sequence,
-            applied_operations: request.operations.len(),
-        };
-        let dedup_bytes = serde_json::to_vec(&dedup)
-            .map_err(|error| StorageNodeError::Corrupt(error.to_string()))?;
-        let mut batch = WriteBatch::default();
-        for operation in &request.operations {
-            match operation {
-                WriteOp::Put { key, value } => {
-                    batch.put_cf(self.data_cf(), key, value);
-                }
-                WriteOp::Delete { key } => {
-                    batch.delete_cf(self.data_cf(), key);
-                }
-            }
-        }
-        batch.put_cf(self.meta_cf(), META_SEQUENCE, sequence.to_be_bytes());
-        batch.put_cf(self.meta_cf(), &dedup_key, dedup_bytes);
-        self.write_batch(batch)?;
-
-        Ok(WriteResult {
-            sequence,
-            status: WriteStatus::Committed,
-            applied_operations: request.operations.len(),
-        })
+        Ok(result)
     }
 
     fn admin(&self) -> &dyn StorageAdmin {
