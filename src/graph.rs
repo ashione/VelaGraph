@@ -519,7 +519,7 @@ impl GraphEngine {
     }
 }
 
-impl GraphReadView<'_> {
+impl<'db> GraphReadView<'db> {
     /// The RocksDB sequence pinned by this view.
     pub fn sequence(&self) -> u64 {
         self.snapshot.sequence_number()
@@ -547,58 +547,33 @@ impl GraphReadView<'_> {
 
     /// Outgoing edges for a vertex in this view, ordered by edge id.
     pub fn out_edges(&self, vertex_id: u64, label: Option<&str>) -> Result<Vec<Edge>> {
-        self.edges_by_direction(vertex_id, EdgeDirection::Out, label)
+        self.adjacency_scan(EdgeDirection::Out, label)?
+            .edges(vertex_id)
     }
 
     /// Incoming edges for a vertex in this view, ordered by edge id.
     pub fn in_edges(&self, vertex_id: u64, label: Option<&str>) -> Result<Vec<Edge>> {
-        self.edges_by_direction(vertex_id, EdgeDirection::In, label)
+        self.adjacency_scan(EdgeDirection::In, label)?
+            .edges(vertex_id)
     }
 
-    fn edges_by_direction(
-        &self,
-        vertex_id: u64,
+    pub(crate) fn adjacency_scan<'a>(
+        &'a self,
         direction: EdgeDirection,
-        label: Option<&str>,
-    ) -> Result<Vec<Edge>> {
+        label: Option<&'a str>,
+    ) -> Result<AdjacencyScan<'a, 'db>> {
         if let Some(label) = label {
             validate_label(label)?;
         }
-        if self
-            .snapshot
-            .get(vertex_key(self.partition, vertex_id))?
-            .is_none()
-        {
-            return Err(Error::VertexNotFound(vertex_id));
-        }
-
-        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
-        let mut edge_ids = Vec::new();
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
-            let (stored_key, _) = item?;
-            if !stored_key.starts_with(&prefix) {
-                break;
-            }
-            edge_ids.push(edge_id_from_adjacency_key(&stored_key)?);
-        }
-        edge_ids.sort_unstable();
-        edge_ids.dedup();
-
-        let mut edges = Vec::with_capacity(edge_ids.len());
-        for edge_id in edge_ids {
-            match self.get_edge_inner(edge_id)? {
-                Some(edge) => edges.push(edge),
-                None => {
-                    return Err(Error::CorruptData(format!(
-                        "adjacency entry references missing edge {edge_id}"
-                    )))
-                }
-            }
-        }
-        Ok(edges)
+        Ok(AdjacencyScan {
+            view: self,
+            direction,
+            label,
+            rows: self.snapshot.raw_iterator(),
+            previous_vertex: None,
+            #[cfg(test)]
+            seeks: 0,
+        })
     }
 
     fn get_edge_inner(&self, id: u64) -> Result<Option<Edge>> {
@@ -613,6 +588,76 @@ impl GraphReadView<'_> {
             )));
         }
         Ok(Some(edge))
+    }
+}
+
+/// One direction and label on a single pinned RocksDB sequence.
+pub(crate) struct AdjacencyScan<'a, 'db> {
+    view: &'a GraphReadView<'db>,
+    direction: EdgeDirection,
+    label: Option<&'a str>,
+    rows: rocksdb::DBRawIterator<'a>,
+    previous_vertex: Option<u64>,
+    #[cfg(test)]
+    seeks: usize,
+}
+
+impl AdjacencyScan<'_, '_> {
+    pub(crate) fn edges(&mut self, vertex_id: u64) -> Result<Vec<Edge>> {
+        if self
+            .view
+            .snapshot
+            .get_pinned(vertex_key(self.view.partition, vertex_id))?
+            .is_none()
+        {
+            return Err(Error::VertexNotFound(vertex_id));
+        }
+        self.edges_from_existing(vertex_id)
+    }
+
+    // The caller has already observed this vertex on the same snapshot.
+    pub(crate) fn edges_from_existing(&mut self, vertex_id: u64) -> Result<Vec<Edge>> {
+        let prefix = adjacency_prefix(self.view.partition, self.direction, vertex_id, self.label);
+        // A completed scan stops on the first nonmatching key (or EOF).
+        // For a later vertex the intervening prefixes are therefore empty.
+        // Seek again when going backwards or when the cursor is still too early.
+        if self
+            .previous_vertex
+            .take()
+            .is_none_or(|last| vertex_id <= last)
+            || self.rows.key().is_some_and(|key| key < prefix.as_slice())
+        {
+            self.rows.seek(&prefix);
+            #[cfg(test)]
+            {
+                self.seeks += 1;
+            }
+        }
+        let mut edge_ids = Vec::new();
+        while let Some(key) = self.rows.key() {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            edge_ids.push(edge_id_from_adjacency_key(key)?);
+            self.rows.next();
+        }
+        self.rows.status()?;
+        self.previous_vertex = Some(vertex_id);
+        edge_ids.sort_unstable();
+        edge_ids.dedup();
+
+        let mut edges = Vec::with_capacity(edge_ids.len());
+        for edge_id in edge_ids {
+            match self.view.get_edge_inner(edge_id)? {
+                Some(edge) => edges.push(edge),
+                None => {
+                    return Err(Error::CorruptData(format!(
+                        "adjacency entry references missing edge {edge_id}"
+                    )))
+                }
+            }
+        }
+        Ok(edges)
     }
 }
 
@@ -1300,6 +1345,39 @@ mod query_scan_tests {
     use super::*;
     use crate::gremlin::{QueryReadBackend, MAX_GREMLIN_ACCOUNTED_BYTES};
     use crate::query_memory::Budget;
+
+    #[test]
+    fn adjacency_scan_reuses_only_gaps_proven_on_its_own_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let graph = GraphEngine::open(dir.path()).unwrap();
+            for id in [1, 2, 3, 4, 5, u64::MAX] {
+                graph.create_vertex(&Vertex::new(id)).unwrap();
+            }
+            graph.create_edge(&Edge::new(10, 1, 2, "a")).unwrap();
+            graph.create_edge(&Edge::new(20, 5, 1, "a")).unwrap();
+            graph.create_edge(&Edge::new(30, 5, 1, "b")).unwrap();
+            let view = graph.read_view();
+            let mut scan = view.adjacency_scan(EdgeDirection::Out, Some("a")).unwrap();
+            assert_eq!(scan.edges(1).unwrap()[0].id, 10);
+            graph.create_edge(&Edge::new(40, 3, 1, "a")).unwrap();
+            for id in 2..5 {
+                assert!(scan.edges(id).unwrap().is_empty());
+            }
+            assert_eq!(scan.edges(5).unwrap(), [Edge::new(20, 5, 1, "a")]);
+            assert_eq!(scan.seeks, 1);
+            // The first nonmatching key is now label b of the same vertex.
+            assert!(scan.edges(u64::MAX).unwrap().is_empty());
+            assert_eq!(scan.seeks, 2);
+            for id in [1, 1] {
+                assert_eq!(scan.edges(id).unwrap()[0].id, 10);
+            }
+            assert_eq!(scan.seeks, 4);
+            assert!(matches!(scan.edges(6), Err(Error::VertexNotFound(6))));
+        }
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        assert_eq!(graph.read_view().out_edges(3, None).unwrap()[0].id, 40);
+    }
 
     fn exhausted() -> Error {
         Error::TraversalLimitExceeded("test budget exhausted".into())
