@@ -35,6 +35,8 @@ pub struct Totals {
     /// HEAD reads performed while creating temporal views or scanning adjacency.
     pub head_reads: u64,
     pub adjacency_iterators: u64,
+    /// RocksDB seeks to a temporal adjacency prefix.
+    pub adjacency_seeks: u64,
     pub adjacency_candidates: u64,
     pub parse_calls: u64,
     pub prepared_text_renders: u64,
@@ -124,6 +126,7 @@ pub(crate) enum ReadEvent {
     LookaheadHit,
     Head,
     AdjacencyIterator,
+    AdjacencySeek,
     AdjacencyCandidate,
     Read,
     Decode,
@@ -153,6 +156,7 @@ pub(crate) fn read_event(event: ReadEvent) {
                 ReadEvent::LookaheadHit => t.record_lookahead_hits += 1,
                 ReadEvent::Head => t.head_reads += 1,
                 ReadEvent::AdjacencyIterator => t.adjacency_iterators += 1,
+                ReadEvent::AdjacencySeek => t.adjacency_seeks += 1,
                 ReadEvent::AdjacencyCandidate => t.adjacency_candidates += 1,
                 ReadEvent::Read => t.record_reads += 1,
                 ReadEvent::Decode => t.record_decodes += 1,
