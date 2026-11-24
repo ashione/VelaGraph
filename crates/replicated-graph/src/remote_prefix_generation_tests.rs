@@ -145,8 +145,12 @@ async fn two_shard_prefix_through_seaweedfs() -> anyhow::Result<()> {
     scenario(Arc::new(store), None).await
 }
 
+const SELECTED_VERSION: u64 = 3;
+
 async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> anyhow::Result<()> {
     let auth = authority();
+    let mut link = edge(7, 8, 42);
+    link.label = "connects".into();
     let cohort = binding();
     let scratch = tempfile::tempdir()?;
     // Isolate the destructive negative fixtures even on concurrent runs.
@@ -164,8 +168,106 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
         let receipt: PrefixReceipt =
             serde_json::from_str(&env::var("VELA_TEST_REMOTE_PREFIX_RECEIPT")?)?;
         reader(Limits::default())?
-            .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
+            .verify_prefix(&receipt, &auth, &cohort, SELECTED_VERSION, scratch.path())
             .await?;
+        let output = tempfile::tempdir()?;
+        let interrupted = output.path().join("interrupted");
+        let read = reader(Limits::default())?;
+        {
+            use std::{
+                future::{poll_fn, Future},
+                task::Poll,
+            };
+            let mut work = Box::pin(read.restore_prefix(
+                &receipt,
+                &auth,
+                &cohort,
+                SELECTED_VERSION,
+                scratch.path(),
+                &interrupted,
+            ));
+            poll_fn(|cx| {
+                assert!(work.as_mut().poll(cx).is_pending());
+                for entry in fs::read_dir(scratch.path()).unwrap() {
+                    let staging = entry.unwrap().path();
+                    if staging.join("9/checkpoint.json").is_file() {
+                        assert!(staging.join("RESTORED_OFFLINE_ONLY").is_file());
+                        assert!(staging.join("9/RESTORED_OFFLINE_ONLY").is_file());
+                        return Poll::Ready(());
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+        }
+        assert!(!interrupted.exists());
+        assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
+        let restored = output.path().join("restored");
+        read.restore_prefix(
+            &receipt,
+            &auth,
+            &cohort,
+            SELECTED_VERSION,
+            scratch.path(),
+            &restored,
+        )
+        .await?;
+        assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
+        let existing = output.path().join("used");
+        fs::create_dir(&existing)?;
+        fs::write(existing.join("sentinel"), b"keep")?;
+        assert!(reader(Limits::default())?
+            .restore_prefix(
+                &receipt,
+                &auth,
+                &cohort,
+                SELECTED_VERSION,
+                scratch.path(),
+                &existing
+            )
+            .await
+            .is_err());
+        assert_eq!(fs::read(existing.join("sentinel"))?, b"keep");
+        assert_eq!(fs::read_dir(&existing)?.count(), 1);
+        assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
+        let session = generation::read_snapshot(
+            &restored,
+            receipt.local_sha256,
+            &auth,
+            &cohort,
+            SELECTED_VERSION,
+            limit(),
+            Duration::from_secs(60),
+        )
+        .await?;
+        let view = GraphSnapshot::from_session(session).unwrap();
+        assert_eq!(view.version().unwrap(), SELECTED_VERSION);
+        for endpoint in [link.from, link.to] {
+            assert_eq!(view.vertex(endpoint).unwrap(), Some(Vertex::new(1)));
+        }
+        assert_eq!(view.edge(link.identity()).unwrap(), Some(link.clone()));
+        assert_eq!(
+            view.observed_adjacency(link.from, Direction::Out).unwrap(),
+            vec![link.clone()]
+        );
+        assert_eq!(
+            view.observed_adjacency(link.to, Direction::In).unwrap(),
+            vec![link]
+        );
+        for group in [0, 9, 7, 8] {
+            let path = if group == 0 {
+                restored.clone()
+            } else {
+                restored.join(group.to_string())
+            };
+            assert!(path.join("RESTORED_OFFLINE_ONLY").is_file());
+            let result = Cluster::new().in_group(group).start_durable(1, path).await;
+            assert!(result
+                .err()
+                .expect("restored votes started")
+                .to_string()
+                .contains("offline-only"));
+        }
         println!("verified remote prefix in child");
         return Ok(());
     }
@@ -193,28 +295,46 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
         CreateCapability::AtomicCreateVerified,
     )?;
     let mut receipts = Vec::new();
-    for shard in [7, 8] {
-        let write = snapshot(&graph)
-            .await
-            .prepare_vertex(shard, &Vertex::new(shard.into()))
-            .unwrap();
-        assert!(matches!(
-            graph.execute(&write).await.unwrap(),
-            Outcome::Committed { visible: true, .. }
-        ));
-        // Second generation adds data on 8, but both certify the same ordinal.
-        let capture = local.path().join(shard.to_string());
-        let prepared = generation::prepare(&capture, &auth, &cohort, 1, &c, &nodes).await?;
+    vertex(&graph, 7, 1).await;
+    vertex(&graph, 8, 1).await;
+    let create = snapshot(&graph).await.prepare_edge(&link).unwrap();
+    assert!(matches!(
+        graph.execute(&create).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    for name in ["before-delete", "after-delete"] {
+        if name == "after-delete" {
+            let delete = snapshot(&graph)
+                .await
+                .prepare_edge_delete(link.identity())
+                .unwrap();
+            assert!(matches!(
+                graph.execute(&delete).await.unwrap(),
+                Outcome::Committed { visible: true, .. }
+            ));
+            let latest = snapshot(&graph).await;
+            assert_eq!(latest.version().unwrap(), SELECTED_VERSION + 1);
+            assert_eq!(latest.edge(link.identity()).unwrap(), None);
+        }
+        let capture = local.path().join(name);
+        let prepared =
+            generation::prepare(&capture, &auth, &cohort, SELECTED_VERSION, &c, &nodes).await?;
         prepared.publish().await?;
         let staged = store
-            .stage_prefix(&capture, prepared.digest(), &auth, &cohort, 1)
+            .stage_prefix(
+                &capture,
+                prepared.digest(),
+                &auth,
+                &cohort,
+                SELECTED_VERSION,
+            )
             .await?;
         let receipt = staged.receipt().clone();
         assert!(matches!(
             objects.head(&outer(&receipt)).await,
             Err(object_store::Error::NotFound { .. })
         ));
-        if shard == 7 {
+        if name == "before-delete" {
             // Remove an actual physical file chunk, not the child manifest.
             let remote: serde_json::Value = serde_json::from_slice(
                 &objects.get(&component(&receipt, 8)).await?.bytes().await?,
@@ -243,13 +363,27 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
             ));
             assert_eq!(faulty.phase.load(Ordering::SeqCst), 2);
             reader(Limits::default())?
-                .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
+                .verify_prefix(&receipt, &auth, &cohort, SELECTED_VERSION, scratch.path())
                 .await?;
             objects.delete(&blob).await?;
             assert!(reader(Limits::default())?
-                .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
+                .verify_prefix(&receipt, &auth, &cohort, SELECTED_VERSION, scratch.path())
                 .await
                 .is_err());
+            let absent = local.path().join("missing-blob");
+            assert!(reader(Limits::default())?
+                .restore_prefix(
+                    &receipt,
+                    &auth,
+                    &cohort,
+                    SELECTED_VERSION,
+                    scratch.path(),
+                    &absent
+                )
+                .await
+                .is_err());
+            assert!(!absent.exists());
+            assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
             objects.put(&blob, retained.into()).await?;
             // Each child fits this budget in isolation. The sum cannot fit.
             let mut largest = 0;
@@ -275,13 +409,19 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
             )?;
             assert!(matches!(
                 bounded
-                    .stage_prefix(&capture, prepared.digest(), &auth, &cohort, 1)
+                    .stage_prefix(
+                        &capture,
+                        prepared.digest(),
+                        &auth,
+                        &cohort,
+                        SELECTED_VERSION
+                    )
                     .await,
                 Err(StoreError::Limit)
             ));
             assert!(matches!(
                 reader(limits)?
-                    .verify_prefix(&receipt, &auth, &cohort, 1, scratch.path())
+                    .verify_prefix(&receipt, &auth, &cohort, SELECTED_VERSION, scratch.path())
                     .await,
                 Err(StoreError::Limit)
             ));
@@ -312,7 +452,7 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
         .env("VELA_TEST_REMOTE_PREFIX_NAMESPACE", namespace)
         .env(
             "VELA_TEST_REMOTE_PREFIX_RECEIPT",
-            serde_json::to_string(first)?,
+            serde_json::to_string(&receipts[1])?,
         )
         .output()?;
     assert!(
@@ -325,7 +465,7 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
 
     let read = reader(Limits::default())?;
     assert!(read
-        .verify_prefix(first, &auth, &cohort, 2, scratch.path())
+        .verify_prefix(first, &auth, &cohort, SELECTED_VERSION + 1, scratch.path())
         .await
         .is_err());
     // Substitute a valid physical shard from another generation, preserving the
@@ -358,7 +498,7 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
         };
         objects.put(&root_key, bytes.into()).await?;
         assert!(
-            matches!(read.verify_prefix(&selection, &auth, &cohort, 1, scratch.path()).await, Err(StoreError::Invalid(reason)) if reason == "generation replica set")
+            matches!(read.verify_prefix(&selection, &auth, &cohort, SELECTED_VERSION, scratch.path()).await, Err(StoreError::Invalid(reason)) if reason == "generation replica set")
         );
     }
     envelope["replicas"][2]["manifest_sha256"] = format!("{:x}", Sha256::digest(&foreign)).into();
@@ -370,16 +510,36 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
     objects.put(&member_key, foreign.into()).await?;
     objects.put(&root_key, mixed.into()).await?;
     let error = read
-        .verify_prefix(&mixed_receipt, &auth, &cohort, 1, scratch.path())
+        .verify_prefix(
+            &mixed_receipt,
+            &auth,
+            &cohort,
+            SELECTED_VERSION,
+            scratch.path(),
+        )
         .await
         .unwrap_err();
     assert!(
         matches!(error, StoreError::Integrity(ref field) if field == "group 8 physical manifest"),
         "{error}"
     );
+    let mixed_destination = scratch.path().join("mixed");
+    assert!(matches!(
+        read.restore_prefix(
+            &mixed_receipt,
+            &auth,
+            &cohort,
+            SELECTED_VERSION,
+            scratch.path(),
+            &mixed_destination
+        )
+        .await,
+        Err(StoreError::Integrity(_))
+    ));
+    assert!(!mixed_destination.exists());
     objects.put(&member_key, original_member.into()).await?;
     objects.put(&root_key, original_outer.into()).await?;
-    read.verify_prefix(first, &auth, &cohort, 1, scratch.path())
+    read.verify_prefix(first, &auth, &cohort, SELECTED_VERSION, scratch.path())
         .await?;
     assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
     Ok(())

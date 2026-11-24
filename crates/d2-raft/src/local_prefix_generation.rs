@@ -151,39 +151,11 @@ pub async fn restore_offline(
     cohort: &Cohort,
     version: u64,
 ) -> anyhow::Result<()> {
-    let selected = blocking_section(|| -> anyhow::Result<_> {
-        let selected = SelectedManifest::read(source, digest, authority, cohort, version)?;
-        let parent = destination
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        ensure!(
-            !parent.canonicalize()?.starts_with(source.canonicalize()?),
-            "restore destination overlaps the selected source"
-        );
-        create_offline_input(destination).context("create fresh offline cohort destination")?;
-        sync_parent(destination)?;
-        Ok(selected)
-    })?;
-    let nodes = std::iter::once(selected.manifest.coordinator_node)
-        .chain(selected.manifest.member_nodes.iter().copied());
-    for ((group, expected), node) in selected.replicas().zip(nodes) {
-        tokio::task::yield_now().await;
-        blocking_section(|| {
-            let directory = group.to_string();
-            restore_replica(
-                &source.join(&directory),
-                &destination.join(directory),
-                group,
-                node,
-                Some(expected),
-            )
-        })
-        .with_context(|| format!("restore group {group}"))?;
-    }
-    selected.verify_components(destination).await?;
-    tokio::task::yield_now().await;
-    blocking_section(|| publish_record(destination, selected.as_bytes()))
+    let selected =
+        blocking_section(|| SelectedManifest::read(source, digest, authority, cohort, version))?;
+    selected
+        .restore_components_offline(source, destination)
+        .await
 }
 
 /// Materialize the exact managed decision version from one published, immutable
@@ -328,6 +300,54 @@ impl SelectedManifest {
                     .map(|member| member.shard),
             )
             .zip(self.manifest.checkpoint_sha256.iter().copied())
+    }
+
+    /// Restore the component directories belonging to this authenticated record.
+    /// The component root and ancestors must be trusted, retained and immutable
+    /// throughout restore. The root record may have been transported separately.
+    /// Partial destinations are offline and cannot be reused.
+    pub async fn restore_components_offline(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        blocking_section(|| -> anyhow::Result<()> {
+            let root: PathBuf = source.components().collect();
+            ensure!(
+                fs::symlink_metadata(&root)?.is_dir(),
+                "invalid component root"
+            );
+            let parent = destination
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            ensure!(
+                !parent.canonicalize()?.starts_with(source.canonicalize()?),
+                "restore destination overlaps the selected source"
+            );
+            create_offline_input(destination).context("create fresh offline cohort destination")?;
+            sync_parent(destination)?;
+            Ok(())
+        })?;
+        let nodes = std::iter::once(self.manifest.coordinator_node)
+            .chain(self.manifest.member_nodes.iter().copied());
+        for ((group, expected), node) in self.replicas().zip(nodes) {
+            tokio::task::yield_now().await;
+            blocking_section(|| {
+                let directory = group.to_string();
+                restore_replica(
+                    &source.join(&directory),
+                    &destination.join(directory),
+                    group,
+                    node,
+                    Some(expected),
+                )
+            })
+            .with_context(|| format!("restore group {group}"))?;
+        }
+        self.verify_components(destination).await?;
+        tokio::task::yield_now().await;
+        blocking_section(|| publish_record(destination, self.as_bytes()))
     }
 
     /// Verify all local physical bytes, identities and the actual decision cut.
