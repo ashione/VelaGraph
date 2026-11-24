@@ -280,8 +280,11 @@ leave temporary data under the scratch parent. Partial remote objects survive.
 
 During restore, budget space for both the scratch generation and the restored
 databases. A missing chunk during transfer leaves the destination untouched.
-An interrupted local copy can leave a guarded partial destination. A deadline
-or cleanup error after local publication can leave a complete destination.
+Local filesystem errors during the copy retain their `io::ErrorKind` in
+`Error::Io`, including `AlreadyExists` if another restore claims the destination
+during transfer. An interrupted local copy can leave a guarded partial
+destination. A deadline or cleanup error after local publication can leave a
+complete destination.
 After an uncertain result, use `generation::verify` on the destination with the
 independently retained digest and cut. Use a fresh path for a retry.
 

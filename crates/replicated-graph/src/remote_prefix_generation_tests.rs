@@ -214,19 +214,49 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
         .await?;
         assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
         let existing = output.path().join("used");
-        fs::create_dir(&existing)?;
-        fs::write(existing.join("sentinel"), b"keep")?;
-        assert!(reader(Limits::default())?
+        // A competing owner claims the path after preflight, during download.
+        let mut pending = std::pin::pin!(read.restore_prefix(
+            &receipt,
+            &auth,
+            &cohort,
+            SELECTED_VERSION,
+            scratch.path(),
+            &existing
+        ));
+        let mut claimed = false;
+        let result = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            let step = pending.as_mut().poll(cx);
+            if step.is_pending()
+                && !claimed
+                && fs::read_dir(scratch.path()).unwrap().next().is_some()
+            {
+                fs::create_dir(&existing).unwrap();
+                fs::write(existing.join("sentinel"), b"keep").unwrap();
+                claimed = true;
+            }
+            step
+        })
+        .await;
+        assert!(claimed);
+        assert!(
+            matches!(result, Err(StoreError::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "{result:?}"
+        );
+        let preflight = read
             .restore_prefix(
                 &receipt,
                 &auth,
                 &cohort,
                 SELECTED_VERSION,
                 scratch.path(),
-                &existing
+                &existing,
             )
-            .await
-            .is_err());
+            .await;
+        assert!(
+            matches!(preflight, Err(StoreError::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "{preflight:?}"
+        );
         assert_eq!(fs::read(existing.join("sentinel"))?, b"keep");
         assert_eq!(fs::read_dir(&existing)?.count(), 1);
         assert_eq!(fs::read_dir(scratch.path())?.count(), 0);
@@ -260,13 +290,7 @@ async fn scenario(store: Arc<dyn ObjectStore>, local_backend: Option<&Path>) -> 
             } else {
                 restored.join(group.to_string())
             };
-            assert!(path.join("RESTORED_OFFLINE_ONLY").is_file());
-            let result = Cluster::new().in_group(group).start_durable(1, path).await;
-            assert!(result
-                .err()
-                .expect("restored votes started")
-                .to_string()
-                .contains("offline-only"));
+            super::offline_cohort_restore_tests::assert_offline(&path, group).await;
         }
         println!("verified remote prefix in child");
         return Ok(());

@@ -268,7 +268,10 @@ impl CheckpointReader {
             selection
                 .restore_components_offline(scratch.path(), destination)
                 .await
-                .map_err(invalid_prefix)?;
+                .map_err(|error| match error.downcast::<std::io::Error>() {
+                    Ok(io) => Error::Io(io),
+                    Err(error) => invalid_prefix(error),
+                })?;
             scratch.close()?;
             if start.elapsed() >= self.inner.limits.timeout {
                 return Err(Error::Deadline);
