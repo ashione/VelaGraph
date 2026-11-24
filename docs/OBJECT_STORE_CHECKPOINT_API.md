@@ -5,6 +5,11 @@ zero-RPO, object-store-authoritative graph storage, automatic live rejoin or GC.
 The separate local two-DB physical checkpoint validator remains authoritative.
 It does not alter or bypass the unresolved #124 purge fence.
 
+Downloaded physical inputs carry the D2 `RESTORED_OFFLINE_ONLY` guard from
+before the first database directory is created. It is local startup metadata.
+Only the final `checkpoint.json` and its validated files establish a complete
+download. See [startup admission](PHYSICAL_CHECKPOINT.md#startup-admission-for-recovery-inputs).
+
 ## Implemented boundary
 
 `crates/checkpoint-object-store` exposes:
@@ -13,7 +18,7 @@ It does not alter or bypass the unresolved #124 purge fence.
 - `upload(completed_checkpoint_directory, checkpoint_id) -> Receipt`
 - `download(&Receipt, new_directory)`
 - `verify(&Receipt) -> Verification` (read-only complete byte verification)
-- `CheckpointReader::new(store, prefix, limits)` exposes only `verify`, without
+- `CheckpointReader::new(store, prefix, limits)` exposes read operations without
   asserting conditional-create support.
 
 The operator supplies a backend (locked Apache `object_store` 0.14.2), endpoint,
@@ -213,3 +218,85 @@ The command intentionally does not echo endpoints, paths or backend error text.
 Do not interpret a successful byte check as global recovery or cloud-provider
 certification. Verification grants no retention lease; a later download must
 still revalidate and use the guarded physical restore path.
+
+## Fixed-cohort D2 decision-prefix transport
+
+The optional `d2-cohort` crate feature transports one published
+[local decision-prefix generation](PHYSICAL_CHECKPOINT.md#publishing-one-local-decision-prefix-generation).
+Supply the trusted producer's local SHA-256, expected authority, complete cohort
+(including epochs and capacity profile) and decision ordinal V. The selection
+covers the coordinator and each member's D2 Raft and state databases.
+Application catalogs and separate temporal stores require additional coverage.
+
+1. Call `CheckpointStore::stage_prefix` on the caller-retained, immutable local
+   root. It selects the local producer record and requires its exact physical
+   digest for each uploaded group. Each replica uses the existing physical
+   manifest and chunk transport. The prefix can already contain verified
+   components from an interrupted attempt.
+2. Save `StagedPrefix::receipt()` outside the backup with the backend, prefix,
+   and intended cut. The receipt binds the local producer bytes and the exact
+   remote envelope. Call `publish(scratch_parent)` on the staged value. It
+   downloads all components into a private temporary directory, checks every
+   chunk and file, and reopens the captured databases to verify the identities
+   and decision history through V. Only then does it conditionally create the
+   generation envelope and reconcile the response by a digest-checked GET.
+3. After restart or uncertain acknowledgement, use
+   `CheckpointReader::verify_prefix` with the saved receipt, same backend and
+   prefix, expected cut and caller-owned, access-controlled scratch parent. This operation repeats the
+   complete download and semantic verification without issuing a backend
+   write. An unreadable or missing object fails the call. A retry of staging
+   and publication from retained immutable input requires the same chunk size.
+
+4. To recover from the backend after loss of the source and local backup, call
+   `CheckpointReader::restore_prefix(receipt, authority, cohort, version,
+   scratch_parent, destination)`. Give it a fresh, exclusively owned destination
+   and a trusted scratch parent. The reader fetches the selected coordinator
+   and every member into private scratch, then performs the local offline restore.
+   It verifies the copied databases and their common decision history before
+   publishing the producer record at the destination. Use
+   `generation::read_snapshot` on that directory with the saved local digest and
+   cut to inspect historical graph records. The root and replica startup guards
+   stay in place.
+
+The envelope at `<prefix>/d2-prefixes/<local-sha256>/generation.json` contains
+the format tag `d2-prefix-transport-v1`, the exact UTF-8 local record in
+`local_record`, and the ordered `replicas` list of physical transport receipts.
+Checkpoint IDs are `d2-<local-sha256>-<decimal-group>`, coordinator first and
+then members in cohort order. The outer digest is SHA-256 of the exact envelope
+bytes. Existing single-replica objects and local generation formats are unchanged.
+
+Each stage, publication, verification or restore call gets one configured timeout. Each
+uses at most 65 groups (the coordinator and up to 64 members), one transfer at a
+time. File count and logical payload bytes are charged across the whole cohort.
+Each physical envelope is subject to the ordinary manifest limit. The published
+outer envelope is capped at the smaller of 256 KiB and that limit, and its
+embedded local record at 64 KiB. Allow scratch space for all replica payloads,
+their physical manifests and filesystem overhead, and memory for opening one
+replica's state. Synchronous local RocksDB verification or filesystem cleanup
+can finish after cancellation or deadline. Publication, verification and restore require
+successful removal of the scratch directory before reporting success. A failed
+or cancelled operation, a filesystem cleanup error, or a process crash can
+leave temporary data under the scratch parent. Partial remote objects survive.
+
+During restore, budget space for both the scratch generation and the restored
+databases. A missing chunk during transfer leaves the destination untouched.
+Local filesystem errors during the copy retain their `io::ErrorKind` in
+`Error::Io`, including `AlreadyExists` if another restore claims the destination
+during transfer. An interrupted local copy can leave a guarded partial
+destination. A deadline or cleanup error after local publication can leave a
+complete destination.
+After an uncertain result, use `generation::verify` on the destination with the
+independently retained digest and cut. Use a fresh path for a retry.
+
+The caller must ensure the backend retains every object during publication,
+verification and later use. Reads attest the bytes observed on that invocation.
+The feature adds no retention lease, live restore, or query readiness guarantee.
+The cross-process fixture runs against a filesystem-backed object store in
+ordinary tests and against a disposable SeaweedFS service in the S3 CI job.
+Both runs capture one coordinator and two data shards, exercise the same
+lost-ACK, missing-chunk and mixed-generation cases, and restore from the selected
+receipt in a fresh process after removing the source and local backup. The
+restored historical view must contain both endpoints and both directions of a
+cross-shard edge deleted before physical capture. The fault wrapper drops the final
+PUT response after the backend commits it and fails the first reconciliation GET.
+Cloud provider behavior requires independent testing against the actual backend and bucket settings.

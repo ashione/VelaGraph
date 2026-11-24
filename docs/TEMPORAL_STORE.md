@@ -27,11 +27,16 @@ is not reuse of v1/v2 permanent qualified IDs.
 uses V/T throughout. V=0 is the empty initialized store. `view(None,T)` resolves
 this local snapshot's current head once; it does not imply a distributed common
 prefix or linearizable cluster latest. A version with no local change is readable.
-Every read lazily seeks one identity's descending system-version index, then
+An uncached read lazily seeks one identity's descending system-version index, then
 selects the first revision containing T. A later correction masks only its valid
 interval; old system views are unchanged. Absent revisions mask earlier assertions
 only over the specified interval. No whole graph or full history is copied into
 a query view, and commits do not copy the graph.
+
+Each store caches one decoded head with its RocksDB snapshot sequence number.
+A new view pins its own snapshot and can reuse the head for that exact sequence
+at any requested V/T. On a miss or cache contention, the view reads the head
+from its pinned snapshot. Only successful reads populate the cache.
 
 The view retains the snapshot head already validated at creation. This is
 distinct from an explicitly selected older V: adjacency candidates are checked
@@ -410,3 +415,10 @@ Gremlin executor. Source candidates must exactly match canonical positive histor
 construction does not repair mismatches. See [the read-model contract](MATERIALIZED_TEMPORAL_READS.md)
 for eager validation, construction/query limits, accounting, ownership and explicit
 refresh. The standalone format and disk-query defaults above are unchanged.
+
+## Bounded cross-query revision reuse
+
+Point and Gremlin reads can reuse [bounded revision prefixes](TEMPORAL_REVISION_CACHE.md)
+across acknowledged unchanged local versions and varying valid times. Snapshot
+sequence guards, endpoint validation and original query budgets remain enforced.
+No format migration or additional dependency is required.

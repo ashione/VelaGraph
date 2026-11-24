@@ -378,6 +378,7 @@ def validate_checkpoint(checkpoint, source_hash, elf_hash, executable, directory
 BUILD_JOB = 'lifecycle-build'
 CARGO_FILES = {'Cargo.lock': 'Cargo.lock', 'cargo-root.toml': 'Cargo.toml',
                'cargo-replicated-graph.toml': 'crates/replicated-graph/Cargo.toml',
+               'cargo-checkpoint-object-store.toml': 'crates/checkpoint-object-store/Cargo.toml',
                'cargo-d2-raft.toml': 'crates/d2-raft/Cargo.toml'}
 HANDOFF_LIMITS = {'handoff.json': 1024 * 1024, 'source.json': 16 * 1024 * 1024,
                   'build.jsonl': 64 * 1024 * 1024, 'dependencies.json': 64 * 1024 * 1024,

@@ -97,3 +97,41 @@ successful rerun for a failed candidate result.
 For v0.0.1, residual historical uncertainty must be explicitly reviewed alongside
 current candidate evidence. No automatic decision to release, close #247, or waive
 its acceptance conditions follows from this document.
+
+## Milestone 1 investigation disposition
+
+The [v0.0.1 release decision](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1)
+accepts the missing historical evidence for the same-version, fixed-topology
+experimental service. The dispositions below apply to that scope.
+
+* **Paged snapshot (#128).** The [original run](https://github.com/ashione/VelaGraph/actions/runs/42512547338)
+  cannot distinguish Open failure from failure on a later page. The ordinary
+  downloader regression injects Unavailable at each boundary, verifies the
+  caller gets an error even after a valid first page, and checks the peer saw
+  exactly one Open and a Close only for an acquired session. The independent
+  process test retains its original budgets and child evidence. Accept the
+  original cause as indeterminate. Investigate a new occurrence from its first
+  failed run and the recorded Open/page phase.
+* **Snapshot seed quorum (#247).** The [first failed attempt](https://github.com/ashione/VelaGraph/actions/runs/43377553475/job/131727467953)
+  identifies a read barrier failure during seed but lacks contemporaneous
+  peer state. Bounded read confirmation and the controlled follower-pause
+  experiment are documented in the [quorum investigation](SNAPSHOT_QUORUM_INVESTIGATION.md).
+  Accept the original trigger as indeterminate. On an ordinary CI differential
+  seed failure, retain `snapshot-seed-failure.json` alongside source provenance.
+  The vertex, selected leader, child state and bounded control observations
+  describe the period **after** the error. Use them with the child phase logs;
+  the later differential incident in #348 has no established common cause.
+* **Observed session expiry (#311).** For same-version nodes, #335 separates
+  Open acquisition from the bounded, nonrenewable snapshot lease. The ordinary
+  wire tests cover the old 3-second boundary, the shorter caller deadline while
+  another HTTP/2 stream is held, and background reclamation of a snapshot whose
+  descriptor could not be delivered. The [original reproduction and provenance](https://github.com/ashione/VelaGraph/issues/311)
+  and [queue observation](https://github.com/ashione/VelaGraph/issues/311#issuecomment-6943163297)
+  distinguish caller timeout from the relative budget computed before transport
+  queueing. Cross-version lease negotiation, exact remote deduction of queue
+  time and arbitrary packet loss are outside the published contract. Revisit
+  the wire protocol before advertising any of those guarantees.
+
+A new unexpected failure of a required test still stops acceptance. Preserve
+the first failed job, tree and artifacts before investigating. Closure of a
+milestone investigation does not provide a production availability estimate.

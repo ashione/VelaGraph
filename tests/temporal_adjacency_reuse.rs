@@ -49,6 +49,13 @@ fn adjacency_reuses_the_head_validated_at_view_creation() {
     );
     let stats = query_profile::finish();
     assert_eq!(stats.head_reads, 1);
+    query_profile::begin();
+    assert_eq!(store.view(None, 9).unwrap().version(), 1);
+    assert_eq!(query_profile::finish().head_reads, 0);
+    store.commit(&[]).unwrap();
+    query_profile::begin();
+    assert_eq!(store.view(Some(1), 9).unwrap().version(), 1);
+    assert_eq!(query_profile::finish().head_reads, 1);
 }
 
 #[test]

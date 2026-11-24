@@ -9,6 +9,8 @@ mod async_read;
 pub use async_read::AsyncGraphReader;
 
 mod error;
+mod execution;
+pub use execution::{CancellationToken, ExecutionControl, QueryBatchLimits};
 mod global_scan;
 mod graph;
 mod graph_records;

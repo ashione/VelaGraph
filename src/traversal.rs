@@ -70,7 +70,6 @@ impl GraphEngine {
         }
 
         let mut visited = HashSet::new();
-        visited.insert(start);
         let mut queue = VecDeque::new();
         queue.push_back(TraversalPath {
             vertices: vec![start],
@@ -87,21 +86,21 @@ impl GraphEngine {
             let edges = self.edges_for_traversal(current, options)?;
             for edge in edges {
                 let next = next_vertex(&edge, current, options.direction);
-                if !visited.insert(next) {
+                if next == start || !discover_endpoint(&paths, &mut visited, next) {
                     continue;
                 }
-                let mut next_path = path.clone();
-                next_path.vertices.push(next);
-                next_path.edges.push(edge.id);
                 if paths.len() >= options.limit {
                     truncated = true;
                     break 'outer;
                 }
-                let expand = next_path.edges.len() < usize::from(options.max_hops);
-                paths.push(next_path.clone());
-                if expand {
-                    queue.push_back(next_path);
+                let next_path = TraversalPath {
+                    vertices: path.vertices.iter().copied().chain([next]).collect(),
+                    edges: path.edges.iter().copied().chain([edge.id]).collect(),
+                };
+                if next_path.edges.len() < usize::from(options.max_hops) {
+                    queue.push_back(next_path.clone());
                 }
+                paths.push(next_path);
             }
         }
         Ok(TraversalResult { paths, truncated })
@@ -109,20 +108,36 @@ impl GraphEngine {
 
     fn edges_for_traversal(&self, vertex: u64, options: &TraversalOptions) -> Result<Vec<Edge>> {
         let label = options.label.as_deref();
-        let mut edges = match options.direction {
-            TraversalDirection::Out => self.out_edges(vertex, label)?,
-            TraversalDirection::In => self.in_edges(vertex, label)?,
+        match options.direction {
+            TraversalDirection::Out => self.out_edges(vertex, label),
+            TraversalDirection::In => self.in_edges(vertex, label),
             TraversalDirection::Both => {
                 let mut edges = self.out_edges(vertex, label)?;
                 edges.extend(self.in_edges(vertex, label)?);
                 edges.sort_by_key(|edge| edge.id);
                 edges.dedup_by_key(|edge| edge.id);
-                edges
+                Ok(edges)
             }
-        };
-        edges.sort_by_key(|edge| edge.id);
-        Ok(edges)
+        }
     }
+}
+
+// Every discovered endpoint is already the last vertex of a result path.
+// Keep membership request-wide when paths from different branches converge.
+fn discover_endpoint(paths: &[TraversalPath], visited: &mut HashSet<u64>, next: u64) -> bool {
+    const LINEAR_ENDPOINTS: usize = 8;
+    let endpoints = || {
+        paths
+            .iter()
+            .map(|path| *path.vertices.last().expect("nonempty path"))
+    };
+    if paths.len() < LINEAR_ENDPOINTS {
+        return !endpoints().any(|vertex| vertex == next);
+    }
+    if visited.is_empty() {
+        visited.extend(endpoints());
+    }
+    visited.insert(next)
 }
 
 fn validate_options(options: &TraversalOptions) -> Result<()> {

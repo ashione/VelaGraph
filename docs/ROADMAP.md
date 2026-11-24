@@ -1,5 +1,19 @@
 # VelaGraph Roadmap（实验阶段）
 
+## Optional native embedding
+
+The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
+in-process access to ordinary incremental memory and temporal RocksDB stores.
+They share existing Gremlin, mutation, V/T and checkpoint contracts. Packed
+results support owned Go materialization and explicitly closed native-memory views.
+The Go native package bundles its ABI header; isolated module/vendor consumers
+are covered by native CI. Cancellation
+is cooperative; no distributed capability or storage format is added. JSON
+encoding/copy costs, explicit lifecycle and shared-process native failure remain
+part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)
+and [issue #376](https://github.com/ashione/VelaGraph/issues/376).
+
+
 > 当前阶段：已有单机图内核、Raft 存储节点、静态路由、有界 observed 跨分片查询及 restricted managed 事务/同版本读取。继续以真实写入、查询和恢复路径补齐功能与容量证据，以 CoreHR 持续验收；容错、在线迁移与生产安全分别推进，实验切片可用不代表 D3、D4、D5 已全部完成。
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
@@ -376,7 +390,8 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 
 **已实现**：#194 的本地双 DB 一致物理 checkpoint、manifest/完整性校验和新目录
 离线恢复；另有 `checkpoint-object-store` 不可变上传/下载、最后发布 manifest 和
-S3-compatible 集成验收。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
+S3-compatible 集成验收。固定 cohort 现可按指定本地 generation 将协调节点和所有成员恢复到新目录，
+并从副本文件核验指定 V 的决策前缀。目标保持离线。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
 [对象运输契约](OBJECT_STORE_CHECKPOINT_API.md)。这不是“尚无 checkpoint/上传工具”。
 
 **仍待实现**：#193 安全 live restart/rejoin，#191 跨组认证恢复集/全局 READY 屏障、
@@ -984,3 +999,17 @@ mutex, publishes under a short lock and reclaims outside it. Candidate version
 construction peaks are included in admission, and record budgets precede
 validation/compaction. Checkpoint writes use conditional, directory-locked publication
 to prevent stale overwrite; this does not establish a service latency SLA.
+
+Owned temporal adjacency reads now support conservative time-block pruning.
+This preserves candidate order, endpoint visibility and original logical query
+admission. It adds bounded in-memory summaries, not a persistent interval index,
+new traversal language, wider batching contract or automatic model refresh.
+
+## Local temporal revision reuse
+
+The local `TemporalStore` now uses [bounded revision-prefix blocks](TEMPORAL_REVISION_CACHE.md)
+for point and Gremlin reads. Reuse across unchanged commits is guarded by logical
+version and physical snapshot sequence; interval indexing preserves revision
+precedence and query budgets. This adds no distributed, storage-format or public
+protocol capability. Synthetic benchmark evidence and cold/write tradeoffs are
+recorded with the cache contract.

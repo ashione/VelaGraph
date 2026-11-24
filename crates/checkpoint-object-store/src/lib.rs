@@ -1,6 +1,9 @@
 //! Immutable checkpoint transport. No live-DB access, remote write ACK or rejoin.
 //! Large files are streamed as bounded content-addressed objects. Publication is
 //! one conditional manifest PUT; neither LIST nor HEAD+PUT is used as a lock.
+#[cfg(feature = "d2-cohort")]
+pub mod cohort;
+
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt, PutMode};
@@ -49,6 +52,30 @@ impl Default for Limits {
         }
     }
 }
+
+// Charge logical files, including duplicate blobs, before transferring them.
+struct InventoryBudget {
+    files: usize,
+    bytes: u64,
+}
+
+impl InventoryBudget {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            files: limits.files,
+            bytes: limits.total_bytes,
+        }
+    }
+
+    fn charge(&mut self, sizes: impl ExactSizeIterator<Item = u64>) -> Result<()> {
+        self.files = self.files.checked_sub(sizes.len()).ok_or(Error::Limit)?;
+        for size in sizes {
+            self.bytes = self.bytes.checked_sub(size).ok_or(Error::Limit)?;
+        }
+        Ok(())
+    }
+}
+
 /// Caller must bind this capability to its actual provider/bucket configuration.
 /// OSS version-enabled/suspended forbid-overwrite is NOT this capability.
 #[derive(Clone, Copy, Debug)]
@@ -160,7 +187,11 @@ fn valid_hash(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn validate_physical(bytes: &[u8], limits: &Limits) -> Result<PhysicalManifest> {
+fn validate_physical(
+    bytes: &[u8],
+    limits: &Limits,
+    budget: &mut InventoryBudget,
+) -> Result<PhysicalManifest> {
     if bytes.len() > limits.manifest_bytes {
         return Err(Error::Limit);
     }
@@ -170,11 +201,8 @@ fn validate_physical(bytes: &[u8], limits: &Limits) -> Result<PhysicalManifest> 
             "unsupported or empty physical manifest".into(),
         ));
     }
-    if manifest.files.len() > limits.files {
-        return Err(Error::Limit);
-    }
+    budget.charge(manifest.files.iter().map(|file| file.size))?;
     let mut names = BTreeSet::new();
-    let mut total = 0u64;
     for f in &manifest.files {
         safe_path(&f.name)?;
         let parts: Vec<_> = f.name.split('/').collect();
@@ -184,10 +212,6 @@ fn validate_physical(bytes: &[u8], limits: &Limits) -> Result<PhysicalManifest> 
             || !names.insert(&f.name)
         {
             return Err(Error::Invalid("invalid or duplicate physical file".into()));
-        }
-        total = total.checked_add(f.size).ok_or(Error::Limit)?;
-        if total > limits.total_bytes {
-            return Err(Error::Limit);
         }
     }
     Ok(manifest)
@@ -266,11 +290,25 @@ impl CheckpointStore {
     }
     pub async fn upload(&self, root: &Path, checkpoint_id: &str) -> Result<Receipt> {
         safe_id(checkpoint_id)?;
-        tokio::time::timeout(self.limits.timeout, self.upload_inner(root, checkpoint_id))
-            .await
-            .map_err(|_| Error::Deadline)?
+        tokio::time::timeout(
+            self.limits.timeout,
+            self.upload_inner(
+                root,
+                checkpoint_id,
+                None,
+                &mut InventoryBudget::new(&self.limits),
+            ),
+        )
+        .await
+        .map_err(|_| Error::Deadline)?
     }
-    async fn upload_inner(&self, root: &Path, id: &str) -> Result<Receipt> {
+    async fn upload_inner(
+        &self,
+        root: &Path,
+        id: &str,
+        expected_physical: Option<[u8; 32]>,
+        budget: &mut InventoryBudget,
+    ) -> Result<Receipt> {
         // Caller owns an immutable completed directory throughout the transfer.
         require_directory(root).await?;
         let manifest_path = root.join("checkpoint.json");
@@ -279,7 +317,12 @@ impl CheckpointStore {
             return Err(Error::Limit);
         }
         let original = tokio::fs::read(&manifest_path).await?;
-        let physical = validate_physical(&original, &self.limits)?;
+        if expected_physical
+            .is_some_and(|expected| <[u8; 32]>::from(Sha256::digest(&original)) != expected)
+        {
+            return Err(Error::Integrity("local physical manifest".into()));
+        }
+        let physical = validate_physical(&original, &self.limits, budget)?;
         for directory in ["raft.db", "state.db"] {
             require_directory(&root.join(directory)).await?;
         }
@@ -380,7 +423,9 @@ impl CheckpointStore {
     /// This does not pin objects, prove a global cut or make a node query-ready.
     pub async fn verify(&self, receipt: &Receipt) -> Result<Verification> {
         tokio::time::timeout(self.limits.timeout, async {
-            let remote = self.read_manifest(receipt).await?;
+            let remote = self
+                .read_manifest(receipt, &mut InventoryBudget::new(&self.limits))
+                .await?;
             let mut report = Verification {
                 files: remote.files.len(),
                 bytes: 0,
@@ -399,7 +444,11 @@ impl CheckpointStore {
         .await
         .map_err(|_| Error::Deadline)?
     }
-    async fn read_manifest(&self, receipt: &Receipt) -> Result<RemoteManifest> {
+    async fn read_manifest(
+        &self,
+        receipt: &Receipt,
+        budget: &mut InventoryBudget,
+    ) -> Result<RemoteManifest> {
         safe_id(&receipt.checkpoint_id)?;
         if !valid_hash(&receipt.manifest_sha256) {
             return Err(Error::Invalid("receipt digest".into()));
@@ -417,7 +466,8 @@ impl CheckpointStore {
         if remote.format != 1 {
             return Err(Error::Invalid("remote manifest format".into()));
         }
-        let physical = validate_physical(remote.physical_manifest.as_bytes(), &self.limits)?;
+        let physical =
+            validate_physical(remote.physical_manifest.as_bytes(), &self.limits, budget)?;
         if remote.files.len() != physical.files.len() {
             return Err(Error::Invalid("remote inventory".into()));
         }
@@ -468,8 +518,14 @@ impl CheckpointStore {
         Ok(())
     }
     async fn download_inner(&self, receipt: &Receipt, destination: &Path) -> Result<()> {
-        let remote = self.read_manifest(receipt).await?;
+        let remote = self
+            .read_manifest(receipt, &mut InventoryBudget::new(&self.limits))
+            .await?;
+        self.write_download(remote, destination).await
+    }
+    async fn write_download(&self, remote: RemoteManifest, destination: &Path) -> Result<()> {
         tokio::fs::create_dir(destination).await?;
+        guard_offline_directory(destination).await?;
         for dir in ["raft.db", "state.db"] {
             tokio::fs::create_dir(destination.join(dir)).await?;
         }
@@ -511,6 +567,18 @@ impl CheckpointStore {
         tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok(())
     }
+}
+async fn guard_offline_directory(destination: &Path) -> Result<()> {
+    // Normal D2 startup recognizes this marker even before checkpoint.json
+    // exists. Persist it before creating either database directory.
+    let guard = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination.join("RESTORED_OFFLINE_ONLY"))
+        .await?;
+    guard.sync_all().await?;
+    tokio::fs::File::open(destination).await?.sync_all().await?;
+    Ok(())
 }
 async fn require_file(path: &Path) -> Result<()> {
     if !tokio::fs::symlink_metadata(path)

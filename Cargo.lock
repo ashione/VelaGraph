@@ -354,6 +354,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "d2-raft",
  "futures",
  "object_store",
  "reqwest",
@@ -1821,12 +1822,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "checkpoint-object-store",
  "d2-raft",
+ "futures",
  "getrandom 0.3.4",
  "h2",
  "http-body",
  "hyper",
  "hyper-util",
+ "object_store",
  "openraft",
  "prost",
  "rustix",
@@ -2689,6 +2693,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "velagraph-ffi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "velagraph",
 ]
 
 [[package]]

@@ -1,0 +1,68 @@
+name: Native FFI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-ffi-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_BUILD_JOBS: '2'
+jobs:
+  native:
+    name: Native C and Go (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev
+          libclang_path=$(dirname "$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' -print -quit)")
+          test -n "$libclang_path" && test "$libclang_path" != .
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+      - name: macOS native dependencies
+        if: runner.os == 'macOS'
+        run: |
+          libclang_path="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          if [ ! -f "$libclang_path/libclang.dylib" ]; then
+            libclang_path="$(xcode-select -p)/usr/lib"
+          fi
+          test -f "$libclang_path/libclang.dylib"
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$libclang_path" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: native-ffi-v1
+      - name: Test and lint native ABI
+        run: |
+          cargo test --locked -p velagraph-ffi
+          cargo clippy --locked -p velagraph-ffi --all-targets -- -D warnings
+          cargo build --locked -p velagraph-ffi
+      - name: C, module/vendor consumers, Go race and portable SDK
+        run: python3 scripts/test_native_ffi.py --lib-dir target/debug
+      - name: Go native example (correctness only)
+        working-directory: sdk/go
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+        run: go run -tags velagraph_native ./native/example

@@ -190,3 +190,53 @@ fn invalid_traversal_options_and_missing_start_fail() {
         Err(Error::InvalidGraphLabel(_))
     ));
 }
+
+#[test]
+fn parallel_edges_and_converging_paths_respect_the_exact_limit() {
+    let dir = TempDir::new().unwrap();
+    let graph = open(dir.path());
+    for id in 0..=10 {
+        graph.create_vertex(&vertex(id)).unwrap();
+    }
+    // Discover the same endpoint twice, before and after growing the visited set.
+    for (id, to) in [0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 3, 9].into_iter().enumerate() {
+        // The storage index groups by label; discovery must still follow edge IDs.
+        let label = if id % 2 == 0 { "B" } else { "A" };
+        graph
+            .create_edge(&edge(id as u64 + 1, 0, to, label))
+            .unwrap();
+    }
+    graph.create_edge(&edge(20, 1, 10, "NEXT")).unwrap();
+    graph.create_edge(&edge(21, 2, 10, "NEXT")).unwrap();
+    graph.create_edge(&edge(22, 3, 0, "NEXT")).unwrap();
+
+    let options = TraversalOptions {
+        max_hops: 2,
+        limit: 10,
+        ..Default::default()
+    };
+    let result = graph.traverse(0, &options).unwrap();
+    assert!(!result.truncated);
+    assert_eq!(result.paths.len(), 10);
+    for (i, path) in result.paths[..9].iter().enumerate() {
+        assert_eq!(path.vertices, [0, i as u64 + 1]);
+    }
+    assert_eq!(result.paths[0].edges, [2]);
+    assert_eq!(result.paths[9].vertices, [0, 1, 10]);
+    assert_eq!(result.paths[9].edges, [2, 20]);
+
+    drop(graph);
+    let graph = open(dir.path());
+    assert_eq!(graph.traverse(0, &options).unwrap(), result);
+    let limited = graph
+        .traverse(
+            0,
+            &TraversalOptions {
+                limit: 8,
+                ..options
+            },
+        )
+        .unwrap();
+    assert!(limited.truncated);
+    assert_eq!(limited.paths, result.paths[..8]);
+}

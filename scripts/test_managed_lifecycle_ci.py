@@ -371,6 +371,7 @@ class HandoffFixture:
         lock = 'version = 4\n'
         for name, path in [('velagraph', 'Cargo.toml'),
                            ('d2-raft', 'crates/d2-raft/Cargo.toml'),
+                           ('checkpoint-object-store', 'crates/checkpoint-object-store/Cargo.toml'),
                            ('replicated-graph', 'crates/replicated-graph/Cargo.toml')]:
             files[path] = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
             lock += f'\n[[package]]\nname = "{name}"\nversion = "0.1.0"\n'
@@ -738,6 +739,7 @@ class HandoffTests(unittest.TestCase):
                  ('Cargo.lock', lambda raw: raw + b'\n# changed\n'),
                  ('cargo-root.toml', lambda raw: raw.replace(b'0.1.0', b'0.1.1')),
                  ('cargo-replicated-graph.toml', lambda raw: raw + b'\n# changed\n'),
+                 ('cargo-checkpoint-object-store.toml', lambda raw: raw + b'\n# changed\n'),
                  ('dependencies.json', change_json(lambda v: v['compiled'].pop())),
                  ('dependencies.json', change_json(lambda v: v.update(lock_sha256='f' * 64))),
                  ('dependencies.json', change_json(lambda v: v['compiled'][0].update(features=['extra']))),

@@ -25,6 +25,13 @@ pub enum Error {
     Application(D1Error),
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cohort read: {self:?}")
+    }
+}
+impl std::error::Error for Error {}
+
 /// Lightweight leader-observed readiness, not itself a read certificate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +112,19 @@ pub async fn acquire(
     .await
 }
 
+pub(crate) fn validate_read_limit(limit: &ReadLimit) -> Result<(), Error> {
+    if limit.rows == 0
+        || limit.rows > crate::versioned_reads::MAX_READ_ROWS
+        || limit.bytes == 0
+        || limit.bytes > crate::versioned_reads::MAX_READ_BYTES
+        || limit.operations == 0
+        || limit.operations > crate::versioned_reads::MAX_REPLAY_OPERATIONS
+    {
+        return Err(Error::InvalidLimits);
+    }
+    Ok(())
+}
+
 impl From<managed_rpc::Error> for Error {
     fn from(error: managed_rpc::Error) -> Self {
         match error {
@@ -128,17 +148,7 @@ pub async fn acquire_endpoints(
     limit: ReadLimit,
     lifetime: Duration,
 ) -> Result<SnapshotSession, Error> {
-    if lifetime.is_zero()
-        || lifetime > MAX_SESSION_LIFETIME
-        || limit.rows == 0
-        || limit.rows > crate::versioned_reads::MAX_READ_ROWS
-        || limit.bytes == 0
-        || limit.bytes > crate::versioned_reads::MAX_READ_BYTES
-        || limit.operations == 0
-        || limit.operations > crate::versioned_reads::MAX_REPLAY_OPERATIONS
-    {
-        return Err(Error::InvalidLimits);
-    }
+    validate_read_limit(&limit)?;
     let window = AcquisitionWindow::new(lifetime)?;
     let result = tokio::time::timeout(lifetime.min(MAX_ACQUIRE_TIME), async {
         let cut = admit_cut(
@@ -268,12 +278,12 @@ pub async fn admit_endpoints_at_least<'a>(
 }
 
 #[derive(Clone, Copy)]
-struct AcquisitionWindow {
+pub(crate) struct AcquisitionWindow {
     expires: Instant,
     deadline: Instant,
 }
 impl AcquisitionWindow {
-    fn new(lifetime: Duration) -> Result<Self, Error> {
+    pub(crate) fn new(lifetime: Duration) -> Result<Self, Error> {
         if lifetime.is_zero() || lifetime > MAX_SESSION_LIFETIME {
             return Err(Error::InvalidLimits);
         }
@@ -284,7 +294,7 @@ impl AcquisitionWindow {
             deadline: Instant::now() + lifetime.min(MAX_ACQUIRE_TIME),
         })
     }
-    fn check(self) -> Result<(), Error> {
+    pub(crate) fn check(self) -> Result<(), Error> {
         if Instant::now() >= self.expires {
             Err(Error::Expired)
         } else if Instant::now() >= self.deadline {
@@ -411,55 +421,103 @@ async fn capture_cut(cut: AdmittedCut<'_>, limit: ReadLimit) -> Result<SnapshotS
         members,
         window,
     } = cut;
-    let mut snapshots = BTreeMap::new();
-    let mut rows = 0usize;
-    let mut bytes = 0usize;
-    let mut operations = 0usize;
+    let mut capture = SessionCapture::new(authority, cohort, version, window, limit);
     for (node, target) in members {
-        window.check()?;
-        let remaining = ReadLimit {
-            rows: limit.rows.saturating_sub(rows),
-            bytes: limit.bytes.saturating_sub(bytes),
-            operations: limit.operations.saturating_sub(operations),
-        };
-        // Exhaustion is fail-closed even if a later shard might be empty.
-        if remaining.rows == 0 || remaining.bytes == 0 || remaining.operations == 0 {
+        let snapshot = node
+            .read_terminal(&target, capture.remaining()?, &proof)
+            .await?;
+        capture.push(snapshot)?;
+    }
+    capture.finish()
+}
+
+// The two trusted capture paths verify the terminal proof with the rows.
+// Only a complete, ordered set of snapshots can become a session.
+pub(crate) struct SessionCapture {
+    session: SnapshotSession,
+    remaining: ReadLimit,
+    window: AcquisitionWindow,
+}
+impl SessionCapture {
+    pub(crate) fn new(
+        authority: Authority,
+        cohort: Cohort,
+        version: u64,
+        window: AcquisitionWindow,
+        limit: ReadLimit,
+    ) -> Self {
+        Self {
+            session: SnapshotSession {
+                authority,
+                cohort,
+                version,
+                expires: window.expires,
+                snapshots: BTreeMap::new(),
+            },
+            remaining: limit,
+            window,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Result<ReadLimit, Error> {
+        self.window.check()?;
+        if self.remaining.rows == 0 || self.remaining.bytes == 0 || self.remaining.operations == 0 {
             return Err(Error::Capacity);
         }
-        let snapshot = node.read_terminal(&target, remaining, &proof).await?;
-        window.check()?;
+        Ok(self.remaining.clone())
+    }
+
+    pub(crate) fn push(&mut self, snapshot: ReadSnapshot) -> Result<(), Error> {
+        self.window.check()?;
+        let session = &mut self.session;
+        let target = session
+            .cohort
+            .members
+            .get(session.snapshots.len())
+            .ok_or(Error::Identity)?;
         if snapshot.shard != target.shard
             || snapshot.epoch != target.epoch
-            || snapshot.version != version
-            || snapshot.applied_prefix < version
+            || snapshot.version != session.version
+            || snapshot.applied_prefix < session.version
             || snapshot.baseline_sequence != 0
-            || snapshot.authority != authority
-            || snapshot.cohort.as_ref() != Some(&cohort)
+            || snapshot.authority != session.authority
+            || snapshot.cohort.as_ref() != Some(&session.cohort)
         {
             return Err(Error::Identity);
         }
-        operations = operations.saturating_add(snapshot.replay_operations);
-        rows = rows.saturating_add(snapshot.entries.len());
-        bytes = bytes.saturating_add(
-            snapshot
-                .entries
-                .iter()
-                .map(|(k, v)| k.len() + v.len())
-                .sum::<usize>(),
-        );
-        if rows > limit.rows || bytes > limit.bytes || operations > limit.operations {
-            return Err(Error::Capacity);
-        }
-        snapshots.insert(target.shard, snapshot);
+        let bytes = snapshot
+            .entries
+            .iter()
+            .try_fold(0usize, |sum, (k, v)| {
+                sum.checked_add(k.len())?.checked_add(v.len())
+            })
+            .ok_or(Error::Capacity)?;
+        self.remaining.rows = self
+            .remaining
+            .rows
+            .checked_sub(snapshot.entries.len())
+            .ok_or(Error::Capacity)?;
+        self.remaining.bytes = self
+            .remaining
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(Error::Capacity)?;
+        self.remaining.operations = self
+            .remaining
+            .operations
+            .checked_sub(snapshot.replay_operations)
+            .ok_or(Error::Capacity)?;
+        session.snapshots.insert(target.shard, snapshot);
+        Ok(())
     }
-    window.check()?;
-    Ok(SnapshotSession {
-        authority,
-        cohort,
-        version,
-        expires: window.expires,
-        snapshots,
-    })
+
+    pub(crate) fn finish(self) -> Result<SnapshotSession, Error> {
+        self.window.check()?;
+        if self.session.snapshots.len() != self.session.cohort.members.len() {
+            return Err(Error::Identity);
+        }
+        Ok(self.session)
+    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ pub(super) fn commit(
     source: IncrementalReadView<'_>,
     staged: Changes,
     deadline: Instant,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<IncrementalCommitStats> {
     // Keep serialization through candidate destruction/reclamation, including
     // all early returns. Existing transaction overlays have their own bounds.
@@ -50,6 +51,7 @@ pub(super) fn commit(
     // Function parameters otherwise drop after local guards on early returns.
     let base = source;
     let changes = staged;
+    check()?;
     check_deadline(deadline)?;
     let token = base.token();
     let bytes = changes.stats.retained_accounted_bytes;
@@ -70,6 +72,7 @@ pub(super) fn commit(
         return Err(limit("COW preparation version budget"));
     }
     drop(alive);
+    check()?;
     check_deadline(deadline)?;
 
     let mut next = base.state().clone();
@@ -83,10 +86,12 @@ pub(super) fn commit(
         preparation_bytes: _,
     } = changes;
     for (id, vertex) in vertices {
+        check()?;
         check_deadline(deadline)?;
         stats.copied_index_entries += next.vertices.set(id, vertex);
     }
     for (id, edge) in edges {
+        check()?;
         check_deadline(deadline)?;
         stats.copied_index_entries += next.edges.set(id, edge);
     }
@@ -103,6 +108,7 @@ pub(super) fn commit(
     // destroyed under the publication lock.
     let mut alive = Vec::with_capacity(graph.limits.max_pinned_versions);
     let mut guard = graph.inner.write().map_err(|_| bad("poisoned lock"))?;
+    check()?;
     check_deadline(deadline)?;
     check_token(&guard.current, &token)?;
     guard.retired.retain(|w| w.strong_count() > 0);
@@ -151,7 +157,7 @@ mod tests {
         };
         let deadline = Instant::now() - Duration::from_secs(1);
         assert!(matches!(
-            commit(&graph, source, changes, deadline),
+            commit(&graph, source, changes, deadline, &|| Ok(())),
             Err(Error::TransactionTooLarge(_))
         ));
         assert_eq!(graph.token().unwrap(), before);

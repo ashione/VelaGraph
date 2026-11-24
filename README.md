@@ -42,6 +42,15 @@ This is not a server-side prepared-plan handle or reuse of the local Rust
 prepared-query API. See the [Go client SDK](sdk/go/README.md) for supported steps
 and snapshot selection.
 
+Go applications can also embed the local engine through the optional
+[`sdk/go/native`](docs/NATIVE_FFI.md) cgo package and versioned C ABI. It supports
+ordinary memory graphs, temporal RocksDB, prepared queries and controlled batches
+without a server. Packed results support owned Go objects or explicitly closed
+views with zero-copy result access. Its Go package includes the ABI header for
+module/vendor consumers; the matching native library is supplied separately.
+This path has local consistency and shared-process failure
+semantics; enable it explicitly with `velagraph_native` and a matching native library.
+
 ## Source prerelease and development main
 
 [v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1) is a published
@@ -129,6 +138,12 @@ explicit; the model never refreshes itself. It borrows validated records during
 shared-executor traversal and copies only selected
 output values. Query results remain owned, and full logical record budgets still
 apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
+Materialized reads keep exact per-access accounting while the shared executor
+and adjacency boundaries enforce the same cooperative deadline, avoiding
+redundant clock polling for individual counters.
+Materialized temporal reads use conservative time summaries on long adjacency
+lists to skip impossible historical ranges while retaining original logical work
+charges. See [time blocks and accounting](docs/MATERIALIZED_TEMPORAL_READS.md#conservative-adjacency-time-blocks).
 
 Prepared queries also reuse static canonical admission counts, checking each
 binding's exact textual size and complexity without rendering the entire query.
@@ -265,7 +280,10 @@ the [read-only verification CLI](docs/OBJECT_STORE_CHECKPOINT_API.md#operator-ve
 checks a retained receipt without staging a local backup.
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
 not object-store-authoritative storage, remote-durable write acknowledgement or
-live-cluster recovery. Physical restoration is guarded for offline use. See the
+live-cluster recovery. Offline recovery can restore the D2 coordinator and every fixed-cohort member
+from a selected local generation or an object-store receipt,
+then verify the copied decision history and inspect managed vertices and edges
+at the requested version. See the
 [physical checkpoint](docs/PHYSICAL_CHECKPOINT.md) and
 [object-store API](docs/OBJECT_STORE_CHECKPOINT_API.md) contracts.
 
@@ -320,3 +338,7 @@ crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserve
 See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
+
+Local temporal reads include [bounded revision-prefix caching](docs/TEMPORAL_REVISION_CACHE.md)
+for arbitrary vertex and edge histories, with safe reuse across unchanged commits
+and interval lookup. This optimization retains the existing storage and query budgets.
