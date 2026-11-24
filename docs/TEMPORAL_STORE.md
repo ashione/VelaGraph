@@ -33,6 +33,11 @@ interval; old system views are unchanged. Absent revisions mask earlier assertio
 only over the specified interval. No whole graph or full history is copied into
 a query view, and commits do not copy the graph.
 
+Each store caches one decoded head with its RocksDB snapshot sequence number.
+A new view pins its own snapshot and can reuse the head for that exact sequence
+at any requested V/T. On a miss or cache contention, the view reads the head
+from its pinned snapshot. Only successful reads populate the cache.
+
 The view retains the snapshot head already validated at creation. This is
 distinct from an explicitly selected older V: adjacency candidates are checked
 against the snapshot head for corruption, then against V for eligibility.
