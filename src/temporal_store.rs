@@ -1,7 +1,7 @@
 //! Experimental single-partition durable temporal assertions (#196).
 //! This is storage plumbing, not a query language or certified distributed V.
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 pub mod materialized;
 mod plan_cache;
@@ -95,6 +95,7 @@ impl TemporalMutation {
 pub struct TemporalStore {
     db: DB,
     write: Mutex<()>,
+    snapshot_head: RwLock<Option<(u64, u64)>>,
     plan_cache: Mutex<plan_cache::PlanCache>,
     revision_cache: revision_cache::RevisionCache,
 }
@@ -124,6 +125,7 @@ impl TemporalStore {
         Ok(Self {
             db,
             write: Mutex::new(()),
+            snapshot_head: RwLock::new(None),
             plan_cache: Mutex::new(plan_cache::PlanCache::default()),
             revision_cache: revision_cache::RevisionCache::default(),
         })
@@ -198,9 +200,7 @@ impl TemporalStore {
     /// store's latest synced prefix, not a distributed latest/linearizable read.
     pub fn view(&self, version: Option<u64>, valid_time: i64) -> Result<TemporalStoreView<'_>> {
         let snapshot = self.db.snapshot();
-        #[cfg(feature = "query-profiling")]
-        crate::query_profile::read_event(crate::query_profile::ReadEvent::Head);
-        let head = decode_version(snapshot.get(HEAD_KEY)?.as_deref())?;
+        let head = self.head_at(&snapshot)?;
         let version = version.unwrap_or(head);
         if version > head {
             return Err(TemporalStoreError::UnavailableVersion);
@@ -213,6 +213,26 @@ impl TemporalStore {
             plan_cache: &self.plan_cache,
             revision_cache: &self.revision_cache,
         })
+    }
+
+    fn head_at(&self, snapshot: &Snapshot<'_>) -> Result<u64> {
+        // Multiple snapshots can share a RocksDB sequence. Reuse the head
+        // only when it was decoded at that exact sequence.
+        let sequence = snapshot.sequence_number();
+        if let Ok(cached) = self.snapshot_head.try_read() {
+            if let Some((_, head)) = cached.filter(|(stored, _)| *stored == sequence) {
+                return Ok(head);
+            }
+        }
+        #[cfg(feature = "query-profiling")]
+        crate::query_profile::read_event(crate::query_profile::ReadEvent::Head);
+        let head = decode_version(snapshot.get(HEAD_KEY)?.as_deref())?;
+        if let Ok(mut cached) = self.snapshot_head.try_write() {
+            if cached.is_none_or(|(stored, _)| stored < sequence) {
+                *cached = Some((sequence, head));
+            }
+        }
+        Ok(head)
     }
 }
 
@@ -825,6 +845,27 @@ mod tests {
             2
         );
     }
+    #[test]
+    fn cached_head_is_scoped_to_the_pinned_physical_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let first = store.db.snapshot();
+        assert_eq!(store.head_at(&first).unwrap(), 0);
+        store.commit(&[vertex(1, 0, None, 1)]).unwrap();
+        assert_eq!(store.view(None, 2).unwrap().version(), 1);
+        assert_eq!(store.head_at(&first).unwrap(), 0);
+        assert!(matches!(
+            store.view(Some(2), 2),
+            Err(TemporalStoreError::UnavailableVersion)
+        ));
+        store.db.delete(HEAD_KEY).unwrap();
+        assert!(matches!(
+            store.view(None, 2),
+            Err(TemporalStoreError::Corrupt)
+        ));
+        assert_eq!(store.head_at(&first).unwrap(), 0);
+    }
+
     #[test]
     fn missing_metadata_and_wrong_payload_kind_are_errors() {
         let dir = tempfile::tempdir().unwrap();
