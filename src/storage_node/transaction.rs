@@ -37,6 +37,9 @@ pub enum TransactionError {
     Deadline,
     #[error("transaction already aborted by a stage failure")]
     Aborted,
+    /// The native write may have committed. Do not replay it through
+    /// [`StorageNode::begin_v1`]: a new handle captures the current shard
+    /// sequence, even when the caller reuses the same request ID.
     #[error("unknown commit outcome for {request_id:?}: {source}")]
     UnknownOutcome {
         request_id: RequestId,
@@ -48,6 +51,8 @@ pub enum TransactionError {
 /// discards all staged operations. Any stage error invalidates the handle.
 pub trait StorageTransaction {
     fn stage(&mut self, operation: &WriteOp) -> std::result::Result<(), TransactionError>;
+    /// Consume the handle and submit its staged writes against the sequence
+    /// captured at begin. See [`TransactionError::UnknownOutcome`] if publication is uncertain.
     fn commit(self: Box<Self>) -> std::result::Result<WriteResult, TransactionError>;
     fn abort(self: Box<Self>);
 }

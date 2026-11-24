@@ -216,6 +216,16 @@ can cause a conflict. Deadline and cancellation are cooperative, including a
 final check under the write lock before native submission. Once submitted, the
 write can finish after the deadline. A native write failure returns
 `UnknownOutcome` with the request ID and performs no automatic retry.
+
+After `UnknownOutcome`, preserve the uncertainty. Do not replay the writes by
+calling `begin_v1` again, even with the same request ID. Commit consumes the
+handle, and a new begin captures the current shard sequence. If the original
+batch committed, its dedup record binds the ID to the original sequence, so
+replaying the same operations with the new sequence yields `IdempotencyConflict`.
+If the original batch did not commit, the new transaction can succeed against
+a later sequence and overwrite an intervening write. The transaction API
+provides no retry token carrying the original condition.
+
 Process exit discards unpublished staging. The replicated and routed adapters
 return `Unsupported` at begin. Their protocol and recovery tests remain open
 under [#393](https://github.com/ashione/VelaGraph/issues/393).

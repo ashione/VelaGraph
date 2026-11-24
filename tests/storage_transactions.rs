@@ -53,6 +53,52 @@ fn readers_observe_only_one_winning_batch() {
 }
 
 #[test]
+fn fresh_begin_with_a_committed_id_conflicts_even_for_identical_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = LocalStorageNode::open(dir.path(), 7).unwrap();
+    let op = WriteOp::put(b"k", b"first");
+    let mut original = node.begin_v1(options(1)).unwrap();
+    original.stage(&op).unwrap();
+    let sequence = original.commit().unwrap().sequence;
+
+    let mut rebuilt = node.begin_v1(options(1)).unwrap();
+    rebuilt.stage(&op).unwrap();
+    assert!(matches!(
+        rebuilt.commit(),
+        Err(TransactionError::Node(StorageNodeError::IdempotencyConflict(id))) if id == [1; 16]
+    ));
+    assert_eq!(node.read_view().unwrap().sequence, sequence);
+}
+
+#[test]
+fn fresh_begin_with_an_unpublished_id_can_overwrite_an_intervening_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = LocalStorageNode::open(dir.path(), 7).unwrap();
+    let op = WriteOp::put(b"k", b"original");
+    let mut original = node.begin_v1(options(1)).unwrap();
+    original.stage(&op).unwrap();
+    original.abort(); // Model the unpublished outcome without injecting an I/O error.
+
+    let mut other = node.begin_v1(options(2)).unwrap();
+    other.stage(&WriteOp::put(b"k", b"intervening")).unwrap();
+    other.commit().unwrap();
+    let before = node.read_view().unwrap();
+
+    let mut rebuilt = node.begin_v1(options(1)).unwrap();
+    rebuilt.stage(&op).unwrap();
+    assert_eq!(rebuilt.commit().unwrap().sequence, before.sequence + 1);
+    let after = node.read_view().unwrap();
+    assert_eq!(
+        node.get(b"k", &before).unwrap().as_deref(),
+        Some(b"intervening".as_slice())
+    );
+    assert_eq!(
+        node.get(b"k", &after).unwrap().as_deref(),
+        Some(b"original".as_slice())
+    );
+}
+
+#[test]
 fn failed_stage_invalidates_the_entire_prefix_for_both_limits() {
     let dir = tempfile::tempdir().unwrap();
     let local = LocalStorageNode::open(dir.path(), 7).unwrap();
