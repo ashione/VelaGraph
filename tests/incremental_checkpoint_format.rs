@@ -369,3 +369,58 @@ fn checkpoint_process_writer() {
         Err(velagraph::Error::TransactionConflict)
     ));
 }
+
+#[test]
+fn wide_bulk_load_and_restore_share_the_exact_admission_boundary_and_order() {
+    let limits = IncrementalLimits::default();
+    let build = |limits| {
+        IncrementalGraph::from_records(
+            "wide",
+            IncrementalMode::Cow,
+            limits,
+            (0..1024).rev().map(Vertex::new).collect(),
+            (0..1024)
+                .rev()
+                .map(|id| Edge::new(id, 0, id, "link"))
+                .collect(),
+            vec![],
+        )
+    };
+    let graph = build(limits.clone()).unwrap();
+    let bytes = graph.read().unwrap().accounted_bytes();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide");
+    graph.checkpoint(&path).unwrap();
+    let restore = |limits| IncrementalGraph::restore(&path, "wide", IncrementalMode::Cow, limits);
+    let exact = IncrementalLimits {
+        max_accounted_bytes: bytes,
+        ..limits
+    };
+    for graph in [
+        build(exact.clone()).unwrap(),
+        restore(exact.clone()).unwrap(),
+    ] {
+        let view = graph.read().unwrap();
+        assert_eq!(view.accounted_bytes(), bytes);
+        assert!(view.vertices().map(|vertex| vertex.id).eq(0..1024));
+        assert!(view.edges().map(|edge| edge.id).eq(0..1024));
+        assert!(view
+            .adjacent(0, false)
+            .unwrap()
+            .map(|edge| edge.id)
+            .eq(0..1024));
+        assert!(view.adjacent(0, true).unwrap().map(|edge| edge.id).eq([0]));
+    }
+    let tight = IncrementalLimits {
+        max_accounted_bytes: bytes - 1,
+        ..exact
+    };
+    assert!(matches!(
+        build(tight.clone()),
+        Err(velagraph::Error::TransactionTooLarge(_))
+    ));
+    assert!(matches!(
+        restore(tight),
+        Err(velagraph::Error::TransactionTooLarge(_))
+    ));
+}
