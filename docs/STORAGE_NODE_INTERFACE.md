@@ -203,17 +203,21 @@ error, not a partially applied transaction.
 
 ### Single-shard transaction
 
-The local adapter implements the optional write-only `StorageNode::begin_v1`
-extension. Begin validates the requested shard and epoch and records the current
-sequence under the write lock. Each `stage` privately copies one opaque put or
-delete in order, up to 10,000 operations and 16 MiB total key/value bytes.
+The local and in-process replicated adapters implement the optional write-only
+`StorageNode::begin_v1` extension. Begin validates the shard and epoch and
+captures the committed sequence. The local adapter holds the write lock for
+this operation. The replicated adapter performs a leader read barrier and
+reads shard metadata without copying the data partition.
+
+Each `stage` privately copies one opaque put or delete in order, up to 10,000
+operations and 16 MiB total key/value bytes.
 Any stage error discards the entire prefix and invalidates the handle.
 Abort and drop discard all staged writes. Empty commits are rejected.
 
 Commit checks the original epoch and sequence and publishes one synchronous
 conditional batch using the supplied request ID. An unrelated intervening write
-can cause a conflict. Deadline and cancellation are cooperative, including a
-final check under the write lock before native submission. Once submitted, the
+can cause a conflict. Deadline and cancellation are cooperative. The local
+adapter checks both under the write lock before native submission. Once submitted, the
 write can finish after the deadline. A native write failure returns
 `UnknownOutcome` with the request ID and performs no automatic retry.
 
@@ -226,8 +230,14 @@ If the original batch did not commit, the new transaction can succeed against
 a later sequence and overwrite an intervening write. The transaction API
 provides no retry token carrying the original condition.
 
-Process exit discards unpublished staging. The replicated and routed adapters
-return `Unsupported` at begin. Their protocol and recovery tests remain open
+On the replicated adapter, stage and abort are caller-local. Commit submits
+one D1V1 conditional batch to the same replica, with the original sequence,
+epoch and ID. The earlier of the caller deadline and adapter timeout bounds
+the wait. A timeout after handoff returns `UnknownOutcome` with that ID.
+A follower rejects begin with `NotLeader`. The adapter does not redirect writes.
+
+Process exit discards unpublished staging. The remote and routed adapters
+return `Unsupported` at begin. Cross-process protocol and recovery tests remain open
 under [#393](https://github.com/ashione/VelaGraph/issues/393).
 
 The broader transaction design also envisages reads inside a transaction:
