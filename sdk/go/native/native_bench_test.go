@@ -100,3 +100,93 @@ func BenchmarkNativeView(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkNativeTemporalRevisions crosses the packed native ABI for every
+// query. FirstRead opens a new store per iteration to reset its revision cache;
+// it leaves the operating system's file cache alone. Open and Close are untimed.
+func BenchmarkNativeTemporalRevisions(b *testing.B) {
+	ctx := context.Background()
+	path := b.TempDir()
+	const version uint64 = 512
+	writer, err := OpenTemporal(ctx, path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer writer.Close()
+	for n := uint64(0); n < version; n++ {
+		end := int64(300)
+		if n == version-1 {
+			end = 200
+		}
+		m := PutVertex(Vertex{ID: 1, Properties: map[string]Value{"n": Integer(int64(n))}})
+		m.Valid = &Interval{From: 0, To: &end}
+		if v, err := writer.Apply(ctx, WriteBatch{ExpectedVersion: n, Mutations: []Mutation{m}}); err != nil || v != n+1 {
+			b.Fatalf("commit %d: got %d, %v", n+1, v, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		b.Fatal(err)
+	}
+	plan, err := Prepare(ctx, "g.V(1).values('n')", PrepareOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer plan.Close()
+	queries := []Query{plan.Query(nil)}
+	open := func(b *testing.B) *Store {
+		s, err := OpenTemporal(ctx, path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		info, err := s.Info(ctx)
+		if err != nil || info.Backend != "temporal" || info.Version != version {
+			s.Close()
+			b.Fatalf("reopened backend: %+v, %v", info, err)
+		}
+		return s
+	}
+	head := version
+	for _, tc := range []struct {
+		name     string
+		at, want int64
+	}{{"Newest", 150, 511}, {"Previous", 255, 510}} {
+		opts := QueryOptions{Version: &head, ValidTimeMicros: &tc.at}
+		read := func(b *testing.B, s *Store) {
+			r, err := s.Query(ctx, queries, opts)
+			if err != nil || r.Version != version || len(r.Results) != 1 || len(r.Results[0].Rows) != 1 {
+				b.Fatal(r, err)
+			}
+			n, ok := r.Results[0].Rows[0].Value.Int64()
+			if !ok || n != tc.want {
+				b.Fatalf("got %d, want %d", n, tc.want)
+			}
+		}
+		b.Run("Warm/"+tc.name, func(b *testing.B) {
+			s := open(b)
+			defer s.Close()
+			// A miss before all intervals populates the overlapping revision prefix.
+			before := int64(-1)
+			r, err := s.Query(ctx, queries, QueryOptions{Version: &head, ValidTimeMicros: &before})
+			if err != nil || r.Version != version || len(r.Results) != 1 || len(r.Results[0].Rows) != 0 {
+				b.Fatal(r, err)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				read(b, s)
+			}
+			b.StopTimer()
+		})
+		b.Run("FirstRead/"+tc.name, func(b *testing.B) {
+			b.StopTimer()
+			for i := 0; i < b.N; i++ {
+				s := open(b)
+				b.StartTimer()
+				read(b, s)
+				b.StopTimer()
+				if err := s.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

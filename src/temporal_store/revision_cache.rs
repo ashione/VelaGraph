@@ -1,5 +1,6 @@
 //! Optional store-local immutable revision prefixes. Cache misses use storage.
 use super::{Interval, Key, TemporalMutation, REVISION_KEY_LEN};
+use std::cmp::Reverse;
 use std::hash::{BuildHasher, RandomState};
 use std::mem::size_of;
 use std::sync::{
@@ -69,7 +70,16 @@ pub(super) struct Hit<'a> {
     pub selected_bytes: usize,
 }
 impl Block {
-    pub fn lookup(&self, time: i64) -> Option<Hit<'_>> {
+    fn winning_row(&self, time: i64) -> Option<usize> {
+        // Rows are captured in storage priority order. The first visible row
+        // wins even if every older interval also covers this instant.
+        if self
+            .rows
+            .first()
+            .is_some_and(|row| row.valid.contains(time))
+        {
+            return Some(0);
+        }
         let mut end = self.index.partition_point(|entry| entry.from <= time);
         let mut winner: Option<usize> = None;
         while end > 0 {
@@ -80,13 +90,17 @@ impl Block {
             let row = &self.rows[entry.row];
             if row.valid.to.is_none_or(|to| time < to) {
                 winner = Some(winner.map_or(entry.row, |old| old.min(entry.row)));
-                if winner == Some(0) {
+                // Row zero already missed the direct interval check.
+                if winner == Some(1) {
                     break;
                 }
             }
             end -= 1;
         }
-        let (rows, selected) = match winner {
+        winner
+    }
+    pub fn lookup(&self, time: i64) -> Option<Hit<'_>> {
+        let (rows, selected) = match self.winning_row(time) {
             Some(i) => (i + 1, Some(&self.rows[i])),
             None if self.complete => (self.rows.len(), None),
             None => return None,
@@ -193,23 +207,59 @@ impl RevisionCache {
         builder: Builder<'_>,
         complete: bool,
     ) {
-        let mut guard = match self.slot(key).try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if guard.as_ref().is_some_and(|e| {
+        self.publish(key, version, sequence, builder.rows.len(), complete, || {
+            builder.finish(complete)
+        });
+    }
+
+    fn publish(
+        &self,
+        key: Key,
+        version: u64,
+        sequence: u64,
+        row_count: usize,
+        complete: bool,
+        build: impl FnOnce() -> Block,
+    ) {
+        let slot = self.slot(key);
+        let supersedes = |e: &Entry| {
             e.key == key
                 && e.from <= version
                 && version <= e.through
                 && e.sequence_from <= sequence
                 && sequence <= e.sequence_through
                 && (e.block.complete
-                    || e.block.rows.len() > builder.rows.len()
-                    || (!complete && e.block.rows.len() == builder.rows.len()))
-        }) {
+                    || e.block.rows.len() > row_count
+                    || (!complete && e.block.rows.len() == row_count))
+        };
+        let same_key_origin =
+            |entry: &Entry| (entry.key == key).then_some((entry.from, entry.sequence_from));
+        let observed = {
+            let Ok(guard) = slot.try_lock() else { return };
+            if guard.as_ref().is_some_and(supersedes) {
+                return;
+            }
+            guard.as_ref().and_then(same_key_origin)
+        };
+        // Readers can use the resident block while the new interval index is sorted.
+        let block = Arc::new(build());
+        let Ok(mut guard) = slot.try_lock() else {
+            return;
+        };
+        if guard.as_ref().is_some_and(supersedes) {
             return;
         }
-        let block = Arc::new(builder.finish(complete));
+        // An overlapping fill may have installed a newer snapshot of this key.
+        // Compare origins only across this build; later historical reads can cache normally.
+        if let Some((v, s)) = guard.as_ref().and_then(same_key_origin) {
+            if observed != Some((v, s))
+                && (v, s) != (version, sequence)
+                && v >= version
+                && s >= sequence
+            {
+                return;
+            }
+        }
         let old = guard.replace(Entry {
             key,
             from: version,
@@ -297,7 +347,8 @@ impl Builder<'_> {
                 row,
             })
             .collect();
-        index.sort_unstable_by_key(|i| (i.from, i.row));
+        // Lookup walks backwards: for a shared start, visit the highest-priority row first.
+        index.sort_unstable_by_key(|i| (i.from, Reverse(i.row)));
         let mut max_to = Some(i64::MIN);
         for i in &mut index {
             max_to = match (max_to, i.max_to) {
@@ -346,6 +397,29 @@ mod tests {
                 .unwrap();
             assert_eq!(block.lookup(time).unwrap().rows, expected + 1);
         }
+    }
+    #[test]
+    fn equal_start_revisions_keep_priority_tombstones_and_scan_charges() {
+        let cache = RevisionCache::default();
+        let mut builder = cache.builder().unwrap();
+        let valid = Interval {
+            from: -2,
+            to: Some(2),
+        };
+        assert!(builder.push(valid, &super::super::encode_assertion(valid, None).unwrap()));
+        row(&mut builder, -2, Some(4));
+        row(&mut builder, -2, None);
+        let block = builder.finish(false);
+        for (time, winner) in [(-2, 0), (1, 0), (2, 1), (3, 1), (4, 2)] {
+            let hit = block.lookup(time).unwrap();
+            let selected = &block.rows[winner];
+            assert_eq!(hit.payload.is_none(), winner == 0);
+            assert_eq!(hit.rows, winner + 1);
+            assert_eq!(hit.bytes, selected.cumulative_bytes);
+            assert_eq!(hit.peak_bytes, selected.peak_bytes);
+            assert_eq!(hit.selected_bytes, REVISION_KEY_LEN + selected.value.len());
+        }
+        assert!(block.lookup(-3).is_none());
     }
     #[test]
     fn incomplete_prefix_never_claims_absence() {
@@ -423,6 +497,39 @@ mod tests {
             .payload
             .is_some());
     }
+    #[test]
+    fn older_builder_finishing_last_preserves_newer_same_key_publication() {
+        let cache = RevisionCache::default();
+        let key = Key::Vertex(1);
+        let mut old = cache.builder().unwrap();
+        row(&mut old, 0, Some(10));
+        let mut new = cache.builder().unwrap();
+        row(&mut new, 10, None);
+
+        // Install the new snapshot after the old builder's first slot check
+        // and before its final replacement check. No thread scheduling required.
+        cache.publish(key, 1, 10, old.rows.len(), true, || {
+            cache.insert(key, 2, 20, new, true);
+            old.finish(true)
+        });
+        let latest = cache.get(key, 2, 20).expect("newer block should stay hot");
+        assert!(latest.lookup(11).unwrap().payload.is_some());
+        assert!(cache.get(key, 1, 10).is_none());
+
+        // A later historical workload may still fill this slot deliberately.
+        let mut historical = cache.builder().unwrap();
+        row(&mut historical, 0, Some(10));
+        cache.insert(key, 1, 10, historical, true);
+        assert!(cache
+            .get(key, 1, 10)
+            .unwrap()
+            .lookup(1)
+            .unwrap()
+            .payload
+            .is_some());
+        assert!(latest.lookup(11).unwrap().payload.is_some());
+    }
+
     #[test]
     fn late_publication_and_contended_notifications_only_cause_misses() {
         let cache = RevisionCache::default();
