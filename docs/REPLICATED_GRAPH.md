@@ -23,6 +23,12 @@ accepted D1 command. On the runtime hosting a `NodeHandle`, construct
 `ReplicatedStorageNode::new(&node, shard, deadline)` and then
 `GraphRecordStore::new(adapter, shard, partition)`.
 
+Direct `ReplicatedStorageNode::begin_v1` supports single-shard write staging.
+A leader barrier captures the epoch and sequence. Commit submits the complete
+batch conditionally through Raft. Abort and drop discard staged writes locally.
+See the [transaction contract](STORAGE_NODE_INTERFACE.md#single-shard-transaction)
+for limits, fencing and how to interpret a lost commit reply.
+
 The root graph crate and D2 crate remain independent. Only the adapter crate
 depends on both. It adds no registry dependencies: Tokio, openraft and test
 helpers were already in the workspace (MIT / Apache-2.0 compatible licenses).

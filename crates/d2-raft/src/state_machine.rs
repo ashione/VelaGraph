@@ -1760,6 +1760,21 @@ impl StateMachine {
         self.decision_prefix(&state, d1, version)
     }
 
+    /// Capture the sequence for an unmanaged D1 write under the same read lock
+    /// that checks its shard, epoch and write mode. Call after a leader barrier.
+    pub async fn d1_unmanaged_write_sequence(
+        &self,
+        shard: u64,
+        epoch: u64,
+    ) -> Result<u64, D1Error> {
+        let state = self.state.read().await;
+        state
+            .d1
+            .as_ref()
+            .ok_or(D1Error::NotActivated)?
+            .unmanaged_write_sequence(shard, epoch)
+    }
+
     /// Local diagnostic metadata, not a linearizable distributed read.
     /// Call `raft.ensure_linearizable()` before sampling on a leader.
     pub async fn d1_metadata(&self) -> Option<(u64, u64, u64)> {

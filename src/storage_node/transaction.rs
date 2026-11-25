@@ -14,7 +14,8 @@ pub struct TransactionOptions {
 }
 
 impl TransactionOptions {
-    fn check(&self) -> std::result::Result<(), TransactionError> {
+    /// Check the caller controls before staging or submitting a write.
+    pub fn check(&self) -> std::result::Result<(), TransactionError> {
         if self.cancellation.is_cancelled() {
             return Err(TransactionError::Cancelled);
         }
@@ -22,6 +23,25 @@ impl TransactionOptions {
             return Err(TransactionError::Deadline);
         }
         Ok(())
+    }
+
+    /// Build a bounded staging handle after the adapter has captured its write
+    /// condition. Only commit calls `publish`; the adapter checks the controls
+    /// again at its own submission boundary.
+    pub fn stage_writes<'a>(
+        self,
+        publish: impl FnOnce(
+                WriteRequest,
+                TransactionOptions,
+            ) -> std::result::Result<WriteResult, TransactionError>
+            + 'a,
+    ) -> Box<dyn StorageTransaction + 'a> {
+        Box::new(StagedTransaction {
+            options: self,
+            staged: Some(Vec::new()),
+            bytes: 0,
+            publish,
+        })
     }
 }
 
@@ -57,10 +77,9 @@ pub trait StorageTransaction {
     fn abort(self: Box<Self>);
 }
 
-struct LocalTransaction<'a> {
-    node: &'a LocalStorageNode,
+struct StagedTransaction<F> {
+    publish: F,
     options: TransactionOptions,
-    sequence: Sequence,
     staged: Option<Vec<WriteOp>>,
     bytes: usize,
 }
@@ -85,16 +104,30 @@ pub(super) fn begin(
     }
     let sequence = node.sequence()?;
     options.check()?;
-    Ok(Box::new(LocalTransaction {
-        node,
-        options,
-        sequence,
-        staged: Some(Vec::new()),
-        bytes: 0,
+    Ok(options.stage_writes(move |request, options| {
+        let canonical = node.validate_write(&request)?;
+        let guard = node.lock()?;
+        options.check()?;
+        let (batch, result) = node.prepare_write(&guard, &request, Some(sequence), canonical)?;
+        options.check()?;
+        if let Some(batch) = batch {
+            node.write_batch(batch)
+                .map_err(|source| TransactionError::UnknownOutcome {
+                    request_id: request.request_id,
+                    source,
+                })?;
+        }
+        Ok(result)
     }))
 }
 
-impl StorageTransaction for LocalTransaction<'_> {
+impl<F> StorageTransaction for StagedTransaction<F>
+where
+    F: FnOnce(
+        WriteRequest,
+        TransactionOptions,
+    ) -> std::result::Result<WriteResult, TransactionError>,
+{
     fn stage(&mut self, operation: &WriteOp) -> std::result::Result<(), TransactionError> {
         // Take the buffer first. Every rejection discards the accepted prefix.
         let mut staged = self.staged.take().ok_or(TransactionError::Aborted)?;
@@ -119,22 +152,7 @@ impl StorageTransaction for LocalTransaction<'_> {
             request_id: self.options.request_id,
             operations,
         };
-        let canonical = self.node.validate_write(&request)?;
-        let guard = self.node.lock()?;
-        self.options.check()?;
-        let (batch, result) =
-            self.node
-                .prepare_write(&guard, &request, Some(self.sequence), canonical)?;
-        self.options.check()?;
-        if let Some(batch) = batch {
-            self.node
-                .write_batch(batch)
-                .map_err(|source| TransactionError::UnknownOutcome {
-                    request_id: request.request_id,
-                    source,
-                })?;
-        }
-        Ok(result)
+        (self.publish)(request, self.options)
     }
 
     fn abort(self: Box<Self>) {}
