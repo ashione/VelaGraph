@@ -127,7 +127,13 @@ has its own empty-commit, request-identity and unknown-outcome rules.
 - Reads consult the overlay first, then the snapshot. A delete in the overlay
   hides the snapshot value.
 - Mutations validate immediately where possible and are revalidated under the
-  commit lock. No mutation touches RocksDB before `commit`.
+  commit lock. They do not write to RocksDB before `commit`.
+- A mutation error does not automatically roll back this K3 transaction. For
+  example, a missing endpoint rejects the new edge but leaves earlier valid
+  writes staged. A subsequent successful commit can publish those writes. To
+  discard the whole transaction, call `abort()` or drop the handle without
+  committing. This differs from `StorageNode::stage`, which invalidates its
+  transaction on a staging error.
 - Each transaction records its read sequence, touched keys, and bounded encoded
   write set.
 - `commit(self)` and `abort(self)` consume the transaction. Safe Rust cannot
@@ -149,9 +155,9 @@ the engine commit lock:
 4. Submit the batch with `WriteOptions::set_sync(true)`. A successful write
    commit is WAL-durable before returning.
 
-A pre-submission failure writes nothing. A RocksDB submission error is not
-proof that the batch was absent; K3 exposes the storage error and has no
-request-ID receipt or replay protocol. The batch remains the atomic unit.
+A commit failure before batch submission writes nothing. A RocksDB submission
+error is not proof that the batch was absent. K3 exposes the storage error and
+has no request-ID receipt or replay protocol. The batch remains the atomic unit.
 
 ### Edge and cascade rules
 
@@ -184,8 +190,9 @@ Transaction errors:
 
 Existing validation errors (`VertexAlreadyExists`, `VertexNotFound`,
 `EdgeEndpointNotFound`, `InvalidGraphLabel`, `CorruptData`) are reused.
-Pre-submission validation failures write nothing; see the commit algorithm for
-RocksDB submission errors.
+Mutation errors do not publish writes or implicitly discard the overlay. See
+[transaction state](#transaction-state) for how to discard it and the commit
+algorithm for storage submission errors.
 
 ## 6. Durability and recovery
 
@@ -250,8 +257,9 @@ harness.
   commit; another reader cannot see it.
 - Conflict: begin, commit an autocommit write, then commit the transaction ->
   `TransactionConflict`, and none of its writes appear.
-- Atomic failure: a transaction with a missing edge endpoint or duplicate id
-  writes nothing.
+- Validation and discard: stage a vertex, reject an edge with a missing
+  endpoint, then drop the transaction. Neither record is persisted. See
+  [`transaction_validation_failure_writes_nothing`](../tests/transactions.rs).
 - Atomic success: create two vertices and an edge in one transaction; after
   commit, the edge, both adjacency entries, and both vertices are visible
   together.
