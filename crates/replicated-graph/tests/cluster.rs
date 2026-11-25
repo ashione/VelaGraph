@@ -829,3 +829,55 @@ async fn staged_transaction_timeout_can_publish_the_complete_batch() -> anyhow::
     })
     .await?
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_transaction_rejects_managed_mode_at_begin_and_apply() -> anyhow::Result<()> {
+    use velagraph::TransactionError;
+    timeout(Duration::from_secs(30), async {
+        let cluster = Cluster::new();
+        let dirs = (0..3)
+            .map(|_| tempfile::tempdir())
+            .collect::<Result<Vec<_>, _>>()?;
+        let nodes = start(&cluster, &dirs).await?;
+        let i = bootstrap(&nodes).await?;
+        let node = ReplicatedStorageNode::new(&nodes[i], 7, Duration::from_secs(5))?;
+        let raft = nodes[i].raft.clone();
+        let runtime = tokio::runtime::Handle::current();
+        run_blocking(move || -> anyhow::Result<()> {
+            let mut tx = node.begin_v1(tx_options(1))?;
+            tx.stage(&put(b"pending"))?;
+            runtime
+                .block_on(
+                    raft.client_write(LogCommand::D1V1(D1Command::EnableManagedWrites {
+                        shard: 7,
+                        epoch: 3,
+                        expected_sequence: 0,
+                        mode_id: [1; 16],
+                    })),
+                )?
+                .data
+                .d1
+                .expect("D1 application response")
+                .expect("mode command accepted");
+            assert!(matches!(
+                node.begin_v1(tx_options(2)),
+                Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+            ));
+            assert!(matches!(
+                tx.commit(),
+                Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+            ));
+            let view = node.read_view()?;
+            assert_eq!(view.sequence, 0);
+            assert_eq!(node.get(b"pending", &view)?, None);
+            Ok(())
+        })
+        .await??;
+        converge(&cluster, &nodes, i).await?;
+        for node in &nodes {
+            cluster.shutdown(node).await;
+        }
+        Ok(())
+    })
+    .await?
+}

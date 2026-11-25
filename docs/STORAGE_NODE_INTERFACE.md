@@ -207,7 +207,9 @@ The local and in-process replicated adapters implement the optional write-only
 `StorageNode::begin_v1` extension. Begin validates the shard and epoch and
 captures the committed sequence. The local adapter holds the write lock for
 this operation. The replicated adapter performs a leader read barrier and
-reads shard metadata without copying the data partition.
+reads shard metadata without copying the data partition. An already-managed
+shard rejects begin with `Unsupported`. If managed writes are enabled after
+begin, the state machine rejects the staged batch at commit.
 
 Each `stage` privately copies one opaque put or delete in order, up to 10,000
 operations and 16 MiB total key/value bytes.
@@ -233,7 +235,9 @@ provides no retry token carrying the original condition.
 On the replicated adapter, stage and abort are caller-local. Commit submits
 one D1V1 conditional batch to the same replica, with the original sequence,
 epoch and ID. The earlier of the caller deadline and adapter timeout bounds
-the wait. A timeout after handoff returns `UnknownOutcome` with that ID.
+the wait. A caller deadline that closes the submission window before handoff
+returns `Deadline` and discards the batch. A timeout after handoff returns
+`UnknownOutcome` with that ID.
 A follower rejects begin with `NotLeader`. The adapter does not redirect writes.
 
 Process exit discards unpublished staging. The remote and routed adapters

@@ -78,6 +78,8 @@ pub struct ReplicatedStorageNode {
     deadline: Duration,
     absolute_deadline: Option<Instant>,
     admission: Arc<Semaphore>,
+    #[cfg(test)]
+    before_transaction_handoff: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ReplicatedStorageNode {
@@ -100,6 +102,8 @@ impl ReplicatedStorageNode {
             deadline,
             absolute_deadline: None,
             admission: Arc::new(Semaphore::new(32)),
+            #[cfg(test)]
+            before_transaction_handoff: None,
         })
     }
 
@@ -188,29 +192,25 @@ impl ReplicatedStorageNode {
         let shard = self.shard;
         let epoch = view.epoch;
         self.dispatch(None, async move {
-            checked_sequence(&state, shard, epoch).await.map(|_| ())
+            let (current_shard, current, _) = state
+                .d1_metadata()
+                .await
+                .ok_or_else(|| StorageNodeError::Unsupported("D1 is not activated".into()))?;
+            if current_shard != shard {
+                return Err(StorageNodeError::InvalidArgument(
+                    "replica belongs to a different shard".into(),
+                ));
+            }
+            if current != epoch {
+                return Err(StorageNodeError::Fenced {
+                    shard,
+                    epoch,
+                    current,
+                });
+            }
+            Ok(())
         })
     }
-}
-
-async fn checked_sequence(state: &StateMachine, shard: ShardId, epoch: Epoch) -> Result<Sequence> {
-    let (current_shard, current, sequence) = state
-        .d1_metadata()
-        .await
-        .ok_or_else(|| StorageNodeError::Unsupported("D1 is not activated".into()))?;
-    if current_shard != shard {
-        return Err(StorageNodeError::InvalidArgument(
-            "replica belongs to a different shard".into(),
-        ));
-    }
-    if current != epoch {
-        return Err(StorageNodeError::Fenced {
-            shard,
-            epoch,
-            current,
-        });
-    }
-    Ok(sequence)
 }
 
 // A queued task must not first poll a write after its absolute deadline.
