@@ -122,32 +122,17 @@ The Rust package and import name are both **`velagraph`**. The local
 explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
-Local Rust temporal queries support reusable parsed plans, checked typed bindings
-and query-local record/adjacency cursor reuse at a fixed snapshot and V/T.
-Already observed record-boundary lookahead can also avoid a redundant seek while
-retaining the normal visibility and validation checks. See
-[temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
-API examples, cache bounds and validation limits.
-Temporal point reads build fixed-width revision keys on the stack and borrow
-their identity prefix, avoiding temporary key allocations during record lookup.
-For repeated reads at a fixed local V, `TemporalStore::materialize` builds an
-owned, bounded [temporal read model](docs/MATERIALIZED_TEMPORAL_READS.md).
-Its covering rows preserve business-time selection and reuse the Gremlin executor
-without query-time KV access. Construction, refresh and memory costs remain
-explicit; the model never refreshes itself. It borrows validated records during
-shared-executor traversal and copies only selected
-output values. Query results remain owned, and full logical record budgets still
-apply. Disk backends retain owned reads; no storage format or Gremlin syntax changes.
-Materialized reads keep exact per-access accounting while the shared executor
-and adjacency boundaries enforce the same cooperative deadline, avoiding
-redundant clock polling for individual counters.
-Materialized temporal reads use conservative time summaries on long adjacency
-lists to skip impossible historical ranges while retaining original logical work
-charges. See [time blocks and accounting](docs/MATERIALIZED_TEMPORAL_READS.md#conservative-adjacency-time-blocks).
+For the separate local storage-node adapter, see the
+[write-only single-shard transaction](docs/STORAGE_NODE_INTERFACE.md#single-shard-transaction).
+Its request identity and unknown-outcome contract differ from the K3 graph API;
+replicated and routed adapters do not implement this extension.
 
-Prepared queries also reuse static canonical admission counts, checking each
-binding's exact textual size and complexity without rendering the entire query.
-This applies to typed prepared queries independently of the storage backend.
+Local temporal queries support reusable parsed plans, typed bindings and
+[bounded query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings).
+For repeated local reads at a fixed version, [materialized temporal reads](docs/MATERIALIZED_TEMPORAL_READS.md)
+trade explicit construction and memory costs for in-memory queries. These models
+do not refresh themselves. See [performance evidence](docs/PERFORMANCE_EVIDENCE.md)
+for reproduction and scope.
 
 Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
@@ -327,8 +312,8 @@ PR lifecycle gate is not full 1,025-write acceptance. Object-store tests have th
 [own workflow](.github/workflows/object-store-checkpoint.yml).
 `cargo test --locked` does not run every ignored long test or every workspace
 member. Passing same-host tests is not proof of multi-machine performance or HA.
-Benchmark reports apply to their named source, binaries and workload, not every
-subsequent commit.
+See [performance evidence and external benchmark plans](docs/PERFORMANCE_EVIDENCE.md).
+Results apply to their named source, binaries and workload, not every subsequent commit.
 
 ## License
 
@@ -338,7 +323,3 @@ crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserve
 See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
-
-Local temporal reads include [bounded revision-prefix caching](docs/TEMPORAL_REVISION_CACHE.md)
-for arbitrary vertex and edge histories, with safe reuse across unchanged commits
-and interval lookup. This optimization retains the existing storage and query budgets.

@@ -68,9 +68,11 @@ total timeout. Already committed mutations cannot be undone by
 cancelling a response.
 
 The default `RemoteStorageNode` catalog/routing chain also uses typed RPC after
-#256. Explicit library legacy/parity services remain separately inventoried;
-`graph-node` never opens those listeners. #218 remains open for other legacy
-coordinator/gateway/Unix paths. This is not a multi-host HA or performance claim.
+#256. The later [transport retirement](RPC_MIGRATION_STATUS.md) removed the
+supported legacy coordinator/gateway/library paths; the Linux UDS gateway was
+also retired. Public HTTP is intentional. #218 still tracks remaining
+interoperability, upgrade and service validation, not a legacy listener
+fallback. This is not a multi-host HA or performance claim.
 
 ## Validation
 

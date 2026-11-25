@@ -84,7 +84,9 @@ evidence and retention), [#350](https://github.com/ashione/VelaGraph/issues/350)
 (global manifest closure), [#351](https://github.com/ashione/VelaGraph/issues/351)
 (isolated whole-cohort restore and READY gate), and
 [#352](https://github.com/ashione/VelaGraph/issues/352) (real coordinator/two-shard
-failure drill). Their assignment to v0.0.2 is not implementation or acceptance.
+failure drill). [#400](https://github.com/ashione/VelaGraph/pull/400) delivers
+receipt-backed offline D2 restore and selected-V inspection. It does not meet
+query READY, live cutover or complete graph recovery acceptance.
 
 - [#108](https://github.com/ashione/VelaGraph/issues/108),
   [#109](https://github.com/ashione/VelaGraph/issues/109) and
@@ -245,6 +247,8 @@ Planned evidence/acceptance under
   #110/#111/#127 evidence without replacing core correctness gates or introducing
   CoreHR-specific optimizations.
 
+The [performance evidence index](PERFORMANCE_EVIDENCE.md) separates current
+local/CoreHR evidence from planned public-client and LDBC measurements.
 Performance regression checks apply throughout all milestones. This stage
 consolidates reproducible scale qualification and honest limitations; it promises
 neither a benchmark result nor a release date or SOTA status.

@@ -41,6 +41,7 @@ accounting are not network compatibility modes and remain unchanged.
 
 The issue and PR record exact-head code generation, formatting, independent
 review and CI/CoreHR evidence. Source changes alone are not a passing gate or a
-production-readiness claim. #218 and #247 remain open until their own acceptance
-criteria are met. Public HTTP, Raft semantics, on-disk formats, and object-store
+production-readiness claim. #218 remains open for broader integration gates;
+[#247](https://github.com/ashione/VelaGraph/issues/247) is closed without proof
+of the earlier failure's cause. Public HTTP, Raft semantics, on-disk formats, and object-store
 HTTP are outside this retirement.
