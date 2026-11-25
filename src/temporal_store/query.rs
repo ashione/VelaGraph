@@ -124,7 +124,12 @@ struct Backend<'a, 'db> {
     record_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
     // True only after observing the first key beyond the previous identity.
     record_lookahead: Cell<bool>,
-    adjacency_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
+    adjacency_cursor: RefCell<Option<CompletedAdjacency<'a>>>,
+}
+struct CompletedAdjacency<'a> {
+    // Prefix order is direction first, then big-endian vertex ID.
+    list: (bool, u64),
+    cursor: rocksdb::DBRawIterator<'a>,
 }
 fn error(error: TemporalStoreError) -> Error {
     Error::TemporalStore(Box::new(error))
@@ -386,66 +391,75 @@ impl<'a, 'db> QueryReadBackend for Backend<'a, 'db> {
         let view: &'a TemporalStoreView<'db> = self.view;
         // Take the cursor out before invoking a visitor. A nested scan can then
         // use a separate temporary cursor instead of panicking on a RefCell borrow.
-        let mut cursor = self
-            .adjacency_cursor
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| {
+        let list = (incoming, id);
+        let (mut cursor, resume) = match self.adjacency_cursor.borrow_mut().take() {
+            Some(previous) => {
+                // The cursor is at the first key after the completed list (or EOF).
+                // If it is already at or beyond this later prefix, there are no
+                // intervening keys to visit. Never advance through unrelated lists.
+                let resume = previous.list < list
+                    && previous
+                        .cursor
+                        .key()
+                        .is_none_or(|key| key >= prefix.as_slice());
+                (previous.cursor, resume)
+            }
+            None => {
                 #[cfg(feature = "query-profiling")]
                 crate::query_profile::read_event(
                     crate::query_profile::ReadEvent::AdjacencyIterator,
                 );
-                view.snapshot.raw_iterator()
-            });
-        let result = (|| -> crate::Result<()> {
-            cursor.seek(&prefix);
-            loop {
-                self.check()?;
-                check()?;
-                cursor.status()?;
-                let Some((key, value)) = cursor.item() else {
-                    break;
-                };
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                #[cfg(feature = "query-profiling")]
-                crate::query_profile::read_event(
-                    crate::query_profile::ReadEvent::AdjacencyCandidate,
-                );
-                self.charge(key.len() + value.len())?;
-                let _raw = budget.reserve(key.len() + value.len())?;
-                if key.len() != prefix.len() + 8 || value.len() != 8 {
-                    return Err(error(TemporalStoreError::Corrupt));
-                }
-                let first = decode_version(Some(value)).map_err(error)?;
-                if first == 0 || first > head {
-                    return Err(error(TemporalStoreError::Corrupt));
-                }
-                if first > self.view.version {
-                    cursor.next();
-                    continue;
-                }
-                let edge_id = u64::from_be_bytes(
-                    key[prefix.len()..]
-                        .try_into()
-                        .map_err(|_| error(TemporalStoreError::Corrupt))?,
-                );
-                let Some(edge) = self.get_edge(edge_id, budget)? else {
-                    cursor.next();
-                    continue;
-                };
-                if (if incoming { edge.to } else { edge.from }) == id
-                    && label.is_none_or(|label| edge.label == label)
-                {
-                    visit(edge)?;
-                }
-                cursor.next();
+                (view.snapshot.raw_iterator(), false)
             }
-            Ok(())
-        })();
-        *self.adjacency_cursor.borrow_mut() = Some(cursor);
-        result
+        };
+        if !resume {
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::AdjacencySeek);
+            cursor.seek(prefix);
+        }
+        loop {
+            self.check()?;
+            check()?;
+            cursor.status()?;
+            let Some((key, value)) = cursor.item() else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::AdjacencyCandidate);
+            self.charge(key.len() + value.len())?;
+            let _raw = budget.reserve(key.len() + value.len())?;
+            if key.len() != prefix.len() + 8 || value.len() != 8 {
+                return Err(error(TemporalStoreError::Corrupt));
+            }
+            let first = decode_version(Some(value)).map_err(error)?;
+            if first == 0 || first > head {
+                return Err(error(TemporalStoreError::Corrupt));
+            }
+            if first > self.view.version {
+                cursor.next();
+                continue;
+            }
+            let edge_id = u64::from_be_bytes(
+                key[prefix.len()..]
+                    .try_into()
+                    .map_err(|_| error(TemporalStoreError::Corrupt))?,
+            );
+            let Some(edge) = self.get_edge(edge_id, budget)? else {
+                cursor.next();
+                continue;
+            };
+            if (if incoming { edge.to } else { edge.from }) == id
+                && label.is_none_or(|label| edge.label == label)
+            {
+                visit(edge)?;
+            }
+            cursor.next();
+        }
+        *self.adjacency_cursor.borrow_mut() = Some(CompletedAdjacency { list, cursor });
+        Ok(())
     }
 }
 

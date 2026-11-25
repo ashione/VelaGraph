@@ -434,14 +434,16 @@ fn decode_version(value: Option<&[u8]>) -> Result<u64> {
             .map_err(|_| TemporalStoreError::Corrupt)?,
     ))
 }
-fn adjacency_prefix(vertex: u64, incoming: bool) -> Vec<u8> {
-    let mut bytes = ADJACENCY_PREFIX.to_vec();
-    bytes.push(u8::from(incoming));
-    bytes.extend_from_slice(&vertex.to_be_bytes());
+fn adjacency_prefix(vertex: u64, incoming: bool) -> [u8; ADJACENCY_KEY_LEN - 8] {
+    let mut bytes = [0; ADJACENCY_KEY_LEN - 8];
+    bytes[..ADJACENCY_PREFIX.len()].copy_from_slice(ADJACENCY_PREFIX);
+    bytes[ADJACENCY_PREFIX.len()] = u8::from(incoming);
+    bytes[ADJACENCY_PREFIX.len() + 1..].copy_from_slice(&vertex.to_be_bytes());
     bytes
 }
 fn adjacency_key(vertex: u64, incoming: bool, edge: u64) -> Vec<u8> {
-    let mut bytes = adjacency_prefix(vertex, incoming);
+    let mut bytes = Vec::with_capacity(ADJACENCY_KEY_LEN);
+    bytes.extend_from_slice(&adjacency_prefix(vertex, incoming));
     bytes.extend_from_slice(&edge.to_be_bytes());
     bytes
 }
