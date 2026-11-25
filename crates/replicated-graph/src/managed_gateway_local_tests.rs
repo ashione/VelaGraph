@@ -394,13 +394,30 @@ async fn fixed_local_unsupported_and_shared_gateway_reservations() {
     let _sessions = crate::remote::distributed::fixed_execution::lock_session_fixtures().await;
     let f = Fixture::new().await;
     let (g, servers, graphs) = local_gateway(&f).await;
-    for text in ["g.V()", "g.V(1).both()", "g.V(1).limit(1)"] {
+    for text in [
+        "g.V()",
+        "g.V(1).both()",
+        "g.V(1).limit(0)",
+        "g.V(1).limit(1001)",
+    ] {
         assert!(matches!(
             call(&g, local_open(None, text, 1)).await,
             Err(Error::Query(_))
         ));
         assert_eq!(g.retained_payload_charge(), 0);
     }
+    // Synchronous limit is now admitted; closing its empty fixed-V result
+    // must release the reservation before the shared-capacity checks below.
+    let (limited, _, page) = ready(
+        call(&g, local_open(Some(0), "g.V(1).limit(1)", 1))
+            .await
+            .unwrap(),
+    );
+    assert!(page.data.rows.is_empty());
+    call(&g, Operation::CloseLocalQuery { session: limited })
+        .await
+        .unwrap();
+    assert_eq!(g.retained_payload_charge(), 0);
     let mut old = Vec::new();
     for _ in 0..3 {
         let Reply::OpenSession(session) = call(

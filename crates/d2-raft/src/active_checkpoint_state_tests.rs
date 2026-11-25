@@ -1220,3 +1220,182 @@ async fn row_witness_real_apply_cost() {
         }
     }
 }
+
+// Retained compatibility oracle: deliberately uses the pre-optimization path.
+async fn full_terminal_reference(
+    sm: &StateMachine,
+    shard: u64,
+    epoch: u64,
+    mode: [u8; 16],
+    version: u64,
+) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
+    let state = sm.state.read().await;
+    let loaded = sm.load_disk_state(&state).map_err(ledger_read_error)?;
+    let d1 = loaded
+        .as_ref()
+        .map(|v| &v.state)
+        .or(state.d1.as_ref())
+        .ok_or(D1Error::NotActivated)?;
+    d1.check_shard(shard)?;
+    d1.check_epoch(epoch)?;
+    if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode) {
+        return Err(D1Error::ManagedModeConflict);
+    }
+    let journal = d1
+        .coordinator
+        .as_ref()
+        .ok_or(D1Error::CoordinatorNotEnabled)?;
+    if version > journal.resolved_prefix() {
+        return Err(D1Error::VisibilityUnresolved);
+    }
+    sm.decision_prefix(&state, d1, version)
+}
+
+#[tokio::test]
+async fn coordinator_prefix_projects_once_and_preserves_range_and_failure_order() {
+    for profile in profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        setup(&mut sm, profile).await;
+        // Keep a hole while later decisions accumulate, then drain it.
+        apply(&mut sm, vec![begin(1, vec![participant()])]).await;
+        for n in 2..=33 {
+            apply(&mut sm, vec![begin(n, vec![participant()]), abort(n)]).await;
+        }
+        for version in [0, 1] {
+            let expected = full_terminal_reference(&sm, 7, 3, [1; 16], version).await;
+            assert_eq!(
+                no_journal(sm.coordinator_terminal_prefix(7, 3, [1; 16], version)).await,
+                expected
+            );
+        }
+        apply(&mut sm, vec![abort(1)]).await;
+        drop(sm);
+        let sm = Arc::new(StateMachine::open(dir.path()).unwrap());
+        for version in [0, 1, 31, 32, 33] {
+            let expected = full_terminal_reference(&sm, 7, 3, [1; 16], version)
+                .await
+                .unwrap();
+            let loads = sm.complete_history_loads.load(Ordering::Relaxed);
+            let walks = event_ledger::raw_walks();
+            let actual = no_journal(sm.coordinator_terminal_prefix(7, 3, [1; 16], version))
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(sm.complete_history_loads.load(Ordering::Relaxed), loads);
+            assert_eq!(event_ledger::raw_walks() - walks, 1);
+        }
+        let segments = rows(&sm, crate::decision_segments::PREFIX);
+        assert_eq!(segments.len(), 2);
+        let raw = rows(&sm, event_ledger::PREFIX);
+        let db = &sm.storage.as_ref().unwrap().db;
+        let manifest = db
+            .get(crate::decision_segments::MANIFEST_KEY)
+            .unwrap()
+            .unwrap();
+        // Unrelated later index damage is ignored for old ranges, including V0.
+        db.put(&segments[1].0, b"{}").unwrap();
+        for version in [0, 1, 32, 33] {
+            assert_eq!(
+                no_journal(sm.coordinator_terminal_prefix(7, 3, [1; 16], version)).await,
+                full_terminal_reference(&sm, 7, 3, [1; 16], version).await,
+            );
+        }
+        db.put(&segments[1].0, &segments[1].1).unwrap();
+        // A canonically encoded change outside returned V=1 but inside its row
+        // must still fail the whole-row comparison.
+        let original = std::str::from_utf8(&segments[0].1).unwrap();
+        let (before, after) = original.rsplit_once("\"prepared\":[false]").unwrap();
+        let changed = format!("{before}\"prepared\":[true]{after}");
+        db.put(&segments[0].0, changed.as_bytes()).unwrap();
+        assert_eq!(
+            no_journal(sm.coordinator_terminal_prefix(7, 3, [1; 16], 1)).await,
+            Err(D1Error::DecisionIndexHistory)
+        );
+        db.put(&segments[0].0, &segments[0].1).unwrap();
+        // Early anchor failures must dominate even incorrect identity and a
+        // broken decision manifest, with exactly the old error mapping.
+        for key in [D1_KEY, APPLIED_KEY, crate::request_index::MANIFEST_KEY] {
+            let saved = db.get(key).unwrap();
+            db.put(key, b"{}").unwrap();
+            db.put(crate::decision_segments::MANIFEST_KEY, b"{}")
+                .unwrap();
+            for shard in [7, 8] {
+                assert_eq!(
+                    no_journal(sm.coordinator_terminal_prefix(shard, 3, [1; 16], 1)).await,
+                    full_terminal_reference(&sm, shard, 3, [1; 16], 1).await,
+                );
+            }
+            match saved {
+                Some(value) => db.put(key, value).unwrap(),
+                None => db.delete(key).unwrap(),
+            }
+            db.put(crate::decision_segments::MANIFEST_KEY, &manifest)
+                .unwrap();
+        }
+        // Pair raw/index/manifest faults with every caller-validation stage.
+        for bad_raw in [false, true] {
+            for bad_manifest in [false, true] {
+                for bad_index in [false, true] {
+                    if bad_raw {
+                        db.put(&raw.last().unwrap().0, b"{}").unwrap();
+                    }
+                    if bad_manifest {
+                        db.put(crate::decision_segments::MANIFEST_KEY, b"{}")
+                            .unwrap();
+                    }
+                    if bad_index {
+                        db.put(&segments[0].0, b"{}").unwrap();
+                    }
+                    let before = disk(&sm);
+                    for (shard, epoch, mode, version) in [
+                        (7, 3, [1; 16], 1),
+                        (8, 3, [1; 16], 1),
+                        (7, 4, [1; 16], 1),
+                        (7, 3, [2; 16], 1),
+                        (7, 3, [1; 16], 34),
+                        (7, 3, [1; 16], 0),
+                    ] {
+                        let expected =
+                            full_terminal_reference(&sm, shard, epoch, mode, version).await;
+                        let loads = sm.complete_history_loads.load(Ordering::Relaxed);
+                        assert_eq!(
+                            no_journal(sm.coordinator_terminal_prefix(shard, epoch, mode, version)).await,
+                            expected,
+                            "profile={profile:?} raw={bad_raw} manifest={bad_manifest} index={bad_index} shard={shard} epoch={epoch} version={version}",
+                        );
+                        assert_eq!(sm.complete_history_loads.load(Ordering::Relaxed), loads);
+                        assert_eq!(disk(&sm), before);
+                    }
+                    db.put(&raw.last().unwrap().0, &raw.last().unwrap().1)
+                        .unwrap();
+                    db.put(crate::decision_segments::MANIFEST_KEY, &manifest)
+                        .unwrap();
+                    db.put(&segments[0].0, &segments[0].1).unwrap();
+                }
+            }
+        }
+        // Poison is reported only after successful raw and caller validation.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sm
+                .storage
+                .as_ref()
+                .unwrap()
+                .decision_manifest
+                .lock()
+                .unwrap();
+            panic!("deliberate manifest-lock poison");
+        }));
+        for bad_raw in [false, true] {
+            if bad_raw {
+                db.put(&raw.last().unwrap().0, b"{}").unwrap();
+            }
+            for (shard, version) in [(7, 1), (8, 1), (7, 34)] {
+                assert_eq!(
+                    no_journal(sm.coordinator_terminal_prefix(shard, 3, [1; 16], version)).await,
+                    full_terminal_reference(&sm, shard, 3, [1; 16], version).await,
+                );
+            }
+        }
+    }
+}

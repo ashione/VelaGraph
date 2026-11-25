@@ -37,8 +37,27 @@ explicit-identity API changes and validation boundaries. Public HTTP
 remains supported; old JSON/TCP clients are not a supported fallback.
 
 Go clients can build a managed traversal locally and submit its steps in one
-gRPC call. See the [Go client SDK](sdk/go/README.md)
-for supported steps and snapshot selection.
+typed `GraphService.Execute` gRPC call without sending Gremlin text for parsing.
+This is not a server-side prepared-plan handle or reuse of the local Rust
+prepared-query API. See the [Go client SDK](sdk/go/README.md) for supported steps
+and snapshot selection.
+
+Go applications can also embed the local engine through the optional
+[`sdk/go/native`](docs/NATIVE_FFI.md) cgo package and versioned C ABI. It supports
+ordinary memory graphs, temporal RocksDB, prepared queries and controlled batches
+without a server. Packed results support owned Go objects or explicitly closed
+views with zero-copy result access. Its Go package includes the ABI header for
+module/vendor consumers; the matching native library is supplied separately.
+This path has local consistency and shared-process failure
+semantics; enable it explicitly with `velagraph_native` and a matching native library.
+
+## Source prerelease and development main
+
+[v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1) is a published
+source-only experimental prerelease, not a prebuilt binary or production release.
+This README describes development `main`, which includes later changes. For the
+released scope and limitations, use the tagged source and its release notes; keep
+clients and services on the same source version.
 
 ## Quick start
 
@@ -103,15 +122,49 @@ The Rust package and import name are both **`velagraph`**. The local
 explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
-Temporal queries support reusable parsed plans, checked typed bindings and
-query-local record/adjacency cursor reuse at a fixed snapshot and V/T.
-Already observed record-boundary lookahead can also avoid a redundant seek while
-retaining the normal visibility and validation checks. See
-[temporal query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings) for
-API examples, cache bounds and validation limits.
+The local storage-node adapter and the in-process Raft adapter both support
+[write-only single-shard transactions](docs/STORAGE_NODE_INTERFACE.md#single-shard-transaction).
+This API carries a caller-supplied request ID if the commit outcome is unknown.
+Remote and routed adapters return `Unsupported` at begin.
+
+Local temporal queries support reusable parsed plans, typed bindings and
+[bounded query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings).
+For repeated local reads at a fixed version, [materialized temporal reads](docs/MATERIALIZED_TEMPORAL_READS.md)
+trade explicit construction and memory costs for in-memory queries. These models
+do not refresh themselves. See [performance evidence](docs/PERFORMANCE_EVIDENCE.md)
+for reproduction and scope.
+
 Existing callers migrating from `rocksdb_sql_table` should read the
 [SQL removal and crate-rename note](docs/SQL_REMOVAL.md). RocksDB remains the
 storage engine; removing SQL did not remove it.
+
+## Optional incremental memory graph
+
+`IncrementalGraph` is an experimental local read-model backend for ordinary
+vertices and edges. It stages bounded changes and publishes records, bidirectional
+indexes, a local sequence and opaque caller progress atomically. Locked readers
+retain a read lock; COW readers retain an immutable version while updates copy
+only touched index shards and adjacency chunks. Gremlin uses the existing executor.
+
+This API does not replace `GraphEngine`, temporal assertions or managed storage.
+Memory commits are not individually durable. A separate versioned local checkpoint
+supports model recovery, but the caller still owns source identity, replayability,
+reader lifetimes and aggregate memory policy. See the [design and limits](docs/INCREMENTAL_MEMORY_GRAPH.md).
+
+```sh
+cargo run --release --locked -p velagraph --example incremental_memory
+cargo run --release --locked -p velagraph --example incremental_publication
+```
+
+COW prepares changed index shards outside the reader publication lock and releases
+retired data after unlocking. Its version budget includes the candidate construction
+peak. Checkpoint publication prevents older or conflicting snapshots from replacing
+an existing target and coordinates through a persistent directory lock sidecar.
+The `incremental_publication` example measures version acquisition during writes.
+
+The `incremental_memory` example uses generated data, compares rebuilding with incremental publication,
+checks each version and restores a checkpoint before continuing. Its timings are
+local observations, not a disk-durability comparison or service capacity claim.
 
 ## Choose your graph path
 
@@ -212,7 +265,10 @@ the [read-only verification CLI](docs/OBJECT_STORE_CHECKPOINT_API.md#operator-ve
 checks a retained receipt without staging a local backup.
 S3-compatible transport is tested against SeaweedFS. This is **backup transport**,
 not object-store-authoritative storage, remote-durable write acknowledgement or
-live-cluster recovery. Physical restoration is guarded for offline use. See the
+live-cluster recovery. Offline recovery can restore the D2 coordinator and every fixed-cohort member
+from a selected local generation or an object-store receipt,
+then verify the copied decision history and inspect managed vertices and edges
+at the requested version. See the
 [physical checkpoint](docs/PHYSICAL_CHECKPOINT.md) and
 [object-store API](docs/OBJECT_STORE_CHECKPOINT_API.md) contracts.
 
@@ -250,12 +306,14 @@ and implementation of scoped roadmap items. Start with
 
 [Ordinary CI](.github/workflows/ci.yml) runs formatting, tests and Clippy.
 [CoreHR CI](docs/COREHR_CI.md) separately exercises the full observed scenario and
-retained 1,025-write managed lifecycle/recovery. Object-store tests have their
+event-specific managed lifecycle/recovery: PRs use a short recovery check; main
+pushes, scheduled and manual runs retain the full 1,025-write acceptance. A green
+PR lifecycle gate is not full 1,025-write acceptance. Object-store tests have their
 [own workflow](.github/workflows/object-store-checkpoint.yml).
 `cargo test --locked` does not run every ignored long test or every workspace
 member. Passing same-host tests is not proof of multi-machine performance or HA.
-Benchmark reports apply to their named source, binaries and workload, not every
-subsequent commit.
+See [performance evidence and external benchmark plans](docs/PERFORMANCE_EVIDENCE.md).
+Results apply to their named source, binaries and workload, not every subsequent commit.
 
 ## License
 
@@ -265,4 +323,3 @@ crates retain `MIT OR Apache-2.0`; third-party licenses and notices are preserve
 See [licensing details](docs/LICENSING.md) and the
 [OpenRaft notice](crates/d2-raft/NOTICE). This is not a claim of a completed
 historical provenance audit or a complete dependency-attribution bundle.
-

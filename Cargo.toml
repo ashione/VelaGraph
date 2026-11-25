@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/d2-raft", "crates/replicated-graph", "crates/checkpoint-object-store"]
+members = ["crates/velagraph-ffi", "crates/d2-raft", "crates/replicated-graph", "crates/checkpoint-object-store"]
 default-members = [".", "crates/d2-raft", "crates/replicated-graph"]
 resolver = "2"
 
@@ -16,17 +16,20 @@ path = "src/lib.rs"
 
 [features]
 query-profiling = []
+async-read = ["dep:tokio"]
 
 [dependencies]
 rocksdb = { version = "0.25.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 gremlin-rs = "0.1.0"
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
 getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "test-util"] }
 
 [[example]]
 name = "quickstart"

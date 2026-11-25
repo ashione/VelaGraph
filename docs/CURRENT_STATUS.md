@@ -1,6 +1,20 @@
 # Current capability and work index
 
-Reviewed on **2026-11-14** against main
+## Optional native embedding
+
+The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
+in-process access to ordinary incremental memory and temporal RocksDB stores.
+They share existing Gremlin, mutation, V/T and checkpoint contracts. Packed
+results support owned Go materialization and explicitly closed native-memory views.
+The Go native package bundles its ABI header; isolated module/vendor consumers
+are covered by native CI. Cancellation
+is cooperative; no distributed capability or storage format is added. JSON
+encoding/copy costs, explicit lifecycle and shared-process native failure remain
+part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)
+and [issue #376](https://github.com/ashione/VelaGraph/issues/376).
+
+
+The communication-retirement baseline was reviewed on **2026-11-14** against main
 [`40e2b9a`](https://github.com/ashione/VelaGraph/commit/40e2b9a419ff941a58761f784c9c7fd500a6bf08).
 GraphService retirement #278 / #279 is merged after exact-head CI and full CoreHR,
 including retained 1025-write lifecycle verification. Supported inter-node and
@@ -209,16 +223,21 @@ transport and the still-unimplemented global disaster recovery in
 | [#124](https://github.com/ashione/VelaGraph/issues/124) → [#118](https://github.com/ashione/VelaGraph/issues/118) | Purge/install publication safety prerequisite, then owned file-backed snapshot delivery and safe spool accounting. Neither means bounded install or a lifted 16 MiB budget. |
 | [#110](https://github.com/ashione/VelaGraph/issues/110) → [#111](https://github.com/ashione/VelaGraph/issues/111) | Data-local certified-V query capacity, then full 200,000-person/5,000-department managed dynamic consistency with an independent oracle and recovery evidence. #111 also depends on #109. |
 | [#127](https://github.com/ashione/VelaGraph/issues/127) | Gateway phase timing is merged in #133; further lifecycle/resource attribution, remote subphases and controlled overhead evidence remain. [#143](https://github.com/ashione/VelaGraph/pull/143) is merged; its diagnostics do not complete product observability. |
-| [#128](https://github.com/ashione/VelaGraph/issues/128) | Bounded paged-snapshot failure diagnostics landed in #131. The original intermittent failure's cause remains unproven; a green rerun alone is not a root-cause fix. |
+| [#393](https://github.com/ashione/VelaGraph/issues/393) | The local and in-process Raft adapters support write-only `StorageNode::begin_v1`. Three-replica tests verify committed visibility after a leader change and a complete batch after a lost commit reply. Remote and routed support, independent-process crash/restart evidence and recovery of the original commit outcome remain open. |
+| [#349](https://github.com/ashione/VelaGraph/issues/349)–[#352](https://github.com/ashione/VelaGraph/issues/352) | Guarded offline D2 restore is implemented; live capture/retention closure, safe query admission and the end-to-end recovery gate remain open. |
 | [#122](https://github.com/ashione/VelaGraph/issues/122) | Low-priority product observability/tuning/operations plan, separate from test diagnostics. |
 
 Automatic routing convergence, online migration, production transport security,
 full D4/D5 acceptance and multi-machine availability/performance remain separate
 milestones. [Physical checkpoints](PHYSICAL_CHECKPOINT.md) and
-[object-store transport](OBJECT_STORE_CHECKPOINT_API.md) are implemented narrow
-slices: restoration remains guarded offline-only, not global checkpoint recovery,
-live rejoin or object-store-authoritative storage. Neither a merged narrow slice nor a completed
-same-host functional fixture closes them.
+[object-store transport](OBJECT_STORE_CHECKPOINT_API.md) support a selected
+fixed-cohort D2 generation, including receipt-backed offline restore and
+inspection at the selected decision version ([#400](https://github.com/ashione/VelaGraph/pull/400)).
+The restored target remains guarded against normal startup. This is not a
+complete graph backup (separate catalog and TemporalStore coverage are absent),
+query READY, live rejoin or object-store-authoritative storage.
+[#128](https://github.com/ashione/VelaGraph/issues/128) is closed with bounded
+diagnostics in #131; that does not establish the old intermittent failure's cause.
 
 ## Verification and source map
 
@@ -232,11 +251,11 @@ same-host functional fixture closes them.
 
 The [ordinary CI](../.github/workflows/ci.yml) runs fmt, workspace tests and strict
 all-target Clippy. The [CoreHR workflow](COREHR_CI.md) separately requires the
-full **observed** scenario and a fresh **managed 1,025-write release lifecycle**
-with original-ID/Plan, old-V, restart and snapshot evidence. The long lifecycle
-is ignored in ordinary debug tests, intentionally required through the release
-gate. The small managed process tests are additional functional coverage, not a
-substitute for either gate or full-scale managed consistency.
+full **observed** scenario on every event. A separate managed lifecycle lane
+runs short recovery on PRs and the retained **1,025-write** lifecycle on main
+pushes, scheduled and manual runs. Read the workflow's `acceptance-tier`, not
+just the historical check name. Small managed process tests do not establish
+full-scale managed consistency. See the [performance evidence index](PERFORMANCE_EVIDENCE.md).
 
 Historical `*_RESULTS.md`, performance reports, `docs/benchmarks/` and
 `docs/evidence/` retain their original source/profile/environment context. Do not
@@ -266,3 +285,24 @@ It reuses #303's verifier through a read-only API, not a second transport or
 recovery implementation. CLI credentials/endpoint controls and acceptance limits
 are in the [design](CHECKPOINT_VERIFY_CLI_DESIGN.md). No global-cut, READY,
 live-rejoin, retention or remote-authority claim follows from this slice.
+
+
+## Optional local incremental read model
+
+The [incremental memory graph](INCREMENTAL_MEMORY_GRAPH.md) is an experimental
+library backend tracked by #370. It preserves bounded ordinary Gremlin reads
+while publishing staged records/indexes and caller metadata.
+COW prepares one candidate outside the publication lock and reclaims retired
+data after unlocking; admission includes the candidate construction peak. Record
+budgets precede validation and bulk compaction. Checkpoint publication serializes
+through a directory file lock and rejects stale/conflicting target versions.
+Existing disk, temporal and managed APIs remain distinct; memory publication is not durable ACK.
+
+## Local temporal revision reuse
+
+The local `TemporalStore` now uses [bounded revision-prefix blocks](TEMPORAL_REVISION_CACHE.md)
+for point and Gremlin reads. Reuse across unchanged commits is guarded by logical
+version and physical snapshot sequence; interval indexing preserves revision
+precedence and query budgets. This adds no distributed, storage-format or public
+protocol capability. Synthetic benchmark evidence and cold/write tradeoffs are
+recorded with the cache contract.

@@ -164,11 +164,15 @@ fn nonmatching_and_descending_ids_seek_but_memo_hits_leave_lookahead_intact() {
             vertex(4, Interval { from: 0, to: None }, 4),
         ])
         .unwrap();
-    let view = store.view(None, 0).unwrap();
+    drop(store);
     for (text, values, seeks, hits) in [
         ("g.V(2,4,3).values('n')", vec![4, 3], 3, 0),
         ("g.V(4,2,4,3).values('n')", vec![4, 4, 3], 2, 1),
     ] {
+        // Keep each cursor scenario cold; retained revision blocks are tested
+        // separately and may legitimately eliminate every seek on warm reads.
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let view = store.view(None, 0).unwrap();
         query_profile::begin();
         assert_eq!(
             view.execute_gremlin(text).unwrap().rows,

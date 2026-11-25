@@ -660,3 +660,224 @@ async fn paged_snapshot_survives_failover_without_switching_view() -> anyhow::Re
     })
     .await?
 }
+
+fn tx_options(id: u8) -> velagraph::TransactionOptions {
+    velagraph::TransactionOptions {
+        shard: 7,
+        epoch: 3,
+        request_id: [id; 16],
+        cancellation: Default::default(),
+        deadline: std::time::Instant::now() + Duration::from_secs(10),
+    }
+}
+
+fn put(key: &[u8]) -> velagraph::WriteOp {
+    velagraph::WriteOp::put(key, [1])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_transaction_conflict_cancellation_and_failover() -> anyhow::Result<()> {
+    use velagraph::TransactionError;
+    timeout(Duration::from_secs(45), async {
+        let cluster = Cluster::new();
+        let dirs = (0..3)
+            .map(|_| tempfile::tempdir())
+            .collect::<Result<Vec<_>, _>>()?;
+        let nodes = start(&cluster, &dirs).await?;
+        let i = bootstrap(&nodes).await?;
+        let adapter =
+            |idx: usize| ReplicatedStorageNode::new(&nodes[idx], 7, Duration::from_secs(2));
+        let follower = adapter((i + 1) % nodes.len())?;
+        let node = adapter(i)?;
+        run_blocking(move || -> anyhow::Result<()> {
+            assert!(matches!(
+                follower.begin_v1(tx_options(1)),
+                Err(TransactionError::Node(StorageNodeError::NotLeader { .. }))
+            ));
+            let mut fenced = tx_options(1);
+            fenced.epoch = 2;
+            assert!(matches!(
+                node.begin_v1(fenced),
+                Err(TransactionError::Node(StorageNodeError::Fenced {
+                    current: 3,
+                    ..
+                }))
+            ));
+            let mut winner = node.begin_v1(tx_options(2))?;
+            let mut stale = node.begin_v1(tx_options(3))?;
+            let mut aborted = node.begin_v1(tx_options(4))?;
+            let controls = tx_options(5);
+            let token = controls.cancellation.clone();
+            let mut cancelled = node.begin_v1(controls)?;
+            winner.stage(&put(b"a"))?;
+            winner.stage(&put(b"b"))?;
+            stale.stage(&put(b"stale"))?;
+            aborted.stage(&put(b"aborted"))?;
+            aborted.abort();
+            cancelled.stage(&put(b"cancelled"))?;
+            token.cancel();
+            assert!(matches!(
+                cancelled.commit(),
+                Err(TransactionError::Cancelled)
+            ));
+            let mut over_limit = node.begin_v1(tx_options(6))?;
+            over_limit.stage(&put(b"prefix"))?;
+            assert!(matches!(
+                over_limit.stage(&velagraph::WriteOp::Delete {
+                    key: vec![0; d2_raft::MAX_BATCH_BYTES]
+                }),
+                Err(TransactionError::Node(StorageNodeError::ResourceExhausted(
+                    _
+                )))
+            ));
+            assert!(matches!(
+                over_limit.commit(),
+                Err(TransactionError::Aborted)
+            ));
+            let before = node.read_view()?;
+            assert_eq!(before.sequence, 0);
+            assert_eq!(node.get(b"a", &before)?, None);
+            let result = winner.commit()?;
+            assert_eq!((result.sequence, result.applied_operations), (1, 2));
+            assert!(matches!(
+                stale.commit(),
+                Err(TransactionError::Node(StorageNodeError::Conflict {
+                    expected: 0,
+                    current: 1
+                }))
+            ));
+            assert_eq!(node.get(b"b", &before)?, None);
+            Ok(())
+        })
+        .await??;
+        converge(&cluster, &nodes, i).await?;
+        cluster.shutdown(&nodes[i]).await;
+        let new_leader = leader(&nodes, Some(nodes[i].id)).await?;
+        let new_node = adapter(new_leader)?;
+        run_blocking(move || -> anyhow::Result<()> {
+            let view = new_node.read_view()?;
+            assert_eq!(view.sequence, 1);
+            for key in [b"a", b"b"] {
+                assert_eq!(new_node.get(key, &view)?, Some(vec![1]));
+            }
+            for key in [b"prefix".as_slice(), b"stale", b"cancelled", b"aborted"] {
+                assert_eq!(new_node.get(key, &view)?, None);
+            }
+            Ok(())
+        })
+        .await??;
+        for (index, node) in nodes.iter().enumerate() {
+            if index != i {
+                cluster.shutdown(node).await;
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_transaction_timeout_can_publish_the_complete_batch() -> anyhow::Result<()> {
+    use velagraph::TransactionError;
+    timeout(Duration::from_secs(30), async {
+        let cluster = Cluster::new();
+        let dirs = (0..3)
+            .map(|_| tempfile::tempdir())
+            .collect::<Result<Vec<_>, _>>()?;
+        let nodes = start(&cluster, &dirs).await?;
+        let i = bootstrap(&nodes).await?;
+        let node = ReplicatedStorageNode::new(&nodes[i], 7, Duration::from_millis(500))?;
+        let reader = node.clone();
+        let (ready, staged) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::sync_channel(1);
+        let writer = tokio::spawn(run_blocking(move || -> anyhow::Result<()> {
+            let mut tx = node.begin_v1(tx_options(77))?;
+            tx.stage(&put(b"first"))?;
+            tx.stage(&put(b"second"))?;
+            ready.send(()).unwrap();
+            paused.recv_timeout(Duration::from_secs(5))?;
+            assert!(matches!(tx.commit(), Err(TransactionError::UnknownOutcome {
+                request_id, source: StorageNodeError::Timeout { request_id: Some(inner) },
+            }) if request_id == [77; 16] && inner == request_id));
+            Ok(())
+        }));
+        staged.await?;
+        let guard = nodes[i].state_machine.pause_state().await;
+        resume.send(())?;
+        writer.await???;
+        drop(guard);
+        // Wait for the actual timed-out command, without issuing another write.
+        timeout(Duration::from_secs(5), async {
+            while nodes[i].state_machine.d1_metadata().await != Some((7, 3, 1)) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        run_blocking(move || -> anyhow::Result<()> {
+            let view = reader.read_view()?;
+            assert_eq!(view.sequence, 1);
+            assert_eq!(reader.get(b"first", &view)?, Some(vec![1]));
+            assert_eq!(reader.get(b"second", &view)?, Some(vec![1]));
+            Ok(())
+        })
+        .await??;
+        converge(&cluster, &nodes, i).await?;
+        for node in &nodes {
+            cluster.shutdown(node).await;
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_transaction_rejects_managed_mode_at_begin_and_apply() -> anyhow::Result<()> {
+    use velagraph::TransactionError;
+    timeout(Duration::from_secs(30), async {
+        let cluster = Cluster::new();
+        let dirs = (0..3)
+            .map(|_| tempfile::tempdir())
+            .collect::<Result<Vec<_>, _>>()?;
+        let nodes = start(&cluster, &dirs).await?;
+        let i = bootstrap(&nodes).await?;
+        let node = ReplicatedStorageNode::new(&nodes[i], 7, Duration::from_secs(5))?;
+        let raft = nodes[i].raft.clone();
+        let runtime = tokio::runtime::Handle::current();
+        run_blocking(move || -> anyhow::Result<()> {
+            let mut tx = node.begin_v1(tx_options(1))?;
+            tx.stage(&put(b"pending"))?;
+            runtime
+                .block_on(
+                    raft.client_write(LogCommand::D1V1(D1Command::EnableManagedWrites {
+                        shard: 7,
+                        epoch: 3,
+                        expected_sequence: 0,
+                        mode_id: [1; 16],
+                    })),
+                )?
+                .data
+                .d1
+                .expect("D1 application response")
+                .expect("mode command accepted");
+            assert!(matches!(
+                node.begin_v1(tx_options(2)),
+                Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+            ));
+            assert!(matches!(
+                tx.commit(),
+                Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+            ));
+            let view = node.read_view()?;
+            assert_eq!(view.sequence, 0);
+            assert_eq!(node.get(b"pending", &view)?, None);
+            Ok(())
+        })
+        .await??;
+        converge(&cluster, &nodes, i).await?;
+        for node in &nodes {
+            cluster.shutdown(node).await;
+        }
+        Ok(())
+    })
+    .await?
+}

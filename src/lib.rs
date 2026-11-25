@@ -3,7 +3,14 @@
 //! Provides typed vertices and edges, deterministic graph records, bounded
 //! traversals, snapshot reads, and single-partition write transactions.
 
+#[cfg(feature = "async-read")]
+mod async_read;
+#[cfg(feature = "async-read")]
+pub use async_read::AsyncGraphReader;
+
 mod error;
+mod execution;
+pub use execution::{CancellationToken, ExecutionControl, QueryBatchLimits};
 mod global_scan;
 mod graph;
 mod graph_records;
@@ -29,8 +36,9 @@ pub use gremlin::{
 };
 pub use storage_node::{
     Epoch, Export, KeyRange, KeyValue, LocalStorageNode, ReadView, RequestId, ScanCursor,
-    ScanLimit, ScanPage, Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp,
-    WriteRequest, WriteResult, WriteStatus, INTERFACE_VERSION, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
+    ScanLimit, ScanPage, Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError,
+    StorageTransaction, TransactionError, TransactionOptions, WriteOp, WriteRequest, WriteResult,
+    WriteStatus, INTERFACE_VERSION, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
 };
 pub use traversal::{
     TraversalDirection, TraversalOptions, TraversalPath, TraversalResult, MAX_TRAVERSAL_HOPS,
@@ -49,3 +57,11 @@ pub mod temporal_store;
 /// Optional local phase counters; no storage or query semantic changes.
 #[cfg(feature = "query-profiling")]
 pub mod query_profile;
+
+/// Experimental bounded incremental memory graph types. Existing disk-backed
+/// engines and temporal APIs retain their separate contracts.
+pub use graph::incremental::{
+    IncrementalCommitStats, IncrementalGraph, IncrementalLimits, IncrementalMemoryError,
+    IncrementalMode, IncrementalMutation, IncrementalQueryLimits, IncrementalReadView,
+    IncrementalToken, IncrementalTransaction,
+};

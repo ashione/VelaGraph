@@ -569,12 +569,17 @@ impl D1State {
         request: &D1WriteRequest,
         history: Option<&Self>,
     ) -> Result<D1Result, D1Error> {
-        self.check_shard(request.shard)?;
-        self.check_epoch(request.epoch)?;
+        self.unmanaged_write_sequence(request.shard, request.epoch)?;
+        self.write_inner(request, history)
+    }
+
+    pub(crate) fn unmanaged_write_sequence(&self, shard: u64, epoch: u64) -> Result<u64, D1Error> {
+        self.check_shard(shard)?;
+        self.check_epoch(epoch)?;
         if self.managed.is_some() {
             return Err(D1Error::ManagedWriteRequired);
         }
-        self.write_inner(request, history)
+        Ok(self.sequence)
     }
 
     pub(crate) fn enable_managed(

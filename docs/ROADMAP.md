@@ -1,10 +1,41 @@
 # VelaGraph Roadmap（实验阶段）
 
+## Optional native embedding
+
+The [ABI1 C library and optional Go cgo package](NATIVE_FFI.md) provide bounded
+in-process access to ordinary incremental memory and temporal RocksDB stores.
+They share existing Gremlin, mutation, V/T and checkpoint contracts. Packed
+results support owned Go materialization and explicitly closed native-memory views.
+The Go native package bundles its ABI header; isolated module/vendor consumers
+are covered by native CI. Cancellation
+is cooperative; no distributed capability or storage format is added. JSON
+encoding/copy costs, explicit lifecycle and shared-process native failure remain
+part of this experimental boundary. See [validation](NATIVE_FFI_VALIDATION.md)
+and [issue #376](https://github.com/ashione/VelaGraph/issues/376).
+
+
 > 当前阶段：已有单机图内核、Raft 存储节点、静态路由、有界 observed 跨分片查询及 restricted managed 事务/同版本读取。继续以真实写入、查询和恢复路径补齐功能与容量证据，以 CoreHR 持续验收；容错、在线迁移与生产安全分别推进，实验切片可用不代表 D3、D4、D5 已全部完成。
 
 **产品终局**：VelaGraph 的目标是成为存储与计算解耦的分布式属性图数据库（当前实现以本地 RocksDB/Raft 为持久化基础；对象存储权威与本地缓存是后续规划，尚未实现），支持标准 Gremlin 子集、强一致单键写入、快照读、水平扩展和多语言客户端。不是通用 SQL 数仓，也不是完整 PostgreSQL 兼容层。
 
-## 当前状态核对（2026-11-15，main `ab94394`）
+## 发布与规划更新（2026-11-19）
+
+[v0.0.1](https://github.com/ashione/VelaGraph/releases/tag/v0.0.1) 已发布为
+source-only 实验预发布；不是预编译发行包或生产就绪承诺。开发 main 已包含后续切片，
+不能把 main 的能力全部归入该标签。发布范围、历史风险和验证证据以 release notes 为准。
+
+开发 main 已合入面向 v0.0.2 的固定 cohort 恢复切片：[#400](https://github.com/ashione/VelaGraph/pull/400)
+支持从对象存储凭据离线恢复并检查指定 V。仍须完成 [#349](https://github.com/ashione/VelaGraph/issues/349)
+捕获与保留、[#350](https://github.com/ashione/VelaGraph/issues/350) 全局清单覆盖、
+[#351](https://github.com/ashione/VelaGraph/issues/351) READY 门禁和
+[#352](https://github.com/ashione/VelaGraph/issues/352) 端到端恢复验收。v0.0.3 的
+[#354](https://github.com/ashione/VelaGraph/issues/354) CDC/周期在线重建的首个目标是一个需要明确
+验证的 MySQL-compatible/InnoDB 来源，该验证尚属规划而非已交付：
+由旧全量+增量继续服务，新全量后台构建并追平，
+再原子切换版本；来源 offset 不等于 graph V。v0.0.5 的 [#353](https://github.com/ashione/VelaGraph/issues/353) 远程持久 ACK 与完整日志恢复闭包。
+保留 #124/#193 前置约束，不改变 offline-only、同版本及生产安全限制。
+
+## 历史状态核对（2026-11-15，main `ab94394`）
 
 本次纠偏跟踪 [#285](https://github.com/ashione/VelaGraph/issues/285)，承接已完成的
 #147 和 #280 文档审计；不是新建实现总目标。下表只列已合入基线的能力，不把待合并 PR 当成交付。
@@ -27,7 +58,8 @@
 正常中断回收子进程。准确合并树已通过独立审查、CI、Go、真实启动写查/退出及
 CoreHR 1025 门禁；[验证索引](CURRENT_STATUS.md#fresh-service-startup-delivery-2026-11-15)。
 仅限 loopback、明文无认证、single-voter 开发演示；不支持 restart/restore/HA，
-父进程 SIGKILL 不保证回收。#224 仍开放，尚未完成 v0.0.1 全部验收或发布。
+父进程 SIGKILL 不保证回收。在该历史检查时，#224 仍开放，v0.0.1 尚未发布；
+后续发布状态见本文顶部，原切片证据不追溯改写。
 后续合入须在对应功能 PR 同步当前状态，历史切片记录则保留其版本与边界。
 相当规模的设计须保留完整 proposal/design doc，关联 issue、实现 PR、milestone/Project；
 按 [贡献规范](../CONTRIBUTING.md#proposals-and-design-records) 区分提议、接受、实现与验证，
@@ -280,7 +312,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 | 接口 | 图 API / 标准 Gremlin 子集 / C ABI | 只依赖存储节点接口，不感知图内部 |
 | 验收 | 单机数据正确、崩溃恢复、基准达标 | 副本一致、故障切换、无数据丢失 |
 
-**存储接口边界**：当前 D1 已提供不透明字节 `get`/`scan`/条件 `batch_write`、稳定读视图及 export/import。完整 `begin` 事务接口、在线 `split/transfer` 仍是目标，不是已冻结且可用的能力；以 [STORAGE_NODE_INTERFACE.md](STORAGE_NODE_INTERFACE.md) 为准。查询层负责图语义，复制层不解释图记录。
+**存储接口边界**：当前 D1 已提供不透明字节 `get`/`scan`/条件 `batch_write`、稳定读视图及 export/import。本地及进程内 Raft 适配器的 `begin_v1` 已支持单分片暂存、条件提交和中止；跨进程事务接口与在线 `split/transfer` 仍是目标，不是已冻结且可用的能力；以 [STORAGE_NODE_INTERFACE.md](STORAGE_NODE_INTERFACE.md) 为准。查询层负责图语义，复制层不解释图记录。
 
 ## 3. 内核线工作包
 
@@ -317,7 +349,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 - **交付物**：`get`/`scan`/`batch_write`/`snapshot`/`transaction` 的窄接口；按点 ID 或范围分片；分片切分与迁移的最小协议。
 - **完成定义**：单机实现通过接口测试；分片路由可解释；迁移过程可回滚，不丢数据。
 - **依赖**：与内核线在 P0 共同冻结接口 v0。
-- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine` 接线、`begin` 事务接口与拆分/迁移仍未实现；静态远程路由见 `REMOTE_ROUTING.md`。
+- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine` 接线、跨进程 D2 多步事务接口与拆分/迁移仍未实现；静态远程路由见 `REMOTE_ROUTING.md`。
 
 ### D2 复制与共识
 
@@ -359,7 +391,9 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 
 **已实现**：#194 的本地双 DB 一致物理 checkpoint、manifest/完整性校验和新目录
 离线恢复；另有 `checkpoint-object-store` 不可变上传/下载、最后发布 manifest 和
-S3-compatible 集成验收。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
+S3-compatible 集成验收。固定 cohort 可从指定本地 generation 或独立保留的对象存储凭据，
+将协调节点和所有成员恢复到新目录，核验共同决策前缀并离线检查指定 V 的图数据。
+目标保持离线，不包含独立 catalog 或 TemporalStore。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
 [对象运输契约](OBJECT_STORE_CHECKPOINT_API.md)。这不是“尚无 checkpoint/上传工具”。
 
 **仍待实现**：#193 安全 live restart/rejoin，#191 跨组认证恢复集/全局 READY 屏障、
@@ -897,7 +931,9 @@ reuses fixed-V workers and shared admission rather than introducing an executor.
 The exact contract, evidence matrix and non-goals remain in
 [MANAGED_QUERY_JOBS.md](MANAGED_QUERY_JOBS.md). #268 acceptance is complete;
 future changes still require their own exact-head review and applicable checks.
-Jobs do not resume after gateway restart, and HTTP job parity remains open.
+Jobs do not resume after gateway restart. HTTP `/preview1/jobs:*` now provides
+the preview lifecycle through the shared executor; stable HTTP v1 and complete
+HTTP/gRPC parity remain separate acceptance. See [HTTP preview](PUBLIC_HTTP_PREVIEW.md#managed-asynchronous-jobs).
 The later #277/#279 retired legacy wires, not the remaining #218 service gates.
 
 ### #276 — managed Gateway library transport retirement (merged #277)
@@ -933,3 +969,49 @@ independent-process acceptance injects a lost public reply and checks recovery
 from a second gateway plus unchanged certified V and complete data after explicit
 original-ID replay. This adds no automatic retry or session failover; the
 remaining multi-gateway routing and availability gates keep #221 open.
+
+### Owned fixed-V temporal read model
+
+The optional standalone `TemporalReadModel` validates source revisions/candidates
+and materializes covering adjacency rows for repeated local reads. It preserves
+all business times at one V, explicit bounds and ownership; no implicit refresh,
+incremental updater, service cache or distributed certification is added. See
+[MATERIALIZED_TEMPORAL_READS.md](MATERIALIZED_TEMPORAL_READS.md).
+
+The local materialized temporal path supports borrowed records in the shared
+Gremlin executor. This removes per-access whole-record clones while retaining
+conservative logical admission and owned output values. It does not add automatic
+refresh, batched sessions, temporal candidate indexes or distributed borrowing.
+
+Prepared binding reuses static canonical admission metadata while preserving
+parameter types and the original text/complexity limits. This is local query
+planning work, not a new language or a relaxation of parser admission.
+
+
+### Optional incremental ordinary-graph read model (#370)
+
+This PR implements a bounded local `IncrementalGraph` candidate with Locked/COW
+read ownership, staged vertex/edge changes, atomic metadata publication and a
+separate versioned checkpoint. See [the proposal and acceptance boundary](INCREMENTAL_MEMORY_GRAPH.md).
+It is not wired into an existing service route and does not complete #354, managed
+recovery, source snapshot/offset certification or distributed temporal updates.
+
+The optional incremental COW path prepares changed shards under a writer-only
+mutex, publishes under a short lock and reclaims outside it. Candidate version
+construction peaks are included in admission, and record budgets precede
+validation/compaction. Checkpoint writes use conditional, directory-locked publication
+to prevent stale overwrite; this does not establish a service latency SLA.
+
+Owned temporal adjacency reads now support conservative time-block pruning.
+This preserves candidate order, endpoint visibility and original logical query
+admission. It adds bounded in-memory summaries, not a persistent interval index,
+new traversal language, wider batching contract or automatic model refresh.
+
+## Local temporal revision reuse
+
+The local `TemporalStore` now uses [bounded revision-prefix blocks](TEMPORAL_REVISION_CACHE.md)
+for point and Gremlin reads. Reuse across unchanged commits is guarded by logical
+version and physical snapshot sequence; interval indexing preserves revision
+precedence and query budgets. This adds no distributed, storage-format or public
+protocol capability. Synthetic benchmark evidence and cold/write tradeoffs are
+recorded with the cache contract.

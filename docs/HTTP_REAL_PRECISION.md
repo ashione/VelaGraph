@@ -98,7 +98,11 @@ crate enables this parser feature on the shared `serde_json` dependency used by
 `replicated-graph`, `velagraph` and `d2-raft`; a workspace build can also unify it
 with `checkpoint-object-store`. It is **not confined to one HTTP function**.
 Notably, `graph-client` JSON input containing Real values also uses the corrected
-parser. Other separately built packages need not select the same feature set;
+parser. The core `velagraph` crate also explicitly selects `float_roundtrip` for
+the optional [incremental memory checkpoint](INCREMENTAL_MEMORY_GRAPH.md), whose
+versioned JSON payload contains Real properties. Its standalone core regression
+checks exact finite binary64 restoration, including subnormals and negative zero.
+Other separately built packages need not select the same feature set;
 do not infer universal feature equivalence across arbitrary downstream builds.
 
 A scoped source audit found current root graph records encode doubles as binary
@@ -107,7 +111,9 @@ carry integer metadata plus opaque byte vectors; checkpoint manifests use
 strings and integers and transfer graph files as bytes. The D2 outer JSON
 record decoder does not reinterpret embedded canonical command bytes as doubles.
 No float-valued persisted JSON field directly reinterpreted by this feature was
-identified in those current paths. This is not a guarantee for all historical
+identified in those paths at the time of that audit. The new incremental memory
+checkpoint is an explicit exception and requires the corrected parser directly.
+This is not a guarantee for all historical
 formats, arbitrary export/import JSON, downstream structs or mixed builds.
 
 The package version, storage key layout and canonical serialization format are

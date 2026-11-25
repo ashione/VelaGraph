@@ -89,6 +89,14 @@ async fn scenario(store: Arc<dyn ObjectStore>) -> anyhow::Result<()> {
     std::fs::remove_dir_all(&backup)?;
     let downloaded = dirs.path().join("downloaded");
     transport.download(&receipt, &downloaded).await?;
+    assert!(downloaded.join("RESTORED_OFFLINE_ONLY").is_file());
+    let error = Cluster::new()
+        .start_durable(1, &downloaded)
+        .await
+        .err()
+        .expect("download is offline-only");
+    assert!(error.to_string().contains("offline-only"), "{error:#}");
+    assert!(!downloaded.join("raft-group.json").exists());
     assert_eq!(
         std::fs::read(downloaded.join("checkpoint.json"))?,
         expected_manifest

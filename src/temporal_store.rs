@@ -1,12 +1,14 @@
 //! Experimental single-partition durable temporal assertions (#196).
 //! This is storage plumbing, not a query language or certified distributed V.
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
+pub mod materialized;
 mod plan_cache;
 mod query_memo;
+mod revision_cache;
 
-use rocksdb::{Direction, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
+use rocksdb::{DBRawIterator, IteratorMode, Options, Snapshot, WriteBatch, WriteOptions, DB};
 
 use crate::graph::{codec, validate_edge, validate_vertex};
 use crate::temporal_reference::{Interval, Key};
@@ -15,7 +17,12 @@ use crate::{Edge, Vertex};
 const FORMAT_KEY: &[u8] = b"graph/temporal/v2/format";
 const HEAD_KEY: &[u8] = b"graph/temporal/v2/head";
 const RECORD_PREFIX: &[u8] = b"graph/temporal/v2/revision/";
+const IDENTITY_PREFIX_LEN: usize =
+    RECORD_PREFIX.len() + std::mem::size_of::<u8>() + std::mem::size_of::<u64>();
+const REVISION_VERSION_END: usize = IDENTITY_PREFIX_LEN + std::mem::size_of::<u64>();
+const REVISION_KEY_LEN: usize = REVISION_VERSION_END + std::mem::size_of::<u32>();
 const ADJACENCY_PREFIX: &[u8] = b"graph/temporal/v2/adjacency/";
+const ADJACENCY_KEY_LEN: usize = ADJACENCY_PREFIX.len() + 1 + 2 * std::mem::size_of::<u64>();
 const MAX_BATCH: usize = 256;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READ_REVISIONS: usize = 4096;
@@ -88,7 +95,9 @@ impl TemporalMutation {
 pub struct TemporalStore {
     db: DB,
     write: Mutex<()>,
+    snapshot_head: RwLock<Option<(u64, u64)>>,
     plan_cache: Mutex<plan_cache::PlanCache>,
+    revision_cache: revision_cache::RevisionCache,
 }
 impl TemporalStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -116,7 +125,9 @@ impl TemporalStore {
         Ok(Self {
             db,
             write: Mutex::new(()),
+            snapshot_head: RwLock::new(None),
             plan_cache: Mutex::new(plan_cache::PlanCache::default()),
+            revision_cache: revision_cache::RevisionCache::default(),
         })
     }
 
@@ -124,12 +135,39 @@ impl TemporalStore {
     /// An empty batch advances the local prefix without changing any assertion.
     /// An uncertain RocksDB error has no idempotent retry guarantee in this slice.
     pub fn commit(&self, mutations: &[TemporalMutation]) -> Result<u64> {
-        let encoded = encode_batch(mutations)?;
+        self.commit_checked(None, mutations, &|| Ok(()))
+    }
+    /// Conditional, controlled WAL-synced batch. Expected version is checked
+    /// under the writer mutex. Cancellation cannot interrupt write_opt or
+    /// replace its acknowledged/uncertain result after the final check.
+    pub fn commit_with_control(
+        &self,
+        expected: u64,
+        mutations: &[TemporalMutation],
+        control: &crate::ExecutionControl,
+    ) -> Result<u64> {
+        self.commit_checked(Some(expected), mutations, &|| {
+            control.check().map_err(TemporalStoreError::Graph)
+        })
+    }
+    fn commit_checked(
+        &self,
+        expected: Option<u64>,
+        mutations: &[TemporalMutation],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<u64> {
+        check()?;
+        let encoded = encode_batch_checked(mutations, check)?;
         let _guard = self.write.lock().map_err(|_| TemporalStoreError::Corrupt)?;
+        check()?;
         let head = decode_version(self.db.get(HEAD_KEY)?.as_deref())?;
+        if expected.is_some_and(|v| v != head) {
+            return Err(TemporalStoreError::Graph(crate::Error::TransactionConflict));
+        }
         let version = head.checked_add(1).ok_or(TemporalStoreError::Limit)?;
         let mut batch = WriteBatch::default();
         for (i, (mutation, value)) in mutations.iter().zip(encoded).enumerate() {
+            check()?;
             batch.put(revision_key(mutation.key(), version, i as u32), value);
             if let TemporalMutation::Edge { edge, .. } = mutation {
                 for (incoming, vertex) in [(false, edge.from), (true, edge.to)] {
@@ -145,7 +183,16 @@ impl TemporalStore {
         batch.put(HEAD_KEY, version.to_be_bytes());
         let mut write = WriteOptions::default();
         write.set_sync(true);
+        check()?;
+        let base_sequence = self.db.latest_sequence_number();
         self.db.write_opt(batch, &write)?;
+        self.revision_cache.committed(
+            head,
+            version,
+            base_sequence,
+            self.db.latest_sequence_number(),
+            mutations,
+        );
         Ok(version)
     }
 
@@ -153,9 +200,7 @@ impl TemporalStore {
     /// store's latest synced prefix, not a distributed latest/linearizable read.
     pub fn view(&self, version: Option<u64>, valid_time: i64) -> Result<TemporalStoreView<'_>> {
         let snapshot = self.db.snapshot();
-        #[cfg(feature = "query-profiling")]
-        crate::query_profile::read_event(crate::query_profile::ReadEvent::Head);
-        let head = decode_version(snapshot.get(HEAD_KEY)?.as_deref())?;
+        let head = self.head_at(&snapshot)?;
         let version = version.unwrap_or(head);
         if version > head {
             return Err(TemporalStoreError::UnavailableVersion);
@@ -166,17 +211,45 @@ impl TemporalStore {
             version,
             valid_time,
             plan_cache: &self.plan_cache,
+            revision_cache: &self.revision_cache,
         })
+    }
+
+    fn head_at(&self, snapshot: &Snapshot<'_>) -> Result<u64> {
+        // Multiple snapshots can share a RocksDB sequence. Reuse the head
+        // only when it was decoded at that exact sequence.
+        let sequence = snapshot.sequence_number();
+        if let Ok(cached) = self.snapshot_head.try_read() {
+            if let Some((_, head)) = cached.filter(|(stored, _)| *stored == sequence) {
+                return Ok(head);
+            }
+        }
+        #[cfg(feature = "query-profiling")]
+        crate::query_profile::read_event(crate::query_profile::ReadEvent::Head);
+        let head = decode_version(snapshot.get(HEAD_KEY)?.as_deref())?;
+        if let Ok(mut cached) = self.snapshot_head.try_write() {
+            if cached.is_none_or(|(stored, _)| stored < sequence) {
+                *cached = Some((sequence, head));
+            }
+        }
+        Ok(head)
     }
 }
 
 fn encode_batch(mutations: &[TemporalMutation]) -> Result<Vec<Vec<u8>>> {
+    encode_batch_checked(mutations, &|| Ok(()))
+}
+fn encode_batch_checked(
+    mutations: &[TemporalMutation],
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<Vec<u8>>> {
     if mutations.len() > MAX_BATCH {
         return Err(TemporalStoreError::Limit);
     }
     let mut encoded = Vec::with_capacity(mutations.len());
     let mut bytes = 0usize;
     for (i, mutation) in mutations.iter().enumerate() {
+        check()?;
         let interval = mutation.interval();
         if interval.to.is_some_and(|to| to <= interval.from) {
             return Err(TemporalStoreError::InvalidInterval);
@@ -197,7 +270,7 @@ fn encode_batch(mutations: &[TemporalMutation]) -> Result<Vec<Vec<u8>>> {
                     + RECORD_PREFIX.len()
                     + 21
                     + if matches!(mutation, TemporalMutation::Edge { .. }) {
-                        2 * (ADJACENCY_PREFIX.len() + 17 + 8)
+                        2 * (ADJACENCY_KEY_LEN + std::mem::size_of::<u64>())
                     } else {
                         0
                     },
@@ -219,6 +292,7 @@ pub struct TemporalStoreView<'a> {
     version: u64,
     valid_time: i64,
     plan_cache: &'a Mutex<plan_cache::PlanCache>,
+    revision_cache: &'a revision_cache::RevisionCache,
 }
 impl TemporalStoreView<'_> {
     pub fn version(&self) -> u64 {
@@ -227,40 +301,82 @@ impl TemporalStoreView<'_> {
     pub fn valid_time(&self) -> i64 {
         self.valid_time
     }
-    fn assertion(&self, key: Key) -> Result<Option<Vec<u8>>> {
-        let prefix = identity_prefix(key);
-        let start = revision_key(key, self.version, 0);
-        let mut bytes = 0usize;
-        for (i, row) in self
-            .snapshot
-            .iterator(IteratorMode::From(&start, Direction::Forward))
-            .enumerate()
+    fn read_assertion<'a, T>(
+        &'a self,
+        cursor: &mut Option<DBRawIterator<'a>>,
+        key: Key,
+        decode: fn(&[u8]) -> crate::Result<T>,
+    ) -> Result<Option<T>> {
+        if let Some(block) =
+            self.revision_cache
+                .get(key, self.version, self.snapshot.sequence_number())
         {
-            let (key, value) = row?;
-            if !key.starts_with(&prefix) {
+            if let Some(hit) = block.lookup(self.valid_time) {
+                return hit.payload.map(decode).transpose().map_err(Into::into);
+            }
+        }
+        let mut builder = self.revision_cache.builder();
+        let cursor = cursor.get_or_insert_with(|| self.snapshot.raw_iterator());
+        let start = revision_key_bytes(key, self.version, 0);
+        let prefix = &start[..IDENTITY_PREFIX_LEN];
+        let mut rows = 0;
+        let mut bytes = 0usize;
+        cursor.seek(start);
+        while let Some((row_key, value)) = cursor.item() {
+            if !row_key.starts_with(prefix) {
                 break;
             }
-            if i >= MAX_READ_REVISIONS {
+            if rows >= MAX_READ_REVISIONS {
                 return Err(TemporalStoreError::Limit);
             }
-            let (valid, payload) = decode_revision(&key, &value, self.version)?;
+            rows += 1;
+            let (valid, payload) = decode_revision(row_key, value, self.version)?;
             bytes = bytes
-                .checked_add(key.len() + value.len())
+                .checked_add(row_key.len() + value.len())
                 .ok_or(TemporalStoreError::Limit)?;
             if bytes > MAX_READ_BYTES {
                 return Err(TemporalStoreError::Limit);
             }
+            revision_cache::capture(&mut builder, valid, value);
             if valid.from <= self.valid_time && valid.to.is_none_or(|to| self.valid_time < to) {
-                return Ok(payload.map(|p| p.to_vec()));
+                let result = payload.map(decode).transpose()?;
+                if let Some(builder) = builder {
+                    self.revision_cache.insert(
+                        key,
+                        self.version,
+                        self.snapshot.sequence_number(),
+                        builder,
+                        false,
+                    );
+                }
+                return Ok(result);
             }
+            cursor.next();
+        }
+        cursor.status()?;
+        if let Some(builder) = builder {
+            self.revision_cache.insert(
+                key,
+                self.version,
+                self.snapshot.sequence_number(),
+                builder,
+                true,
+            );
         }
         Ok(None)
     }
     pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        let Some(payload) = self.assertion(Key::Vertex(id))? else {
+        self.read_vertex(&mut None, id)
+    }
+    fn read_vertex<'a>(
+        &'a self,
+        cursor: &mut Option<DBRawIterator<'a>>,
+        id: u64,
+    ) -> Result<Option<Vertex>> {
+        let Some(vertex) = self.read_assertion(cursor, Key::Vertex(id), codec::decode_vertex)?
+        else {
             return Ok(None);
         };
-        let vertex = codec::decode_vertex(&payload)?;
         if vertex.id != id {
             return Err(TemporalStoreError::Corrupt);
         }
@@ -270,15 +386,18 @@ impl TemporalStoreView<'_> {
     /// Assertions may be recorded before endpoints. Visibility requires both
     /// endpoints at V/T; this never weakens v1 create-edge validation.
     pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
-        let Some(payload) = self.assertion(Key::Edge(id))? else {
+        let mut cursor = None;
+        let Some(edge) = self.read_assertion(&mut cursor, Key::Edge(id), codec::decode_edge)?
+        else {
             return Ok(None);
         };
-        let edge = codec::decode_edge(&payload)?;
         if edge.id != id {
             return Err(TemporalStoreError::Corrupt);
         }
         validate_edge(&edge)?;
-        if self.get_vertex(edge.from)?.is_none() || self.get_vertex(edge.to)?.is_none() {
+        if self.read_vertex(&mut cursor, edge.from)?.is_none()
+            || (edge.from != edge.to && self.read_vertex(&mut cursor, edge.to)?.is_none())
+        {
             return Ok(None);
         }
         Ok(Some(edge))
@@ -289,16 +408,16 @@ fn decode_revision<'a>(
     value: &'a [u8],
     max_version: u64,
 ) -> Result<(Interval, Option<&'a [u8]>)> {
-    if key.len() != RECORD_PREFIX.len() + 21 || value.len() > MAX_BATCH_BYTES {
+    if key.len() != REVISION_KEY_LEN || value.len() > MAX_BATCH_BYTES {
         return Err(TemporalStoreError::Corrupt);
     }
     let version = !u64::from_be_bytes(
-        key[RECORD_PREFIX.len() + 9..RECORD_PREFIX.len() + 17]
+        key[IDENTITY_PREFIX_LEN..REVISION_VERSION_END]
             .try_into()
             .map_err(|_| TemporalStoreError::Corrupt)?,
     );
     let ordinal = u32::from_be_bytes(
-        key[RECORD_PREFIX.len() + 17..]
+        key[REVISION_VERSION_END..]
             .try_into()
             .map_err(|_| TemporalStoreError::Corrupt)?,
     );
@@ -315,31 +434,39 @@ fn decode_version(value: Option<&[u8]>) -> Result<u64> {
             .map_err(|_| TemporalStoreError::Corrupt)?,
     ))
 }
-fn adjacency_prefix(vertex: u64, incoming: bool) -> Vec<u8> {
-    let mut bytes = ADJACENCY_PREFIX.to_vec();
-    bytes.push(u8::from(incoming));
-    bytes.extend_from_slice(&vertex.to_be_bytes());
+fn adjacency_prefix(vertex: u64, incoming: bool) -> [u8; ADJACENCY_KEY_LEN - 8] {
+    let mut bytes = [0; ADJACENCY_KEY_LEN - 8];
+    bytes[..ADJACENCY_PREFIX.len()].copy_from_slice(ADJACENCY_PREFIX);
+    bytes[ADJACENCY_PREFIX.len()] = u8::from(incoming);
+    bytes[ADJACENCY_PREFIX.len() + 1..].copy_from_slice(&vertex.to_be_bytes());
     bytes
 }
 fn adjacency_key(vertex: u64, incoming: bool, edge: u64) -> Vec<u8> {
-    let mut bytes = adjacency_prefix(vertex, incoming);
+    let mut bytes = Vec::with_capacity(ADJACENCY_KEY_LEN);
+    bytes.extend_from_slice(&adjacency_prefix(vertex, incoming));
     bytes.extend_from_slice(&edge.to_be_bytes());
     bytes
 }
 fn identity_prefix(key: Key) -> Vec<u8> {
-    let mut bytes = RECORD_PREFIX.to_vec();
+    revision_key_bytes(key, 0, 0)[..IDENTITY_PREFIX_LEN].to_vec()
+}
+fn revision_key(key: Key, version: u64, ordinal: u32) -> Vec<u8> {
+    revision_key_bytes(key, version, ordinal).to_vec()
+}
+// The layout is fixed. Point reads can borrow this key and its identity prefix
+// without allocating two independently grown Vec buffers for every lookup.
+fn revision_key_bytes(key: Key, version: u64, ordinal: u32) -> [u8; REVISION_KEY_LEN] {
+    let mut bytes = [0; REVISION_KEY_LEN];
+    bytes[..RECORD_PREFIX.len()].copy_from_slice(RECORD_PREFIX);
     let (kind, id) = match key {
         Key::Vertex(id) => (1, id),
         Key::Edge(id) => (2, id),
     };
-    bytes.push(kind);
-    bytes.extend_from_slice(&id.to_be_bytes());
-    bytes
-}
-fn revision_key(key: Key, version: u64, ordinal: u32) -> Vec<u8> {
-    let mut bytes = identity_prefix(key);
-    bytes.extend_from_slice(&(!version).to_be_bytes());
-    bytes.extend_from_slice(&ordinal.to_be_bytes());
+    bytes[RECORD_PREFIX.len()] = kind;
+    bytes[RECORD_PREFIX.len() + std::mem::size_of::<u8>()..IDENTITY_PREFIX_LEN]
+        .copy_from_slice(&id.to_be_bytes());
+    bytes[IDENTITY_PREFIX_LEN..REVISION_VERSION_END].copy_from_slice(&(!version).to_be_bytes());
+    bytes[REVISION_VERSION_END..].copy_from_slice(&ordinal.to_be_bytes());
     bytes
 }
 fn encode_assertion(valid: Interval, payload: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -416,6 +543,33 @@ mod tests {
                 Value::Integer(n) => n,
                 _ => panic!("wrong type"),
             })
+    }
+    #[test]
+    fn fixed_revision_keys_keep_vertex_edge_and_boundary_bytes() {
+        let cases = [
+            (Key::Vertex(0), 0, 0, 1u8, [0u8; 8], [255u8; 8], [0u8; 4]),
+            (
+                Key::Edge(u64::MAX),
+                u64::MAX,
+                u32::MAX,
+                2u8,
+                [255u8; 8],
+                [0u8; 8],
+                [255u8; 4],
+            ),
+        ];
+        for (identity, version, ordinal, kind, id, v, o) in cases {
+            let mut expected = b"graph/temporal/v2/revision/".to_vec();
+            expected.push(kind);
+            expected.extend(id);
+            expected.extend(v);
+            expected.extend(o);
+            assert_eq!(
+                revision_key_bytes(identity, version, ordinal).as_slice(),
+                expected
+            );
+            assert_eq!(revision_key(identity, version, ordinal), expected);
+        }
     }
     #[test]
     fn golden_keys_and_envelopes() {
@@ -694,6 +848,27 @@ mod tests {
         );
     }
     #[test]
+    fn cached_head_is_scoped_to_the_pinned_physical_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let first = store.db.snapshot();
+        assert_eq!(store.head_at(&first).unwrap(), 0);
+        store.commit(&[vertex(1, 0, None, 1)]).unwrap();
+        assert_eq!(store.view(None, 2).unwrap().version(), 1);
+        assert_eq!(store.head_at(&first).unwrap(), 0);
+        assert!(matches!(
+            store.view(Some(2), 2),
+            Err(TemporalStoreError::UnavailableVersion)
+        ));
+        store.db.delete(HEAD_KEY).unwrap();
+        assert!(matches!(
+            store.view(None, 2),
+            Err(TemporalStoreError::Corrupt)
+        ));
+        assert_eq!(store.head_at(&first).unwrap(), 0);
+    }
+
+    #[test]
     fn missing_metadata_and_wrong_payload_kind_are_errors() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -717,6 +892,58 @@ mod tests {
             TemporalStore::open(dir.path()),
             Err(TemporalStoreError::Corrupt)
         ));
+    }
+    #[test]
+    fn direct_edge_reseeks_endpoints_and_checks_self_loop_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let valid = interval(0, None);
+        store
+            .commit(&[
+                vertex(1, 0, None, 1),
+                vertex(2, 0, None, 2),
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(1, 2, 1, "link"),
+                },
+                TemporalMutation::Edge {
+                    valid,
+                    edge: Edge::new(2, 1, 1, "loop"),
+                },
+            ])
+            .unwrap();
+        let pinned = store.view(None, 7).unwrap();
+        store
+            .commit(&[TemporalMutation::Absent {
+                valid: interval(5, Some(10)),
+                key: Key::Vertex(1),
+            }])
+            .unwrap();
+        for id in [1, 2] {
+            assert_eq!(pinned.get_edge(id).unwrap().unwrap().id, id);
+            assert!(store.view(None, 7).unwrap().get_edge(id).unwrap().is_none());
+            assert_eq!(
+                store
+                    .view(None, 10)
+                    .unwrap()
+                    .get_edge(id)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
+        // Both a destination and a self-loop endpoint must propagate bad records.
+        store
+            .db
+            .put(revision_key(Key::Vertex(1), 1, 0), b"damaged")
+            .unwrap();
+        for id in [1, 2] {
+            assert!(matches!(
+                store.view(None, 10).unwrap().get_edge(id),
+                Err(TemporalStoreError::Corrupt)
+            ));
+        }
     }
     #[test]
     fn corruption_and_history_work_limits_fail_not_missing() {
@@ -761,3 +988,146 @@ mod query;
 
 /// Temporal records inside the existing D1/managed state-machine database.
 pub mod managed;
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use std::cell::Cell;
+    fn mutation(id: u64) -> TemporalMutation {
+        TemporalMutation::Vertex {
+            valid: Interval { from: 0, to: None },
+            vertex: Vertex::new(id),
+        }
+    }
+    #[test]
+    fn every_pre_write_cancel_preserves_reopened_data() {
+        let d = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(d.path()).unwrap();
+        let changes = [
+            mutation(1),
+            mutation(2),
+            TemporalMutation::Edge {
+                valid: Interval { from: 0, to: None },
+                edge: Edge::new(7, 1, 2, "link"),
+            },
+        ];
+        let count = Cell::new(0);
+        store
+            .commit_checked(Some(0), &changes, &|| {
+                count.set(count.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        for stop in 1..=count.get() + 1 {
+            let d = tempfile::tempdir().unwrap();
+            let store = TemporalStore::open(d.path()).unwrap();
+            let calls = Cell::new(0);
+            let result = store.commit_checked(Some(0), &changes, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == stop {
+                    Err(TemporalStoreError::Graph(crate::Error::ExecutionCancelled))
+                } else {
+                    Ok(())
+                }
+            });
+            let published = stop > count.get();
+            if published {
+                assert_eq!(result.unwrap(), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TemporalStoreError::Graph(crate::Error::ExecutionCancelled))
+                ));
+            }
+            drop(store);
+            let store = TemporalStore::open(d.path()).unwrap();
+            let view = store.view(None, 0).unwrap();
+            assert_eq!(view.version(), u64::from(published));
+            let q = crate::GremlinQuery::parse("g.V(1).out('link')").unwrap();
+            assert_eq!(
+                view.execute_query(&q).unwrap().rows.len(),
+                usize::from(published)
+            );
+            store.commit(&[mutation(2)]).unwrap();
+        }
+    }
+    #[test]
+    fn concurrent_conditional_writers_have_one_winner() {
+        let d = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(d.path()).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let run = |id| {
+                barrier.wait();
+                store.commit_checked(Some(0), &[mutation(id)], &|| Ok(()))
+            };
+            let a = scope.spawn(move || run(1));
+            let b = scope.spawn(move || run(2));
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|r| matches!(r, Ok(1))).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(
+                    r,
+                    Err(TemporalStoreError::Graph(crate::Error::TransactionConflict))
+                ))
+                .count(),
+            1
+        );
+        let winner = if outcomes[0].is_ok() { 1 } else { 2 };
+        drop(store);
+        let store = TemporalStore::open(d.path()).unwrap();
+        let view = store.view(None, 0).unwrap();
+        assert_eq!(view.version(), 1);
+        assert_eq!(
+            view.execute_query(&crate::GremlinQuery::parse("g.V(1,2)").unwrap())
+                .unwrap()
+                .rows,
+            vec![crate::GremlinRow::Vertex(winner)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod writer_wait_control_tests {
+    use super::*;
+    #[test]
+    fn cancellation_after_temporal_writer_wait_does_not_advance_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemporalStore::open(dir.path()).unwrap();
+        let held = store.write.lock().unwrap();
+        let token = crate::CancellationToken::default();
+        let control =
+            crate::ExecutionControl::new(token.clone(), std::time::Duration::from_secs(30))
+                .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let store = &store;
+            let control = &control;
+            let join = scope.spawn(move || {
+                let calls = std::cell::Cell::new(0);
+                store.commit_checked(Some(0), &[], &|| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        tx.send(()).unwrap();
+                        Ok(())
+                    } else {
+                        control.check().map_err(TemporalStoreError::Graph)
+                    }
+                })
+            });
+            rx.recv().unwrap();
+            token.cancel();
+            drop(held);
+            assert!(matches!(
+                join.join().unwrap(),
+                Err(TemporalStoreError::Graph(crate::Error::ExecutionCancelled))
+            ));
+        });
+        assert_eq!(store.view(None, 0).unwrap().version(), 0);
+        assert_eq!(store.commit(&[]).unwrap(), 1);
+    }
+}

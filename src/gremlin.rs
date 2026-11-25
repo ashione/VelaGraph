@@ -8,6 +8,7 @@
 //! The normative subset, semantics, limits, and errors live in
 //! `docs/QUERY_SPEC.md`.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,34 @@ use crate::value::Value;
 pub(crate) trait QueryReadBackend {
     fn get_vertex(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Vertex>>>;
     fn get_edge(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Edge>>>;
+    // Optional borrowed reads. Defaults retain the existing owned backend's
+    // integrity checks and reservations. References cannot outlive this view;
+    // callers must keep full logical record reservations even for a borrow.
+    fn query_vertex(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Cow<'_, Vertex>>>> {
+        Ok(self.get_vertex(id, budget)?.map(|v| v.map(Cow::Owned)))
+    }
+    fn query_edge(&self, id: u64, budget: &Budget) -> Result<Option<Accounted<Cow<'_, Edge>>>> {
+        Ok(self.get_edge(id, budget)?.map(|e| e.map(Cow::Owned)))
+    }
+    fn visit_query_edges<'a>(
+        &'a self,
+        vertex_id: u64,
+        incoming: bool,
+        label: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+        visit: &mut impl FnMut(Accounted<Cow<'a, Edge>>) -> Result<()>,
+        budget: &Budget,
+    ) -> Result<()> {
+        self.visit_adjacent_edges(
+            vertex_id,
+            incoming,
+            label,
+            check,
+            &mut |edge| visit(edge.map(Cow::Owned)),
+            budget,
+        )
+    }
+
     fn scan_vertices_checked(
         &self,
         limit: usize,
@@ -248,28 +277,59 @@ impl ObservedGremlinQuery {
     }
 }
 
-fn validate_query_text(input: &str) -> Result<()> {
-    if input.len() > MAX_GREMLIN_QUERY_BYTES {
+// Shared raw-byte admission for parsed source text and canonical bound plans.
+#[derive(Clone, Copy, Debug, Default)]
+struct QueryTextSize {
+    bytes: usize,
+    marks: usize,
+}
+impl QueryTextSize {
+    fn measure(input: &str) -> Self {
+        Self {
+            bytes: input.len(),
+            marks: input
+                .bytes()
+                .filter(|byte| b"()[]{},.:;".contains(byte))
+                .count(),
+        }
+    }
+    fn add(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_add(other.bytes),
+            marks: self.marks.saturating_add(other.marks),
+        }
+    }
+    fn subtract(self, part: Self) -> Self {
+        Self {
+            bytes: self.bytes - part.bytes,
+            marks: self.marks - part.marks,
+        }
+    }
+    fn validate(self) -> Result<()> {
+        validate_query_bytes(self.bytes)?;
+        if self.marks > MAX_GREMLIN_STRUCTURAL_MARKS {
+            return Err(Error::GremlinComplexityLimit {
+                marks: self.marks,
+                limit: MAX_GREMLIN_STRUCTURAL_MARKS,
+            });
+        }
+        Ok(())
+    }
+}
+pub(crate) fn validate_query_bytes(bytes: usize) -> Result<()> {
+    if bytes > MAX_GREMLIN_QUERY_BYTES {
         return Err(Error::GremlinParse(format!(
-            "query text is {} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}",
-            input.len()
+            "query text is {bytes} bytes; the limit is {MAX_GREMLIN_QUERY_BYTES}"
         )));
     }
-    // The byte cap alone is insufficient: short repeated arguments, chains,
-    // or nested literals can overflow the generated parser's call stack.
-    // Count raw marks, including quoted/commented ones, so malformed lexical
-    // input and lexer recovery cannot hide recursion from admission. Do not
-    // interpret tokens, escapes, identifiers, or Gremlin semantics here.
-    let marks = input
-        .bytes()
-        .filter(|byte| b"()[]{},.:;".contains(byte))
-        .count();
-    if marks > MAX_GREMLIN_STRUCTURAL_MARKS {
-        return Err(Error::GremlinComplexityLimit {
-            marks,
-            limit: MAX_GREMLIN_STRUCTURAL_MARKS,
-        });
-    }
+    Ok(())
+}
+
+fn validate_query_text(input: &str) -> Result<()> {
+    // Reject oversized input before scanning. Raw marks inside quoted/commented
+    // input still count, so lexer recovery cannot hide parser recursion.
+    validate_query_bytes(input.len())?;
+    QueryTextSize::measure(input).validate()?;
     if contains_unquoted_semicolon(input) {
         return Err(Error::GremlinParse(
             "multiple Gremlin traversals are not supported".into(),
@@ -564,13 +624,13 @@ impl GremlinQuery {
         Ok(GremlinResult { rows })
     }
 
-    fn start_rows(
+    fn start_rows<'a>(
         &self,
-        graph: &impl QueryReadBackend,
+        graph: &'a impl QueryReadBackend,
         limit: Option<usize>,
         check: &dyn Fn() -> Result<()>,
         budget: &Budget,
-    ) -> Result<AccountedVec<Accounted<Row>>> {
+    ) -> Result<AccountedVec<Accounted<Row<'a>>>> {
         let mut rows = AccountedVec::new(budget);
         match &self.start {
             GremlinStart::Vertices(ids) if ids.is_empty() => {
@@ -586,13 +646,13 @@ impl GremlinQuery {
                 }
                 for vertex in vertices {
                     check()?;
-                    rows.push(vertex_row(vertex, budget)?)?;
+                    rows.push(vertex_row(vertex.map(Cow::Owned), budget)?)?;
                 }
             }
             GremlinStart::Vertices(ids) => {
                 for id in ids {
                     check()?;
-                    if let Some(vertex) = graph.get_vertex(*id, budget)? {
+                    if let Some(vertex) = graph.query_vertex(*id, budget)? {
                         check()?;
                         enforce_row_cap(rows.len() + 1)?;
                         rows.push(vertex_row(vertex, budget)?)?;
@@ -615,13 +675,13 @@ impl GremlinQuery {
                 }
                 for edge in edges {
                     check()?;
-                    rows.push(edge_row(edge)?)?;
+                    rows.push(edge_row(edge.map(Cow::Owned))?)?;
                 }
             }
             GremlinStart::Edges(ids) => {
                 for id in ids {
                     check()?;
-                    if let Some(edge) = graph.get_edge(*id, budget)? {
+                    if let Some(edge) = graph.query_edge(*id, budget)? {
                         check()?;
                         enforce_row_cap(rows.len() + 1)?;
                         rows.push(edge_row(edge)?)?;
@@ -637,13 +697,13 @@ impl GremlinQuery {
 }
 
 /// Query result: ordered rows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GremlinResult {
     pub rows: Vec<GremlinRow>,
 }
 
 /// One result row. These are the row shapes allowed by `QUERY_SPEC.md`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum GremlinRow {
     Vertex(u64),
     Edge(u64),
@@ -653,27 +713,27 @@ pub enum GremlinRow {
 }
 
 /// A vertex or edge id in a traversal path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PathElement {
     Vertex(u64),
     Edge(u64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Element {
-    Vertex(Vertex),
-    Edge(Edge),
+enum Element<'a> {
+    Vertex(Cow<'a, Vertex>),
+    Edge(Cow<'a, Edge>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Row {
-    Element(Element, Vec<PathElement>),
+enum Row<'a> {
+    Element(Element<'a>, Vec<PathElement>),
     Value(Value),
     Path(Vec<PathElement>),
     Count(u64),
 }
 
-impl Row {
+impl Row<'_> {
     fn into_row(self) -> GremlinRow {
         match self {
             Row::Element(Element::Vertex(vertex), _) => GremlinRow::Vertex(vertex.id),
@@ -685,12 +745,16 @@ impl Row {
     }
 }
 
-fn vertex_row(mut vertex: Accounted<Vertex>, _budget: &Budget) -> Result<Accounted<Row>> {
+fn vertex_row<'a>(
+    mut vertex: Accounted<Cow<'a, Vertex>>,
+    _budget: &Budget,
+) -> Result<Accounted<Row<'a>>> {
     vertex.charge.grow(query_memory::PATH_ITEM)?;
     let id = vertex.id;
     Ok(vertex.map(|v| Row::Element(Element::Vertex(v), vec![PathElement::Vertex(id)])))
 }
-fn edge_row(mut edge: Accounted<Edge>) -> Result<Accounted<Row>> {
+fn edge_row(edge: Accounted<Cow<'_, Edge>>) -> Result<Accounted<Row<'_>>> {
+    let mut edge = edge;
     edge.charge.grow(query_memory::PATH_ITEM)?;
     let id = edge.id;
     Ok(edge.map(|e| Row::Element(Element::Edge(e), vec![PathElement::Edge(id)])))
@@ -708,13 +772,13 @@ fn result_payload_bytes(row: &GremlinRow) -> Result<usize> {
         _ => Ok(0),
     }
 }
-fn apply_step(
-    graph: &impl QueryReadBackend,
-    rows: AccountedVec<Accounted<Row>>,
+fn apply_step<'a>(
+    graph: &'a impl QueryReadBackend,
+    rows: AccountedVec<Accounted<Row<'a>>>,
     step: &GremlinStep,
     check: &dyn Fn() -> Result<()>,
     budget: &Budget,
-) -> Result<AccountedVec<Accounted<Row>>> {
+) -> Result<AccountedVec<Accounted<Row<'a>>>> {
     check()?;
     match step {
         GremlinStep::Out(label) => {
@@ -780,13 +844,15 @@ fn apply_step(
                 matches.then_some(Row::Element(element, path))
             }
             GremlinStep::Values(key) => {
-                // Move the value out; never temporarily duplicate a large Text.
-                let mut properties = match element {
-                    Element::Vertex(v) => v.properties,
-                    Element::Edge(e) => e.properties,
+                // Owned backends still move values without a temporary copy.
+                // Borrowed records clone only the selected property; their full
+                // logical reservation already covers the resulting owned value.
+                let value = match element {
+                    Element::Vertex(Cow::Owned(mut v)) => v.properties.remove(key),
+                    Element::Edge(Cow::Owned(mut e)) => e.properties.remove(key),
+                    Element::Vertex(Cow::Borrowed(v)) => v.properties.get(key).cloned(),
+                    Element::Edge(Cow::Borrowed(e)) => e.properties.get(key).cloned(),
                 };
-                let value = properties.remove(key);
-                drop(properties);
                 drop(path);
                 charge.shrink(value.as_ref().map_or(0, value_bytes));
                 value.map(Row::Value)
@@ -807,8 +873,14 @@ fn apply_step(
             }
             GremlinStep::Label => {
                 let label = match element {
-                    Element::Vertex(v) => v.labels.into_iter().next().unwrap_or_default(),
-                    Element::Edge(e) => e.label,
+                    Element::Vertex(Cow::Owned(v)) => {
+                        v.labels.into_iter().next().unwrap_or_default()
+                    }
+                    Element::Edge(Cow::Owned(e)) => e.label,
+                    Element::Vertex(Cow::Borrowed(v)) => {
+                        v.labels.first().cloned().unwrap_or_default()
+                    }
+                    Element::Edge(Cow::Borrowed(e)) => e.label.clone(),
                 };
                 drop(path);
                 charge.shrink(label.len());
@@ -840,11 +912,11 @@ pub(crate) fn apply_global_element_step(
 ) -> Result<Option<Accounted<GremlinRow>>> {
     check()?;
     let row = match row.value {
-        GremlinRow::Vertex(id) => match graph.get_vertex(id, budget)? {
+        GremlinRow::Vertex(id) => match graph.query_vertex(id, budget)? {
             Some(vertex) => vertex_row(vertex, budget)?,
             None => return Ok(None),
         },
-        GremlinRow::Edge(id) => match graph.get_edge(id, budget)? {
+        GremlinRow::Edge(id) => match graph.query_edge(id, budget)? {
             Some(edge) => edge_row(edge)?,
             None => return Ok(None),
         },
@@ -871,14 +943,14 @@ enum Direction {
     Both,
 }
 
-fn expand(
-    graph: &impl QueryReadBackend,
-    rows: AccountedVec<Accounted<Row>>,
+fn expand<'a>(
+    graph: &'a impl QueryReadBackend,
+    rows: AccountedVec<Accounted<Row<'a>>>,
     direction: Direction,
     label: Option<&str>,
     check: &dyn Fn() -> Result<()>,
     budget: &Budget,
-) -> Result<AccountedVec<Accounted<Row>>> {
+) -> Result<AccountedVec<Accounted<Row<'a>>>> {
     let mut next = AccountedVec::new(budget);
     for source in rows {
         check()?;
@@ -891,7 +963,7 @@ fn expand(
         // Input, current source, adjacent map and next rows all keep their own
         // reservations alive throughout this overlap.
         let mut adjacent = BTreeMap::new();
-        let mut visit = |edge: Accounted<Edge>| -> Result<()> {
+        let mut visit = |edge: Accounted<Cow<'a, Edge>>| -> Result<()> {
             check()?;
             if adjacent.contains_key(&edge.id) {
                 return Ok(());
@@ -902,7 +974,7 @@ fn expand(
                 Direction::Both if edge.from == vertex.id => edge.to,
                 Direction::Both => edge.from,
             };
-            let Some(mut target) = graph.get_vertex(target_id, budget)? else {
+            let Some(mut target) = graph.query_vertex(target_id, budget)? else {
                 return Ok(());
             };
             check()?;
@@ -921,7 +993,7 @@ fn expand(
             Ok(())
         };
         if matches!(direction, Direction::Out | Direction::Both) {
-            graph.visit_adjacent_edges(
+            graph.visit_query_edges(
                 vertex.id,
                 false,
                 label,
@@ -931,14 +1003,7 @@ fn expand(
             )?;
         }
         if matches!(direction, Direction::In | Direction::Both) {
-            graph.visit_adjacent_edges(
-                vertex.id,
-                true,
-                label,
-                &mut || check(),
-                &mut visit,
-                budget,
-            )?;
+            graph.visit_query_edges(vertex.id, true, label, &mut || check(), &mut visit, budget)?;
         }
         // BTreeMap's allocator node packing is excluded; the defined per-entry
         // charge moves out and is released only after the output slot is reserved.

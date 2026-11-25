@@ -114,6 +114,25 @@ Rules:
   `UnsupportedGremlinValue` because v0 does not add a separate id row type.
 - A missing vertex/edge id yields no row, not an error.
 
+### Bounded asynchronous local reads
+
+With the optional `async-read` Cargo feature, an embedding host can create one
+`AsyncGraphReader::new(Arc<GraphEngine>)` and clone that reader into its Tokio
+request handlers. Its `gremlin(&str)` method accepts the same text as
+`GraphEngine::gremlin`. Each reader and its clones share 32 execution slots.
+When all are occupied, up to four additional calls can wait for a slot for
+2 ms. A full queue or expired wait returns
+`Error::StorageNode(StorageNodeError::ResourceExhausted(_))`. Parsing and
+execution run on the blocking pool, retaining a slot until work stops even
+when the caller disconnects. The 2 ms budget covers admission only. Separately
+constructed readers have independent budgets. Direct engine calls, including
+writes, use their existing APIs. The `AsyncGraphReader` rustdoc includes a
+runnable example. The host Tokio runtime must have its time driver enabled.
+When building a runtime manually, call `Builder::enable_time()` or
+`Builder::enable_all()`. An immediately admitted read can succeed without a
+timer, but a read entering the wait queue on that runtime panics when it sets
+the admission deadline.
+
 ### Single-node read consistency
 
 Each execution of a parsed query pins one RocksDB snapshot before its first
@@ -685,3 +704,43 @@ edges and endpoints at the same V/T; no distributed query is implied. Order, bag
 unchanged. One query shares cumulative temporal revision/byte work bounds,
 logical allocation accounting and a cooperative deadline. See the precise
 [temporal query contract](TEMPORAL_STORE.md#official-gremlin-point-query-integration).
+
+### Certified data-local synchronous limit admission
+
+The separate [managed data-local gateway](MANAGED_LOCAL_GATEWAY.md) admits
+`limit(n)` between its supported explicit-ID `out`/`in` steps, before terminal
+`path` or `count`, using this same official AST and the shared distributed
+executor. Limits operate on the global ordered bag at their original position,
+not on independent shard prefixes. Existing 1..=1000 validation, hop, work,
+result and deadline bounds remain unchanged. This does not extend renewable
+jobs, global starts, filters or other currently unsupported local syntax.
+
+## Owned materialized temporal entrypoint
+
+The standalone temporal store's optional [owned read model](MATERIALIZED_TEMPORAL_READS.md)
+reuses this parser and executor at one captured local V and caller-selected T.
+It preserves explicit-ID order, multiplicity, values, properties and traversal
+semantics. Global starts stay unsupported. Its explicit 65,536-operation / 64 MiB
+logical-work maxima are separate from disk physical-revision accounting, while
+this executor's live-memory, result, hop and deadline limits remain in force.
+This is not a managed/cohort or distributed read entrypoint.
+
+The shared local executor may carry borrowed records from an immutable backend.
+Borrowing preserves full logical record reservations and query work charges;
+owned disk reads keep their validation and value-move behavior. Selected property
+and label results are owned even after the read model is dropped. This changes
+allocation behavior only, not syntax, traversal order, multiplicity or limits.
+
+Prepared query binding caches the canonical byte and raw structural-mark counts
+of static plan components. Each bind adds the exact decimal start-ID and quoted
+literal contributions and applies the same byte-before-complexity guard as text
+input. Literal types, finite-real checks, empty/nonempty start rules and parameter
+counts are unchanged. Canonical fields are quoted by the existing serializer;
+source text still passes semicolon validation and the official grammar parser.
+No complete query text is reconstructed on repeated binds.
+
+Immutable temporal backends may skip a whole adjacency block proved impossible
+at T by conservative interval bounds. Skipped candidates retain their full logical
+operation/byte fees; possible candidates retain normal label and endpoint checks.
+This preserves order, duplicate semantics and resource admission. Cooperative
+checks cover each bounded skipped block; see MATERIALIZED_TEMPORAL_READS.md.

@@ -27,11 +27,16 @@ is not reuse of v1/v2 permanent qualified IDs.
 uses V/T throughout. V=0 is the empty initialized store. `view(None,T)` resolves
 this local snapshot's current head once; it does not imply a distributed common
 prefix or linearizable cluster latest. A version with no local change is readable.
-Every read lazily seeks one identity's descending system-version index, then
+An uncached read lazily seeks one identity's descending system-version index, then
 selects the first revision containing T. A later correction masks only its valid
 interval; old system views are unchanged. Absent revisions mask earlier assertions
 only over the specified interval. No whole graph or full history is copied into
 a query view, and commits do not copy the graph.
+
+Each store caches one decoded head with its RocksDB snapshot sequence number.
+A new view pins its own snapshot and can reuse the head for that exact sequence
+at any requested V/T. On a miss or cache contention, the view reads the head
+from its pinned snapshot. Only successful reads populate the cache.
 
 The view retains the snapshot head already validated at creation. This is
 distinct from an explicitly selected older V: adjacency candidates are checked
@@ -151,11 +156,12 @@ are rejected rather than becoming a global scan. Duplicate start IDs and their
 order are retained. Keys, labels, limits and operators are not bindable in this
 initial API.
 
-Before execution, bound arguments pass the original text/structural limits using
-a canonical standard-Gremlin representation. Caller values are bounded before
-cloning/rendering. Rendering is for admission accounting only; the official
-parser is not invoked again. This retains the conservative structural-mark
-limit even for marks inside literal strings.
+Preparation measures a canonical standard-Gremlin representation once and caches
+its static byte/structural-mark contribution. Each bind validates caller input
+before cloning, then adds exact decimal-ID and quoted-literal contributions. It
+does not render the whole bound query or invoke the official parser again. The
+original canonical byte and structural limits still apply, including marks inside
+literal strings. This is local typed-plan reuse, not a remotely retained plan.
 
 `execute_prepared` binds and calls the same checked executor as textual queries.
 The global-start restriction, fresh deadline and fresh read/memory budgets are
@@ -251,6 +257,15 @@ returned. Candidate order, skipped-candidate work charges and raw-byte accountin
 are unchanged, and callbacks can still return errors. Neither cursor nor record
 memo is retained across executions. Snapshot HEAD is not re-read for each scan.
 
+After a complete adjacency list, the cursor is at the first following key or
+at the end of the snapshot. A later (direction, vertex ID) prefix can resume
+there if the cursor has already reached or passed its lower bound. Repeated,
+backward and farther-away prefixes seek directly as needed. An interrupted
+list cannot supply a resume position. This applies to fixed-view batches as
+well as single queries. For a warm synthetic comparison, run
+`cargo run --locked --release -p velagraph --example temporal_adjacency_bench`
+with the same example source on both revisions.
+
 Start rows retain their original order, duplicates, missing-ID handling and
 leading-limit short circuit. There is no eager decode of later roots, no new
 query syntax, no multi-key I/O batching, and no asynchronous prefetch. Temporal
@@ -264,6 +279,13 @@ lower bound. Otherwise it seeks normally. This does not speculate forward or
 skip revision validation: status, envelope, V/T, payload, endpoint and work-budget
 checks still run. EOF and successful selected records do not create lookahead.
 The marker belongs to the execution's record cursor and never crosses views.
+
+Point reads construct the fixed-width revision key in a stack buffer and borrow
+its identity prefix from that buffer. Owned keys required by writes or storage
+adapter ranges use the same encoder. This removes temporary key allocations;
+it does not change key bytes, seek order, visited revisions, decoding, visibility
+checks, work charges or query limits. Golden vectors cover both record kinds
+and integer boundaries; existing databases remain readable without migration.
 
 `cargo run --locked --release -p velagraph --example temporal_record_seek_bench`
 reproduces this workload class with generated edge intervals. It creates four
@@ -392,3 +414,20 @@ purge-fence bypass is added. A locally reopened member is not proof of a complet
 restored cohort. Global checkpoint recovery remains separately blocked until all
 required members/coordinator, topology, cut and temporal data are validated before
 query admission. Do not advertise this slice as production temporal recovery.
+
+## Owned fixed-V read models
+
+`TemporalStore::materialize` validates one source snapshot and returns an owned
+`TemporalReadModel`. It compiles revision/absence selection once, retains all T
+at the chosen local V, and uses typed covering adjacency rows with the existing
+Gremlin executor. Source candidates must exactly match canonical positive history;
+construction does not repair mismatches. See [the read-model contract](MATERIALIZED_TEMPORAL_READS.md)
+for eager validation, construction/query limits, accounting, ownership and explicit
+refresh. The standalone format and disk-query defaults above are unchanged.
+
+## Bounded cross-query revision reuse
+
+Point and Gremlin reads can reuse [bounded revision prefixes](TEMPORAL_REVISION_CACHE.md)
+across acknowledged unchanged local versions and varying valid times. Snapshot
+sequence guards, endpoint validation and original query budgets remain enforced.
+No format migration or additional dependency is required.

@@ -375,7 +375,10 @@ impl StateMachine {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.set_compression_type(DBCompressionType::None);
-        let db = DB::open(&options, path.as_ref())?;
+        Self::load_from_db(DB::open(&options, path.as_ref())?)
+    }
+
+    fn load_from_db(db: DB) -> anyhow::Result<Self> {
         let storage = Arc::new(StateMachineStorage {
             db,
             legacy_d1: AtomicBool::new(false),
@@ -1693,9 +1696,10 @@ impl StateMachine {
         })
     }
 
-    /// Project the requested terminal cut from a temporarily materialized full
-    /// authority. S2 retains this explicit control-read boundary; only the
-    /// requested terminal rows are checked against the complete Journal.
+    /// Project the requested terminal cut after complete raw authority checks.
+    /// Active coordinators stream a projection without a complete Journal;
+    /// legacy representations retain full materialization. Only intersecting
+    /// decision rows are checked, in full, before truncating the response.
     pub async fn coordinator_terminal_prefix(
         &self,
         shard: u64,
@@ -1704,8 +1708,36 @@ impl StateMachine {
         version: u64,
     ) -> Result<crate::terminal_prefix::TerminalPrefix, D1Error> {
         let state = self.state.read().await;
-        // Terminal range validation deliberately retains the complete temporary
-        // authority path in S2; it never keeps that Journal in published state.
+        if let Some(d1) = state.d1.as_ref().filter(|d1| {
+            d1.coordinator
+                .as_ref()
+                .is_some_and(|journal| journal.active().is_some())
+        }) {
+            if let Some(cut) = self.archive_cut(&state)? {
+                let storage = self.storage.as_ref().ok_or(D1Error::EventLedgerHistory)?;
+                return blocking_section(|| {
+                    event_ledger::coordinator_prefix(&storage.db, cut, version, || {
+                        d1.check_shard(shard)?;
+                        d1.check_epoch(epoch)?;
+                        if d1.managed.as_ref().is_none_or(|m| m.mode_id != mode_id) {
+                            return Err(D1Error::ManagedModeConflict);
+                        }
+                        if version > d1.coordinator.as_ref().unwrap().resolved_prefix() {
+                            return Err(D1Error::VisibilityUnresolved);
+                        }
+                        let manifest = storage
+                            .decision_manifest
+                            .lock()
+                            .map_err(|_| D1Error::DecisionIndexUnavailable)?;
+                        Ok(manifest
+                            .as_ref()
+                            .ok_or(D1Error::DecisionIndexHistory)?
+                            .clone())
+                    })
+                });
+            }
+        }
+        // Legacy representations retain complete temporary authority validation.
         let persisted =
             blocking_section(|| self.load_disk_state(&state)).map_err(ledger_read_error)?;
         let d1 = persisted
@@ -1726,6 +1758,21 @@ impl StateMachine {
             return Err(D1Error::VisibilityUnresolved);
         }
         self.decision_prefix(&state, d1, version)
+    }
+
+    /// Capture the sequence for an unmanaged D1 write under the same read lock
+    /// that checks its shard, epoch and write mode. Call after a leader barrier.
+    pub async fn d1_unmanaged_write_sequence(
+        &self,
+        shard: u64,
+        epoch: u64,
+    ) -> Result<u64, D1Error> {
+        let state = self.state.read().await;
+        state
+            .d1
+            .as_ref()
+            .ok_or(D1Error::NotActivated)?
+            .unmanaged_write_sequence(shard, epoch)
     }
 
     /// Local diagnostic metadata, not a linearizable distributed read.
@@ -1795,7 +1842,14 @@ impl StateMachine {
             .archive_cut(sm)
             .map_err(|e| fail(anyhow::anyhow!("active archive cut: {e:?}")))?
             .ok_or_else(|| fail(anyhow::anyhow!("active coordinator lacks publication cut")))?;
-        let verified = event_ledger::verify_active(&storage.db, cut)
+        let mut entries = entries.into_iter().peekable();
+        let first_command = entries.peek().and_then(|entry| match &entry.payload {
+            EntryPayload::Normal(LogCommand::D1V1(D1Command::Coordinator { command, .. })) => {
+                Some(command)
+            }
+            _ => None,
+        });
+        let verified = event_ledger::verify_coordinator_command(&storage.db, cut, first_command)
             .map_err(|error| fail(anyhow::anyhow!("active archive verification: {error:?}")))?;
         let current = sm
             .d1

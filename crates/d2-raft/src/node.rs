@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,10 +16,18 @@ use crate::types::NodeId;
 
 pub struct Node;
 
+// Keep the log store paired with its startup identity and state allocation.
+// A weak reference preserves existing state-machine ownership and teardown.
+struct DurableCheckpointSource {
+    id: NodeId,
+    state: Weak<StateMachine>,
+    logs: DurableLogStore,
+}
+
 pub struct NodeHandle {
     registry: Registry,
     registration: Arc<()>,
-    durable_logs: Option<DurableLogStore>,
+    checkpoint_source: Option<DurableCheckpointSource>,
     pub id: NodeId,
     pub raft: Raft,
     pub state_machine: Arc<StateMachine>,
@@ -29,13 +37,25 @@ impl NodeHandle {
     /// Create a local two-DB backup of this replica, preserving node/group identity.
     /// Writes briefly pause; this does not alter Raft acknowledgement durability.
     pub async fn physical_checkpoint(&self, destination: impl AsRef<Path>) -> anyhow::Result<()> {
-        let logs = self
-            .durable_logs
+        self.checkpoint_digest(destination.as_ref()).await.map(drop)
+    }
+
+    pub(crate) async fn checkpoint_digest(&self, destination: &Path) -> anyhow::Result<[u8; 32]> {
+        let source = self
+            .checkpoint_source
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("checkpoint requires a durable node"))?;
+        anyhow::ensure!(
+            self.id == source.id && source.state.ptr_eq(&Arc::downgrade(&self.state_machine)),
+            "checkpoint handle differs from its durable startup binding"
+        );
         self.state_machine
-            .physical_checkpoint(logs, destination.as_ref(), self.group_id(), self.id)
+            .physical_checkpoint(&source.logs, destination, self.group_id(), source.id)
             .await
+    }
+
+    pub(crate) fn shares_transport(&self, other: &Self) -> bool {
+        self.registry.shares_transport(&other.registry)
     }
 
     /// Immutable in-process consensus group associated with this replica.
@@ -79,7 +99,7 @@ impl Node {
         Ok(NodeHandle {
             registry,
             registration,
-            durable_logs: None,
+            checkpoint_source: None,
             id,
             raft,
             state_machine,
@@ -135,7 +155,11 @@ impl Node {
         Ok(NodeHandle {
             registry,
             registration,
-            durable_logs: Some(log_store),
+            checkpoint_source: Some(DurableCheckpointSource {
+                id,
+                state: Arc::downgrade(&state_machine),
+                logs: log_store,
+            }),
             id,
             raft,
             state_machine,
@@ -260,12 +284,32 @@ pub(crate) fn bind_durable_identity(
     group_id: GroupId,
     node_id: NodeId,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !dir.join("RESTORE_INCOMPLETE").exists(),
-        "incomplete checkpoint restore"
-    );
-    anyhow::ensure!(!dir.join("RESTORED_OFFLINE_ONLY").exists(),
-        "restored backup is offline-only; live consensus rejoin requires a separate recovery protocol");
+    // The presence of a reserved entry is enough. Do not follow a symlink or
+    // interpret a metadata I/O error as permission to open old vote state.
+    for (name, reason) in [
+        ("RESTORE_INCOMPLETE", "incomplete checkpoint restore"),
+        (
+            "RESTORED_OFFLINE_ONLY",
+            "checkpoint directory is offline-only",
+        ),
+        (
+            "checkpoint.json",
+            "physical checkpoint input is offline-only",
+        ),
+        (".checkpoint-pending", "incomplete checkpoint download"),
+        (
+            "prefix-generation.json",
+            "cohort checkpoint input is offline-only",
+        ),
+    ] {
+        match std::fs::symlink_metadata(dir.join(name)) {
+            Ok(_) => anyhow::bail!("{reason}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect startup guard {name}"))
+            }
+        }
+    }
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     #[serde(deny_unknown_fields)]
     struct Identity {

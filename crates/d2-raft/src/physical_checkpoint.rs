@@ -74,6 +74,17 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Use the existing startup guard so older nodes also reject new inputs.
+fn create_offline_input(root: &Path) -> anyhow::Result<()> {
+    fs::create_dir(root)?;
+    write_new(
+        &root.join("RESTORED_OFFLINE_ONLY"),
+        b"Checkpoint input only\n",
+    )?;
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
 impl StateMachine {
     pub(crate) async fn physical_checkpoint(
         &self,
@@ -81,13 +92,13 @@ impl StateMachine {
         root: &Path,
         group_id: u64,
         node_id: NodeId,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<[u8; 32]> {
         let storage = self
             .storage
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("physical checkpoint requires durable state"))?;
         // Existing destinations, including interrupted attempts, are never overwritten.
-        fs::create_dir(root)?;
+        create_offline_input(root)?;
         // Matches snapshot installation/builder ordering. All state, snapshot and
         // log writes are excluded until BOTH DB checkpoint handles have finished.
         let state = self.state.write().await;
@@ -130,35 +141,25 @@ impl StateMachine {
                 File::open(root.join(dir))?.sync_all()?;
             }
             // Completion record is published LAST. A partial manifest is invalid.
-            write_new(
-                &root.join("checkpoint.json"),
-                &serde_json::to_vec(&manifest)?,
-            )?;
+            let bytes = serde_json::to_vec(&manifest)?;
+            write_new(&root.join("checkpoint.json"), &bytes)?;
             File::open(root)?.sync_all()?;
             sync_parent(root)?;
-            Ok(())
+            Ok(Sha256::digest(&bytes).into())
         })
     }
 }
 
-/// Restore a local backup into a newly created directory. Never overwrites an
-/// existing path, joins a cluster, or changes identity. The original replica
-/// cannot be safely replaced in a live cluster from an old vote state. Normal
-/// startup rejects the restored offline-only marker. This is NOT an
-/// acknowledged-write zero-loss guarantee: writes after the cut are absent.
-/// Interrupted destinations are retained for inspection and rejected on retry.
-pub fn restore_physical_checkpoint(
-    backup: impl AsRef<Path>,
-    destination: impl AsRef<Path>,
+fn checked_manifest(
+    backup: &Path,
     group_id: u64,
     node_id: NodeId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(std::path::PathBuf, Manifest, Vec<u8>)> {
     // Components removes trailing separators / `.` so a root symlink cannot
     // evade symlink_metadata through a spelling such as "backup-link/".
     // This does not resolve ancestors or `..`, or prevent concurrent changes.
-    let backup_path: std::path::PathBuf = backup.as_ref().components().collect();
+    let backup_path: std::path::PathBuf = backup.components().collect();
     let backup = backup_path.as_path();
-    let destination = destination.as_ref();
     for directory in [
         backup.to_path_buf(),
         backup.join("raft.db"),
@@ -175,7 +176,8 @@ pub fn restore_physical_checkpoint(
             .is_file(),
         "checkpoint manifest must be a regular file"
     );
-    let manifest: Manifest = serde_json::from_slice(&fs::read(backup.join("checkpoint.json"))?)?;
+    let bytes = fs::read(backup.join("checkpoint.json"))?;
+    let manifest: Manifest = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(manifest.format == 1, "unsupported checkpoint format");
     anyhow::ensure!(
         manifest.group_id == group_id && manifest.node_id == node_id,
@@ -196,13 +198,97 @@ pub fn restore_physical_checkpoint(
         manifest.log.as_ref() == Some(&log),
         "checkpoint log metadata mismatch"
     );
+    Ok((backup_path, manifest, bytes))
+}
+
+fn validate_state_cut(state: &StateMachine, manifest: &Manifest) -> anyhow::Result<()> {
+    let actual = state.state.try_read().expect("new state has no readers");
+    anyhow::ensure!(
+        actual.last_applied_log == manifest.applied
+            && actual.last_membership == manifest.membership,
+        "checkpoint state metadata mismatch"
+    );
+    let snapshot = state
+        .current_snapshot
+        .try_read()
+        .expect("new snapshot has no readers");
+    anyhow::ensure!(
+        snapshot.as_ref().map(|s| &s.meta) == manifest.snapshot.as_ref(),
+        "checkpoint snapshot metadata mismatch"
+    );
+    Ok(())
+}
+
+/// Verify a trusted, immutable local physical checkpoint without restoring it.
+/// Both RocksDB handles are read-only. This checks a single replica's local
+/// cut and does not grant managed cohort certification or permission to rejoin.
+pub fn verify_physical_checkpoint(
+    backup: impl AsRef<Path>,
+    group_id: u64,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    open_verified_state(backup.as_ref(), group_id, node_id).map(drop)
+}
+
+fn open_verified_state(
+    backup: &Path,
+    group_id: u64,
+    node_id: NodeId,
+) -> anyhow::Result<(StateMachine, [u8; 32])> {
+    let (backup, manifest, bytes) = checked_manifest(backup, group_id, node_id)?;
+    let db = DB::open_for_read_only(&Options::default(), backup.join("state.db"), false)?;
+    let state = StateMachine::load_from_db(db)?;
+    validate_state_cut(&state, &manifest)?;
+    Ok((state, Sha256::digest(&bytes).into()))
+}
+
+#[path = "cohort_checkpoint_inputs.rs"]
+pub mod cohort_inputs;
+
+/// Restore a local backup into a newly created directory. Never overwrites an
+/// existing path, joins a cluster, or changes identity. The original replica
+/// cannot be safely replaced in a live cluster from an old vote state. Normal
+/// startup rejects the restored offline-only marker. This is NOT an
+/// acknowledged-write zero-loss guarantee: writes after the cut are absent.
+/// Interrupted destinations are retained for inspection and rejected on retry.
+pub fn restore_physical_checkpoint(
+    backup: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    group_id: u64,
+    node_id: NodeId,
+) -> anyhow::Result<()> {
+    restore_replica(
+        backup.as_ref(),
+        destination.as_ref(),
+        group_id,
+        node_id,
+        None,
+    )
+}
+
+// A cohort restore preserves the producer's exact inventory for the final
+// read-only prefix check. Standalone restores retain their existing layout.
+fn restore_replica(
+    backup: &Path,
+    destination: &Path,
+    group_id: u64,
+    node_id: NodeId,
+    selected_digest: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    let (backup, manifest, bytes) = checked_manifest(backup, group_id, node_id)?;
+    if let Some(expected) = selected_digest {
+        anyhow::ensure!(
+            <[u8; 32]>::from(Sha256::digest(&bytes)) == expected,
+            "physical checkpoint generation mismatch"
+        );
+    }
     fs::create_dir(destination)?;
     write_new(&destination.join("RESTORE_INCOMPLETE"), b"1")?;
     File::open(destination)?.sync_all()?;
     for directory in ["raft.db", "state.db"] {
         fs::create_dir(destination.join(directory))?;
     }
-    for file in files {
+    for file in &manifest.files {
         // Copy rather than hard link: the restored DB must not mutate the backup.
         let mut source = File::open(backup.join(&file.name))?;
         let mut target = OpenOptions::new()
@@ -227,26 +313,16 @@ pub fn restore_physical_checkpoint(
         );
         target.sync_all()?;
     }
-    // Opening performs the existing full state/ledger validation, not a weakened
-    // replacement loader. Verify the applied cut and membership before startup.
-    let state = StateMachine::open(destination.join("state.db"))?;
-    let actual = state.state.try_read().expect("new state has no readers");
-    anyhow::ensure!(
-        actual.last_applied_log == manifest.applied
-            && actual.last_membership == manifest.membership,
-        "checkpoint state metadata mismatch"
-    );
-    let snapshot = state
-        .current_snapshot
-        .try_read()
-        .expect("new snapshot has no readers");
-    anyhow::ensure!(
-        snapshot.as_ref().map(|s| &s.meta) == manifest.snapshot.as_ref(),
-        "checkpoint snapshot metadata mismatch"
-    );
-    drop(snapshot);
-    drop(actual);
-    drop(state);
+    if selected_digest.is_some() {
+        // A writable open could change the files covered by the inventory.
+        // The cohort verifier opens the copied databases before publication.
+        write_new(&destination.join("checkpoint.json"), &bytes)?;
+    } else {
+        validate_state_cut(
+            &StateMachine::open(destination.join("state.db"))?,
+            &manifest,
+        )?;
+    }
     let identity = serde_json::json!({"version":1,"group_id":group_id,"node_id":node_id});
     write_new(
         &destination.join("raft-group.json"),
@@ -284,6 +360,7 @@ mod tests {
             .physical_checkpoint(&logs, &backup, 0, 1)
             .await
             .is_err());
+        assert!(backup.join("RESTORED_OFFLINE_ONLY").is_file());
         assert!(!backup.join("checkpoint.json").exists());
         assert!(restore_physical_checkpoint(&backup, dirs.path().join("restored"), 0, 1).is_err());
         Ok(())

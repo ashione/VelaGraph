@@ -205,6 +205,110 @@ pub(crate) fn manifest_bytes(
     Ok(serde_json::to_vec(&Manifest::of(&view, applied)?)?)
 }
 
+/// Operation-local coordinator range verification. Index errors are retained,
+/// not returned from raw projection, so raw/identity/manifest precedence survives.
+pub(crate) struct RequestedRows {
+    domain: Domain,
+    through: u64,
+    requested: u64,
+    row: Option<Row>,
+    error: Option<D1Error>,
+}
+impl RequestedRows {
+    pub(crate) fn new(identity: &CheckpointIdentity, through: u64, requested: u64) -> Self {
+        Self {
+            domain: Domain {
+                role: identity.role,
+                shard: identity.shard,
+                epoch: identity.epoch,
+                mode: identity.mode,
+                authority: identity.authority.clone(),
+                cohort: identity.cohort.clone(),
+            },
+            through,
+            requested,
+            row: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, snapshot: &rocksdb::Snapshot<'_>, tx: &Transaction) {
+        if self.error.is_some() || self.requested == 0 {
+            return;
+        }
+        let first =
+            (tx.ordinal - 1) / SEGMENT_TRANSACTIONS as u64 * SEGMENT_TRANSACTIONS as u64 + 1;
+        if first > self.requested {
+            return;
+        }
+        if let Err(error) = self.observe_checked(snapshot, tx, first) {
+            self.error = Some(error);
+        }
+    }
+
+    fn observe_checked(
+        &mut self,
+        snapshot: &rocksdb::Snapshot<'_>,
+        tx: &Transaction,
+        first: u64,
+    ) -> Result<(), D1Error> {
+        if tx.ordinal == first {
+            let bytes = snapshot
+                .get(self.domain.key(first))
+                .map_err(|_| D1Error::DecisionIndexUnavailable)?
+                .ok_or(D1Error::DecisionIndexHistory)?;
+            let row = Row::decode(&bytes).map_err(|_| D1Error::DecisionIndexHistory)?;
+            let count = (self.through - first + 1).min(SEGMENT_TRANSACTIONS as u64);
+            if row.domain != self.domain || row.first != first || row.records.len() as u64 != count
+            {
+                return Err(D1Error::DecisionIndexHistory);
+            }
+            self.row = Some(row);
+        }
+        let record = self
+            .row
+            .as_ref()
+            .and_then(|row| row.records.get((tx.ordinal - first) as usize))
+            .ok_or(D1Error::DecisionIndexHistory)?;
+        if record.id != tx.id
+            || record.ordinal != tx.ordinal
+            || record.participants != tx.participants
+            || record.prepared != tx.prepared
+            || Some(record.decision) != tx.decision
+        {
+            return Err(D1Error::DecisionIndexHistory);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        self,
+        snapshot: &rocksdb::Snapshot<'_>,
+        cached: &[u8],
+    ) -> Result<(), D1Error> {
+        if snapshot
+            .get(MANIFEST_KEY)
+            .map_err(|_| D1Error::DecisionIndexUnavailable)?
+            .as_deref()
+            != Some(cached)
+        {
+            return Err(D1Error::DecisionIndexHistory);
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(cached).map_err(|_| D1Error::DecisionIndexHistory)?;
+        if manifest.version != self.domain.cohort.profile.storage_format()
+            || manifest.domain != self.domain
+            || manifest.through != self.through
+        {
+            return Err(D1Error::DecisionIndexHistory);
+        }
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Full strict validation on reopen; a legacy format cannot carry orphan rows.
 pub(crate) fn validate(
     db: &DB,

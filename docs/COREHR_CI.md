@@ -3,8 +3,9 @@
 `CoreHR full scale` runs the **complete 200,000-person / 5,000-department**
 scenario on every pull-request open, reopen and update, every push to `main`,
 manually through `workflow_dispatch`, and daily at **03:17 UTC**. GitHub schedules
-can be delayed; cron runs the default branch. New runs cancel obsolete runs for
-the same event/ref. It is not a small smoke-only substitute, and has no path
+can be delayed; cron runs the default branch. Only superseded PR runs are
+cancelled. Main, scheduled and manual runs have unique concurrency groups and
+are retained. It is not a small smoke-only substitute, and has no path
 filters. This workflow is a PR check; making it a required branch-protection
 check is a separate repository setting, not changed by this patch.
 
@@ -15,6 +16,16 @@ existing debug/test cache. The 90-minute job timeout bounds runner spending,
 not a fabricated query-latency pass threshold. Existing 120-second job leases,
 five-second request deadlines, and all production row/byte/work/identity limits
 remain unchanged and are still tested.
+
+## Event-specific lifecycle acceptance
+
+The full observed scenario below runs on every event. A separate release-build
+handoff feeds a short lifecycle/recovery check on PRs (`pr-short`) and the full
+retained 1,025-write lifecycle on main pushes, schedules and manual runs
+(`full-1025`). The aggregate gate checks the tier against the triggering event.
+The retained lifecycle job keeps its historical check name for compatibility;
+read its summary and `acceptance-tier`, not the name alone. A green PR gate does
+not certify the full 1,025-write boundary.
 
 ## Coverage
 
@@ -80,8 +91,8 @@ From a revision containing all three prerequisites:
 
 ```sh
 cargo build --release --locked --example corehr_fixture
-cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --bin graph-node
-python3 -m unittest discover -s scripts -p test_corehr_ci.py
+cargo build --release --locked -p replicated-graph --example corehr_run --example corehr_jobs_run --example corehr_result_pages --bin graph-node
+python3 -m unittest discover -s scripts -p 'test_corehr*ci.py'
 TOKIO_WORKER_THREADS=2 python3 scripts/corehr_ci.py new-corehr-ci-results
 ```
 

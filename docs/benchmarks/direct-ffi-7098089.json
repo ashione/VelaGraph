@@ -1,0 +1,796 @@
+{
+  "base_revision": "570c3e377bfc4fece59635fc840f57ae02289335",
+  "candidate_revision": "7098089e30e32d5ba0b669150e254f112969b83d",
+  "library_sha256": {
+    "base": "84c4d90608823a98cc5fa4648d5c1b7e0ced4d05130dfabc5bf79cd4074bd212",
+    "candidate": "ea126bd48ed934da2f5c659fe79c3390bcc2023f00e9534b8411595d7cc90790"
+  },
+  "benchmark_sha256": "ccd2ae4caf02aa3de4544e7479ddad1d5d868fc0a5371e7ff8a37bc761df89ee",
+  "system": "Darwin",
+  "arch": "arm64",
+  "rounds": 10,
+  "gomaxprocs": 4,
+  "iterations": {
+    "Warm": 10000,
+    "FirstRead": 64,
+    "Tree": 128
+  },
+  "summary": {
+    "Warm/Newest": {
+      "base_ns_op": 4986.5,
+      "candidate_ns_op": 4075.5,
+      "median_paired_change_pct": -18.209553226873552,
+      "candidate_faster_pairs": 10
+    },
+    "Warm/Previous": {
+      "base_ns_op": 4994.0,
+      "candidate_ns_op": 4092.0,
+      "median_paired_change_pct": -18.752846813740945,
+      "candidate_faster_pairs": 10
+    },
+    "FirstRead/Newest": {
+      "base_ns_op": 46236.5,
+      "candidate_ns_op": 47184.5,
+      "median_paired_change_pct": 5.006320976137779,
+      "candidate_faster_pairs": 2
+    },
+    "FirstRead/Previous": {
+      "base_ns_op": 47725.0,
+      "candidate_ns_op": 48022.5,
+      "median_paired_change_pct": -0.11156592196558957,
+      "candidate_faster_pairs": 6
+    },
+    "Tree/Parents16": {
+      "base_ns_op": 51929.0,
+      "candidate_ns_op": 54252.5,
+      "median_paired_change_pct": 1.266625292077167,
+      "candidate_faster_pairs": 5
+    },
+    "Tree/Subtree43": {
+      "base_ns_op": 101371.0,
+      "candidate_ns_op": 101683.5,
+      "median_paired_change_pct": -1.0099956204658866,
+      "candidate_faster_pairs": 6
+    },
+    "Tree/Whole259": {
+      "base_ns_op": 850456.0,
+      "candidate_ns_op": 860681.0,
+      "median_paired_change_pct": 1.6631796590695802,
+      "candidate_faster_pairs": 3
+    }
+  },
+  "samples": {
+    "base": {
+      "Warm/Newest": [
+        {
+          "ns_op": 5023.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4623.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4854.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5031.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4950.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5125.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5035.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5027.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4911.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4917.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        }
+      ],
+      "Warm/Previous": [
+        {
+          "ns_op": 4946.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4672.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4897.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5124.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5019.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4842.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4975.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5013.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5075.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 5073.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        }
+      ],
+      "FirstRead/Newest": [
+        {
+          "ns_op": 46764.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 43592.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47083.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46781.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46676.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 43943.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 44035.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 48551.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 45735.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 45797.0,
+          "go_bytes_op": 821,
+          "go_allocs_op": 13
+        }
+      ],
+      "FirstRead/Previous": [
+        {
+          "ns_op": 51102.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 50434.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47792.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47317.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 45185.0,
+          "go_bytes_op": 821,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47658.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 48152.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46795.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47246.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 49002.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        }
+      ],
+      "Tree/Parents16": [
+        {
+          "ns_op": 51709.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 54204.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 57301.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 52377.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 54924.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 50056.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 49589.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 48934.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 52149.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 50938.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        }
+      ],
+      "Tree/Subtree43": [
+        {
+          "ns_op": 92729.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 107356.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 101168.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 104395.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 101574.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 107368.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 99803.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 97370.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 102769.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 97107.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        }
+      ],
+      "Tree/Whole259": [
+        {
+          "ns_op": 860181.0,
+          "go_bytes_op": 30718,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 803307.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 846171.0,
+          "go_bytes_op": 30719,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 850635.0,
+          "go_bytes_op": 30718,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 888010.0,
+          "go_bytes_op": 30718,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 850277.0,
+          "go_bytes_op": 30721,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 846829.0,
+          "go_bytes_op": 30719,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 844482.0,
+          "go_bytes_op": 30762,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 870182.0,
+          "go_bytes_op": 30718,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 862726.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        }
+      ]
+    },
+    "candidate": {
+      "Warm/Newest": [
+        {
+          "ns_op": 4111.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4062.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4075.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4044.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4046.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4122.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4161.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4076.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 3950.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4110.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        }
+      ],
+      "Warm/Previous": [
+        {
+          "ns_op": 3906.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 3947.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4118.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4162.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4143.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 3919.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 3932.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4074.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4204.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 4110.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        }
+      ],
+      "FirstRead/Newest": [
+        {
+          "ns_op": 50238.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 49869.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47465.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 50336.0,
+          "go_bytes_op": 811,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 45727.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46868.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46999.0,
+          "go_bytes_op": 816,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 45614.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47270.0,
+          "go_bytes_op": 811,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47099.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        }
+      ],
+      "FirstRead/Previous": [
+        {
+          "ns_op": 48329.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 49387.0,
+          "go_bytes_op": 808,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 47716.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 48816.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46200.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 48810.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 44853.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46765.0,
+          "go_bytes_op": 818,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 50391.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 45688.0,
+          "go_bytes_op": 813,
+          "go_allocs_op": 13
+        }
+      ],
+      "Tree/Parents16": [
+        {
+          "ns_op": 58365.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 50582.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 52090.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 54407.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 54098.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 49384.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 61114.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 55668.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 60032.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        },
+        {
+          "ns_op": 46358.0,
+          "go_bytes_op": 2728,
+          "go_allocs_op": 13
+        }
+      ],
+      "Tree/Subtree43": [
+        {
+          "ns_op": 103276.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 92170.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 99433.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 100877.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 108538.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 105489.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 111046.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 97073.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 90473.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        },
+        {
+          "ns_op": 102490.0,
+          "go_bytes_op": 5968,
+          "go_allocs_op": 19
+        }
+      ],
+      "Tree/Whole259": [
+        {
+          "ns_op": 892613.0,
+          "go_bytes_op": 30719,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 794504.0,
+          "go_bytes_op": 30718,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 848015.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 879706.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 904402.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 887063.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 864378.0,
+          "go_bytes_op": 30716,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 856984.0,
+          "go_bytes_op": 30719,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 820486.0,
+          "go_bytes_op": 30720,
+          "go_allocs_op": 22
+        },
+        {
+          "ns_op": 854950.0,
+          "go_bytes_op": 30721,
+          "go_allocs_op": 22
+        }
+      ]
+    }
+  }
+}

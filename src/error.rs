@@ -3,6 +3,16 @@ use thiserror::Error;
 /// Errors returned by the graph kernel.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A caller requested cooperative cancellation before publication/completion.
+    #[error("execution cancelled")]
+    ExecutionCancelled,
+    /// The caller's execution deadline expired at a cooperative checkpoint.
+    #[error("execution deadline exceeded")]
+    ExecutionDeadlineExceeded,
+    /// Failure specific to the optional in-memory graph/checkpoint backend.
+    #[error("incremental memory graph: {0}")]
+    IncrementalMemory(#[source] Box<crate::IncrementalMemoryError>),
+
     #[error("temporal store error: {0}")]
     TemporalStore(Box<crate::temporal_store::TemporalStoreError>),
 

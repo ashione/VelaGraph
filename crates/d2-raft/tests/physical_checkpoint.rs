@@ -1,6 +1,6 @@
 use d2_raft::{
-    restore_physical_checkpoint, Cluster, D1Command, D1Result, D1WriteRequest, D1WriteStatus,
-    LogCommand, StateMachine, WriteOp,
+    restore_physical_checkpoint, verify_physical_checkpoint, Cluster, D1Command, D1Result,
+    D1WriteRequest, D1WriteStatus, LogCommand, StateMachine, WriteOp,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use std::collections::BTreeMap;
@@ -51,6 +51,28 @@ async fn checkpoint_concurrent_writes_restore_membership_and_dedup() -> anyhow::
         node.physical_checkpoint(&backup).await.is_err(),
         "no overwrite on retry"
     );
+    verify_physical_checkpoint(&backup, 0, 1)?;
+    // Use a separate registry so duplicate registration cannot mask the guard.
+    assert!(backup.join("RESTORED_OFFLINE_ONLY").is_file());
+    let error = Cluster::new()
+        .start_durable(1, &backup)
+        .await
+        .err()
+        .expect("backup is offline-only");
+    assert!(error.to_string().contains("offline-only"), "{error:#}");
+    assert!(!backup.join("raft-group.json").exists());
+    verify_physical_checkpoint(&backup, 0, 1)?;
+    // A real snapshot with a different ID can share all log boundaries and
+    // file checksums. The verifier must compare the loaded state to the claim.
+    let manifest_path = backup.join("checkpoint.json");
+    let original = std::fs::read(&manifest_path)?;
+    let mut altered: serde_json::Value = serde_json::from_slice(&original)?;
+    altered["snapshot"]["snapshot_id"] = "different-snapshot".into();
+    std::fs::write(&manifest_path, serde_json::to_vec(&altered)?)?;
+    let error = verify_physical_checkpoint(&backup, 0, 1).unwrap_err();
+    assert_eq!(error.to_string(), "checkpoint snapshot metadata mismatch");
+    std::fs::write(&manifest_path, original)?;
+    assert!(verify_physical_checkpoint(&backup, 0, 2).is_err());
     let restored = dirs.path().join("restored");
     assert!(restore_physical_checkpoint(&backup, &restored, 0, 2).is_err());
     assert!(!restored.exists());
@@ -136,5 +158,90 @@ async fn tcp_start_rejects_restored_identity_mismatch() -> anyhow::Result<()> {
         assert!(result.is_err());
         assert!(!dir.path().join("raft.db").exists());
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_refuses_relabelled_node_and_substituted_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let cluster = Cluster::new();
+    let mut first = cluster
+        .in_group(7)
+        .start_durable(1, dir.path().join("first"))
+        .await?;
+    let mut other = cluster
+        .in_group(8)
+        .start_durable(1, dir.path().join("other"))
+        .await?;
+    let backup = dir.path().join("backup");
+    first.id = 99;
+    assert!(first
+        .physical_checkpoint(&backup)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("startup binding"));
+    assert!(!backup.exists());
+    first.id = 1;
+    std::mem::swap(&mut first.state_machine, &mut other.state_machine);
+    assert!(first
+        .physical_checkpoint(&backup)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("startup binding"));
+    assert!(!backup.exists());
+    std::mem::swap(&mut first.state_machine, &mut other.state_machine);
+    first.physical_checkpoint(&backup).await?;
+    verify_physical_checkpoint(&backup, 7, 1)?;
+    first.raft.shutdown().await?;
+    other.raft.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_checkpoint_records_reject_both_node_entrypoints() -> anyhow::Result<()> {
+    for name in [
+        "checkpoint.json",
+        ".checkpoint-pending",
+        "prefix-generation.json",
+    ] {
+        let dir = tempfile::tempdir()?;
+        // The final record can be partial. Presence reserves this directory.
+        std::fs::write(dir.path().join(name), b"{")?;
+        let inproc = Cluster::new()
+            .start_durable(1, dir.path())
+            .await
+            .err()
+            .expect("checkpoint input");
+        let tcp = d2_raft::TcpNode::start(d2_raft::TcpNodeConfig {
+            id: 1,
+            raft_addr: "127.0.0.1:0".into(),
+            control_addr: "127.0.0.1:0".into(),
+            data_dir: dir.path().to_owned(),
+        })
+        .await
+        .err()
+        .expect("checkpoint input");
+        for error in [inproc, tcp] {
+            assert!(error.to_string().contains("checkpoint"), "{error:#}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_offline_guard_still_blocks_startup() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::os::unix::fs::symlink("absent", dir.path().join("RESTORED_OFFLINE_ONLY"))?;
+    let error = Cluster::new()
+        .start_durable(1, dir.path())
+        .await
+        .err()
+        .expect("offline-only");
+    assert!(error.to_string().contains("offline-only"), "{error:#}");
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
     Ok(())
 }

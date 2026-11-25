@@ -18,7 +18,8 @@ impl TemporalStoreView<'_> {
     pub fn execute_gremlin(&self, text: &str) -> crate::Result<GremlinResult> {
         #[cfg(feature = "query-profiling")]
         let _api = crate::query_profile::Timer::start(crate::query_profile::Phase::Api);
-        // Only immutable syntax plans are reused. No result, view or budget is cached.
+        // Syntax plans and revision prefixes are reused; each execution has fresh
+        // V/T checks, endpoint validation, work limits and live-memory charges.
         // A poisoned optimization cache is treated as a miss; query/storage errors
         // still propagate through the unchanged execution path below.
         let cached = self
@@ -68,6 +69,31 @@ impl TemporalStoreView<'_> {
         self.execute_query_inner(&bound)
     }
 
+    /// Execute one fixed-V/T batch, sharing revision work, memo and live budgets.
+    /// Existing temporal revision ceilings remain stricter than caller limits.
+    pub fn execute_query_batch(
+        &self,
+        queries: &[GremlinQuery],
+        control: &crate::ExecutionControl,
+        limits: crate::QueryBatchLimits,
+    ) -> crate::Result<Vec<GremlinResult>> {
+        control.check()?;
+        limits.validate(queries.len())?;
+        for query in queries {
+            if matches!(query.start(), GremlinStart::Vertices(ids)|GremlinStart::Edges(ids) if ids.is_empty())
+            {
+                return Err(Error::UnsupportedGremlinArgument(
+                    "temporal global start requires an index".into(),
+                ));
+            }
+        }
+        let budget = Budget::new(limits.max_live_bytes);
+        let mut backend = Backend::new(self, &budget);
+        backend.control = Some(control.clone());
+        backend.limits = limits;
+        crate::execution::execute_batch(queries, &backend, &|| backend.check(), limits, &budget)
+    }
+
     fn execute_query_inner(&self, query: &GremlinQuery) -> crate::Result<GremlinResult> {
         match query.start() {
             GremlinStart::Vertices(ids) | GremlinStart::Edges(ids) if ids.is_empty() => {
@@ -89,6 +115,8 @@ impl TemporalStoreView<'_> {
 struct Backend<'a, 'db> {
     view: &'a TemporalStoreView<'db>,
     deadline: Instant,
+    control: Option<crate::ExecutionControl>,
+    limits: crate::QueryBatchLimits,
     rows: Cell<usize>,
     bytes: Cell<usize>,
     memo: Rc<RecordMemo>,
@@ -96,7 +124,12 @@ struct Backend<'a, 'db> {
     record_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
     // True only after observing the first key beyond the previous identity.
     record_lookahead: Cell<bool>,
-    adjacency_cursor: RefCell<Option<rocksdb::DBRawIterator<'a>>>,
+    adjacency_cursor: RefCell<Option<CompletedAdjacency<'a>>>,
+}
+struct CompletedAdjacency<'a> {
+    // Prefix order is direction first, then big-endian vertex ID.
+    list: (bool, u64),
+    cursor: rocksdb::DBRawIterator<'a>,
 }
 fn error(error: TemporalStoreError) -> Error {
     Error::TemporalStore(Box::new(error))
@@ -109,6 +142,8 @@ impl<'a, 'db> Backend<'a, 'db> {
         Self {
             view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo,
@@ -118,6 +153,9 @@ impl<'a, 'db> Backend<'a, 'db> {
         }
     }
     fn check(&self) -> crate::Result<()> {
+        if let Some(control) = &self.control {
+            control.check()?;
+        }
         if Instant::now() >= self.deadline {
             return Err(Error::TraversalLimitExceeded(
                 "temporal query deadline".into(),
@@ -126,17 +164,22 @@ impl<'a, 'db> Backend<'a, 'db> {
         Ok(())
     }
     fn charge(&self, bytes: usize) -> crate::Result<()> {
+        self.charge_many(1, bytes)
+    }
+    fn charge_many(&self, count: usize, bytes: usize) -> crate::Result<()> {
         let rows = self
             .rows
             .get()
-            .checked_add(1)
+            .checked_add(count)
             .ok_or_else(|| error(TemporalStoreError::Limit))?;
         let bytes = self
             .bytes
             .get()
             .checked_add(bytes)
             .ok_or_else(|| error(TemporalStoreError::Limit))?;
-        if rows > MAX_READ_REVISIONS || bytes > MAX_READ_BYTES {
+        if rows > MAX_READ_REVISIONS.min(self.limits.max_work_operations)
+            || bytes > MAX_READ_BYTES.min(self.limits.max_work_bytes)
+        {
             return Err(error(TemporalStoreError::Limit));
         }
         self.rows.set(rows);
@@ -155,8 +198,45 @@ impl<'a, 'db> Backend<'a, 'db> {
             use crate::query_profile::{read_event, ReadEvent};
             read_event(ReadEvent::Read);
         }
-        let prefix = identity_prefix(identity);
-        let start = revision_key(identity, self.view.version, 0);
+        if let Some(block) = self.view.revision_cache.get(
+            identity,
+            self.view.version,
+            self.view.snapshot.sequence_number(),
+        ) {
+            if let Some(hit) = block.lookup(self.view.valid_time) {
+                // If any prefix admission might fail, replay storage in original
+                // row order so competing memory/work errors keep their precedence.
+                let fits = self.rows.get().checked_add(hit.rows).is_some_and(|rows| {
+                    rows <= MAX_READ_REVISIONS.min(self.limits.max_work_operations)
+                }) && self
+                    .bytes
+                    .get()
+                    .checked_add(hit.bytes)
+                    .is_some_and(|bytes| bytes <= MAX_READ_BYTES.min(self.limits.max_work_bytes))
+                    && hit.peak_bytes <= budget.available();
+                if fits {
+                    self.charge_many(hit.rows, hit.bytes)?;
+                    // Reproduce the largest transient raw-row reservation before
+                    // decoding the selected payload under its original raw charge.
+                    drop(budget.reserve(hit.peak_bytes)?);
+                    let _raw = budget.reserve(hit.selected_bytes)?;
+                    self.check()?;
+                    return hit
+                        .payload
+                        .map(|bytes| {
+                            #[cfg(feature = "query-profiling")]
+                            crate::query_profile::read_event(
+                                crate::query_profile::ReadEvent::Decode,
+                            );
+                            decode(bytes, budget)
+                        })
+                        .transpose();
+                }
+            }
+        }
+        let mut builder = self.view.revision_cache.builder();
+        let start = revision_key_bytes(identity, self.view.version, 0);
+        let prefix = &start[..IDENTITY_PREFIX_LEN];
         let view: &'a TemporalStoreView<'db> = self.view;
         let mut slot = self.record_cursor.borrow_mut();
         let cursor = slot.get_or_insert_with(|| {
@@ -167,12 +247,12 @@ impl<'a, 'db> Backend<'a, 'db> {
         let reuse_lookahead = self.record_lookahead.replace(false)
             && cursor
                 .key()
-                .is_some_and(|key| key.starts_with(&prefix) && key >= start.as_slice());
+                .is_some_and(|key| key.starts_with(prefix) && key >= start.as_slice());
         if reuse_lookahead {
             #[cfg(feature = "query-profiling")]
             crate::query_profile::read_event(crate::query_profile::ReadEvent::LookaheadHit);
         } else {
-            cursor.seek(&start);
+            cursor.seek(start.as_slice());
             #[cfg(feature = "query-profiling")]
             crate::query_profile::read_event(crate::query_profile::ReadEvent::Seek);
         }
@@ -183,26 +263,46 @@ impl<'a, 'db> Backend<'a, 'db> {
             let Some((key, value)) = cursor.item() else {
                 break;
             };
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(prefix) {
                 self.record_lookahead.set(true);
                 break;
             }
             self.charge(key.len() + value.len())?;
             let _raw = budget.reserve(key.len() + value.len())?;
             let (valid, payload) = decode_revision(key, value, self.view.version).map_err(error)?;
+            revision_cache::capture(&mut builder, valid, value);
             if valid.from <= self.view.valid_time
                 && valid.to.is_none_or(|to| self.view.valid_time < to)
             {
                 self.check()?;
-                return payload
+                let result = payload
                     .map(|bytes| {
                         #[cfg(feature = "query-profiling")]
                         crate::query_profile::read_event(crate::query_profile::ReadEvent::Decode);
                         decode(bytes, budget)
                     })
-                    .transpose();
+                    .transpose()?;
+                if let Some(builder) = builder {
+                    self.view.revision_cache.insert(
+                        identity,
+                        self.view.version,
+                        self.view.snapshot.sequence_number(),
+                        builder,
+                        false,
+                    );
+                }
+                return Ok(result);
             }
             cursor.next();
+        }
+        if let Some(builder) = builder {
+            self.view.revision_cache.insert(
+                identity,
+                self.view.version,
+                self.view.snapshot.sequence_number(),
+                builder,
+                true,
+            );
         }
         Ok(None)
     }
@@ -291,66 +391,75 @@ impl<'a, 'db> QueryReadBackend for Backend<'a, 'db> {
         let view: &'a TemporalStoreView<'db> = self.view;
         // Take the cursor out before invoking a visitor. A nested scan can then
         // use a separate temporary cursor instead of panicking on a RefCell borrow.
-        let mut cursor = self
-            .adjacency_cursor
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| {
+        let list = (incoming, id);
+        let (mut cursor, resume) = match self.adjacency_cursor.borrow_mut().take() {
+            Some(previous) => {
+                // The cursor is at the first key after the completed list (or EOF).
+                // If it is already at or beyond this later prefix, there are no
+                // intervening keys to visit. Never advance through unrelated lists.
+                let resume = previous.list < list
+                    && previous
+                        .cursor
+                        .key()
+                        .is_none_or(|key| key >= prefix.as_slice());
+                (previous.cursor, resume)
+            }
+            None => {
                 #[cfg(feature = "query-profiling")]
                 crate::query_profile::read_event(
                     crate::query_profile::ReadEvent::AdjacencyIterator,
                 );
-                view.snapshot.raw_iterator()
-            });
-        let result = (|| -> crate::Result<()> {
-            cursor.seek(&prefix);
-            loop {
-                self.check()?;
-                check()?;
-                cursor.status()?;
-                let Some((key, value)) = cursor.item() else {
-                    break;
-                };
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                #[cfg(feature = "query-profiling")]
-                crate::query_profile::read_event(
-                    crate::query_profile::ReadEvent::AdjacencyCandidate,
-                );
-                self.charge(key.len() + value.len())?;
-                let _raw = budget.reserve(key.len() + value.len())?;
-                if key.len() != prefix.len() + 8 || value.len() != 8 {
-                    return Err(error(TemporalStoreError::Corrupt));
-                }
-                let first = decode_version(Some(value)).map_err(error)?;
-                if first == 0 || first > head {
-                    return Err(error(TemporalStoreError::Corrupt));
-                }
-                if first > self.view.version {
-                    cursor.next();
-                    continue;
-                }
-                let edge_id = u64::from_be_bytes(
-                    key[prefix.len()..]
-                        .try_into()
-                        .map_err(|_| error(TemporalStoreError::Corrupt))?,
-                );
-                let Some(edge) = self.get_edge(edge_id, budget)? else {
-                    cursor.next();
-                    continue;
-                };
-                if (if incoming { edge.to } else { edge.from }) == id
-                    && label.is_none_or(|label| edge.label == label)
-                {
-                    visit(edge)?;
-                }
-                cursor.next();
+                (view.snapshot.raw_iterator(), false)
             }
-            Ok(())
-        })();
-        *self.adjacency_cursor.borrow_mut() = Some(cursor);
-        result
+        };
+        if !resume {
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::AdjacencySeek);
+            cursor.seek(prefix);
+        }
+        loop {
+            self.check()?;
+            check()?;
+            cursor.status()?;
+            let Some((key, value)) = cursor.item() else {
+                break;
+            };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            #[cfg(feature = "query-profiling")]
+            crate::query_profile::read_event(crate::query_profile::ReadEvent::AdjacencyCandidate);
+            self.charge(key.len() + value.len())?;
+            let _raw = budget.reserve(key.len() + value.len())?;
+            if key.len() != prefix.len() + 8 || value.len() != 8 {
+                return Err(error(TemporalStoreError::Corrupt));
+            }
+            let first = decode_version(Some(value)).map_err(error)?;
+            if first == 0 || first > head {
+                return Err(error(TemporalStoreError::Corrupt));
+            }
+            if first > self.view.version {
+                cursor.next();
+                continue;
+            }
+            let edge_id = u64::from_be_bytes(
+                key[prefix.len()..]
+                    .try_into()
+                    .map_err(|_| error(TemporalStoreError::Corrupt))?,
+            );
+            let Some(edge) = self.get_edge(edge_id, budget)? else {
+                cursor.next();
+                continue;
+            };
+            if (if incoming { edge.to } else { edge.from }) == id
+                && label.is_none_or(|label| edge.label == label)
+            {
+                visit(edge)?;
+            }
+            cursor.next();
+        }
+        *self.adjacency_cursor.borrow_mut() = Some(CompletedAdjacency { list, cursor });
+        Ok(())
     }
 }
 
@@ -678,6 +787,8 @@ mod tests {
         let backend = Backend {
             view: &view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -697,6 +808,8 @@ mod tests {
         let expired = Backend {
             view: &view,
             deadline: Instant::now(),
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -748,6 +861,8 @@ mod tests {
         let backend = Backend {
             view: &view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(0),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -1018,6 +1133,8 @@ mod adjacency_limits {
         let backend = Backend {
             view: &view,
             deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+            control: None,
+            limits: crate::QueryBatchLimits::default(),
             rows: Cell::new(MAX_READ_REVISIONS),
             bytes: Cell::new(0),
             memo: Default::default(),
@@ -1131,6 +1248,8 @@ mod adjacency_atomicity {
             let backend = Backend {
                 view: &view,
                 deadline: Instant::now() + crate::GREMLIN_DEADLINE,
+                control: None,
+                limits: crate::QueryBatchLimits::default(),
                 rows: Cell::new(0),
                 bytes: Cell::new(0),
                 memo: Default::default(),

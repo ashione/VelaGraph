@@ -11,7 +11,7 @@ pub struct Interval {
     pub to: Option<ValidTime>,
 }
 impl Interval {
-    fn contains(self, t: ValidTime) -> bool {
+    pub(crate) fn contains(self, t: ValidTime) -> bool {
         self.from <= t && self.to.is_none_or(|end| t < end)
     }
     fn overlaps(self, other: Self) -> bool {

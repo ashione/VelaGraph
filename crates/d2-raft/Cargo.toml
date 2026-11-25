@@ -27,9 +27,9 @@ tonic-prost = "0.14"
 http-body = "1"
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
+tempfile = "3"
 
 [dev-dependencies]
 h2 = "0.4"
 checkpoint-object-store = { path = "../checkpoint-object-store" }
 object_store = { version = "=0.14.2", features = ["aws"] }
-tempfile = "3"

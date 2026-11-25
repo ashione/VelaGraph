@@ -24,7 +24,7 @@ Retries return `Duplicate`, conflicting operations or conditions return `Idempot
 are stable and bounded, scans enforce half-open ranges plus row/byte limits, and
 `StorageAdmin` provides export/import plus epoch advancement.
 
-This is deliberately not the full interface: transactions (`begin`), shard
+This is deliberately not the full interface: transactional reads, shard
 routing, split/transfer, follower reads, and mixed-shard rejection are not
 implemented, and the node has no leader/ownership identity yet (it never returns
 `NotLeader`; any caller that presents the stored epoch is accepted). The adapter
@@ -203,6 +203,49 @@ error, not a partially applied transaction.
 
 ### Single-shard transaction
 
+The local and in-process replicated adapters implement the optional write-only
+`StorageNode::begin_v1` extension. Begin validates the shard and epoch and
+captures the committed sequence. The local adapter holds the write lock for
+this operation. The replicated adapter performs a leader read barrier and
+reads shard metadata without copying the data partition. An already-managed
+shard rejects begin with `Unsupported`. If managed writes are enabled after
+begin, the state machine rejects the staged batch at commit.
+
+Each `stage` privately copies one opaque put or delete in order, up to 10,000
+operations and 16 MiB total key/value bytes.
+Any stage error discards the entire prefix and invalidates the handle.
+Abort and drop discard all staged writes. Empty commits are rejected.
+
+Commit checks the original epoch and sequence and publishes one synchronous
+conditional batch using the supplied request ID. An unrelated intervening write
+can cause a conflict. Deadline and cancellation are cooperative. The local
+adapter checks both under the write lock before native submission. Once submitted, the
+write can finish after the deadline. A native write failure returns
+`UnknownOutcome` with the request ID and performs no automatic retry.
+
+After `UnknownOutcome`, preserve the uncertainty. Do not replay the writes by
+calling `begin_v1` again, even with the same request ID. Commit consumes the
+handle, and a new begin captures the current shard sequence. If the original
+batch committed, its dedup record binds the ID to the original sequence, so
+replaying the same operations with the new sequence yields `IdempotencyConflict`.
+If the original batch did not commit, the new transaction can succeed against
+a later sequence and overwrite an intervening write. The transaction API
+provides no retry token carrying the original condition.
+
+On the replicated adapter, stage and abort are caller-local. Commit submits
+one D1V1 conditional batch to the same replica, with the original sequence,
+epoch and ID. The earlier of the caller deadline and adapter timeout bounds
+the wait. A caller deadline that closes the submission window before handoff
+returns `Deadline` and discards the batch. A timeout after handoff returns
+`UnknownOutcome` with that ID.
+A follower rejects begin with `NotLeader`. The adapter does not redirect writes.
+
+Process exit discards unpublished staging. The remote and routed adapters
+return `Unsupported` at begin. Cross-process protocol and recovery tests remain open
+under [#393](https://github.com/ashione/VelaGraph/issues/393).
+
+The broader transaction design also envisages reads inside a transaction:
+
 ```text
 begin(shard, epoch, options) -> TransactionHandle
 txn.get / txn.scan / txn.put / txn.delete
@@ -356,7 +399,8 @@ pub trait StorageNode: Send + Sync {
     fn batch_write(&self, request: WriteRequest) -> Result<WriteResult>;
     fn batch_write_conditional(&self, request: WriteRequest,
         expected_sequence: Option<Sequence>) -> Result<WriteResult>;
-    fn begin(&self, request: TransactionRequest) -> Result<Box<dyn Transaction>>;
+    fn begin_v1(&self, options: TransactionOptions)
+        -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError>;
     fn admin(&self) -> &dyn StorageAdmin;
 }
 ```

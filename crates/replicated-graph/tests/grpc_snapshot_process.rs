@@ -10,6 +10,7 @@ use replicated_graph::{
 };
 use std::{
     net::SocketAddr,
+    path::Path,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,6 +29,10 @@ use velagraph::{GraphRecordStore, Value, Vertex};
 
 const SHARD: u64 = 7;
 const BUDGET: Duration = Duration::from_secs(10);
+#[derive(Debug, thiserror::Error)]
+#[error("snapshot fixture seed vertex {0}/36")]
+struct SeedVertex(u64);
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -43,7 +48,7 @@ struct Cluster {
     _dirs: Vec<tempfile::TempDir>,
 }
 impl Cluster {
-    async fn start() -> anyhow::Result<Self> {
+    async fn start(scenario: &'static str) -> anyhow::Result<Self> {
         let mut reserved = Vec::new();
         for _ in 0..12 {
             reserved.push(TcpListener::bind("127.0.0.1:0").await?);
@@ -63,25 +68,28 @@ impl Cluster {
         let mut processes = Vec::new();
         for i in 0..3 {
             let mut command = typed_graph_node::command();
-            command.env("TOKIO_WORKER_THREADS", "2").args([
-                "--allow-insecure-development",
-                "--id",
-                &(i + 1).to_string(),
-                "--raft",
-                &addresses[4 * i].to_string(),
-                "--control",
-                &addresses[4 * i + 1].to_string(),
-                "--graph",
-                &addresses[4 * i + 2].to_string(),
-                "--grpc-snapshot",
-                &addresses[4 * i + 3].to_string(),
-                "--shard",
-                "7",
-                "--epoch",
-                "3",
-                "--data-dir",
-                dirs[i].path().to_str().context("data path")?,
-            ]);
+            command
+                .env(typed_graph_node::SCENARIO_ENV, scenario)
+                .env("TOKIO_WORKER_THREADS", "2")
+                .args([
+                    "--allow-insecure-development",
+                    "--id",
+                    &(i + 1).to_string(),
+                    "--raft",
+                    &addresses[4 * i].to_string(),
+                    "--control",
+                    &addresses[4 * i + 1].to_string(),
+                    "--graph",
+                    &addresses[4 * i + 2].to_string(),
+                    "--grpc-snapshot",
+                    &addresses[4 * i + 3].to_string(),
+                    "--shard",
+                    "7",
+                    "--epoch",
+                    "3",
+                    "--data-dir",
+                    dirs[i].path().to_str().context("data path")?,
+                ]);
             if i == 0 {
                 command.args(["--bootstrap", &members]);
             }
@@ -91,6 +99,16 @@ impl Cluster {
                     .stderr(Stdio::inherit())
                     .spawn()?,
             ));
+            // Own the child before emitting diagnostics so cleanup remains RAII.
+            eprintln!(
+                "{}",
+                typed_graph_node::child_mapping(
+                    scenario,
+                    std::process::id(),
+                    processes.last().unwrap().0.id(),
+                    (i + 1) as u64
+                )
+            );
         }
         let leader = timeout(Duration::from_secs(35), async {
             loop {
@@ -140,7 +158,7 @@ impl Cluster {
     fn grpc(&self) -> SocketAddr {
         self.addresses[4 * self.leader + 3]
     }
-    async fn seed(&self) -> anyhow::Result<()> {
+    async fn seed(&mut self, evidence_dir: Option<&Path>) -> anyhow::Result<()> {
         let node = RemoteStorageNode::new_identified(
             self.grpc(),
             self.identity().group,
@@ -159,7 +177,7 @@ impl Cluster {
                     .insert("payload".into(), Value::Text("x".repeat(64 * 1024)));
                 graph
                     .create_vertex(&vertex)
-                    .with_context(|| format!("snapshot fixture seed vertex {id}/36"))?;
+                    .with_context(|| SeedVertex(id))?;
             }
             Ok(())
         })
@@ -169,7 +187,37 @@ impl Cluster {
         if let Err(error) = result {
             // Observation only, after failure: never retry a mutation or treat
             // a later healthy status as proof that the failed barrier succeeded.
-            return Err(error.context(self.failure_status().await));
+            let children: Vec<_> = self
+                ._processes
+                .iter_mut()
+                .enumerate()
+                .map(|(i, child)| {
+                    let state = match child.0.try_wait() {
+                        Ok(None) => "running",
+                        Ok(Some(_)) => "exited",
+                        Err(_) => "unknown",
+                    };
+                    serde_json::json!({"node": i + 1, "pid": child.0.id(), "state": state})
+                })
+                .collect();
+            let status = self.failure_status().await;
+            if let Some(dir) = evidence_dir {
+                let observation = serde_json::json!({
+                    "phase": "snapshot_seed",
+                    "vertex": error.downcast_ref::<SeedVertex>().map(|step| step.0),
+                    "selected_leader": self.leader + 1,
+                    "children_after_error": children,
+                    "control_after_error": status,
+                });
+                let write = std::fs::File::create_new(dir.join("snapshot-seed-failure.json"))
+                    .and_then(|file| {
+                        serde_json::to_writer(file, &observation).map_err(std::io::Error::from)
+                    });
+                if let Err(capture) = write {
+                    eprintln!("snapshot seed evidence unavailable: {}", capture.kind());
+                }
+            }
+            return Err(error.context(status));
         }
         Ok(())
     }
@@ -302,18 +350,32 @@ async fn three_process_typed_snapshot_matches_tcp_and_reuses_channel() -> anyhow
     timeout(Duration::from_secs(180), differential()).await?
 }
 async fn differential() -> anyhow::Result<()> {
-    let mut cluster = Cluster::start().await?;
-    cluster.seed().await?;
-    let proxy = Proxy::start(cluster.grpc()).await?;
-    let client = SnapshotClient::connect(proxy.address, cluster.identity(), BUDGET).await?;
+    let mut cluster = Cluster::start("differential")
+        .await
+        .with_context(|| "snapshot differential: cluster-start")?;
+    let evidence = std::env::var_os("VELAGRAPH_REMOTE_EVIDENCE_DIR");
+    cluster
+        .seed(evidence.as_deref().map(Path::new))
+        .await
+        .with_context(|| "snapshot differential: seed")?;
+    let proxy = Proxy::start(cluster.grpc())
+        .await
+        .with_context(|| "snapshot differential: proxy-start")?;
+    let client = SnapshotClient::connect(proxy.address, cluster.identity(), BUDGET)
+        .await
+        .with_context(|| "snapshot differential: proxy-connect")?;
     let convenience = remote::open_snapshot(
         cluster.convenience(),
         Some(cluster.identity()),
         SHARD,
         BUDGET,
     )
-    .await?;
-    let grpc = client.open(SHARD, BUDGET).await?;
+    .await
+    .with_context(|| "snapshot differential: convenience-open")?;
+    let grpc = client
+        .open(SHARD, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: grpc-open")?;
     same_view(&convenience, &grpc);
     ensure!(grpc.bytes > remote::MAX_PAGE_BYTES);
     let (mut tc, mut gc) = (None, None);
@@ -327,11 +389,18 @@ async fn differential() -> anyhow::Result<()> {
             tc,
             BUDGET,
         )
-        .await?;
-        let b = client.page(grpc.clone(), gc.clone(), BUDGET).await?;
+        .await
+        .with_context(|| format!("snapshot differential: convenience-page page={pages}"))?;
+        let b = client
+            .page(grpc.clone(), gc.clone(), BUDGET)
+            .await
+            .with_context(|| format!("snapshot differential: grpc-page page={pages}"))?;
         assert_eq!(a.entries, b.entries);
         assert_eq!(a.next.is_some(), b.next.is_some());
-        let repeat = client.page(grpc.clone(), gc, BUDGET).await?;
+        let repeat = client
+            .page(grpc.clone(), gc, BUDGET)
+            .await
+            .with_context(|| format!("snapshot differential: grpc-repeat-page page={pages}"))?;
         assert_eq!(repeat.entries, b.entries);
         assert_eq!(repeat.next, b.next);
         total += b.entries.len();
@@ -353,9 +422,12 @@ async fn differential() -> anyhow::Result<()> {
         cluster.identity().node,
         SHARD,
         BUDGET,
-    )?;
+    )
+    .with_context(|| "snapshot differential: post-write-client")?;
     run_blocking(move || GraphRecordStore::new(node, SHARD, 0).create_vertex(&Vertex::new(999)))
-        .await??;
+        .await
+        .with_context(|| "snapshot differential: post-write999-task")?
+        .with_context(|| "snapshot differential: post-write999-operation")?;
     let a = remote::snapshot_page(
         cluster.convenience(),
         Some(cluster.identity()),
@@ -363,18 +435,31 @@ async fn differential() -> anyhow::Result<()> {
         None,
         BUDGET,
     )
-    .await?;
-    let b = client.page(grpc.clone(), None, BUDGET).await?;
+    .await
+    .with_context(|| "snapshot differential: convenience-replay-after-write")?;
+    let b = client
+        .page(grpc.clone(), None, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: grpc-replay-after-write")?;
     assert_eq!(a.entries, b.entries);
     assert_eq!(b.descriptor, grpc);
-    let latest = client.open(SHARD, BUDGET).await?;
+    let latest = client
+        .open(SHARD, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: latest-open")?;
     ensure!(latest.sequence > grpc.sequence);
     ensure!(latest.rows > grpc.rows);
-    client.close(latest, BUDGET).await?;
+    client
+        .close(latest, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: latest-close")?;
 
     // Abort after a response is held in the proxy. This tests cancellation at
     // the caller and subsequent session reuse, NOT server-side rollback.
-    proxy.paused.send(true)?;
+    proxy
+        .paused
+        .send(true)
+        .with_context(|| "snapshot differential: proxy-pause")?;
     let pending_client = client.clone();
     let pending_descriptor = grpc.clone();
     let pending =
@@ -384,9 +469,16 @@ async fn differential() -> anyhow::Result<()> {
         .context("page response reached proxy")?;
     pending.abort();
     assert!(pending.await.unwrap_err().is_cancelled());
-    proxy.paused.send(false)?;
+    proxy
+        .paused
+        .send(false)
+        .with_context(|| "snapshot differential: proxy-resume")?;
     assert_eq!(
-        client.page(grpc.clone(), None, BUDGET).await?.entries,
+        client
+            .page(grpc.clone(), None, BUDGET)
+            .await
+            .with_context(|| "snapshot differential: resumed-page")?
+            .entries,
         b.entries
     );
 
@@ -408,7 +500,9 @@ async fn differential() -> anyhow::Result<()> {
         group: 999,
         ..cluster.identity()
     };
-    let wrong_client = SnapshotClient::connect(cluster.grpc(), wrong, BUDGET).await?;
+    let wrong_client = SnapshotClient::connect(cluster.grpc(), wrong, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: wrong-identity-connect")?;
     assert!(matches!(
         wrong_client.open(SHARD, BUDGET).await,
         Err(RemoteError::InvalidArgument)
@@ -421,7 +515,8 @@ async fn differential() -> anyhow::Result<()> {
     assert_eq!(
         client
             .page(convenience.clone(), None, BUDGET)
-            .await?
+            .await
+            .with_context(|| "snapshot differential: grpc-cross-protocol-page")?
             .entries,
         a.entries
     );
@@ -433,7 +528,8 @@ async fn differential() -> anyhow::Result<()> {
             None,
             BUDGET
         )
-        .await?
+        .await
+        .with_context(|| "snapshot differential: convenience-cross-protocol-page")?
         .entries,
         b.entries
     );
@@ -445,7 +541,8 @@ async fn differential() -> anyhow::Result<()> {
         "http://{}",
         cluster.grpc()
     ))
-    .await?;
+    .await
+    .with_context(|| "snapshot differential: raw-client-connect")?;
     let context = wire::Context {
         version: 1,
         identity: Some(cluster.identity().into()),
@@ -500,7 +597,9 @@ async fn differential() -> anyhow::Result<()> {
         group: 0,
         node: (follower + 1) as u64,
     };
-    let fc = SnapshotClient::connect(cluster.addresses[4 * follower + 3], fi, BUDGET).await?;
+    let fc = SnapshotClient::connect(cluster.addresses[4 * follower + 3], fi, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: follower-connect")?;
     let fe = fc.open(SHARD, BUDGET).await;
     let te =
         remote::open_snapshot(cluster.addresses[4 * follower + 2], Some(fi), SHARD, BUDGET).await;
@@ -510,14 +609,18 @@ async fn differential() -> anyhow::Result<()> {
         }
         pair => anyhow::bail!("follower error mismatch: {pair:?}"),
     }
-    client.close(convenience.clone(), BUDGET).await?;
+    client
+        .close(convenience.clone(), BUDGET)
+        .await
+        .with_context(|| "snapshot differential: grpc-cross-close")?;
     remote::close_snapshot(
         cluster.convenience(),
         Some(cluster.identity()),
         grpc.clone(),
         BUDGET,
     )
-    .await?;
+    .await
+    .with_context(|| "snapshot differential: convenience-cross-close")?;
     assert!(matches!(
         client.page(grpc.clone(), None, BUDGET).await,
         Err(RemoteError::SessionUnavailable)
@@ -542,7 +645,9 @@ async fn differential() -> anyhow::Result<()> {
     let mut held = Vec::new();
     for i in 0..remote::MAX_SESSIONS {
         held.push(if i % 2 == 0 {
-            client.open(SHARD, BUDGET).await?
+            client.open(SHARD, BUDGET).await.with_context(|| {
+                format!("snapshot differential: admission-fill-grpc ordinal={i}")
+            })?
         } else {
             remote::open_snapshot(
                 cluster.convenience(),
@@ -550,17 +655,31 @@ async fn differential() -> anyhow::Result<()> {
                 SHARD,
                 BUDGET,
             )
-            .await?
+            .await
+            .with_context(|| {
+                format!("snapshot differential: admission-fill-convenience ordinal={i}")
+            })?
         });
     }
     assert!(matches!(
         client.open(SHARD, BUDGET).await,
         Err(RemoteError::ResourceExhausted)
     ));
-    client.close(held.pop().unwrap(), BUDGET).await?;
-    held.push(client.open(SHARD, BUDGET).await?);
-    for d in held {
-        client.close(d, BUDGET).await?;
+    client
+        .close(held.pop().unwrap(), BUDGET)
+        .await
+        .with_context(|| "snapshot differential: admission-release")?;
+    held.push(
+        client
+            .open(SHARD, BUDGET)
+            .await
+            .with_context(|| "snapshot differential: admission-reopen")?,
+    );
+    for (ordinal, d) in held.into_iter().enumerate() {
+        client
+            .close(d, BUDGET)
+            .await
+            .with_context(|| format!("snapshot differential: admission-close ordinal={ordinal}"))?;
     }
     assert_eq!(
         proxy.connections.load(Ordering::SeqCst),
@@ -569,19 +688,27 @@ async fn differential() -> anyhow::Result<()> {
     );
     // Hold all HTTP/2 response windows at zero. Permits must cover queued
     // response bodies, not just handler execution. No client consumes DATA.
-    let slow_descriptor = client.open(SHARD, BUDGET).await?;
-    let socket = TcpStream::connect(cluster.grpc()).await?;
+    let slow_descriptor = client
+        .open(SHARD, BUDGET)
+        .await
+        .with_context(|| "snapshot differential: slow-reader-open")?;
+    let socket = TcpStream::connect(cluster.grpc())
+        .await
+        .with_context(|| "snapshot differential: slow-reader-tcp-connect")?;
     let (mut sender, connection) = h2::client::Builder::new()
         .initial_window_size(0)
         .handshake(socket)
-        .await?;
+        .await
+        .with_context(|| "snapshot differential: slow-reader-h2-handshake")?;
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
     let mut blocked_responses = Vec::new();
     use prost::Message;
-    for _ in 0..remote::MAX_IN_FLIGHT {
-        sender = sender.ready().await?;
+    for ordinal in 0..remote::MAX_IN_FLIGHT {
+        sender = sender.ready().await.with_context(|| {
+            format!("snapshot differential: slow-reader-ready ordinal={ordinal}")
+        })?;
         let message = wire::PageRequest {
             context: Some(wire::Context {
                 version: 1,
@@ -602,10 +729,25 @@ async fn differential() -> anyhow::Result<()> {
                 cluster.grpc()
             ))
             .header("content-type", "application/grpc")
-            .body(())?;
-        let (response, mut send) = sender.send_request(request, false)?;
-        send.send_data(tonic::codegen::Bytes::from(frame), true)?;
-        let response = timeout(BUDGET, response).await??;
+            .body(())
+            .with_context(|| {
+                format!("snapshot differential: slow-reader-request-build ordinal={ordinal}")
+            })?;
+        let (response, mut send) = sender.send_request(request, false).with_context(|| {
+            format!("snapshot differential: slow-reader-send-request ordinal={ordinal}")
+        })?;
+        send.send_data(tonic::codegen::Bytes::from(frame), true)
+            .with_context(|| {
+                format!("snapshot differential: slow-reader-send-data ordinal={ordinal}")
+            })?;
+        let response = timeout(BUDGET, response)
+            .await
+            .with_context(|| {
+                format!("snapshot differential: slow-reader-response-timeout ordinal={ordinal}")
+            })?
+            .with_context(|| {
+                format!("snapshot differential: slow-reader-response ordinal={ordinal}")
+            })?;
         ensure!(
             response.headers().get("grpc-status").is_none(),
             "slow-reader page rejected before body"
@@ -623,11 +765,17 @@ async fn differential() -> anyhow::Result<()> {
         let pid = cluster._processes[cluster.leader].0.id();
         ensure!(Command::new("kill")
             .args(["-INT", &pid.to_string()])
-            .status()?
+            .status()
+            .with_context(|| "snapshot differential: shutdown-signal")?
             .success());
         timeout(Duration::from_secs(8), async {
             loop {
-                if cluster._processes[cluster.leader].0.try_wait()?.is_some() {
+                if cluster._processes[cluster.leader]
+                    .0
+                    .try_wait()
+                    .with_context(|| "snapshot differential: shutdown-poll")?
+                    .is_some()
+                {
                     break;
                 }
                 sleep(Duration::from_millis(20)).await;
@@ -635,7 +783,8 @@ async fn differential() -> anyhow::Result<()> {
             anyhow::Ok(())
         })
         .await
-        .context("flow-controlled node shutdown exceeded its bound")??;
+        .context("flow-controlled node shutdown exceeded its bound")?
+        .with_context(|| "snapshot differential: shutdown-operation")?;
     }
     drop(blocked_responses);
     driver.abort();
@@ -648,7 +797,7 @@ async fn differential() -> anyhow::Result<()> {
 #[ignore = "real server fixed 60-second expiry; extended transport validation"]
 async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()> {
     timeout(Duration::from_secs(120), async {
-        let cluster = Cluster::start().await?;
+        let cluster = Cluster::start("expiry").await?;
         let client = SnapshotClient::connect(cluster.grpc(), cluster.identity(), BUDGET).await?;
         let convenience = remote::open_snapshot(
             cluster.convenience(),
@@ -687,17 +836,37 @@ async fn three_process_tcp_and_grpc_expire_fixed_sessions() -> anyhow::Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seed_quorum_loss_preserves_stage_and_bounded_status_evidence() -> anyhow::Result<()> {
     timeout(Duration::from_secs(45), async {
-        let mut cluster = Cluster::start().await?;
+        let mut cluster = Cluster::start("quorum-loss").await?;
         for (i, process) in cluster._processes.iter_mut().enumerate() {
             if i != cluster.leader {
                 process.0.kill()?;
                 process.0.wait()?;
             }
         }
-        let error = timeout(Duration::from_secs(12), cluster.seed())
+        let dir = tempfile::tempdir()?;
+        let error = timeout(Duration::from_secs(12), cluster.seed(Some(dir.path())))
             .await?
             .expect_err("seed must not succeed without a quorum");
+        let record: serde_json::Value = serde_json::from_reader(std::fs::File::open(
+            dir.path().join("snapshot-seed-failure.json"),
+        )?)?;
+        ensure!(record["phase"] == "snapshot_seed" && record["vertex"] == 1);
+        ensure!(record["selected_leader"] == cluster.leader + 1);
+        let children = record["children_after_error"]
+            .as_array()
+            .context("missing children")?;
+        ensure!(children.len() == 3);
+        for (i, child) in children.iter().enumerate() {
+            ensure!(child["node"] == i + 1 && child["pid"] == cluster._processes[i].0.id());
+            let state = if i == cluster.leader {
+                "running"
+            } else {
+                "exited"
+            };
+            ensure!(child["state"] == state);
+        }
         let evidence = format!("{error:#}");
+        ensure!(record["control_after_error"] == error.to_string());
         ensure!(
             evidence.contains("seed vertex 1/36"),
             "missing seed stage: {evidence}"
@@ -803,7 +972,7 @@ async fn investigate_read_confirmation_scheduling_window() -> anyhow::Result<()>
         (180, 2, 50),
     ] {
         for attempt in 1..=3 {
-            let cluster = Cluster::start().await?;
+            let cluster = Cluster::start("read-confirmation").await?;
             let client =
                 SnapshotClient::connect(cluster.grpc(), cluster.identity(), BUDGET).await?;
             // Allow readiness traffic to finish before applying a controlled pause.
@@ -874,7 +1043,7 @@ async fn managed_inspect_status_recover_transient_quorum_without_replaying_write
             }
         }
     }
-    let cluster = Cluster::start().await?;
+    let cluster = Cluster::start("managed-confirmation").await?;
     let identity = cluster.identity();
     let endpoint = cluster.grpc();
     let mode = [43; 16];
@@ -999,5 +1168,124 @@ async fn managed_inspect_status_recover_transient_quorum_without_replaying_write
     ensure!(page.next.is_none());
     client.close(descriptor, BUDGET).await?;
 
+    Ok(())
+}
+
+// Pure diagnostic contracts only: these tests do not start nodes or issue RPCs.
+#[test]
+fn diagnostic_phase_context_preserves_original_error() {
+    let error = Err::<(), _>(RemoteError::Unavailable)
+        .with_context(|| format!("snapshot differential: grpc-page page={}", 7))
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<RemoteError>(),
+        Some(RemoteError::Unavailable)
+    ));
+    assert!(format!("{error:#}")
+        .starts_with("snapshot differential: grpc-page page=7: remote unavailable"));
+    let operation: anyhow::Result<()> = Err(RemoteError::Unavailable.into());
+    let task: anyhow::Result<anyhow::Result<()>> = Ok(operation);
+    let error = task
+        .with_context(|| "post-write999-task")
+        .unwrap()
+        .with_context(|| "post-write999-operation")
+        .unwrap_err();
+    assert_eq!(error.to_string(), "post-write999-operation");
+    assert!(matches!(
+        error.downcast_ref::<RemoteError>(),
+        Some(RemoteError::Unavailable)
+    ));
+    let task: anyhow::Result<anyhow::Result<()>> = Err(anyhow::anyhow!("synthetic task failure"));
+    assert_eq!(
+        task.with_context(|| "post-write999-task")
+            .unwrap_err()
+            .to_string(),
+        "post-write999-task"
+    );
+}
+
+#[test]
+#[ignore = "one controlled startup diagnostic, not the snapshot differential"]
+fn diagnostic_controlled_child_identity_failure() -> anyhow::Result<()> {
+    use std::io::Read;
+    let root = tempfile::tempdir()?;
+    let data = root.path().join("data");
+    std::fs::create_dir(&data)?;
+    std::fs::write(data.join("unmarked-data"), b"sentinel")?;
+    let log = root.path().join("child.stderr");
+    let mut command = typed_graph_node::command();
+    command
+        .env(typed_graph_node::SCENARIO_ENV, "differential")
+        .args([
+            "--allow-insecure-development",
+            "--id",
+            "1",
+            "--shard",
+            "7",
+            "--epoch",
+            "3",
+            "--raft",
+            "127.0.0.1:0",
+            "--control",
+            "127.0.0.1:0",
+            "--graph",
+            "127.0.0.1:0",
+            "--grpc-snapshot",
+            "127.0.0.1:0",
+            "--data-dir",
+            data.to_str().context("data path")?,
+        ]);
+    let mut child = Process(
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log)?))
+            .spawn()?,
+    );
+    let pid = child.0.id();
+    let parent = std::process::id();
+    let mapping = typed_graph_node::child_mapping("differential", parent, pid, 1);
+    assert_eq!(
+        mapping,
+        format!("snapshot_child scenario=differential parent_pid={parent} child_pid={pid} node=1")
+    );
+    eprintln!("{mapping}");
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        ensure!(
+            std::time::Instant::now() < end,
+            "controlled child exceeded watchdog"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    ensure!(!status.success(), "controlled child unexpectedly succeeded");
+    let mut bytes = Vec::new();
+    std::fs::File::open(&log)?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 65536,
+        "controlled child stderr exceeds bound"
+    );
+    let stderr = std::str::from_utf8(&bytes)?;
+    let marker = format!(
+        "snapshot_child_failure scenario=differential child_pid={pid} node=1 stage=identity"
+    );
+    ensure!(
+        stderr.lines().any(|line| line == marker),
+        "missing exact child marker"
+    );
+    ensure!(
+        stderr.contains("cannot bind graph identity to an unmarked nonempty data directory"),
+        "missing original identity refusal"
+    );
+    assert_eq!(std::fs::read(data.join("unmarked-data"))?, b"sentinel");
+    let entries = std::fs::read_dir(&data)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(entries, vec![std::ffi::OsString::from("unmarked-data")]);
+    eprintln!("{marker} observed_exit={status}");
     Ok(())
 }

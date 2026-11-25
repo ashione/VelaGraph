@@ -17,6 +17,7 @@ pub mod managed_submission_timing;
 pub mod remote;
 pub mod remote_storage;
 mod selected_properties;
+mod transaction;
 pub use remote_storage::RemoteStorageNode;
 pub mod routing;
 
@@ -33,8 +34,9 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use velagraph::{
     Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
-    Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
-    WriteResult, WriteStatus, MAX_VIEW_BYTES, MAX_VIEW_ROWS,
+    Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, StorageTransaction,
+    TransactionError, TransactionOptions, WriteOp, WriteRequest, WriteResult, WriteStatus,
+    MAX_VIEW_BYTES, MAX_VIEW_ROWS,
 };
 
 type Result<T> = std::result::Result<T, StorageNodeError>;
@@ -76,6 +78,8 @@ pub struct ReplicatedStorageNode {
     deadline: Duration,
     absolute_deadline: Option<Instant>,
     admission: Arc<Semaphore>,
+    #[cfg(test)]
+    before_transaction_handoff: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ReplicatedStorageNode {
@@ -98,6 +102,8 @@ impl ReplicatedStorageNode {
             deadline,
             absolute_deadline: None,
             admission: Arc::new(Semaphore::new(32)),
+            #[cfg(test)]
+            before_transaction_handoff: None,
         })
     }
 
@@ -116,13 +122,29 @@ impl ReplicatedStorageNode {
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
     {
-        self.check_execution_context()?;
-        let end = match self.absolute_deadline {
-            Some(end) => end,
+        self.dispatch_until(request_id, self.dispatch_deadline()?, future)
+    }
+
+    fn dispatch_deadline(&self) -> Result<Instant> {
+        match self.absolute_deadline {
+            Some(end) => Ok(end),
             None => Instant::now()
                 .checked_add(self.deadline)
-                .ok_or_else(|| StorageNodeError::InvalidArgument("deadline overflow".into()))?,
-        };
+                .ok_or_else(|| StorageNodeError::InvalidArgument("deadline overflow".into())),
+        }
+    }
+
+    fn dispatch_until<T, F>(
+        &self,
+        request_id: Option<RequestId>,
+        end: Instant,
+        future: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        self.check_execution_context()?;
         if Instant::now() >= end {
             return Err(StorageNodeError::Timeout { request_id });
         }
@@ -289,85 +311,103 @@ impl StorageNode for ReplicatedStorageNode {
         request: WriteRequest,
         expected_sequence: Option<Sequence>,
     ) -> Result<WriteResult> {
-        if request.shard != self.shard {
-            return Err(StorageNodeError::InvalidArgument(
-                "request belongs to a different shard".into(),
-            ));
-        }
-        // Preflight bounds before cloning/queueing; state machine still validates.
-        if request.operations.is_empty() {
-            return Err(StorageNodeError::InvalidArgument("empty batch".into()));
-        }
-        let bytes = request.operations.iter().fold(0usize, |n, op| match op {
-            WriteOp::Put { key, value } => n.saturating_add(key.len()).saturating_add(value.len()),
-            WriteOp::Delete { key } => n.saturating_add(key.len()),
-        });
-        if request.operations.len() > d2_raft::MAX_BATCH_OPERATIONS
-            || bytes > d2_raft::MAX_BATCH_BYTES
-        {
-            return Err(StorageNodeError::ResourceExhausted(
-                "D1 batch limit exceeded".into(),
-            ));
-        }
-        let id = request.request_id;
-        let shard = request.shard;
-        let epoch = request.epoch;
-        let raft = self.raft.clone();
-        let command = D1Command::Write(D1WriteRequest {
-            shard,
-            epoch,
-            request_id: id,
-            expected_sequence,
-            operations: request
-                .operations
-                .into_iter()
-                .map(|op| match op {
-                    WriteOp::Put { key, value } => d2_raft::WriteOp::Put { key, value },
-                    WriteOp::Delete { key } => d2_raft::WriteOp::Delete { key },
-                })
-                .collect(),
-        });
-        self.dispatch(Some(id), async move {
-            let response = raft
-                .client_write(LogCommand::D1V1(command))
-                .await
-                .map_err(|e| {
-                    if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
-                        StorageNodeError::NotLeader {
-                            leader: hint.leader_id,
-                        }
-                    } else {
-                        StorageNodeError::Unavailable(
-                            "Raft write failed; retry original identity if outcome is unknown"
-                                .into(),
-                        )
-                    }
-                })?;
-            let result = response
-                .data
-                .d1
-                .ok_or_else(|| StorageNodeError::Corrupt("missing D1 response".into()))?
-                .map_err(|e| application_error(e, shard, epoch, id))?;
-            match result {
-                D1Result::Write {
-                    sequence,
-                    status,
-                    applied_operations,
-                } => Ok(WriteResult {
-                    sequence,
-                    applied_operations,
-                    status: match status {
-                        D1WriteStatus::Committed => WriteStatus::Committed,
-                        D1WriteStatus::Duplicate => WriteStatus::Duplicate,
-                    },
-                }),
-                _ => Err(StorageNodeError::Corrupt("unexpected D1 response".into())),
-            }
-        })
+        let request = prepare_write(self.shard, request, expected_sequence)?;
+        self.dispatch(
+            Some(request.request_id),
+            replicate_write(self.raft.clone(), request),
+        )
+    }
+
+    fn begin_v1(
+        &self,
+        options: TransactionOptions,
+    ) -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError> {
+        self.begin_transaction(options)
     }
 
     fn admin(&self) -> &dyn StorageAdmin {
         self
+    }
+}
+
+fn prepare_write(
+    adapter_shard: ShardId,
+    request: WriteRequest,
+    expected_sequence: Option<Sequence>,
+) -> Result<D1WriteRequest> {
+    if request.shard != adapter_shard {
+        return Err(StorageNodeError::InvalidArgument(
+            "request belongs to a different shard".into(),
+        ));
+    }
+    // Preflight bounds before cloning/queueing; state machine still validates.
+    if request.operations.is_empty() {
+        return Err(StorageNodeError::InvalidArgument("empty batch".into()));
+    }
+    let bytes = request.operations.iter().fold(0usize, |n, op| match op {
+        WriteOp::Put { key, value } => n.saturating_add(key.len()).saturating_add(value.len()),
+        WriteOp::Delete { key } => n.saturating_add(key.len()),
+    });
+    if request.operations.len() > d2_raft::MAX_BATCH_OPERATIONS || bytes > d2_raft::MAX_BATCH_BYTES
+    {
+        return Err(StorageNodeError::ResourceExhausted(
+            "D1 batch limit exceeded".into(),
+        ));
+    }
+    Ok(D1WriteRequest {
+        shard: request.shard,
+        epoch: request.epoch,
+        request_id: request.request_id,
+        expected_sequence,
+        operations: request
+            .operations
+            .into_iter()
+            .map(|op| match op {
+                WriteOp::Put { key, value } => d2_raft::WriteOp::Put { key, value },
+                WriteOp::Delete { key } => d2_raft::WriteOp::Delete { key },
+            })
+            .collect(),
+    })
+}
+
+async fn replicate_write(
+    raft: openraft::Raft<TypeConfig>,
+    request: D1WriteRequest,
+) -> Result<WriteResult> {
+    let (shard, epoch, id) = (request.shard, request.epoch, request.request_id);
+    let response = raft
+        .client_write(LogCommand::D1V1(D1Command::Write(request)))
+        .await
+        .map_err(|e| {
+            if let Some(hint) = e.forward_to_leader::<openraft::BasicNode>() {
+                StorageNodeError::NotLeader {
+                    leader: hint.leader_id,
+                }
+            } else {
+                StorageNodeError::Unavailable(
+                    "Raft write failed; retry original identity if outcome is unknown".into(),
+                )
+            }
+        })?;
+    let result = response
+        .data
+        .d1
+        .ok_or_else(|| StorageNodeError::Corrupt("missing D1 response".into()))?
+        .map_err(|e| application_error(e, shard, epoch, id))?;
+    match result {
+        D1Result::Write {
+            sequence,
+            status,
+            applied_operations,
+        } => Ok(WriteResult {
+            sequence,
+            applied_operations,
+            status: match status {
+                D1WriteStatus::Committed => WriteStatus::Committed,
+                D1WriteStatus::Duplicate => WriteStatus::Duplicate,
+            },
+        }),
+        _ => Err(StorageNodeError::Corrupt("unexpected D1 response".into())),
     }
 }
 

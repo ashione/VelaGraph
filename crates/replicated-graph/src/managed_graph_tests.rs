@@ -1768,6 +1768,33 @@ async fn actual_durable_gateway_uses_retained_control_with_lost_acks_and_reopen(
             visible: true
         })
     );
+    // The byte-bound recovery inputs must preserve the original request archive
+    // as well as the resolved terminal prefix. Inspect only an offline copy.
+    let recovery = tempfile::tempdir().unwrap();
+    let inputs = recovery.path().join("inputs");
+    d2_raft::cohort_inputs::capture(
+        &inputs,
+        &authority(),
+        &cohort,
+        4,
+        &reopened[0],
+        &[&reopened[1], &reopened[2]],
+    )
+    .await
+    .unwrap();
+    let offline = recovery.path().join("offline");
+    d2_raft::restore_physical_checkpoint(inputs.join("9"), &offline, 9, 1).unwrap();
+    assert!(offline.join("RESTORED_OFFLINE_ONLY").is_file());
+    let recovered_state = d2_raft::StateMachine::open(offline.join("state.db")).unwrap();
+    let lookup = recovered_state
+        .coordinator_request(9, 1, [9; 16], [222; 16])
+        .await
+        .unwrap();
+    let record = lookup.record.unwrap().record;
+    assert_eq!(record.id, [222; 16]);
+    assert_eq!(record.transaction_id, admitted.id());
+    assert_eq!(record.request, bytes);
+    assert_eq!(record.payload, admitted.durable_bytes().unwrap());
     for (node, shard) in reopened.iter().zip([9, 7, 8]) {
         cluster.in_group(shard).shutdown(node).await;
     }
@@ -1939,3 +1966,310 @@ async fn member_parallelism_is_checked_without_contacting_endpoints() {
 
 #[path = "managed_temporal_tests.rs"]
 mod temporal_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_cohort_inputs_verify_decisions_after_all_sources_stop() -> anyhow::Result<()> {
+    use d2_raft::cohort_inputs::{capture, verify};
+    use std::fs;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path();
+    let live = tempfile::tempdir()?;
+    let cluster = Cluster::new();
+    let durable = |shard| {
+        let group = cluster.in_group(shard);
+        let data = live.path().join(format!("live-{shard}"));
+        async move { initialize(group.start_durable(1, data).await.unwrap(), shard).await }
+    };
+    let c = durable(9).await;
+    let a = durable(7).await;
+    let b = durable(8).await;
+    let g = graph(&c, &a, &b);
+    let lag = path.join("lag");
+    b.physical_checkpoint(&lag).await?;
+    let plan = snapshot(&g)
+        .await
+        .prepare_vertex(7, &Vertex::new(1))
+        .unwrap();
+    assert!(matches!(
+        g.execute(&plan).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    let aborted = snapshot(&g)
+        .await
+        .prepare_vertex(8, &Vertex::new(2))
+        .unwrap();
+    assert!(matches!(
+        g.abort(&aborted).await.unwrap(),
+        Outcome::Aborted { visible: true, .. }
+    ));
+    assert_eq!(snapshot(&g).await.version().unwrap(), 2);
+
+    // Leave a real unresolved ordinal after the cut; it cannot be certified.
+    let hole = snapshot(&g)
+        .await
+        .prepare_vertex(7, &Vertex::new(3))
+        .unwrap();
+    g.command(Command::Begin {
+        id: hole.id,
+        participants: hole.parts.iter().map(|p| p.descriptor.clone()).collect(),
+    })
+    .await
+    .unwrap();
+    let auth = authority();
+    let cohort = binding();
+    let root = path.join("retained");
+    assert!(capture(&root, &auth, &cohort, u64::MAX, &c, &[&a, &b])
+        .await
+        .is_err());
+    assert!(capture(&root, &auth, &cohort, 2, &c, &[&b, &a])
+        .await
+        .is_err());
+    assert!(!root.exists());
+    capture(&root, &auth, &cohort, 2, &c, &[&a, &b]).await?;
+    assert!(capture(&root, &auth, &cohort, 2, &c, &[&a, &b])
+        .await
+        .is_err());
+
+    // Same identities and version, same first transaction, opposite decision.
+    // Shard 8 is a nonparticipant for that transaction in both histories.
+    let other = Cluster::new();
+    let oc = start(&other, 9).await;
+    let oa = start(&other, 7).await;
+    let ob = initialize(
+        other
+            .in_group(8)
+            .start_durable(1, live.path().join("other-8"))
+            .await?,
+        8,
+    )
+    .await;
+    assert!(matches!(
+        graph(&oc, &oa, &ob).abort(&plan).await.unwrap(),
+        Outcome::Aborted { visible: true, .. }
+    ));
+    let divergent = path.join("divergent");
+    ob.physical_checkpoint(&divergent).await?;
+
+    // Drive the real future until the coordinator is durable, then cancel it
+    // at that poll boundary. No timer race or detached capture task.
+    let cancelled = path.join("cancelled");
+    let members = [&a, &b];
+    let mut attempt = Box::pin(capture(&cancelled, &auth, &cohort, 2, &c, &members));
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        use std::task::Poll;
+        assert!(
+            attempt.as_mut().poll(cx).is_pending(),
+            "capture ran past cancellation"
+        );
+        if cancelled.join("9/checkpoint.json").is_file() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    drop(attempt);
+    assert!(cancelled.join("RESTORED_OFFLINE_ONLY").is_file());
+    assert!(Cluster::new().start_durable(1, &cancelled).await.is_err());
+    assert!(!cancelled.join("raft-group.json").exists());
+    assert!(!cancelled.join("7").exists() && !cancelled.join("8").exists());
+    d2_raft::verify_physical_checkpoint(cancelled.join("9"), 9, 1)?;
+    assert!(verify(&cancelled, &auth, &cohort, 2, 1, &[1, 1])
+        .await
+        .is_err());
+
+    // In-memory member 7 cannot be captured. Earlier physical roots survive.
+    let partial = path.join("partial");
+    let failure = capture(&partial, &auth, &cohort, 2, &c, &[&oa, &b])
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("group 7"));
+    assert!(partial.join("9/checkpoint.json").is_file());
+    assert!(verify(&partial, &auth, &cohort, 2, 1, &[1, 1])
+        .await
+        .is_err());
+    for node in [&c, &a, &b, &oc, &oa, &ob] {
+        node.raft.shutdown().await?;
+    }
+    drop((c, a, b, oc, oa, ob));
+    live.close()?;
+
+    verify(&root, &auth, &cohort, 1, 1, &[1, 1]).await?;
+    verify(&root, &auth, &cohort, 2, 1, &[1, 1]).await?;
+    let unresolved = verify(&root, &auth, &cohort, 3, 1, &[1, 1])
+        .await
+        .unwrap_err();
+    assert!(
+        unresolved.to_string().contains("VisibilityUnresolved"),
+        "{unresolved:#}"
+    );
+    assert!(verify(&root, &auth, &cohort, 2, 1, &[1]).await.is_err());
+    assert!(verify(&root, &auth, &cohort, 2, 1, &[1, 2]).await.is_err());
+    let mut wrong = cohort.clone();
+    wrong.members[0].epoch += 1;
+    assert!(verify(&root, &auth, &wrong, 2, 1, &[1, 1]).await.is_err());
+    let mut wrong = auth.clone();
+    wrong.mode = [42; 16];
+    assert!(verify(&root, &wrong, &cohort, 2, 1, &[1, 1]).await.is_err());
+
+    fs::rename(root.join("8"), path.join("genuine-8"))?;
+    fs::rename(&lag, root.join("8"))?;
+    let stale = verify(&root, &auth, &cohort, 1, 1, &[1, 1])
+        .await
+        .unwrap_err();
+    assert!(
+        stale.to_string().contains("lagging visibility"),
+        "{stale:#}"
+    );
+    fs::rename(root.join("8"), lag)?;
+    fs::rename(divergent, root.join("8"))?;
+    let mismatch = verify(&root, &auth, &cohort, 1, 1, &[1, 1])
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch
+            .to_string()
+            .contains("group 8 terminal prefix: VisibilityHistory"),
+        "{mismatch:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn published_prefix_generation_survives_restart() -> anyhow::Result<()> {
+    use d2_raft::cohort_inputs::generation::{prepare, verify};
+    use std::{env, fs, process};
+
+    let auth = authority();
+    let cohort = binding();
+    if let Some(root) = env::var_os("VELA_TEST_PUBLISHED_PREFIX_ROOT") {
+        let receipt = serde_json::from_str(&env::var("VELA_TEST_PUBLISHED_PREFIX_DIGEST")?)?;
+        verify(std::path::Path::new(&root), receipt, &auth, &cohort, 1).await?;
+        println!("verified selected generation in child");
+        return Ok(());
+    }
+
+    let backup = tempfile::tempdir()?;
+    let live = tempfile::tempdir()?;
+    let cluster = Cluster::new();
+    let durable = |shard| {
+        let group = cluster.in_group(shard);
+        let path = live.path().join(shard.to_string());
+        async move { initialize(group.start_durable(1, path).await.unwrap(), shard).await }
+    };
+    let c = durable(9).await;
+    let a = durable(7).await;
+    let b = durable(8).await;
+    let graph = graph(&c, &a, &b);
+    let members = [&a, &b];
+    let root = backup.path().join("first");
+    let other = start(&Cluster::new(), 8).await;
+    let mixed = prepare(&root, &auth, &cohort, 0, &c, &[&a, &other]).await;
+    assert!(mixed.err().unwrap().to_string().contains("registries"));
+    assert!(!root.exists());
+    other.raft.shutdown().await?;
+
+    let write = snapshot(&graph)
+        .await
+        .prepare_vertex(7, &Vertex::new(10))
+        .unwrap();
+    assert!(matches!(
+        graph.execute(&write).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    let partial = backup.path().join("unresolved");
+    assert!(prepare(&partial, &auth, &cohort, 2, &c, &members)
+        .await?
+        .publish()
+        .await
+        .is_err());
+    assert!(!partial.join("prefix-generation.json").exists());
+
+    let first = prepare(&root, &auth, &cohort, 1, &c, &members).await?;
+    let receipt = first.digest();
+    assert!(verify(&root, receipt, &auth, &cohort, 1).await.is_err());
+    let file = root.join("8/state.db/CURRENT");
+    let removed = backup.path().join("removed");
+    fs::rename(&file, &removed)?;
+    assert!(first.publish().await.is_err());
+    assert!(!root.join("prefix-generation.json").exists());
+    fs::rename(&removed, &file)?;
+    first.publish().await?;
+    first.publish().await?;
+    assert!(verify(&root, receipt, &auth, &cohort, 0).await.is_err());
+    let write = snapshot(&graph)
+        .await
+        .prepare_vertex(8, &Vertex::new(11))
+        .unwrap();
+    assert!(matches!(
+        graph.execute(&write).await.unwrap(),
+        Outcome::Committed { visible: true, .. }
+    ));
+    let second_root = backup.path().join("second");
+    let second = prepare(&second_root, &auth, &cohort, 1, &c, &members).await?;
+    second.publish().await?;
+
+    for node in [&c, &a, &b] {
+        node.raft.shutdown().await?;
+    }
+    drop((c, a, b));
+    live.close()?;
+    let test = std::thread::current().name().unwrap().to_owned();
+    let child = process::Command::new(env::current_exe()?)
+        .args(["--exact", &test, "--nocapture"])
+        .env("VELA_TEST_PUBLISHED_PREFIX_ROOT", &root)
+        .env(
+            "VELA_TEST_PUBLISHED_PREFIX_DIGEST",
+            serde_json::to_string(&receipt)?,
+        )
+        .output()?;
+    assert!(
+        child.status.success()
+            && String::from_utf8_lossy(&child.stdout)
+                .contains("verified selected generation in child"),
+        "child stdout={} stderr={}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    // Both complete generations certify the same V. Even a semantically valid
+    // member from the other capture must fail the pinned physical digest.
+    verify(&second_root, second.digest(), &auth, &cohort, 1).await?;
+    assert!(verify(&second_root, receipt, &auth, &cohort, 1)
+        .await
+        .is_err());
+    let original = backup.path().join("original");
+    fs::rename(root.join("8"), &original)?;
+    fs::rename(second_root.join("8"), root.join("8"))?;
+    d2_raft::cohort_inputs::verify(&root, &auth, &cohort, 1, 1, &[1, 1]).await?;
+    assert!(verify(&root, receipt, &auth, &cohort, 1)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("physical checkpoint generation mismatch"));
+    fs::rename(root.join("8"), second_root.join("8"))?;
+    fs::rename(original, root.join("8"))?;
+
+    fs::rename(&file, &removed)?;
+    assert!(verify(&root, receipt, &auth, &cohort, 1).await.is_err());
+    fs::rename(removed, file)?;
+    verify(&root, receipt, &auth, &cohort, 1).await?;
+
+    let manifest = root.join("prefix-generation.json");
+    fs::write(&manifest, b"interrupted")?;
+    assert!(first.publish().await.is_err());
+    assert_eq!(fs::read(manifest)?, b"interrupted");
+    assert!(verify(&root, receipt, &auth, &cohort, 1).await.is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[path = "remote_prefix_cleanup_tests.rs"]
+mod remote_prefix_cleanup_tests;
+
+#[path = "remote_prefix_generation_tests.rs"]
+mod remote_prefix_generation_tests;
+
+#[path = "offline_cohort_restore_tests.rs"]
+mod offline_cohort_restore_tests;

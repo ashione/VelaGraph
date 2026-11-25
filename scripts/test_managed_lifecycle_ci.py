@@ -12,6 +12,7 @@ import struct
 import warnings
 import zipfile
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -370,6 +371,7 @@ class HandoffFixture:
         lock = 'version = 4\n'
         for name, path in [('velagraph', 'Cargo.toml'),
                            ('d2-raft', 'crates/d2-raft/Cargo.toml'),
+                           ('checkpoint-object-store', 'crates/checkpoint-object-store/Cargo.toml'),
                            ('replicated-graph', 'crates/replicated-graph/Cargo.toml')]:
             files[path] = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
             lock += f'\n[[package]]\nname = "{name}"\nversion = "0.1.0"\n'
@@ -458,7 +460,8 @@ class HandoffFixture:
 
 class GateTests(unittest.TestCase):
     def run_fixture(self, root, out, test_output=None, exit_code=0, mutate=None,
-                    build_exit=0, artifact_mutate=None, mutate_artifacts=None):
+                    build_exit=0, artifact_mutate=None, mutate_artifacts=None,
+                    mode='runtime', mutate_runtime=None):
         fixture = HandoffFixture(root)
         selected, binary = fixture.selected, fixture.binary
         calls = []
@@ -471,10 +474,16 @@ class GateTests(unittest.TestCase):
                 fixture.records[-1]['success'] = build_exit == 0
                 stdout.write(''.join(json.dumps(row) + '\n' for row in fixture.records))
                 return subprocess.CompletedProcess(command, build_exit)
-            self.assertEqual(command, [str(out / 'managed_process'), gate.TEST, '--exact',
+            test = gate.PR_TEST if mode == 'runtime-pr' else gate.TEST
+            self.assertEqual(command, [str(out / 'managed_process'), test, '--exact',
                                       '--nocapture', '--test-threads=1', '--format=pretty', '--color=never'])
             self.assertEqual(pathlib.Path(command[0]).read_bytes(), binary.read_bytes())
             self.assertTrue(os.access(command[0], os.X_OK))
+            if mode == 'runtime-pr':
+                stdout.write(output(name=test) if test_output is None else test_output)
+                if mutate_runtime:
+                    mutate_runtime(root, pathlib.Path(command[0]))
+                return subprocess.CompletedProcess(command, exit_code)
             self.assertEqual(env['BYTE_BOUND_PROCESS_ELF_SHA256'], gate.sha256(binary))
             stdout.write(output() if test_output is None else test_output)
             saved = checkpoint(command[0], env['BYTE_BOUND_PROCESS_DIRECTORY'],
@@ -491,8 +500,60 @@ class GateTests(unittest.TestCase):
             gate.run_gate(root, fixture.build, 'build')
         fixture.download_build()
         with fixture.context(), patch.object(gate.subprocess, 'run', side_effect=fake_run):
-            gate.run_gate(root, out, 'runtime', fixture.archive)
+            gate.run_gate(root, out, mode, fixture.archive)
         return calls
+
+    def test_pr_short_gate_reuses_verified_handoff_without_a_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            out = root / 'results'
+            calls = self.run_fixture(root, out, mode='runtime-pr')
+            self.assertEqual(len(calls), 2)  # One build, one exact existing test.
+            execution = json.loads((out / 'execution.json').read_text())
+            self.assertEqual(execution['status'], 'PR_RECOVERY_COMPLETE')
+            self.assertEqual(execution['acceptance_tier'], 'pr-short')
+            self.assertEqual(execution['test'], gate.PR_TEST)
+            self.assertFalse((out / 'lifecycle').exists())
+            self.assertIn('not the 1025-write boundary acceptance', (out / 'summary.md').read_text())
+            self.assertIn('acceptance-tier=pr-short\n', (root / 'target/github-output').read_text())
+
+    def test_pr_short_gate_rejects_wrong_test_skip_failure_and_changed_source_or_elf(self):
+        cases = [{'test_output': output()},  # The long test cannot impersonate the short tier.
+                 {'test_output': output(name=gate.PR_TEST, running=0, passed=0)},
+                 {'test_output': output(name=gate.PR_TEST, result='ignored', passed=0, ignored=1)},
+                 {'exit_code': 7},
+                 {'mutate_runtime': lambda root, elf: elf.write_bytes(b'changed')},
+                 {'mutate_runtime': lambda root, elf: (root / 'Cargo.lock').write_text('changed')}]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                out = root / 'results'
+                with self.assertRaises(ValueError):
+                    self.run_fixture(root, out, mode='runtime-pr', **case)
+                self.assertEqual(json.loads((out / 'execution.json').read_text())['status'], 'INCOMPLETE')
+                self.assertNotIn('acceptance-tier=', (root / 'target/github-output').read_text())
+
+    def test_short_mode_cannot_run_on_main_schedule_or_manual_events(self):
+        for event in ('push', 'schedule', 'workflow_dispatch', '', 'pull_request_target'):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                with patch.dict(os.environ, {'GITHUB_EVENT_NAME': event}), \
+                        patch.object(gate.subprocess, 'run') as run, self.assertRaises(ValueError):
+                    gate.run_gate(root, root / 'results', 'runtime-pr', root / 'handoff.zip')
+                run.assert_not_called()
+                self.assertFalse((root / 'results').exists())
+
+    def test_pr_short_gate_rejects_corrupt_handoff_before_materializing_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fixture = HandoffFixture(root).prepare()
+            fixture.change_payload('managed_process', lambda data: b'not-an-ELF')
+            out = root / 'results'
+            with fixture.context(), patch.object(gate.subprocess, 'run') as run, \
+                    self.assertRaises(ValueError):
+                gate.run_gate(root, out, 'runtime-pr', fixture.archive)
+            run.assert_not_called()
+            self.assertFalse((out / 'managed_process').exists())
 
     def test_fresh_complete_run_preserves_exact_frozen_elf_and_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -678,6 +739,7 @@ class HandoffTests(unittest.TestCase):
                  ('Cargo.lock', lambda raw: raw + b'\n# changed\n'),
                  ('cargo-root.toml', lambda raw: raw.replace(b'0.1.0', b'0.1.1')),
                  ('cargo-replicated-graph.toml', lambda raw: raw + b'\n# changed\n'),
+                 ('cargo-checkpoint-object-store.toml', lambda raw: raw + b'\n# changed\n'),
                  ('dependencies.json', change_json(lambda v: v['compiled'].pop())),
                  ('dependencies.json', change_json(lambda v: v.update(lock_sha256='f' * 64))),
                  ('dependencies.json', change_json(lambda v: v['compiled'][0].update(features=['extra']))),
@@ -808,13 +870,29 @@ class HandoffTests(unittest.TestCase):
                     self.assert_rejected_before_execution(fixture)
 
     def test_aggregate_rejects_every_non_success_result(self):
-        gate.validate_results('success', 'success', 'success')
+        gate.validate_results('success', 'success', 'success', 'push', 'full-1025')
         for index in range(3):
             for result in ('failure', 'cancelled', 'skipped', '', None):
                 results = ['success'] * 3
                 results[index] = result
                 with self.subTest(results=results), self.assertRaises(ValueError):
-                    gate.validate_results(*results)
+                    gate.validate_results(*results, 'push', 'full-1025')
+
+    def test_aggregate_requires_exact_tier_for_each_event(self):
+        for event, expected in [('pull_request', 'pr-short'), ('push', 'full-1025'),
+                                ('schedule', 'full-1025'), ('workflow_dispatch', 'full-1025')]:
+            gate.validate_results('success', 'success', 'success', event, expected)
+            for tier in ('pr-short', 'full-1025', '', None, 'unknown'):
+                if tier == expected:
+                    continue
+                with self.subTest(event=event, tier=tier), self.assertRaises(ValueError):
+                    gate.validate_results('success', 'success', 'success', event, tier)
+            for result in ('failure', 'cancelled', 'skipped', '', None):
+                with self.subTest(event=event, result=result), self.assertRaises(ValueError):
+                    gate.validate_results('success', result, 'success', event, expected)
+        for event in ('', None, 'pull_request_target', 'unknown'):
+            with self.subTest(event=event), self.assertRaises(ValueError):
+                gate.validate_results('success', 'success', 'success', event, 'full-1025')
 
     def test_clean_checkout_and_event_sha_are_independently_required(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -861,6 +939,7 @@ class HandoffTests(unittest.TestCase):
         builder = text.split('  lifecycle-build:', 1)[1].split('  lifecycle:', 1)[0]
         runtime = text.split('  lifecycle:', 1)[1].split('  scenario:', 1)[0]
         aggregate = text.split('  full-scale:', 1)[1]
+        self.assertIn('    name: Retained 1025-write release lifecycle\n', runtime)
         self.assertIn('needs: [lifecycle-build]', runtime)
         self.assertIn('timeout-minutes: 90', runtime)
         self.assertIn('artifact-id: ${{ steps.upload_handoff.outputs.artifact-id }}', builder)
@@ -883,7 +962,52 @@ class HandoffTests(unittest.TestCase):
         self.assertIn('needs: [lifecycle-build, lifecycle, scenario]', aggregate)
         self.assertIn('if: always()', aggregate)
         self.assertIn('--mode aggregate', aggregate)
+        self.assertIn('pull_request) mode=runtime-pr ;;', runtime)
+        self.assertIn('push|schedule|workflow_dispatch) mode=runtime ;;', runtime)
+        self.assertIn('*) echo \'Unsupported lifecycle event\' >&2; exit 1 ;;', runtime)
+        self.assertIn('acceptance-tier: ${{ steps.managed_lifecycle.outputs.acceptance-tier }}', runtime)
+        self.assertIn('LIFECYCLE_ACCEPTANCE_TIER: ${{ needs.lifecycle.outputs.acceptance-tier }}', aggregate)
         self.assertNotIn('continue-on-error', text)
+
+    def test_full_validation_runs_cannot_replace_running_or_pending_runs(self):
+        workflow = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()
+        concurrency = workflow.split('\nconcurrency:\n', 1)[1].split('\nenv:', 1)[0]
+        settings = [line.strip() for line in concurrency.splitlines()
+                    if line.strip() and not line.lstrip().startswith('#')]
+        # cancel-in-progress=false alone is insufficient: a shared group can
+        # still replace a pending run. Full runs must have distinct run IDs.
+        self.assertEqual(settings, [
+            "group: corehr-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}",
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+        ])
+
+    def test_workflow_runtime_shell_selects_exact_mode_and_rejects_unknown_events(self):
+        workflow = (pathlib.Path(__file__).resolve().parents[1] / '.github/workflows/corehr.yml').read_text()
+        step = workflow.split('      - name: Verify event-specific lifecycle in release\n', 1)[1]
+        script = textwrap.dedent(step.split('        run: |\n', 1)[1].split('      - name:', 1)[0])
+        for event, mode in [('pull_request', 'runtime-pr'), ('push', 'runtime'),
+                            ('schedule', 'runtime'), ('workflow_dispatch', 'runtime'),
+                            ('pull_request_target', None), ('', None)]:
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                command = root / 'python3'
+                command.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$LIFECYCLE_TEST_ARGS"\n')
+                command.chmod(0o755)
+                capture = root / 'args'
+                env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ.get('PATH', ''),
+                       'GITHUB_EVENT_NAME': event, 'RUNNER_TEMP': str(root),
+                       'LIFECYCLE_TEST_ARGS': str(capture)}
+                result = subprocess.run(['/bin/bash', '-e', '-c', script], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if mode is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(capture.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    self.assertEqual(capture.read_text().splitlines(),
+                                     ['scripts/managed_lifecycle_ci.py', 'managed-lifecycle-ci-results',
+                                      '--mode', mode, '--handoff',
+                                      str(root / 'managed-lifecycle-handoff/handoff.zip')])
 
 
 class RunnerMetadataTests(unittest.TestCase):
