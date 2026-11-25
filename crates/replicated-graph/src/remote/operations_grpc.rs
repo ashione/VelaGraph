@@ -239,6 +239,17 @@ impl Client {
         self
     }
     pub(in crate::remote) async fn call(&mut self, op: Operation) -> Result<Reply, RemoteError> {
+        self.exchange(op, || Ok(())).await?
+    }
+
+    // Outer errors cover transport, deadlines and decoding. The inner result
+    // comes from the identified server. A transaction needs this distinction
+    // when its request was sent but its response cannot be trusted.
+    async fn exchange(
+        &mut self,
+        op: Operation,
+        before_send: impl FnOnce() -> Result<(), RemoteError>,
+    ) -> Result<Result<Reply, RemoteError>, RemoteError> {
         #[cfg(test)]
         let total = Instant::now();
         let end = self.absolute_deadline.map_or_else(
@@ -281,6 +292,7 @@ impl Client {
             phase(self.identity.group, Phase::ClientPrepare, measured);
             #[cfg(test)]
             let measured = Instant::now();
+            before_send()?;
             let response = client
                 .call(request)
                 .await
@@ -294,7 +306,7 @@ impl Client {
             logical_response(&result, end)?;
             #[cfg(test)]
             phase(self.identity.group, Phase::ClientFinish, measured);
-            result
+            Ok(result.map_err(|e| retain_id(e, id)))
         };
         let result = timeout_at(end, future)
             .await
@@ -303,6 +315,36 @@ impl Client {
         #[cfg(test)]
         phase(self.identity.group, Phase::ClientTotal, total);
         result
+    }
+    pub(crate) async fn begin_transaction(
+        &mut self,
+        shard: u64,
+        epoch: u64,
+    ) -> Result<Option<u64>, RemoteError> {
+        match self
+            .call(Operation::BeginTransaction { shard, epoch })
+            .await?
+        {
+            Reply::UnmanagedWriteSequence(sequence) => Ok(Some(sequence)),
+            // An older peer ignores the opt-in flag and answers a mode inspection.
+            Reply::Managed(super::managed::Output::Mode(_)) => Ok(None),
+            _ => Err(RemoteError::Protocol),
+        }
+    }
+
+    pub(crate) async fn transaction_write(
+        &mut self,
+        request: D1WriteRequest,
+        before_send: impl FnOnce() -> Result<(), RemoteError>,
+    ) -> Result<Result<D1Result, RemoteError>, RemoteError> {
+        match self
+            .exchange(Operation::Write(request), before_send)
+            .await?
+        {
+            Ok(Reply::Write(result)) => Ok(Ok(result)),
+            Ok(_) => Err(RemoteError::Protocol),
+            Err(error) => Ok(Err(error)),
+        }
     }
     pub async fn probe(&mut self, shard: u64) -> Result<(), RemoteError> {
         match self.call(Operation::Probe { shard }).await? {

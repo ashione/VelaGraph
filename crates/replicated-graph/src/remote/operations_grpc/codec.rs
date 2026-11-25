@@ -8,6 +8,12 @@ fn id(v: Vec<u8>) -> Result<[u8; 16], RemoteError> {
 pub(super) fn operation(v: wire::request::Operation) -> Result<Operation, RemoteError> {
     Ok(match v {
         wire::request::Operation::Snapshot(shard) => Operation::Snapshot { shard },
+        wire::request::Operation::ManagedInspect(v) if v.for_unmanaged_write => {
+            Operation::BeginTransaction {
+                shard: v.shard,
+                epoch: v.epoch,
+            }
+        }
         wire::request::Operation::ManagedInspect(v) => {
             Operation::Managed(managed::Request::Inspect {
                 shard: v.shard,
@@ -60,9 +66,20 @@ pub(super) fn request(
         operation: Some(match op {
             Operation::Probe { shard } => wire::request::Operation::Probe(shard),
             Operation::Snapshot { shard } => wire::request::Operation::Snapshot(shard),
+            Operation::BeginTransaction { shard, epoch } => {
+                wire::request::Operation::ManagedInspect(wire::ManagedInspect {
+                    shard,
+                    epoch,
+                    for_unmanaged_write: true,
+                })
+            }
             Operation::Managed(v) => match v {
                 managed::Request::Inspect { shard, epoch } => {
-                    wire::request::Operation::ManagedInspect(wire::ManagedInspect { shard, epoch })
+                    wire::request::Operation::ManagedInspect(wire::ManagedInspect {
+                        shard,
+                        epoch,
+                        for_unmanaged_write: false,
+                    })
                 }
                 managed::Request::Enable {
                     shard,
@@ -192,6 +209,7 @@ pub(super) fn response(v: Result<Reply, RemoteError>) -> Result<wire::Response, 
                     }),
                 }),
             },
+            Ok(Reply::UnmanagedWriteSequence(sequence)) => R::UnmanagedWriteSequence(sequence),
             Ok(Reply::Probe) => R::Probe(wire::Empty {}),
             Ok(Reply::Metadata(shard, epoch, sequence)) => R::Metadata(wire::Metadata {
                 shard,
@@ -277,6 +295,7 @@ pub(super) fn reply(v: wire::Response) -> Result<Result<Reply, RemoteError>, Rem
                 }
             },
         ))),
+        R::UnmanagedWriteSequence(sequence) => Ok(Reply::UnmanagedWriteSequence(sequence)),
         R::Probe(_) => Ok(Reply::Probe),
         R::Metadata(v) => Ok(Reply::Metadata(v.shard, v.epoch, v.sequence)),
         R::Write(v) => Ok(Reply::Write(D1Result::Write {

@@ -111,7 +111,7 @@ pub mod remote_failure {
 pub struct Response {
     #[prost(uint32, tag = "1")]
     pub version: u32,
-    #[prost(oneof = "response::Result", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof = "response::Result", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub result: ::core::option::Option<response::Result>,
 }
 /// Nested message and enum types in `Response`.
@@ -137,6 +137,8 @@ pub mod response {
         ManagedWritten(super::ManagedWritten),
         #[prost(message, tag = "10")]
         ManagedStatus(super::ManagedStatusResult),
+        #[prost(uint64, tag = "11")]
+        UnmanagedWriteSequence(u64),
     }
 }
 #[allow(clippy::all)]
@@ -195,6 +197,7 @@ pub struct Snapshot {
     #[prost(message, repeated, tag = "4")]
     pub entries: ::prost::alloc::vec::Vec<SnapshotEntry>,
 }
+/// Older peers ignore the opt-in and return managed_mode, never a write sequence.
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ManagedInspect {
@@ -202,6 +205,8 @@ pub struct ManagedInspect {
     pub shard: u64,
     #[prost(uint64, tag = "2")]
     pub epoch: u64,
+    #[prost(bool, tag = "3")]
+    pub for_unmanaged_write: bool,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
