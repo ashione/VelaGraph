@@ -118,8 +118,8 @@ impl GraphTransaction<'_> {
 }
 ```
 
-The exact Rust names may be adjusted during implementation, but these semantics
-are normative.
+This is the local K3 graph API. The separate [StorageNode write-only transaction](STORAGE_NODE_INTERFACE.md#single-shard-transaction)
+has its own empty-commit, request-identity and unknown-outcome rules.
 
 ### Transaction state
 
@@ -130,29 +130,28 @@ are normative.
   commit lock. No mutation touches RocksDB before `commit`.
 - Each transaction records its read sequence, touched keys, and bounded encoded
   write set.
-- A transaction is single-use. Any operation after `commit` or `abort` returns
-  `TransactionClosed`.
+- `commit(self)` and `abort(self)` consume the transaction. Safe Rust cannot
+  use the same handle again, even if commit returned an error.
 - Dropping a transaction without `commit` is equivalent to `abort`; it writes
   nothing.
 
 ### Commit algorithm
 
-Under the engine commit lock:
+A read-only commit returns success without writing. For a write commit, under
+the engine commit lock:
 
-1. Reject if the transaction is already closed, or if it has no writes
-   (read-only commit is a successful no-op).
-2. If `db.latest_sequence_number() != read_sequence`, return
+1. If `db.latest_sequence_number() != read_sequence`, return
    `TransactionConflict` without writing.
-3. Revalidate the complete overlay against the current database state: ids,
+2. Revalidate the complete overlay against the current database state: ids,
    labels, duplicate creates, missing endpoints, and all edge/adjacency updates.
-4. Build exactly one `WriteBatch` containing record changes and both adjacency
-   indexes, including cascades from vertex deletion.
-5. Write the batch with `WriteOptions::set_sync(true)` so a successful commit is
-   WAL-durable before the call returns.
-6. Mark the transaction committed and release the lock.
+3. Build one `WriteBatch` containing the record and adjacency changes, including
+   cascades, and check its encoded size.
+4. Submit the batch with `WriteOptions::set_sync(true)`. A successful write
+   commit is WAL-durable before returning.
 
-If any step fails, the batch is not written. There is no partial commit and no
-best-effort repair inside the transaction path.
+A pre-submission failure writes nothing. A RocksDB submission error is not
+proof that the batch was absent; K3 exposes the storage error and has no
+request-ID receipt or replay protocol. The batch remains the atomic unit.
 
 ### Edge and cascade rules
 
@@ -176,25 +175,24 @@ and tested):
 - maximum operations per transaction: 10,000;
 - maximum read/scan rows: the query limits, or 10,000 for direct scans.
 
-Proposed typed errors:
+Transaction errors:
 
 | Error | Meaning |
 |---|---|
 | `TransactionConflict` | another write committed after the snapshot |
-| `TransactionClosed` | commit/abort/operation on a closed transaction |
 | `TransactionTooLarge` | operation or byte limit exceeded |
-| `UnsupportedTransaction` | request outside the single-partition K3 boundary |
 
 Existing validation errors (`VertexAlreadyExists`, `VertexNotFound`,
-`EdgeEndpointNotFound`, `InvalidGraphLabel`, `CorruptData`, RocksDB errors) are
-reused and abort the transaction without writing.
+`EdgeEndpointNotFound`, `InvalidGraphLabel`, `CorruptData`) are reused.
+Pre-submission validation failures write nothing; see the commit algorithm for
+RocksDB submission errors.
 
 ## 6. Durability and recovery
 
 K3 uses RocksDB's WAL as the only commit log. There is no application-level WAL
 and no second source of truth.
 
-- A transaction commit sets `sync=true`; once `commit()` returns, the batch is
+- A write transaction sets `sync=true`; once `commit()` returns `Ok(())`, the batch is
   durable under the process/OS crash model exercised by K3 tests.
 - RocksDB WAL replay on `GraphEngine::open` recovers committed batches. A batch
   is the atomic unit, so recovery never exposes an edge without its adjacency
@@ -262,7 +260,7 @@ harness.
 - Reopen: committed transaction data survives close/reopen; uncommitted
   buffered writes do not.
 - Read-only commit is a no-op.
-- Closed transaction operations return `TransactionClosed`.
+- Commit and abort consume the Rust handle; reuse is a compile-time error.
 - Limits: write-set byte/operation limits return `TransactionTooLarge` before
   any write.
 - Crash harness: the documented crash windows above.
@@ -272,7 +270,8 @@ harness.
 - Cross-partition/cross-shard transactions (D4).
 - Global serializability, distributed snapshots, and follower reads (D3/D4).
 - Per-key version indexes and non-conservative conflict detection.
-- Transaction retry, idempotency keys, and client request IDs (D1 node layer).
+- K3 graph-level transaction retry, idempotency keys and client request IDs.
+  The separate D1 local write adapter does not add these features to K3.
 - Gremlin through replicated storage needs a bounded, paginated read interface;
   the local query backend does not alter the D1 scan contract or provide Raft reads.
 

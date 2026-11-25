@@ -33,7 +33,7 @@ Raft snapshot data is an existing snapshot image carried with typed metadata/off
 - [CoreHR 43596727002](https://github.com/ashione/VelaGraph/actions/runs/43596727002): full-scale and retained 1025-write release lifecycle passed with exact-head artifact provenance.
 - Independent static review passed the final candidate. No local compilation is claimed.
 
-A passing later run does not identify the cause of earlier generic Unavailable failures; #247 remains open. Controlled cancellation fixtures prove RPC-stream cancellation, not necessarily physical TCP closure.
+A passing later run does not identify the cause of earlier generic Unavailable failures. [#247](https://github.com/ashione/VelaGraph/issues/247) is closed; closure does not prove that cause. Controlled cancellation fixtures prove RPC-stream cancellation, not necessarily physical TCP closure.
 
 ## #218 gates updated through #295 (2026-11-16)
 

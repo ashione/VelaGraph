@@ -24,10 +24,11 @@ and [issue #376](https://github.com/ashione/VelaGraph/issues/376).
 source-only 实验预发布；不是预编译发行包或生产就绪承诺。开发 main 已包含后续切片，
 不能把 main 的能力全部归入该标签。发布范围、历史风险和验证证据以 release notes 为准。
 
-后续均为规划而非已交付：v0.0.2 的 [#349](https://github.com/ashione/VelaGraph/issues/349)
-固定 V 捕获证据、[#350](https://github.com/ashione/VelaGraph/issues/350) 全局 manifest、
-[#351](https://github.com/ashione/VelaGraph/issues/351) 隔离整组恢复/READY 门禁、
-[#352](https://github.com/ashione/VelaGraph/issues/352) 真实恢复演练；v0.0.3 的
+开发 main 已合入面向 v0.0.2 的固定 cohort 恢复切片：[#400](https://github.com/ashione/VelaGraph/pull/400)
+支持从对象存储凭据离线恢复并检查指定 V。仍须完成 [#349](https://github.com/ashione/VelaGraph/issues/349)
+捕获与保留、[#350](https://github.com/ashione/VelaGraph/issues/350) 全局清单覆盖、
+[#351](https://github.com/ashione/VelaGraph/issues/351) READY 门禁和
+[#352](https://github.com/ashione/VelaGraph/issues/352) 端到端恢复验收。v0.0.3 的
 [#354](https://github.com/ashione/VelaGraph/issues/354) CDC/周期在线重建的首个目标是一个需要明确
 验证的 MySQL-compatible/InnoDB 来源，该验证尚属规划而非已交付：
 由旧全量+增量继续服务，新全量后台构建并追平，
@@ -390,8 +391,9 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 
 **已实现**：#194 的本地双 DB 一致物理 checkpoint、manifest/完整性校验和新目录
 离线恢复；另有 `checkpoint-object-store` 不可变上传/下载、最后发布 manifest 和
-S3-compatible 集成验收。固定 cohort 现可按指定本地 generation 将协调节点和所有成员恢复到新目录，
-并从副本文件核验指定 V 的决策前缀。目标保持离线。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
+S3-compatible 集成验收。固定 cohort 可从指定本地 generation 或独立保留的对象存储凭据，
+将协调节点和所有成员恢复到新目录，核验共同决策前缀并离线检查指定 V 的图数据。
+目标保持离线，不包含独立 catalog 或 TemporalStore。见 [物理 checkpoint](PHYSICAL_CHECKPOINT.md) 与
 [对象运输契约](OBJECT_STORE_CHECKPOINT_API.md)。这不是“尚无 checkpoint/上传工具”。
 
 **仍待实现**：#193 安全 live restart/rejoin，#191 跨组认证恢复集/全局 READY 屏障、
