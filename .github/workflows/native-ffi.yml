@@ -59,10 +59,12 @@ jobs:
           cargo build --locked -p velagraph-ffi
       - name: C, module/vendor consumers, Go race and portable SDK
         run: python3 scripts/test_native_ffi.py --lib-dir target/debug
-      - name: Go native example (correctness only)
+      - name: Go native example and direct tree fixture (correctness only)
         working-directory: sdk/go
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
-        run: go run -tags velagraph_native ./native/example
+        run: |
+          go run -tags velagraph_native ./native/example
+          go test -tags velagraph_native -run '^$' -bench '^BenchmarkNativeTemporalTree$' -benchtime=1x ./native

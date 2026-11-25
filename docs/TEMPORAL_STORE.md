@@ -257,6 +257,15 @@ returned. Candidate order, skipped-candidate work charges and raw-byte accountin
 are unchanged, and callbacks can still return errors. Neither cursor nor record
 memo is retained across executions. Snapshot HEAD is not re-read for each scan.
 
+After a complete adjacency list, the cursor is at the first following key or
+at the end of the snapshot. A later (direction, vertex ID) prefix can resume
+there if the cursor has already reached or passed its lower bound. Repeated,
+backward and farther-away prefixes seek directly as needed. An interrupted
+list cannot supply a resume position. This applies to fixed-view batches as
+well as single queries. For a warm synthetic comparison, run
+`cargo run --locked --release -p velagraph --example temporal_adjacency_bench`
+with the same example source on both revisions.
+
 Start rows retain their original order, duplicates, missing-ID handling and
 leading-limit short circuit. There is no eager decode of later roots, no new
 query syntax, no multi-key I/O batching, and no asynchronous prefetch. Temporal

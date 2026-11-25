@@ -42,6 +42,19 @@ impl<T: Clone> Table<T> {
     pub fn get(&self, id: u64) -> Option<&T> {
         self.buckets[shard(id)].map.get(&id)
     }
+    // Bulk construction owns every bucket and validates unique record IDs.
+    // Edge input is ID-ordered; vertex input is finalized before publication.
+    pub fn push_bulk(&mut self, id: u64, value: T) {
+        let bucket = Arc::make_mut(&mut self.buckets[shard(id)]);
+        let old = bucket.map.insert(id, value);
+        debug_assert!(old.is_none(), "bulk input was checked for duplicate IDs");
+        bucket.ids.push(id);
+    }
+    pub fn sort_bulk_ids(&mut self) {
+        for bucket in &mut self.buckets {
+            Arc::make_mut(bucket).ids.sort_unstable();
+        }
+    }
     pub fn set(&mut self, id: u64, value: Option<T>) -> usize {
         let bucket = &mut self.buckets[shard(id)];
         let copied = if Arc::strong_count(bucket) > 1 {
