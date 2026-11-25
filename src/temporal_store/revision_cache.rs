@@ -207,8 +207,21 @@ impl RevisionCache {
         builder: Builder<'_>,
         complete: bool,
     ) {
+        self.publish(key, version, sequence, builder.rows.len(), complete, || {
+            builder.finish(complete)
+        });
+    }
+
+    fn publish(
+        &self,
+        key: Key,
+        version: u64,
+        sequence: u64,
+        row_count: usize,
+        complete: bool,
+        build: impl FnOnce() -> Block,
+    ) {
         let slot = self.slot(key);
-        let row_count = builder.rows.len();
         let supersedes = |e: &Entry| {
             e.key == key
                 && e.from <= version
@@ -219,19 +232,33 @@ impl RevisionCache {
                     || e.block.rows.len() > row_count
                     || (!complete && e.block.rows.len() == row_count))
         };
-        {
+        let same_key_origin =
+            |entry: &Entry| (entry.key == key).then_some((entry.from, entry.sequence_from));
+        let observed = {
             let Ok(guard) = slot.try_lock() else { return };
             if guard.as_ref().is_some_and(supersedes) {
                 return;
             }
-        }
+            guard.as_ref().and_then(same_key_origin)
+        };
         // Readers can use the resident block while the new interval index is sorted.
-        let block = Arc::new(builder.finish(complete));
+        let block = Arc::new(build());
         let Ok(mut guard) = slot.try_lock() else {
             return;
         };
         if guard.as_ref().is_some_and(supersedes) {
             return;
+        }
+        // An overlapping fill may have installed a newer snapshot of this key.
+        // Compare origins only across this build; later historical reads can cache normally.
+        if let Some((v, s)) = guard.as_ref().and_then(same_key_origin) {
+            if observed != Some((v, s))
+                && (v, s) != (version, sequence)
+                && v >= version
+                && s >= sequence
+            {
+                return;
+            }
         }
         let old = guard.replace(Entry {
             key,
@@ -470,6 +497,39 @@ mod tests {
             .payload
             .is_some());
     }
+    #[test]
+    fn older_builder_finishing_last_preserves_newer_same_key_publication() {
+        let cache = RevisionCache::default();
+        let key = Key::Vertex(1);
+        let mut old = cache.builder().unwrap();
+        row(&mut old, 0, Some(10));
+        let mut new = cache.builder().unwrap();
+        row(&mut new, 10, None);
+
+        // Install the new snapshot after the old builder's first slot check
+        // and before its final replacement check. No thread scheduling required.
+        cache.publish(key, 1, 10, old.rows.len(), true, || {
+            cache.insert(key, 2, 20, new, true);
+            old.finish(true)
+        });
+        let latest = cache.get(key, 2, 20).expect("newer block should stay hot");
+        assert!(latest.lookup(11).unwrap().payload.is_some());
+        assert!(cache.get(key, 1, 10).is_none());
+
+        // A later historical workload may still fill this slot deliberately.
+        let mut historical = cache.builder().unwrap();
+        row(&mut historical, 0, Some(10));
+        cache.insert(key, 1, 10, historical, true);
+        assert!(cache
+            .get(key, 1, 10)
+            .unwrap()
+            .lookup(1)
+            .unwrap()
+            .payload
+            .is_some());
+        assert!(latest.lookup(11).unwrap().payload.is_some());
+    }
+
     #[test]
     fn late_publication_and_contended_notifications_only_cause_misses() {
         let cache = RevisionCache::default();
