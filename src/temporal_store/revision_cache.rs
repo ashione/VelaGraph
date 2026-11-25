@@ -1,5 +1,6 @@
 //! Optional store-local immutable revision prefixes. Cache misses use storage.
 use super::{Interval, Key, TemporalMutation, REVISION_KEY_LEN};
+use std::cmp::Reverse;
 use std::hash::{BuildHasher, RandomState};
 use std::mem::size_of;
 use std::sync::{
@@ -69,7 +70,16 @@ pub(super) struct Hit<'a> {
     pub selected_bytes: usize,
 }
 impl Block {
-    pub fn lookup(&self, time: i64) -> Option<Hit<'_>> {
+    fn winning_row(&self, time: i64) -> Option<usize> {
+        // Rows are captured in storage priority order. The first visible row
+        // wins even if every older interval also covers this instant.
+        if self
+            .rows
+            .first()
+            .is_some_and(|row| row.valid.contains(time))
+        {
+            return Some(0);
+        }
         let mut end = self.index.partition_point(|entry| entry.from <= time);
         let mut winner: Option<usize> = None;
         while end > 0 {
@@ -80,13 +90,17 @@ impl Block {
             let row = &self.rows[entry.row];
             if row.valid.to.is_none_or(|to| time < to) {
                 winner = Some(winner.map_or(entry.row, |old| old.min(entry.row)));
-                if winner == Some(0) {
+                // Row zero already missed the direct interval check.
+                if winner == Some(1) {
                     break;
                 }
             }
             end -= 1;
         }
-        let (rows, selected) = match winner {
+        winner
+    }
+    pub fn lookup(&self, time: i64) -> Option<Hit<'_>> {
+        let (rows, selected) = match self.winning_row(time) {
             Some(i) => (i + 1, Some(&self.rows[i])),
             None if self.complete => (self.rows.len(), None),
             None => return None,
@@ -193,23 +207,32 @@ impl RevisionCache {
         builder: Builder<'_>,
         complete: bool,
     ) {
-        let mut guard = match self.slot(key).try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if guard.as_ref().is_some_and(|e| {
+        let slot = self.slot(key);
+        let row_count = builder.rows.len();
+        let supersedes = |e: &Entry| {
             e.key == key
                 && e.from <= version
                 && version <= e.through
                 && e.sequence_from <= sequence
                 && sequence <= e.sequence_through
                 && (e.block.complete
-                    || e.block.rows.len() > builder.rows.len()
-                    || (!complete && e.block.rows.len() == builder.rows.len()))
-        }) {
+                    || e.block.rows.len() > row_count
+                    || (!complete && e.block.rows.len() == row_count))
+        };
+        {
+            let Ok(guard) = slot.try_lock() else { return };
+            if guard.as_ref().is_some_and(supersedes) {
+                return;
+            }
+        }
+        // Readers can use the resident block while the new interval index is sorted.
+        let block = Arc::new(builder.finish(complete));
+        let Ok(mut guard) = slot.try_lock() else {
+            return;
+        };
+        if guard.as_ref().is_some_and(supersedes) {
             return;
         }
-        let block = Arc::new(builder.finish(complete));
         let old = guard.replace(Entry {
             key,
             from: version,
@@ -297,7 +320,8 @@ impl Builder<'_> {
                 row,
             })
             .collect();
-        index.sort_unstable_by_key(|i| (i.from, i.row));
+        // Lookup walks backwards: for a shared start, visit the highest-priority row first.
+        index.sort_unstable_by_key(|i| (i.from, Reverse(i.row)));
         let mut max_to = Some(i64::MIN);
         for i in &mut index {
             max_to = match (max_to, i.max_to) {
@@ -346,6 +370,29 @@ mod tests {
                 .unwrap();
             assert_eq!(block.lookup(time).unwrap().rows, expected + 1);
         }
+    }
+    #[test]
+    fn equal_start_revisions_keep_priority_tombstones_and_scan_charges() {
+        let cache = RevisionCache::default();
+        let mut builder = cache.builder().unwrap();
+        let valid = Interval {
+            from: -2,
+            to: Some(2),
+        };
+        assert!(builder.push(valid, &super::super::encode_assertion(valid, None).unwrap()));
+        row(&mut builder, -2, Some(4));
+        row(&mut builder, -2, None);
+        let block = builder.finish(false);
+        for (time, winner) in [(-2, 0), (1, 0), (2, 1), (3, 1), (4, 2)] {
+            let hit = block.lookup(time).unwrap();
+            let selected = &block.rows[winner];
+            assert_eq!(hit.payload.is_none(), winner == 0);
+            assert_eq!(hit.rows, winner + 1);
+            assert_eq!(hit.bytes, selected.cumulative_bytes);
+            assert_eq!(hit.peak_bytes, selected.peak_bytes);
+            assert_eq!(hit.selected_bytes, REVISION_KEY_LEN + selected.value.len());
+        }
+        assert!(block.lookup(-3).is_none());
     }
     #[test]
     fn incomplete_prefix_never_claims_absence() {

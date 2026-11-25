@@ -1,5 +1,6 @@
 use super::*;
 pub(super) const CHUNK: usize = 256;
+const CHUNK_FEE: usize = 64;
 #[derive(Clone, Default)]
 pub(super) struct Adj(Option<Arc<AdjStorage>>);
 
@@ -50,22 +51,25 @@ impl Adj {
                 self.header_bytes()
                     + a.chunks
                         .iter()
-                        .map(|c| c.capacity() * 8 + 64)
+                        .map(|c| c.capacity() * size_of::<u64>() + CHUNK_FEE)
                         .sum::<usize>()
             }
             _ => 0,
         }
     }
-    pub fn append_sorted(&mut self, id: u64) {
+    // Only the private bulk loader appends to an unshared, ID-ordered direction.
+    // Return its growth in retained bytes for the per-edge admission check.
+    pub fn append_sorted(&mut self, id: u64) -> usize {
         let Some(storage) = &mut self.0 else {
             self.0 = Some(Arc::new(AdjStorage::One(id)));
-            return;
+            return 0;
         };
-        let data = Arc::make_mut(storage);
+        let data = Arc::get_mut(storage).expect("bulk adjacency must be private");
         match data {
             AdjStorage::One(first) => {
                 debug_assert!(*first < id);
                 *data = AdjStorage::pair(*first, id);
+                self.bytes()
             }
             AdjStorage::Many(a) => a.append_sorted(id),
         }
@@ -114,16 +118,22 @@ impl AdjStorage {
 }
 
 impl AdjChunks {
-    fn append_sorted(&mut self, id: u64) {
+    fn append_sorted(&mut self, id: u64) -> usize {
+        let header_capacity = self.chunks.capacity();
+        let mut growth = 0;
         if self.chunks.last().is_none_or(|c| c.len() == CHUNK) {
             self.chunks.reserve_exact(1);
             self.chunks.push(Arc::new(Vec::new()));
+            growth =
+                CHUNK_FEE + (self.chunks.capacity() - header_capacity) * size_of::<Arc<Vec<u64>>>();
         }
         let chunk = Arc::make_mut(self.chunks.last_mut().expect("allocated adjacency chunk"));
         debug_assert!(chunk.last().is_none_or(|old| *old < id));
+        let capacity = chunk.capacity();
         chunk.reserve_exact(1);
         chunk.push(id);
         self.len += 1;
+        growth + (chunk.capacity() - capacity) * size_of::<u64>()
     }
     fn change(&mut self, id: u64, insert: bool) -> usize {
         let mut i = self
@@ -167,6 +177,15 @@ impl AdjChunks {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bulk_append_charges_exact_growth_across_chunk_boundaries() {
+        let mut adj = Adj::default();
+        let mut charged = 0;
+        for id in 0..(CHUNK as u64 * 4 + 3) {
+            charged += adj.append_sorted(id);
+            assert_eq!(charged, adj.bytes());
+        }
+    }
     #[test]
     fn empty_directions_release_storage_without_disturbing_pinned_readers() {
         let mut current = Adj::default();

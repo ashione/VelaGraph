@@ -399,8 +399,13 @@ impl IncrementalGraph {
                     outgoing: Adj::default(),
                 };
                 s.bytes = admitted;
-                s.vertices.set(id, Some(entry));
+                s.vertices.push_bulk(id, entry);
                 s.vertex_count += 1;
+            }
+            s.vertices.sort_bulk_ids();
+            check()?;
+            if Instant::now() >= deadline {
+                return Err(limit("restore deadline"));
             }
             for e in edges {
                 check()?;
@@ -429,23 +434,20 @@ impl IncrementalGraph {
                         .vertices
                         .get_mut(id)
                         .ok_or_else(|| bad("restore endpoint"))?;
-                    let before = v.bytes();
                     let adj = if incoming {
                         &mut v.incoming
                     } else {
                         &mut v.outgoing
                     };
-                    adj.append_sorted(e.id);
                     s.bytes = s
                         .bytes
-                        .checked_sub(before)
-                        .and_then(|n| n.checked_add(v.bytes()))
+                        .checked_add(adj.append_sorted(e.id))
                         .ok_or_else(|| limit("restore accounting"))?;
                 }
                 if s.bytes > graph.limits.max_accounted_bytes {
                     return Err(limit("restore retained bytes"));
                 }
-                s.edges.set(e.id, Some(Arc::new(Cached::new(e))));
+                s.edges.push_bulk(e.id, Arc::new(Cached::new(e)));
                 s.edge_count += 1;
             }
             s.sequence = sequence;
