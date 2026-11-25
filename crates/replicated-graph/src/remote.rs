@@ -93,6 +93,10 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Operation {
+    BeginTransaction {
+        shard: u64,
+        epoch: u64,
+    },
     Probe {
         shard: u64,
     },
@@ -142,6 +146,7 @@ struct Response {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    UnmanagedWriteSequence(u64),
     Probe,
     Snapshot(RemoteSnapshot),
     Metadata(u64, u64, u64),
@@ -470,6 +475,20 @@ async fn execute(
         Operation::CloseSnapshot { descriptor } => {
             sessions.close(identity, shard, &descriptor)?;
             Ok(Reply::CloseSnapshot)
+        }
+        Operation::BeginTransaction {
+            shard: requested,
+            epoch,
+        } => {
+            if requested != shard {
+                return Err(RemoteError::InvalidArgument);
+            }
+            read_barrier::confirm(&raft, end, "read_barrier").await?;
+            state
+                .d1_unmanaged_write_sequence(shard, epoch)
+                .await
+                .map(Reply::UnmanagedWriteSequence)
+                .map_err(RemoteError::Application)
         }
         Operation::Probe { shard: requested } => {
             if requested != shard {

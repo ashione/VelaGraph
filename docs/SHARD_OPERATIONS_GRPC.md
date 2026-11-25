@@ -31,6 +31,13 @@ Identity matching protects against accidental routing, not an untrusted caller.
 This is plaintext development transport behind the existing
 `--allow-insecure-development` guard, not production authorization.
 
+A directly addressed `RemoteStorageNode::begin_v1` opts into
+`ManagedInspect.for_unmanaged_write`. The replica performs a leader barrier
+and returns `unmanaged_write_sequence` after checking shard, epoch and write
+mode together. Older servers ignore this flag and return only `managed_mode`.
+The adapter then reports `Unsupported` without submitting a write. Commit
+uses one ordinary conditional Write RPC with the sequence captured at begin.
+
 ## CLI
 
 Use the address printed as `graph=...` by `graph-node --graph ADDR`. This is now

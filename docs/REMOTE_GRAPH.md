@@ -49,6 +49,11 @@ run_blocking(move || {
 }).await??;
 ```
 
+The direct adapter also supports write-only single-shard transactions.
+Begin captures the leader's unmanaged write sequence. Stage and abort are
+client-local. Commit sends one conditional batch and returns the request ID
+if its outcome is unknown. See the [transaction contract](STORAGE_NODE_INTERFACE.md#single-shard-transaction).
+
 The endpoint must be the current leader for new views and writes. There is no
 automatic leader discovery, forwarding, application retry, or failover.
 Clones reuse successful unary Channels and a separate bounded Metadata stream;

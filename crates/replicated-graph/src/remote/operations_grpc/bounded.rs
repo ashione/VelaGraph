@@ -133,7 +133,7 @@ fn field(s: S, t: u32) -> Option<F> {
         (Snapshot, 1..=3) => f(t, V),
         (Snapshot, 4) => r(t, Child(SnapshotEntry)),
         (SnapshotEntry, 1 | 2) => f(t, Bytes(None)),
-        (ManagedInspect, 1 | 2) | (ManagedEnable, 1..=3) | (ManagedStatusRequest, 1 | 2) => f(t, V),
+        (ManagedInspect, 1..=3) | (ManagedEnable, 1..=3) | (ManagedStatusRequest, 1 | 2) => f(t, V),
         (ManagedEnable, 4)
         | (ManagedWrite, 1)
         | (ManagedStatusRequest, 3 | 4)
@@ -144,7 +144,7 @@ fn field(s: S, t: u32) -> Option<F> {
         (ManagedWritten, 2) => f(t, Child(WriteResult)),
         (ManagedStatusResult, 1) => f(t, Child(Empty)),
         (ManagedStatusResult, 2) => f(t, V),
-        (Response, 1) => f(t, V),
+        (Response, 1 | 11) => f(t, V),
         (Response, 2) => f(t, Child(Empty)),
         (Response, 3) => f(t, Child(Metadata)),
         (Response, 4) => f(t, Child(WriteResult)),
@@ -282,11 +282,12 @@ fn scan_inner(
                 let value = varint(&mut d)?;
                 // Prost narrows uint32/enum varints: reject high bits rather than
                 // allowing a wrapped protocol version or status to become valid.
-                if (matches!(
-                    s,
-                    S::Request | S::Response | S::MetadataRequest | S::MetadataResponse
-                ) && tag == 1
-                    && value > u64::from(u32::MAX))
+                if (matches!((s, tag), (S::ManagedInspect, 3)) && value > 1)
+                    || (matches!(
+                        s,
+                        S::Request | S::Response | S::MetadataRequest | S::MetadataResponse
+                    ) && tag == 1
+                        && value > u64::from(u32::MAX))
                     || (matches!((s, tag), (S::WriteResult, 2) | (S::ApplicationError, 44))
                         && value > i32::MAX as u64)
                 {

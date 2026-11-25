@@ -11,14 +11,16 @@ use std::net::SocketAddr;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use d2_raft::{D1Result, D1WriteRequest, D1WriteStatus};
+use d2_raft::{D1Result, D1WriteStatus};
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, Semaphore};
 use velagraph::{
     Epoch, Export, KeyRange, KeyValue, ReadView, RequestId, ScanCursor, ScanLimit, ScanPage,
-    Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, WriteOp, WriteRequest,
-    WriteResult, WriteStatus,
+    Sequence, ShardId, StorageAdmin, StorageNode, StorageNodeError, StorageTransaction,
+    TransactionError, TransactionOptions, WriteRequest, WriteResult, WriteStatus,
 };
+
+mod transaction;
 
 use crate::remote::{self, RemoteError};
 use crate::{application_error, poll_before_deadline, Result, BLOCKING_SCOPE};
@@ -135,13 +137,20 @@ impl RemoteStorageNode {
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
     {
+        self.dispatch_until(request_id, self.operation_deadline(), future)
+    }
+
+    fn dispatch_until<T, F>(
+        &self,
+        request_id: Option<RequestId>,
+        end: Instant,
+        future: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
         self.check_execution_context()?;
-        let end = match self.absolute_deadline {
-            Some(end) => end,
-            None => Instant::now()
-                .checked_add(self.deadline)
-                .ok_or_else(|| StorageNodeError::InvalidArgument("deadline overflow".into()))?,
-        };
         if Instant::now() >= end {
             return Err(StorageNodeError::Timeout { request_id });
         }
@@ -320,41 +329,9 @@ impl StorageNode for RemoteStorageNode {
         expected_sequence: Option<Sequence>,
     ) -> Result<WriteResult> {
         self.check_execution_context()?;
-        if request.shard != self.shard {
-            return Err(StorageNodeError::InvalidArgument(
-                "request belongs to a different shard".into(),
-            ));
-        }
-        if request.operations.is_empty() {
-            return Err(StorageNodeError::InvalidArgument("empty batch".into()));
-        }
-        let bytes = request.operations.iter().fold(0usize, |n, op| match op {
-            WriteOp::Put { key, value } => n.saturating_add(key.len()).saturating_add(value.len()),
-            WriteOp::Delete { key } => n.saturating_add(key.len()),
-        });
-        if request.operations.len() > d2_raft::MAX_BATCH_OPERATIONS
-            || bytes > d2_raft::MAX_BATCH_BYTES
-        {
-            return Err(StorageNodeError::ResourceExhausted(
-                "D1 batch limit exceeded".into(),
-            ));
-        }
+        let request = crate::prepare_write(self.shard, request, expected_sequence)?;
         let end = self.operation_deadline();
-        let (shard, epoch, id) = (self.shard, request.epoch, request.request_id);
-        let request = D1WriteRequest {
-            shard,
-            epoch,
-            request_id: id,
-            expected_sequence,
-            operations: request
-                .operations
-                .into_iter()
-                .map(|op| match op {
-                    WriteOp::Put { key, value } => d2_raft::WriteOp::Put { key, value },
-                    WriteOp::Delete { key } => d2_raft::WriteOp::Delete { key },
-                })
-                .collect(),
-        };
+        let (shard, epoch, id) = (request.shard, request.epoch, request.request_id);
         let client = self.client(end);
         self.dispatch(Some(id), async move {
             if Instant::now() >= end {
@@ -369,28 +346,39 @@ impl StorageNode for RemoteStorageNode {
                 .write(request)
                 .await
                 .map_err(|e| map_error(e, shard, epoch, Some(id)))?;
-            match result {
-                D1Result::Write {
-                    sequence,
-                    status,
-                    applied_operations,
-                } => Ok(WriteResult {
-                    sequence,
-                    applied_operations,
-                    status: match status {
-                        D1WriteStatus::Committed => WriteStatus::Committed,
-                        D1WriteStatus::Duplicate => WriteStatus::Duplicate,
-                    },
-                }),
-                _ => Err(StorageNodeError::Timeout {
-                    request_id: Some(id),
-                }),
-            }
+            write_result(result, id)
         })
+    }
+
+    fn begin_v1(
+        &self,
+        options: TransactionOptions,
+    ) -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError> {
+        self.begin_transaction(options)
     }
 
     fn admin(&self) -> &dyn StorageAdmin {
         self
+    }
+}
+
+fn write_result(result: D1Result, id: RequestId) -> Result<WriteResult> {
+    match result {
+        D1Result::Write {
+            sequence,
+            status,
+            applied_operations,
+        } => Ok(WriteResult {
+            sequence,
+            applied_operations,
+            status: match status {
+                D1WriteStatus::Committed => WriteStatus::Committed,
+                D1WriteStatus::Duplicate => WriteStatus::Duplicate,
+            },
+        }),
+        _ => Err(StorageNodeError::Timeout {
+            request_id: Some(id),
+        }),
     }
 }
 
@@ -643,15 +631,62 @@ mod channel_cache_tests {
     impl wire::shard_operations_server::ShardOperations for Probe {
         async fn call(
             &self,
-            _: tonic::Request<wire::Request>,
+            request: tonic::Request<wire::Request>,
         ) -> std::result::Result<tonic::Response<wire::Response>, tonic::Status> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(tonic::Response::new(wire::Response {
                 version: 1,
-                result: Some(wire::response::Result::Probe(wire::Empty {})),
+                result: Some(match request.into_inner().operation {
+                    Some(wire::request::Operation::ManagedInspect(_)) => {
+                        wire::response::Result::ManagedMode(wire::ManagedModeResult { mode: None })
+                    }
+                    Some(wire::request::Operation::Probe(_)) => {
+                        wire::response::Result::Probe(wire::Empty {})
+                    }
+                    _ => return Err(tonic::Status::invalid_argument("unexpected operation")),
+                }),
             }))
         }
     }
+    #[tokio::test]
+    async fn mode_only_peer_cannot_admit_remote_transactions() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service =
+            wire::shard_operations_server::ShardOperationsServer::new(Probe(calls.clone()));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                ),
+        );
+        let node = RemoteStorageNode::new_identified(address, 1, 1, 7, Duration::from_secs(2))?;
+        crate::run_blocking(move || {
+            let options = TransactionOptions {
+                shard: 7,
+                epoch: 3,
+                request_id: [1; 16],
+                cancellation: Default::default(),
+                deadline: Instant::now() + Duration::from_secs(2),
+            };
+            assert!(matches!(
+                node.begin_v1(options),
+                Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+            ));
+        })
+        .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = stop.send(());
+        server.await??;
+        Ok(())
+    }
+
     async fn until(mut predicate: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(3), async {
             while !predicate() {

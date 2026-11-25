@@ -100,14 +100,22 @@ impl Cluster {
             .iter()
             .map(|x| x.local_addr())
             .collect::<std::io::Result<Vec<_>>>()?;
-        let bootstrap = (0..3)
-            .map(|i| format!("{}={}", i + 1, addresses[4 * i]))
-            .collect::<Vec<_>>()
-            .join(",");
         let dirs = (0..3)
             .map(|_| tempfile::tempdir())
             .collect::<std::io::Result<Vec<_>>>()?;
         drop(reservations);
+        Self::launch(addresses, dirs, true).await
+    }
+
+    async fn launch(
+        addresses: Vec<SocketAddr>,
+        dirs: Vec<tempfile::TempDir>,
+        initialize: bool,
+    ) -> anyhow::Result<Self> {
+        let bootstrap = (0..3)
+            .map(|i| format!("{}={}", i + 1, addresses[4 * i]))
+            .collect::<Vec<_>>()
+            .join(",");
         let mut processes = Vec::new();
         for i in 0..3 {
             let mut command = Command::new(env!("CARGO_BIN_EXE_graph-node"));
@@ -130,7 +138,7 @@ impl Cluster {
                 "--data-dir",
                 dirs[i].path().to_str().context("data dir")?,
             ]);
-            if i == 0 {
+            if initialize && i == 0 {
                 command.args(["--bootstrap", &bootstrap]);
             }
             let log = tempfile::NamedTempFile::new()?;
@@ -184,6 +192,18 @@ impl Cluster {
             _dirs: dirs,
         })
     }
+    async fn restart(mut self) -> anyhow::Result<Self> {
+        for process in &mut self._processes {
+            process.process.0.kill()?;
+        }
+        for process in &mut self._processes {
+            process.process.0.wait()?;
+            process.success = true;
+        }
+        drop(self._processes);
+        Self::launch(self.addresses, self._dirs, false).await
+    }
+
     fn identity(&self, i: usize) -> RemoteIdentity {
         RemoteIdentity {
             group: GROUP,
@@ -709,7 +729,11 @@ async fn cli_checks(
     );
     Ok(())
 }
-async fn run_cli(mut command: Command) -> anyhow::Result<bool> {
+async fn run_cli(command: Command) -> anyhow::Result<bool> {
+    Ok(run_child(command).await?.success())
+}
+
+async fn run_child(mut command: Command) -> anyhow::Result<std::process::ExitStatus> {
     let mut child = Process(
         command
             .stdout(Stdio::null())
@@ -719,7 +743,7 @@ async fn run_cli(mut command: Command) -> anyhow::Result<bool> {
     timeout(Duration::from_secs(8), async {
         loop {
             if let Some(status) = child.0.try_wait()? {
-                return Ok(status.success());
+                return Ok(status);
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -1252,5 +1276,212 @@ async fn proxy_records_held_response_without_changing_gate() -> anyhow::Result<(
     assert_eq!(&response, b"ok");
     client.shutdown().await?;
     timeout(BUDGET, upstream).await???;
+    Ok(())
+}
+
+fn transaction_options(id: u8) -> velagraph::TransactionOptions {
+    velagraph::TransactionOptions {
+        shard: SHARD,
+        epoch: 3,
+        request_id: [id; 16],
+        cancellation: Default::default(),
+        deadline: std::time::Instant::now() + BUDGET,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "child process for the transaction recovery test"]
+async fn exit_with_remote_staged_writes() -> anyhow::Result<()> {
+    use replicated_graph::{run_blocking, RemoteStorageNode};
+    use velagraph::{StorageNode, WriteOp};
+    let endpoint = std::env::var("VG_TRANSACTION_ENDPOINT")?.parse()?;
+    let leader = std::env::var("VG_TRANSACTION_MEMBER")?.parse()?;
+    let node = RemoteStorageNode::new_identified(endpoint, GROUP, leader, SHARD, BUDGET)?;
+    run_blocking(move || -> anyhow::Result<()> {
+        let mut pending = node.begin_v1(transaction_options(72))?;
+        pending.stage(&WriteOp::put(b"unpublished", [1]))?;
+        // Exit with a live handle. No commit, abort, or Rust destructors run.
+        std::process::exit(73)
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_transactions_survive_client_exit_lost_reply_and_cluster_restart(
+) -> anyhow::Result<()> {
+    timeout(Duration::from_secs(100), remote_transaction_recovery()).await?
+}
+
+async fn remote_transaction_recovery() -> anyhow::Result<()> {
+    use replicated_graph::{run_blocking, RemoteStorageNode};
+    use velagraph::{StorageNode, StorageNodeError, TransactionError, WriteOp};
+    let cluster = Cluster::start().await?;
+    let endpoint = cluster.grpc(cluster.leader);
+    let id = cluster.identity(cluster.leader);
+    let adapter = |addr, member, budget| {
+        RemoteStorageNode::new_identified(addr, GROUP, member, SHARD, budget)
+    };
+    let reader = adapter(endpoint, id.node, BUDGET)?;
+    let follower = (cluster.leader + 1) % 3;
+    let other = adapter(
+        cluster.grpc(follower),
+        cluster.identity(follower).node,
+        BUDGET,
+    )?;
+    run_blocking(move || -> anyhow::Result<()> {
+        assert!(matches!(
+            other.begin_v1(transaction_options(1)),
+            Err(TransactionError::Node(StorageNodeError::NotLeader { .. }))
+        ));
+        let mut wrong_epoch = transaction_options(1);
+        wrong_epoch.epoch = 2;
+        assert!(matches!(
+            reader.begin_v1(wrong_epoch),
+            Err(TransactionError::Node(StorageNodeError::Fenced {
+                current: 3,
+                ..
+            }))
+        ));
+        let mut stale = reader.begin_v1(transaction_options(70))?;
+        stale.stage(&WriteOp::put(b"stale", [1]))?;
+        let mut tx = reader.begin_v1(transaction_options(71))?;
+        tx.stage(&WriteOp::put(b"one", [1]))?;
+        tx.stage(&WriteOp::put(b"two", [2]))?;
+        let pinned = reader.read_view()?;
+        assert_eq!(pinned.sequence, 0);
+        assert_eq!(tx.commit()?.sequence, 1);
+        assert!(matches!(
+            stale.commit(),
+            Err(TransactionError::Node(StorageNodeError::Conflict {
+                expected: 0,
+                current: 1
+            }))
+        ));
+        assert_eq!(reader.get(b"one", &pinned)?, None);
+        let mut aborted = reader.begin_v1(transaction_options(77))?;
+        aborted.stage(&WriteOp::put(b"aborted", [1]))?;
+        aborted.abort();
+        let options = transaction_options(78);
+        let cancellation = options.cancellation.clone();
+        let mut cancelled = reader.begin_v1(options)?;
+        cancelled.stage(&WriteOp::put(b"cancelled", [1]))?;
+        cancellation.cancel();
+        assert!(matches!(
+            cancelled.commit(),
+            Err(TransactionError::Cancelled)
+        ));
+        let mut poisoned = reader.begin_v1(transaction_options(74))?;
+        poisoned.stage(&WriteOp::put(b"prefix", [1]))?;
+        assert!(matches!(
+            poisoned.stage(&WriteOp::delete(vec![0; d2_raft::MAX_BATCH_BYTES])),
+            Err(TransactionError::Node(StorageNodeError::ResourceExhausted(
+                _
+            )))
+        ));
+        assert!(matches!(poisoned.commit(), Err(TransactionError::Aborted)));
+        Ok(())
+    })
+    .await??;
+    let mut child = Command::new(std::env::current_exe()?);
+    child
+        .args(["--ignored", "--exact", "exit_with_remote_staged_writes"])
+        .env("VG_TRANSACTION_ENDPOINT", endpoint.to_string())
+        .env("VG_TRANSACTION_MEMBER", id.node.to_string());
+    ensure!(
+        run_child(child).await?.code() == Some(73),
+        "client did not exit with live staging"
+    );
+
+    let proxy = Proxy::start(endpoint).await?;
+    let writer = adapter(proxy.address, id.node, Duration::from_millis(900))?;
+    let pause = proxy.paused.clone();
+    let pending = tokio::spawn(run_blocking(move || -> anyhow::Result<()> {
+        let mut tx = writer.begin_v1(transaction_options(73))?;
+        tx.stage(&WriteOp::put(b"three", [3]))?;
+        tx.stage(&WriteOp::put(b"four", [4]))?;
+        pause.send(true)?;
+        assert!(
+            matches!(tx.commit(), Err(TransactionError::UnknownOutcome { request_id, .. }) if request_id == [73; 16])
+        );
+        Ok(())
+    }));
+    timeout(BUDGET, proxy.blocked.notified()).await?;
+    pending.await???;
+    proxy.paused.send(false)?;
+    // Observe actual application independently before killing all voters.
+    timeout(BUDGET, async {
+        let mut verifier = Client::connect(endpoint, id, BUDGET).await?;
+        while verifier.metadata(SHARD).await?.2 != 2 {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<(), RemoteError>(())
+    })
+    .await??;
+    drop(proxy);
+    let mut reopened = cluster.restart().await?;
+    let reader = adapter(
+        reopened.grpc(reopened.leader),
+        reopened.identity(reopened.leader).node,
+        BUDGET,
+    )?;
+    run_blocking(move || -> anyhow::Result<()> {
+        let view = reader.read_view()?;
+        assert_eq!(view.sequence, 2);
+        for (key, value) in [
+            (b"one".as_slice(), 1),
+            (b"two", 2),
+            (b"three", 3),
+            (b"four", 4),
+        ] {
+            assert_eq!(reader.get(key, &view)?, Some(vec![value]));
+        }
+        for key in [
+            b"unpublished".as_slice(),
+            b"stale",
+            b"prefix",
+            b"aborted",
+            b"cancelled",
+        ] {
+            assert_eq!(reader.get(key, &view)?, None);
+        }
+        Ok(())
+    })
+    .await??;
+    let endpoint = reopened.grpc(reopened.leader);
+    let identity = reopened.identity(reopened.leader);
+    let reader = adapter(endpoint, identity.node, BUDGET)?;
+    let runtime = tokio::runtime::Handle::current();
+    run_blocking(move || -> anyhow::Result<()> {
+        let mut pending = reader.begin_v1(transaction_options(75))?;
+        pending.stage(&WriteOp::put(b"managed", [5]))?;
+        runtime.block_on(remote::managed::request(
+            endpoint,
+            identity,
+            remote::managed::Request::Enable {
+                shard: SHARD,
+                epoch: 3,
+                expected_sequence: 2,
+                mode_id: [9; 16],
+            },
+            BUDGET,
+        ))?;
+        assert!(matches!(
+            reader.begin_v1(transaction_options(76)),
+            Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+        ));
+        assert!(matches!(
+            pending.commit(),
+            Err(TransactionError::Node(StorageNodeError::Unsupported(_)))
+        ));
+        let view = reader.read_view()?;
+        assert_eq!(view.sequence, 2);
+        assert_eq!(reader.get(b"managed", &view)?, None);
+        Ok(())
+    })
+    .await??;
+    for process in &mut reopened._processes {
+        process.success = true;
+    }
     Ok(())
 }

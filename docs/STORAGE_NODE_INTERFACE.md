@@ -203,7 +203,7 @@ error, not a partially applied transaction.
 
 ### Single-shard transaction
 
-The local and in-process replicated adapters implement the optional write-only
+The local, in-process replicated and directly addressed remote adapters implement the optional write-only
 `StorageNode::begin_v1` extension. Begin validates the shard and epoch and
 captures the committed sequence. The local adapter holds the write lock for
 this operation. The replicated adapter performs a leader read barrier and
@@ -240,9 +240,18 @@ returns `Deadline` and discards the batch. A timeout after handoff returns
 `UnknownOutcome` with that ID.
 A follower rejects begin with `NotLeader`. The adapter does not redirect writes.
 
-Process exit discards unpublished staging. The remote and routed adapters
-return `Unsupported` at begin. Cross-process protocol and recovery tests remain open
-under [#393](https://github.com/ashione/VelaGraph/issues/393).
+On `RemoteStorageNode`, begin uses one typed RPC to the selected replica.
+The leader checks shard, epoch and unmanaged write mode and captures the
+sequence under one state lock. A peer that only supports ordinary mode
+inspection returns no sequence and begin reports `Unsupported`. Commit uses
+the existing conditional write RPC and shares its frame and allocation caps.
+A lost or undecodable reply after dispatch reports `UnknownOutcome`. A fresh
+begin cannot resolve that outcome.
+
+Client exit discards unpublished staging. The independent-process test reads
+both committed batches after a restart of all three voters, including one
+whose commit reply was withheld. Routed begin still returns `Unsupported`.
+See [#393](https://github.com/ashione/VelaGraph/issues/393).
 
 The broader transaction design also envisages reads inside a transaction:
 
