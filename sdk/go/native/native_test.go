@@ -90,8 +90,13 @@ func TestTemporalAndCancellation(t *testing.T) {
 	}
 	defer s.Close()
 	info, e := s.Info(ctx)
-	if e != nil || info.Version != 1 {
+	if e != nil || info.Backend != "temporal" || info.Version != 1 {
 		t.Fatal(info, e)
+	}
+	at := int64(10)
+	r, e := s.Query(ctx, []Query{{Text: "g.V(1)"}}, QueryOptions{Version: &info.Version, ValidTimeMicros: &at})
+	if e != nil || r.Version != 1 || len(r.Results) != 1 || len(r.Results[0].Rows) != 1 || r.Results[0].Rows[0].Kind != "Vertex" || r.Results[0].Rows[0].ID != 1 {
+		t.Fatal(r, e)
 	}
 }
 
