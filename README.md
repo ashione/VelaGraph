@@ -122,10 +122,10 @@ The Rust package and import name are both **`velagraph`**. The local
 explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
-For the separate local storage-node adapter, see the
-[write-only single-shard transaction](docs/STORAGE_NODE_INTERFACE.md#single-shard-transaction).
-Its request identity and unknown-outcome contract differ from the K3 graph API;
-replicated and routed adapters do not implement this extension.
+The local storage-node adapter and the in-process Raft adapter both support
+[write-only single-shard transactions](docs/STORAGE_NODE_INTERFACE.md#single-shard-transaction).
+This API carries a caller-supplied request ID if the commit outcome is unknown.
+Remote and routed adapters return `Unsupported` at begin.
 
 Local temporal queries support reusable parsed plans, typed bindings and
 [bounded query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings).
