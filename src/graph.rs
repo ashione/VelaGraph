@@ -24,6 +24,7 @@
 pub(crate) mod codec;
 pub(crate) mod incremental;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
@@ -520,6 +521,14 @@ impl GraphEngine {
 }
 
 impl<'db> GraphReadView<'db> {
+    pub(crate) fn query_backend(&self) -> LocalQueryRead<'_, 'db> {
+        LocalQueryRead {
+            partition: self.partition,
+            snapshot: &self.snapshot,
+            adjacency_cursor: Cell::new(None),
+        }
+    }
+
     /// The RocksDB sequence pinned by this view.
     pub fn sequence(&self) -> u64 {
         self.snapshot.sequence_number()
@@ -1150,7 +1159,14 @@ pub(crate) fn validate_label(label: &str) -> Result<()> {
     }
 }
 
-impl crate::gremlin::QueryReadBackend for GraphReadView<'_> {
+/// Scratch state for one local Gremlin execution on a pinned snapshot.
+pub(crate) struct LocalQueryRead<'a, 'db> {
+    partition: u32,
+    snapshot: &'a Snapshot<'db>,
+    adjacency_cursor: Cell<Option<rocksdb::DBRawIterator<'a>>>,
+}
+
+impl crate::gremlin::QueryReadBackend for LocalQueryRead<'_, '_> {
     fn get_vertex(
         &self,
         id: u64,
@@ -1302,18 +1318,21 @@ impl crate::gremlin::QueryReadBackend for GraphReadView<'_> {
             EdgeDirection::Out
         };
         let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
-        {
+        // A visitor may start another scan. Give each active scan its own cursor
+        // and keep just the last completed cursor for the next expansion.
+        let mut cursor = self
+            .adjacency_cursor
+            .take()
+            .unwrap_or_else(|| self.snapshot.raw_iterator());
+        cursor.seek(&prefix);
+        while let Some((stored_key, value)) = cursor.item() {
             check()?;
-            let (stored_key, value) = item?;
             let _adjacency_raw =
                 budget.reserve(crate::query_memory::add(stored_key.len(), value.len())?)?;
             if !stored_key.starts_with(&prefix) {
                 break;
             }
-            let edge_id = edge_id_from_adjacency_key(&stored_key)?;
+            let edge_id = edge_id_from_adjacency_key(stored_key)?;
             let bytes = self.snapshot.get(edge_key(self.partition, edge_id))?;
             check()?;
             let Some(bytes) = bytes else {
@@ -1332,8 +1351,11 @@ impl crate::gremlin::QueryReadBackend for GraphReadView<'_> {
             }
             visit(edge)?;
             check()?;
+            cursor.next();
         }
         check()?;
+        cursor.status()?;
+        self.adjacency_cursor.set(Some(cursor));
         Ok(())
     }
 }
@@ -1400,6 +1422,7 @@ mod query_scan_tests {
             let result = if vertices {
                 graph
                     .read_view()
+                    .query_backend()
                     .scan_vertices_checked(
                         10,
                         &mut check,
@@ -1409,6 +1432,7 @@ mod query_scan_tests {
             } else {
                 graph
                     .read_view()
+                    .query_backend()
                     .scan_edges_checked(10, &mut check, &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES))
                     .map(|_| ())
             };
@@ -1436,6 +1460,7 @@ mod query_scan_tests {
             let result = if vertices {
                 graph
                     .read_view()
+                    .query_backend()
                     .scan_vertices_checked(
                         10,
                         &mut check,
@@ -1445,6 +1470,7 @@ mod query_scan_tests {
             } else {
                 graph
                     .read_view()
+                    .query_backend()
                     .scan_edges_checked(10, &mut check, &Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES))
                     .map(|_| ())
             };
@@ -1454,13 +1480,55 @@ mod query_scan_tests {
     }
 
     #[test]
+    fn nested_adjacency_visits_preserve_the_outer_cursor_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphEngine::open(dir.path()).unwrap();
+        for id in 1..=3 {
+            graph.create_vertex(&Vertex::new(id)).unwrap();
+        }
+        graph.create_edge(&Edge::new(1, 1, 2, "link")).unwrap();
+        graph.create_edge(&Edge::new(2, 1, 3, "link")).unwrap();
+        let view = graph.read_view();
+        let backend = view.query_backend();
+        graph.create_edge(&Edge::new(3, 1, 2, "link")).unwrap();
+        let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
+        let mut pairs = Vec::new();
+        for _ in 0..2 {
+            backend
+                .visit_adjacent_edges(
+                    1,
+                    false,
+                    Some("link"),
+                    &mut || Ok(()),
+                    &mut |outer| {
+                        backend.visit_adjacent_edges(
+                            outer.to,
+                            true,
+                            None,
+                            &mut || Ok(()),
+                            &mut |inner| {
+                                pairs.push((outer.id, inner.id));
+                                Ok(())
+                            },
+                            &budget,
+                        )
+                    },
+                    &budget,
+                )
+                .unwrap();
+        }
+        assert_eq!(pairs, [(1, 1), (2, 2), (1, 1), (2, 2)]);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn adjacency_visitor_checks_budget_after_visiting_last_edge() {
         let dir = tempfile::tempdir().unwrap();
         let graph = GraphEngine::open(dir.path()).unwrap();
         graph.create_vertex(&Vertex::new(1)).unwrap();
         graph.create_edge(&Edge::new(2, 1, 1, "LOOP")).unwrap();
         let visited = Cell::new(false);
-        let result = graph.read_view().visit_adjacent_edges(
+        let result = graph.read_view().query_backend().visit_adjacent_edges(
             1,
             false,
             None,
@@ -1491,7 +1559,7 @@ mod query_scan_tests {
         }
         graph.db.put(edge_key(graph.partition, 3), b"bad").unwrap();
         let mut visited = Vec::new();
-        let result = graph.read_view().visit_adjacent_edges(
+        let result = graph.read_view().query_backend().visit_adjacent_edges(
             1,
             false,
             None,
