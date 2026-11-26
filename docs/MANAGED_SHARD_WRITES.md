@@ -116,8 +116,8 @@ historical cause of #128/#247 or a multi-machine availability guarantee.
   IDs cannot conceal substituted graph bytes. Replay keeps borrowed final values
   per live key, bounded by retained D1 history, without cloning payloads. A
   fresh replica may install a valid managed snapshot and then replay its log.
-- LocalStorageNode/GraphEngine are separate local engines, not these Raft shard
-  files. This mode makes no claims about them or independent physical copies.
+- `LocalStorageNode` and `GraphEngine::open` use separate local databases.
+  This mode covers the managed Raft shard files.
   Filesystem tampering, replacement with an old directory or hostile unauthenticated
   Raft membership/transport is outside this protocol's security boundary.
 

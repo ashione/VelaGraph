@@ -143,10 +143,20 @@ async fn graph_crud_conflicts_and_follower_rejection() -> anyhow::Result<()> {
             g.create_vertex(&Vertex::new(100)),
             Err(Error::StorageNode(StorageNodeError::Unsupported(_)))
         ));
-        on(&g, |g| {
+        on(&g, |store| {
+            let g = velagraph::GraphEngine::from_storage_node(store.node().clone(), 7, 0);
+            let wrong = velagraph::GraphEngine::from_storage_node(store.node().clone(), 8, 0);
             for id in 1..=3 {
                 g.create_vertex(&Vertex::new(id))?;
             }
+            assert!(matches!(
+                wrong.get_vertex(1),
+                Err(Error::StorageNode(StorageNodeError::InvalidArgument(_)))
+            ));
+            assert!(matches!(
+                wrong.delete_vertex(1),
+                Err(Error::StorageNode(StorageNodeError::InvalidArgument(_)))
+            ));
             let mut vertex = Vertex::new(1);
             vertex.labels.push("person".into());
             vertex.properties.insert("age".into(), Value::Integer(42));
@@ -154,21 +164,22 @@ async fn graph_crud_conflicts_and_follower_rejection() -> anyhow::Result<()> {
             assert_eq!(g.get_vertex(1)?, Some(vertex));
             g.create_edge(&Edge::new(10, 1, 2, "knows"))?;
             assert_eq!(
-                g.out_edges(1, Some("knows"), 10)?,
+                g.out_edges(1, Some("knows"))?,
                 vec![Edge::new(10, 1, 2, "knows")]
             );
-            assert_eq!(g.in_edges(2, None, 10)?.len(), 1);
+            assert_eq!(g.in_edges(2, None)?.len(), 1);
             let mut edge = Edge::new(10, 3, 1, "likes");
             edge.properties.insert("weight".into(), Value::Integer(5));
             g.update_edge(&edge)?;
             assert_eq!(g.get_edge(10)?, Some(edge.clone()));
-            assert!(g.out_edges(1, None, 10)?.is_empty());
-            assert!(g.in_edges(2, None, 10)?.is_empty());
-            assert_eq!(g.out_edges(3, Some("likes"), 10)?, vec![edge]);
-            g.delete_edge(10)?;
+            assert!(g.out_edges(1, None)?.is_empty());
+            assert!(g.in_edges(2, None)?.is_empty());
+            assert_eq!(g.out_edges(3, Some("likes"))?, vec![edge]);
+            assert!(g.delete_edge(10)?);
+            assert!(!g.delete_edge(10)?);
             assert!(g.get_edge(10)?.is_none());
-            assert!(g.out_edges(3, None, 10)?.is_empty());
-            assert!(g.in_edges(1, None, 10)?.is_empty());
+            assert!(g.out_edges(3, None)?.is_empty());
+            assert!(g.in_edges(1, None)?.is_empty());
             for e in [
                 Edge::new(11, 1, 2, "out"),
                 Edge::new(12, 2, 1, "in"),
@@ -176,15 +187,16 @@ async fn graph_crud_conflicts_and_follower_rejection() -> anyhow::Result<()> {
             ] {
                 g.create_edge(&e)?;
             }
-            g.delete_vertex(1)?;
+            assert!(g.delete_vertex(1)?);
+            assert!(!g.delete_vertex(1)?);
             assert!(g.get_vertex(1)?.is_none());
             assert!(g.get_vertex(2)?.is_some());
             for id in 11..=13 {
                 assert!(g.get_edge(id)?.is_none());
             }
             for id in 2..=3 {
-                assert!(g.out_edges(id, None, 10)?.is_empty());
-                assert!(g.in_edges(id, None, 10)?.is_empty());
+                assert!(g.out_edges(id, None)?.is_empty());
+                assert!(g.in_edges(id, None)?.is_empty());
             }
             Ok(())
         })

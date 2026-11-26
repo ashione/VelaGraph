@@ -5,10 +5,8 @@
 //! existing `graph/v1` key layout and codec, but owns no RocksDB handle: every
 //! mutation is one `batch_write`, and every read comes from a [`ReadView`].
 //!
-//! `GraphEngine` still uses its own RocksDB handle and remains the K1 kernel
-//! path. This adapter is the seam that lets a future distributed store persist
-//! the same vertices, edges, and adjacency entries as opaque D1 bytes. It does
-//! not implement transactions, routing, or replication by itself.
+//! The storage-backed graph engine uses this store for graph operations.
+//! The node owns replication and epoch fencing.
 //!
 //! Mutations through one store are serialized by an internal mutex. Each
 //! mutation validates against one read view and submits its sequence as an
@@ -124,6 +122,11 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// All subsequent query reads retain this sequence and use the node's checks.
     pub fn read_view(&self) -> Result<GraphRecordReadView<'_, S>> {
         self.node.check_execution_context()?;
+        let view = self.storage_view()?;
+        Ok(GraphRecordReadView { store: self, view })
+    }
+
+    fn storage_view(&self) -> Result<ReadView> {
         let view = self.node.read_view()?;
         if view.shard != self.shard {
             return Err(StorageNodeError::InvalidArgument(
@@ -131,7 +134,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
             )
             .into());
         }
-        Ok(GraphRecordReadView { store: self, view })
+        Ok(view)
     }
 
     /// Parse and execute standard Gremlin against one newly pinned D1 view.
@@ -152,7 +155,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     }
 
     pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         self.get_vertex_in(&view, id)
     }
 
@@ -167,7 +170,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Retain the returned value for retry after an uncertain commit outcome.
     pub fn prepare_create_vertex(&self, vertex: &Vertex) -> Result<PreparedGraphMutation> {
         validate_vertex(vertex)?;
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         if self.get_vertex_in(&view, vertex.id)?.is_some() {
             return Err(Error::VertexAlreadyExists(vertex.id));
         }
@@ -189,7 +192,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Retain the returned value for retry after an uncertain commit outcome.
     pub fn prepare_update_vertex(&self, vertex: &Vertex) -> Result<PreparedGraphMutation> {
         validate_vertex(vertex)?;
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         if self.get_vertex_in(&view, vertex.id)?.is_none() {
             return Err(Error::VertexNotFound(vertex.id));
         }
@@ -211,7 +214,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Validate and prepare this mutation without writing it.
     /// Retain the returned value for retry after an uncertain commit outcome.
     pub fn prepare_delete_vertex(&self, id: u64) -> Result<PreparedGraphMutation> {
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         if self.get_vertex_in(&view, id)?.is_none() {
             return Err(Error::VertexNotFound(id));
         }
@@ -230,7 +233,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     }
 
     pub fn get_edge(&self, id: u64) -> Result<Option<Edge>> {
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         self.get_edge_in(&view, id)
     }
 
@@ -245,7 +248,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Retain the returned value for retry after an uncertain commit outcome.
     pub fn prepare_create_edge(&self, edge: &Edge) -> Result<PreparedGraphMutation> {
         validate_edge(edge)?;
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         if self.get_edge_in(&view, edge.id)?.is_some() {
             return Err(Error::EdgeAlreadyExists(edge.id));
         }
@@ -268,7 +271,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Retain the returned value for retry after an uncertain commit outcome.
     pub fn prepare_update_edge(&self, edge: &Edge) -> Result<PreparedGraphMutation> {
         validate_edge(edge)?;
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         let previous = self
             .get_edge_in(&view, edge.id)?
             .ok_or(Error::EdgeNotFound(edge.id))?;
@@ -330,7 +333,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
     /// Validate and prepare this mutation without writing it.
     /// Retain the returned value for retry after an uncertain commit outcome.
     pub fn prepare_delete_edge(&self, id: u64) -> Result<PreparedGraphMutation> {
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         let edge = self
             .get_edge_in(&view, id)?
             .ok_or(Error::EdgeNotFound(id))?;
@@ -371,7 +374,7 @@ impl<S: StorageNode> GraphRecordStore<S> {
         if let Some(label) = label {
             crate::graph::validate_label(label)?;
         }
-        let view = self.node.read_view()?;
+        let view = self.storage_view()?;
         if self.get_vertex_in(&view, vertex_id)?.is_none() {
             return Err(Error::VertexNotFound(vertex_id));
         }

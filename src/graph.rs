@@ -23,6 +23,7 @@
 
 pub(crate) mod codec;
 pub(crate) mod incremental;
+mod storage_engine;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -93,6 +94,18 @@ pub(crate) enum EdgeDirection {
     In,
 }
 
+/// One graph partition over a concrete storage backend.
+pub struct PartitionGraph<B> {
+    backend: B,
+}
+
+/// The native RocksDB backend used by the local graph engine.
+pub struct LocalGraphStorage {
+    db: DB,
+    write_lock: Mutex<()>,
+    partition: u32,
+}
+
 /// A single-node property graph backed by RocksDB, scoped to one partition.
 ///
 /// Mutations are serialized by an in-process lock and committed as one batch,
@@ -105,16 +118,16 @@ pub(crate) enum EdgeDirection {
 /// adjacent vertices and edges in the same partition. A batch is atomic only
 /// within this partition; cross-partition transactions need the transaction
 /// layer that K3 adds.
-pub struct GraphEngine {
-    db: DB,
-    write_lock: Mutex<()>,
-    partition: u32,
-}
+pub type GraphEngine = PartitionGraph<LocalGraphStorage>;
+
+/// A graph engine bound to one D1 storage node, shard and graph partition.
+/// Construct it with [`GraphEngine::from_storage_node`](type.GraphEngine.html#method.from_storage_node).
+pub type StorageGraphEngine<S> = PartitionGraph<crate::GraphRecordStore<S>>;
 
 /// A stable, read-only view of one graph partition.
 ///
 /// The view pins a RocksDB snapshot, so it continues to observe the state at
-/// [`GraphEngine::read_view`] even while newer writes commit. It exposes point
+/// [`GraphEngine::read_view`](type.GraphEngine.html#method.read_view) even while newer writes commit. It exposes point
 /// and adjacency reads only; writes go through [`GraphEngine`] or a future
 /// transaction. Snapshot creation copies no graph data.
 pub struct GraphReadView<'a> {
@@ -129,7 +142,7 @@ pub struct GraphReadView<'a> {
 /// writes one synced `WriteBatch`. Dropping the transaction aborts it. Reads
 /// see the transaction's own buffered writes over its pinned snapshot.
 ///
-/// [`begin`]: GraphEngine::begin
+/// [`begin`]: type.GraphEngine.html#method.begin
 pub struct GraphTransaction<'a> {
     engine: &'a GraphEngine,
     snapshot: Snapshot<'a>,
@@ -180,27 +193,29 @@ impl GraphEngine {
     ) -> Result<Self> {
         let db = DB::open(&options, path.as_ref())?;
         Ok(Self {
-            db,
-            write_lock: Mutex::new(()),
-            partition,
+            backend: LocalGraphStorage {
+                db,
+                write_lock: Mutex::new(()),
+                partition,
+            },
         })
     }
 
     pub fn partition(&self) -> u32 {
-        self.partition
+        self.backend.partition
     }
 
     /// Pin a stable read view at the current RocksDB sequence.
     pub fn read_view(&self) -> GraphReadView<'_> {
         GraphReadView {
-            snapshot: self.db.snapshot(),
-            partition: self.partition,
+            snapshot: self.backend.db.snapshot(),
+            partition: self.backend.partition,
         }
     }
 
     /// Start a single-partition transaction at the current RocksDB sequence.
     pub fn begin(&self) -> Result<GraphTransaction<'_>> {
-        let snapshot = self.db.snapshot();
+        let snapshot = self.backend.db.snapshot();
         let read_sequence = snapshot.sequence_number();
         Ok(GraphTransaction {
             engine: self,
@@ -217,12 +232,12 @@ impl GraphEngine {
     pub fn create_vertex(&self, vertex: &Vertex) -> Result<()> {
         validate_vertex(vertex)?;
         let encoded = codec::encode_vertex(vertex)?;
-        let key = vertex_key(self.partition, vertex.id);
+        let key = vertex_key(self.backend.partition, vertex.id);
         let _guard = self.lock();
-        if self.db.get(&key)?.is_some() {
+        if self.backend.db.get(&key)?.is_some() {
             return Err(Error::VertexAlreadyExists(vertex.id));
         }
-        self.db.put(key, encoded)?;
+        self.backend.db.put(key, encoded)?;
         Ok(())
     }
 
@@ -230,17 +245,21 @@ impl GraphEngine {
     pub fn update_vertex(&self, vertex: &Vertex) -> Result<()> {
         validate_vertex(vertex)?;
         let encoded = codec::encode_vertex(vertex)?;
-        let key = vertex_key(self.partition, vertex.id);
+        let key = vertex_key(self.backend.partition, vertex.id);
         let _guard = self.lock();
-        if self.db.get(&key)?.is_none() {
+        if self.backend.db.get(&key)?.is_none() {
             return Err(Error::VertexNotFound(vertex.id));
         }
-        self.db.put(key, encoded)?;
+        self.backend.db.put(key, encoded)?;
         Ok(())
     }
 
     pub fn get_vertex(&self, id: u64) -> Result<Option<Vertex>> {
-        let Some(bytes) = self.db.get(vertex_key(self.partition, id))? else {
+        let Some(bytes) = self
+            .backend
+            .db
+            .get(vertex_key(self.backend.partition, id))?
+        else {
             return Ok(None);
         };
         let vertex = codec::decode_vertex(&bytes)?;
@@ -256,19 +275,20 @@ impl GraphEngine {
     /// Delete a vertex and every incident edge, including both endpoints'
     /// adjacency entries. Returns `false` when the vertex does not exist.
     pub fn delete_vertex(&self, id: u64) -> Result<bool> {
-        let key = vertex_key(self.partition, id);
+        let key = vertex_key(self.backend.partition, id);
         let _guard = self.lock();
-        if self.db.get(&key)?.is_none() {
+        if self.backend.db.get(&key)?.is_none() {
             return Ok(false);
         }
 
         let mut edge_ids = HashSet::new();
         let mut adjacency_keys = Vec::new();
         for prefix in [
-            adjacency_prefix(self.partition, EdgeDirection::Out, id, None),
-            adjacency_prefix(self.partition, EdgeDirection::In, id, None),
+            adjacency_prefix(self.backend.partition, EdgeDirection::Out, id, None),
+            adjacency_prefix(self.backend.partition, EdgeDirection::In, id, None),
         ] {
             for item in self
+                .backend
                 .db
                 .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
             {
@@ -284,16 +304,16 @@ impl GraphEngine {
         let mut batch = WriteBatch::default();
         for edge_id in edge_ids {
             if let Some(edge) = self.get_edge_inner(edge_id)? {
-                batch.delete(edge_key(self.partition, edge.id));
+                batch.delete(edge_key(self.backend.partition, edge.id));
                 batch.delete(adjacency_key(
-                    self.partition,
+                    self.backend.partition,
                     EdgeDirection::Out,
                     edge.from,
                     &edge.label,
                     edge.id,
                 ));
                 batch.delete(adjacency_key(
-                    self.partition,
+                    self.backend.partition,
                     EdgeDirection::In,
                     edge.to,
                     &edge.label,
@@ -307,7 +327,7 @@ impl GraphEngine {
             batch.delete(stored_key);
         }
         batch.delete(key);
-        self.db.write(batch)?;
+        self.backend.db.write(batch)?;
         Ok(true)
     }
 
@@ -316,19 +336,25 @@ impl GraphEngine {
     pub fn create_edge(&self, edge: &Edge) -> Result<()> {
         validate_edge(edge)?;
         let encoded = codec::encode_edge(edge)?;
-        let key = edge_key(self.partition, edge.id);
+        let key = edge_key(self.backend.partition, edge.id);
         let _guard = self.lock();
-        if self.db.get(&key)?.is_some() {
+        if self.backend.db.get(&key)?.is_some() {
             return Err(Error::EdgeAlreadyExists(edge.id));
         }
         if self
+            .backend
             .db
-            .get(vertex_key(self.partition, edge.from))?
+            .get(vertex_key(self.backend.partition, edge.from))?
             .is_none()
         {
             return Err(Error::EdgeEndpointNotFound(edge.from));
         }
-        if self.db.get(vertex_key(self.partition, edge.to))?.is_none() {
+        if self
+            .backend
+            .db
+            .get(vertex_key(self.backend.partition, edge.to))?
+            .is_none()
+        {
             return Err(Error::EdgeEndpointNotFound(edge.to));
         }
 
@@ -336,7 +362,7 @@ impl GraphEngine {
         batch.put(key, encoded);
         batch.put(
             adjacency_key(
-                self.partition,
+                self.backend.partition,
                 EdgeDirection::Out,
                 edge.from,
                 &edge.label,
@@ -346,7 +372,7 @@ impl GraphEngine {
         );
         batch.put(
             adjacency_key(
-                self.partition,
+                self.backend.partition,
                 EdgeDirection::In,
                 edge.to,
                 &edge.label,
@@ -354,7 +380,7 @@ impl GraphEngine {
             ),
             Vec::new(),
         );
-        self.db.write(batch)?;
+        self.backend.db.write(batch)?;
         Ok(())
     }
 
@@ -370,22 +396,22 @@ impl GraphEngine {
             return Ok(false);
         };
         let mut batch = WriteBatch::default();
-        batch.delete(edge_key(self.partition, edge.id));
+        batch.delete(edge_key(self.backend.partition, edge.id));
         batch.delete(adjacency_key(
-            self.partition,
+            self.backend.partition,
             EdgeDirection::Out,
             edge.from,
             &edge.label,
             edge.id,
         ));
         batch.delete(adjacency_key(
-            self.partition,
+            self.backend.partition,
             EdgeDirection::In,
             edge.to,
             &edge.label,
             edge.id,
         ));
-        self.db.write(batch)?;
+        self.backend.db.write(batch)?;
         Ok(true)
     }
 
@@ -403,9 +429,10 @@ impl GraphEngine {
 
     /// All vertices in this partition, ordered by id.
     pub fn vertices(&self) -> Result<Vec<Vertex>> {
-        let prefix = vertex_prefix(self.partition);
+        let prefix = vertex_prefix(self.backend.partition);
         let mut vertices: Vec<Vertex> = Vec::new();
         for item in self
+            .backend
             .db
             .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
         {
@@ -429,9 +456,10 @@ impl GraphEngine {
 
     /// All edges in this partition, ordered by id.
     pub fn edges(&self) -> Result<Vec<Edge>> {
-        let prefix = edge_prefix(self.partition);
+        let prefix = edge_prefix(self.backend.partition);
         let mut edges: Vec<Edge> = Vec::new();
         for item in self
+            .backend
             .db
             .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
         {
@@ -463,16 +491,18 @@ impl GraphEngine {
             validate_label(label)?;
         }
         if self
+            .backend
             .db
-            .get(vertex_key(self.partition, vertex_id))?
+            .get(vertex_key(self.backend.partition, vertex_id))?
             .is_none()
         {
             return Err(Error::VertexNotFound(vertex_id));
         }
 
-        let prefix = adjacency_prefix(self.partition, direction, vertex_id, label);
+        let prefix = adjacency_prefix(self.backend.partition, direction, vertex_id, label);
         let mut edge_ids = Vec::new();
         for item in self
+            .backend
             .db
             .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
         {
@@ -500,7 +530,7 @@ impl GraphEngine {
     }
 
     fn get_edge_inner(&self, id: u64) -> Result<Option<Edge>> {
-        let Some(bytes) = self.db.get(edge_key(self.partition, id))? else {
+        let Some(bytes) = self.backend.db.get(edge_key(self.backend.partition, id))? else {
             return Ok(None);
         };
         let edge = codec::decode_edge(&bytes)?;
@@ -514,7 +544,8 @@ impl GraphEngine {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.write_lock
+        self.backend
+            .write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -757,7 +788,7 @@ impl GraphTransaction<'_> {
         }
 
         let _guard = self.engine.lock();
-        if self.engine.db.latest_sequence_number() != self.read_sequence {
+        if self.engine.backend.db.latest_sequence_number() != self.read_sequence {
             return Err(Error::TransactionConflict);
         }
         self.validate_final_state()?;
@@ -771,7 +802,7 @@ impl GraphTransaction<'_> {
 
         let mut options = WriteOptions::default();
         options.set_sync(true);
-        self.engine.db.write_opt(batch, &options)?;
+        self.engine.backend.db.write_opt(batch, &options)?;
         Ok(())
     }
 
@@ -793,7 +824,10 @@ impl GraphTransaction<'_> {
     }
 
     fn read_vertex_snapshot(&self, id: u64) -> Result<Option<Vertex>> {
-        let Some(bytes) = self.snapshot.get(vertex_key(self.engine.partition, id))? else {
+        let Some(bytes) = self
+            .snapshot
+            .get(vertex_key(self.engine.backend.partition, id))?
+        else {
             return Ok(None);
         };
         let vertex = codec::decode_vertex(&bytes)?;
@@ -807,7 +841,10 @@ impl GraphTransaction<'_> {
     }
 
     fn read_edge_snapshot(&self, id: u64) -> Result<Option<Edge>> {
-        let Some(bytes) = self.snapshot.get(edge_key(self.engine.partition, id))? else {
+        let Some(bytes) = self
+            .snapshot
+            .get(edge_key(self.engine.backend.partition, id))?
+        else {
             return Ok(None);
         };
         let edge = codec::decode_edge(&bytes)?;
@@ -865,8 +902,18 @@ impl GraphTransaction<'_> {
         let mut snapshot_edge_ids = BTreeSet::new();
         let mut adjacency_keys = BTreeSet::new();
         for prefix in [
-            adjacency_prefix(self.engine.partition, EdgeDirection::Out, vertex_id, None),
-            adjacency_prefix(self.engine.partition, EdgeDirection::In, vertex_id, None),
+            adjacency_prefix(
+                self.engine.backend.partition,
+                EdgeDirection::Out,
+                vertex_id,
+                None,
+            ),
+            adjacency_prefix(
+                self.engine.backend.partition,
+                EdgeDirection::In,
+                vertex_id,
+                None,
+            ),
         ] {
             for item in self
                 .snapshot
@@ -951,7 +998,7 @@ impl GraphTransaction<'_> {
     }
 
     fn build_batch(&self) -> Result<WriteBatch> {
-        let partition = self.engine.partition;
+        let partition = self.engine.backend.partition;
         let mut batch = WriteBatch::default();
 
         // Orphaned adjacency entries from a deleted vertex must go first so a
@@ -1557,7 +1604,11 @@ mod query_scan_tests {
         for id in 2..=3 {
             graph.create_edge(&Edge::new(id, 1, 1, "LOOP")).unwrap();
         }
-        graph.db.put(edge_key(graph.partition, 3), b"bad").unwrap();
+        graph
+            .backend
+            .db
+            .put(edge_key(graph.partition(), 3), b"bad")
+            .unwrap();
         let mut visited = Vec::new();
         let result = graph.read_view().query_backend().visit_adjacent_edges(
             1,
@@ -1584,8 +1635,9 @@ mod query_scan_tests {
             graph.create_edge(&Edge::new(id, 1, 2, "LINK")).unwrap();
         }
         graph
+            .backend
             .db
-            .put(edge_key(graph.partition, 10_002), b"bad")
+            .put(edge_key(graph.partition(), 10_002), b"bad")
             .unwrap();
 
         // The explicit limit cannot hide an overflowing intermediate expansion.

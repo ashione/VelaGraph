@@ -349,7 +349,7 @@ RocksDB/Raft 仍是持久化权威，不能清空后当缓存重建。持续推�
 - **交付物**：`get`/`scan`/`batch_write`/`snapshot`/`transaction` 的窄接口；按点 ID 或范围分片；分片切分与迁移的最小协议。
 - **完成定义**：单机实现通过接口测试；分片路由可解释；迁移过程可回滚，不丢数据。
 - **依赖**：与内核线在 P0 共同冻结接口 v0。
-- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine` 接线与拆分/迁移仍未实现；静态远程路由见 `REMOTE_ROUTING.md`。
+- **当前状态**：`src/storage_node.rs` 已有单 shard 本地适配：不透明字节 `get`/`scan`/`batch_write`、稳定读视图、epoch 围栏、请求幂等和 export/import；接口测试见 `tests/storage_node.rs`。`src/graph_records.rs` 已提供基于同一 `graph/v1` 布局的图记录适配器（点/边/邻接的 create/update/delete、标签过滤、级联删除和 reopen），并基于同一 read view 的 sequence 条件批写阻止多 store 的陈旧验证提交；冲突返回 typed `Conflict`，不自动重试。旧 StorageNode 实现对条件写默认返回 `Unsupported`，不降级；D2 已有独立版本化 D1V1 复制命令承载条件/幂等语义，并由独立 `replicated-graph` crate 实现同步 StorageNode trait 与 GraphRecordStore 的进程内 Raft 接线（leader 读屏障、有界稳定快照、prepared 请求原样重试）；见 `REPLICATED_GRAPH.md`。`GraphEngine::from_storage_node` 已接入单分片点边 CRUD 和有界读取。`RouteResolver::begin_v1` 可按目录分区开启事务，提交固定到选定副本，见 `REMOTE_ROUTING.md`。在线拆分与迁移仍待实现。
 
 ### D2 复制与共识
 

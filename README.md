@@ -122,6 +122,11 @@ The Rust package and import name are both **`velagraph`**. The local
 explicit single-partition transactions. It is not itself a distributed client.
 See [query semantics](docs/QUERY_SPEC.md), [transactions](docs/TRANSACTIONS.md)
 and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin.rs).
+
+For vertex and edge CRUD on a Raft shard, construct a
+[storage-backed graph engine](docs/REPLICATED_GRAPH.md#construction-and-execution)
+with `GraphEngine::from_storage_node(adapter, shard, partition)`.
+
 The local, in-process Raft and directly addressed remote storage adapters support
 [write-only single-shard transactions](docs/STORAGE_NODE_INTERFACE.md#single-shard-transaction).
 This API carries a caller-supplied request ID if the commit outcome is unknown.

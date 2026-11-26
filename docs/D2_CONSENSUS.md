@@ -12,8 +12,8 @@ shaped for D1 batches; a three-node shutdown/reopen test is in
 value bytes, and `openraft::testing::Suite::test_all` passes against both durable
 stores (`tests/conformance.rs`). A single-shard local D1 byte adapter exists in
 `src/storage_node.rs`, and `src/graph_records.rs` maps graph records onto it;
-`GraphEngine` still uses its local kernel. The separate
-[replicated graph adapter](REPLICATED_GRAPH.md) connects `GraphRecordStore` to Raft,
+`GraphEngine::from_storage_node` uses that record store through the
+[replicated graph adapter](REPLICATED_GRAPH.md),
 with later remote/routed and managed layers indexed in [CURRENT_STATUS.md](CURRENT_STATUS.md).
 This document freezes the Raft library choice and preserves the original prototype
 plan below; that plan is not the full current implementation inventory.

@@ -22,7 +22,7 @@ mod value;
 
 pub use error::{Error, Result};
 pub use global_scan::{GlobalScanOutput, GlobalScanPlan, QualifiedGremlinRow};
-pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, Vertex};
+pub use graph::{Edge, GraphEngine, GraphReadView, GraphTransaction, StorageGraphEngine, Vertex};
 pub use graph_records::{
     GraphRecordReadView, GraphRecordStore, PreparedGraphMutation, GRAPH_QUERY_PAGE_BYTES,
     MAX_ADJACENCY_EDGES, MAX_GRAPH_BATCH_OPERATIONS,
