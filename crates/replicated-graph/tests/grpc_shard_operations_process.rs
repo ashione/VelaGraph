@@ -84,6 +84,63 @@ impl Drop for ObservedProcess {
         }
     }
 }
+async fn reserve_addresses(count: usize) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut reservations = Vec::new();
+    for _ in 0..count {
+        reservations.push(TcpListener::bind("127.0.0.1:0").await?);
+    }
+    Ok(reservations
+        .iter()
+        .map(|x| x.local_addr())
+        .collect::<std::io::Result<Vec<_>>>()?)
+}
+
+impl ObservedProcess {
+    fn spawn(
+        id: usize,
+        addresses: &[SocketAddr],
+        dir: &std::path::Path,
+        bootstrap: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_graph-node"));
+        command.env("TOKIO_WORKER_THREADS", "2").args([
+            "--allow-insecure-development",
+            "--group",
+            &GROUP.to_string(),
+            "--id",
+            &id.to_string(),
+            "--raft",
+            &addresses[0].to_string(),
+            "--control",
+            &addresses[1].to_string(),
+            "--graph",
+            &addresses[3].to_string(),
+            "--shard",
+            "7",
+            "--epoch",
+            "3",
+            "--data-dir",
+            dir.to_str().context("data dir")?,
+        ]);
+        if let Some(bootstrap) = bootstrap {
+            command.args(["--bootstrap", bootstrap]);
+        }
+        let log = tempfile::NamedTempFile::new()?;
+        let output = log.reopen()?;
+        let child = command
+            .stdout(Stdio::from(output.try_clone()?))
+            .stderr(Stdio::from(output))
+            .spawn()
+            .with_context(|| format!("spawn shard node {id}"))?;
+        Ok(Self {
+            process: Process(child),
+            log,
+            node: id,
+            success: false,
+        })
+    }
+}
+
 struct Cluster {
     addresses: Vec<SocketAddr>,
     leader: usize,
@@ -92,18 +149,10 @@ struct Cluster {
 }
 impl Cluster {
     async fn start() -> anyhow::Result<Self> {
-        let mut reservations = Vec::new();
-        for _ in 0..12 {
-            reservations.push(TcpListener::bind("127.0.0.1:0").await?);
-        }
-        let addresses = reservations
-            .iter()
-            .map(|x| x.local_addr())
-            .collect::<std::io::Result<Vec<_>>>()?;
         let dirs = (0..3)
             .map(|_| tempfile::tempdir())
             .collect::<std::io::Result<Vec<_>>>()?;
-        drop(reservations);
+        let addresses = reserve_addresses(12).await?;
         Self::launch(addresses, dirs, true).await
     }
 
@@ -118,42 +167,12 @@ impl Cluster {
             .join(",");
         let mut processes = Vec::new();
         for i in 0..3 {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_graph-node"));
-            command.env("TOKIO_WORKER_THREADS", "2").args([
-                "--allow-insecure-development",
-                "--group",
-                &GROUP.to_string(),
-                "--id",
-                &(i + 1).to_string(),
-                "--raft",
-                &addresses[4 * i].to_string(),
-                "--control",
-                &addresses[4 * i + 1].to_string(),
-                "--graph",
-                &addresses[4 * i + 3].to_string(),
-                "--shard",
-                "7",
-                "--epoch",
-                "3",
-                "--data-dir",
-                dirs[i].path().to_str().context("data dir")?,
-            ]);
-            if initialize && i == 0 {
-                command.args(["--bootstrap", &bootstrap]);
-            }
-            let log = tempfile::NamedTempFile::new()?;
-            let output = log.reopen()?;
-            let child = command
-                .stdout(Stdio::from(output.try_clone()?))
-                .stderr(Stdio::from(output))
-                .spawn()
-                .with_context(|| format!("spawn shard node {}", i + 1))?;
-            processes.push(ObservedProcess {
-                process: Process(child),
-                log,
-                node: i + 1,
-                success: false,
-            });
+            processes.push(ObservedProcess::spawn(
+                i + 1,
+                &addresses[4 * i..4 * i + 4],
+                dirs[i].path(),
+                (initialize && i == 0).then_some(bootstrap.as_str()),
+            )?);
         }
         let leader = timeout(Duration::from_secs(35), async {
             loop {
@@ -192,7 +211,7 @@ impl Cluster {
             _dirs: dirs,
         })
     }
-    async fn restart(mut self) -> anyhow::Result<Self> {
+    fn stop(&mut self) -> anyhow::Result<()> {
         for process in &mut self._processes {
             process.process.0.kill()?;
         }
@@ -200,6 +219,10 @@ impl Cluster {
             process.process.0.wait()?;
             process.success = true;
         }
+        Ok(())
+    }
+    async fn restart(mut self) -> anyhow::Result<Self> {
+        self.stop()?;
         drop(self._processes);
         Self::launch(self.addresses, self._dirs, false).await
     }
@@ -1565,3 +1588,6 @@ async fn graph_engine_recovers_department_membership_after_voter_restart() -> an
     }
     Ok(())
 }
+
+#[path = "support/graph_replication_delivery.rs"]
+mod graph_replication_delivery;
