@@ -125,7 +125,8 @@ and the executable [graph tests](tests/graph.rs) / [Gremlin tests](tests/gremlin
 The local, in-process Raft and directly addressed remote storage adapters support
 [write-only single-shard transactions](docs/STORAGE_NODE_INTERFACE.md#single-shard-transaction).
 This API carries a caller-supplied request ID if the commit outcome is unknown.
-The routed adapter and older remote peers return `Unsupported` at begin.
+`RouteResolver::begin_v1` selects one shard by catalog partition. Older remote
+peers return `Unsupported` at begin.
 
 Local temporal queries support reusable parsed plans, typed bindings and
 [bounded query reuse](docs/TEMPORAL_STORE.md#query-reuse-and-typed-bindings).

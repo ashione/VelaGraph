@@ -354,7 +354,7 @@ impl StorageNode for RemoteStorageNode {
         &self,
         options: TransactionOptions,
     ) -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError> {
-        self.begin_transaction(options)
+        self.clone().begin_transaction(options)
     }
 
     fn admin(&self) -> &dyn StorageAdmin {

@@ -3,10 +3,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 impl RemoteStorageNode {
-    pub(super) fn begin_transaction(
-        &self,
+    pub(crate) fn begin_transaction(
+        self,
         options: TransactionOptions,
-    ) -> std::result::Result<Box<dyn StorageTransaction + '_>, TransactionError> {
+    ) -> std::result::Result<Box<dyn StorageTransaction>, TransactionError> {
         options.check()?;
         let (shard, epoch) = (options.shard, options.epoch);
         if shard != self.shard {
