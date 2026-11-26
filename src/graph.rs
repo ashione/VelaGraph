@@ -43,7 +43,7 @@ const VERTEX_SUFFIX: &[u8] = b"vertex/";
 const EDGE_SUFFIX: &[u8] = b"edge/";
 const OUT_SUFFIX: &[u8] = b"out/";
 const IN_SUFFIX: &[u8] = b"in/";
-const MAX_LABEL_LEN: usize = 64;
+pub(crate) const MAX_LABEL_LEN: usize = 64;
 const MAX_TRANSACTION_OPERATIONS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 

@@ -5,7 +5,7 @@ use replicated_graph::{
     routing::{
         experimental::{
             AdjacencyCompleteness, EdgeMutationKind, ExperimentalReadSession,
-            ExperimentalRouteError, MutationAcknowledgement, ObservedElementRef,
+            ExperimentalRouteError, MutationAcknowledgement, ObservedEdgeState, ObservedElementRef,
             ObservedPathElement, ObservedRow, ObservedRowV2, ObservedRowV3, Stage, StageOutcome,
         },
         RemoteReplica, RouteError, RouteResolver,
@@ -1261,6 +1261,10 @@ async fn property_mutation_scenario() -> anyhow::Result<()> {
             other => panic!("expected source-only append: {other:?}"),
         }
         let partial = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(partial.probe_edge(incomplete.identity(), incomplete.to, &incomplete.label)?, ObservedEdgeState::LiveWithoutReverse);
+        assert_eq!(session.probe_edge(incomplete.identity(), incomplete.to, &incomplete.label)?, ObservedEdgeState::Neither);
+        assert!(matches!(partial.probe_edge(incomplete.identity(), incomplete.to, "Other"),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::Invalid(_)))));
         assert!(matches!(partial.get_edge(incomplete.identity()),
             Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
                 if edge == incomplete.identity()));
@@ -1277,6 +1281,7 @@ async fn property_mutation_scenario() -> anyhow::Result<()> {
             Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
                 if edge == incomplete.identity()));
         let unknown = after_rejection.prepare_edge_properties(EdgeRef { partition: 1, id: 101 }, &patch)?;
+        check_reverse_only_probe(&resolver, &target_node, &incomplete)?;
         // Trusted raw D1 fault injection: deleting the target endpoint must
         // make a fresh session reject preparation before any source mutation.
         let mut target_vertex_key = b"graph/v2/p/".to_vec();
@@ -1290,6 +1295,8 @@ async fn property_mutation_scenario() -> anyhow::Result<()> {
             operations: vec![WriteOp::Delete { key: target_vertex_key }],
         })?;
         let invalid = resolver.experimental_read_session(BUDGET)?;
+        assert!(matches!(invalid.probe_edge(incomplete.identity(), incomplete.to, &incomplete.label),
+            Err(ExperimentalRouteError::Graph(ExperimentalError::MissingEndpoint(v))) if v == incomplete.to));
         let invalid_ref = EdgeRef { partition: 1, id: 101 };
         assert!(matches!(invalid.prepare_edge_properties(invalid_ref, &patch),
             Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(edge)))
@@ -1375,6 +1382,9 @@ async fn edge_deletion_scenario() -> anyhow::Result<()> {
             assert_eq!(deletion.reverse_request_id().is_some(), e.to.partition == 2);
             assert_eq!(resolver.experimental_commit_mutation(&deletion, BUDGET)?, MutationAcknowledgement::AllBatchesAcknowledged);
             let deleted = resolver.experimental_read_session(BUDGET)?;
+            assert_eq!(before_delete.probe_edge(e.identity(), e.to, &e.label)?, ObservedEdgeState::LiveWithReverse);
+            assert_eq!(deleted.probe_edge(e.identity(), e.to, &e.label)?,
+                ObservedEdgeState::DeletedWithoutReverse { operation_id: deletion.operation_id() });
             assert!(deleted.get_edge(e.identity())?.is_none());
             assert!(before_delete.get_edge(e.identity())?.is_some());
             assert_eq!(frozen.get_edge(e.identity())?, Some(e.clone()));
@@ -1432,6 +1442,8 @@ async fn edge_deletion_scenario() -> anyhow::Result<()> {
             }
         }
         let partial = resolver.experimental_read_session(BUDGET)?;
+        assert_eq!(partial.probe_edge(survivor.identity(), survivor.to, &survivor.label)?,
+            ObservedEdgeState::DeletedWithReverse { operation_id: deletion.operation_id() });
         assert!(matches!(partial.get_edge(survivor.identity()),
             Err(ExperimentalRouteError::Graph(ExperimentalError::Incomplete(id))) if id == survivor.identity()));
         assert!(matches!(partial.observed_gremlin_v3(999, "g.E().count()"),
@@ -1663,5 +1675,69 @@ async fn vertex_property_scenario() -> anyhow::Result<()> {
         assert!(after.get_vertex(vr(2))?.is_some());
         Ok(())
     }).await??;
+    Ok(())
+}
+
+/// Seed just the target participant to exercise a reverse observation without
+/// a canonical record. The reverse key cannot tell us the source vertex ID.
+fn check_reverse_only_probe(
+    resolver: &RouteResolver,
+    node: &replicated_graph::RemoteStorageNode,
+    incomplete: &CrossEdge,
+) -> anyhow::Result<()> {
+    use velagraph::experimental_graph::AppendOnlyStore;
+    // Same target, label and numeric edge ID; only the owner differs.
+    let edge = CrossEdge {
+        from: VertexRef {
+            partition: 3,
+            id: 7,
+        },
+        ..incomplete.clone()
+    };
+    let before = resolver.experimental_read_session(BUDGET)?;
+    let reverse = AppendOnlyStore::new(node.clone(), 530, 2).prepare_reverse(&edge)?;
+    reverse.submit(node)?;
+    let observed = resolver.experimental_read_session(BUDGET)?;
+    assert_eq!(
+        before.probe_edge(edge.identity(), edge.to, &edge.label)?,
+        ObservedEdgeState::Neither
+    );
+    assert_eq!(
+        observed.probe_edge(edge.identity(), edge.to, &edge.label)?,
+        ObservedEdgeState::ReverseOnly
+    );
+    assert_eq!(
+        observed.probe_edge(incomplete.identity(), incomplete.to, &incomplete.label)?,
+        ObservedEdgeState::LiveWithoutReverse
+    );
+    assert!(matches!(
+        observed.probe_edge(edge.identity(), edge.to, &"x".repeat(65)),
+        Err(ExperimentalRouteError::Graph(ExperimentalError::Invalid(_)))
+    ));
+    assert_eq!(
+        observed.probe_edge(edge.identity(), edge.to, "Other")?,
+        ObservedEdgeState::Neither
+    );
+    assert_eq!(
+        observed.snapshots,
+        resolver.experimental_read_session(BUDGET)?.snapshots
+    );
+
+    // A malformed index value must not look absent or repairable.
+    let (mut request, _) = reverse.into_conditional_request();
+    let [WriteOp::Put { value, .. }] = request.operations.as_mut_slice() else {
+        anyhow::bail!("expected one reverse index put")
+    };
+    value.push(1);
+    request.request_id = [235; 16];
+    node.batch_write(request)?;
+    assert!(matches!(
+        resolver.experimental_read_session(BUDGET)?.probe_edge(
+            edge.identity(),
+            edge.to,
+            &edge.label
+        ),
+        Err(ExperimentalRouteError::Graph(ExperimentalError::Corrupt(_)))
+    ));
     Ok(())
 }

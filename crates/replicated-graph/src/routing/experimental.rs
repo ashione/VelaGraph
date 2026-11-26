@@ -74,6 +74,21 @@ pub enum AppendAcknowledgement {
 pub enum AdjacencyCompleteness {
     Unverified,
 }
+/// Point observations for a qualified edge on this session's shard snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedEdgeState {
+    /// Neither the canonical record nor the requested incoming key was observed.
+    Neither,
+    ReverseOnly,
+    LiveWithoutReverse,
+    LiveWithReverse,
+    DeletedWithoutReverse {
+        operation_id: RequestId,
+    },
+    DeletedWithReverse {
+        operation_id: RequestId,
+    },
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObservedAdjacency {
     pub edges: Vec<CrossEdge>,
@@ -189,6 +204,41 @@ impl ExperimentalReadSession {
             Some(EdgeRecord::Deleted(_)) | None => None,
         };
         Ok(value)
+    }
+    /// Inspect a known canonical edge identity and exact reverse key. Supply the
+    /// target and label even when the canonical record is absent. The result
+    /// describes only the pinned shard views and makes no writes.
+    pub fn probe_edge(
+        &self,
+        edge: EdgeRef,
+        target: VertexRef,
+        label: &str,
+    ) -> ExperimentalResult<ObservedEdgeState> {
+        let canonical = self.store(edge.partition)?.get_edge_record(edge.id)?;
+        if let Some(record) = &canonical {
+            if record.edge().to != target || record.edge().label != label {
+                return Err(ExperimentalError::Invalid(
+                    "probe target or label differs from canonical edge",
+                )
+                .into());
+            }
+        }
+        let reverse = self
+            .store(target.partition)?
+            .has_reverse_index(edge, target, label)?;
+        self.op.check(None)?;
+        Ok(match (canonical, reverse) {
+            (None, false) => ObservedEdgeState::Neither,
+            (None, true) => ObservedEdgeState::ReverseOnly,
+            (Some(EdgeRecord::Live(_)), false) => ObservedEdgeState::LiveWithoutReverse,
+            (Some(EdgeRecord::Live(_)), true) => ObservedEdgeState::LiveWithReverse,
+            (Some(EdgeRecord::Deleted(t)), false) => ObservedEdgeState::DeletedWithoutReverse {
+                operation_id: t.operation_id,
+            },
+            (Some(EdgeRecord::Deleted(t)), true) => ObservedEdgeState::DeletedWithReverse {
+                operation_id: t.operation_id,
+            },
+        })
     }
     fn verified_edge_record(&self, edge: EdgeRef) -> ExperimentalResult<Option<EdgeRecord>> {
         let value = self.store(edge.partition)?.get_edge_record(edge.id)?;
