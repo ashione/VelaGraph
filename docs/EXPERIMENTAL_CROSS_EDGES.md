@@ -75,6 +75,34 @@ value does not extend a read session. Commit uses the prepared frozen placements
 not newly registered catalog entries. Epoch fencing is still checked by storage.
 There is no placement migration or ownership change support.
 
+## Inspect a known cross-shard edge
+
+Call `ExperimentalReadSession::probe_edge(edge_ref, target_vertex, label)` on
+a pinned session. Supply the source partition and edge ID in `edge_ref`.
+Supply the qualified target vertex and exact label to locate the incoming key
+even if the canonical record is missing. The incoming key does not store the
+source vertex ID or edge properties.
+
+| Source record | Matching incoming key absent | Matching incoming key present |
+| --- | --- | --- |
+| Absent | `Neither` | `ReverseOnly` |
+| Live | `LiveWithoutReverse` | `LiveWithReverse` |
+| Tombstone | `DeletedWithoutReverse` | `DeletedWithReverse` |
+
+Both deletion states carry the original tombstone operation ID. A conflict on
+the second shard of a source-first create can yield `LiveWithoutReverse`. A
+conflict on the second shard of a delete can yield `DeletedWithReverse`. In
+either case preserve the original prepared request if available. A reverse-only
+observation cannot supply the missing canonical edge.
+
+The probe uses point reads on the session's pinned snapshots. The existing
+canonical-record checks still apply. An absent target vertex, a malformed
+index value, or a supplied target or label that disagrees with the canonical
+record returns an error. Interpret the result with the session's per-shard
+snapshot stamps. The probe only covers the requested pair of keys: `Neither`
+does not rule out an entry elsewhere. Relationship completeness remains
+`Unverified`. The probe performs no repair.
+
 ## Additive edge property mutation
 
 `ExperimentalReadSession::prepare_edge_properties(EdgeRef, &EdgePropertyPatch)`

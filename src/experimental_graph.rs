@@ -684,6 +684,27 @@ impl<S: StorageNode> AppendOnlyStore<S> {
             )],
         )
     }
+    /// Inspect one exact incoming index key on an existing target vertex.
+    /// The reverse key carries the source partition and edge ID, but no source vertex ID.
+    pub fn has_reverse_index(&self, edge: EdgeRef, target: VertexRef, label: &str) -> Result<bool> {
+        if target.partition != self.partition {
+            return Err(ExperimentalError::Invalid("target partition mismatch"));
+        }
+        if label.len() > crate::graph::MAX_LABEL_LEN {
+            return Err(ExperimentalError::Invalid("edge label too long"));
+        }
+        validate_label(label)?;
+        let view = self.view()?;
+        if self.vertex_in(target.id, &view)?.is_none() {
+            return Err(ExperimentalError::MissingEndpoint(target));
+        }
+        let key = qualified_index_key(target, Direction::In, label, edge);
+        match self.node.get(&key, &view)? {
+            None => Ok(false),
+            Some(value) if value.is_empty() => Ok(true),
+            Some(_) => Err(ExperimentalError::Corrupt("index encoding")),
+        }
+    }
     pub fn verify_reverse(&self, edge: &CrossEdge) -> Result<()> {
         if edge.to.partition != self.partition {
             return Err(ExperimentalError::Invalid("target partition mismatch"));
@@ -762,11 +783,19 @@ fn index_prefix(p: u32, d: Direction, id: u64) -> Vec<u8> {
 }
 fn index_key(e: &CrossEdge, d: Direction) -> Vec<u8> {
     let endpoint = if d == Direction::Out { e.from } else { e.to };
-    let mut k = index_prefix(endpoint.partition, d, endpoint.id);
-    k.extend(e.label.as_bytes());
+    qualified_index_key(endpoint, d, &e.label, e.identity())
+}
+fn qualified_index_key(
+    endpoint: VertexRef,
+    direction: Direction,
+    label: &str,
+    edge: EdgeRef,
+) -> Vec<u8> {
+    let mut k = index_prefix(endpoint.partition, direction, endpoint.id);
+    k.extend(label.as_bytes());
     k.push(b'/');
-    k.extend(e.from.partition.to_be_bytes());
-    k.extend(e.id.to_be_bytes());
+    k.extend(edge.partition.to_be_bytes());
+    k.extend(edge.id.to_be_bytes());
     k
 }
 // v2 protobuf envelope: version=2, kind, fixed32 partition field 3,
