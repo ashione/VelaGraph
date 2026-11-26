@@ -1,4 +1,4 @@
-//! Four independent Raft participant groups, exercised only through managed writes
+//! Independent Raft participant groups, exercised only through managed writes
 //! and the public TCP gateway. Fixture IDs have no production significance.
 use super::*;
 
@@ -15,14 +15,19 @@ struct ScalingFixture {
 }
 
 fn scaling_binding() -> Binding {
+    binding_for(&SHARDS)
+}
+
+fn binding_for(shards: &[u64]) -> Binding {
     Binding {
         authority: authority(),
         cohort: Cohort {
             profile: Default::default(),
             coordinator_shard: 9,
             coordinator_epoch: 1,
-            members: SHARDS
-                .into_iter()
+            members: shards
+                .iter()
+                .copied()
                 .map(|shard| Member {
                     shard,
                     epoch: 1,
@@ -43,13 +48,22 @@ fn scaling_identity(shard: u64) -> Identity {
 
 impl ScalingFixture {
     async fn new() -> Self {
+        Self::for_shards(&SHARDS).await
+    }
+
+    async fn for_shards(shards: &[u64]) -> Self {
+        let binding = binding_for(shards);
+        let member_identity = |shard| Identity {
+            cohort: binding.cohort.clone(),
+            ..identity(shard)
+        };
         let cluster = Cluster::new();
         let mut nodes = Vec::new();
         let mut servers = Vec::new();
         let mut graphs = Vec::new();
         let mut clients = Vec::new();
         let mut routes = Vec::new();
-        for shard in std::iter::once(9).chain(SHARDS) {
+        for shard in std::iter::once(9).chain(shards.iter().copied()) {
             let node = cluster.in_group(shard).start(1).await.unwrap();
             node.raft
                 .initialize(BTreeMap::from([(
@@ -100,7 +114,7 @@ impl ScalingFixture {
                         epoch: 1,
                         mode_id: [9; 16],
                         command: Command::BindCohort {
-                            cohort: scaling_binding().cohort,
+                            cohort: binding.cohort.clone(),
                         },
                     },
                 )
@@ -121,7 +135,7 @@ impl ScalingFixture {
                 let mut journal = Journal::new([9; 16]).unwrap();
                 journal
                     .apply(Command::BindCohort {
-                        cohort: scaling_binding().cohort,
+                        cohort: binding.cohort.clone(),
                     })
                     .unwrap();
                 submit(
@@ -139,14 +153,14 @@ impl ScalingFixture {
             let node = Arc::new(node);
             let server = Server::bind(
                 node.clone(),
-                scaling_identity(shard),
+                member_identity(shard),
                 "127.0.0.1:0".parse().unwrap(),
                 DEADLINE,
             )
             .await
             .unwrap();
             clients
-                .push(Client::new(server.local_addr(), scaling_identity(shard), DEADLINE).unwrap());
+                .push(Client::new(server.local_addr(), member_identity(shard), DEADLINE).unwrap());
             servers.push(server);
             if shard != 9 {
                 let graph = GraphService::start_managed(
@@ -164,7 +178,7 @@ impl ScalingFixture {
                         group: shard,
                         node: 1,
                     },
-                    managed_identity: scaling_identity(shard),
+                    managed_identity: member_identity(shard),
                 });
                 graphs.push(graph);
             }
@@ -177,7 +191,7 @@ impl ScalingFixture {
             graphs,
             config: RemoteConfig {
                 coordinator: clients.remove(0),
-                binding: scaling_binding(),
+                binding,
                 members: clients,
             },
             routes,
@@ -216,7 +230,9 @@ impl ScalingFixture {
         for server in self.servers {
             server.shutdown().await;
         }
-        for (node, shard) in self.nodes.iter().zip(std::iter::once(9).chain(SHARDS)) {
+        for (node, shard) in self.nodes.iter().zip(
+            std::iter::once(9).chain(self.config.binding.cohort.members.iter().map(|m| m.shard)),
+        ) {
             self.cluster.in_group(shard).shutdown(node).await;
         }
     }
@@ -579,3 +595,6 @@ async fn fixed_local_scaling_invalid_widths_fail_before_routes_or_network() {
         assert!(matches!(result, Err(Error::Protocol)), "width={width}");
     }
 }
+
+#[path = "managed_gateway_fixed_page_work_tests.rs"]
+mod fixed_page_work;

@@ -137,6 +137,12 @@ impl Sessions {
         {
             return Err(RemoteError::Protocol);
         }
+        #[cfg(test)]
+        {
+            let mut work = self.fixed_work.lock().unwrap();
+            work.captures += 1;
+            work.replay_operations += snapshot.replay_operations;
+        }
         let capture_cost = CaptureCost {
             rows: snapshot.entries.len(),
             bytes: snapshot
@@ -364,6 +370,8 @@ impl Sessions {
             .try_acquire()
             .map_err(|_| RemoteError::ResourceExhausted)?;
         let expected = request.descriptor.clone();
+        #[cfg(test)]
+        let fixed_work = self.fixed_work.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Both permits and the full view stay alive after caller cancellation.
             let _permit = permit;
@@ -392,6 +400,8 @@ impl Sessions {
                     .min(CEILING.work.saturating_sub(ledger.used.work)),
             };
             let node = MeteredNode {
+                #[cfg(test)]
+                fixed_work: Some(fixed_work),
                 frozen: query::FrozenNode {
                     view: session.node.view.clone(),
                     end: end.into_std(),
