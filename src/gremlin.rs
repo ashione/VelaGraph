@@ -539,7 +539,8 @@ impl GremlinQuery {
     ) -> Result<GremlinResult> {
         check()?;
         let view = graph.read_view();
-        self.execute_on_read(&view, check)
+        let backend = view.query_backend();
+        self.execute_on_read(&backend, check)
     }
 
     /// Execute against one newly acquired D1 graph view. Its acquisition, including
@@ -1820,13 +1821,21 @@ mod snapshot_tests {
             .collect();
         let before: Vec<_> = queries
             .iter()
-            .map(|q| q.execute_on_read(&view, &|| Ok(())).unwrap())
+            .map(|q| {
+                q.execute_on_read(&view.query_backend(), &|| Ok(()))
+                    .unwrap()
+            })
             .collect();
         std::thread::scope(|scope| scope.spawn(|| replace_graph(&graph)).join().unwrap());
         assert_eq!(view.sequence(), sequence);
         assert!(graph.read_view().sequence() > sequence);
         for (query, expected) in queries.iter().zip(before) {
-            assert_eq!(query.execute_on_read(&view, &|| Ok(())).unwrap(), expected);
+            assert_eq!(
+                query
+                    .execute_on_read(&view.query_backend(), &|| Ok(()))
+                    .unwrap(),
+                expected
+            );
             assert_ne!(query.execute(&graph).unwrap(), expected);
         }
     }
@@ -1924,7 +1933,7 @@ mod memory_overlap_tests {
             let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
             GremlinQuery::parse(text)
                 .unwrap()
-                .execute_on_read_budget(&view, &|| Ok(()), &budget)
+                .execute_on_read_budget(&view.query_backend(), &|| Ok(()), &budget)
                 .unwrap();
             individually = individually.max(budget.peak());
             assert_eq!(budget.used(), 0);
@@ -1932,14 +1941,14 @@ mod memory_overlap_tests {
         let query = GremlinQuery::parse("g.V(1,1).out() ").unwrap();
         let tight = Budget::new(individually);
         assert!(matches!(
-            query.execute_on_read_budget(&view, &|| Ok(()), &tight),
+            query.execute_on_read_budget(&view.query_backend(), &|| Ok(()), &tight),
             Err(Error::TraversalLimitExceeded(_))
         ));
         assert_eq!(tight.used(), 0);
         let roomy = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
         assert_eq!(
             query
-                .execute_on_read_budget(&view, &|| Ok(()), &roomy)
+                .execute_on_read_budget(&view.query_backend(), &|| Ok(()), &roomy)
                 .unwrap()
                 .rows,
             vec![GremlinRow::Vertex(2), GremlinRow::Vertex(2)]
@@ -1984,7 +1993,7 @@ mod memory_overlap_tests {
         ] {
             let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
             let result = GremlinQuery::parse(text).unwrap().execute_on_read_budget(
-                &graph.read_view(),
+                &graph.read_view().query_backend(),
                 &|| Ok(()),
                 &budget,
             );
@@ -2001,7 +2010,7 @@ mod memory_overlap_tests {
         let budget = Budget::new(MAX_GREMLIN_ACCOUNTED_BYTES);
         GremlinQuery::parse("g.V().count()")
             .unwrap()
-            .execute_on_read_budget(&graph.read_view(), &|| Ok(()), &budget)
+            .execute_on_read_budget(&graph.read_view().query_backend(), &|| Ok(()), &budget)
             .unwrap();
         println!("g.V().count(): peak_accounted_bytes={}", budget.peak());
         assert_eq!(budget.used(), 0);

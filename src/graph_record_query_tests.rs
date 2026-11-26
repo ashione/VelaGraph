@@ -713,7 +713,7 @@ fn aggregate_budget_exact_point_boundaries_projections_and_edge_scratch() {
             expected,
             "{text}"
         );
-        check_exact_point_budget(&local.read_view(), text, &expected);
+        check_exact_point_budget(&local.read_view().query_backend(), text, &expected);
         check_exact_point_budget(&retained, text, &expected);
     }
     // Traversal decodes and drops a large edge even when returning only IDs or paths.
@@ -759,7 +759,7 @@ fn aggregate_budget_exact_point_boundaries_projections_and_edge_scratch() {
         );
         assert_eq!(budget.used(), 0);
     }
-    check_edge_scratch(&local.read_view());
+    check_edge_scratch(&local.read_view().query_backend());
     check_edge_scratch(&retained);
 }
 
@@ -815,7 +815,7 @@ fn audit_local_lookahead_is_charged_for_vertices_and_edges() {
     for text in ["g.V().limit(1)", "g.E().limit(1)"] {
         let budget = Budget::new(8192);
         let result = GremlinQuery::parse(text).unwrap().execute_on_read_budget(
-            &graph.read_view(),
+            &graph.read_view().query_backend(),
             &|| Ok(()),
             &budget,
         );
@@ -880,6 +880,6 @@ fn audit_cancellation_releases_all_local_and_d1_overlap() {
         local.create_edge(edge).unwrap();
     }
     let store = GraphRecordStore::new(Node::new(&vertices, &edges), 7, 0);
-    audit_cancel_every_checkpoint(&local.read_view());
+    audit_cancel_every_checkpoint(&local.read_view().query_backend());
     audit_cancel_every_checkpoint(&store.read_view().unwrap());
 }
