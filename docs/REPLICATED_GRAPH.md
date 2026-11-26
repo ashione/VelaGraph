@@ -171,6 +171,14 @@ Existing convenience graph CRUD signatures and local behavior are unchanged.
 - Root prepared-mutation tests cover all CRUD, local reopen, stale condition,
   target/epoch fencing and an unknown committed result resubmitted unchanged
   through a replacement adapter without a fresh read.
+- `restarted_learner_handles_reordered_and_duplicate_graph_appends` registers a
+  fourth process as a learner, stops it, and commits an edge create and update
+  on the three voters. With the voters stopped, the restarted learner receives
+  the two real log entries via Raft gRPC. It rejects the update before its
+  predecessor, then accepts ordered and repeated deliveries. Local metadata
+  stays at the same sequence on each duplicate. After the learner is killed,
+  its reopened graph records and both adjacency indexes match the leader's
+  pre-shutdown view byte for byte.
 - Atomic D2 snapshot tests interleave writes/read captures and verify sequence
   and both data values agree, with exact row/byte boundary rejection.
 - Real three-node uncertain-commit regression locks apply until a client timeout,
