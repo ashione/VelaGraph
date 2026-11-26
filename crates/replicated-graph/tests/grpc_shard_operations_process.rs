@@ -1485,3 +1485,83 @@ async fn remote_transaction_recovery() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_engine_recovers_department_membership_after_voter_restart() -> anyhow::Result<()> {
+    use replicated_graph::{run_blocking, RemoteStorageNode};
+    use velagraph::{Edge, Error, GraphEngine, GremlinRow, StorageNodeError, Value, Vertex};
+
+    let engine = |cluster: &Cluster| -> anyhow::Result<_> {
+        let node = RemoteStorageNode::new_identified(
+            cluster.grpc(cluster.leader),
+            GROUP,
+            cluster.identity(cluster.leader).node,
+            SHARD,
+            BUDGET,
+        )?;
+        Ok(GraphEngine::from_storage_node(node, SHARD, 4))
+    };
+    let mut employee = Vertex::new(1);
+    employee.labels.push("employee".into());
+    employee
+        .properties
+        .insert("name".into(), Value::Text("Ada".into()));
+    let mut department = Vertex::new(2);
+    department.labels.push("department".into());
+    let membership = Edge::new(9, 1, 2, "member_of");
+    let cluster = Cluster::start().await?;
+    let writer = engine(&cluster)?;
+    let (employee, department, membership, committed, stale) =
+        run_blocking(move || -> velagraph::Result<_> {
+            writer.create_vertex(&employee)?;
+            writer.create_vertex(&department)?;
+            let before = writer.read_view()?;
+            let stale = writer.records().prepare_delete_vertex(department.id)?;
+            let committed = writer.records().prepare_create_edge(&membership)?;
+            writer.records().commit_prepared(&committed)?;
+            assert_eq!(before.sequence(), 2);
+            assert_eq!(before.get_edge(membership.id)?, None);
+            Ok((employee, department, membership, committed, stale))
+        })
+        .await??;
+
+    // Kill all three OS processes and reopen their original databases.
+    let mut reopened = cluster.restart().await?;
+    let reader = engine(&reopened)?;
+    run_blocking(move || -> velagraph::Result<()> {
+        assert_eq!(reader.partition(), 4);
+        assert_eq!(reader.read_view()?.sequence(), 3);
+        reader.records().commit_prepared(&committed)?;
+        assert!(matches!(
+            reader.records().commit_prepared(&stale),
+            Err(Error::StorageNode(StorageNodeError::Conflict {
+                expected: 2,
+                current: 3
+            }))
+        ));
+        assert_eq!(reader.read_view()?.sequence(), 3);
+        assert_eq!(reader.get_vertex(1)?, Some(employee));
+        assert_eq!(reader.get_vertex(2)?, Some(department));
+        assert_eq!(reader.get_edge(9)?, Some(membership.clone()));
+        assert_eq!(
+            reader.out_edges(1, Some("member_of"))?,
+            vec![membership.clone()]
+        );
+        assert_eq!(reader.in_edges(2, Some("member_of"))?, vec![membership]);
+        assert!(reader.out_edges(1, Some("reports_to"))?.is_empty());
+        assert_eq!(
+            reader.gremlin("g.V(1).out('member_of')")?.rows,
+            vec![GremlinRow::Vertex(2)]
+        );
+        assert!(reader.delete_vertex(2)?);
+        assert_eq!(reader.read_view()?.sequence(), 4);
+        assert_eq!(reader.get_edge(9)?, None);
+        assert!(reader.out_edges(1, None)?.is_empty());
+        Ok(())
+    })
+    .await??;
+    for process in &mut reopened._processes {
+        process.success = true;
+    }
+    Ok(())
+}

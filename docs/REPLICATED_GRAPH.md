@@ -5,8 +5,8 @@ synchronous D1 `StorageNode` trait to an actual three-voter openraft group.
 The original adapter described below is an **in-process correctness prototype**.
 The separate [development-only remote adapter](REMOTE_GRAPH.md) adds TCP access
 to explicitly selected replicas; it does not make this a production service.
-`GraphEngine` and its K3 transaction API still use the local kernel. The same
-Gremlin parser/operators can also execute through this replicated D1 adapter.
+`GraphEngine::from_storage_node` exposes graph operations on a selected D1 node.
+`GraphEngine::open` and its K3 read/write transactions use local RocksDB.
 A separate [D3a static catalog](D3_STATIC_CATALOG.md) provides persisted immutable
 placement in a dedicated metadata group. The optional bounded in-process resolver
 is described there. This v1 adapter has no cross-shard transactions. Separate
@@ -21,7 +21,23 @@ machine with `LogCommand::D1V1(D1Command::Activate { shard, epoch })`. Inspect t
 nested application result; a successful Raft write is not necessarily an
 accepted D1 command. On the runtime hosting a `NodeHandle`, construct
 `ReplicatedStorageNode::new(&node, shard, deadline)` and then
-`GraphRecordStore::new(adapter, shard, partition)`.
+`GraphEngine::from_storage_node(adapter, shard, partition)`. The returned
+`StorageGraphEngine` exposes vertex and edge CRUD, filtered adjacency, stable
+reads and the record store's supported read-only Gremlin operations. Call these
+synchronous methods on the blocking pool. Both adjacency directions enforce
+the storage scan limits; an oversized scan returns an error. The same
+constructor accepts a directly addressed `RemoteStorageNode`.
+
+For retryable mutations use `engine.records().prepare_*` and retain the result.
+After an uncertain reply, submit that same value with
+`engine.records().commit_prepared(&prepared)`. A fresh CRUD call creates a new
+identity. `engine.read_view()?` captures the leader's committed graph sequence.
+
+The three-voter in-process CRUD test exercises the engine methods. The
+`graph_engine_recovers_department_membership_after_voter_restart` test kills
+and reopens three independent processes. It checks the employee, department,
+edge, both adjacency indexes, exact prepared replay and rejection of a stale
+cascade. This fixture covers one unmanaged graph partition.
 
 Direct `ReplicatedStorageNode::begin_v1` supports single-shard write staging.
 A leader barrier captures the epoch and sequence. Commit submits the complete
