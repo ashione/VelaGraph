@@ -71,6 +71,7 @@ pub enum RouteError {
     MissingPartition(u32),
     MissingReplica { group: u64, node: u64 },
     PlacementMismatch,
+    Transaction(velagraph::TransactionError),
 }
 impl fmt::Display for RouteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,6 +84,7 @@ impl fmt::Display for RouteError {
             Self::MissingReplica { group, node } => {
                 write!(f, "unregistered replica ({group}, {node})")
             }
+            Self::Transaction(e) => write!(f, "{e}"),
             Self::PlacementMismatch => f.write_str("prepared route identity mismatch"),
         }
     }
@@ -91,6 +93,14 @@ impl Error for RouteError {}
 impl From<StorageNodeError> for RouteError {
     fn from(e: StorageNodeError) -> Self {
         Self::Storage(e)
+    }
+}
+impl From<velagraph::TransactionError> for RouteError {
+    fn from(error: velagraph::TransactionError) -> Self {
+        match error {
+            velagraph::TransactionError::Node(error) => Self::Storage(error),
+            other => Self::Transaction(other),
+        }
     }
 }
 impl From<CatalogError> for RouteError {
@@ -1811,3 +1821,4 @@ mod global_scan_tests {
 
 /// Explicitly non-atomic, append-only graph/v2 experiment.
 pub mod experimental;
+mod transaction;

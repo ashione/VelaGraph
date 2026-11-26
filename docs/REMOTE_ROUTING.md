@@ -66,7 +66,7 @@ Candidate IDs and leader hints only reorder fixed configured endpoints; they
 cannot introduce addresses or groups. Each candidate is visited at most once.
 A read-only leader probe before writing uses a quorum barrier and metadata, not
 a snapshot, so it cannot replace the prepared sequence or fail because graph
-snapshot data has grown. Only a definite NotLeader permits another post-dispatch
+snapshot data has grown. For prepared graph mutations, only a definite NotLeader permits another post-dispatch
 write attempt. Timeout/disconnect/protocol loss on a write preserves its request
 ID as an unknown outcome, never automatic replay. No success after deadline.
 These bounded attempts are normal leader selection, not validated availability
@@ -89,13 +89,28 @@ budgets; independently created resolvers have independent session/dispatch pools
 These are bounded work limits, not process RSS bounds. Catalog preparation and
 queries retain their existing bounded cooperative CPU behavior.
 
+## Single-shard write transactions
+
+Call `RouteResolver::begin_v1(partition, request_id, timeout, cancellation)` on
+the blocking pool. Begin reads the catalog and passes the selected shard and
+epoch to transaction admission on the configured data candidates. The first
+successful admission fixes the replica and the committed sequence. The caller
+stages opaque byte operations on that shard. Two partitions mapped to the same
+shard share its keyspace, sequence and request-ID namespace.
+
+The handle retains one of the 32 operation slots, including while idle. Commit,
+abort or drop releases it. The original timeout covers lookup, admission,
+staging and commit. Commit makes one attempt on the pinned replica. A follower
+can return `NotLeader`. An ambiguous write returns `UnknownOutcome` with the
+original ID. See the [storage transaction contract](STORAGE_NODE_INTERFACE.md#single-shard-transaction).
+
 ## Verification and limits
 
 `remote_routing` starts nine actual OS processes: three metadata voters and two
 independent three-voter data groups with overlapping numeric node, vertex and
 edge IDs. It verifies normal routing, catalog and graph exact retries, all CRUD,
 standard Gremlin, pinned historical views, unknown partitions, configuration
-errors and endpoint identity mismatch. Unit tests cover identity validation for
+errors and endpoint identity mismatch. The same fixture stages identical byte keys and request IDs on two distinct shards and checks conflicts and cancellation. Unit tests cover identity validation for
 all RPCs, no-snapshot leader probing, durable marker rejection, shared admission
 and expired dispatch scopes. Existing in-process catalog/router tests still run.
 

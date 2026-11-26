@@ -266,6 +266,25 @@ async fn failover_keeps_retained_pages_and_queries_historical_then_fences_epoch(
         f.a.converge().await?;
         let old = leader(&f.a.nodes, None).await?;
         let old_id = f.a.nodes[old].id;
+        // The routed transaction must keep the replica selected at begin, even
+        // after that replica learns the new leader's identity.
+        let resolver = f.resolver.clone();
+        let (ready, staged) = tokio::sync::oneshot::channel();
+        let (resume, changed) = std::sync::mpsc::channel();
+        let pinned = tokio::spawn(run_blocking(move || -> anyhow::Result<()> {
+            let mut tx = resolver.begin_v1(1, [91; 16], BUDGET, Default::default())?;
+            tx.stage(&velagraph::WriteOp::put(b"pinned", [1]))?;
+            ready.send(()).unwrap();
+            changed.recv_timeout(BUDGET)?;
+            assert!(matches!(
+                tx.commit(),
+                Err(velagraph::TransactionError::Node(
+                    StorageNodeError::NotLeader { .. }
+                ))
+            ));
+            Ok(())
+        }));
+        staged.await?;
         f.a.isolate(old_id).await;
         let new = leader(&f.a.nodes, Some(old_id)).await?;
         assert_ne!(new, old);
@@ -276,6 +295,11 @@ async fn failover_keeps_retained_pages_and_queries_historical_then_fences_epoch(
             }
         })
         .await?;
+        resume.send(())?;
+        pinned.await???;
+        let after = read(&f.resolver, 1).await?;
+        assert_eq!(after.sequence(), 2);
+        assert_eq!(run_blocking(move || after.get(b"pinned")).await??, None);
         // The same resolver must discover the new leader, without replacing handles.
         let p = prepare(&f.resolver, 1, 3, "later").await?;
         commit(&f.resolver, &p, BUDGET).await?;
@@ -336,6 +360,17 @@ async fn failover_keeps_retained_pages_and_queries_historical_then_fences_epoch(
                 ..
             }))
         ));
+        let resolver = f.resolver.clone();
+        run_blocking(move || {
+            assert!(matches!(
+                resolver.begin_v1(1, [92; 16], BUDGET, Default::default()),
+                Err(RouteError::Storage(StorageNodeError::Fenced {
+                    current: 2,
+                    ..
+                }))
+            ));
+        })
+        .await?;
         assert!(matches!(
             commit(&f.resolver, &p, BUDGET).await,
             Err(RouteError::Storage(StorageNodeError::Fenced {
@@ -692,4 +727,61 @@ async fn independent_expired_sessions_still_consume_slots_and_runtime_rejects() 
         Ok(())
     })
     .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routed_transaction_shares_session_capacity_and_preserves_unknown_outcome(
+) -> anyhow::Result<()> {
+    use velagraph::{TransactionError, WriteOp};
+    let f = Fixture::new().await?;
+    let resolver = f.resolver.clone();
+    let leader_index = leader(&f.a.nodes, None).await?;
+    let (ready, staged) = tokio::sync::oneshot::channel();
+    let (resume, paused) = std::sync::mpsc::channel();
+    let writer = tokio::spawn(run_blocking(move || -> anyhow::Result<()> {
+        let mut views = Vec::new();
+        for _ in 1..replicated_graph::routing::MAX_OPERATIONS {
+            views.push(resolver.read_view(2, BUDGET)?);
+        }
+        let aborted = resolver.begin_v1(1, [94; 16], BUDGET, Default::default())?;
+        assert!(matches!(
+            resolver.read_view(2, BUDGET),
+            Err(RouteError::Storage(StorageNodeError::ResourceExhausted(_)))
+        ));
+        aborted.abort();
+        let mut tx = resolver.begin_v1(1, [95; 16], Duration::from_secs(2), Default::default())?;
+        tx.stage(&WriteOp::put(b"first", [1]))?;
+        tx.stage(&WriteOp::put(b"second", [2]))?;
+        ready.send(()).unwrap();
+        paused.recv_timeout(BUDGET)?;
+        assert!(
+            matches!(tx.commit(), Err(TransactionError::UnknownOutcome {request_id, ..}) if request_id == [95;16])
+        );
+        assert_eq!(resolver.read_view(2, BUDGET)?.sequence(), 0);
+        Ok(())
+    }));
+    timeout(BUDGET, staged).await??;
+    let guard = f.a.nodes[leader_index].state_machine.pause_state().await;
+    resume.send(())?;
+    let worker_result = timeout(BUDGET, writer).await?;
+    worker_result???;
+    drop(guard);
+    timeout(BUDGET, async {
+        while f.a.nodes[leader_index].state_machine.d1_metadata().await
+            != Some((f.a.placement.shard, 1, 1))
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let view = read(&f.resolver, 1).await?;
+    assert_eq!(view.sequence(), 1);
+    run_blocking(move || -> anyhow::Result<()> {
+        assert_eq!(view.get(b"first")?, Some(vec![1]));
+        assert_eq!(view.get(b"second")?, Some(vec![2]));
+        Ok(())
+    })
+    .await??;
+    f.stop().await;
+    Ok(())
 }

@@ -350,9 +350,58 @@ async fn scenario() -> anyhow::Result<()> {
                 Value::Text(name.into())
             );
         }
+        routed_transactions(&resolver)?;
         Ok(())
     })
     .await??;
+    Ok(())
+}
+
+fn routed_transactions(resolver: &RouteResolver) -> anyhow::Result<()> {
+    use velagraph::{CancellationToken, TransactionError, WriteOp};
+
+    assert!(matches!(
+        resolver.begin_v1(999, [44; 16], BUDGET, Default::default()),
+        Err(RouteError::MissingPartition(999))
+    ));
+    let mut first = resolver.begin_v1(1, [45; 16], BUDGET, Default::default())?;
+    let mut second = resolver.begin_v1(2, [45; 16], BUDGET, Default::default())?;
+    let mut stale = resolver.begin_v1(1, [46; 16], BUDGET, Default::default())?;
+    first.stage(&WriteOp::put(b"same", [1]))?;
+    second.stage(&WriteOp::put(b"same", [2]))?;
+    stale.stage(&WriteOp::put(b"stale", [1]))?;
+    let before = resolver.read_view(1, BUDGET)?;
+    assert_eq!(before.get(b"same")?, None);
+    assert_eq!(first.commit()?.sequence, 8);
+    assert_eq!(second.commit()?.sequence, 8);
+    assert!(matches!(
+        stale.commit(),
+        Err(TransactionError::Node(StorageNodeError::Conflict {
+            expected: 7,
+            current: 8
+        }))
+    ));
+    assert_eq!(before.get(b"same")?, None);
+
+    let token = CancellationToken::default();
+    let mut cancelled = resolver.begin_v1(1, [47; 16], BUDGET, token.clone())?;
+    cancelled.stage(&WriteOp::put(b"cancelled", [3]))?;
+    token.cancel();
+    assert!(matches!(
+        cancelled.commit(),
+        Err(TransactionError::Cancelled)
+    ));
+    assert!(matches!(
+        resolver.begin_v1(1, [48; 16], BUDGET, token),
+        Err(RouteError::Transaction(TransactionError::Cancelled))
+    ));
+    for partition in [1, 2] {
+        let view = resolver.read_view(partition, BUDGET)?;
+        assert_eq!(view.sequence(), 8);
+        assert_eq!(view.get(b"same")?, Some(vec![partition as u8]));
+        assert_eq!(view.get(b"cancelled")?, None);
+        assert_eq!(view.get(b"stale")?, None);
+    }
     Ok(())
 }
 

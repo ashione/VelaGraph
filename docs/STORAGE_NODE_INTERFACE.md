@@ -250,7 +250,13 @@ begin cannot resolve that outcome.
 
 Client exit discards unpublished staging. The independent-process test reads
 both committed batches after a restart of all three voters, including one
-whose commit reply was withheld. Routed begin still returns `Unsupported`.
+whose commit reply was withheld.
+
+`RouteResolver::begin_v1(partition, request_id, timeout, cancellation)` looks up
+the immutable placement and selects a data leader at begin. The returned handle
+holds one resolver slot and commits once on that replica. The placement selects
+the shard for all opaque keys. A leadership change can reject a staged commit
+with `NotLeader`; a lost reply can leave its outcome unknown.
 See [#393](https://github.com/ashione/VelaGraph/issues/393).
 
 The broader transaction design also envisages reads inside a transaction:
