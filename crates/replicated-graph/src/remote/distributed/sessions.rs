@@ -41,6 +41,8 @@ struct Session {
     _bytes: tokio::sync::SemaphorePermit<'static>,
 }
 pub(in crate::remote) struct Sessions {
+    #[cfg(test)]
+    pub(in crate::remote) fixed_work: Arc<Mutex<crate::remote::FixedReadWork>>,
     incarnation: [u8; 16],
     #[cfg(test)]
     fragment_test_gate: Mutex<Option<FragmentTestGate>>,
@@ -56,6 +58,8 @@ impl Sessions {
     pub(in crate::remote) fn new() -> Result<Self, RemoteError> {
         Ok(Self {
             incarnation: token()?,
+            #[cfg(test)]
+            fixed_work: Default::default(),
             #[cfg(test)]
             fragment_test_gate: Mutex::new(None),
             values: Mutex::new(BTreeMap::new()),
@@ -398,6 +402,8 @@ impl Sessions {
                     .min(budget.work.saturating_sub(used.work)),
             };
             let node = MeteredNode {
+                #[cfg(test)]
+                fixed_work: None,
                 frozen: query::FrozenNode {
                     view: session.node.view.clone(),
                     end: end.into_std(),
@@ -709,6 +715,8 @@ fn run_scan_fragment(
 
 #[derive(Clone)]
 struct MeteredNode {
+    #[cfg(test)]
+    fixed_work: Option<Arc<Mutex<crate::remote::FixedReadWork>>>,
     frozen: query::FrozenNode,
     cost: Arc<Mutex<Cost>>,
     ceiling: Cost,
@@ -732,6 +740,10 @@ impl StorageNode for MeteredNode {
     }
     fn get(&self, key: &[u8], view: &ReadView) -> Result<Option<Vec<u8>>, StorageNodeError> {
         self.charge(128 + key.len(), 1)?;
+        #[cfg(test)]
+        if let Some(work) = &self.fixed_work {
+            work.lock().unwrap().gets += 1;
+        }
         let value = self.frozen.get(key, view)?;
         self.charge(value.as_ref().map_or(0, |v| v.len().saturating_mul(4)), 0)?;
         Ok(value)
@@ -758,6 +770,12 @@ impl StorageNode for MeteredNode {
             ));
         }
         let rows = self.frozen.scan(range, limit, view)?;
+        #[cfg(test)]
+        if let Some(work) = &self.fixed_work {
+            let mut work = work.lock().unwrap();
+            work.scans += 1;
+            work.scan_rows += rows.len();
+        }
         self.charge(
             rows.iter()
                 .map(|r| 128 + (r.key.len() + r.value.len()) * 4)
@@ -791,6 +809,12 @@ impl StorageNode for MeteredNode {
             ));
         }
         let page = self.frozen.scan_page(range, limit, view, cursor)?;
+        #[cfg(test)]
+        if let Some(work) = &self.fixed_work {
+            let mut work = work.lock().unwrap();
+            work.scans += 1;
+            work.scan_rows += page.rows.len();
+        }
         self.charge(
             page.rows
                 .iter()
@@ -824,6 +848,8 @@ mod tests {
     use super::*;
     fn node(entries: BTreeMap<Vec<u8>, Vec<u8>>, ceiling: Cost) -> MeteredNode {
         MeteredNode {
+            #[cfg(test)]
+            fixed_work: None,
             frozen: query::FrozenNode {
                 view: ReadView::from_entries(1, 1, 1, entries).unwrap(),
                 end: std::time::Instant::now() + Duration::from_secs(5),
@@ -1050,6 +1076,8 @@ mod lifetime_tests {
         let bound = fixed_parallel::reservation_for_test(&fragment, &session).unwrap();
         let prepared = fixed_execution::prepare(&mut session, fragment.clone(), bound).unwrap();
         let node = MeteredNode {
+            #[cfg(test)]
+            fixed_work: None,
             frozen: frozen.clone(),
             cost: Arc::new(Mutex::new(Cost::default())),
             ceiling: Cost {
@@ -2050,6 +2078,8 @@ mod epoch_tests {
             }
         }
         let meter = MeteredNode {
+            #[cfg(test)]
+            fixed_work: None,
             frozen: pinned.node.clone(),
             cost: Arc::new(Mutex::new(Cost::default())),
             ceiling: jobs::JOB_CEILING,

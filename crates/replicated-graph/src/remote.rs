@@ -257,7 +257,24 @@ impl std::ops::Deref for GraphService {
         &self.shared
     }
 }
+// Per-service counters for successful fixed-version graph read fixtures. The
+// lookup counters describe the captured ReadView, independently of Raft I/O.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FixedReadWork {
+    pub(crate) captures: usize,
+    pub(crate) replay_operations: usize,
+    pub(crate) gets: usize,
+    pub(crate) scans: usize,
+    pub(crate) scan_rows: usize,
+}
+
 impl GraphService {
+    #[cfg(test)]
+    pub(crate) fn fixed_read_work(&self) -> FixedReadWork {
+        *self.shared.query_sessions.fixed_work.lock().unwrap()
+    }
+
     pub async fn start(
         node: &d2_raft::tcp::TcpNode,
         bind: SocketAddr,
