@@ -18,6 +18,7 @@ use rocksdb::{DBCompressionType, Direction, IteratorMode, Options, WriteBatch, W
 use tokio::sync::Mutex;
 
 use crate::blocking::blocking_section;
+use crate::state_machine::StateMachine;
 use crate::types::{NodeId, TypeConfig};
 
 // Soft encoded-byte cap: an oversized first entry remains indivisible.
@@ -81,6 +82,23 @@ impl DurableLogStore {
             inner: Arc::new(Mutex::new(DurableLogStoreInner { db })),
         })
     }
+    /// Validate the two persisted boundaries before OpenRaft can replay or
+    /// clean up logs. Neither store has been handed to a worker at this point.
+    pub(crate) async fn open_for_node(dir: &Path) -> anyhow::Result<(Self, Arc<StateMachine>)> {
+        let logs = Self::open(dir.join("raft.db"))?;
+        let state = Arc::new(StateMachine::open(dir.join("state.db"))?);
+        let applied = state.applied().await;
+        let purged = {
+            let inner = logs.inner.lock().await;
+            blocking_section(|| inner.last_purged())?
+        };
+        anyhow::ensure!(
+            log_cut_leq(purged, applied),
+            "durable applied state {applied:?} does not cover purged log boundary {purged:?}"
+        );
+        Ok((logs, state))
+    }
+
     // Lock is retained across both physical checkpoints. No purge policy changes.
     pub(crate) async fn checkpoint_pair(
         &self,
@@ -93,12 +111,12 @@ impl DurableLogStore {
         blocking_section(|| {
             let purged = inner.last_purged()?;
             anyhow::ensure!(
-                checkpoint_cut_leq(purged, snapshot) && checkpoint_cut_leq(snapshot, applied),
+                log_cut_leq(purged, snapshot) && log_cut_leq(snapshot, applied),
                 "checkpoint requires a durable snapshot covering the purged log boundary"
             );
             let last = inner.last_log_id()?.or(purged);
             anyhow::ensure!(
-                checkpoint_cut_leq(applied, last),
+                log_cut_leq(applied, last),
                 "applied state exceeds retained Raft history"
             );
             if let Some(applied) = applied.filter(|a| Some(*a) > purged) {
@@ -581,7 +599,7 @@ mod tests {
     }
 }
 
-fn checkpoint_cut_leq(a: Option<LogId<NodeId>>, b: Option<LogId<NodeId>>) -> bool {
+fn log_cut_leq(a: Option<LogId<NodeId>>, b: Option<LogId<NodeId>>) -> bool {
     match (a, b) {
         (None, _) => true,
         (Some(_), None) => false,
@@ -621,10 +639,10 @@ pub(crate) fn validate_checkpoint_log(
         .map(|v| serde_json::from_slice::<Vote<NodeId>>(&v))
         .transpose()?;
     anyhow::ensure!(
-        checkpoint_cut_leq(purged, snapshot)
-            && checkpoint_cut_leq(snapshot, applied)
-            && checkpoint_cut_leq(applied, last)
-            && checkpoint_cut_leq(committed, last),
+        log_cut_leq(purged, snapshot)
+            && log_cut_leq(snapshot, applied)
+            && log_cut_leq(applied, last)
+            && log_cut_leq(committed, last),
         "inconsistent checkpoint Raft boundaries"
     );
     let mut prior = purged;
@@ -642,7 +660,7 @@ pub(crate) fn validate_checkpoint_log(
         let entry: openraft::Entry<TypeConfig> = serde_json::from_slice(&value)?;
         anyhow::ensure!(entry.log_id.index == index, "checkpoint log index mismatch");
         anyhow::ensure!(
-            checkpoint_cut_leq(prior, Some(entry.log_id)),
+            log_cut_leq(prior, Some(entry.log_id)),
             "checkpoint log terms regress"
         );
         for cut in [applied, snapshot, committed].into_iter().flatten() {
@@ -670,8 +688,8 @@ fn checkpoint_cuts_require_index_and_full_identity() {
     let a = LogId::new(CommittedLeaderId::new(1, 1), 4);
     let same_index_other_term = LogId::new(CommittedLeaderId::new(2, 1), 4);
     let lower_index_other_term = LogId::new(CommittedLeaderId::new(2, 1), 3);
-    assert!(checkpoint_cut_leq(None, Some(a)));
-    assert!(checkpoint_cut_leq(Some(a), Some(a)));
-    assert!(!checkpoint_cut_leq(Some(a), Some(same_index_other_term)));
-    assert!(!checkpoint_cut_leq(Some(a), Some(lower_index_other_term)));
+    assert!(log_cut_leq(None, Some(a)));
+    assert!(log_cut_leq(Some(a), Some(a)));
+    assert!(!log_cut_leq(Some(a), Some(same_index_other_term)));
+    assert!(!log_cut_leq(Some(a), Some(lower_index_other_term)));
 }
