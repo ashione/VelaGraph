@@ -121,8 +121,7 @@ impl Node {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create data dir {}", dir.display()))?;
         bind_durable_identity(dir, registry.group_id(), id)?;
-        let log_store = DurableLogStore::open(dir.join("raft.db"))?;
-        let state_machine = Arc::new(StateMachine::open(dir.join("state.db"))?);
+        let (log_store, state_machine) = DurableLogStore::open_for_node(dir).await?;
         let config = Arc::new(
             Config {
                 heartbeat_interval: 100,

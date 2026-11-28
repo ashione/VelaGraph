@@ -111,6 +111,15 @@ The TCP node always opens two separate RocksDB directories under `--data-dir`:
   data range and metadata in one batch, so a crash cannot expose a partially
   installed snapshot.
 
+At startup, both durable node constructors compare the persisted purge marker
+with the applied log ID loaded from the state database before starting OpenRaft.
+A purged index must be covered by the applied state. At the same index the
+full IDs must match, and at an earlier index the purged ID must precede the
+applied ID. An inconsistent pair fails startup before committed suffix replay
+or startup log cleanup. A valid pair can still replay a retained committed
+suffix or clean up to an already published snapshot. Coordinating live purge
+with concurrent snapshot installation remains open in [#124](https://github.com/ashione/VelaGraph/issues/124).
+
 `Node::start_durable` / `Cluster::start_durable` expose the same stores for
 in-process restart tests. `tests/durable.rs` initializes three voters, writes a
 value, shuts all three nodes down, reopens the same directories without

@@ -1,11 +1,13 @@
 //! A cluster restart must recover the Raft log and applied state from RocksDB.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use d2_raft::{initialize_cluster, Cluster, DurableLogStore, LogCommand, NodeHandle};
-use openraft::storage::RaftLogStorage;
-use openraft::{CommittedLeaderId, LogId, Vote};
+use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
+use openraft::{CommittedLeaderId, LogId, RaftLogReader, Vote};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -126,6 +128,166 @@ async fn log_metadata_survives_reopen() -> anyhow::Result<()> {
     let state = reopened.get_log_state().await?;
     assert_eq!(state.last_purged_log_id, Some(log_id));
     assert_eq!(state.last_log_id, Some(log_id));
+    Ok(())
+}
+
+fn cut(term: u64, index: u64) -> LogId<u64> {
+    LogId::new(CommittedLeaderId::new(term, 1), index)
+}
+
+async fn seed_startup_cut(
+    dir: &Path,
+    applied: Option<LogId<u64>>,
+    purged: LogId<u64>,
+) -> anyhow::Result<()> {
+    let mut state = Arc::new(d2_raft::StateMachine::open(dir.join("state.db"))?);
+    if let Some(log_id) = applied {
+        state
+            .apply([openraft::Entry {
+                log_id,
+                payload: openraft::EntryPayload::Normal(LogCommand::put("witness", "published")),
+            }])
+            .await?;
+    }
+    let mut logs = DurableLogStore::open(dir.join("raft.db"))?;
+    logs.save_committed(applied).await?;
+    logs.purge(purged).await?;
+    Ok(())
+}
+
+fn tcp_config(dir: &Path) -> d2_raft::TcpNodeConfig {
+    d2_raft::TcpNodeConfig {
+        id: 1,
+        raft_addr: "127.0.0.1:0".into(),
+        control_addr: "127.0.0.1:0".into(),
+        data_dir: dir.to_owned(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_durable_starts_reject_uncovered_purge_before_recovery() -> anyhow::Result<()> {
+    for (applied, purged) in [
+        (None, cut(3, 7)),
+        (Some(cut(3, 7)), cut(3, 8)),
+        // Index alone and LogId ordering alone would each accept invalid cuts.
+        (Some(cut(3, 7)), cut(2, 7)),
+        (Some(cut(3, 7)), cut(2, 8)),
+        (Some(cut(3, 7)), cut(4, 6)),
+    ] {
+        let dir = tempfile::tempdir()?;
+        seed_startup_cut(dir.path(), applied, purged).await?;
+        for error in [
+            Cluster::new().start_durable(1, dir.path()).await.err(),
+            d2_raft::TcpNode::start(tcp_config(dir.path())).await.err(),
+        ] {
+            let error = error.expect("inconsistent durable cut must reject startup");
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not cover purged log boundary"),
+                "{error:#}"
+            );
+        }
+        let mut logs = DurableLogStore::open(dir.path().join("raft.db"))?;
+        assert_eq!(logs.get_log_state().await?.last_purged_log_id, Some(purged));
+        assert_eq!(logs.read_committed().await?, applied);
+        let state = d2_raft::StateMachine::open(dir.path().join("state.db"))?;
+        assert_eq!(state.applied().await, applied);
+        assert_eq!(
+            state.get("witness").await.as_deref(),
+            applied.map(|_| "published")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_start_cleans_up_to_published_state_and_reopens_at_equality() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let applied = cut(3, 7);
+    seed_startup_cut(dir.path(), Some(applied), cut(2, 5)).await?;
+    let cluster = Cluster::new();
+    let node = cluster.start_durable(1, dir.path()).await?;
+    assert_eq!(
+        node.state_machine.get("witness").await.as_deref(),
+        Some("published")
+    );
+    cluster.shutdown(&node).await;
+    drop(node);
+    {
+        let mut logs = DurableLogStore::open(dir.path().join("raft.db"))?;
+        assert_eq!(
+            logs.get_log_state().await?.last_purged_log_id,
+            Some(applied)
+        );
+    }
+    let tcp = d2_raft::TcpNode::start(tcp_config(dir.path())).await?;
+    assert_eq!(tcp.state_machine.applied().await, Some(applied));
+    assert_eq!(
+        tcp.state_machine.get("witness").await.as_deref(),
+        Some("published")
+    );
+    tcp.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_validates_the_purged_identity_before_replaying_a_committed_suffix(
+) -> anyhow::Result<()> {
+    let applied = cut(3, 7);
+    let committed = cut(4, 8);
+    let suffix = [
+        openraft::Entry::<d2_raft::TypeConfig> {
+            log_id: committed,
+            payload: openraft::EntryPayload::Normal(LogCommand::put("witness", "replayed")),
+        },
+        openraft::Entry {
+            log_id: cut(5, 9),
+            payload: openraft::EntryPayload::Normal(LogCommand::put("witness", "uncommitted")),
+        },
+    ];
+    for purged in [cut(2, 7), applied] {
+        let dir = tempfile::tempdir()?;
+        seed_startup_cut(dir.path(), Some(applied), purged).await?;
+        {
+            let mut logs = DurableLogStore::open(dir.path().join("raft.db"))?;
+            logs.blocking_append(suffix.clone()).await?;
+            logs.save_committed(Some(committed)).await?;
+        }
+        let cluster = Cluster::new();
+        let start = cluster.start_durable(1, dir.path()).await;
+        let expected_value = if purged == applied {
+            let node = start?;
+            cluster.shutdown(&node).await;
+            "replayed"
+        } else {
+            let error = start
+                .err()
+                .expect("committed suffix cannot authorize a mismatched cut");
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not cover purged log boundary"),
+                "{error:#}"
+            );
+            "published"
+        };
+        let state = d2_raft::StateMachine::open(dir.path().join("state.db"))?;
+        assert_eq!(state.get("witness").await.as_deref(), Some(expected_value));
+        assert_eq!(
+            state.applied().await,
+            Some(if purged == applied {
+                committed
+            } else {
+                applied
+            })
+        );
+        let mut logs = DurableLogStore::open(dir.path().join("raft.db"))?;
+        assert_eq!(logs.get_log_state().await?.last_purged_log_id, Some(purged));
+        assert_eq!(logs.read_committed().await?, Some(committed));
+        assert_eq!(logs.try_get_log_entries(8..=9).await?, suffix);
+    }
     Ok(())
 }
 
